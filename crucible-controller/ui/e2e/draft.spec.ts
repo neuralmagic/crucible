@@ -1,5 +1,13 @@
 import { expect, test, type Locator, type Page, type Route } from '@playwright/test';
-import { DISPATCHABLE, PLAYBOOK_RUN, PLAYBOOK_RUNS, RANKED_IMAGES, ROUTES, stubApi } from './api';
+import {
+  DISPATCHABLE,
+  PLAYBOOK_RUN,
+  PLAYBOOK_RUNS,
+  RANKED_IMAGES,
+  ROUTES,
+  RUNS,
+  stubApi,
+} from './api';
 
 const STUDIO = '/playbooks/drafts/studio';
 
@@ -119,8 +127,8 @@ async function savesWith(page: Page, body: Record<string, unknown>): Promise<voi
 
 /// The studio's newest test-fire, served from state the test moves by hand: the launch POST lights
 /// a fire, and the fire's detail flips from the run going to its verdict once `settled` turns.
-/// Registered after `stubApi`, so the fires query and the new fire's detail answer here while
-/// everything else keeps the stock fixtures.
+/// Registered after `stubApi`, so the fires query, the new fire's detail, and the run's own row
+/// answer here while everything else keeps the stock fixtures.
 async function serveFire(
   page: Page,
   state: { launched: boolean; settled: boolean },
@@ -183,6 +191,23 @@ async function serveFire(
       },
     });
   });
+  await page.route('**/api/runs/RUN-0500', (route: Route) =>
+    route.fulfill({
+      status: 200,
+      json: {
+        run: {
+          ...RUNS[1],
+          run_id: 'RUN-0500',
+          issue_key: 'playbook:studio:0200',
+          status: state.settled ? 'failed' : 'running',
+          cost_usd: state.settled ? 0.31 : null,
+          pod: null,
+        },
+        candidates: [],
+        has_plan: true,
+      },
+    }),
+  );
 }
 
 test.describe('draft authoring studio', () => {
@@ -748,8 +773,9 @@ test.describe('draft authoring studio', () => {
     expect(deletes).toHaveLength(1);
   });
 
-  /// The studio loop closes on itself: launching does not leave the page, and the fire card under
-  /// the button follows the fire that launch lit through the run's verdict.
+  /// The studio loop closes on itself: launching does not leave the page, the fire card under the
+  /// button follows the fire that launch lit through the run's verdict, and the run itself is
+  /// watched in the pane — the live session and both consoles the run's own page shows.
   test('a test fire stays in the studio and the card follows it to its verdict', async ({
     page,
   }) => {
@@ -769,9 +795,27 @@ test.describe('draft authoring studio', () => {
     await expect(card).toContainText('running');
     await expect(page).toHaveURL(/\/playbooks\/drafts\/studio$/);
 
+    await expect(
+      page.locator('[data-ui="section-header"]', { hasText: 'Live session' }),
+    ).toBeVisible();
+    const grid = page.locator('summary', { hasText: 'Grid' });
+    await expect(grid).toBeVisible();
+    await grid.click();
+    await expect(page.locator('[data-testid="grid-cell"][data-task="read"]')).toHaveAttribute(
+      'data-status',
+      'pass',
+    );
+    await expect(page.getByTestId('run-task-log')).toBeVisible();
+    await expect(page.getByTestId('run-engine-log')).toBeVisible();
+
     fire.settled = true;
     await expect(card).toContainText('failed', { timeout: 15000 });
     await expect(card.getByRole('button', { name: 'Re-draft from this failure' })).toBeVisible();
+    // The live session left with the run; the grid and the consoles stay as its record.
+    await expect(
+      page.locator('[data-ui="section-header"]', { hasText: 'Live session' }),
+    ).toHaveCount(0);
+    await expect(page.getByTestId('run-engine-log')).toBeVisible();
   });
 
   /// The failure loop the studio exists for: a failed fire's error is read from the run's own
@@ -813,6 +857,9 @@ test.describe('draft authoring studio', () => {
     const card = page.getByTestId('draft-test-fire');
     await expect(card).toContainText('jolly-otter');
     await expect(card).toContainText('failed');
+    // The settled fire keeps its run view in the pane, so the failure is read where it happened.
+    await expect(page.getByTestId('run-task-log')).toBeVisible();
+    await expect(page.getByTestId('run-engine-log')).toBeVisible();
     await page.getByRole('button', { name: 'Re-draft from this failure' }).click();
 
     await expect(page.getByLabel('Intent')).toHaveValue(/the ranking script exited 1/);

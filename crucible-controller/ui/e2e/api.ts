@@ -69,7 +69,7 @@ const ISSUES = [
   },
 ];
 
-const RUNS = [
+export const RUNS = [
   {
     run_id: 'RUN-0412',
     scope: 1,
@@ -791,6 +791,45 @@ export const ROUTES: Record<string, Json> = {
   [`/api/runs/${TRIAGE_RUN}/log`]: TRIAGE_LOG,
   [`/api/runs/${TRIAGE_RUN}/tasks/triage[1027]/evidence`]: TRIAGE_EVIDENCE,
   [`/api/runs/${TRIAGE_RUN}/tasks/scan/evidence`]: SCAN_EVIDENCE,
+  /** The studio's newest test-fire run: the pack's read task finished, its summarize command has
+   * not reported yet, and its console is held locally. */
+  '/api/runs/RUN-0500': {
+    run: {
+      ...RUNS[1],
+      run_id: 'RUN-0500',
+      issue_key: 'playbook:studio:0200',
+      status: 'running',
+      cost_usd: null,
+      pod: null,
+    },
+    candidates: [],
+    has_plan: true,
+  },
+  '/api/runs/RUN-0500/graph': {
+    plan_version: 1,
+    tasks: [
+      { name: 'read', kind: 'agent', depends_on: [], session: 'survey', needs: 'any', required: true, over: '', max_fanout: 0, when: '', keyed: [] },
+      { name: 'summarize', kind: 'command', depends_on: ['read'], session: '', needs: 'any', required: true, over: '', max_fanout: 0, when: '', keyed: [] },
+    ],
+    fanout: [],
+    decisions: [],
+    results: [
+      { iter: 0, task: 'read', status: 'pass', note: '', cost_usd: 0.19, secs: 41, links: [], repairs: [], agent: { harness: 'claude', model: 'glm-5.3', effort: 'low' } },
+    ],
+  },
+  '/api/runs/RUN-0500/log': {
+    run_id: 'RUN-0500',
+    dispatch: 'local',
+    text: 'plan run: admitted 2 tasks\nplan run: read pass\n',
+    truncated: false,
+    location: null,
+  },
+  '/api/runs/RUN-0500/tasks/log': {
+    run_id: 'RUN-0500',
+    text: '[task read] READ THE PAPER\n[task read] one entry per citation\n',
+    truncated: false,
+    location: null,
+  },
   '/api/repos': [
     { repo: 'vllm-project/vllm', paused: false, new: 2, scoped: 1, awaiting_approval: 1, running: 1, pr_open: 0, parked: 0, done: 4 },
     { repo: 'neuralmagic/crucible', paused: false, new: 1, scoped: 0, awaiting_approval: 0, running: 0, pr_open: 1, parked: 1, done: 9 },
@@ -1394,6 +1433,11 @@ export async function stubApi(page: Page): Promise<void> {
       // the design baselines nondeterministic. A day-long retry holds that off for a test's
       // lifetime, which is the same quiet-open the real endpoint gives.
       if (path === '/api/events/stream') {
+        return route.fulfill({ status: 200, contentType: 'text/event-stream', body: 'retry: 86400000\n\n' });
+      }
+      // A run's live session is the same kind of stream: held open and quiet rather than answered
+      // with JSON an EventSource would choke on and reconnect-loop against.
+      if (path.endsWith('/live')) {
         return route.fulfill({ status: 200, contentType: 'text/event-stream', body: 'retry: 86400000\n\n' });
       }
       // Acting as a team: whoami answers for the team the header names, and a team the caller
