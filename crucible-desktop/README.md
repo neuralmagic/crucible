@@ -207,9 +207,9 @@ the edit button opens it in the editor. A file over 8 MiB is not fetched; the pa
 
 `Edit` on a draft run's pack, or `Draft` on a registered one, pulls the draft into a working copy
 under `~/Library/Application Support/crucible-playbooks/drafts` (on Fedora,
-`~/.local/share/crucible-playbooks/drafts`; `$CRUCIBLE_DRAFTS_DIR`
-overrides it). A registered playbook's draft is `<playbook>-<user>`, created from the playbook
-the first time. The Pack tab then switches between the run's pack and the working copy, which
+`~/.local/share/crucible-playbooks/drafts`). `Drafts folder` in Settings, or `drafts_dir` in
+`config.toml`, keeps them somewhere else, and `$CRUCIBLE_DRAFTS_DIR` overrides both. A registered
+playbook's draft is `<playbook>-<user>`, created from the playbook the first time. The Pack tab then switches between the run's pack and the working copy, which
 opens in the editor, is checked by `crucible-lsp`, and is re-read once a second. `Save` sends it
 as the draft's next version, refused when someone saved since; `Pull` replaces it with the
 newest save; `Launch` launches the draft.

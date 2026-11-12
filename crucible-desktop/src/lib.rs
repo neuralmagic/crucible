@@ -482,6 +482,9 @@ pub struct App {
     pub drop_cost: TextEdit,
     pub drop_time: TextEdit,
     pub drop_error: Option<String>,
+    /// The drafts folder as typed in Settings, and why it did not take.
+    pub drafts_dir: TextEdit,
+    pub drafts_error: Option<String>,
     /// Why the last pack folder dropped on the app did not launch.
     pub drop_failed: Option<String>,
     /// Effect and layout values tuned live; their defaults unless built with `knobs`.
@@ -1603,6 +1606,13 @@ fn init() -> App {
     let editor_command = TextEdit::new(&settings.editor_command);
     let drop_cost = TextEdit::new(format!("{}", settings.drop_max_cost));
     let drop_time = TextEdit::new(&settings.drop_max_time);
+    let drafts_dir = TextEdit::new(
+        settings
+            .drafts_dir
+            .as_deref()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_default(),
+    );
     let (opened_tx, opened) = std::sync::mpsc::channel();
     let open_wake: std::sync::Arc<std::sync::Mutex<Option<Waker>>> = Default::default();
     let woken = open_wake.clone();
@@ -1617,7 +1627,7 @@ fn init() -> App {
         profile::Target::new(&name, chosen, &settings.keys()).acting_as(settings.act_as(&name));
     let keeper = target.start(&repo, profile::supervisor);
     let net = net::Net::start();
-    let remote = remote::Remote::new(target.clone(), &net, None);
+    let remote = remote::Remote::new(target.clone(), &net, settings.drafts_root(), None);
     App {
         repo: repo.display().to_string(),
         remote,
@@ -1681,6 +1691,8 @@ fn init() -> App {
         drop_cost,
         drop_time,
         drop_error: None,
+        drafts_dir,
+        drafts_error: None,
         drop_failed: None,
         login_editor: LoginEditor::Unasked,
         opening: None,
