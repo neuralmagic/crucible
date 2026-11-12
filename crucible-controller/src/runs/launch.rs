@@ -266,12 +266,18 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
             Ok(())
         }
         // The subprocess is supervised out of band, exactly as the pod watch drives a pod's
-        // completion — and only once the run row it will fold into is committed.
+        // completion — and only once the run row it will fold into is committed. The registry
+        // entry goes in before the supervisor is spawned, so a cancel that arrives while the run
+        // row is fresh already finds the engine reachable.
         Started::Local(run) => {
+            let live = cfg.runtime.local_runs.clone();
+            live.register(&run_id, run.handle());
             crate::runs::agent_tools::attribute_launched(db, cfg, &issue.key, &run_id).await;
             let db = db.clone();
             let key = issue.key.clone();
-            tokio::spawn(async move { crate::runs::local_run::supervise(db, key, *run).await });
+            tokio::spawn(
+                async move { crate::runs::local_run::supervise(db, key, *run, live).await },
+            );
             Ok(())
         }
     }

@@ -43,10 +43,28 @@ pub struct LocalRun {
     deadline: Duration,
 }
 
-/// The process group a local run's engine leads, holding everything it spawned. Dropped armed, it
-/// SIGKILLs the group, so a run whose supervisor goes away (a controller shutdown, a run row that
-/// never committed) leaves no process behind.
-struct ProcessGroup(Option<nix::unistd::Pid>);
+impl LocalRun {
+    /// The registry's handle on this run's process group, for a cancel to signal.
+    pub(crate) fn handle(&self) -> GroupHandle {
+        self.group.handle()
+    }
+}
+
+/// The slot a process group's state lives in, shared between the supervisor that owns the child
+/// and the registry entry a cancel reaches it through.
+type GroupSlot = Arc<std::sync::Mutex<GroupState>>;
+
+struct GroupState {
+    pgid: Option<nix::unistd::Pid>,
+    cancelled_at: Option<std::time::Instant>,
+}
+
+/// The process group a local run's engine leads, holding everything it spawned. Its pgid lives in
+/// a slot shared with the cancel path; the supervisor disarms the slot the moment it sees the
+/// engine gone, so a pid the OS has since reused is never signalled. Dropped armed, it SIGKILLs
+/// the group, so a run whose supervisor goes away (a controller shutdown, a run row that never
+/// committed) leaves no process behind.
+struct ProcessGroup(GroupSlot);
 
 impl ProcessGroup {
     fn led_by(child: &tokio::process::Child) -> Result<Self> {
@@ -54,25 +72,123 @@ impl ProcessGroup {
             .id()
             .context("the spawned engine was reaped before its process group was recorded")?;
         let pid = i32::try_from(pid).with_context(|| format!("engine pid {pid} is not a pid_t"))?;
-        Ok(Self(Some(nix::unistd::Pid::from_raw(pid))))
+        Ok(Self(Arc::new(std::sync::Mutex::new(GroupState {
+            pgid: Some(nix::unistd::Pid::from_raw(pid)),
+            cancelled_at: None,
+        }))))
+    }
+
+    fn handle(&self) -> GroupHandle {
+        GroupHandle(self.0.clone())
+    }
+
+    /// When a cancel signalled this group, if one did.
+    fn cancelled_at(&self) -> Option<std::time::Instant> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cancelled_at
     }
 
     /// Leave the group running: the engine exited on its own, and whatever it left behind is its
     /// business.
-    fn release(mut self) {
-        self.0 = None;
+    fn release(self) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pgid = None;
     }
 }
 
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
-        let Some(pgid) = self.0 else { return };
+        let pgid = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pgid
+            .take();
+        let Some(pgid) = pgid else { return };
         match nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL) {
             Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
             Err(e) => {
                 tracing::warn!(%pgid, error = %e, "killing a local run's process group failed")
             }
         }
+    }
+}
+
+/// The registry's side of a live local run's process group.
+#[derive(Clone)]
+pub struct GroupHandle(GroupSlot);
+
+impl GroupHandle {
+    /// Whether a cancel signalled the run this handle leads.
+    fn cancelled(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cancelled_at
+            .is_some()
+    }
+
+    /// Stop the run this handle leads: mark its group cancelled and SIGTERM it. The engine's own
+    /// signal handler terminates the task children it leads and exits; the supervisor escalates to
+    /// a kill if the group is still armed past its grace. Returns whether a live engine was
+    /// signalled — a slot already disarmed is a run that ended on its own.
+    fn signal_cancel(&self) -> bool {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(pgid) = state.pgid else { return false };
+        match nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGTERM) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => {
+                state.cancelled_at = Some(std::time::Instant::now());
+                true
+            }
+            Err(e) => {
+                tracing::warn!(%pgid, error = %e, "signalling a cancelled local run's group failed");
+                false
+            }
+        }
+    }
+}
+
+/// The local runs this controller process is supervising, keyed by run id. The supervisor task
+/// owns each run's child; this is the only handle a cancel gets, registered by dispatch before the
+/// supervisor is spawned and unregistered when the run settles. A run whose entry is gone is not
+/// one this process is driving — nothing here can stop it.
+#[derive(Clone, Default)]
+pub struct LocalRuns(Arc<std::sync::Mutex<std::collections::HashMap<String, GroupHandle>>>);
+
+impl LocalRuns {
+    pub(crate) fn register(&self, run_id: &str, group: GroupHandle) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(run_id.to_string(), group);
+    }
+
+    pub(crate) fn unregister(&self, run_id: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(run_id);
+    }
+
+    /// Stop a live local run. Returns whether a supervised engine was signalled.
+    pub fn cancel(&self, run_id: &str) -> bool {
+        let Some(handle) = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(run_id)
+            .cloned()
+        else {
+            return false;
+        };
+        handle.signal_cancel()
     }
 }
 
@@ -285,11 +401,23 @@ pub(crate) async fn start(
     })
 }
 
+/// How long a cancelled run's engine is given to honor the cancel's SIGTERM before the supervisor
+/// kills it. The engine's handler terminates the task children it leads and exits; this is the
+/// backstop for a process that stopped honoring signals.
+const CANCEL_GRACE: Duration = Duration::from_secs(30);
+
 /// Drive one local run to its end: stream its output into the log, kill it if it outlives its own
 /// ceiling, and fold whatever session it published into the ledger through the pod path's
 /// completion. A run that published nothing parks the launch with the supervisor's account of how
-/// it ended, so a failed local run is never a silently `running` row.
-pub async fn supervise(db: Db, key: String, run: LocalRun) {
+/// it ended, so a failed local run is never a silently `running` row. Unregisters from `live` when
+/// it settles, so a later cancel can never reach a run that is already over.
+pub async fn supervise(db: Db, key: String, run: LocalRun, live: LocalRuns) {
+    let run_id = run.run_id.clone();
+    drive(db, key, run).await;
+    live.unregister(&run_id);
+}
+
+async fn drive(db: Db, key: String, run: LocalRun) {
     let LocalRun {
         mut child,
         group,
@@ -297,6 +425,7 @@ pub async fn supervise(db: Db, key: String, run: LocalRun) {
         run_id,
         deadline,
     } = run;
+    let cancel_handle = group.handle();
     let mut tail = Vec::new();
     let mut streams = tokio::task::JoinSet::new();
     let log = open_engine_log(&dir).await;
@@ -332,7 +461,19 @@ pub async fn supervise(db: Db, key: String, run: LocalRun) {
                 }
             }
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                    if group
+                        .cancelled_at()
+                        .is_some_and(|at| std::time::Instant::now() >= at + CANCEL_GRACE)
+                    {
+                        drop(group);
+                        let _ = child.wait().await;
+                        break format!(
+                            "the engine ignored its cancel for {}s and was killed",
+                            CANCEL_GRACE.as_secs()
+                        );
+                    }
+                }
                 _ = fold.tick() => {
                     fold_live_graph(&db, &run_id, &dir).await;
                 }
@@ -355,6 +496,11 @@ pub async fn supervise(db: Db, key: String, run: LocalRun) {
 
     let session = std::fs::read_to_string(session_log(&dir)).unwrap_or_default();
     if session.trim().is_empty() {
+        if cancel_handle.cancelled() {
+            tracing::info!(%key, %run_id, "{outcome}");
+            stamp_cancelled(&db, &key, &run_id).await;
+            return;
+        }
         let tail = tail
             .iter()
             .rev()
@@ -370,6 +516,17 @@ pub async fn supervise(db: Db, key: String, run: LocalRun) {
     }
     if let Err(e) = complete(&db, &key, &run_id, &session).await {
         tracing::warn!(%key, %run_id, error = %format!("{e:#}"), "ingesting a local run failed");
+    }
+    if cancel_handle.cancelled() {
+        stamp_cancelled(&db, &key, &run_id).await;
+    }
+}
+
+/// Stamp a cancelled local run's row `cancelled`. The launch's park is the cancel override's; the
+/// fold already recorded whatever the run published before it stopped.
+async fn stamp_cancelled(db: &Db, key: &str, run_id: &str) {
+    if let Err(e) = crate::runs::store::set_run_status(db.pool(), run_id, "cancelled").await {
+        tracing::warn!(%key, %run_id, error = %format!("{e:#}"), "stamping a cancelled local run failed");
     }
 }
 
@@ -848,6 +1005,54 @@ mod tests {
         )
         .expect("clean up the group");
         child.wait().await.expect("reap");
+    }
+
+    /// A cancel SIGTERMs the group: the engine and the task children it led stop, and the handle
+    /// reports a live engine was signalled.
+    #[tokio::test]
+    async fn a_cancelled_process_group_stops_the_engine_and_its_children() {
+        let (mut child, group) = spawn_group_with_straggler();
+        let straggler = straggler_pid(&mut child).await;
+        let handle = group.handle();
+        assert!(handle.signal_cancel(), "a live engine is signalled");
+        assert!(handle.cancelled(), "the cancel is recorded on the group");
+        child.wait().await.expect("reap the signalled leader");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while alive(straggler) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "pid {straggler} outlived its group's cancel"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// A group whose engine already ended on its own is disarmed: a cancel reports no live engine
+    /// instead of signalling a pid the OS may have reused.
+    #[tokio::test]
+    async fn a_disarmed_group_tells_a_cancel_no_live_engine_is_there() {
+        let (mut child, group) = spawn_group_with_straggler();
+        let straggler = straggler_pid(&mut child).await;
+        let handle = group.handle();
+        group.release();
+        assert!(!handle.signal_cancel(), "a released group signals nothing");
+        assert!(!handle.cancelled(), "nothing was marked cancelled");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(alive(straggler), "a released group is not signalled");
+        nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(i32::try_from(child.id().expect("running")).expect("pid")),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .expect("clean up the group");
+        child.wait().await.expect("reap");
+    }
+
+    /// A run this process is not supervising has no registry entry, so a cancel is a refusal
+    /// rather than a signal to whatever else the id might name.
+    #[test]
+    fn a_run_this_process_does_not_supervise_cannot_be_cancelled() {
+        let live = LocalRuns::default();
+        assert!(!live.cancel("playbook_run_not_mine"));
     }
 
     /// A run directory is per launch and safe to build from a run id, which carries the launch

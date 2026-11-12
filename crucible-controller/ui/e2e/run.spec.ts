@@ -3,8 +3,10 @@ import { RUN_FILE_CSP } from '../src/pages/runFileView';
 import {
   COST_DRIFT_RUN,
   PLANLESS_RUN,
+  PLAYBOOK_RUN,
   RETRY_RUN,
   ROUTE_RUN,
+  RUNS,
   stubApi,
   TRIAGE_RUN,
 } from './api';
@@ -450,6 +452,69 @@ test.describe('the run header', () => {
     await chip.click();
     await expect(chip).toHaveText(/copied/);
     expect(await page.evaluate(() => navigator.clipboard.readText())).toBe('RUN-0412');
+  });
+
+  /// A running playbook run's header carries its launch's stop: the cancel is armed in two steps
+  /// and posts the launch's key, so a run watched from its own page can be ended there.
+  test('offers the launch cancel from a running run header', async ({ page }) => {
+    await stubApi(page);
+    await page.route(`**/api/runs/${TRIAGE_RUN}`, (route) =>
+      route.fulfill({
+        status: 200,
+        json: {
+          run: {
+            ...RUNS[1],
+            run_id: TRIAGE_RUN,
+            issue_key: 'playbook:triage-local:01a030fe',
+            status: 'running',
+            cost_usd: null,
+            pod: null,
+          },
+          candidates: [],
+          has_plan: true,
+        },
+      }),
+    );
+    await page.route('**/api/playbook-runs/playbook%3Atriage-local%3A01a030fe', (route) =>
+      route.fulfill({
+        status: 200,
+        json: {
+          launch: {
+            ...PLAYBOOK_RUN,
+            key: 'playbook:triage-local:01a030fe',
+            playbook: 'triage-local',
+            status: 'running',
+            cost_usd: null,
+          },
+          source_exists: true,
+          dispatch: { state: 'dispatched', failure: null, failed_at: null, failures: 0 },
+          runs: [],
+        },
+      }),
+    );
+    let cancelledUrl = '';
+    await page.route(
+      '**/api/playbook-runs/playbook%3Atriage-local%3A01a030fe/cancel',
+      (route) => {
+        cancelledUrl = route.request().url();
+        return route.fulfill({
+          status: 202,
+          json: {
+            key: 'playbook:triage-local:01a030fe',
+            actor: 'kylesayrs',
+            reason: 'cancelled by kylesayrs',
+          },
+        });
+      },
+    );
+    await ready(page, `/runs/${encodeURIComponent(TRIAGE_RUN)}`);
+
+    const cancel = page.getByRole('button', { name: 'Cancel', exact: true });
+    await expect(cancel).toBeVisible();
+    await cancel.click();
+    await page.getByRole('button', { name: 'Confirm cancel', exact: true }).click();
+    await expect(page.getByText('Cancelling')).toBeVisible();
+    expect(cancelledUrl).toContain('playbook%3Atriage-local%3A01a030fe/cancel');
   });
 });
 

@@ -214,6 +214,16 @@ async function serveFire(
       body: '## Reading list\n\nflashinfer, paged attention, cuda graphs\n',
     }),
   );
+  await page.route('**/api/playbook-runs/playbook%3Astudio%3A0200/cancel', (route: Route) =>
+    route.fulfill({
+      status: 202,
+      json: {
+        key: 'playbook:studio:0200',
+        actor: 'kylesayrs',
+        reason: 'cancelled by kylesayrs',
+      },
+    }),
+  );
 }
 
 test.describe('draft authoring studio', () => {
@@ -800,6 +810,18 @@ test.describe('draft authoring studio', () => {
     await expect(card).toContainText('jolly-otter');
     await expect(card).toContainText('running');
     await expect(page).toHaveURL(/\/playbooks\/drafts\/studio$/);
+
+    // The fire can be ended where it is watched: the running row carries the launch's cancel,
+    // armed in two steps like the launch page's, and posts the fire's own key.
+    const cancel = card.getByRole('button', { name: 'Cancel', exact: true });
+    await expect(cancel).toBeVisible();
+    const cancelPost = page.waitForRequest((req) =>
+      req.url().includes('/api/playbook-runs/playbook%3Astudio%3A0200/cancel'),
+    );
+    await cancel.click();
+    await card.getByRole('button', { name: 'Confirm cancel', exact: true }).click();
+    await cancelPost;
+    await expect(card).toContainText('Cancelling');
 
     await expect(
       page.locator('[data-ui="section-header"]', { hasText: 'Live session' }),

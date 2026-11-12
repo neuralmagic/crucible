@@ -7781,6 +7781,120 @@ async fn a_local_playbook_launch_runs_a_subprocess_into_the_ordinary_ledger(
     Ok(())
 }
 
+/// A stand-in engine for a run that is still going: records its pid, publishes the session-so-far,
+/// and sleeps until a cancel's SIGTERM reaches it.
+fn fake_local_engine_running(dir: &Path, pid_out: &Path) -> PathBuf {
+    let bin = dir.join("crucible-local-engine-running");
+    crate::testing::write_exec(
+        &bin,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" > {pid_out:?}\nmkdir -p state\ncat > state/session.jsonl <<'LOG'\n{}\nLOG\nsleep 300\n",
+            r#"{"v":1,"kind":"identity","identity":{"digest":"v1:aaaa"}}"#,
+        ),
+    );
+    bin
+}
+
+/// Cancelling a local launch stops its engine and settles the run `cancelled`: the cancel drives
+/// the override path the endpoint does, the supervisor folds the session-so-far the engine
+/// published, and the run's verdict names the cancel, not the signal that ended it.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn cancelling_a_local_launch_stops_its_engine_and_stamps_the_run_cancelled(
+    pool: PgPool,
+) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let pid_out = dir.path().join("engine.pid");
+    let bin = fake_local_engine_running(dir.path(), &pid_out);
+    unsafe {
+        std::env::set_var("CRUCIBLE_BIN", &bin);
+    }
+    let cfg = ControllerCfg {
+        playbook_executor: crucible_controller::PlaybookExecutor::Local,
+        ..cfg_with(dir.path(), Profile::default())
+    };
+
+    let key = "playbook:survey:0199c0de-7c2c-71a5-8000-g";
+    seed_registered_playbook(&db, "survey").await;
+    adopt_launch(&db, key, 3.5).await;
+
+    reconcile(&db, &cfg, key).await?;
+    unsafe {
+        std::env::remove_var("CRUCIBLE_BIN");
+    }
+
+    let run_id: String = sqlx::query_scalar("SELECT run_id FROM runs WHERE issue = $1")
+        .bind(key)
+        .fetch_one(db.pool())
+        .await?;
+    let mut pid = None;
+    for _ in 0..200 {
+        if let Ok(line) = std::fs::read_to_string(&pid_out)
+            && let Ok(engine) = line.trim().parse::<i32>()
+        {
+            pid = Some(engine);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let engine = nix::unistd::Pid::from_raw(pid.expect("the engine records its pid"));
+    assert!(
+        nix::sys::signal::kill(engine, None).is_ok(),
+        "the engine is running"
+    );
+
+    let store = std::sync::Arc::new(crucible_controller::OverrideStore::new());
+    let sink = crate::daemon::overrides::QueueOverrideSink::new(
+        store.clone(),
+        crate::daemon::queue::WorkQueue::new(),
+    );
+    sink.submit(crate::daemon::queue::Override {
+        key: crate::daemon::queue::IssueKey(key.to_string()),
+        kind: crate::daemon::queue::OverrideKind::Cancel,
+        reason: None,
+        priority: None,
+        actor: Some("wren".to_string()),
+    });
+    let applied = crate::daemon::overrides::apply_pending(&db, &store, key, false).await?;
+    assert!(applied.is_some(), "the cancel override applies");
+    let stopped = crate::runs::cancel::cancel_runs(&db, &cfg, key, Some("wren")).await?;
+    assert_eq!(stopped, 1, "the local run was signalled");
+
+    let mut status = "running".to_string();
+    for _ in 0..200 {
+        status = sqlx::query_scalar("SELECT status FROM runs WHERE run_id = $1")
+            .bind(&run_id)
+            .fetch_one(db.pool())
+            .await?;
+        if status != "running" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(status, "cancelled", "the supervisor settled the cancel");
+    assert!(
+        nix::sys::signal::kill(engine, None).is_err(),
+        "the engine is gone"
+    );
+    assert!(
+        !cfg.runtime.local_runs.cancel(&run_id),
+        "the settled run is no longer registered"
+    );
+    let issue = crate::issues::store::get_issue(db.pool(), key)
+        .await?
+        .expect("issue");
+    assert_eq!(issue.status, Status::Parked);
+    assert!(
+        issue
+            .parked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("cancelled by wren")),
+        "the park says who cancelled: {:?}",
+        issue.parked_reason
+    );
+    Ok(())
+}
+
 /// A local run whose engine dies without publishing a session parks the launch with the
 /// supervisor's account, rather than leaving the row `running` forever.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]

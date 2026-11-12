@@ -45,6 +45,7 @@ import { EngineLogSection } from './EngineLogSection';
 import { TaskOutputSection } from './TaskOutputSection';
 import { RunTaskGrid } from './RunTaskGrid';
 import { RunTaskGraph } from './RunTaskGraph';
+import { CancelLaunchControl } from './CancelLaunchControl';
 import { LiveSession } from '../live/LiveSession';
 import { ArtifactsPanel, CostSection, FilesPanel } from './RunDetailPage';
 import { readSandboxImage, setSandboxImage } from './imagePicker';
@@ -1046,6 +1047,9 @@ function DraftStudio({ id }: { id: string }) {
                   {run.cost_usd === null || run.cost_usd === undefined ? null : (
                     <span className="text-ink-3">{formatCost(run.cost_usd)}</span>
                   )}
+                  {run.status === 'running' ? (
+                    <CancelLaunchControl launchKey={fireKey} />
+                  ) : null}
                   {run.status === 'failed' && writable ? (
                     <Button
                       className="uppercase"
