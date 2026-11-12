@@ -3,9 +3,9 @@
 //! pack's scratch directory before a compile.
 
 use anyhow::Context as _;
-use crucible::plan::deps::{Auth, Cache, LOCK_FILE, Lock, LockedDep};
+use crucible::plan::deps::{Auth, Cache, LockedDep};
 use crucible_contract::pack_tree::PackTree;
-use sqlx::{PgConnection, PgPool};
+use sqlx::PgPool;
 
 use crate::secrets::github_app::{GithubAppTokenSource, GithubOwner};
 
@@ -77,25 +77,9 @@ fn github_owner(rest: &str) -> Option<&str> {
     }
 }
 
-/// The lock a lock file's text holds. One that does not parse is no lock; the compile reports it.
-pub(crate) fn parse_lock(lock: Option<&[u8]>) -> Option<Lock> {
-    lock.and_then(|bytes| std::str::from_utf8(bytes).ok())
-        .and_then(|text| Lock::parse(text, std::path::Path::new(LOCK_FILE)).ok())
-}
-
-/// `tree`'s lock.
-pub(crate) fn lock_of(tree: &PackTree) -> Option<Lock> {
-    parse_lock(
-        tree.files()
-            .iter()
-            .find(|(path, _)| path.as_str() == LOCK_FILE)
-            .map(|(_, bytes)| bytes.as_slice()),
-    )
-}
-
 /// The dependencies `tree`'s lock pins.
 pub(crate) fn locked(tree: &PackTree) -> Vec<LockedDep> {
-    lock_of(tree).map_or_else(Vec::new, |lock| lock.deps)
+    crate::playbooks::lock::lock_of(tree).map_or_else(Vec::new, |lock| lock.deps)
 }
 
 /// Store every dependency in `deps` that is not stored yet, fetching it at its locked commit.
@@ -164,38 +148,16 @@ pub(crate) fn write_beside(pack_root: &std::path::Path, deps: &[PackTree]) -> an
     Ok(())
 }
 
-/// Record which stored trees `tree`'s lock pins. A dependency that is not stored gets no row.
-pub(crate) async fn pin(conn: &mut PgConnection, tree: &PackTree) -> anyhow::Result<()> {
-    let deps = locked(tree);
-    if deps.is_empty() {
-        return Ok(());
-    }
-    let names: Vec<&str> = deps.iter().map(|dep| dep.name.as_str()).collect();
-    let digests: Vec<&str> = deps.iter().map(|dep| dep.tree.as_str()).collect();
-    sqlx::query(
-        "INSERT INTO pack_tree_deps (tree_digest, name, dep_digest)
-         SELECT $1, d.name, d.digest FROM UNNEST($2::TEXT[], $3::TEXT[]) AS d(name, digest)
-         JOIN pack_trees t ON t.digest = d.digest
-         ON CONFLICT (tree_digest, name) DO NOTHING",
-    )
-    .bind(tree.digest().as_str())
-    .bind(&names)
-    .bind(&digests)
-    .execute(conn)
-    .await
-    .context("pinning a pack's dependencies")?;
-    Ok(())
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::playbooks::deps::*;
     use crate::playbooks::pack_trees::{EncodedPack, collect, get_tree, put_tree};
+    use crucible::plan::deps::LOCK_FILE;
     use std::path::Path;
     use std::process::Command;
 
     pub(crate) fn locked_in(lock: Option<&[u8]>) -> Vec<LockedDep> {
-        parse_lock(lock).map_or_else(Vec::new, |lock| lock.deps)
+        crate::playbooks::lock::parse_lock(lock).map_or_else(Vec::new, |lock| lock.deps)
     }
 
     fn git(dir: &Path, args: &[&str]) {

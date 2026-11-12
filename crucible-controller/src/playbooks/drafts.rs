@@ -749,7 +749,7 @@ pub async fn create(
 }
 
 fn lock_in(files: &BTreeMap<String, String>) -> Option<crucible::plan::deps::Lock> {
-    crate::playbooks::deps::parse_lock(
+    crate::playbooks::lock::parse_lock(
         files
             .get(crucible::plan::deps::LOCK_FILE)
             .map(String::as_bytes),

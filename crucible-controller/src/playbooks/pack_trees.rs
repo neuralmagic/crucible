@@ -82,8 +82,7 @@ pub(crate) async fn put_tree(conn: &mut PgConnection, pack: &EncodedPack) -> Res
             put_files(&mut tx, &digest, tree, &file_hashes).await?;
         }
     }
-    crate::playbooks::deps::pin(&mut tx, tree).await?;
-    crate::playbooks::tools::pin(&mut tx, tree).await?;
+    crate::playbooks::lock::pin(&mut tx, tree).await?;
     tx.commit().await.context("committing a pack tree")?;
     Ok(digest)
 }
@@ -199,7 +198,7 @@ async fn collect_in(conn: &mut PgConnection) -> Result<Collected> {
     .await
     .context("deleting unpinned pack trees")?
     .rows_affected();
-    let tools = crate::playbooks::tools::collect(&mut *conn, &cutoff).await?;
+    let tools = crate::playbooks::lock::collect_tools(&mut *conn, &cutoff).await?;
     let blobs = sqlx::query(
         "DELETE FROM pack_blobs WHERE sha256 IN (
              SELECT sha256 FROM pack_blobs b

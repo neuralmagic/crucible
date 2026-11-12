@@ -9,17 +9,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use crucible::plan::deps::LockedTool;
-use crucible_contract::pack_tree::PackTree;
-use sqlx::{PgConnection, PgPool};
+use sqlx::PgPool;
 
 use crate::client::Db;
 use crate::playbooks::deps::{Remotes, ResolveError};
 use crate::runs::pod_token::Subject;
-
-/// The tools `tree`'s lock pins.
-pub(crate) fn locked(tree: &PackTree) -> Vec<LockedTool> {
-    crate::playbooks::deps::lock_of(tree).map_or_else(Vec::new, |lock| lock.tools)
-}
 
 /// Store every download in `tools` that is not stored yet, refusing one whose bytes differ from
 /// the lock. A stored one is made new again, so collection leaves it for the save that follows.
@@ -61,45 +55,6 @@ pub(crate) async fn resolve(
         .with_context(|| format!("storing tool {}", tool.name))?;
     }
     Ok(())
-}
-
-/// Record which stored downloads `tree`'s lock pins. One that is not stored gets no row.
-pub(crate) async fn pin(conn: &mut PgConnection, tree: &PackTree) -> anyhow::Result<()> {
-    let tools = locked(tree);
-    if tools.is_empty() {
-        return Ok(());
-    }
-    let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
-    let platforms: Vec<&str> = tools.iter().map(|tool| tool.platform.as_str()).collect();
-    let digests: Vec<&str> = tools.iter().map(|tool| tool.sha256.as_str()).collect();
-    sqlx::query(
-        "INSERT INTO pack_tree_tools (tree_digest, name, platform, sha256)
-         SELECT $1, t.name, t.platform, t.sha256
-         FROM UNNEST($2::TEXT[], $3::TEXT[], $4::TEXT[]) AS t(name, platform, sha256)
-         JOIN tool_blobs b ON b.sha256 = t.sha256
-         ON CONFLICT (tree_digest, name, platform) DO NOTHING",
-    )
-    .bind(tree.digest().as_str())
-    .bind(&names)
-    .bind(&platforms)
-    .bind(&digests)
-    .execute(conn)
-    .await
-    .context("pinning a pack's tools")?;
-    Ok(())
-}
-
-/// Delete every stored download created before `cutoff` that no stored pack tree pins.
-pub(crate) async fn collect(conn: &mut PgConnection, cutoff: &str) -> anyhow::Result<u64> {
-    Ok(sqlx::query(
-        "DELETE FROM tool_blobs b WHERE b.created_at < $1
-           AND NOT EXISTS (SELECT 1 FROM pack_tree_tools p WHERE p.sha256 = b.sha256)",
-    )
-    .bind(cutoff)
-    .execute(conn)
-    .await
-    .context("deleting unpinned tools")?
-    .rows_affected())
 }
 
 /// Let `run_id`'s token fetch the downloads the lock of the pack at `pack_dir` pins.
@@ -194,13 +149,17 @@ mod tests {
     use crate::client::Db;
     use crate::playbooks::deps::{Remotes, ResolveError};
     use crate::playbooks::pack_trees::{EncodedPack, collect, put_tree};
-    use crate::playbooks::tools::{grant, locked, resolve, router};
+    use crate::playbooks::tools::{grant, resolve, router};
     use crate::runs::pod_token::{Subject, mint};
     use crucible::plan::deps::{Cache, Controller, LOCK_FILE, Platform, fetch_tools_from};
     use crucible_contract::pack_tree::PackTree;
     use sqlx::PgPool;
     use std::collections::BTreeMap;
     use std::time::Duration;
+
+    fn locked(tree: &PackTree) -> Vec<crucible::plan::deps::LockedTool> {
+        crate::playbooks::lock::lock_of(tree).map_or_else(Vec::new, |lock| lock.tools)
+    }
 
     const HOUR: Duration = Duration::from_secs(3600);
     const GREET: &[u8] = b"#!/bin/sh\necho hello\n";

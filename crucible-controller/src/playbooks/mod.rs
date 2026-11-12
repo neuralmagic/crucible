@@ -10,6 +10,7 @@ pub mod dispatch;
 pub mod drafts;
 pub mod exposure;
 pub mod imports;
+pub(crate) mod lock;
 pub mod pack_migration;
 pub mod pack_trees;
 pub mod packs;
