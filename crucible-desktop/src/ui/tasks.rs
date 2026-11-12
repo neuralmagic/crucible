@@ -51,6 +51,7 @@ pub(crate) fn task_list(
         .scroll(ScrollSpec {
             stick_bottom: false,
         })
+        .scroll_anchor()
         .scroll_edge_fade(10.0);
     if tasks.is_empty() {
         let named = streamed_tasks(log);
