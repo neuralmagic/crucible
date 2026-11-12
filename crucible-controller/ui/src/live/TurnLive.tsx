@@ -1,9 +1,10 @@
 import { useLayoutEffect, useState } from 'react';
-import { Button, Mono, Status, statusTone } from '../ui';
+import { Button, CopyButton, Mono, Status, statusTone } from '../ui';
 import { useTurnLive } from './useTurnLive';
 import { connLabel } from './connLabel';
 import {
   activityLabel,
+  logText,
   phaseColor,
   type LogLine,
   type ScopeActivityBeat,
@@ -63,15 +64,18 @@ export function TurnLive({ podName, createdAt }: TurnLiveProps) {
 
       {activity && streaming && <ActivityTicker beat={activity} />}
 
-      <Button
-        className="w-full justify-start uppercase"
-        aria-expanded={logsOpen}
-        onClick={() => {
-          setLogsOpen(!logsOpen);
-        }}
-      >
-        {logsOpen ? '▾ Hide live log' : `▸ Live log (${logs.length} lines)`}
-      </Button>
+      <div className="flex items-center">
+        <Button
+          className="min-w-0 flex-1 justify-start uppercase"
+          aria-expanded={logsOpen}
+          onClick={() => {
+            setLogsOpen(!logsOpen);
+          }}
+        >
+          {logsOpen ? '▾ Hide live log' : `▸ Live log (${logs.length} lines)`}
+        </Button>
+        <CopyButton value={() => logText(logs)} label="live log" className="px-2.5" />
+      </div>
       {logsOpen && <LogPane logs={logs} />}
     </div>
   );
