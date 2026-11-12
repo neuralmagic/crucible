@@ -393,6 +393,9 @@ with an init container and run it ahead of their own, and the cache runs it unle
 `ghcr.io/neuralmagic/crucible-buildit`, so a buildit-only change rolls by moving this pin; the
 controller reads the profile at each dispatch, and the cache needs `crucible deploy
 --buildit-cache` applied again.
+A tag instead of a digest floats: loop pods pull it every time, so
+`ghcr.io/neuralmagic/crucible-buildit:stable`, which each release moves, follows releases with no
+profile change. The cache is a Deployment and keeps the image it started with until it restarts.
 
 `[buildit.cache]` adds a `buildit cache` in the loop namespace that every build may use: ccache
 objects and stored build outputs shared across runs. `crucible deploy --buildit-cache --profile
