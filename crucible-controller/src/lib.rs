@@ -122,6 +122,7 @@ pub(crate) fn human_router(
         scratch_dir: state.scratch_dir.clone(),
         guard: both.clone(),
     });
+    let tools = playbooks::tools::router(state.db.clone());
     let decisions = decisions::run_routes(state.db.clone());
     let router = api::router(state)
         .merge(spa::router(ui, next))
@@ -130,6 +131,7 @@ pub(crate) fn human_router(
             identity::auth::require_auth_or_api_key,
         ))
         .merge(evidence)
+        .merge(tools)
         .merge(decisions)
         .merge(identity::oidc::routes::router(auth.routes));
     let router = match auth.issuer.filter(|i| i.people.is_some()) {

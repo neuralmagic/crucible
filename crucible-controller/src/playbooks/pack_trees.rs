@@ -82,6 +82,7 @@ pub(crate) async fn put_tree(conn: &mut PgConnection, pack: &EncodedPack) -> Res
             put_files(&mut tx, &digest, tree, &file_hashes).await?;
         }
     }
+    crate::playbooks::lock::pin(&mut tx, tree).await?;
     tx.commit().await.context("committing a pack tree")?;
     Ok(digest)
 }
@@ -137,7 +138,7 @@ async fn put_files(
 
 /// Every `(table, column)` that pins a stored tree. Aliases and draft or binding provenance name
 /// trees without keeping them.
-const TREE_PINS: [(&str, &str); 7] = [
+const TREE_PINS: [(&str, &str); 8] = [
     ("playbooks", "tree_digest"),
     ("playbook_revisions", "tree_digest"),
     ("pack_imports", "tree_digest"),
@@ -145,6 +146,7 @@ const TREE_PINS: [(&str, &str); 7] = [
     ("playbook_standing_launches", "adopted_tree_digest"),
     ("pack_tarballs", "tree_digest"),
     ("scopes", "tree_digest"),
+    ("pack_tree_deps", "dep_digest"),
 ];
 
 /// How old an unpinned tree must be before [`collect`] deletes it.
@@ -155,10 +157,12 @@ const COLLECT_AFTER: jiff::SignedDuration = jiff::SignedDuration::from_hours(24)
 pub struct Collected {
     pub trees: u64,
     pub blobs: u64,
+    pub tools: u64,
 }
 
 /// Delete every tree older than [`COLLECT_AFTER`] that no [`TREE_PINS`] column names, then every
-/// blob no remaining tree holds. A row that pins one of those trees, or a writer that takes one of
+/// tool download that old that no remaining tree's lock pins and every blob no remaining tree
+/// holds. A row that pins one of those trees, or a writer that takes one of
 /// those blobs, while this runs makes a foreign key refuse the delete, which is an error with
 /// nothing deleted.
 pub async fn collect(pool: &sqlx::PgPool) -> Result<Collected> {
@@ -179,6 +183,7 @@ async fn collect_in(conn: &mut PgConnection) -> Result<Collected> {
     let cutoff = jiff::Timestamp::now()
         .checked_sub(COLLECT_AFTER)
         .context("computing the pack tree cutoff")?;
+    let cutoff = crate::clock::stamp(cutoff);
     let unpinned: String = TREE_PINS
         .iter()
         .map(|(table, column)| {
@@ -188,11 +193,12 @@ async fn collect_in(conn: &mut PgConnection) -> Result<Collected> {
     let trees = sqlx::query(sqlx::AssertSqlSafe(format!(
         "DELETE FROM pack_trees t WHERE t.created_at < $1{unpinned}"
     )))
-    .bind(crate::clock::stamp(cutoff))
+    .bind(&cutoff)
     .execute(&mut *conn)
     .await
     .context("deleting unpinned pack trees")?
     .rows_affected();
+    let tools = crate::playbooks::lock::collect_tools(&mut *conn, &cutoff).await?;
     let blobs = sqlx::query(
         "DELETE FROM pack_blobs WHERE sha256 IN (
              SELECT sha256 FROM pack_blobs b
@@ -203,7 +209,11 @@ async fn collect_in(conn: &mut PgConnection) -> Result<Collected> {
     .await
     .context("deleting unreferenced pack blobs")?
     .rows_affected();
-    Ok(Collected { trees, blobs })
+    Ok(Collected {
+        trees,
+        blobs,
+        tools,
+    })
 }
 
 /// The columns [`PackRef::from_row`] reads, for a table with `tree_digest` and `tar_gz` columns.
@@ -935,7 +945,8 @@ mod tests {
         .expect("draft tree")
     }
 
-    /// Every foreign key into `pack_trees` other than its own files is a pin collection honors.
+    /// Every foreign key into `pack_trees` that does not cascade is a pin collection honors. The
+    /// cascading ones are rows a tree owns: its files and its dependency list.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn collection_honors_every_foreign_key_into_pack_trees(pool: PgPool) {
         let mut keys: Vec<(String, String)> = sqlx::query_as(
@@ -943,7 +954,7 @@ mod tests {
              JOIN pg_class cl ON cl.oid = c.conrelid
              JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
              WHERE c.contype = 'f' AND c.confrelid = 'pack_trees'::regclass
-               AND cl.relname <> 'pack_tree_files'",
+               AND c.confdeltype <> 'c'",
         )
         .fetch_all(&pool)
         .await
@@ -1188,7 +1199,11 @@ mod tests {
 
         assert_eq!(
             collect(&pool).await.expect("collect"),
-            Collected { trees: 1, blobs: 1 }
+            Collected {
+                trees: 1,
+                blobs: 1,
+                tools: 0
+            }
         );
 
         assert_eq!(stored(&pool, dropped_digest.as_str()).await, (false, 0));
@@ -1322,7 +1337,11 @@ mod tests {
         let mut collector = pool.begin().await.expect("begin");
         assert_eq!(
             collect_in(&mut collector).await.expect("collect"),
-            Collected { trees: 1, blobs: 2 }
+            Collected {
+                trees: 1,
+                blobs: 2,
+                tools: 0
+            }
         );
         let writing = tokio::spawn({
             let pool = pool.clone();

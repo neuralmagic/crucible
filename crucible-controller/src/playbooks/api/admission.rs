@@ -265,6 +265,7 @@ pub(crate) async fn admit<P: Admissible>(
     let params = crate::playbooks::registry::validate_params(&schema, request.params)
         .map_err(invalid_fields)?;
     check_plan(
+        state.db.pool(),
         target.tree(state.db.pool()).await?,
         &params,
         &max_time,
@@ -344,6 +345,7 @@ pub(crate) fn check_ceilings(
 /// validated values, its graph does not compile or declares a task timeout past `max_time`.
 #[allow(clippy::result_large_err)]
 async fn check_plan(
+    pool: &sqlx::PgPool,
     tree: crucible_contract::pack_tree::PackTree,
     params: &serde_json::Value,
     max_time: &crate::model::MaxTime,
@@ -351,6 +353,7 @@ async fn check_plan(
 ) -> Result<(), Response> {
     let params = crate::launches::store::stored_params(params);
     match crate::playbooks::registry::check_tree_runnable(
+        pool,
         tree,
         params,
         max_time.clone(),

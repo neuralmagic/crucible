@@ -748,6 +748,39 @@ pub async fn create(
     save_version(pool, id, files, actor, None).await
 }
 
+fn lock_in(files: &BTreeMap<String, String>) -> Option<crucible::plan::deps::Lock> {
+    crate::playbooks::lock::parse_lock(
+        files
+            .get(crucible::plan::deps::LOCK_FILE)
+            .map(String::as_bytes),
+    )
+}
+
+fn locked_deps(files: &BTreeMap<String, String>) -> Vec<crucible::plan::deps::LockedDep> {
+    lock_in(files).map_or_else(Vec::new, |lock| lock.deps)
+}
+
+/// Fetch and store the dependencies and tools the file map's lock pins that are not stored yet,
+/// so the save that follows compiles against the dependencies and pins both. A lock or remote at
+/// fault is [`DraftError::Invalid`].
+pub(crate) async fn resolve_locked(
+    pool: &PgPool,
+    files: &BTreeMap<String, String>,
+    remotes: &crate::playbooks::deps::Remotes,
+) -> Result<(), DraftError> {
+    let Some(lock) = lock_in(files) else {
+        return Ok(());
+    };
+    let resolved = async {
+        crate::playbooks::deps::resolve(pool, &lock.deps, remotes).await?;
+        crate::playbooks::tools::resolve(pool, &lock.tools, remotes).await
+    };
+    resolved.await.map_err(|error| match error {
+        crate::playbooks::deps::ResolveError::Refused(message) => DraftError::Invalid(message),
+        crate::playbooks::deps::ResolveError::Internal(error) => DraftError::Internal(error),
+    })
+}
+
 /// Store a save: store the file map's tree, compile it, and write the next version row either
 /// way. A `base_version` that is not the newest save is refused with [`DraftError::StaleBase`]
 /// carrying the version that overtook it, so the writer re-reads and merges instead of clobbering
@@ -773,6 +806,9 @@ pub async fn save_version(
         Some(manifest) => crate::playbooks::blueprints::declared_anywhere(manifest).ok(),
         None => Some(Vec::new()),
     };
+    let deps = crate::playbooks::deps::load(pool, &locked_deps(&files))
+        .await
+        .map_err(DraftError::Internal)?;
     let compiled = tokio::task::spawn_blocking(move || {
         let scratch = tempfile::tempdir()
             .context("draft compile scratch dir")
@@ -782,6 +818,7 @@ pub async fn save_version(
             .context("creating the draft tree")
             .map_err(DraftError::Internal)?;
         write_tree(&files, &root)?;
+        crate::playbooks::deps::write_beside(&root, &deps).map_err(DraftError::Internal)?;
         let pack = crate::playbooks::packs::deliverable(&root)?;
         Ok::<_, DraftError>((pack, compile_tree(&root)))
     })
@@ -1108,9 +1145,10 @@ pub async fn exposure_of(
     let Some((_, tree)) = version_pack(pool, id, Some(version)).await? else {
         return Ok(None);
     };
+    let pack = crate::playbooks::packs::materialize(pool, tree)
+        .await
+        .map_err(DraftError::Internal)?;
     let extraction = tokio::task::spawn_blocking(move || {
-        let pack = crate::playbooks::packs::materialize_tree(&tree)
-            .map_err(crate::playbooks::exposure::ExtractError::Internal)?;
         crate::playbooks::exposure::extract(pack.path(), None, None)
     })
     .await
@@ -1708,6 +1746,62 @@ mod tests {
             ("crucible.toml".to_string(), SKELETON_MANIFEST.to_string()),
             ("workflow.star".to_string(), SKELETON_WORKFLOW.to_string()),
         ])
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_draft_compiles_against_a_locked_library_once_it_is_resolved(pool: PgPool) {
+        create(
+            &pool,
+            "studio",
+            "a drafted pack",
+            DraftSeed::Skeleton,
+            Some("wren"),
+            &crate::authz::model::Principal::platform(),
+        )
+        .await
+        .expect("the skeleton compiles");
+        let root = tempfile::tempdir().expect("root");
+        let tag = format!("draft-{}", uuid::Uuid::now_v7());
+        let lock = crate::playbooks::deps::tests::locked_library(root.path(), &tag);
+        let mut files = skeleton();
+        files.insert(crucible::plan::deps::LOCK_FILE.to_string(), lock);
+        files.insert(
+            "workflow.star".to_string(),
+            concat!(
+                "params = {}\n",
+                "load(\"@gates//gates.star\", \"hello\")\n",
+                "greet = hello(\"greet\")\n",
+                "workflow(type = \"playbook\", tasks = [greet], result = greet)\n",
+            )
+            .to_string(),
+        );
+
+        let unresolved = save_version(&pool, "studio", files.clone(), None, None)
+            .await
+            .expect("a save that does not compile is still stored");
+        assert!(
+            unresolved
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("is not in the cache")),
+            "{:?}",
+            unresolved.diagnostics
+        );
+
+        resolve_locked(&pool, &files, &crate::playbooks::deps::Remotes::Any)
+            .await
+            .expect("resolve");
+        let saved = save_version(&pool, "studio", files, None, None)
+            .await
+            .expect("save");
+        assert!(saved.diagnostics.is_empty(), "{:?}", saved.diagnostics);
+        let graph = serde_json::to_string(&saved.graph).expect("graph");
+        assert!(graph.contains("greet"), "{graph}");
+        let pins: i64 = sqlx::query_scalar("SELECT count(*) FROM pack_tree_deps")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(pins, 1);
     }
 
     /// A save whose files each fit the per-file cap, but whose delivered tarball is over the

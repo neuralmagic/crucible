@@ -412,12 +412,13 @@ pub async fn backfill_pack_agents(pool: &sqlx::PgPool) -> Result<usize> {
                 }
             };
             let variant = crate::playbooks::packs::variant_from_row(&row)?;
-            let agent = tokio::task::spawn_blocking(move || {
-                let pack = crate::playbooks::packs::materialize_tree(&tree)?;
-                pack_agent(pack.path(), variant.as_ref())
-            })
-            .await
-            .context("joining the pack agent backfill worker")?;
+            let Ok(pack) = crate::playbooks::packs::materialize(pool, tree).await else {
+                continue;
+            };
+            let agent =
+                tokio::task::spawn_blocking(move || pack_agent(pack.path(), variant.as_ref()))
+                    .await
+                    .context("joining the pack agent backfill worker")?;
             let Ok(agent) = agent else {
                 continue;
             };

@@ -333,10 +333,11 @@ pub async fn compile(
         .await?
         .ok_or_else(|| ImportError::NotFound(format!("no pack import {id:?}")))?;
     let variant = get(pool, id).await?.and_then(|import| import.variant);
+    let pack = crate::playbooks::packs::materialize(pool, tree)
+        .await
+        .context("writing the frozen import to scratch")
+        .map_err(RegisterError::Internal)?;
     let preview = tokio::task::spawn_blocking(move || {
-        let pack = crate::playbooks::packs::materialize_tree(&tree)
-            .context("writing the frozen import to scratch")
-            .map_err(RegisterError::Internal)?;
         crate::playbooks::preview::preview_pack(
             pack.path(),
             &params,
