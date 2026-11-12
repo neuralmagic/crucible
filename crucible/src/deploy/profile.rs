@@ -455,7 +455,8 @@ pub struct BuilditCfg {
     #[serde(default)]
     pub cache: Option<BuilditCacheCfg>,
     /// The image the loop pod takes its `buildit` from, at `/usr/local/bin/buildit`, ahead of the
-    /// loop image's own on the loop container's PATH. Default the loop image's.
+    /// loop image's own on the loop container's PATH. Default the loop image's. A digest pins
+    /// it; a tag such as `:stable` is pulled for every loop pod and follows the tag.
     #[serde(default)]
     pub image: Option<String>,
 }

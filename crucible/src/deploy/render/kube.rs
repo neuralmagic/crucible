@@ -823,13 +823,19 @@ impl Renderer<'_> {
     }
 
     /// With `[buildit] image`, the init container that copies its `buildit` into the emptyDir the
-    /// loop container runs it from.
+    /// loop container runs it from. An image named by tag is pulled for every pod, so a moved tag
+    /// reaches every node.
     fn buildit_bin(&self) -> Option<core::Container> {
         let image = self.buildit_image.as_ref()?;
+        let pull = if image.contains("@sha256:") {
+            "IfNotPresent"
+        } else {
+            "Always"
+        };
         Some(core::Container {
             name: BUILDIT_BIN_VOLUME.to_string(),
             image: Some(image.clone()),
-            image_pull_policy: Some("IfNotPresent".to_string()),
+            image_pull_policy: Some(pull.to_string()),
             command: Some(vec![
                 "cp".to_string(),
                 BUILDIT_IN_IMAGE.to_string(),
@@ -5548,6 +5554,17 @@ mod tests {
         let spec = pod("image = \"ghcr.io/example/crucible-buildit@sha256:abc\"\n")["spec"].clone();
         let init = named(&spec["initContainers"], "buildit-bin").expect("the buildit-bin init");
         assert_eq!(init["image"], "ghcr.io/example/crucible-buildit@sha256:abc");
+        assert_eq!(init["imagePullPolicy"], "IfNotPresent");
+        let floating = pod("image = \"ghcr.io/example/crucible-buildit:stable\"\n")["spec"].clone();
+        let init_by_tag = named(&floating["initContainers"], "buildit-bin").unwrap();
+        assert_eq!(
+            init_by_tag["image"],
+            "ghcr.io/example/crucible-buildit:stable"
+        );
+        assert_eq!(
+            init_by_tag["imagePullPolicy"], "Always",
+            "a moved tag reaches a node that holds the old image"
+        );
         assert_eq!(
             init["command"],
             serde_json::json!([
