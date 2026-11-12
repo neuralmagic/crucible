@@ -301,6 +301,7 @@ mod tests {
             )
         );
         assert!(script.contains("export DISABLE_AUTOUPDATER=1\n"));
+        assert!(script.contains("export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\n"));
         assert!(script.contains("export K='v w'\n"));
         assert!(script.ends_with("export OTEL_X='a'\\''b'\n"));
     }
