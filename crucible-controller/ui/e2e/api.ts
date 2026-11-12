@@ -426,7 +426,7 @@ const UNDISPATCHABLE = {
   },
 };
 
-const DISPATCHABLE = {
+export const DISPATCHABLE = {
   backend: 'local',
   sandbox_image: null,
   dispatchable: true,
@@ -578,7 +578,7 @@ export const PLAYBOOK_RUN = {
 };
 
 /** The runs list, newest first; one of them a schedule's firing. */
-const PLAYBOOK_RUNS = [
+export const PLAYBOOK_RUNS = [
   { ...PLAYBOOK_RUN, key: 'playbook:triage:0201', playbook: 'triage', status: 'running', cost_usd: 0.42, created_by: 'kylesayrs', created_at: '2026-08-24T11:40:00Z' },
   {
     ...PLAYBOOK_RUN,
@@ -980,6 +980,11 @@ export const ROUTES: Record<string, Json> = {
     diagnostics: [],
     dispatch: DISPATCHABLE,
   },
+  '/api/playbook-drafts/studio/generate/progress': {
+    intent: null,
+    lines: [],
+    running: false,
+  },
   '/api/playbooks/drafts/co-draft': {
     url: 'https://crucible.example.com',
     skill_url: 'https://crucible.example.com/api/playbooks/drafts/skill',
@@ -1090,6 +1095,27 @@ export const ROUTES: Record<string, Json> = {
     runs: [
       { run_id: 'RUN-0412', status: 'running', dispatch: 'local', pod: null, cost_usd: 8.4 },
     ],
+  },
+  '/api/playbook-runs/playbook:studio:0196': {
+    launch: {
+      ...PLAYBOOK_RUN,
+      key: 'playbook:studio:0196',
+      playbook: 'studio',
+      origin: 'draft',
+      draft_version: 3,
+      status: 'parked',
+      parked_reason: 'dispatch failed',
+      cost_usd: null,
+      runs: 0,
+    },
+    source_exists: true,
+    dispatch: {
+      state: 'failed',
+      failure: 'creating the pack ConfigMap: etcdserver: request timed out',
+      failed_at: '2026-08-24T10:00:10Z',
+      failures: 1,
+    },
+    runs: [],
   },
   '/api/playbook-runs/playbook:survey:0197': {
     launch: {
@@ -1603,8 +1629,13 @@ export async function stubApi(page: Page): Promise<void> {
         });
       }
       if (path === '/api/playbook-runs') {
-        const schedule = new URL(route.request().url()).searchParams.get('schedule');
-        const rows = schedule ? PLAYBOOK_RUNS.filter((row) => row.schedule === schedule) : PLAYBOOK_RUNS;
+        const query = new URL(route.request().url()).searchParams;
+        const rows = PLAYBOOK_RUNS.filter(
+          (row) =>
+            (query.get('schedule') === null || row.schedule === query.get('schedule')) &&
+            (query.get('playbook') === null || row.playbook === query.get('playbook')) &&
+            (query.get('origin') === null || row.origin === query.get('origin')),
+        );
         return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(rows) });
       }
       const body = ROUTES[path] ?? fallback(path);

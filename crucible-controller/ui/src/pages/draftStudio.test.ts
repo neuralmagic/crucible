@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import type { components } from '../api/schema';
 import { NO_AGENT_PICK } from './agentPick';
 import type { ParamFieldSpec } from './playbookLaunchForm';
 import {
@@ -6,12 +7,14 @@ import {
   cloneDraftBody,
   draftLaunchBody,
   EMPTY_STUDIO,
+  fireIsLive,
   flaggedFiles,
   isDirty,
   markersFor,
   originLabel,
   originMovedLabel,
   pathsOf,
+  redraftIntent,
   saveBody,
   shortRev,
   staleBaseOf,
@@ -362,5 +365,79 @@ describe('draftLaunchBody', () => {
   it('omits the digest when the form was rendered against none', () => {
     const body = draftLaunchBody(specs, {}, { ...ceilings, schemaDigest: null }, NO_AGENT_PICK);
     expect('schema_digest' in body && body.schema_digest !== undefined).toBe(false);
+  });
+});
+
+function fireDetail(over: {
+  status?: string;
+  runStatuses?: string[];
+  dispatchState?: components['schemas']['DispatchState'];
+}): components['schemas']['PlaybookLaunchDetailDto'] {
+  const runStatuses = over.runStatuses ?? [];
+  return {
+    dispatch: { state: over.dispatchState ?? 'dispatched', failures: 0 },
+    launch: {
+      advance_dedupe: false,
+      created_at: '2026-11-12T00:00:00Z',
+      key: 'playbook:studio:0199',
+      max_cost: 1,
+      max_time: '1h',
+      origin: 'draft',
+      params: {},
+      playbook: 'studio',
+      runs: runStatuses.length,
+      schema_digest: 'digest',
+      schema_drifted: false,
+      status: over.status ?? 'done',
+      transport_losses: 0,
+    },
+    runs: runStatuses.map((status, i) => ({
+      cluster: 'hub',
+      dispatch: 'local',
+      run_id: `run-${i}`,
+      status,
+    })),
+    source_exists: true,
+  };
+}
+
+describe('fireIsLive', () => {
+  it('keeps polling while a run is still going', () => {
+    expect(fireIsLive(fireDetail({ status: 'running', runStatuses: ['running'] }))).toBe(true);
+  });
+
+  it('keeps polling a settled launch whose dispatch never settled', () => {
+    expect(fireIsLive(fireDetail({ dispatchState: 'pending' }))).toBe(true);
+  });
+
+  it('stops polling once every run and the dispatch have settled', () => {
+    expect(fireIsLive(fireDetail({ runStatuses: ['failed'], dispatchState: 'failed' }))).toBe(
+      false
+    );
+    expect(
+      fireIsLive(fireDetail({ status: 'done', runStatuses: ['finished', 'failed'] }))
+    ).toBe(false);
+  });
+});
+
+describe('redraftIntent', () => {
+  it('wraps the run’s output in the instruction to write the next version', () => {
+    const intent = redraftIntent('boom: the harness refused the manifest\n');
+    expect(intent).toContain('The last test-fire of this pack failed.');
+    expect(intent).toContain('boom: the harness refused the manifest');
+    expect(intent).toContain('Write the next version of the pack');
+  });
+
+  it('keeps only the tail of a long console so the instruction around it survives', () => {
+    const console = Array.from({ length: 60 }, (_, i) => `line ${i}`).join('\n');
+    const intent = redraftIntent(console);
+    expect(intent).not.toContain('line 0\n');
+    expect(intent).toContain('line 30');
+    expect(intent).toContain('line 59');
+  });
+
+  it('says so when the run failed with nothing held on this machine', () => {
+    expect(redraftIntent(null)).toContain('no error output held on this machine');
+    expect(redraftIntent('   \n')).toContain('no error output held on this machine');
   });
 });

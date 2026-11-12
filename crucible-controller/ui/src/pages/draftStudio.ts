@@ -282,6 +282,39 @@ export function originMovedLabel(origin: DraftOrigin | null | undefined): string
   return `${name} re-pinned to ${shortRev(now)} since this draft was taken at ${shortRev(then)}.`;
 }
 
+/// How many lines of a failed run's task console a re-draft intent carries.
+const FAILURE_TAIL_LINES = 30;
+
+/// Whether a test-fire still has work in flight: a run going, or the dispatch not yet settled.
+/// Settled fires stop their poll; live ones keep it.
+export function fireIsLive(detail: components['schemas']['PlaybookLaunchDetailDto']): boolean {
+  return (
+    detail.launch.status === 'running' ||
+    detail.runs.some((run) => run.status === 'running') ||
+    detail.dispatch.state === 'pending'
+  );
+}
+
+/// The intent a re-draft from a failed test-fire runs on: the error the run printed, capped to
+/// its tail so a long console cannot swallow the instruction around it.
+export function redraftIntent(failure: string | null): string {
+  const tail = (failure ?? '')
+    .trimEnd()
+    .split('\n')
+    .slice(-FAILURE_TAIL_LINES)
+    .join('\n')
+    .trim();
+  const body =
+    tail.length > 0 ? tail : 'The run failed with no error output held on this machine.';
+  return [
+    'The last test-fire of this pack failed. This is what the run printed, oldest line first:',
+    '',
+    body,
+    '',
+    'Write the next version of the pack so this failure cannot happen again and the experiment completes.',
+  ].join('\n');
+}
+
 /// A rev or digest cut to what a reader compares by eye: a `sha256:` or `tree1:` prefix and the 8
 /// characters after it, or the first 8 of a commit.
 export function shortRev(rev: string | null | undefined): string {
