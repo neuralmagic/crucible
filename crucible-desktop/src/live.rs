@@ -39,6 +39,8 @@ const FOLLOW_RETRY: Duration = Duration::from_secs(15);
 /// How long a follow that ended cleanly, while the list still says running, waits before the
 /// next one: the list catches up in that time.
 const FOLLOW_REST: Duration = Duration::from_secs(4);
+/// How long a replay that stopped short of what it replaces waits before it is shown anyway.
+const REPLAY_QUIET: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Default, PartialEq)]
 pub enum LiveView {
@@ -832,6 +834,8 @@ struct CachedLaunch {
 #[derive(Default)]
 struct CachedRun {
     fold: RunFold,
+    /// Session lines a stream has folded into `fold`.
+    lines: usize,
     log: Vec<LogLine>,
     settled: bool,
     source: &'static str,
@@ -839,12 +843,101 @@ struct CachedRun {
     follow: Option<SessionFollow>,
     retry_at: Option<Instant>,
     /// A new stream replays the session and the log from their starts; what each replaces stays
-    /// on screen until that replay's first lines land.
-    replaying: bool,
-    replaying_log: bool,
+    /// on screen until its replay has caught up.
+    replay: Option<Replay<RunFold>>,
+    log_replay: Option<Replay<Vec<LogLine>>>,
     /// Its captured files, and how many results had settled when they were listed.
     files: Option<Result<Vec<Captured>, String>>,
     files_at: usize,
+}
+
+/// What a restarted stream has replayed so far, held off screen.
+struct Replay<T> {
+    held: T,
+    lines: usize,
+    landed: Instant,
+}
+
+impl<T: Default> Replay<T> {
+    fn starting(now: Instant) -> Self {
+        Replay {
+            held: T::default(),
+            lines: 0,
+            landed: now,
+        }
+    }
+
+    /// Whether the replay replaces `shown` lines yet: it has reached them, its stream finished,
+    /// or it went quiet short of them. A stream that failed part way replaces nothing.
+    fn caught_up(&self, shown: usize, ended: Option<bool>, now: Instant) -> bool {
+        if self.lines == 0 {
+            return false;
+        }
+        self.lines >= shown
+            || match ended {
+                Some(finished) => finished,
+                None => now.saturating_duration_since(self.landed) >= REPLAY_QUIET,
+            }
+    }
+}
+
+impl CachedRun {
+    fn restart(&mut self, now: Instant) {
+        self.replay = Some(Replay::starting(now));
+        self.log_replay = Some(Replay::starting(now));
+    }
+
+    /// Fold what a stream delivered. `ended` is whether it finished cleanly, once it has ended.
+    fn take(&mut self, lines: &[String], logs: &[String], ended: Option<bool>, now: Instant) {
+        match self.replay.take() {
+            Some(mut replay) => {
+                for line in lines {
+                    replay.held.apply_line(line);
+                }
+                if !lines.is_empty() {
+                    replay.lines += lines.len();
+                    replay.landed = now;
+                }
+                if replay.caught_up(self.lines, ended, now) {
+                    self.fold = replay.held;
+                    self.lines = replay.lines;
+                } else {
+                    self.replay = Some(replay);
+                }
+            }
+            None => {
+                for line in lines {
+                    self.fold.apply_line(line);
+                }
+                self.lines += lines.len();
+            }
+        }
+        let parsed = logs.iter().map(|raw| LogLine::parse(raw));
+        match self.log_replay.take() {
+            Some(mut replay) => {
+                replay.held.extend(parsed);
+                trim_log(&mut replay.held);
+                if !logs.is_empty() {
+                    replay.lines += logs.len();
+                    replay.landed = now;
+                }
+                if replay.caught_up(self.log.len(), ended, now) {
+                    self.log = replay.held;
+                } else {
+                    self.log_replay = Some(replay);
+                }
+            }
+            None => {
+                self.log.extend(parsed);
+                trim_log(&mut self.log);
+            }
+        }
+    }
+}
+
+fn trim_log(log: &mut Vec<LogLine>) {
+    let excess = log.len().saturating_sub(LOG_LINES);
+    log.drain(..excess);
 }
 
 /// A running run's session and pod log, streamed by [`crux::Client::follow_run`] on its own
@@ -1300,7 +1393,7 @@ impl Fetcher {
                 if running {
                     follow_session(run, connection, run_id, wake);
                     if poll
-                        && run.replaying_log
+                        && run.log_replay.is_some()
                         && let Ok(log) = console(connection, run_id).await
                         && log.len() >= run.log.len().min(1)
                     {
@@ -1364,23 +1457,11 @@ fn follow_session(
     wake: UnboundedSender<Msg>,
 ) {
     if let Some(follow) = &run.follow {
+        let ended = follow.ended();
         let (lines, logs) = (follow.drain(), follow.drain_logs());
-        // A new stream replays from the start, so its first lines replace what the last one left.
-        if run.replaying && !lines.is_empty() {
-            run.fold = RunFold::default();
-            run.replaying = false;
-        }
-        if run.replaying_log && !logs.is_empty() {
-            run.log.clear();
-            run.replaying_log = false;
-        }
-        for line in lines {
-            run.fold.apply_line(&line);
-        }
-        run.log.extend(logs.iter().map(|raw| LogLine::parse(raw)));
-        let excess = run.log.len().saturating_sub(LOG_LINES);
-        run.log.drain(..excess);
-        match follow.ended() {
+        let finished = ended.as_ref().map(Result::is_ok);
+        run.take(&lines, &logs, finished, Instant::now());
+        match ended {
             None => return,
             Some(Ok(())) => run.retry_at = Some(Instant::now() + FOLLOW_REST),
             Some(Err(error)) => {
@@ -1394,8 +1475,7 @@ fn follow_session(
     if run.retry_at.is_some_and(|at| Instant::now() < at) {
         return;
     }
-    run.replaying = true;
-    run.replaying_log = true;
+    run.restart(Instant::now());
     run.source = "session";
     run.error = None;
     run.follow = Some(SessionFollow::spawn(connection, run_id, wake));
@@ -2352,6 +2432,123 @@ mod tests {
             fold.apply_line(line);
         }
         fold
+    }
+
+    fn session_lines() -> Vec<String> {
+        SESSION.lines().map(str::to_string).collect()
+    }
+
+    /// A run whose first stream delivered the whole of [`SESSION`] and three console lines.
+    fn streamed(now: Instant) -> CachedRun {
+        let mut run = CachedRun::default();
+        run.restart(now);
+        let logs = ["one", "two", "three"].map(str::to_string);
+        run.take(&session_lines(), &logs, None, now);
+        run
+    }
+
+    fn raw(log: &[LogLine]) -> Vec<&str> {
+        log.iter().map(|line| line.raw.as_str()).collect()
+    }
+
+    #[test]
+    fn a_first_stream_shows_its_lines_as_they_land() {
+        let now = Instant::now();
+        let lines = session_lines();
+        let mut run = CachedRun::default();
+        run.restart(now);
+        run.take(&lines[..1], &["one".to_string()], None, now);
+        assert_eq!(run.fold.tasks.len(), 2);
+        assert!(run.fold.tasks.iter().all(|task| task.result.is_none()));
+        assert_eq!(raw(&run.log), ["one"]);
+        run.take(&lines[1..], &["two".to_string()], None, now);
+        assert_eq!(run.fold, session());
+        assert_eq!(raw(&run.log), ["one", "two"]);
+    }
+
+    #[test]
+    fn a_restarted_stream_stays_off_screen_until_it_reaches_what_is_shown() {
+        let now = Instant::now();
+        let lines = session_lines();
+        let mut run = streamed(now);
+        run.restart(now);
+        run.take(&lines[..1], &["one".to_string()], None, now);
+        assert_eq!(run.fold, session(), "a partial session replay is held");
+        assert_eq!(raw(&run.log), ["one", "two", "three"]);
+        run.take(&lines[1..2], &["two".to_string()], None, now);
+        assert_eq!(run.fold, session());
+        assert_eq!(raw(&run.log), ["one", "two", "three"]);
+
+        let note = r#"{"v":1,"kind":"note","msg":"hi"}"#.to_string();
+        run.take(&[lines[2].clone(), note], &["three".to_string()], None, now);
+        assert_eq!(run.fold.tasks, session().tasks);
+        assert_eq!(
+            run.fold.notes,
+            ["hi"],
+            "the replay is shown once it has caught up"
+        );
+        assert_eq!(raw(&run.log), ["one", "two", "three"]);
+
+        let later = r#"{"v":1,"kind":"note","msg":"later"}"#.to_string();
+        run.take(&[later], &["four".to_string()], None, now);
+        assert_eq!(
+            run.fold.notes,
+            ["hi", "later"],
+            "then lines fold in as they land"
+        );
+        assert_eq!(raw(&run.log), ["one", "two", "three", "four"]);
+    }
+
+    #[test]
+    fn a_replay_that_goes_quiet_short_of_what_is_shown_replaces_it() {
+        let now = Instant::now();
+        let mut run = streamed(now);
+        run.restart(now);
+        run.take(&session_lines()[..1], &["one".to_string()], None, now);
+        let almost = now + REPLAY_QUIET - Duration::from_millis(1);
+        run.take(&[], &[], None, almost);
+        assert_eq!(run.fold, session());
+        assert_eq!(raw(&run.log), ["one", "two", "three"]);
+        run.take(&[], &[], None, now + REPLAY_QUIET);
+        assert!(run.fold.tasks.iter().all(|task| task.result.is_none()));
+        assert_eq!(raw(&run.log), ["one"]);
+    }
+
+    #[test]
+    fn a_stream_that_finishes_short_of_what_is_shown_replaces_it() {
+        let now = Instant::now();
+        let mut run = streamed(now);
+        run.restart(now);
+        run.take(&session_lines()[..1], &["one".to_string()], Some(true), now);
+        assert!(run.fold.tasks.iter().all(|task| task.result.is_none()));
+        assert_eq!(raw(&run.log), ["one"]);
+    }
+
+    #[test]
+    fn a_stream_that_fails_part_way_through_its_replay_replaces_nothing() {
+        let now = Instant::now();
+        let mut run = streamed(now);
+        run.restart(now);
+        let late = now + REPLAY_QUIET * 4;
+        run.take(
+            &session_lines()[..1],
+            &["one".to_string()],
+            Some(false),
+            late,
+        );
+        assert_eq!(run.fold, session());
+        assert_eq!(raw(&run.log), ["one", "two", "three"]);
+    }
+
+    #[test]
+    fn a_restarted_stream_that_delivers_nothing_never_blanks_the_run() {
+        let now = Instant::now();
+        let mut run = streamed(now);
+        run.restart(now);
+        run.take(&[], &[], None, now + REPLAY_QUIET * 4);
+        run.take(&[], &[], Some(true), now + REPLAY_QUIET * 8);
+        assert_eq!(run.fold, session());
+        assert_eq!(raw(&run.log), ["one", "two", "three"]);
     }
 
     #[test]
