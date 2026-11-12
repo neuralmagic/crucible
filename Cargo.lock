@@ -2321,6 +2321,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "cel",
+ "crucible-contract",
  "http",
  "http-body-util",
  "jsonwebtoken 11.1.0",

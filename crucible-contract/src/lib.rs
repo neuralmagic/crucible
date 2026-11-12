@@ -27,6 +27,7 @@ pub mod json;
 pub mod link;
 pub mod markers;
 pub mod mcp;
+pub mod mcp_message;
 pub mod oauth;
 pub mod outputs;
 pub mod pack_tree;

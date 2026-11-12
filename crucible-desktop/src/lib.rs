@@ -4,6 +4,7 @@
 
 mod activity;
 mod admin;
+mod agent;
 mod apikeys;
 mod captured;
 mod commands;
@@ -982,7 +983,7 @@ impl App {
     }
 
     /// The newest launch of `playbook` the list shows, to prefill a form from.
-    fn newest_launch(&self, playbook: &str) -> Option<&LivePlaybook> {
+    pub(crate) fn newest_launch(&self, playbook: &str) -> Option<&LivePlaybook> {
         self.remote
             .live
             .launches_of(playbook)
@@ -1780,6 +1781,7 @@ fn poll(app: &mut App, clock: f64, tx: &mut Tx) -> bool {
     let place = app.place();
     app.history.saw(place);
     changed |= app.refresh_working();
+    changed |= app.refresh_agent();
     changed |= app.finish_sign_in();
     changed |= app.finish_login_editor();
     changed |= app.finish_release_check();
