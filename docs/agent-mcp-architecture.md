@@ -1180,7 +1180,8 @@ traffic. These are the broker, the OTLP collector, `buildit` on 8848 with `[buil
 | `crucible-openshell-gateway` | cluster | `tokenreviews`: create; `nodes`: get, list, watch; `runtimeclasses`, `priorityclasses`, `namespaces`: get | same |
 | sandbox service account (`[cluster] sandbox_service_account`, default `crucible-sandbox` under isolated gateways) | sandbox | none. Sandbox and supervisor pods mount no token; the account needs only what admits them (an OpenShift SCC). The render creates it | loop render `sandbox_rbac` |
 | controller identity (`[cluster] sandbox_readers`) | sandbox | `sandboxes`: get, list, patch, delete; `pods`: get, list, create, delete; `pods/finalizers`: update; `services`, `secrets`, `networkpolicies`: list, create, delete | loop render `sandbox_reader_rbac` (`kube.rs:1658`) |
-| controller identity | loop | `services`: list, create, delete; plus the dispatch rights in `docs/controller-deploy.md` | same, and the operator |
+| controller identity | loop | `services`: list, create, delete | same |
+| controller identity | loop | `crucible-dispatch`: `pods`: create, get, list, watch, delete; `pods/log`: get; `pods/finalizers`: update; `configmaps`: create, delete; `secrets`: create, delete, list, patch | loop render `dispatch_rbac`, for any `sandbox_readers` |
 | controller identity | SPIRE | `services/proxy`: get | the operator |
 | controller identity | cluster | `tokenreviews`: create (`system:auth-delegator`), for links | the operator |
 | loop service account | sandbox | none under an isolated profile | loop render |

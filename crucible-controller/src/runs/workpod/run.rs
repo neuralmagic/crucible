@@ -818,6 +818,7 @@ pub(crate) async fn dispatch_run(
     }
 
     let created: Result<()> = async {
+        let mut minted_at = jiff::Timestamp::now();
         // The bound values, read from Vault here so a run that cannot get them fails before it
         // costs a pod. They reach the pod as one mounted Secret; the spec names it and carries
         // nothing else.
@@ -829,6 +830,7 @@ pub(crate) async fn dispatch_run(
                     .context("this scope binds a secret and this deployment can read no values")?;
                 let mut rows = Vec::with_capacity(mints.len());
                 let mut values = Vec::with_capacity(mints.len());
+                minted_at = jiff::Timestamp::now();
                 for mint in &mints {
                     let row = crate::secrets::store::get(db.pool(), &mint.item.secret_id)
                         .await?
@@ -1050,8 +1052,15 @@ pub(crate) async fn dispatch_run(
                 .await
                 .context("creating the run Secret")?;
             if let Some(token) = delivery.git_token.as_ref().filter(|t| t.minted) {
-                crate::secrets::refresh::record(db.pool(), &pod_name, &cluster, &namespace, token)
-                    .await
+                crate::secrets::refresh::record(
+                    db.pool(),
+                    &pod_name,
+                    &cluster,
+                    &namespace,
+                    token,
+                    minted_at,
+                )
+                .await
                     .context("recording the run's GitHub token for refresh")?;
             }
         }

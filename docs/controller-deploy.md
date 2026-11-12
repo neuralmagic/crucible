@@ -91,7 +91,7 @@ A minimal set of objects:
   OpenShift's owner-reference admission checks); `configmaps` and `secrets` create/delete (the
   pack ConfigMap and the run Secret, which holds the pod token and the delivered secrets, both
   owner-referenced to the pod); `secrets` list/patch, with which the leader re-mints a running
-  run's GitHub App token into its Secret every 25 minutes; and `leases` get/create/update/patch
+  run's GitHub App token into its Secret once it has less than 30 minutes left; and `leases` get/create/update/patch
   for leader election;
 - a **Secret** for `CONTROLLER_API_TOKEN` and one for `GITHUB_TOKEN`, referenced by env;
 - a **Service** on the API port;
@@ -131,6 +131,15 @@ If the controller runs loops in other clusters (spokes):
   `CONTROLLER_CLUSTER_POLICY`: a caller fenced off the pinned cluster cannot launch the pack.
   A draft-head schedule saved before its draft added a pin fails its firing until it is saved
   again.
+- The identity in each spoke's kubeconfig needs the Role above in that spoke's loop namespace,
+  without `leases`. Name it in the spoke profile's `[cluster] sandbox_readers` and the loop render
+  emits that grant as the Role `crucible-dispatch`, so it is not written by hand. It includes
+  `secrets` patch. With create and delete alone the hub delivers each run's Secret but every
+  re-mint of its GitHub App token is refused, and the run's GitHub calls answer 401 an hour after
+  dispatch. The verb cannot be limited to run Secrets by `resourceNames`, because each is named
+  after its pod (`<pod>-secrets`) and a Role lists exact names.
+  `kubectl --kubeconfig <spoke kubeconfig> auth can-i patch secrets -n <loop namespace>` answers
+  whether a spoke has it.
 - If the hub cannot reach a spoke, the spoke sends reports to the hub.
   `crucible-controller cluster-snapshot` runs on the spoke as a CronJob and posts to the push
   endpoint of the hub with a bearer token that the hub lists in `CONTROLLER_PUSH_TOKENS`.
@@ -221,6 +230,11 @@ For the controller's identity, `sandbox_readers` is granted: `sandboxes` get/lis
 `pods` get/list/create/delete and `pods/finalizers` update (the gateway's Secrets block its
 pod's deletion); `services`, `secrets` and `networkpolicies` list/create/delete in the sandbox
 namespace; and `services` list/create/delete in the loop namespace.
+
+Whatever the gateway mode, `sandbox_readers` is also granted the Role `crucible-dispatch` in the
+loop namespace, which is what the controller dispatches and collects run pods with: `pods`
+create/get/list/watch/delete, `pods/log` get, `pods/finalizers` update, `configmaps`
+create/delete, and `secrets` create/delete/list/patch. It has no `get` on Secrets.
 
 Grounded-rank and scope turns get a gateway of their own the same way, with certificates valid for
 the turn's deadline; a failed launch tears it down, and the gateway sweep removes it once the
@@ -431,8 +445,10 @@ binding projected as `GH_TOKEN` or `GITHUB_TOKEN` (a personal access token, say)
 container and mounts
 it into the sidecar alone, by directory. A variable the binding was projected as still exists in the
 loop container, holding the placeholder `crucible-git`, so a pack's tools find it set and its
-scripts need no change. A minted token is re-minted into the run's Secret by the leader every 25
-minutes, so a long run never pushes with a lapsed one; a personal access token does not expire
+scripts need no change. A minted token is re-minted into the run's Secret by the leader once it has
+less than 30 minutes left, so a long run never pushes with a lapsed one. The leader checks every
+minute and retries a failed re-mint at the next check, logging `GitHub token refresh failed` with
+the run's id; a personal access token does not expire
 hourly and is not refreshed. A run binding two GitHub credentials is refused. An agent-visible
 binding projected as `GH_TOKEN` or `GITHUB_TOKEN` stays as bound, with a warning at dispatch: the
 sandbox reaches GitHub directly, outside `crucible-git`. A minted token under any other variable
