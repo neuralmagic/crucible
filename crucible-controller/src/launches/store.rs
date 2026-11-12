@@ -232,7 +232,8 @@ pub(crate) async fn list_playbook_runs(
 ) -> Result<Vec<PlaybookRun>> {
     let rows = sqlx::query!(
         r#"
-        SELECT pl.key AS "key!", pl.playbook AS "playbook!", p.description AS "description?",
+        SELECT pl.key AS "key!", pl.playbook AS "playbook!",
+               COALESCE(p.description, i.title) AS "description?",
                pl.params AS "params!", pl.schema_digest AS "schema_digest!",
                p.schema_digest AS "current_schema_digest?", pl.max_cost AS "max_cost!",
                pl.max_time AS "max_time!", pl.advance_dedupe AS "advance_dedupe!",

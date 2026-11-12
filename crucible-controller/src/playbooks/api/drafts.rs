@@ -184,6 +184,8 @@ dto! {
         pub core_rev: String,
         pub created_by: Option<String>,
         pub created_at: String,
+        /// The intent a generate was handed to write this version; an editor save carries none.
+        pub intent: Option<String>,
     }
 }
 
@@ -283,6 +285,8 @@ dto! {
         pub saved_by: Option<String>,
         pub saved_at: String,
         pub diagnostics: Vec<crate::playbooks::drafts::Diagnostic>,
+        /// The intent a generate was handed to write this version; an editor save carries none.
+        pub intent: Option<String>,
         /// `{path: content}`, every file the pack holds.
         pub files: std::collections::BTreeMap<String, String>,
     }
@@ -784,6 +788,7 @@ pub(crate) async fn save_playbook_draft(
         body.files,
         identity.as_deref(),
         body.base_version,
+        None,
     )
     .await
     {
@@ -796,6 +801,256 @@ pub(crate) async fn save_playbook_draft(
         },
         Err(e) => draft_refusal(e),
     }
+}
+
+/// The drafting budget a generate asks for when the caller does not: enough for one drafting turn
+/// and one refine round on a mid-size pack.
+const DEFAULT_DRAFT_MAX_COST: f64 = 5.0;
+
+/// Total turns when the caller does not say: one drafting turn and one refine round.
+const DEFAULT_DRAFT_REFINE_ROUNDS: u32 = 2;
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct GenerateDraftBody {
+    /// What the drafting agent should build, in the operator's words. Travels to the engine in a
+    /// file, never argv.
+    intent: String,
+    /// The drafting turn's budget in USD. Absent means 5. Held to this controller's playbook cost
+    /// cap, the same bound a launch's ceilings answer to.
+    #[serde(default)]
+    max_cost: Option<f64>,
+    /// Total turns: one drafting turn plus its refine rounds. Absent means 2. The budget, not
+    /// this, is what stops the loop.
+    #[serde(default)]
+    refine_rounds: Option<u32>,
+}
+
+/// What a generate landed: the version it stored (the same shape a save answers with) and what the
+/// drafting turn itself reported about it.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GeneratedDraftDto {
+    #[serde(flatten)]
+    pub compile: DraftCompileDto,
+    /// What the drafting turn spent.
+    pub cost_usd: f64,
+    /// How many turns it ran.
+    pub rounds: u32,
+    /// Whether the drafted pack passed the engine's compile check. A false still stored the
+    /// version: a save that did not compile is a save, and the diagnostics are in `compile`.
+    pub ok: bool,
+    /// The turn ran past the budget it was given.
+    pub over_budget: bool,
+    /// The engine's own check findings on the pack as it stands.
+    pub findings: Vec<String>,
+}
+
+/// `POST /api/playbook-drafts/{id}/generate` — hand an intent to the engine's drafting turn and
+/// store what it wrote as the next version. The newest save seeds the turn as context, so a
+/// generate edits what the draft holds rather than overwriting blind, and rides the save's
+/// `base_version` semantics: a concurrent writer landing first refuses this one with the version
+/// that overtook it. Nothing the turn wrote executes here — a generate is a save, and launch is
+/// where exposure and admission happen.
+#[utoipa::path(
+    post,
+    path = "/api/playbook-drafts/{id}/generate",
+    params(("id" = String, Path, description = "Draft id")),
+    request_body = GenerateDraftBody,
+    responses(
+        (status = 200, description = "The version the drafting turn stored, and what the engine made of it", body = GeneratedDraftDto),
+        (status = 403, description = "The active policy denies the caller this action", body = ErrorBody),
+        (status = 404, description = "No draft with that id", body = ErrorBody),
+        (status = 409, description = "A newer save overtook the base the generate read", body = StaleBaseBody),
+        (status = 422, description = "Empty intent, a budget the caps refuse, the agent declined the intent, or the turn wrote nothing", body = ErrorBody),
+        (status = 502, description = "The engine boundary failed", body = ErrorBody)
+    )
+)]
+pub(crate) async fn generate_playbook_draft(
+    State(state): State<ApiState>,
+    identity: crate::identity::session::Identity,
+    caller: crate::authz::Caller,
+    Path(id): Path<String>,
+    Json(body): Json<GenerateDraftBody>,
+) -> Response {
+    if let Some(msg) = require_non_empty(&[("intent", &body.intent)]) {
+        return unprocessable(msg);
+    }
+    let max_cost = body.max_cost.unwrap_or(DEFAULT_DRAFT_MAX_COST);
+    if !max_cost.is_finite() || max_cost <= 0.0 || max_cost > state.playbook_caps.max_cost {
+        return unprocessable(format!(
+            "max_cost {max_cost} must be a positive number of USD no greater than this \
+             controller's cap of {}",
+            state.playbook_caps.max_cost
+        ));
+    }
+    let refine_rounds = body.refine_rounds.unwrap_or(DEFAULT_DRAFT_REFINE_ROUNDS);
+    if refine_rounds == 0 {
+        return unprocessable("refine_rounds must be at least 1: one drafting turn".to_string());
+    }
+    if let Err(refused) =
+        readable_draft(&state, &caller, &id, crate::authz::action::Verb::Update).await
+    {
+        return refused;
+    }
+    // The base this generate extends: the newest save. Its files seed the turn's context and its
+    // version rides into the save, so a concurrent writer is a StaleBase refusal, not a clobber.
+    let (base_version, context) =
+        match crate::playbooks::drafts::files(state.db.pool(), &id, None).await {
+            Ok(Some(current)) => (Some(current.version), current.files),
+            Ok(None) => return not_found(format!("no draft {id:?}")),
+            Err(e) => return draft_refusal(e),
+        };
+    // Begun before the spawn so every poll during this generate reads this turn, never the tail
+    // of the draft's previous one.
+    let progress = state.draft_progress.begin(&id, body.intent.trim());
+    let generated = match crate::playbooks::generate::generate(
+        &state.contracts,
+        body.intent.trim(),
+        &context,
+        max_cost,
+        refine_rounds,
+        &state.draft_knobs,
+        Some(progress.log()),
+    )
+    .await
+    {
+        Ok(g) => g,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorBody::new(format!("{e:#}"))),
+            )
+                .into_response();
+        }
+    };
+    // The turn already spent; the ledger row is booked before anything downstream can refuse.
+    if let Err(e) = state
+        .db
+        .ledger_append(None, "draft", generated.report.cost_usd)
+        .await
+    {
+        return ApiError::from(e).into_response();
+    }
+    if let Some(reason) = generated.report.declined.as_deref() {
+        return unprocessable(format!("the drafting agent declined this intent: {reason}"));
+    }
+    if generated.files.is_empty() {
+        let findings = if generated.report.findings.is_empty() {
+            "no findings reported".to_string()
+        } else {
+            generated.report.findings.join("; ")
+        };
+        return unprocessable(format!("the drafting turn wrote no files: {findings}"));
+    }
+    let catalog = match crate::playbooks::api::registry::catalog(&state).await {
+        Ok(c) => c,
+        Err(refusal) => return refusal,
+    };
+    match crate::playbooks::drafts::save_version(
+        state.db.pool(),
+        &id,
+        generated.files,
+        identity.as_deref(),
+        base_version,
+        Some(body.intent.trim()),
+    )
+    .await
+    {
+        Ok(saved) => {
+            state
+                .audit(
+                    crate::event_log::Event::now(
+                        &format!("draft:{id}"),
+                        "generated",
+                        "generated",
+                        Some(&format!(
+                            "draft {id} generated from an intent: {} rounds, ${:.4}, engine check {}",
+                            generated.report.rounds,
+                            generated.report.cost_usd,
+                            if generated.report.ok { "passed" } else { "failed" },
+                        )),
+                        None,
+                    )
+                    .by(identity.as_deref()),
+                    "generate_playbook_draft",
+                )
+                .await;
+            Json(GeneratedDraftDto {
+                compile: DraftCompileDto::from_saved(saved, &state, &catalog),
+                cost_usd: generated.report.cost_usd,
+                rounds: generated.report.rounds,
+                ok: generated.report.ok,
+                over_budget: generated.report.over_budget,
+                findings: generated.report.findings,
+            })
+            .into_response()
+        }
+        Err(e) => draft_refusal(e),
+    }
+}
+
+/// One line of a drafting turn's progress, as the studio polls it: the round it belongs to and
+/// what the agent just did, already redacted by the engine.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DraftProgressEntryDto {
+    /// The drafting round: 1 is the drafting turn, later rounds are refines.
+    pub round: u32,
+    pub line: String,
+}
+
+/// What the draft's most recent generate did, oldest line first. Empty until the draft has
+/// generated at least once.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DraftProgressDto {
+    pub lines: Vec<DraftProgressEntryDto>,
+    /// Whether that generate is still running. A page reloaded mid-turn reads this to pick the
+    /// turn back up instead of showing a studio where nothing seems to be happening.
+    pub running: bool,
+    /// The intent that generate was given, so the same reloaded page can restore what the
+    /// operator typed into the box the refresh emptied.
+    pub intent: Option<String>,
+}
+
+/// `GET /api/playbook-drafts/{id}/generate/progress` — the lines of the draft's most recent
+/// generate as the engine reported them, live while the turn runs and kept after it ends so a
+/// poll racing the response still reads the tail. A draft that has never generated answers an
+/// empty list, not a refusal.
+#[utoipa::path(
+    get,
+    path = "/api/playbook-drafts/{id}/generate/progress",
+    params(("id" = String, Path, description = "Draft id")),
+    responses(
+        (status = 200, description = "The latest generate's progress lines, oldest first", body = DraftProgressDto),
+        (status = 403, description = "The active policy denies the caller this action", body = ErrorBody),
+        (status = 404, description = "No draft with that id", body = ErrorBody)
+    )
+)]
+pub(crate) async fn get_playbook_draft_generate_progress(
+    State(state): State<ApiState>,
+    caller: crate::authz::Caller,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    if let Err(refused) =
+        readable_draft(&state, &caller, &id, crate::authz::action::Verb::Read).await
+    {
+        return Ok(refused);
+    }
+    let (lines, running, intent) = state
+        .draft_progress
+        .get(&id)
+        .map(|log| (log.snapshot(), log.is_running(), log.intent()))
+        .unwrap_or((Vec::new(), false, None));
+    Ok(Json(DraftProgressDto {
+        lines: lines
+            .into_iter()
+            .map(|entry| DraftProgressEntryDto {
+                round: entry.round,
+                line: entry.line,
+            })
+            .collect(),
+        running,
+        intent,
+    })
+    .into_response())
 }
 
 /// `DELETE /api/playbook-drafts/{id}` — drop a draft, every version it holds, and its secret

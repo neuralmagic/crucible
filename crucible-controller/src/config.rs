@@ -182,6 +182,16 @@ pub struct PlaybookCaps {
     pub max_time: crate::model::MaxTime,
 }
 
+/// The engine knobs every studio generate runs with, copied off the parsed [`ControllerCfg`].
+/// Operator configuration, never per-request input — the studio's Generate stays one button.
+#[derive(Debug, Clone, Default)]
+pub struct DraftKnobs {
+    /// `crucible draft --model`; `None` leaves the turn on the harness's default model.
+    pub model: Option<String>,
+    /// `crucible draft --effort`; `None` leaves the tier to the harness.
+    pub effort: Option<crucible::knobs::ReasoningEffort>,
+}
+
 impl Default for PlaybookCaps {
     fn default() -> Self {
         PlaybookCaps {
@@ -672,6 +682,13 @@ pub struct ControllerCfg {
         default_value_t = crate::model::MaxTime::hours(DEFAULT_PLAYBOOK_MAX_TIME_HOURS)
     )]
     pub playbook_max_time_cap: crate::model::MaxTime,
+    /// The model this controller's drafting turns run on, handed to `crucible draft --model`.
+    /// Unset means the turn's harness picks its own default.
+    #[arg(long = "draft-model", env = "CONTROLLER_DRAFT_MODEL")]
+    pub draft_model: Option<String>,
+    /// The drafting turns' reasoning-effort tier; unset means the harness picks its own.
+    #[arg(long = "draft-effort", env = "CONTROLLER_DRAFT_EFFORT", value_enum)]
+    pub draft_effort: Option<crucible::knobs::ReasoningEffort>,
     /// How long a loop run's pod may stay non-terminal before the controller deletes it and fails
     /// the run. A playbook run's bound is its own `max_time` plus a fixed startup margin.
     #[arg(
@@ -1160,6 +1177,18 @@ const RETIRED: &[Retired] = &[
         removed: MLFLOW_REMOVED,
         instead: MLFLOW_INSTEAD,
     },
+    Retired {
+        var: "CRUCIBLE_DRAFT_MODEL",
+        live: |_| true,
+        removed: "the draft model moved to the controller's own env namespace",
+        instead: "set CONTROLLER_DRAFT_MODEL (or --draft-model)",
+    },
+    Retired {
+        var: "CRUCIBLE_DRAFT_EFFORT",
+        live: |_| true,
+        removed: "the draft effort moved to the controller's own env namespace",
+        instead: "set CONTROLLER_DRAFT_EFFORT (or --draft-effort)",
+    },
 ];
 
 const MLFLOW_REMOVED: &str = "the MLflow run exporter was removed";
@@ -1185,6 +1214,28 @@ pub fn refuse_retired_settings(env: impl Fn(&str) -> Option<String>) -> Result<(
 
 #[cfg(test)]
 mod tests {
+
+    /// The draft knobs are operator flags: parsed once at boot and typed, so a misspelled effort
+    /// tier refuses the boot rather than 502-ing the first studio generate.
+    #[test]
+    fn draft_knobs_parse_the_operator_flags_and_refuse_a_mistyped_effort() {
+        let cfg = crate::testing::cfg_from_args([
+            "ctl",
+            "--draft-model",
+            "gateway/example-model",
+            "--draft-effort",
+            "xhigh",
+        ]);
+        assert_eq!(cfg.draft_model.as_deref(), Some("gateway/example-model"));
+        assert_eq!(
+            cfg.draft_effort,
+            Some(crucible::knobs::ReasoningEffort::Xhigh)
+        );
+        let refused = crate::testing::try_cfg_from_args(["ctl", "--draft-effort", "sloppy"])
+            .expect_err("a mistyped effort tier must refuse the boot");
+        let message = refused.to_string();
+        assert!(message.contains("sloppy"), "{message}");
+    }
 
     /// The routing knob the chart had been setting into a void: no code read
     /// `CONTROLLER_DISPATCH_CLUSTER_BY_CONTRACT`, so an operator's `vllm=hub` did nothing.
@@ -1596,6 +1647,12 @@ mod tests {
             ),
             ("CONTROLLER_MLFLOW_EXPERIMENT", "crucible", "/api/export"),
             ("CONTROLLER_MLFLOW_TOKEN", "mlflow-secret", "/api/export"),
+            (
+                "CRUCIBLE_DRAFT_MODEL",
+                "gateway/model-x",
+                "CONTROLLER_DRAFT_MODEL",
+            ),
+            ("CRUCIBLE_DRAFT_EFFORT", "low", "CONTROLLER_DRAFT_EFFORT"),
         ] {
             let refusal =
                 crate::config::refuse_retired_settings(env_of(&[(var, value)])).expect_err(var);

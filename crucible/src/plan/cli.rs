@@ -2007,6 +2007,7 @@ workflow(type = "playbook", tasks = [pick, gate, a, b, lint, optional, publish])
             [agent]
             backend = "openshell"
             goal = "g"
+            allowed_tools = ["Read", "mcp__buildit"]
             mcp = ["buildit"]
             [mcp.buildit]
             bin = "sh"

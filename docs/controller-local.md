@@ -38,7 +38,7 @@ crux draft-launch notes --max-cost 1 --max-time 5m
 | `CONTROLLER_SESSION_SECURE` | `false` | The UI is plain http. |
 | `KUBECONFIG` | `/dev/null` | The controller does not connect to the cluster in your kubeconfig. |
 | `OPENSHELL_PODMAN_SOCKET` | the API socket of the podman machine | The engine starts OpenShell sandboxes here. Set it to use a different socket. |
-| `CRUCIBLE_BIN` | the built `crucible` | The engine a launch runs. |
+| `CRUCIBLE_BIN` | the built `crucible` | The engine a launch runs. Built with `crucible/autoresearch` because the draft studio's Generate shells `crucible draft`, which lives behind that feature; the controller's own autoresearch lane stays off. |
 | `CONTROLLER_HOOKS_ADDR` | `127.0.0.1:8871` (set `HOOKS_PORT` to change it) | The webhook delivery listener, on a separate port. |
 | `CONTROLLER_HOOKS_PUBLIC_URL` | `http://127.0.0.1:8871` | The base of the delivery URL of each new webhook. |
 | `CONTROLLER_WEBHOOK_KEY_FILE` | `$CONTROLLER_STATE_DIR/webhook.key`, generated once | Seals `hmac_sha256` webhook secrets. |

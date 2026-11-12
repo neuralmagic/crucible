@@ -69,7 +69,7 @@ pub(crate) struct RegisterAck {
     pub(crate) exposure_digest: Option<String>,
     /// True when re-registering an existing id changed the declared exposure.
     pub(crate) exposure_changed: bool,
-    /// Paths under an excluded segment (`state`, `.git`, `workspace`) that were not stored.
+    /// Paths under an excluded segment (`state`, `.git`, `workspace`, `__pycache__`) that were not stored.
     pub(crate) ignored_paths: Vec<String>,
 }
 

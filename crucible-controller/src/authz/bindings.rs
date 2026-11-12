@@ -222,6 +222,13 @@ pub static BINDINGS: &[Binding] = &[
         Route,
     ),
     bind("GET", "/api/runs/{run_id}/log", R::Run, V::Read, Route),
+    bind(
+        "GET",
+        "/api/runs/{run_id}/tasks/log",
+        R::Run,
+        V::Read,
+        Route,
+    ),
     bind("GET", "/api/runs/{run_id}/files", R::Run, V::Read, Route),
     bind("GET", "/api/runs/{run_id}/rerun", R::Run, V::Read, Route),
     bind(
@@ -507,6 +514,20 @@ pub static BINDINGS: &[Binding] = &[
         "/api/playbook-drafts/{id}/versions",
         R::PlaybookDraft,
         V::Update,
+        Route,
+    ),
+    bind(
+        "POST",
+        "/api/playbook-drafts/{id}/generate",
+        R::PlaybookDraft,
+        V::Update,
+        Route,
+    ),
+    bind(
+        "GET",
+        "/api/playbook-drafts/{id}/generate/progress",
+        R::PlaybookDraft,
+        V::Read,
         Route,
     ),
     bind(

@@ -21,6 +21,8 @@ __pycache__/
 /STEER.md
 # macOS Finder droppings.
 .DS_Store
+# Per-user IDE state (JetBrains).
+.idea/
 # Live example variants (real-model smokes) keep their own workspace dir.
 examples/*/workspace-*/
 # Local MCP server wiring (machine-specific endpoints, tokens pulled at launch).
@@ -41,3 +43,11 @@ formal/.lake/
 
 # Per-cluster e2e values (just kueue-e2e-cluster); the *.env.example files are committed.
 e2e/kueue/clusters/*.env
+
+# Ad-hoc UI drive scripts against a live controller, their recordings, and Playwright run output.
+crucible-controller/ui/drive-*.mjs
+crucible-controller/ui/dump-panel.mjs
+crucible-controller/ui/verify-launch-log.mjs
+crucible-controller/ui/recordings/
+test-results/
+crucible-controller/ui/verify-panels.mjs

@@ -8,6 +8,7 @@
 backend       = "openshell"
 harness       = "claude"
 model         = "claude-opus-4-6"
+allowed_tools = ["Read", "Edit", "Write", "Glob", "Grep", "Bash", "mcp__crucible-git"]
 sandbox_image = "ghcr.io/neuralmagic/sandbox-triage-cc@sha256:36a11bb264a7268962eaf982986a631e7a2673848b468f8c8fd636c559770333"
 goal          = "Push a branch and open a draft pull request through the run's crucible-git."
 

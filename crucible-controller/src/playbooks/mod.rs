@@ -8,6 +8,7 @@ pub mod co_draft;
 pub mod dispatch;
 pub mod drafts;
 pub mod exposure;
+pub mod generate;
 pub mod imports;
 pub mod pack_migration;
 pub mod pack_trees;

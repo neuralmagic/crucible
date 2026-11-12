@@ -3432,6 +3432,7 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/runs/{run_id}/graph",
         "/api/runs/{run_id}/tasks/{task}/evidence",
         "/api/runs/{run_id}/log",
+        "/api/runs/{run_id}/tasks/log",
         "/api/runs/{run_id}/files",
         "/api/runs/{run_id}/rerun",
         "/api/runs/{run_id}/files/{key}",
@@ -3487,6 +3488,8 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/playbook-drafts/{id}/rename",
         "/api/playbook-drafts/{id}/clone",
         "/api/playbook-drafts/{id}/launch",
+        "/api/playbook-drafts/{id}/generate",
+        "/api/playbook-drafts/{id}/generate/progress",
         "/api/playbook-drafts/{id}/graduate",
         "/api/playbook-drafts/{id}/publish",
         "/api/playbook-runs",
@@ -9286,6 +9289,275 @@ async fn a_stale_base_is_refused_with_the_version_that_overtook_it(pool: PgPool)
         ],
         "the history interleaves the human's saves with the agent's"
     );
+    Ok(())
+}
+
+// --- the generate panel (intent in, drafted version out) ------------------------
+
+/// The tail of a drafting stand-in that writes a compiling pack and reports success.
+const STANDIN_PACKED: &str = r#"cat > "$out/crucible.toml" <<'TOML'
+[repo]
+path = "."
+
+[agent]
+
+[workflow]
+type = "playbook"
+file = "workflow.star"
+TOML
+cat > "$out/workflow.star" <<'STAR'
+params = {}
+sweep = command(name = "sweep", run = "echo swept")
+workflow(type = "playbook", tasks = [sweep], result = sweep)
+STAR
+echo '{"ok":true,"cost_usd":0.75,"over_budget":false,"rounds":2,"findings":[],"declined":null}'
+exit 0
+"#;
+
+/// The tail of a drafting stand-in whose agent declined the intent.
+const STANDIN_DECLINED: &str = r#"echo 'I will not draft this' > "$out/REJECTED.md"
+echo '{"ok":false,"cost_usd":0.1,"over_budget":false,"rounds":1,"findings":[],"declined":"outside my remit"}'
+exit 1
+"#;
+
+/// The tail of a stand-in that speaks no report at all.
+const STANDIN_SPEECHLESS: &str = "echo 'the engine is not feeling well'\nexit 1\n";
+
+/// A scripted `crucible` on `CRUCIBLE_BIN` for the duration of `f`: the drafting seam shells the
+/// engine, and this is what stands in for it. The script parses the flags it was handed, records
+/// the argv, the goal file's content, and the context dir's listing to `log`, then runs `tail`.
+/// The crate-wide `ENV_LOCK` is held for the whole body, so no sibling test spawns against a
+/// stand-in it did not install.
+async fn with_draft_standin<F, Fut, T>(dir: &std::path::Path, tail: &str, f: F) -> (T, String)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let bin = dir.join("draft-standin");
+    let log = dir.join("draft-calls.log");
+    let script = format!(
+        r#"#!/bin/sh
+log='{}'
+echo "argv: $*" >> "$log"
+goal=
+out=
+context=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --goal-file) goal="$2"; shift 2 ;;
+    --out) out="$2"; shift 2 ;;
+    --context) context="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+if [ -n "$context" ]; then
+  echo "context: $(ls "$context" | sort | tr '\n' ' ')" >> "$log"
+fi
+echo "goal: $(cat "$goal")" >> "$log"
+{tail}"#,
+        log.display()
+    );
+    crate::testing::write_exec(&bin, &script);
+    let _g = crate::ENV_LOCK.lock().await;
+    unsafe {
+        std::env::set_var("CRUCIBLE_BIN", &bin);
+    }
+    let out = f().await;
+    unsafe {
+        std::env::remove_var("CRUCIBLE_BIN");
+    }
+    (out, std::fs::read_to_string(&log).unwrap_or_default())
+}
+
+/// Create draft `studio` as `wren`; the caller holds its version 1 skeleton.
+async fn create_studio_draft(app: &Router) {
+    let (status, body) = post_admin(
+        app,
+        "/api/playbook-drafts",
+        serde_json::json!({"id": "studio", "description": "a drafted pack"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+/// The generate panel end to end at the engine boundary: the intent reaches the drafting turn in
+/// a file (never argv), the turn sees the draft's current files as its context, what it wrote
+/// lands as the next version with the save's compile shape, the spend is ledgered, and a
+/// concurrent writer's base refusal rides the version the generate stamped.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_generated_draft_stores_the_pack_the_engine_wrote(pool: PgPool) -> Result<()> {
+    let (db, dir) = db_with(pool);
+    let app = app_with_admins(db.clone(), vec!["wren".to_string()]);
+    create_studio_draft(&app).await;
+
+    // The refusals that never reach the engine.
+    for (label, body) in [
+        ("empty intent", serde_json::json!({"intent": "  "})),
+        (
+            "zero budget",
+            serde_json::json!({"intent": "sweep", "max_cost": 0.0}),
+        ),
+        (
+            "over-cap budget",
+            serde_json::json!({"intent": "sweep", "max_cost": 30.0}),
+        ),
+        (
+            "no rounds",
+            serde_json::json!({"intent": "sweep", "refine_rounds": 0}),
+        ),
+    ] {
+        let (status, refused) =
+            post_admin(&app, "/api/playbook-drafts/studio/generate", body).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{label}: {refused}"
+        );
+    }
+
+    let intent = "sweep max-num-batched-tokens across eight vllm deployments";
+    let generate = |app: Router| {
+        let intent = intent.to_string();
+        async move {
+            post_admin(
+                &app,
+                "/api/playbook-drafts/studio/generate",
+                serde_json::json!({"intent": intent}),
+            )
+            .await
+        }
+    };
+    let ((status, body), log) =
+        with_draft_standin(dir.path(), STANDIN_PACKED, || generate(app.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["version"], 2);
+    assert_eq!(body["saved_by"], "wren");
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["cost_usd"], 0.75);
+    assert_eq!(body["rounds"], 2);
+    assert_eq!(body["findings"], serde_json::json!([]));
+    assert_eq!(body["diagnostics"], serde_json::json!([]));
+    assert_eq!(body["graph"]["result"], "sweep", "{body}");
+    assert!(body["schema_digest"].is_string(), "{body}");
+
+    // The intent reached the turn in the goal file, not on the command line, and the draft's own
+    // files seeded the turn's context.
+    assert!(log.contains(&format!("goal: {intent}")), "{log}");
+    assert!(
+        !log.contains(&format!("argv: draft --json --goal-file {intent}")),
+        "{log}"
+    );
+    assert!(log.contains("--goal-file"), "{log}");
+    assert!(
+        log.contains("context: crucible.toml workflow.star"),
+        "the skeleton seeds the context: {log}"
+    );
+
+    // What the turn wrote is what a reader picks up.
+    let (status, files) = get_json_object(&app, "/api/playbook-drafts/studio/files").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(files["version"], 2);
+    assert!(
+        files["files"]["workflow.star"]
+            .as_str()
+            .expect("workflow")
+            .contains("sweep"),
+        "{files}"
+    );
+
+    // The spend is ledgered under its own tag.
+    let (_, ledger) = get_json_value(&app, "/api/ledger/by-tag").await;
+    let tags = ledger["tags"].as_array().expect("tags");
+    let draft = tags
+        .iter()
+        .find(|t| t["tag"] == "draft")
+        .unwrap_or_else(|| panic!("the drafting spend is ledgered: {ledger}"));
+    assert_eq!(draft["total_usd"], 0.75);
+
+    // The generate stamped the base it read: a writer still holding version 1 is refused with the
+    // version that overtook it, exactly like a save.
+    let (status, stale) = post_admin(
+        &app,
+        "/api/playbook-drafts/studio/versions",
+        serde_json::json!({"files": draft_files(), "base_version": 1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{stale}");
+    assert_eq!(stale["current_version"], 2);
+    Ok(())
+}
+
+/// A declined turn is a clean answer, not a failure to run: the refusal carries the agent's own
+/// reason, nothing is stored, and the spend the turn already made is still booked.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_declined_drafting_turn_is_refused_and_stores_nothing(pool: PgPool) -> Result<()> {
+    let (db, dir) = db_with(pool);
+    let app = app_with_admins(db.clone(), vec!["wren".to_string()]);
+    create_studio_draft(&app).await;
+
+    let generate = |app: Router| async move {
+        post_admin(
+            &app,
+            "/api/playbook-drafts/studio/generate",
+            serde_json::json!({"intent": "draft me something impossible"}),
+        )
+        .await
+    };
+    let ((status, body), _log) =
+        with_draft_standin(dir.path(), STANDIN_DECLINED, || generate(app.clone())).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .expect("error")
+            .contains("outside my remit"),
+        "{body}"
+    );
+
+    let (status, detail) = get_json_object(&app, "/api/playbook-drafts/studio").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        detail["latest_version"], 1,
+        "a declined turn stores nothing"
+    );
+
+    let (_, ledger) = get_json_value(&app, "/api/ledger/by-tag").await;
+    assert!(
+        ledger["tags"]
+            .as_array()
+            .expect("tags")
+            .iter()
+            .any(|t| t["tag"] == "draft" && t["total_usd"] == 0.1),
+        "the declined turn still spent: {ledger}"
+    );
+    Ok(())
+}
+
+/// An engine that speaks no report is a boundary failure, not a verdict about the intent.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn an_engine_that_prints_no_report_is_a_bad_gateway(pool: PgPool) -> Result<()> {
+    let (db, dir) = db_with(pool);
+    let app = app_with_admins(db, vec!["wren".to_string()]);
+    create_studio_draft(&app).await;
+
+    let generate = |app: Router| async move {
+        post_admin(
+            &app,
+            "/api/playbook-drafts/studio/generate",
+            serde_json::json!({"intent": "sweep"}),
+        )
+        .await
+    };
+    let ((status, body), _log) =
+        with_draft_standin(dir.path(), STANDIN_SPEECHLESS, || generate(app.clone())).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(
+        body["error"].as_str().expect("error").contains("report"),
+        "{body}"
+    );
+
+    let (_, detail) = get_json_object(&app, "/api/playbook-drafts/studio").await;
+    assert_eq!(detail["latest_version"], 1);
     Ok(())
 }
 

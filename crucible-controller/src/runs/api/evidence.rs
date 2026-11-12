@@ -221,6 +221,80 @@ pub(crate) async fn get_run_log(
     .into_response())
 }
 
+/// A run's task console: the session log folded into one chronological, task-prefixed text.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RunTaskLogDto {
+    pub run_id: String,
+    /// Every line a task printed under `[task]`, framed by its lifecycle lines, tail-first-line
+    /// aligned and capped; null when this machine holds no session for the run.
+    pub text: Option<String>,
+    /// True when the head of the console was dropped to fit the cap.
+    pub truncated: bool,
+    /// Where the session lives when the controller holds none.
+    pub location: Option<String>,
+}
+
+/// `GET /api/runs/{run_id}/tasks/log` — the run's task output, folded out of its session log. A
+/// local run's session file grows while the run works, so this is the live per-task console; a run
+/// whose session is reachable from neither the store nor this disk answers with where it lives.
+/// Only an unknown run is a 404.
+#[utoipa::path(
+    get,
+    path = "/api/runs/{run_id}/tasks/log",
+    params(("run_id" = String, Path, description = "Run identifier")),
+    responses(
+        (status = 200, description = "The run's folded task console, or where its session lives", body = RunTaskLogDto),
+        (status = 400, description = "The run id is not a single path segment", body = ErrorBody),
+        (status = 404, description = "Run not found", body = ErrorBody)
+    )
+)]
+pub(crate) async fn get_run_task_log(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+) -> ApiResult<Response> {
+    if !task_evidence::safe_segment(&run_id) {
+        return Ok(bad_request("a run id is one path segment"));
+    }
+    let Some(run) = crate::runs::store::get_run(state.db.pool(), &run_id).await? else {
+        return Ok(not_found(format!("run not found: {run_id}")));
+    };
+    let session =
+        match task_evidence::run_session(state.db.pool(), &state.scratch_dir, &run_id).await {
+            Ok(session) => session,
+            Err(e) => {
+                tracing::warn!(run_id, error = %e, "reading the run session failed");
+                None
+            }
+        };
+    let (text, truncated, location) = match session {
+        Some(session) => {
+            let folded = task_evidence::task_console(&session);
+            let (text, truncated) = task_evidence::tail_within_cap(folded.as_bytes());
+            (Some(text), truncated, None)
+        }
+        None => (None, false, Some(task_log_location(&run, &run_id, &state))),
+    };
+    Ok(Json(RunTaskLogDto {
+        run_id,
+        text,
+        truncated,
+        location,
+    })
+    .into_response())
+}
+
+/// Where a run's session lives when the controller holds none: the work pod for a pod run, the
+/// run's own directory for a local run that kept no session.
+fn task_log_location(run: &crate::runs::model::Run, run_id: &str, state: &ApiState) -> String {
+    match run.dispatch {
+        crate::runs::model::RunDispatch::Pod => pod_location(run, &state.pod_namespace),
+        crate::runs::model::RunDispatch::Local => format!(
+            "no session log under {}",
+            task_evidence::run_dir(&state.scratch_dir, run_id).display()
+        ),
+    }
+}
+
 /// A pod run's output. A running pod is read live; once it goes terminal it is deleted within
 /// minutes, so the engine log the completion edge kept is served, and the ingested session for a
 /// run that finished before that existed.

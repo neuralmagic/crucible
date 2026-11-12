@@ -69,7 +69,7 @@ const ISSUES = [
   },
 ];
 
-const RUNS = [
+export const RUNS = [
   {
     run_id: 'RUN-0412',
     scope: 1,
@@ -275,6 +275,12 @@ const ROUTE_GRAPH = {
   ],
 };
 
+/** A run from before the work-graph executor: the detail says it never admitted a plan, and the
+ * artifacts listing — db-backed, so exact — carries no flow.html. The page must settle both
+ * questions from what it already fetched; the graph and flow endpoints' 404s are the same
+ * answers, but console-noisy ones. */
+export const PLANLESS_RUN = 'RUN-0407';
+
 const TRIAGE_MD = [
   '# 1027: [RFC]: Checkpoint and restore RNG state so a resumed run reproduces the uninterrupted run',
   '',
@@ -325,6 +331,26 @@ const TRIAGE_LOG = {
 const RUN_DETAIL = {
   run: RUNS[0],
   candidates: [],
+  has_plan: true,
+};
+
+/** A run whose three iteration costs each round up on their own, so the raw cells miss the row
+ * total by a cent ($0.13 + $0.21 + $0.31 against $0.64): the cost table has to reconcile its
+ * line items to the total it prints beside them. */
+export const COST_DRIFT_RUN = 'RUN-0640';
+
+const COST_DRIFT_GRAPH = {
+  plan_version: 1,
+  tasks: [
+    { name: 'propose', kind: 'agent', depends_on: [], session: '', needs: 'any', required: true, over: '', max_fanout: 0, when: '', keyed: [] },
+  ],
+  fanout: [],
+  decisions: [],
+  results: [
+    { iter: 1, task: 'propose', status: 'pass', note: '', cost_usd: 0.1268564, secs: 20, links: [], repairs: [] },
+    { iter: 2, task: 'propose', status: 'pass', note: '', cost_usd: 0.2094645, secs: 30, links: [], repairs: [] },
+    { iter: 3, task: 'propose', status: 'pass', note: '', cost_usd: 0.3084733, secs: 45, links: [], repairs: [] },
+  ],
 };
 
 /** The compiled plan the preview surfaces draw: one of every card the graph has to say
@@ -400,7 +426,7 @@ const UNDISPATCHABLE = {
   },
 };
 
-const DISPATCHABLE = {
+export const DISPATCHABLE = {
   backend: 'local',
   sandbox_image: null,
   dispatchable: true,
@@ -552,7 +578,7 @@ export const PLAYBOOK_RUN = {
 };
 
 /** The runs list, newest first; one of them a schedule's firing. */
-const PLAYBOOK_RUNS = [
+export const PLAYBOOK_RUNS = [
   { ...PLAYBOOK_RUN, key: 'playbook:triage:0201', playbook: 'triage', status: 'running', cost_usd: 0.42, created_by: 'kylesayrs', created_at: '2026-08-24T11:40:00Z' },
   {
     ...PLAYBOOK_RUN,
@@ -732,18 +758,78 @@ export const ROUTES: Record<string, Json> = {
     files: [],
     running: false,
   },
-  [`/api/runs/${RETRY_RUN}`]: { run: { ...RUNS[0], run_id: RETRY_RUN }, candidates: [] },
+  [`/api/runs/${RETRY_RUN}`]: { run: { ...RUNS[0], run_id: RETRY_RUN }, candidates: [], has_plan: true },
   [`/api/runs/${RETRY_RUN}/iterations`]: [],
   [`/api/runs/${RETRY_RUN}/graph`]: RETRY_GRAPH,
-  [`/api/runs/${TRIAGE_RUN}`]: { run: { ...RUNS[1], run_id: TRIAGE_RUN, issue_key: 'playbook:triage-local:01a030fe', cost_usd: 1.38, agent_provider: 'pricetag-glm', agent_model: 'glm-5.3' }, candidates: [] },
+  [`/api/runs/${TRIAGE_RUN}`]: { run: { ...RUNS[1], run_id: TRIAGE_RUN, issue_key: 'playbook:triage-local:01a030fe', cost_usd: 1.38, agent_provider: 'pricetag-glm', agent_model: 'glm-5.3' }, candidates: [], has_plan: true },
   [`/api/runs/${TRIAGE_RUN}/iterations`]: [],
   [`/api/runs/${TRIAGE_RUN}/graph`]: TRIAGE_GRAPH,
-  [`/api/runs/${ROUTE_RUN}`]: { run: { ...RUNS[0], run_id: ROUTE_RUN }, candidates: [] },
+  [`/api/runs/${ROUTE_RUN}`]: { run: { ...RUNS[0], run_id: ROUTE_RUN }, candidates: [], has_plan: true },
   [`/api/runs/${ROUTE_RUN}/iterations`]: [],
   [`/api/runs/${ROUTE_RUN}/graph`]: ROUTE_GRAPH,
+  [`/api/runs/${PLANLESS_RUN}`]: {
+    run: { ...RUNS[1], run_id: PLANLESS_RUN, pod: null },
+    candidates: [],
+    has_plan: false,
+  },
+  [`/api/runs/${PLANLESS_RUN}/iterations`]: [],
+  [`/api/runs/${PLANLESS_RUN}/artifacts`]: {
+    run_id: PLANLESS_RUN,
+    entries: [{ path: 'session.jsonl', size_bytes: 2048 }],
+  },
+  [`/api/runs/${COST_DRIFT_RUN}`]: {
+    run: { ...RUNS[1], run_id: COST_DRIFT_RUN, pod: null, status: 'succeeded', cost_usd: 0.6447942 },
+    candidates: [],
+    has_plan: true,
+  },
+  [`/api/runs/${COST_DRIFT_RUN}/iterations`]: [],
+  [`/api/runs/${COST_DRIFT_RUN}/graph`]: COST_DRIFT_GRAPH,
+  [`/api/runs/${COST_DRIFT_RUN}/artifacts`]: {
+    run_id: COST_DRIFT_RUN,
+    entries: [],
+  },
   [`/api/runs/${TRIAGE_RUN}/log`]: TRIAGE_LOG,
   [`/api/runs/${TRIAGE_RUN}/tasks/triage[1027]/evidence`]: TRIAGE_EVIDENCE,
   [`/api/runs/${TRIAGE_RUN}/tasks/scan/evidence`]: SCAN_EVIDENCE,
+  /** The studio's newest test-fire run: the pack's read task finished, its summarize command has
+   * not reported yet, and its console is held locally. */
+  '/api/runs/RUN-0500': {
+    run: {
+      ...RUNS[1],
+      run_id: 'RUN-0500',
+      issue_key: 'playbook:studio:0200',
+      status: 'running',
+      cost_usd: null,
+      pod: null,
+    },
+    candidates: [],
+    has_plan: true,
+  },
+  '/api/runs/RUN-0500/graph': {
+    plan_version: 1,
+    tasks: [
+      { name: 'read', kind: 'agent', depends_on: [], session: 'survey', needs: 'any', required: true, over: '', max_fanout: 0, when: '', keyed: [] },
+      { name: 'summarize', kind: 'command', depends_on: ['read'], session: '', needs: 'any', required: true, over: '', max_fanout: 0, when: '', keyed: [] },
+    ],
+    fanout: [],
+    decisions: [],
+    results: [
+      { iter: 0, task: 'read', status: 'pass', note: '', cost_usd: 0.19, secs: 41, links: [], repairs: [], agent: { harness: 'claude', model: 'glm-5.3', effort: 'low' } },
+    ],
+  },
+  '/api/runs/RUN-0500/log': {
+    run_id: 'RUN-0500',
+    dispatch: 'local',
+    text: 'plan run: admitted 2 tasks\nplan run: read pass\n',
+    truncated: false,
+    location: null,
+  },
+  '/api/runs/RUN-0500/tasks/log': {
+    run_id: 'RUN-0500',
+    text: '[task read] READ THE PAPER\n[task read] one entry per citation\n',
+    truncated: false,
+    location: null,
+  },
   '/api/repos': [
     { repo: 'vllm-project/vllm', paused: false, new: 2, scoped: 1, awaiting_approval: 1, running: 1, pr_open: 0, parked: 0, done: 4 },
     { repo: 'neuralmagic/crucible', paused: false, new: 1, scoped: 0, awaiting_approval: 0, running: 0, pr_open: 1, parked: 1, done: 9 },
@@ -933,6 +1019,11 @@ export const ROUTES: Record<string, Json> = {
     diagnostics: [],
     dispatch: DISPATCHABLE,
   },
+  '/api/playbook-drafts/studio/generate/progress': {
+    intent: null,
+    lines: [],
+    running: false,
+  },
   '/api/playbooks/drafts/co-draft': {
     url: 'https://crucible.example.com',
     skill_url: 'https://crucible.example.com/api/playbooks/drafts/skill',
@@ -1043,6 +1134,27 @@ export const ROUTES: Record<string, Json> = {
     runs: [
       { run_id: 'RUN-0412', status: 'running', dispatch: 'local', pod: null, cost_usd: 8.4 },
     ],
+  },
+  '/api/playbook-runs/playbook:studio:0196': {
+    launch: {
+      ...PLAYBOOK_RUN,
+      key: 'playbook:studio:0196',
+      playbook: 'studio',
+      origin: 'draft',
+      draft_version: 3,
+      status: 'parked',
+      parked_reason: 'dispatch failed',
+      cost_usd: null,
+      runs: 0,
+    },
+    source_exists: true,
+    dispatch: {
+      state: 'failed',
+      failure: 'creating the pack ConfigMap: etcdserver: request timed out',
+      failed_at: '2026-08-24T10:00:10Z',
+      failures: 1,
+    },
+    runs: [],
   },
   '/api/playbook-runs/playbook:survey:0197': {
     launch: {
@@ -1316,8 +1428,17 @@ export async function stubApi(page: Page): Promise<void> {
       // fixture map is keyed by the path the endpoint answers on.
       const path = decodeURIComponent(new URL(route.request().url()).pathname);
 
-      if (path === '/api/events') {
-        return route.fulfill({ status: 200, contentType: 'text/event-stream', body: '' });
+      // The real stream stays open and quiet; a finite body would EOF and EventSource would
+      // reconnect every few seconds, with every reopen invalidating the live queries and making
+      // the design baselines nondeterministic. A day-long retry holds that off for a test's
+      // lifetime, which is the same quiet-open the real endpoint gives.
+      if (path === '/api/events/stream') {
+        return route.fulfill({ status: 200, contentType: 'text/event-stream', body: 'retry: 86400000\n\n' });
+      }
+      // A run's live session is the same kind of stream: held open and quiet rather than answered
+      // with JSON an EventSource would choke on and reconnect-loop against.
+      if (path.endsWith('/live')) {
+        return route.fulfill({ status: 200, contentType: 'text/event-stream', body: 'retry: 86400000\n\n' });
       }
       // Acting as a team: whoami answers for the team the header names, and a team the caller
       // does not hold is refused with the marker the client recovers from.
@@ -1552,8 +1673,13 @@ export async function stubApi(page: Page): Promise<void> {
         });
       }
       if (path === '/api/playbook-runs') {
-        const schedule = new URL(route.request().url()).searchParams.get('schedule');
-        const rows = schedule ? PLAYBOOK_RUNS.filter((row) => row.schedule === schedule) : PLAYBOOK_RUNS;
+        const query = new URL(route.request().url()).searchParams;
+        const rows = PLAYBOOK_RUNS.filter(
+          (row) =>
+            (query.get('schedule') === null || row.schedule === query.get('schedule')) &&
+            (query.get('playbook') === null || row.playbook === query.get('playbook')) &&
+            (query.get('origin') === null || row.origin === query.get('origin')),
+        );
         return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(rows) });
       }
       const body = ROUTES[path] ?? fallback(path);

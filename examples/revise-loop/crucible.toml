@@ -11,6 +11,7 @@ inject = ["check.sh"]
 backend = "openshell"
 harness = "claude"
 model = "fake"
+allowed_tools = ["Read", "Edit", "Write", "Glob", "Grep", "Bash"]
 sandbox_image = "localhost/crucible-fake-claude:dev"
 goal = "Write a probe the reviewer accepts."
 

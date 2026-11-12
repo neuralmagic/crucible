@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { buildCostBreakdown, type TaskCostInput } from './costBreakdown';
+import {
+  buildCostBreakdown,
+  iterDisplayCosts,
+  type TaskCostInput,
+  type TaskCostRow,
+} from './costBreakdown';
 
 const r = (iter: number, task: string, cost: number | null | undefined): TaskCostInput => ({
   iter,
@@ -60,5 +65,43 @@ describe('buildCostBreakdown', () => {
     const b = buildCostBreakdown([r(1, 'propose', -1.0), r(1, 'measure', 2.0)], null);
     expect(b?.rows.map((x) => x.task)).toEqual(['measure']);
     expect(b?.tasksTotal).toBeCloseTo(2.0);
+  });
+});
+
+describe('iterDisplayCosts', () => {
+  const row = (inputs: TaskCostInput[]): TaskCostRow => {
+    const b = buildCostBreakdown(inputs, null);
+    if (b === null || b.rows.length === 0) throw new Error('fixture produced no rows');
+    return b.rows[0];
+  };
+
+  it('sums the iter cells to the row total when independent rounding would not', () => {
+    const row0 = row([
+      r(1, 'propose', 0.1268564),
+      r(2, 'propose', 0.2094645),
+      r(3, 'propose', 0.3084733),
+    ]);
+    const cells = iterDisplayCosts(row0);
+    const cents = [...cells.values()].map((v) => Math.round(v * 100));
+    expect(cents).toEqual([12, 21, 31]);
+    expect(cents.reduce((a, b) => a + b, 0)).toBe(Math.round(row0.total * 100));
+  });
+
+  it('leaves cells whose rounding already sums alone', () => {
+    const cells = iterDisplayCosts(row([r(1, 'propose', 0.1), r(2, 'propose', 0.2), r(3, 'propose', 0.3)]));
+    expect([...cells.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v)).toEqual([0.1, 0.2, 0.3]);
+  });
+
+  it('gives a spare cent to the cell with the largest fractional remainder', () => {
+    const cells = iterDisplayCosts(row([r(1, 'propose', 0.104), r(2, 'propose', 0.101), r(3, 'propose', 0.101)]));
+    expect(cells.get(1)).toBeCloseTo(0.11);
+    expect(cells.get(2)).toBeCloseTo(0.10);
+    expect(cells.get(3)).toBeCloseTo(0.10);
+  });
+
+  it('breaks remainder ties by iteration', () => {
+    const cells = iterDisplayCosts(row([r(2, 'propose', 0.105), r(1, 'propose', 0.105)]));
+    expect(cells.get(1)).toBeCloseTo(0.11);
+    expect(cells.get(2)).toBeCloseTo(0.10);
   });
 });

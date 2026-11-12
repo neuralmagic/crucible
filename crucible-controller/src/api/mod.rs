@@ -59,6 +59,7 @@ pub(crate) mod tests;
         crate::runs::api::runs::get_run_graph,
         crate::runs::api::evidence::get_task_evidence,
         crate::runs::api::evidence::get_run_log,
+        crate::runs::api::evidence::get_run_task_log,
         crate::runs::api::evidence::get_run_files,
         crate::runs::api::rerun::preview_rerun,
         crate::runs::api::evidence::get_run_file,
@@ -94,6 +95,8 @@ pub(crate) mod tests;
         crate::playbooks::api::drafts::get_playbook_draft_origin_files,
         crate::playbooks::api::drafts::get_playbook_draft_tarball,
         crate::playbooks::api::drafts::save_playbook_draft,
+        crate::playbooks::api::drafts::generate_playbook_draft,
+        crate::playbooks::api::drafts::get_playbook_draft_generate_progress,
         crate::playbooks::api::drafts::delete_playbook_draft,
         crate::playbooks::api::drafts::rename_playbook_draft,
         crate::playbooks::api::drafts::clone_playbook_draft,
@@ -275,6 +278,10 @@ pub(crate) mod tests;
         crate::playbooks::api::import::PackImportDto,
         crate::playbooks::api::drafts::CreateDraftBody,
         crate::playbooks::api::drafts::SaveDraftBody,
+        crate::playbooks::api::drafts::GenerateDraftBody,
+        crate::playbooks::api::drafts::GeneratedDraftDto,
+        crate::playbooks::api::drafts::DraftProgressDto,
+        crate::playbooks::api::drafts::DraftProgressEntryDto,
         crate::playbooks::api::drafts::LaunchDraftBody,
         crate::playbooks::api::drafts::GraduateDraftBody,
         crate::playbooks::api::drafts::GraduateAck,
@@ -466,6 +473,7 @@ pub fn router(state: ApiState) -> Router {
         .routes(routes!(crate::runs::api::runs::get_run_graph))
         .routes(routes!(crate::runs::api::evidence::get_task_evidence))
         .routes(routes!(crate::runs::api::evidence::get_run_log))
+        .routes(routes!(crate::runs::api::evidence::get_run_task_log))
         .routes(routes!(crate::runs::api::evidence::get_run_files))
         .routes(routes!(crate::runs::api::rerun::preview_rerun))
         .routes(routes!(crate::runs::api::runs::list_run_artifacts))
@@ -524,6 +532,12 @@ pub fn router(state: ApiState) -> Router {
                 ),
             ),
         )
+        .routes(routes!(
+            crate::playbooks::api::drafts::generate_playbook_draft
+        ))
+        .routes(routes!(
+            crate::playbooks::api::drafts::get_playbook_draft_generate_progress
+        ))
         .routes(routes!(
             crate::playbooks::api::drafts::rename_playbook_draft
         ))

@@ -578,6 +578,8 @@ fn test_cfg(state_dir: &Path, repos: Vec<String>) -> ControllerCfg {
         playbook_executor: crucible_controller::PlaybookExecutor::Pod,
         playbook_max_cost_cap: 25.0,
         playbook_max_time_cap: crucible_controller::model::MaxTime::hours(4),
+        draft_model: None,
+        draft_effort: None,
         loop_run_max_age: crucible_controller::model::MaxTime::hours(24),
         schedule_auto_disable_failures: 5,
         allow_t3: false,

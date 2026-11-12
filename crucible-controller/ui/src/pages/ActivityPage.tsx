@@ -3,7 +3,6 @@ import { $api } from '../api/client';
 import { formatError } from '../api/errors';
 import type { components } from '../api/schema.d';
 import { openEventSource } from '../api/session';
-import { issueStatusColor } from './issueStatus';
 import {
   createDataColumnHelper,
   DataTable,
@@ -15,10 +14,9 @@ import {
   Section,
   SectionHeader,
   Status,
-  statusTone,
   useDataTable,
 } from '../ui';
-import { detailPath } from './launchView';
+import { EventTransition, eventKeyPath } from './eventView';
 import { Stamp } from './Stamp';
 
 type EventDto = components['schemas']['EventDto'];
@@ -105,29 +103,26 @@ const columns = helper.columns([
     cell: ({ getValue }) => <Stamp iso={getValue()} />,
   }),
   helper.accessor('key', {
-    header: 'Issue',
+    header: 'Identifier',
     enableSorting: false,
     meta: { pad: 'tight', shrink: true },
-    cell: ({ getValue }) => (
-      <Identifier to={detailPath(getValue())} title={getValue()}>
-        {getValue()}
-      </Identifier>
-    ),
+    cell: ({ getValue }) => {
+      const key = getValue();
+      const to = eventKeyPath(key);
+      return to === null ? (
+        <Identifier title={key}>{key}</Identifier>
+      ) : (
+        <Identifier to={to} title={key}>
+          {key}
+        </Identifier>
+      );
+    },
   }),
   helper.display({
     id: 'transition',
     header: 'Transition',
     meta: { shrink: true },
-    cell: ({ row }) => (
-      <span className="flex items-center gap-2">
-        <Status
-          status={row.original.from}
-          tone={statusTone(issueStatusColor(row.original.from))}
-        />
-        <Mono tone="ink-3">→</Mono>
-        <Status status={row.original.to} tone={statusTone(issueStatusColor(row.original.to))} />
-      </span>
-    ),
+    cell: ({ row }) => <EventTransition from={row.original.from} to={row.original.to} />,
   }),
   helper.accessor('actor', {
     header: 'Actor',

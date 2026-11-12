@@ -104,6 +104,9 @@ pub struct ApiState {
     /// (`CONTROLLER_PLAYBOOK_MAX_COST_USD` / `CONTROLLER_PLAYBOOK_MAX_TIME`). Deploy-pinned like
     /// `broker_contracts`; a pack may not declare either.
     pub(crate) playbook_caps: crate::config::PlaybookCaps,
+    /// The studio's drafting turns run on these engine knobs, read off the parsed
+    /// [`ControllerCfg`](crate::config::ControllerCfg) at startup. Deploy-pinned.
+    pub(crate) draft_knobs: crate::config::DraftKnobs,
     /// What substrate this deployment can dispatch a pack's agent onto, derived from the deploy
     /// profile and the playbook executor. Deploy-pinned; the preview gate warns on it and the
     /// launch endpoints refuse on it.
@@ -160,6 +163,9 @@ pub struct ApiState {
     pub(crate) cluster_links: Option<Arc<crate::identity::cluster_link::ClusterLinks>>,
     /// The issuer whose people grant the consent page decides; `None` when it serves no people.
     pub(crate) people_issuer: Option<Arc<crate::agent_auth::AgentAuth>>,
+    /// Each draft's latest generate progress, keyed by draft id, streamed by the drafting turn
+    /// and polled by the studio.
+    pub(crate) draft_progress: Arc<crate::playbooks::generate::DraftProgressRegistry>,
 }
 
 impl ApiState {
@@ -172,6 +178,11 @@ impl ApiState {
     /// the adopt path uses.
     pub(crate) fn trackers(&self) -> crate::launches::jira::Trackers {
         crate::launches::jira::trackers(self.jira.clone())
+    }
+
+    /// The engine knobs the studio's drafting turns run on, for the serve path's boot log.
+    pub fn draft_knobs(&self) -> &crate::config::DraftKnobs {
+        &self.draft_knobs
     }
 
     /// Assemble the shared handler state: the runtime handles the daemon owns, plus the
@@ -236,6 +247,10 @@ impl ApiState {
                 max_cost: cfg.playbook_max_cost_cap,
                 max_time: cfg.playbook_max_time_cap.clone(),
             },
+            draft_knobs: crate::config::DraftKnobs {
+                model: cfg.draft_model.clone(),
+                effort: cfg.draft_effort,
+            },
             dispatch: crate::playbooks::dispatch::DispatchCapability::from_cfg(cfg),
             default_cluster: cfg.dispatch_cluster.clone(),
             // A malformed policy already failed the boot validation; an unparsable one here would
@@ -258,6 +273,7 @@ impl ApiState {
             contracts,
             images_refresh: Arc::new(tokio::sync::Notify::new()),
             policy,
+            draft_progress: Arc::new(Default::default()),
         }
     }
 
@@ -373,6 +389,7 @@ impl ApiState {
             emission: None,
             broker_contracts: Default::default(),
             playbook_caps: Default::default(),
+            draft_knobs: Default::default(),
             dispatch: crate::playbooks::dispatch::DispatchCapability::new(
                 crate::config::PlaybookExecutor::Pod,
                 true,
@@ -390,6 +407,7 @@ impl ApiState {
             cluster_policy: Arc::new(Default::default()),
             policy: crate::authz::policy::ActivePolicy::default_set()
                 .expect("the shipped default policy set loads"),
+            draft_progress: Arc::new(Default::default()),
         }
     }
 }

@@ -29,6 +29,27 @@ export interface CostBreakdown {
 // Below half a cent the difference is float noise, not spend worth a footnote.
 const RECONCILE_EPSILON = 0.005;
 
+/// Per-iteration display costs for one row, in exact cents, adjusted so the cells sum to the
+/// row's rounded total: rounding each cell independently can drift a cent off it ($0.13 +
+/// $0.21 + $0.31 against a $0.64 total), and line items that do not sum to their total read
+/// as an error. Spare cents go to the cells with the largest fractional remainders; ties
+/// break by iteration so the choice is deterministic.
+export function iterDisplayCosts(row: TaskCostRow): ReadonlyMap<number, number> {
+  const totalCents = Math.round(row.total * 100);
+  const cells = [...row.byIter.entries()].map(([iter, cost]) => {
+    const cents = cost * 100;
+    return { iter, cents: Math.floor(cents), rem: cents - Math.floor(cents) };
+  });
+  let spare = totalCents - cells.reduce((a, c) => a + c.cents, 0);
+  const ranked = [...cells].sort((a, b) => b.rem - a.rem || a.iter - b.iter);
+  for (const c of ranked) {
+    if (spare <= 0) break;
+    c.cents += 1;
+    spare -= 1;
+  }
+  return new Map(cells.map((c) => [c.iter, c.cents / 100]));
+}
+
 /// Fold task results into a per-task cost table. `null` when no result carries a nonzero cost —
 /// the caller renders nothing rather than an all-dash table.
 export function buildCostBreakdown(

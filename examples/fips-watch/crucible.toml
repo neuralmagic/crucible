@@ -10,6 +10,7 @@ inject = ["variants.json", "blockers.json", "required.json", "file_issues.py"]
 backend = "openshell"
 harness = "claude"
 model = "claude-opus-4-6"
+allowed_tools = ["Read", "Edit", "Write", "Glob", "Grep", "Bash"]
 sandbox_image = "ghcr.io/neuralmagic/sandbox-rust-cc@sha256:3f45dc93d2510e42a5346ae766dddc54151c21be6440fce69d0b61df0c568a83"
 goal = "Explain why a Rust build stopped resolving crypto to the system OpenSSL, and propose the minimal fix."
 

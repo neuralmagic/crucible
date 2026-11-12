@@ -5,6 +5,7 @@ import {
   fileSize,
   logBody,
   logPath,
+  logSectionNote,
   payloadText,
   pendingLine,
 } from './taskEvidenceView';
@@ -81,6 +82,15 @@ describe('the run log', () => {
     expect(logBody({ run_id: 'r', dispatch: 'pod', text: null, truncated: false, location: null })).toBe(
       'no output recorded for this run',
     );
+  });
+
+  it('names the output source and a dropped head in the section note', () => {
+    expect(
+      logSectionNote({ run_id: 'r', dispatch: 'local', text: 'done\n', truncated: false, location: null }),
+    ).toBe('local process');
+    expect(
+      logSectionNote({ run_id: 'r', dispatch: 'pod', text: 'tail\n', truncated: true, location: null }),
+    ).toBe('work pod · earlier output dropped');
   });
 
   it('sends real output to the editor and a location hint to prose', () => {

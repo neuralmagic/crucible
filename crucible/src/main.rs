@@ -32,6 +32,8 @@ mod args;
 mod cli;
 mod control;
 #[cfg(feature = "autoresearch")]
+mod draft;
+#[cfg(feature = "autoresearch")]
 mod identity;
 mod object_store;
 mod process;

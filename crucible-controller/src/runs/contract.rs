@@ -187,6 +187,8 @@ pub enum RequestKind {
     LocalScope,
     /// `crucible fetch`: an artifact download the controller spawns the engine for.
     Fetch,
+    /// `crucible draft`: the intent-to-pack drafting turn the draft studio's generate panel runs.
+    Draft,
 }
 
 impl RequestKind {
@@ -199,6 +201,7 @@ impl RequestKind {
             Self::LocalGroundedRank => "local-grounded-rank",
             Self::LocalScope => "local-scope",
             Self::Fetch => "fetch",
+            Self::Draft => "draft",
         }
     }
 }

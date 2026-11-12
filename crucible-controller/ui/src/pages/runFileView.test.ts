@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { components } from '../api/schema';
+import { EVIDENCE_CSP, evidencePolicy } from './decisions';
 import {
   decodeFileKey,
   downloadName,
@@ -9,6 +10,8 @@ import {
   parseRunFilePath,
   prettyJson,
   producerOf,
+  RUN_FILE_CSP,
+  RUN_FILE_SCRIPTS,
   runFileApiPath,
   runFilePath,
   runFileUrl,
@@ -203,6 +206,34 @@ describe('selectRunFile', () => {
     expect(selectRunFile([stray, early], null, [])).toEqual({ state: 'found', file: stray });
   });
 
+  it('carries an HTML report inline, ahead of the markdown summary beside it', () => {
+    const submitted = file({
+      key: 'submit/campaign.submitted.json',
+      path: 'campaign.submitted.json',
+      task: 'submit',
+    });
+    const summary = file({ key: 'summary/CAMPAIGN.md', path: 'CAMPAIGN.md', task: 'summary' });
+    const report = file({ key: 'watch/CAMPAIGN.html', path: 'CAMPAIGN.html', task: 'watch' });
+    const order = ['submit', 'validate', 'summary', 'watch'];
+    expect(selectRunFile([submitted, summary, report], null, order)).toEqual({
+      state: 'found',
+      file: report,
+    });
+    expect(selectRunFile([submitted, summary, report], null)).toEqual({
+      state: 'found',
+      file: report,
+    });
+  });
+
+  it('lets the task order outrank the report format', () => {
+    const html = file({ key: 'render/REPORT.html', path: 'REPORT.html', task: 'render' });
+    const md = file({ key: 'report/REPORT.md', path: 'REPORT.md', task: 'report' });
+    expect(selectRunFile([html, md], null, ['render', 'report'])).toEqual({
+      state: 'found',
+      file: md,
+    });
+  });
+
   it('opens a captured file before an empty one, unless only empty ones exist', () => {
     const empty = file({ key: 'report/REPORT.md', path: 'REPORT.md', task: 'report', size_bytes: 0 });
     const log = file({ key: 'apply/apply.log', path: 'apply.log', task: 'apply', size_bytes: 0 });
@@ -269,5 +300,26 @@ describe('shouldAnchorFiles', () => {
 
   it('never anchors a page opened without a file key, whatever the click rewrote the URL to', () => {
     expect(shouldAnchorFiles({ openedOnDeepLink: false, anchored: false, loaded: 3 })).toBe(false);
+  });
+});
+
+describe('RUN_FILE_SCRIPTS', () => {
+  it('pins each script to one versioned https file', () => {
+    expect(RUN_FILE_SCRIPTS.length).toBeGreaterThan(0);
+    for (const url of RUN_FILE_SCRIPTS) {
+      const parsed = new URL(url);
+      expect(parsed.href, url).toBe(url);
+      expect(parsed.protocol, url).toBe('https:');
+      expect(parsed.search + parsed.hash, url).toBe('');
+      expect(parsed.pathname, url).toMatch(/\d+\.\d+\.\d+/);
+      expect(parsed.pathname, url).toMatch(/\.js$/);
+      expect(url, url).not.toMatch(/[*;,'\s]/);
+    }
+  });
+
+  it('adds them to the evidence policy and nothing else', () => {
+    const added = RUN_FILE_SCRIPTS.map((url) => ` ${url}`).join('');
+    expect(RUN_FILE_CSP).toBe(evidencePolicy(RUN_FILE_SCRIPTS));
+    expect(RUN_FILE_CSP.replace(added, '')).toBe(EVIDENCE_CSP);
   });
 });

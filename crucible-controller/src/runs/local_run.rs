@@ -27,6 +27,10 @@ use tokio::sync::Mutex;
 /// stopped honoring it.
 const CEILING_SLACK: Duration = Duration::from_secs(120);
 
+/// How often a live run's session-so-far is folded into the task-graph index while the engine
+/// subprocess is alive.
+const LIVE_FOLD_PERIOD: Duration = Duration::from_secs(2);
+
 /// How many trailing output lines ride a failure that published no session.
 const TAIL_LINES: usize = 40;
 
@@ -309,22 +313,38 @@ pub async fn supervise(db: Db, key: String, run: LocalRun) {
         streams.spawn(async move { pump(BufReader::new(err), &run_id, "stderr", log).await });
     }
 
-    let outcome = match tokio::time::timeout(deadline, child.wait()).await {
-        Ok(Ok(status)) => {
-            group.release();
-            format!("engine exited {status}")
-        }
-        Ok(Err(e)) => {
-            drop(group);
-            format!("waiting on the engine failed: {e}")
-        }
-        Err(_) => {
-            drop(group);
-            let _ = child.wait().await;
-            format!(
-                "the engine outlived its ceiling by {}s and was killed",
-                CEILING_SLACK.as_secs()
-            )
+    let outcome = {
+        // The session-so-far is folded on a tick while the engine lives, so the run page's graph
+        // draws during the run rather than after it exits.
+        let mut fold = tokio::time::interval(LIVE_FOLD_PERIOD);
+        fold.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let ceiling = tokio::time::Instant::now() + deadline;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    group.release();
+                    break format!("engine exited {status}");
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    drop(group);
+                    break format!("waiting on the engine failed: {e}");
+                }
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                _ = fold.tick() => {
+                    fold_live_graph(&db, &run_id, &dir).await;
+                }
+                _ = tokio::time::sleep_until(ceiling) => {
+                    drop(group);
+                    let _ = child.wait().await;
+                    break format!(
+                        "the engine outlived its ceiling by {}s and was killed",
+                        CEILING_SLACK.as_secs()
+                    );
+                }
+            }
         }
     };
     while let Some(joined) = streams.join_next().await {
@@ -350,6 +370,26 @@ pub async fn supervise(db: Db, key: String, run: LocalRun) {
     }
     if let Err(e) = complete(&db, &key, &run_id, &session).await {
         tracing::warn!(%key, %run_id, error = %format!("{e:#}"), "ingesting a local run failed");
+    }
+}
+
+/// Fold the run's session-so-far into the task-graph index, best-effort: the completion fold
+/// after the engine exits is authoritative, so a failure here costs a live update, not the run.
+/// A session file not written yet is the normal early state, not a degradation.
+async fn fold_live_graph(db: &Db, run_id: &str, dir: &Path) {
+    let content = match tokio::fs::read_to_string(session_log(dir)).await {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            tracing::warn!(%run_id, error = %e, "reading a live run's session log failed");
+            return;
+        }
+    };
+    if content.trim().is_empty() {
+        return;
+    }
+    if let Err(e) = crate::runs::ingest::fold_live_graph(db, run_id, &content).await {
+        tracing::warn!(%run_id, error = %format!("{e:#}"), "folding a live run's task graph failed");
     }
 }
 
