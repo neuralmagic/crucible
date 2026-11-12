@@ -179,6 +179,9 @@ pub struct McpArgs {
     /// containers-storage driver of build pods
     #[arg(long, env = "MCP_STORAGE_DRIVER", value_enum, default_value_t = StorageDriver::Vfs)]
     pub storage_driver: StorageDriver,
+    /// Extra `buildah bud` argument for every Dockerfile build, after buildit's own (repeatable)
+    #[arg(long = "bud-arg", allow_hyphen_values = true)]
+    pub bud_args: Vec<String>,
     /// Builds per sandbox that may be running at once; `build` is refused past this
     #[arg(long, default_value_t = 4)]
     pub max_builds: usize,
@@ -335,6 +338,7 @@ pub async fn serve(client: kube::Client, args: McpArgs) -> Result<()> {
             limits: args.limits,
         },
         storage: args.storage_driver,
+        bud_args: args.bud_args,
         users: args.pod_users,
         deadline_secs: args.pod_deadline,
         ttl_secs: args.job_ttl,
@@ -1076,6 +1080,7 @@ fn bud_argv(
     build_args: &BTreeMap<String, String>,
     volumes: &[(String, String)],
     ccache: bool,
+    extra: &[String],
 ) -> Result<Vec<String>> {
     let mut out = argv(["buildah", "bud"]);
     for (_, volume) in volumes {
@@ -1100,6 +1105,7 @@ fn bud_argv(
         }
         out.extend(["--build-arg".to_string(), format!("{k}={v}")]);
     }
+    out.extend(extra.iter().cloned());
     out.extend([
         "-f".to_string(),
         format!("{}/{}", jobs::WORKSPACE, dockerfile.as_str()),
@@ -1728,6 +1734,7 @@ impl Broker {
             &p.build_args,
             &volumes,
             p.ccache,
+            &self.site.bud_args,
         )?;
         let files = (!snapshots.plan.is_empty()).then(|| step::SnapshotFiles {
             plan: format!("{INPUTS_DIR}/snapshots"),
@@ -3012,6 +3019,7 @@ mod tests {
                 storage: std::env::var("BUILDIT_E2E_STORAGE_DRIVER")
                     .map(|d| <StorageDriver as clap::ValueEnum>::from_str(&d, false).unwrap())
                     .unwrap_or_default(),
+                bud_args: Vec::new(),
                 users: match std::env::var("BUILDIT_E2E_POD_USERS").as_deref() {
                     Ok("host") => jobs::PodUsers::Host,
                     _ => jobs::PodUsers::Namespaced,
@@ -4527,13 +4535,22 @@ mod tests {
         let df = RelPath::parse("Dockerfile").unwrap();
         let args = BTreeMap::new();
         let conf = format!("{}/ccache.conf:/etc/ccache.conf:ro", jobs::FACTS);
-        let with = bud_argv(&id, &df, None, &args, &[], true).unwrap();
+        let with = bud_argv(&id, &df, None, &args, &[], true, &[]).unwrap();
         assert!(
             with.windows(2).any(|w| w == ["--volume", conf.as_str()]),
             "{with:?}"
         );
-        let without = bud_argv(&id, &df, None, &args, &[], false).unwrap();
+        let without = bud_argv(&id, &df, None, &args, &[], false, &[]).unwrap();
         assert!(!without.iter().any(|a| a.contains("ccache")), "{without:?}");
+
+        let args = BTreeMap::from([("A".to_string(), "1".to_string())]);
+        let extra = ["--retry".to_string(), "5".to_string()];
+        let tuned = bud_argv(&id, &df, None, &args, &[], false, &extra).unwrap();
+        let at = |a: &str| tuned.iter().position(|x| x == a).unwrap();
+        assert!(
+            at("--build-arg") < at("--retry") && at("5") + 1 == at("-f"),
+            "the site's arguments follow buildit's own: {tuned:?}"
+        );
     }
 
     #[test]

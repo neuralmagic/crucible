@@ -441,8 +441,8 @@ pub struct BuilditCfg {
     /// manages the namespace and holds pods that name no queue.
     #[serde(default)]
     pub queue: Option<KubeName>,
-    /// Builder pods on every cluster: `node_arch`, `max_builds`, `pod_deadline_secs`, `requests`
-    /// and `limits`. Unset, they run on the loop pod's architecture with buildit's defaults.
+    /// Builder pods on every cluster: `node_arch`, `max_builds`, `pod_deadline_secs`, `requests`,
+    /// `limits`, `storage_driver` and `bud_args`. Unset, they run on the loop pod's architecture with buildit's defaults.
     #[serde(default)]
     pub builders: BuilderPods,
     /// Builder pods on one cluster, each setting replacing `builders`' there:

@@ -116,6 +116,8 @@ pub struct Site {
     pub node_arch: Option<String>,
     pub resources: Resources,
     pub storage: StorageDriver,
+    /// Extra `buildah bud` arguments for every Dockerfile build.
+    pub bud_args: Vec<String>,
     pub users: PodUsers,
     /// The longest any Job of this server runs.
     pub deadline_secs: i64,
@@ -1028,6 +1030,7 @@ mod tests {
                 limits: Vec::new(),
             },
             storage: StorageDriver::Overlay,
+            bud_args: Vec::new(),
             users: PodUsers::Namespaced,
             deadline_secs: 3600,
             ttl_secs: 900,
