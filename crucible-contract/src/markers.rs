@@ -86,6 +86,10 @@ pub const ENV_UI_BASE_URL: &str = "CRUCIBLE_UI_BASE_URL";
 /// Absent means the pod has no controller to deliver to.
 pub const ENV_CONTROLLER_URL: &str = "CRUCIBLE_CONTROLLER_URL";
 
+/// Where the controller serves a run its pack's locked tool downloads, as
+/// `<controller>/api/tools/<sha256 hex>`, to the run's pod token.
+pub const TOOLS_PATH: &str = "/api/tools";
+
 /// Env var carrying the pod token (RFC-0004:C-RUN-EVIDENCE), projected from the pod's Secret: a
 /// run pod's bearer for its run's evidence and its parent's, a turn pod's for its pack and
 /// transcript.

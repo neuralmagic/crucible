@@ -1022,7 +1022,7 @@ pub fn markdown() -> String {
     out.push_str(&dialect_sentence());
     out.push_str(
         "\n\n`prompt_file()`, `schema_file()`, and `load()` are the only file access, all confined \
-         below the pack directory, and a loaded module cannot re-export what it loaded. The surface has no \
+         below the pack directory or a dependency `crucible.lock` pins (`@name//path`), and a loaded module cannot re-export what it loaded. The surface has no \
          processes, network access, clock, or randomness.\n\n\
          For what the engine does with the compiled graph, see [Work graphs](./work-graphs.md); \
          for the normative rules, see the [implementation contract](./crucible-contract.md).\n\n",

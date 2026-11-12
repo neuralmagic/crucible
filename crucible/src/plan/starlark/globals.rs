@@ -378,11 +378,11 @@ fn call<'v>(
         let value = match (function, argument) {
             ("prompt_file", dsl::Value::String(path)) => state
                 .context_mut()
-                .prompt_file(&path)
+                .prompt_file(&path, at)
                 .map(dsl::Value::String),
             ("schema_file", dsl::Value::String(path)) => state
                 .context_mut()
-                .schema_file(&path)
+                .schema_file(&path, at)
                 .map(dsl::Value::Schema),
             ("param", dsl::Value::String(name)) => state.context_mut().param(&name),
             ("optional", dsl::Value::Task(task)) => Ok(dsl::Value::Optional(task.name)),

@@ -182,7 +182,7 @@ pub struct MissingEnv {
 /// What one manifest table's commands receive of the engine's environment. The default passes
 /// the base alone.
 #[derive(Clone)]
-pub struct HostEnv(Reach);
+pub struct HostEnv(Reach, Vec<std::path::PathBuf>);
 
 #[derive(Clone)]
 enum Reach {
@@ -193,7 +193,7 @@ enum Reach {
 
 impl Default for HostEnv {
     fn default() -> Self {
-        HostEnv(Reach::Declared(Vec::new()))
+        HostEnv(Reach::Declared(Vec::new()), Vec::new())
     }
 }
 
@@ -225,7 +225,7 @@ impl HostEnv {
 
     /// The engine's whole environment.
     pub fn inherited() -> HostEnv {
-        HostEnv(Reach::Inherited)
+        HostEnv(Reach::Inherited, Vec::new())
     }
 
     fn resolve_with(
@@ -243,7 +243,7 @@ impl HostEnv {
             }
         }
         if missing.is_empty() {
-            Ok(HostEnv(Reach::Declared(found)))
+            Ok(HostEnv(Reach::Declared(found), Vec::new()))
         } else {
             Err(MissingEnv { table, missing })
         }
@@ -253,18 +253,30 @@ impl HostEnv {
     /// engine's when inherited. Variables the engine sets for the command itself go on
     /// afterwards.
     pub fn apply(&self, cmd: &mut Command) {
-        let Reach::Declared(declared) = &self.0 else {
-            return;
-        };
-        cmd.env_clear();
-        for name in BASE {
-            if let Some(value) = std::env::var_os(name) {
-                cmd.env(name, value);
+        if let Reach::Declared(declared) = &self.0 {
+            cmd.env_clear();
+            for name in BASE {
+                if let Some(value) = std::env::var_os(name) {
+                    cmd.env(name, value);
+                }
+            }
+            for (name, value) in declared {
+                cmd.env(name.as_str(), value);
             }
         }
-        for (name, value) in declared {
-            cmd.env(name.as_str(), value);
+        if !self.1.is_empty() {
+            let engine = std::env::var_os("PATH").unwrap_or_default();
+            let path = self.1.iter().cloned().chain(std::env::split_paths(&engine));
+            if let Ok(path) = std::env::join_paths(path) {
+                cmd.env("PATH", path);
+            }
         }
+    }
+
+    /// The same environment with `dirs` searched before the engine's `PATH`.
+    pub fn with_path_prefix(mut self, dirs: Vec<std::path::PathBuf>) -> HostEnv {
+        self.1 = dirs;
+        self
     }
 }
 

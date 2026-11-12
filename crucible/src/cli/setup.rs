@@ -319,7 +319,7 @@ pub(crate) fn prep_plan_runner(
     prep_plan_runner_with_params(
         manifest_path,
         None,
-        &std::collections::BTreeMap::new(),
+        (&std::collections::BTreeMap::new()).into(),
         crate::openshell::gateway::ComputeDriver::Podman,
         crate::args::AgentOverride::default(),
         None,
@@ -462,10 +462,27 @@ pub(crate) fn state_dir(manifest_path: &Path) -> std::path::PathBuf {
     manifest::manifest_dir(manifest_path).join("state")
 }
 
+/// What a launcher hands a manifest run: its parameter values, and the compiled graph to run
+/// instead of compiling the manifest's workflow source when it has one.
+#[derive(Clone, Copy)]
+pub(crate) struct Supplied<'a> {
+    pub params: &'a std::collections::BTreeMap<String, String>,
+    pub resolved_workflow: Option<&'a Path>,
+}
+
+impl<'a> From<&'a std::collections::BTreeMap<String, String>> for Supplied<'a> {
+    fn from(params: &'a std::collections::BTreeMap<String, String>) -> Self {
+        Supplied {
+            params,
+            resolved_workflow: None,
+        }
+    }
+}
+
 pub(crate) fn prep_plan_runner_with_params(
     manifest_path: &Path,
     variant: Option<&manifest::variant::VariantName>,
-    params: &std::collections::BTreeMap<String, String>,
+    supplied: Supplied<'_>,
     compute_driver: crate::openshell::gateway::ComputeDriver,
     agent: crate::args::AgentOverride,
     engine: Option<tokio::runtime::Handle>,
@@ -473,7 +490,7 @@ pub(crate) fn prep_plan_runner_with_params(
 ) -> Result<(crate::plan::harness::HarnessRunner, manifest::Manifest)> {
     let mut m = manifest::Manifest::load_frozen_variant(manifest_path, variant)?;
     let manifest_dir = manifest::manifest_dir(manifest_path);
-    m.resolve_workflow_with(&manifest_dir, params)?;
+    m.resolve_workflow_from(&manifest_dir, supplied.params, supplied.resolved_workflow)?;
     warn_inherited_env(crate::exposure::inherits_engine_env(&m));
     if let Some(all) = m.launch.all() {
         for (setting, flag, value) in [
@@ -497,7 +514,7 @@ pub(crate) fn prep_plan_runner_with_params(
     let frozen = frozen_projection(
         &m,
         m.publish.as_ref().and_then(|p| p.pr_repo.as_deref()),
-        &manifest::launch::split(params).0,
+        &manifest::launch::split(supplied.params).0,
         &p.session_log,
     )?;
     let launched_ref = m.launch.repo_ref();
@@ -557,7 +574,8 @@ pub(crate) fn prep_plan_runner_with_params(
         .as_ref()
         .map(crate::plan::workflow::WorkflowCfg::host_env)
         .transpose()?
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .with_path_prefix(crucible::plan::deps::tool_dirs(&manifest_dir)?);
     args.workflow_servers = m
         .workflow
         .as_ref()

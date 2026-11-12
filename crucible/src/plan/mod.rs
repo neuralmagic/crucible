@@ -6,6 +6,7 @@ pub mod admission;
 pub mod admitted;
 pub mod attempt;
 pub mod decide;
+pub mod deps;
 pub mod diag;
 pub mod exec;
 pub mod files;

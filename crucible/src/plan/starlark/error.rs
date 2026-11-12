@@ -1,9 +1,11 @@
 //! What the workflow compiler refuses, with the source span it refused at.
 
 use crate::errors::FileError;
+use crate::plan::deps::DepName;
 use crate::plan::diag;
 use crate::plan::ir::{MAX_FANOUT_CEILING, MAX_REPAIR_CEILING, MAX_ROUNDS_CEILING};
 use crate::plan::workflow::WorkflowError;
+use crucible_contract::pack_tree::TreeDigest;
 use starlark_syntax::codemap::FileSpan;
 
 pub(crate) const MAX_SOURCE_BYTES: usize = 256 * 1024;
@@ -295,6 +297,16 @@ pub enum CompileError {
     LoadSourceBudgetSpent,
     #[error("load({raw:?}) resolved to no module")]
     LoadUnresolved { raw: String },
+    #[error("{call}({raw:?}) names dependency \"{name}\", which crucible.lock does not list")]
+    DepUnknown {
+        call: &'static str,
+        raw: String,
+        name: DepName,
+    },
+    #[error("dependency \"{name}\" ({tree}) is not in the cache; run `crucible deps fetch`")]
+    DepNotFetched { name: DepName, tree: TreeDigest },
+    #[error(transparent)]
+    Deps(#[from] crate::plan::deps::Error),
     #[error("unknown workflow variable {name:?}{}", diag::hint(.suggestion.as_deref()))]
     UnknownVariable {
         name: String,
