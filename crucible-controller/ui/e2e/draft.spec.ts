@@ -208,6 +208,12 @@ async function serveFire(
       },
     }),
   );
+  await page.route('**/api/runs/RUN-0500/files/read/NOTES.md', (route: Route) =>
+    route.fulfill({
+      contentType: 'application/octet-stream',
+      body: '## Reading list\n\nflashinfer, paged attention, cuda graphs\n',
+    }),
+  );
 }
 
 test.describe('draft authoring studio', () => {
@@ -807,6 +813,22 @@ test.describe('draft authoring studio', () => {
     );
     await expect(page.getByTestId('run-task-log')).toBeVisible();
     await expect(page.getByTestId('run-engine-log')).toBeVisible();
+
+    // The pane carries the run page's graph and files beside the draft's own preview graph: the
+    // run's is the section titled Task graph, and a captured file opens in place — the studio
+    // never navigates away to the run page's file URL.
+    const runGraph = page
+      .locator('section[data-ui="section"]')
+      .filter({ has: page.locator('[data-ui="section-header"]', { hasText: 'Task graph' }) })
+      .getByTestId('workflow-graph');
+    await expect(runGraph.locator('[data-task="read"]')).toContainText('pass');
+    const files = page.locator('[id="crucible.run-files"]');
+    await expect(files.getByRole('button', { name: 'read/NOTES.md' })).toBeVisible();
+    await files.getByRole('button', { name: 'read/NOTES.md' }).click();
+    await expect(files).toContainText('flashinfer, paged attention, cuda graphs');
+    await expect(page).toHaveURL(/\/playbooks\/drafts\/studio$/);
+    await expect(page.getByText('No artifacts recorded for this run.')).toBeVisible();
+    await expect(page.getByText('$0.19 across graded tasks')).toBeVisible();
 
     fire.settled = true;
     await expect(card).toContainText('failed', { timeout: 15000 });

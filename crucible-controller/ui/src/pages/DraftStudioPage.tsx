@@ -44,7 +44,9 @@ import { ImagePickerField } from './ImagePickerField';
 import { EngineLogSection } from './EngineLogSection';
 import { TaskOutputSection } from './TaskOutputSection';
 import { RunTaskGrid } from './RunTaskGrid';
+import { RunTaskGraph } from './RunTaskGraph';
 import { LiveSession } from '../live/LiveSession';
+import { ArtifactsPanel, CostSection, FilesPanel } from './RunDetailPage';
 import { readSandboxImage, setSandboxImage } from './imagePicker';
 import { ProviderModelField } from './ProviderModelField';
 import { NO_AGENT_PICK, type AgentPick } from './agentPick';
@@ -1081,20 +1083,15 @@ function DraftStudio({ id }: { id: string }) {
         )}
       </Section>
 
-      {fireRun === null ? null : (
-        <>
-          {fireRunLive && (
-            <Section>
-              <SectionHeader title="Live session" />
-              <SectionBody>
-                <LiveSession runId={fireRun.run_id} compact onEnded={() => void fire.refetch()} />
-              </SectionBody>
-            </Section>
-          )}
-          <RunTaskGrid runId={fireRun.run_id} />
-          <TaskOutputSection runId={fireRun.run_id} live={fireRunLive} />
-          <EngineLogSection runId={fireRun.run_id} live={fireRunLive} />
-        </>
+      {fireRun === null || fireKey === null ? null : (
+        <FireRunView
+          key={fireRun.run_id}
+          runId={fireRun.run_id}
+          launchKey={fireKey}
+          runCost={fireRun.cost_usd ?? null}
+          live={fireRunLive}
+          onEnded={() => void fire.refetch()}
+        />
       )}
 
       <Section>
@@ -1350,5 +1347,51 @@ function DraftStudio({ id }: { id: string }) {
         </div>
       )}
     </div>
+  );
+}
+
+/// The run a test fire produced, in the studio pane: the same sections the run page shows a run,
+/// in the same order, minus the header the fire card already is. A captured file opens in place —
+/// the file's own URL belongs to the run page, and following it here would leave the studio.
+function FireRunView({
+  runId,
+  launchKey,
+  runCost,
+  live,
+  onEnded,
+}: {
+  runId: string;
+  launchKey: string;
+  runCost: number | null;
+  live: boolean;
+  onEnded: () => void;
+}) {
+  const [fileKey, setFileKey] = useState<string | null>(null);
+  return (
+    <>
+      {live && (
+        <Section>
+          <SectionHeader title="Live session" />
+          <SectionBody>
+            <LiveSession runId={runId} compact onEnded={onEnded} />
+          </SectionBody>
+        </Section>
+      )}
+      <RunTaskGraph runId={runId} />
+      <RunTaskGrid runId={runId} />
+      <TaskOutputSection runId={runId} live={live} />
+      <EngineLogSection runId={runId} live={live} />
+      <FilesPanel
+        runId={runId}
+        launchKey={launchKey}
+        fileKey={fileKey}
+        live={live}
+        onOpenFile={setFileKey}
+      />
+      <div className="grid grid-cols-2 max-wide:grid-cols-1">
+        <CostSection runId={runId} runCost={runCost} />
+        <ArtifactsPanel runId={runId} />
+      </div>
+    </>
   );
 }

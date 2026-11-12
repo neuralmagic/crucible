@@ -1110,7 +1110,7 @@ const costHelper = createDataColumnHelper<TaskCostRow>();
 /// Per-task cost from the run's graph results. Rendered only when the run admitted a plan AND some
 /// task recorded a nonzero cost — otherwise there is nothing to break down and the section is
 /// simply absent (same quiet treatment as the task graph itself).
-function CostSection({ runId, runCost }: { runId: string; runCost: number | null | undefined }) {
+export function CostSection({ runId, runCost }: { runId: string; runCost: number | null | undefined }) {
   const query = useRunGraph(runId);
   const graph: RunGraph | undefined = query.data;
 
@@ -1224,7 +1224,7 @@ const artifactHelper = createDataColumnHelper<ArtifactEntry>();
 /// The run's artifact directory, from the typed manifest endpoint. html opens in a tab (served
 /// under a sandbox CSP); everything else downloads. RESULTS.md / summary.json additionally expand
 /// to an inline view. Old runs with nothing published get the same quiet text as the flow section.
-function ArtifactsPanel({ runId }: { runId: string }) {
+export function ArtifactsPanel({ runId }: { runId: string }) {
   const manifest = $api.useQuery(
     'get',
     '/api/runs/{run_id}/artifacts',
@@ -1386,16 +1386,18 @@ function anchorFilesPanel(el: HTMLElement): () => void {
   return stop;
 }
 
-function FilesPanel({
+export function FilesPanel({
   runId,
   launchKey,
   fileKey,
   live,
+  onOpenFile,
 }: {
   runId: string;
   launchKey: string | null;
   fileKey: string | null;
   live: boolean;
+  onOpenFile?: (key: string) => void;
 }) {
   const navigate = useNavigate();
   const poll = live ? POLL_RUNNING : false;
@@ -1513,6 +1515,10 @@ function FilesPanel({
                   type="button"
                   aria-pressed={e.key === selectedKey}
                   onClick={() => {
+                    if (onOpenFile !== undefined) {
+                      onOpenFile(e.key);
+                      return;
+                    }
                     void navigate(runFilePath({ launchKey, runId, fileKey: e.key }), {
                       replace: true,
                     });
