@@ -1,8 +1,12 @@
 import { useState } from 'react';
-import { $api } from '../api/client';
+import { useQuery } from '@tanstack/react-query';
+import { $api, fetchRunFile } from '../api/client';
 import { CodeSurface } from '../editor/CodeSurface';
 import { LogView } from '../logs/LogView';
-import { cn, Split, SplitHandle, SplitPane } from '../ui';
+import { cn, Mono, Spinner, Split, SplitHandle, SplitPane } from '../ui';
+import { formatError } from '../api/errors';
+import { sandboxedDocument } from './decisions';
+import { RUN_FILE_CSP, inlineKind } from './runFileView';
 import { evidenceItems, logBody, logPath, pendingLine, type EvidenceItem } from './taskEvidenceView';
 
 const LOG_ID = 'log';
@@ -23,6 +27,42 @@ function Prose({ body, testId }: { body: string; testId?: string }) {
     >
       {body}
     </pre>
+  );
+}
+
+/// An HTML file a task captured, opened as the document it is: the payload's copy when it carried
+/// one, the run's file store otherwise, sandboxed the way the Files tab sandboxes one.
+function EvidenceDocument({ runId, item }: { runId: string; item: EvidenceItem }) {
+  const fetched = useQuery({
+    queryKey: ['task-evidence-file', runId, item.key],
+    queryFn: () => fetchRunFile(runId, item.key ?? ''),
+    enabled: item.body === null && item.key !== null,
+  });
+  const source = item.body ?? fetched.data ?? null;
+  if (source === null) {
+    if (fetched.isError) {
+      return (
+        <div className="px-2 py-1.5">
+          <Mono tone="ink-3">{formatError(fetched.error)}</Mono>
+        </div>
+      );
+    }
+    return (
+      <div className="px-2 py-1.5">
+        <Spinner label="Opening document" />
+      </div>
+    );
+  }
+  return (
+    <div className="min-h-0 flex-1">
+      <iframe
+        className="h-full w-full border-0 bg-surface"
+        title={item.name}
+        sandbox="allow-scripts"
+        referrerPolicy="no-referrer"
+        srcDoc={sandboxedDocument(source, 'text/html', RUN_FILE_CSP)}
+      />
+    </div>
   );
 }
 
@@ -91,6 +131,7 @@ export function TaskEvidence({ runId, task }: { runId: string; task: string }) {
       note: null,
       path: log.data === undefined ? null : logPath(log.data),
       body: log.data === undefined ? 'reading the run log…' : logBody(log.data),
+      key: null,
     },
   ];
   const selected = items.find((item) => item.id === picked) ?? items[0];
@@ -126,9 +167,11 @@ export function TaskEvidence({ runId, task }: { runId: string; task: string }) {
         <SplitHandle orientation="vertical" label="Resize the evidence content" />
         <SplitPane id="content" minSize="3rem">
           <div data-testid="task-evidence-content" className="flex min-h-0 flex-1 flex-col">
-            {selected.body === null ? (
+            {selected.kind === 'file' && inlineKind(selected.name) === 'html' ? (
+              <EvidenceDocument runId={runId} item={selected} />
+            ) : selected.body === null ? (
               <p className="m-0 px-2 py-1.5 font-mono text-data text-ink-3">
-                {`${selected.name} was captured but not carried inline.`}
+                {`${selected.name} was captured but not carried inline; it opens from the run's Files tab.`}
               </p>
             ) : selected.path === null ? (
               <Prose body={selected.body} testId={CONTENT_TEST_ID[selected.kind]} />

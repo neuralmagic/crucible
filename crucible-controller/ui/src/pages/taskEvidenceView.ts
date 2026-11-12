@@ -2,6 +2,7 @@
 // `GET /api/runs/{run_id}/log`. Pure functions so the wording is testable without a graph.
 
 import type { components } from '../api/schema';
+import { inlineKind } from './runFileView';
 
 export type TaskEvidence = components['schemas']['TaskEvidenceDto'];
 export type EvidenceFile = components['schemas']['EvidenceFileDto'];
@@ -14,10 +15,12 @@ export function fileSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-/// One file's line under its name: its size, plus why its content is not here when it isn't.
+/// One file's line under its name: its size, plus why its content is not here when it isn't. An
+/// HTML file opens as a document whatever the payload carried, so its row says the size alone.
 export function fileLine(file: EvidenceFile): string {
   const size = fileSize(file.size_bytes);
-  return (file.content ?? null) === null ? `${size} · not shown inline` : size;
+  if ((file.content ?? null) !== null) return size;
+  return inlineKind(file.name) === 'html' ? size : `${size} · not shown inline`;
 }
 
 /// The task's payload, pretty-printed; null when it emitted none.
@@ -65,6 +68,9 @@ export interface EvidenceItem {
   /// The path the body is highlighted by; null for prose read as text.
   path: string | null;
   body: string | null;
+  /// The file's key at the run's file-bytes endpoint, for a document the pane fetches itself;
+  /// null for the rows that are not files.
+  key: string | null;
 }
 
 /// The evidence one task left, as the list reads it: its note, what it emitted, then every file it
@@ -73,7 +79,7 @@ export function evidenceItems(evidence: TaskEvidence): EvidenceItem[] {
   const items: EvidenceItem[] = [];
   const note = evidence.note ?? '';
   if (note !== '') {
-    items.push({ id: 'result', kind: 'result', name: 'result', note: null, path: null, body: note });
+    items.push({ id: 'result', kind: 'result', name: 'result', note: null, path: null, body: note, key: null });
   }
   const payload = payloadText(evidence);
   if (payload !== null) {
@@ -84,6 +90,7 @@ export function evidenceItems(evidence: TaskEvidence): EvidenceItem[] {
       note: null,
       path: `${evidence.task}/payload.json`,
       body: payload,
+      key: null,
     });
   }
   for (const file of evidence.files) {
@@ -94,6 +101,7 @@ export function evidenceItems(evidence: TaskEvidence): EvidenceItem[] {
       note: fileLine(file),
       path: file.name,
       body: file.content ?? null,
+      key: file.key,
     });
   }
   return items;

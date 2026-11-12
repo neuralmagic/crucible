@@ -21,6 +21,10 @@ dto! {
     /// One file a task captured, as the panel reads it.
     pub struct EvidenceFileDto: From<f: crate::runs::run_files::CapturedFile> {
         pub name: String,
+        /// The file's key, `<capture directory>/<declared path>`, as this API's file-bytes endpoint
+        /// takes it: the address for bytes the payload did not carry, a fan-out instance's key
+        /// escaped as the engine named its directory.
+        pub key: String,
         pub size_bytes: u64,
         /// The file's text; null for a file that is not decodable text or is over the inline cap, which
         /// the panel then lists by name and size alone.
