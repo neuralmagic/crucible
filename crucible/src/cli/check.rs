@@ -330,6 +330,7 @@ fn check_single(manifest_path: &Path, variant: Option<&VariantName>) -> Result<C
 /// bootstrap, no injects, no `setup_cmd` — which is the contract the drafting loop
 /// (`crucible draft`) relies on: it checks an agent-authored pack before any human has signed
 /// off, and a draft is inert until launch.
+#[cfg(feature = "autoresearch")]
 pub fn run_compile_only(
     manifest_path: &Path,
     variant: Option<&VariantName>,
