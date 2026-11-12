@@ -74,7 +74,7 @@ pub struct Remote {
     /// A pull or save is on its way, and only replies newer than `draft_after` answer it.
     pub draft_busy: bool,
     pub draft_after: u64,
-    /// The drafting agent's panel and its session.
+    /// The drafting agent's pane and its session.
     pub agent: crate::agent::Desk,
 
     /// A key pasted for the profile, for one the browser cannot reach.

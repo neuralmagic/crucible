@@ -1,10 +1,10 @@
 //! Drafting with an agent: a coding agent in a sandbox that edits, launches and watches one
-//! draft through the controller's MCP tools, its output streamed into the Pack tab.
+//! draft through the controller's MCP tools, its output streamed into the Agent pane.
 //!
 //! ```text
-//! Pack tab ── prompt ──▶ Session ── exec ──▶ sandbox: the user's harness
-//!    ▲                     │                    │ MCP
-//!    └── entries, saves ───┘                  relay ──▶ controller /mcp, as the user
+//! Agent pane ── prompt ──▶ Session ── exec ──▶ sandbox: the user's harness
+//!     ▲                      │                    │ MCP
+//!     └── entries, saves ────┘                  relay ──▶ controller /mcp, as the user
 //! ```
 //!
 //! The session is the only part that knows where the agent runs. A hosted sandbox would be a
@@ -31,7 +31,7 @@ use crate::agent::session::Session;
 use crate::session::AgentStep;
 use crate::workspace::PaneKind;
 
-/// Agent events the panel keeps; older ones are dropped.
+/// Agent events the pane keeps; older ones are dropped.
 const KEPT: usize = 8000;
 /// The task name the session's agent events carry, which no pack task can have.
 pub const SPEAKER: &str = "@agent";
@@ -238,7 +238,7 @@ impl From<String> for State {
 /// Setting up the gateway, a provider and the image.
 pub const SETUP_GUIDE: &str = "https://neuralmagic.github.io/crucible/desktop-agent-local.html";
 
-/// Something the panel shows beside a turn: what was asked, or what the session did.
+/// Something the pane shows beside a turn: what was asked, or what the session did.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Entry {
     Asked {
@@ -274,7 +274,7 @@ pub struct Update {
     pub launched: bool,
 }
 
-/// The panel's state for the profile in use.
+/// The pane's state for the profile in use.
 pub struct Desk {
     pub prompt: TextEdit,
     session: Option<Session>,

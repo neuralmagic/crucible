@@ -306,10 +306,10 @@ mod tests {
     type Sent = std::collections::BTreeMap<String, String>;
     type Asked = Arc<Mutex<Vec<(Option<String>, Option<String>, Value, Sent)>>>;
 
-    /// A stand-in controller: records each call's bearer, act-as header and body, and answers
-    /// like the hosted tool surface does.
     type Feed = tokio::sync::mpsc::UnboundedSender<&'static str>;
 
+    /// A stand-in controller: records each call's bearer, act-as header and body, and answers
+    /// like the hosted tool surface does.
     async fn controller() -> (String, Asked, Arc<Mutex<Vec<Option<String>>>>, Feed) {
         let asked = Asked::default();
         let seen = Arc::clone(&asked);
