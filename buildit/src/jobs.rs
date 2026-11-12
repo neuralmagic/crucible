@@ -1605,11 +1605,17 @@ mod tests {
             env("RUN_TARGETS").as_deref(),
             Some("/root/a \"b\"\n/buildit")
         );
+        let listed = env("RUN_MOUNTS").unwrap();
+        let listed: serde_json::Value =
+            serde_json::from_str(&format!("[{}]", listed.strip_suffix(',').unwrap())).unwrap();
         assert_eq!(
-            env("RUN_MOUNTS").as_deref(),
-            Some(
-                r#"{"destination":"/root/a \"b\"","options":["rbind","ro"],"source":"/c/deps","type":"bind"},{"destination":"/buildit","options":["rbind","rw"],"source":"/buildit-out/facts","type":"bind"},"#
-            )
+            listed,
+            serde_json::json!([
+                { "destination": "/root/a \"b\"", "type": "bind", "source": "/c/deps",
+                  "options": ["rbind", "ro"] },
+                { "destination": "/buildit", "type": "bind", "source": "/buildit-out/facts",
+                  "options": ["rbind", "rw"] },
+            ])
         );
         for buildah in [
             "BUILDAH_ISOLATION",
