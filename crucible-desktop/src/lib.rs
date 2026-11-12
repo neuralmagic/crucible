@@ -81,7 +81,7 @@ use crate::editor::Editor;
 use crate::filter::{LandedFilter, LaunchFilter, OriginFilter, OwnerFilter};
 use crate::link::Link;
 use crate::live::{LiveDetail, LivePlaybook, LiveView, Target};
-use crate::logline::LogView;
+use crate::logline::{LogLine, LogView};
 use crate::model::{Client, PackView, Snapshot, Verdict};
 use crate::pack::{Disk, PackFile, PackFiles};
 use crate::session::TaskView;
@@ -643,6 +643,20 @@ impl App {
             .live_detail
             .as_deref()
             .filter(|detail| detail.key == launch.key)
+    }
+
+    /// The selected run's transcript and console.
+    pub(crate) fn log_lines(&self) -> (&[LogLine], &[LogLine]) {
+        match &self.selection {
+            Some(Selection::Local(_)) => self
+                .selected_pack()
+                .map(|pack| (pack.transcript.as_slice(), pack.log.as_slice())),
+            Some(Selection::Live { .. }) => self
+                .selected_detail()
+                .map(|detail| (detail.fold.transcript.as_slice(), detail.log.as_slice())),
+            None => None,
+        }
+        .unwrap_or_default()
     }
 
     /// The pack the Pack tab shows, local or from the controller.
