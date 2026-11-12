@@ -91,7 +91,7 @@ A minimal set of objects:
   OpenShift's owner-reference admission checks); `configmaps` and `secrets` create/delete (the
   pack ConfigMap and the run Secret, which holds the pod token and the delivered secrets, both
   owner-referenced to the pod); `secrets` list/patch, with which the leader re-mints a running
-  run's GitHub App token into its Secret every 25 minutes; and `leases` get/create/update/patch
+  run's GitHub App token into its Secret once it has less than 30 minutes left; and `leases` get/create/update/patch
   for leader election;
 - a **Secret** for `CONTROLLER_API_TOKEN` and one for `GITHUB_TOKEN`, referenced by env;
 - a **Service** on the API port;
@@ -431,8 +431,10 @@ binding projected as `GH_TOKEN` or `GITHUB_TOKEN` (a personal access token, say)
 container and mounts
 it into the sidecar alone, by directory. A variable the binding was projected as still exists in the
 loop container, holding the placeholder `crucible-git`, so a pack's tools find it set and its
-scripts need no change. A minted token is re-minted into the run's Secret by the leader every 25
-minutes, so a long run never pushes with a lapsed one; a personal access token does not expire
+scripts need no change. A minted token is re-minted into the run's Secret by the leader once it has
+less than 30 minutes left, so a long run never pushes with a lapsed one. The leader checks every
+minute and retries a failed re-mint at the next check, logging `GitHub token refresh failed` with
+the run's id; a personal access token does not expire
 hourly and is not refreshed. A run binding two GitHub credentials is refused. An agent-visible
 binding projected as `GH_TOKEN` or `GITHUB_TOKEN` stays as bound, with a warning at dispatch: the
 sandbox reaches GitHub directly, outside `crucible-git`. A minted token under any other variable

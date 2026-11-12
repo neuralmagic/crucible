@@ -61,6 +61,27 @@ impl PodDispatcher for KubePodDispatcher {
         Ok(())
     }
 
+    async fn set_secret_value(
+        &self,
+        cluster: &str,
+        namespace: &str,
+        secret: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<()> {
+        let client = self.clusters.client(cluster).await?;
+        let api: kube::Api<Secret> = kube::Api::namespaced(client, namespace);
+        let patch = serde_json::json!({ "stringData": { key: value } });
+        api.patch(
+            secret,
+            &kube::api::PatchParams::default(),
+            &kube::api::Patch::Merge(&patch),
+        )
+        .await
+        .with_context(|| format!("patching Secret {namespace}/{secret}"))?;
+        Ok(())
+    }
+
     async fn create_service(
         &self,
         cluster: &str,

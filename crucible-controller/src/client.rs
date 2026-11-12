@@ -552,6 +552,10 @@ mod tests {
                 "0085_launch_choice_snapshots.sql",
                 "1a16cb0896ccc1dab6280ff9bad3a2b3f011b4efda5397727ba82feb05c0215c",
             ),
+            (
+                "0086_run_git_token_minted_at.sql",
+                "9a578ca46da766eb43dd2821a5135c5bb54c3255fd4c5061a8375ee05ac7512d",
+            ),
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
         for (name, want) in pinned {

@@ -11,6 +11,8 @@ pub enum Unsupported {
     Services,
     #[error("this dispatcher creates no NetworkPolicies")]
     NetworkPolicies,
+    #[error("this dispatcher rewrites no Secrets")]
+    SecretValues,
 }
 
 /// The cluster boundary every work kind is dispatched over: create a pod, wait for it to go terminal,
@@ -41,6 +43,18 @@ pub trait PodDispatcher: Send + Sync {
     /// collected by the cluster when the pod goes.
     async fn create_secret(&self, _cluster: &str, _namespace: &str, _secret: Secret) -> Result<()> {
         Ok(())
+    }
+    /// Replace one key of an existing Secret, leaving its other keys as they are. Only the refresh
+    /// of a live run's minted token needs it, so the default refuses.
+    async fn set_secret_value(
+        &self,
+        _cluster: &str,
+        _namespace: &str,
+        _secret: &str,
+        _key: &str,
+        _value: &str,
+    ) -> Result<()> {
+        Err(Unsupported::SecretValues.into())
     }
     /// Create a Service, returning it as the API server stored it, its `spec.clusterIP` assigned.
     /// Only an isolated run gateway needs one, so the default refuses.

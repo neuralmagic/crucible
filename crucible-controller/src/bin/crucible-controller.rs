@@ -877,7 +877,7 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
         if let Some(provider) = cfg.secret_provider.clone() {
             tokio::spawn(crucible_controller::secrets::refresh::watch_loop(
                 db.clone(),
-                clusters.clone(),
+                dispatcher.clone(),
                 provider,
             ));
         }
