@@ -830,6 +830,12 @@ export const ROUTES: Record<string, Json> = {
     truncated: false,
     location: null,
   },
+  '/api/runs/RUN-0500/files': {
+    run_id: 'RUN-0500',
+    files: [
+      { task: 'read', instance: null, path: 'NOTES.md', size_bytes: 210, key: 'read/NOTES.md' },
+    ],
+  },
   '/api/repos': [
     { repo: 'vllm-project/vllm', paused: false, new: 2, scoped: 1, awaiting_approval: 1, running: 1, pr_open: 0, parked: 0, done: 4 },
     { repo: 'neuralmagic/crucible', paused: false, new: 1, scoped: 0, awaiting_approval: 0, running: 0, pr_open: 1, parked: 1, done: 9 },
