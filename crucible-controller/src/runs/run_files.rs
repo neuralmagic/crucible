@@ -208,6 +208,9 @@ const MAX_FILES: usize = 64;
 pub struct CapturedFile {
     /// The path the task declared, relative to its capture directory.
     pub name: String,
+    /// The file's key, `<capture directory>/<declared path>`, as the run's file-bytes endpoint
+    /// takes it.
+    pub key: String,
     pub size_bytes: u64,
     /// The file's text, for UTF-8 content under [`crate::runs::task_evidence::MAX_INLINE_BYTES`]; `None` for anything bigger
     /// or not decodable.
@@ -240,6 +243,7 @@ pub async fn captured_files(
     .into_iter()
     .map(|(file, body)| CapturedFile {
         name: file.path,
+        key: file.key,
         size_bytes: file.size_bytes,
         content: body.and_then(|bytes| String::from_utf8(bytes).ok()),
     })

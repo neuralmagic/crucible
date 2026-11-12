@@ -232,14 +232,37 @@ test.describe('the run task graph', () => {
     const content = panel.getByTestId('task-evidence-content');
     await expect(panel.getByTestId('task-payload')).toContainText('"classification": "feature"');
 
-    const file = panel.getByTestId('task-file');
-    await expect(file).toContainText('TRIAGE.md');
+    const file = panel.getByTestId('task-file').filter({ hasText: 'TRIAGE.md' });
     await expect(file).toContainText('1.3 KB');
     await file.click();
     await expect(content).toContainText('feature, severity low, confidence high');
 
     await panel.getByRole('button', { name: 'run log' }).click();
     await expect(panel.getByTestId('run-log')).toContainText('admitted 3 tasks');
+  });
+
+  /// A task's html capture opens from the panel as the document it is — fetched from the file store
+  /// when the payload did not carry it, sandboxed the way the Files tab sandboxes one.
+  test('opens a captured html report from the task panel', async ({ page }) => {
+    await stubApi(page);
+    const html =
+      '<!doctype html><html><head><title>report</title></head><body><p id="t">static</p>' +
+      "<script>document.getElementById('t').textContent = 'scripted report';</script></body></html>";
+    await page.route(/campaign-report\.html$/, (route) =>
+      route.fulfill({ contentType: 'application/octet-stream', body: html }),
+    );
+    await ready(page, `/runs/${encodeURIComponent(TRIAGE_RUN)}`);
+
+    await page.getByTestId('workflow-graph').locator('[data-task="triage[1027]"]').click();
+    const panel = page.getByRole('complementary', { name: 'Task triage[1027]' });
+    const report = panel.getByTestId('task-file').filter({ hasText: 'campaign-report.html' });
+    await expect(report).toContainText('1.4 MB');
+    await expect(report).not.toContainText('not shown inline');
+    await report.click();
+
+    const frame = panel.locator('iframe[title="evidence/campaign-report.html"]');
+    await expect(frame).toHaveAttribute('sandbox', 'allow-scripts');
+    await expect(frame.contentFrame().locator('#t')).toHaveText('scripted report');
   });
 
   /// Program output keeps its colours, in the theme's palette, and none of its escape codes.

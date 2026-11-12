@@ -301,7 +301,15 @@ const TRIAGE_EVIDENCE = {
   cost_usd: 0.2297655,
   secs: 0,
   payload: { classification: 'feature', confidence: 'high', severity: 'low' },
-  files: [{ name: 'TRIAGE.md', size_bytes: 1379, content: TRIAGE_MD }],
+  files: [
+    { name: 'TRIAGE.md', size_bytes: 1379, content: TRIAGE_MD, key: 'triage[1027]/TRIAGE.md' },
+    {
+      name: 'evidence/campaign-report.html',
+      size_bytes: 1480943,
+      content: null,
+      key: 'triage[1027]/evidence/campaign-report.html',
+    },
+  ],
   running: false,
 };
 

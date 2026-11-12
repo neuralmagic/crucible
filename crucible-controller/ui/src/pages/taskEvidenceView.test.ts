@@ -36,10 +36,16 @@ describe('a task file', () => {
   });
 
   it('says why a body is missing rather than showing an empty block', () => {
-    expect(fileLine({ name: 'TRIAGE.md', size_bytes: 1379, content: '# 1027\n' })).toBe('1.3 KB');
-    expect(fileLine({ name: 'core.bin', size_bytes: 2048, content: null })).toBe(
+    expect(fileLine({ name: 'TRIAGE.md', size_bytes: 1379, content: '# 1027\n', key: 't/TRIAGE.md' })).toBe('1.3 KB');
+    expect(fileLine({ name: 'core.bin', size_bytes: 2048, content: null, key: 't/core.bin' })).toBe(
       '2.0 KB · not shown inline',
     );
+  });
+
+  it('says only the size of an html report, which opens as a document however big it is', () => {
+    expect(
+      fileLine({ name: 'evidence/campaign-report.html', size_bytes: 1480943, content: null, key: 't/evidence/campaign-report.html' }),
+    ).toBe('1.4 MB');
   });
 });
 
@@ -116,8 +122,8 @@ describe('the evidence list', () => {
         note: 'classified as a feature',
         payload: { severity: 'low' },
         files: [
-          { name: 'TRIAGE.md', size_bytes: 1379, content: '# 1027\n' },
-          { name: 'core.bin', size_bytes: 2048, content: null },
+          { name: 'TRIAGE.md', size_bytes: 1379, content: '# 1027\n', key: 'triage[1027]/TRIAGE.md' },
+          { name: 'core.bin', size_bytes: 2048, content: null, key: 'triage[1027]/core.bin' },
         ],
       }),
     );
@@ -128,10 +134,10 @@ describe('the evidence list', () => {
       'file:TRIAGE.md',
       'file:core.bin',
     ]);
-    expect(items[0]).toMatchObject({ name: 'result', path: null, body: 'classified as a feature' });
-    expect(items[1]).toMatchObject({ path: 'triage[1027]/payload.json', body: '{\n  "severity": "low"\n}' });
-    expect(items[2]).toMatchObject({ note: '1.3 KB', path: 'TRIAGE.md', body: '# 1027\n' });
-    expect(items[3]).toMatchObject({ note: '2.0 KB · not shown inline', body: null });
+    expect(items[0]).toMatchObject({ name: 'result', path: null, body: 'classified as a feature', key: null });
+    expect(items[1]).toMatchObject({ path: 'triage[1027]/payload.json', body: '{\n  "severity": "low"\n}', key: null });
+    expect(items[2]).toMatchObject({ note: '1.3 KB', path: 'TRIAGE.md', body: '# 1027\n', key: 'triage[1027]/TRIAGE.md' });
+    expect(items[3]).toMatchObject({ note: '2.0 KB · not shown inline', body: null, key: 'triage[1027]/core.bin' });
   });
 
   it('leaves out what a task never produced', () => {
