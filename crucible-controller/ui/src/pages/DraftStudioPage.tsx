@@ -41,6 +41,10 @@ import { PlaybookParamFields } from './PlaybookParamFields';
 import { SharesSection } from './SharesSection';
 import { PackDispatchNotice } from './PackDispatchNotice';
 import { ImagePickerField } from './ImagePickerField';
+import { EngineLogSection } from './EngineLogSection';
+import { TaskOutputSection } from './TaskOutputSection';
+import { RunTaskGrid } from './RunTaskGrid';
+import { LiveSession } from '../live/LiveSession';
 import { readSandboxImage, setSandboxImage } from './imagePicker';
 import { ProviderModelField } from './ProviderModelField';
 import { NO_AGENT_PICK, type AgentPick } from './agentPick';
@@ -190,6 +194,10 @@ function DraftStudio({ id }: { id: string }) {
         query.state.data !== undefined && fireIsLive(query.state.data) ? FIRE_POLL_MS : false,
     },
   );
+  // The run the run view follows: a fire's runs are newest first, so the first is the one this
+  // fire is working on. Null until the dispatch produced a run.
+  const fireRun = fire.data?.runs[0] ?? null;
+  const fireRunLive = fireRun !== null && fireRun.status === 'running';
 
   const save = $api.useMutation('post', '/api/playbook-drafts/{id}/versions');
   const generate = $api.useMutation('post', '/api/playbook-drafts/{id}/generate');
@@ -1072,6 +1080,22 @@ function DraftStudio({ id }: { id: string }) {
           </SectionBody>
         )}
       </Section>
+
+      {fireRun === null ? null : (
+        <>
+          {fireRunLive && (
+            <Section>
+              <SectionHeader title="Live session" />
+              <SectionBody>
+                <LiveSession runId={fireRun.run_id} compact onEnded={() => void fire.refetch()} />
+              </SectionBody>
+            </Section>
+          )}
+          <RunTaskGrid runId={fireRun.run_id} />
+          <TaskOutputSection runId={fireRun.run_id} live={fireRunLive} />
+          <EngineLogSection runId={fireRun.run_id} live={fireRunLive} />
+        </>
+      )}
 
       <Section>
         <SectionHeader title="Graduate" />
