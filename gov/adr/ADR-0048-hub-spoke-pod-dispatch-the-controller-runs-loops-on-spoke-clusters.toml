@@ -112,6 +112,12 @@ grants remain pod-identity grants on wharf, unchanged. The chart keeps rendering
 turn-profile ConfigMap; the profile continues to describe wharf, only the dispatch target
 changes.
 
+**Amended 2026-11-12:** the controller identity also needs `secrets` patch in the loop namespace.
+[[ADR-0051]] re-mints a live run's GitHub App token into its Secret, and with create and delete
+alone every re-mint is refused, so a run loses GitHub access an hour after dispatch. The verb
+cannot be limited to run Secrets by `resourceNames`: each is named after its pod, and a Role
+lists exact names.
+
 ## Non-goals
 
 Multi-spoke configuration (structure only); run-live raw TCP for remote pods; spoke-side

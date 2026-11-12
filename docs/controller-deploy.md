@@ -131,6 +131,13 @@ If the controller runs loops in other clusters (spokes):
   `CONTROLLER_CLUSTER_POLICY`: a caller fenced off the pinned cluster cannot launch the pack.
   A draft-head schedule saved before its draft added a pin fails its firing until it is saved
   again.
+- The identity in each spoke's kubeconfig needs the Role above in that spoke's loop namespace,
+  without `leases`. That includes `secrets` patch. With create and delete alone the hub delivers
+  each run's Secret but every re-mint of its GitHub App token is refused, and the run's GitHub
+  calls answer 401 an hour after dispatch. The verb cannot be limited to run Secrets by
+  `resourceNames`, because each is named after its pod (`<pod>-secrets`) and a Role lists exact
+  names. `kubectl --kubeconfig <spoke kubeconfig> auth can-i patch secrets -n <loop namespace>`
+  answers whether a spoke has it.
 - If the hub cannot reach a spoke, the spoke sends reports to the hub.
   `crucible-controller cluster-snapshot` runs on the spoke as a CronJob and posts to the push
   endpoint of the hub with a bearer token that the hub lists in `CONTROLLER_PUSH_TOKENS`.
