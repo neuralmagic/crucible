@@ -151,7 +151,8 @@ accepted too). It returns the `build_id` at once; the build may wait in the queu
 pushes its image by digest to `--image-repo` (default the OpenShift internal registry,
 `image-registry.openshift-image-registry.svc:5000/<namespace>/buildit`, which the pod reaches with
 its service account token and the cluster's service CA; `--registry-auth insecure` for a registry
-over plain HTTP). `status` reports `running`, `succeeded`, `failed` or `cancelled` with the exit
+over plain HTTP); a Dockerfile's `FROM` pulls an earlier build's image from there the same
+way. `status` reports `running`, `succeeded`, `failed` or `cancelled` with the exit
 code, `timed_out`, and the end of the build log; poll it, then `run` a succeeded build and `clean`
 it when done. `run` runs a command in a fresh pod of the built image and copies `fetch_paths` back
 to `.buildit/<build_id>/` in the sandbox. `push` copies a succeeded build's image to the one
