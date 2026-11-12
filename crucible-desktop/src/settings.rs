@@ -177,6 +177,8 @@ pub struct Settings {
     pub zoom: f32,
     /// Draw charts through the CRT pass.
     pub crt: bool,
+    /// Draw run graphs with less room in and between their nodes, unless a run is switched.
+    pub compact_graph: bool,
     /// Keep profile keys in the system credential store, not in files.
     pub keychain: bool,
     /// Ask GitHub once a day whether a newer release exists.
@@ -225,6 +227,7 @@ struct Config {
     text_size: TextSize,
     zoom: Option<f32>,
     crt: Option<bool>,
+    compact_graph: Option<bool>,
     keychain: Option<bool>,
     check_updates: Option<bool>,
     notify: Option<bool>,
@@ -294,6 +297,7 @@ impl Settings {
                 .filter(|z| ZOOMS.iter().any(|known| (known - z).abs() < 0.01))
                 .unwrap_or(1.0),
             crt: config.crt.unwrap_or(true),
+            compact_graph: config.compact_graph.unwrap_or(true),
             keychain: config.keychain.unwrap_or(false),
             updates: config.check_updates.unwrap_or(true),
             notify: config.notify.unwrap_or(true),
@@ -444,6 +448,11 @@ impl Settings {
         self.save();
     }
 
+    pub fn set_compact_graph(&mut self, on: bool) {
+        self.compact_graph = on;
+        self.save();
+    }
+
     pub fn set_keychain(&mut self, on: bool) {
         self.keychain = on;
         self.save();
@@ -518,6 +527,7 @@ impl Settings {
             text_size: self.text_size,
             zoom: Some(self.zoom),
             crt: Some(self.crt),
+            compact_graph: Some(self.compact_graph),
             keychain: Some(self.keychain),
             check_updates: Some(self.updates),
             notify: Some(self.notify),
@@ -703,6 +713,21 @@ mod tests {
             fs::read_to_string(&path)
                 .unwrap()
                 .contains("check_updates = false")
+        );
+    }
+
+    #[test]
+    fn graphs_draw_compact_until_turned_roomy_and_stay_roomy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crucible-playbooks").join("config.toml");
+        let mut settings = Settings::load_from(path.clone());
+        assert!(settings.compact_graph);
+        settings.set_compact_graph(false);
+        assert!(!Settings::load_from(path.clone()).compact_graph);
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("compact_graph = false")
         );
     }
 

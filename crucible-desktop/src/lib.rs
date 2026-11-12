@@ -6,6 +6,7 @@ mod activity;
 mod admin;
 mod agent;
 mod apikeys;
+mod camera;
 mod captured;
 mod commands;
 mod cron;
@@ -354,8 +355,12 @@ pub struct RunView {
     /// The task card shown open, and the task the Data pane shows.
     pub expanded: Option<String>,
     pub inspect: inspect::Inspect,
-    /// Fan-outs the graph draws with their instances.
-    pub unfolded: HashSet<String>,
+    /// Fan-outs the graph draws without their instances.
+    pub folded: HashSet<String>,
+    /// How far the graph is zoomed and moved.
+    pub camera: camera::Camera,
+    /// Whether the graph is drawn compact; `None` takes the setting.
+    pub compact_graph: Option<bool>,
     /// The launch picked to compare against; `None` takes the one before.
     pub compare_to: Option<String>,
     /// Only lines from this task or fan-out instance.
@@ -1428,9 +1433,9 @@ impl App {
         self.show_pane(PaneKind::Data);
     }
 
-    pub fn toggle_unfolded(&mut self, task: &str) {
-        if !self.run.unfolded.remove(task) {
-            self.run.unfolded.insert(task.to_string());
+    pub fn toggle_folded(&mut self, task: &str) {
+        if !self.run.folded.remove(task) {
+            self.run.folded.insert(task.to_string());
         }
     }
 
