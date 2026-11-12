@@ -158,8 +158,8 @@ impl Session {
             Ok(runtime) => {
                 let on = runtime.clone();
                 Some(Task::spawn(&runtime, async move {
-                    if let Err(why) = serve(&on, target, spec, asked, &out).await {
-                        out.state(State::Failed(why));
+                    if let Err(ended) = serve(&on, target, spec, asked, &out).await {
+                        out.state(ended);
                     }
                 }))
             }
@@ -263,12 +263,12 @@ async fn serve(
     spec: Spec,
     mut asks: UnboundedReceiver<Ask>,
     out: &Out,
-) -> Result<(), String> {
+) -> Result<(), State> {
     let config = &spec.config;
     out.starting("Starting the relay");
     let upstream = crate::net::blocking(move || Upstream::of(&target))
         .await
-        .ok_or("opening the controller connection stopped early")??;
+        .ok_or_else(|| "opening the controller connection stopped early".to_string())??;
     let (passed, mut passes) = unbounded_channel();
     let relay = relay::bind(runtime, upstream, &spec.draft, passed).await?;
     let endpoint = Endpoint {
@@ -285,7 +285,8 @@ async fn serve(
         &config.binaries,
         relay.port,
     )
-    .await?;
+    .await
+    .map_err(State::NotSetUp)?;
     out.state(State::Idle);
 
     let mut turns = 0u32;
@@ -351,14 +352,14 @@ async fn serve(
                 }
                 match (done.transport_error, done.exit_code) {
                     (Some((_, why)), _) => {
-                        return Err(format!("The sandbox stopped answering: {why}"));
+                        return Err(format!("The sandbox stopped answering: {why}").into());
                     }
                     (None, Some(0)) => {}
                     (None, Some(code)) => out.note(format!("The agent exited {code}")),
                     (None, None) => out.note("The agent ended without an exit code"),
                 }
             }
-            Err(why) => return Err(why),
+            Err(why) => return Err(why.into()),
         }
         turns += 1;
         if next.is_none() {

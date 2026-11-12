@@ -155,7 +155,8 @@ in `CONTROLLER_URL` and `CONTROLLER_API_TOKEN` (what `crux` reads) and in `CRUCI
 
 ## When it does not work
 
-The pane's status row carries the reason in red.
+The pane's status row carries the reason in red. When the sandbox could not be created, `Setup
+guide` beside it opens this page.
 
 | What you see | Cause | Fix |
 | --- | --- | --- |

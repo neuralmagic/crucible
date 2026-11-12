@@ -5,7 +5,7 @@ use rune::{El, ScrollSpec, TextStyle, Tx, col, el, row, text};
 use rune_kit::{Button, ButtonVariant, Spinner, TextInput};
 
 use crate::App;
-use crate::agent::{Entry, SPEAKER, State};
+use crate::agent::{Entry, SETUP_GUIDE, SPEAKER, State};
 use crate::settings::LogFont;
 use crate::transcript::turns;
 use crate::ui::Paint;
@@ -21,7 +21,7 @@ fn status(app: &App, p: &Paint) -> El {
         Some(State::Starting(what)) => (what.clone(), p.live),
         Some(State::Running) => ("Working".to_string(), p.live),
         Some(State::Idle) => ("Ready".to_string(), p.pass),
-        Some(State::Failed(why)) => (why.clone(), p.fail),
+        Some(State::NotSetUp(why) | State::Failed(why)) => (why.clone(), p.fail),
     };
     let mut bar = row().w_full().h(24.0).gap(8.0).center_y();
     if desk.busy() {
@@ -44,6 +44,17 @@ fn status(app: &App, p: &Paint) -> El {
                 .on_press(|app: &mut App| app.stop_agent())
                 .build(p.k)
                 .key("agent-stop"),
+        );
+    }
+    if matches!(desk.state, Some(State::NotSetUp(_))) {
+        bar = bar.child(
+            Button::new("Setup guide")
+                .variant(ButtonVariant::Neutral)
+                .on_press(|app: &mut App| {
+                    app.editor_error = crate::editor::open_url(SETUP_GUIDE).err();
+                })
+                .build(p.k)
+                .key("agent-setup-guide"),
         );
     }
     if desk.state.is_some() {

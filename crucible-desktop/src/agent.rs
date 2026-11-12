@@ -217,8 +217,26 @@ pub enum State {
     /// Waiting for a prompt.
     Idle,
     Running,
+    /// The sandbox could not be created: the gateway, the image or a provider is missing.
+    NotSetUp(String),
     Failed(String),
 }
+
+impl State {
+    /// The session is over and the next prompt needs a new one.
+    pub fn ended(&self) -> bool {
+        matches!(self, State::NotSetUp(_) | State::Failed(_))
+    }
+}
+
+impl From<String> for State {
+    fn from(why: String) -> State {
+        State::Failed(why)
+    }
+}
+
+/// Setting up the gateway, a provider and the image.
+pub const SETUP_GUIDE: &str = "https://neuralmagic.github.io/crucible/desktop-agent-local.html";
 
 /// Something the panel shows beside a turn: what was asked, or what the session did.
 #[derive(Clone, Debug, PartialEq)]
@@ -370,7 +388,7 @@ impl App {
         };
         let prompt = self.remote.agent.prompt.text.trim().to_string();
         let usable = self.remote.agent.draft() == Some(working.draft.as_str())
-            && !matches!(self.remote.agent.state, Some(State::Failed(_)));
+            && !self.remote.agent.state.as_ref().is_some_and(State::ended);
         if !usable {
             self.start_agent(&working);
         }
@@ -514,7 +532,7 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use crate::agent::{Config, Desk, Endpoint, Format, State};
+    use crate::agent::{Config, Desk, Endpoint, Format, SETUP_GUIDE, State};
 
     fn endpoint() -> Endpoint {
         Endpoint {
@@ -633,6 +651,20 @@ mod tests {
         assert!(toml::from_str::<Config>("imge = \"x\"").is_err());
         let back: Config = toml::from_str(&toml::to_string(&Config::default()).unwrap()).unwrap();
         assert_eq!(back, Config::default());
+    }
+
+    #[test]
+    fn a_session_that_ended_takes_a_new_one_and_only_setup_trouble_is_not_set_up() {
+        assert!(State::NotSetUp("no gateway".into()).ended());
+        assert!(State::Failed("gone".into()).ended());
+        for live in [State::Idle, State::Running, State::Starting("x".into())] {
+            assert!(!live.ended(), "{live:?}");
+        }
+        assert_eq!(
+            State::from("gone".to_string()),
+            State::Failed("gone".into())
+        );
+        assert!(SETUP_GUIDE.ends_with("/desktop-agent-local.html"));
     }
 
     #[test]
