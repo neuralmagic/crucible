@@ -1944,8 +1944,6 @@ exit $rc
         objects
     }
 
-    /// What `cluster.sandbox_readers`, the controller's identity on this cluster, dispatches run
-    /// pods into the loop namespace with. Nothing when none is named.
     fn dispatch_rbac(&self) -> Vec<SandboxRbacObject> {
         let cluster = &self.profile.cluster;
         if cluster.sandbox_readers.is_empty() {
@@ -4646,15 +4644,10 @@ mod tests {
         }
     }
 
-    /// The controller's identity gets its dispatch grant in the loop namespace wherever sandboxes
-    /// run, and no read of any Secret there.
     #[test]
     fn the_controller_identity_is_granted_dispatch_in_the_loop_namespace() {
         let none = render_k8s(&k8s_profile(""));
-        assert!(
-            !none.contains("name: crucible-dispatch"),
-            "no controller identity named, no dispatch grant: {none}"
-        );
+        assert!(!none.contains("name: crucible-dispatch"), "{none}");
         for extra in [
             "sandbox_readers = [\"crucible-control/crucible-controller\"]",
             "sandbox_namespace = \"crucible-sandboxes\"\nsandbox_readers = [\"crucible-control/crucible-controller\"]",
@@ -4669,11 +4662,7 @@ mod tests {
             assert_eq!(rules, crate::deploy::render::dispatch::rules());
             let mut secret_verbs = secret_verbs_granted(&rules);
             secret_verbs.sort();
-            assert_eq!(
-                secret_verbs,
-                ["create", "delete", "list", "patch"],
-                "patch re-mints a live run's token; no get, so no Secret is read back"
-            );
+            assert_eq!(secret_verbs, ["create", "delete", "list", "patch"]);
             let binding: rbac::RoleBinding = serde_norway::from_str(
                 docs_of_kind(&yaml, "RoleBinding")
                     .find(|d| d.contains("name: crucible-dispatch\n"))

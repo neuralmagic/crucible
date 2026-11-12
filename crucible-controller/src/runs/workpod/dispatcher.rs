@@ -44,8 +44,7 @@ pub trait PodDispatcher: Send + Sync {
     async fn create_secret(&self, _cluster: &str, _namespace: &str, _secret: Secret) -> Result<()> {
         Ok(())
     }
-    /// Replace one key of an existing Secret, leaving its other keys as they are. Only the refresh
-    /// of a live run's minted token needs it, so the default refuses.
+    /// Replace one key of an existing Secret. The default refuses.
     async fn set_secret_value(
         &self,
         _cluster: &str,

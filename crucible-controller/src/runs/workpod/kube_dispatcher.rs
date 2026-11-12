@@ -350,15 +350,12 @@ pub(crate) fn terminated_message(status: Option<&PodStatus>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    /// One request to the core API group, by resource and verb.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct ApiCall {
         resource: &'static str,
         verb: &'static str,
     }
 
-    /// Every call [`KubePodDispatcher`] makes in the namespace a run pod is dispatched into, which the
-    /// identity it runs as on that cluster must be granted.
     const LOOP_NAMESPACE_CALLS: [ApiCall; 7] = [
         ApiCall {
             resource: "pods",
@@ -390,8 +387,6 @@ mod tests {
         },
     ];
 
-    /// A call the dispatcher makes that the rendered dispatch Role does not grant is refused on
-    /// every cluster rendered from a profile, so each one must be in the Role.
     #[test]
     fn the_rendered_dispatch_role_grants_every_call_the_dispatcher_makes() {
         let rules = crucible::deploy::render::dispatch::rules();
@@ -405,8 +400,6 @@ mod tests {
         }
     }
 
-    /// The token refresh rewrites a run Secret in place; without this verb every re-mint is
-    /// refused and a run loses GitHub access an hour after dispatch.
     #[test]
     fn rewriting_a_run_secret_is_among_the_calls_the_role_must_grant() {
         assert!(LOOP_NAMESPACE_CALLS.contains(&ApiCall {

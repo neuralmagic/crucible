@@ -1,17 +1,12 @@
 //! Keeps a live run's minted GitHub App token fresh (ADR-0051). An installation token lasts an
-//! hour and a run is minted one at dispatch, so once a token has less than half of that left the
-//! leader re-mints it and rewrites that key of that pod's Secret alone. The token is mounted into
-//! `crucible-git` by directory, so the kubelet carries the new bytes in, and the sidecar reads the
-//! file on every request.
+//! hour and a run is minted one at dispatch, so once a token has less than half that left the
+//! leader re-mints it for the running pod it recorded delivering it to, and merge-patches that
+//! key of that pod's Secret alone. The token is mounted into `crucible-git` by directory, so the
+//! kubelet carries the new bytes in, and the sidecar reads the file on every request.
 //!
-//! What to refresh, and when, comes only from `run_git_tokens`: a row is written at dispatch with
-//! the time its token was minted, and each re-mint moves that time forward. A controller that
-//! restarts or changes leader therefore picks up where the last one stopped, and a re-mint that
-//! fails leaves its row due, so the next sweep tries it again.
-//!
-//! Each sweep first drops the rows of pods no longer running and of runs whose binding is gone or
-//! now names another secret, so revoking a binding stops the refresh at the next sweep rather than
-//! at the run's end.
+//! What to refresh comes only from `run_git_tokens`, written at dispatch. Each sweep first drops
+//! the rows of pods no longer running and of runs whose binding is gone or now names another
+//! secret, so revoking a binding stops the refresh at the next sweep rather than at the run's end.
 
 use crate::runs::workpod::dispatcher::PodDispatcher;
 use crate::secrets::deliver::GitToken;
@@ -21,27 +16,22 @@ use jiff::{SignedDuration, Timestamp};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// How often the leader looks for tokens to re-mint, and so how soon a failed re-mint is retried.
+/// How often the leader looks for tokens to re-mint.
 pub const INTERVAL: Duration = Duration::from_secs(60);
 
-/// How long GitHub honours an installation token.
 const TOKEN_LIFETIME: SignedDuration = SignedDuration::from_mins(60);
 
-/// A token with less than this left is re-minted.
 const RENEW_WITH_LEFT: SignedDuration = SignedDuration::from_mins(30);
 
-/// How long a token minted at `minted_at` is still good for at `now`; negative once it has lapsed.
 fn remaining(minted_at: Timestamp, now: Timestamp) -> SignedDuration {
     TOKEN_LIFETIME.saturating_sub(now.duration_since(minted_at))
 }
 
-/// Whether a token minted at `minted_at` is re-minted at `now`. One of unknown age always is.
 fn due(minted_at: Option<Timestamp>, now: Timestamp) -> bool {
     minted_at.is_none_or(|minted_at| remaining(minted_at, now) < RENEW_WITH_LEFT)
 }
 
-/// Record that `pod_name`'s Secret carries `token`, minted through its binding no earlier than
-/// `minted_at`.
+/// Record that `pod_name`'s Secret carries `token`, minted through its binding.
 pub async fn record(
     pool: &sqlx::PgPool,
     pod_name: &str,
@@ -89,7 +79,6 @@ impl Live {
     }
 }
 
-/// What one sweep did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Swept {
     pub renewed: usize,
@@ -133,8 +122,6 @@ async fn prune(pool: &sqlx::PgPool) -> Result<u64> {
     Ok(done.rows_affected())
 }
 
-/// Re-mint the token of every live run whose token is due at `now`. One run's failure is logged
-/// and counted, and does not stop the others.
 pub async fn sweep(
     pool: &sqlx::PgPool,
     dispatcher: &dyn PodDispatcher,
@@ -285,7 +272,6 @@ mod tests {
         now - SignedDuration::from_mins(minutes_ago)
     }
 
-    /// A running pod delivered secret `s1`'s token `minutes_ago`, through a binding of its own.
     async fn live_run(pool: &sqlx::PgPool, pod: &str, now: Timestamp, minutes_ago: i64) {
         work_pod(pool, pod, "running").await;
         let binding_id = format!("b-{pod}");
@@ -313,10 +299,8 @@ mod tests {
         .map(|raw| raw.parse().unwrap())
     }
 
-    /// One Secret key rewritten: cluster, namespace, Secret, key, value.
     type Write = (String, String, String, String, String);
 
-    /// Keeps every Secret value it is asked to write, in place of a cluster.
     #[derive(Default)]
     struct Secrets {
         writes: Mutex<Vec<Write>>,
@@ -381,7 +365,6 @@ mod tests {
         }))
     }
 
-    /// The production provider over a GitHub App whose API is `server`, home installation 99.
     fn app_provider(server: &MockServer, key_dir: &std::path::Path) -> Arc<dyn SecretProvider> {
         let app = GithubAppTokenSource::new(
             "4210340",
@@ -397,11 +380,11 @@ mod tests {
         let now: Timestamp = "2026-11-12T17:00:00Z".parse().unwrap();
         let aged = |secs: i64| Some(now - SignedDuration::from_secs(secs));
         assert!(!due(aged(0), now));
-        assert!(!due(aged(30 * 60), now), "exactly half left is not yet due");
+        assert!(!due(aged(30 * 60), now));
         assert!(due(aged(30 * 60 + 1), now));
-        assert!(due(aged(74 * 60), now), "a lapsed token is still re-minted");
-        assert!(due(None, now), "a token of unknown age is re-minted");
-        assert!(!due(aged(-120), now), "a mint time ahead of the clock");
+        assert!(due(aged(74 * 60), now));
+        assert!(due(None, now));
+        assert!(!due(aged(-120), now));
     }
 
     #[test]
@@ -412,8 +395,6 @@ mod tests {
         assert_eq!(remaining(at(now, 74), now), SignedDuration::from_mins(-14));
     }
 
-    /// The sweep must leave time for a failed re-mint to be retried many times, and for the
-    /// kubelet to carry the bytes in, before the token it replaces lapses.
     #[test]
     fn the_sweep_interval_leaves_many_retries_before_a_due_token_lapses() {
         let retries = RENEW_WITH_LEFT.as_secs() / INTERVAL.as_secs() as i64;
@@ -463,8 +444,6 @@ mod tests {
         assert_eq!(left, ["live"]);
     }
 
-    /// Only the run whose token is past half its life is re-minted, into its own Secret's key, and
-    /// a sweep right after finds nothing due.
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn a_due_token_is_re_minted_into_its_runs_secret_and_a_fresh_one_is_left(
         pool: sqlx::PgPool,
@@ -517,7 +496,6 @@ mod tests {
         assert_eq!(again, Swept::default());
     }
 
-    /// A run that outlives several tokens is re-minted each time the current one is half spent.
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn a_long_run_is_re_minted_again_once_the_new_token_is_half_spent(pool: sqlx::PgPool) {
         let dir = tempfile::tempdir().unwrap();
@@ -544,9 +522,6 @@ mod tests {
         assert_eq!(cluster.writes().len(), 2);
     }
 
-    /// The re-mint goes through the registry row the launch minted from, so a token for another
-    /// account's installation is renewed there, and asks for no narrower or wider grant than the
-    /// installation's own, as the launch mint does.
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn a_token_is_re_minted_through_the_installation_its_secret_names(pool: sqlx::PgPool) {
         let dir = tempfile::tempdir().unwrap();
@@ -582,13 +557,9 @@ mod tests {
             .iter()
             .find(|r| r.method.as_str() == "POST")
             .expect("one mint");
-        assert!(
-            mint.body.is_empty(),
-            "the mint names no repositories or permissions"
-        );
+        assert!(mint.body.is_empty());
     }
 
-    /// A re-mint GitHub refuses writes nothing and leaves the run due, so the next sweep retries.
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn a_failed_re_mint_stays_due_and_the_next_sweep_retries_it(pool: sqlx::PgPool) {
         let dir = tempfile::tempdir().unwrap();
@@ -638,8 +609,6 @@ mod tests {
         assert_eq!(cluster.writes()[0].4, "ghs_after_retry");
     }
 
-    /// A token minted but not written is not counted as delivered: the run stays due, and one
-    /// run's failure does not keep another from its token.
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn a_secret_the_cluster_refuses_to_rewrite_stays_due(pool: sqlx::PgPool) {
         let dir = tempfile::tempdir().unwrap();
@@ -675,7 +644,6 @@ mod tests {
         assert_eq!(minted_at(&pool, "crucible-run-b").await, Some(at(now, 50)));
     }
 
-    /// Renewal ends with the run: a finished pod's token is not re-minted however old it is.
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn a_finished_runs_token_is_not_re_minted(pool: sqlx::PgPool) {
         let dir = tempfile::tempdir().unwrap();
@@ -708,7 +676,6 @@ mod tests {
         assert_eq!(rows, 0);
     }
 
-    /// A row written before mint times were recorded is re-minted at once.
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn a_run_with_no_recorded_mint_time_is_re_minted_at_once(pool: sqlx::PgPool) {
         let dir = tempfile::tempdir().unwrap();
