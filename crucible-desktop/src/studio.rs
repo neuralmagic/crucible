@@ -162,6 +162,16 @@ impl App {
         true
     }
 
+    /// Keep working copies in the folder typed in Settings from now on.
+    pub fn set_drafts_dir(&mut self) {
+        let typed = self.drafts_dir.text.clone();
+        self.drafts_error = self.settings.set_drafts_dir(&typed).err();
+        if self.drafts_error.is_none() {
+            self.remote
+                .set_drafts(&self.net, self.settings.drafts_root(), self.waker.as_ref());
+        }
+    }
+
     /// Pull the shown run's draft into its working copy, creating the draft when it is new.
     pub fn pull_draft(&mut self) {
         let Some((draft, template)) = self.draft_target() else {
@@ -309,7 +319,7 @@ impl App {
         let detail = self.selected_detail()?;
         let record = detail.launch.as_ref()?;
         let (draft, template) = self.draft_target()?;
-        let root = crate::draft::root()?;
+        let root = self.settings.drafts_root()?;
         let mine = self.remote.working.as_ref().filter(|w| w.draft == draft);
         let pulled = mine.is_some_and(|w| {
             !self.remote.working_edited && Some(w.base) == record.launch.draft_version

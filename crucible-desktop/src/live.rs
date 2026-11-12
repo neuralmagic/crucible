@@ -1823,12 +1823,17 @@ impl Shared {
 }
 
 impl Client {
-    pub fn spawn(connector: Connector) -> Self {
+    pub fn spawn(connector: Connector, drafts: Option<PathBuf>) -> Self {
         let dirs = Dirs {
-            drafts: crate::draft::root(),
+            drafts,
             files: crate::captured::cache_dir(),
         };
         Client::spawn_with(connector, dirs)
+    }
+
+    /// Keep working copies under `drafts` from the next pull or save on.
+    pub fn set_drafts(&mut self, drafts: Option<PathBuf>) {
+        self.dirs.drafts = drafts;
     }
 
     fn spawn_with(connector: Connector, dirs: Dirs) -> Self {

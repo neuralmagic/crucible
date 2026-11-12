@@ -1,6 +1,7 @@
 //! What the window holds for the profile in use: its workers, what they last read, and what is
 //! half done against it. Switching profile replaces it whole, so nothing of the last one stays.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
@@ -90,11 +91,16 @@ pub struct Remote {
 
 impl Remote {
     /// Fresh workers on `target`, with nothing read yet.
-    pub fn new(target: Target, net: &Net, waker: Option<&Waker>) -> Remote {
+    pub fn new(
+        target: Target,
+        net: &Net,
+        drafts: Option<PathBuf>,
+        waker: Option<&Waker>,
+    ) -> Remote {
         let connector = net.connector(target.clone());
         let remote = Remote {
             target,
-            live_client: live::Client::spawn(connector.clone()),
+            live_client: live::Client::spawn(connector.clone(), drafts.clone()),
             live_seen: 0,
             live: Arc::default(),
             live_detail: None,
@@ -122,7 +128,7 @@ impl Remote {
             working_pack: None,
             working_preview: None,
             working_edited: false,
-            working_watch: crate::draft::Watcher::start(net.handle(), crate::draft::root()),
+            working_watch: crate::draft::Watcher::start(net.handle(), drafts),
             working_sent: None,
             working_seen: 0,
             graph_source: None,
@@ -147,5 +153,69 @@ impl Remote {
         self.admin_client.set_waker(waker.clone());
         self.finder_client.set_waker(waker.clone());
         self.working_watch.set_waker(waker.clone());
+    }
+
+    /// Keep working copies under `drafts` from now on. The copy shown is read again from there.
+    pub fn set_drafts(&mut self, net: &Net, drafts: Option<PathBuf>, waker: Option<&Waker>) {
+        self.live_client.set_drafts(drafts.clone());
+        self.working_watch = crate::draft::Watcher::start(net.handle(), drafts);
+        if let Some(waker) = waker {
+            self.working_watch.set_waker(waker.clone());
+        }
+        self.working = None;
+        self.working_pack = None;
+        self.working_preview = None;
+        self.working_edited = false;
+        self.working_sent = None;
+        self.working_seen = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::time::{Duration, Instant};
+
+    use crate::draft::Working;
+    use crate::remote::Remote;
+
+    #[test]
+    fn working_copies_are_read_from_the_folder_last_set() {
+        let (url, _) = crate::testserver::serve(|_| "[]".into());
+        let keys = tempfile::tempdir().unwrap();
+        let (before, after) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let pack = BTreeMap::from([("crucible.toml".to_string(), "[workflow]\n".to_string())]);
+        let old = Working::write(before.path(), "triage-me", 4, &pack).unwrap();
+        let new = Working::write(after.path(), "triage-me", 7, &pack).unwrap();
+
+        let net = crate::net::Net::uncached_for_tests();
+        let target = crate::testserver::target("t", &url, keys.path());
+        let mut remote = Remote::new(target, &net, Some(before.path().to_path_buf()), None);
+        let read = |remote: &mut Remote| {
+            remote.working_watch.watch(Some("triage-me"));
+            let until = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some((version, Some(copy))) = remote.working_watch.take(remote.working_seen)
+                {
+                    remote.working_seen = version;
+                    return copy.working.clone();
+                }
+                assert!(Instant::now() < until, "no working copy was read");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        assert_eq!(read(&mut remote), old);
+        remote.working = Some(old);
+        remote.working_edited = true;
+        remote.working_sent = Some("triage-me".into());
+
+        remote.set_drafts(&net, Some(after.path().to_path_buf()), None);
+        assert_eq!(remote.working, None);
+        assert!(!remote.working_edited);
+        assert_eq!(
+            (remote.working_sent.as_deref(), remote.working_seen),
+            (None, 0)
+        );
+        assert_eq!(read(&mut remote), new);
     }
 }

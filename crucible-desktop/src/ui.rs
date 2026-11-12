@@ -1989,7 +1989,7 @@ fn settings_pane(app: &App, p: &Paint) -> El {
             ],
             p,
         ))
-        .child(settings_section("packs", "Packs", editor_rows(app, p), p))
+        .child(settings_section("packs", "Packs", pack_rows(app, p), p))
         .child(settings_section(
             "dropped",
             "Dropped on the Dock",
@@ -2096,6 +2096,32 @@ fn drop_rows(app: &App, p: &Paint) -> Vec<El> {
         ),
     ];
     if let Some(why) = &app.drop_error {
+        rows.push(text(why.clone()).font(p.k.ty.small).color(p.fail).pb(10.0));
+    }
+    rows
+}
+
+/// The editor rows, then the folder draft working copies are kept in.
+fn pack_rows(app: &App, p: &Paint) -> Vec<El> {
+    let mut rows = editor_rows(app, p);
+    rows.push(rule("drafts-sep", false, p));
+    rows.push(setting_row(
+        "Drafts folder",
+        TextInput::new(&app.drafts_dir)
+            .placeholder(
+                crate::draft::default_root()
+                    .map(|dir| dir.display().to_string())
+                    .unwrap_or_default(),
+            )
+            .width(Some(400.0))
+            .invalid(app.drafts_error.is_some())
+            .on_edit(|app: &mut App| &mut app.drafts_dir)
+            .on_change(|app: &mut App, _: &mut Tx| app.set_drafts_dir())
+            .build(p.k)
+            .key("drafts-dir"),
+        p,
+    ));
+    if let Some(why) = &app.drafts_error {
         rows.push(text(why.clone()).font(p.k.ty.small).color(p.fail).pb(10.0));
     }
     rows

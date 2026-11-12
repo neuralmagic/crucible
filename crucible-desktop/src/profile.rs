@@ -1034,7 +1034,12 @@ impl crate::App {
     }
 
     fn connect(&mut self, target: Target) {
-        self.remote = crate::remote::Remote::new(target, &self.net, self.waker.as_ref());
+        self.remote = crate::remote::Remote::new(
+            target,
+            &self.net,
+            self.settings.drafts_root(),
+            self.waker.as_ref(),
+        );
         if matches!(self.selection, Some(crate::Selection::Live { .. })) {
             self.selection = None;
         }
