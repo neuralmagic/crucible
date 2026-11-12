@@ -69,6 +69,7 @@ const LABEL_BUILD_ID: &str = "buildit.dev/build-id";
 const LABEL_LAUNCHED_BY: &str = "crucible.dev/launched-by";
 /// The [`ContextDigest`] of what buildit uploaded for a builder pod's first build.
 const ANNOTATION_CONTEXT_DIGEST: &str = "buildit.dev/context-digest";
+const ANNOTATION_BUILDER: &str = "buildit.dev/builder";
 
 /// Scope that lets a token read build status and logs.
 pub const SCOPE_READ: &str = "buildit.read";
@@ -176,15 +177,15 @@ pub struct McpArgs {
     /// Directory this server keeps ended builds' and runs' logs in
     #[arg(long, env = "MCP_LOG_DIR", default_value = "/tmp/buildit-mcp-logs")]
     pub log_dir: PathBuf,
-    /// What builds a Dockerfile in a build pod; `buildkit` is experimental
+    /// What builds a Dockerfile when the build names no builder; `buildkit` is experimental
     #[arg(long, env = "MCP_BUILDER", value_enum, default_value_t = jobs::Builder::Buildah)]
     pub builder: jobs::Builder,
     /// containers-storage driver of build pods; with `--builder buildkit`, `vfs` is BuildKit's
     /// `native` snapshotter and `overlay` its `overlayfs`
     #[arg(long, env = "MCP_STORAGE_DRIVER", value_enum, default_value_t = StorageDriver::Vfs)]
     pub storage_driver: StorageDriver,
-    /// Extra `buildah bud` argument for every Dockerfile build, after buildit's own (repeatable).
-    /// Refused with `--builder buildkit`
+    /// Extra `buildah bud` argument for every Dockerfile build buildah runs, after buildit's own
+    /// (repeatable)
     #[arg(long = "bud-arg", allow_hyphen_values = true)]
     pub bud_args: Vec<String>,
     /// Builds per sandbox that may be running at once; `build` is refused past this
@@ -281,9 +282,6 @@ pub async fn serve(client: kube::Client, args: McpArgs) -> Result<()> {
         && !is_label_value(q)
     {
         bail!("queue {q:?} is not a label value");
-    }
-    if args.builder == jobs::Builder::Buildkit && !args.bud_args.is_empty() {
-        bail!("--bud-arg adds `buildah bud` arguments, which --builder buildkit does not run");
     }
     if args.builder == jobs::Builder::Buildkit {
         tracing::warn!("--builder buildkit is experimental");
@@ -573,7 +571,8 @@ fn cache_mounts(caches: &[CacheSpec]) -> Result<Vec<jobs::RunMount>> {
             }
             let path = Path::new(&c.path);
             let clean = c.path.len() <= 255
-                && !c.path.contains([':', ',', '\0'])
+                && !c.path.contains([':', ','])
+                && !c.path.contains(char::is_control)
                 && c.path.strip_prefix('/').is_some_and(|rest| {
                     rest.split('/')
                         .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
@@ -981,6 +980,11 @@ pub struct BuildParams {
     /// /buildit/ccache-stats.log. Needs ccache 4.4 or later in the image
     #[serde(default)]
     pub ccache: bool,
+    /// What builds the Dockerfile: "buildah" or "buildkit" (default the server's, which `build`
+    /// and `status` report). They differ where buildah departs from `docker build`: under
+    /// buildah a COPY whose wildcard matches nothing fails the build, under buildkit it copies
+    /// nothing. buildkit is experimental
+    pub builder: Option<jobs::Builder>,
 }
 
 /// A cache a build declares.
@@ -1067,6 +1071,9 @@ pub struct BuildReply {
     pub status: Status,
     /// The digest of the context buildit uploaded for this build
     pub context_digest: ContextDigest,
+    /// What builds the Dockerfile; absent for a build with `base`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builder: Option<jobs::Builder>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1077,6 +1084,9 @@ pub struct StatusReply {
     pub timed_out: bool,
     pub log_tail: String,
     pub context_digest: Option<ContextDigest>,
+    /// What built the Dockerfile, while Kubernetes keeps the build's Job
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builder: Option<jobs::Builder>,
     /// The JSON object the build wrote to `/buildit/facts.json`, once it has ended
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub facts: Option<serde_json::Map<String, serde_json::Value>>,
@@ -1684,6 +1694,7 @@ impl Broker {
             }
         };
         seen.context_digest = context_digest;
+        seen.builder = annotation(&job.metadata, ANNOTATION_BUILDER).and_then(jobs::Builder::parse);
         let archived = matches!(log, LogName::Run(_)) || is_layer(&job);
         if archived
             && matches!(
@@ -1748,10 +1759,11 @@ impl Broker {
         &self,
         caller: &Caller,
         p: BuildParams,
-    ) -> Result<(BuildId, Snapshot, ContextDigest)> {
+    ) -> Result<(BuildId, Snapshot, ContextDigest, Option<jobs::Builder>)> {
         let cache = self.cache()?;
         let context = caller.workspace.context(&p.context)?;
         let recipe = Recipe::of(&p)?;
+        let builder = recipe.builder(p.builder, self.site.builder)?;
         let dockerfile = RelPath::parse(p.dockerfile.as_deref().unwrap_or("Dockerfile"))?;
         let limit = timeout(p.timeout_s, DEFAULT_BUILD_TIMEOUT_S);
         let mounts = run_mounts(cache_mounts(&p.caches)?, p.ccache);
@@ -1788,7 +1800,7 @@ impl Broker {
         };
         let snapshots = cache.snapshots(&p.caches, &tar, starter, root)?;
         let id = BuildId::fresh();
-        let (stage, stamps) = match self.site.builder {
+        let (stage, stamps) = match builder.unwrap_or_default() {
             jobs::Builder::Buildah => (
                 bud_argv(
                     &id,
@@ -1834,15 +1846,19 @@ impl Broker {
             );
         }
         let labels = self.labels(caller, &id);
+        let mut annotations = BTreeMap::from([(
+            ANNOTATION_CONTEXT_DIGEST.to_string(),
+            digest.as_str().to_string(),
+        )]);
+        if let Some(builder) = builder {
+            annotations.insert(ANNOTATION_BUILDER.to_string(), builder.as_str().to_string());
+        }
         let ident = jobs::Ident {
             name: id.as_str(),
             build: id.as_str(),
             sandbox: caller.sandbox.as_str(),
             labels: &labels,
-            annotations: BTreeMap::from([(
-                ANNOTATION_CONTEXT_DIGEST.to_string(),
-                digest.as_str().to_string(),
-            )]),
+            annotations,
         };
         let spec = match recipe {
             Recipe::Dockerfile => {
@@ -1859,7 +1875,7 @@ impl Broker {
                         context_digest: digest.as_str(),
                         cache_dirs: &cache_dirs,
                         runner_args: &runner_args,
-                        engine: match self.site.builder {
+                        engine: match builder.unwrap_or_default() {
                             jobs::Builder::Buildah => jobs::Engine::Buildah {
                                 local_tag: &local_tag,
                             },
@@ -1901,7 +1917,7 @@ impl Broker {
             tar.len() / 1024,
         );
         let now = now_string();
-        Ok((id, Snapshot::running(&now), digest))
+        Ok((id, Snapshot::running(&now), digest, builder))
     }
 
     /// Creates `job` and then its inputs Secret, owned by it; deletes the Job when the Secret
@@ -1955,11 +1971,12 @@ impl Broker {
     }
 
     pub async fn build(&self, caller: &Caller, p: BuildParams) -> Result<BuildReply> {
-        let (id, snap, context_digest) = self.start_build(caller, p).await?;
+        let (id, snap, context_digest, builder) = self.start_build(caller, p).await?;
         Ok(BuildReply {
             build_id: id.0,
             status: snap.state.status(),
             context_digest,
+            builder,
         })
     }
 
@@ -2111,6 +2128,7 @@ impl Broker {
             timed_out: seen.snap.state.timed_out(),
             log_tail,
             context_digest: seen.context_digest.clone(),
+            builder: seen.builder,
             facts,
         })
     }
@@ -2505,6 +2523,7 @@ struct Seen {
     working: Option<Working>,
     digest: Option<String>,
     context_digest: Option<ContextDigest>,
+    builder: Option<jobs::Builder>,
 }
 
 impl Seen {
@@ -2520,6 +2539,7 @@ impl Seen {
             working: Some(working),
             digest: None,
             context_digest: None,
+            builder: None,
         }
     }
 
@@ -2537,6 +2557,7 @@ impl Seen {
             working: None,
             digest,
             context_digest: None,
+            builder: None,
         }
     }
 }
@@ -2582,6 +2603,22 @@ enum Recipe<'a> {
 }
 
 impl<'a> Recipe<'a> {
+    /// What builds a Dockerfile build that asks for `asked` on a server that defaults to `site`;
+    /// a layer build has no builder to choose.
+    fn builder(
+        &self,
+        asked: Option<jobs::Builder>,
+        site: jobs::Builder,
+    ) -> Result<Option<jobs::Builder>> {
+        match (self, asked) {
+            (Self::Dockerfile, _) => Ok(Some(asked.unwrap_or(site))),
+            (Self::Layer { .. }, None) => Ok(None),
+            (Self::Layer { .. }, Some(_)) => {
+                bail!("builder chooses what builds a Dockerfile; a build with base has none")
+            }
+        }
+    }
+
     fn of(p: &'a BuildParams) -> Result<Self> {
         let Some(base) = p.base.as_deref() else {
             if p.script.is_some() || p.path.is_some() {
@@ -2893,9 +2930,11 @@ fn internal(e: anyhow::Error) -> McpError {
 impl BuilditMcp {
     #[tool(
         description = "Start building a Dockerfile (params: context, dockerfile, target, build_args, \
-        timeout_s); `push` publishes it once it succeeds. Returns build_id with status running at once; \
-        the build waits in the queue until there is room. Poll `status` until succeeded or failed, \
-        then `run`/`logs` as needed, and `clean` the build_id when done. \
+        timeout_s, builder); `push` publishes it once it succeeds. Returns build_id with status running \
+        at once, and the builder used; the build waits in the queue until there is room. Poll `status` \
+        until succeeded or failed, then `run`/`logs` as needed, and `clean` the build_id when done. A \
+        Dockerfile that builds under `docker build` and fails here under buildah may build with \
+        builder \"buildkit\". \
         Clients with the tasks extension get a task to poll instead."
     )]
     async fn build(
@@ -2907,7 +2946,7 @@ impl BuilditMcp {
             return complete(async { self.broker.build(&caller(&ctx)?, p).await }.await);
         }
         let started = async { self.broker.start_build(&caller(&ctx)?, p).await }.await;
-        let (id, snap, _) = started.map_err(|e| format!("{e:#}"))?;
+        let (id, snap, _, _) = started.map_err(|e| format!("{e:#}"))?;
         let t = TaskRef {
             build: id,
             log: LogName::Build,
@@ -3885,6 +3924,52 @@ mod tests {
     }
 
     #[test]
+    fn a_build_may_name_its_builder_and_a_layer_build_has_none() {
+        use crate::context::ContextDigest;
+        use crate::jobs::Builder::{Buildah, Buildkit};
+        use crate::mcp::{BuildReply, Recipe};
+        let parse = |v: serde_json::Value| serde_json::from_value::<BuildParams>(v);
+        let p = parse(serde_json::json!({ "context": "svc", "builder": "buildkit" })).unwrap();
+        assert_eq!(p.builder, Some(Buildkit));
+        assert_eq!(
+            parse(serde_json::json!({ "context": "svc" }))
+                .unwrap()
+                .builder,
+            None
+        );
+        assert!(parse(serde_json::json!({ "context": "svc", "builder": "kaniko" })).is_err());
+        let schema = serde_json::to_value(rmcp::schemars::schema_for!(BuildParams)).unwrap();
+        assert!(schema.to_string().contains("\"buildkit\""), "{schema}");
+
+        let dockerfile = Recipe::of(&p).unwrap();
+        assert_eq!(dockerfile.builder(None, Buildah).unwrap(), Some(Buildah));
+        assert_eq!(dockerfile.builder(None, Buildkit).unwrap(), Some(Buildkit));
+        assert_eq!(
+            dockerfile.builder(Some(Buildkit), Buildah).unwrap(),
+            Some(Buildkit)
+        );
+        assert_eq!(
+            dockerfile.builder(Some(Buildah), Buildkit).unwrap(),
+            Some(Buildah)
+        );
+        let layer = parse(serde_json::json!({
+            "context": "svc", "base": "docker.io/acme/base:1", "script": "make", "path": "/src",
+        }))
+        .unwrap();
+        let layer = Recipe::of(&layer).unwrap();
+        assert_eq!(layer.builder(None, Buildkit).unwrap(), None);
+        assert!(layer.builder(Some(Buildkit), Buildah).is_err());
+
+        let reply = BuildReply {
+            build_id: "buildit-00000000000000a1".to_string(),
+            status: crate::step::Status::Running,
+            context_digest: ContextDigest::parse(&format!("sha256:{}", "0".repeat(64))).unwrap(),
+            builder: Some(Buildkit),
+        };
+        assert_eq!(serde_json::to_value(&reply).unwrap()["builder"], "buildkit");
+    }
+
+    #[test]
     fn build_ids_cannot_smuggle_selectors() {
         assert!(BuildId::parse(&BuildId::fresh().0).is_ok());
         for bad in [
@@ -4759,7 +4844,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bud_arguments_are_refused_by_a_server_that_builds_with_buildkit() {
+    async fn the_server_takes_the_builder_its_builds_default_to() {
         use clap::Parser;
         let parsed = |extra: &[&str]| {
             let mut argv = vec!["buildit", "--tokens-file", "/t"];
@@ -4771,9 +4856,6 @@ mod tests {
             parsed(&["--builder", "buildkit"]).builder,
             jobs::Builder::Buildkit
         );
-        let both = parsed(&["--builder", "buildkit", "--bud-arg=--retry", "--bud-arg=5"]);
-        let e = crate::mcp::serve(offline_client(), both).await.unwrap_err();
-        assert!(e.to_string().contains("--bud-arg"), "{e}");
     }
 
     #[test]
@@ -5288,6 +5370,7 @@ mod tests {
                     timeout_s: Some(600),
                     caches: caches(),
                     ccache: true,
+                    builder: None,
                     base: None,
                     script: None,
                     path: None,
@@ -5451,7 +5534,6 @@ mod tests {
             }),
             ..broker_value(client, &file, Some(&work))
         };
-        broker.site.builder = jobs::Builder::Buildkit;
         broker.site.cache = cache_url.trim_end_matches('/').to_string();
         let site = broker.site.clone();
         let (addr, _server) = serve(Arc::new(broker)).await;
@@ -5490,10 +5572,11 @@ mod tests {
 
         let (first, status, log) = build(serde_json::json!({
             "context": "svc", "timeout_s": 600, "ccache": true, "caches": deps,
-            "build_args": { "NONCE": format!("{run}-seed") },
+            "build_args": { "NONCE": format!("{run}-seed") }, "builder": "buildkit",
         }))
         .await;
         assert_eq!(status["status"], "succeeded", "{status}\n{log}");
+        assert_eq!(status["builder"], "buildkit", "{status}");
         assert_eq!(status["exit"], 0, "{status}");
         assert_eq!(
             status["facts"],
@@ -5516,8 +5599,8 @@ mod tests {
             "run",
             serde_json::json!({
                 "build_id": first,
-                "cmd": ["sh", "-c", "test -e /app/vllm || echo no-vllm; ls /deps; \
-                         wc -c < /etc/ccache.conf; cat /buildit/steps.log"],
+                "cmd": ["sh", "-c", "for p in /app/vllm /deps /etc/ccache.conf; do \
+                         test -e $p || echo \"no $p\"; done; cat /buildit/steps.log"],
             }),
         )
         .await
@@ -5525,9 +5608,9 @@ mod tests {
         let out = ran["log_tail"].as_str().unwrap_or_default();
         assert_eq!(ran["exit"], 0, "{ran}");
         assert!(
-            out.starts_with("1:no-vllm\n2:0\n"),
-            "a COPY whose wildcard matches nothing copies nothing, and the image holds only the \
-             mount points of the cache and the ccache conf: {out}"
+            out.starts_with("1:no /app/vllm\n2:no /deps\n3:no /etc/ccache.conf\n4:"),
+            "a COPY whose wildcard matches nothing copies nothing, and no mount buildit adds \
+             leaves its mount point in the image: {out}"
         );
         let at = |line: &str| {
             out.lines()
@@ -5562,6 +5645,7 @@ mod tests {
         .unwrap();
         let (second, status, log) = build(serde_json::json!({
             "context": "next", "timeout_s": 600, "target": "base", "caches": deps,
+            "builder": "buildkit",
         }))
         .await;
         assert_eq!(status["status"], "succeeded", "{status}\n{log}");
@@ -5572,15 +5656,27 @@ mod tests {
             "a build FROM an earlier build's image pulls it, stops at its target and starts \
              from the saved cache: {log}"
         );
-        let (_, status, log) =
-            build(serde_json::json!({ "context": "next", "timeout_s": 600 })).await;
+        let (_, status, log) = build(serde_json::json!({
+            "context": "next", "timeout_s": 600, "builder": "buildkit",
+        }))
+        .await;
         assert_eq!(status["status"], "failed", "{status}\n{log}");
         assert_eq!(status["exit"], 1, "{status}");
         assert_eq!(status["timed_out"], false, "{status}");
 
-        let (_, status, _) = build(serde_json::json!({ "context": "slow", "timeout_s": 20 })).await;
+        let (_, status, _) = build(serde_json::json!({
+            "context": "slow", "timeout_s": 20, "builder": "buildkit",
+        }))
+        .await;
         assert_eq!(status["status"], "failed", "{status}");
         assert_eq!(status["timed_out"], true, "{status}");
+        let (_, status, log) =
+            build(serde_json::json!({ "context": "svc", "timeout_s": 600 })).await;
+        assert_eq!(
+            status["builder"], "buildah",
+            "the server's builder: {status}"
+        );
+        assert_eq!(status["status"], "failed", "{status}\n{log}");
 
         let ran = a(
             "run",
@@ -5673,6 +5769,7 @@ mod tests {
                                 key: vec!["pins.txt".to_string()],
                             }],
                             ccache: false,
+                            builder: None,
                             base: None,
                             script: None,
                             path: None,
@@ -6360,6 +6457,7 @@ mod tests {
                 timeout_s: None,
                 caches: Vec::new(),
                 ccache: false,
+                builder: None,
                 base: None,
                 script: None,
                 path: None,

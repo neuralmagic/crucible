@@ -168,13 +168,13 @@ pub struct BuilderPods {
     /// Resource limits, `{ cpu = "32", memory = "64Gi" }`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<BTreeMap<String, String>>,
-    /// What builds a Dockerfile.
+    /// What builds a Dockerfile when the build names no builder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub builder: Option<Builder>,
     /// Where the builder keeps image layers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_driver: Option<StorageDriver>,
-    /// Extra `buildah bud` arguments for every Dockerfile build, after buildit's own.
+    /// Extra `buildah bud` arguments for every Dockerfile build buildah runs, after buildit's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bud_args: Option<Vec<String>>,
 }

@@ -353,14 +353,13 @@ pods that name no queue (`manageJobsWithoutQueueName`), or builds wait 10 minute
 `storage_driver`, and `bud_args`.
 `[buildit.cluster_builders.<cluster>]` replaces any of those on one cluster, so a mixed-architecture cluster can pin its builds. Without
 `node_arch`, builder pods run on the loop pod's architecture; unset limits are buildit's defaults
-(4 builds, 7200 s, no requests or limits). `builder` is `buildah` (the default) or `buildkit`
-(experimental), which builds Dockerfiles as `docker build` does; `buildit/README.md` lists what
-differs. Apply the builder admission policy of the same release, which admits the BuildKit image. `storage_driver` is `vfs` (the default), a full copy
+(4 builds, 7200 s, no requests or limits). `builder` is what builds a Dockerfile when the
+build names no builder: `buildah` (the default) or `buildkit` (experimental), which builds as
+`docker build` does; `buildit/README.md` lists what differs. Apply the builder admission policy of the same release, which admits the BuildKit image. `storage_driver` is `vfs` (the default), a full copy
 of the filesystem per image layer, or `overlay`, each layer stored once with kernel overlayfs in
 the builder's user namespace; `overlay` needs a kernel that allows that (5.13 and later, such as
 RHEL 9's). `bud_args` are extra `buildah bud` arguments for every Dockerfile build, placed after
-buildit's own; a server whose `builder` is `buildkit` refuses them, so set `bud_args = []` on a
-cluster that overrides `builder`.
+buildit's own.
 
 ```toml
 [buildit]
@@ -383,7 +382,6 @@ bud_args          = ["--retry", "5"]
 [buildit.cluster_builders.spoke-b]                  # optional, per cluster
 node_arch = "amd64"
 builder   = "buildkit"
-bud_args  = []
 
 [buildit.cache]                                     # optional, a cache builds share
 clusters     = ["spoke-a"]                          # default the hub; deploy it on each

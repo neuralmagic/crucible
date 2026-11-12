@@ -198,25 +198,28 @@ is not part of the image. It needs ccache 4.4 or later, which reads the `seconda
 
 #### Building with BuildKit (experimental)
 
-`--builder buildkit` (`MCP_BUILDER`) builds Dockerfiles with rootless BuildKit, so they behave as
-under `docker build`: a `COPY` whose wildcard matches nothing copies nothing, where `buildah bud`
-fails. `buildah` stays the default, and a build with `base` is unaffected. The server logs a
-warning at start while this is experimental.
+BuildKit builds a Dockerfile as `docker build` does: a `COPY` whose wildcard matches nothing
+copies nothing, where `buildah bud` fails. A build asks for it with `builder: "buildkit"`
+(`--builder buildkit` on the CLI), and `build` and `status` report the builder used, so a caller
+whose build fails on a buildah difference can retry it under BuildKit. `--builder buildkit`
+(`MCP_BUILDER`) on the server makes it the default for builds that name none; `buildah` is the
+default otherwise, and a build with `base` has no builder. The server logs a warning at start
+when its default is BuildKit, while this is experimental.
 
 The pod and its privileges are the same. An init container copies BuildKit's static binaries from
 `docker.io/moby/buildkit:v0.35.0-rootless`, and the `builder` container starts a `buildkitd` for
 the one build and runs `buildctl build`, which pushes the image. Registry handling, `target`,
 build args, the timeout, cluster caches, `status` and `logs` work as with buildah.
 `--storage-driver vfs` is BuildKit's `native` snapshotter and `overlay` its `overlayfs`;
-`--bud-arg` is refused.
+`--bud-arg` reaches buildah builds only.
 
 `buildkitd` runs with `noProcessSandbox` and a wrapper around its runtime that drops each `RUN`
 step's hostname, binds the pod's `/dev/pts`, and adds `/buildit`, `/etc/ccache.conf` and the
-declared caches to the step's mounts, since BuildKit has no `--volume`. Known differences:
+declared caches to the step's mounts, since BuildKit has no `--volume`; it removes the mount
+points it made once the step ends, so they are not in the image. Known differences:
 
 - The log is `buildctl --progress=plain`: output lines are prefixed, `#9 0.156 hello`, and
   `steps.log` stamps lines like `#5 [build 2/3] RUN make` in place of `STEP` and `COMMIT`.
-- The image keeps an empty mount point for `/buildit`, `/etc/ccache.conf` and each cache path.
 - A Dockerfile's own `RUN --mount=type=cache` ends with the pod; use a `scope: "cluster"` cache.
 - BuildKit resolves every stage's base image before it builds any.
 

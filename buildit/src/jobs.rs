@@ -26,6 +26,7 @@ use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1 as core;
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
+use rmcp::schemars;
 
 use crate::backend::{Resources, StorageDriver};
 use crate::step::State;
@@ -105,13 +106,40 @@ impl Registry {
 }
 
 /// What builds a Dockerfile in a build pod.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum Builder {
     /// `buildah bud`, then a push.
     #[default]
     Buildah,
     /// Rootless BuildKit, the builder `docker build` uses: a `buildkitd` for the one build.
     Buildkit,
+}
+
+impl Builder {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Buildah => "buildah",
+            Self::Buildkit => "buildkit",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        [Self::Buildah, Self::Buildkit]
+            .into_iter()
+            .find(|b| b.as_str() == raw)
+    }
 }
 
 /// A directory or file of the build pod that every `RUN` step of a Dockerfile build sees.
@@ -361,6 +389,7 @@ mkdir -p "$bk" "$XDG_RUNTIME_DIR" /buildit-out/facts "$TMPDIR" $CACHE_DIRS
 export PATH="/buildit-tools:$PATH" DOCKER_CONFIG="$bk"
 printf '%s\n' "$RUNC" > "$bk/runc"; chmod +x "$bk/runc"
 printf '%s' "$RUN_MOUNTS" > "$bk/mounts.json"
+printf '%s\n' "$RUN_TARGETS" > "$bk/targets"
 {
   printf 'root = "%s/buildkit"\n[grpc]\n  address = ["%s"]\n[otel]\n  socketPath = "%s/otel-grpc.sock"\n' \
     "$STORAGE" "$BUILDKIT_HOST" "$bk"
@@ -394,18 +423,41 @@ done"#;
 
 /// `buildkitd`'s OCI runtime: `buildkit-runc`, after three edits to the config of the `RUN` step
 /// it is about to start. The hostname goes, /dev/pts becomes a bind of the pod's, and the build's
-/// [`RunMount`]s go first in the mounts.
+/// [`RunMount`]s go first in the mounts. Once the step has ended, the mount points the runtime
+/// made for them in the step's root, and the directories it made to hold those, go again where
+/// the step left them empty.
 const RUNC: &str = r#"#!/bin/bash
 b=; prev=
 for a in "$@"; do [ "$prev" = --bundle ] && b=$a; prev=$a; done
-if [ -n "$b" ] && [ -f "$b/config.json" ]; then
-  sed -i -e 's/"hostname":"[^"]*",//' \
-    -e 's#{"destination":"/dev/pts","type":"devpts","source":"devpts","options":\[[^]]*\]}#{"destination":"/dev/pts","type":"bind","source":"/dev/pts","options":["rbind","nosuid","noexec"]}#' \
-    "$b/config.json"
-  c=$(< "$b/config.json"); m=$(< /tmp/buildkit/mounts.json)
-  printf '%s' "${c/'"mounts":['/'"mounts":['"$m"}" > "$b/config.json"
-fi
-exec /buildit-tools/buildkit-runc "$@""#;
+if [ -z "$b" ] || [ ! -f "$b/config.json" ]; then exec /buildit-tools/buildkit-runc "$@"; fi
+sed -i -e 's/"hostname":"[^"]*",//' \
+  -e 's#{"destination":"/dev/pts","type":"devpts","source":"devpts","options":\[[^]]*\]}#{"destination":"/dev/pts","type":"bind","source":"/dev/pts","options":["rbind","nosuid","noexec"]}#' \
+  "$b/config.json"
+c=$(< "$b/config.json"); m=$(< /tmp/buildkit/mounts.json)
+printf '%s' "${c/'"mounts":['/'"mounts":['"$m"}" > "$b/config.json"
+root=$b/rootfs; made=()
+while IFS= read -r t; do
+  [ -n "$t" ] || continue
+  top=; p=$t
+  while [ "$p" != / ] && [ ! -e "$root$p" ] && [ ! -L "$root$p" ]; do top=$p; p=$(dirname "$p"); done
+  [ -n "$top" ] && made+=("$t" "$top")
+done < /tmp/buildkit/targets
+/buildit-tools/buildkit-runc "$@" &
+r=$!
+trap 'kill -TERM "$r" 2> /dev/null' TERM INT
+wait "$r"; code=$?
+while kill -0 "$r" 2> /dev/null; do wait "$r"; code=$?; done
+for ((i = 0; i < ${#made[@]}; i += 2)); do
+  p=${made[i]}; top=${made[i + 1]}
+  while :; do
+    if [ -d "$root$p" ] && [ ! -L "$root$p" ]; then rmdir "$root$p" 2> /dev/null || break
+    elif [ -f "$root$p" ] && [ ! -s "$root$p" ]; then rm -f "$root$p"
+    else break; fi
+    [ "$p" = "$top" ] && break
+    p=$(dirname "$p")
+  done
+done
+exit "$code""#;
 
 /// `step::RUNNER` with its log mirrored to stdout, and its exit record.
 const BUILD_RUN: &str = r#"for f in ccache.conf cache.json; do [ -e "/buildit-inputs/$f" ] && cp "/buildit-inputs/$f" /buildit-out/facts/; done
@@ -557,6 +609,14 @@ pub fn build_job(site: &Site, id: &Ident<'_>, b: &BuildJob<'_>) -> Job {
                 env("BUILDKIT_HOST", &buildkit_host()),
                 env("RUNC", RUNC),
                 env("RUN_MOUNTS", &run_mounts_json(run_mounts)),
+                env(
+                    "RUN_TARGETS",
+                    &run_mounts
+                        .iter()
+                        .map(|m| m.target.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
                 env("SNAPSHOTTER", snapshotter(site.storage)),
                 env("XDG_RUNTIME_DIR", &format!("{BUILDKIT_DIR}/run")),
             ]);
@@ -1542,6 +1602,10 @@ mod tests {
         assert_eq!(env("CACHE_DIRS").as_deref(), Some("/c/deps"));
         assert_eq!(env("RUNC").as_deref(), Some(crate::jobs::RUNC));
         assert_eq!(
+            env("RUN_TARGETS").as_deref(),
+            Some("/root/a \"b\"\n/buildit")
+        );
+        assert_eq!(
             env("RUN_MOUNTS").as_deref(),
             Some(
                 r#"{"destination":"/root/a \"b\"","options":["rbind","ro"],"source":"/c/deps","type":"bind"},{"destination":"/buildit","options":["rbind","rw"],"source":"/buildit-out/facts","type":"bind"},"#
@@ -1601,27 +1665,36 @@ mod tests {
     }
 
     /// [`crate::jobs::RUNC`] on a config as `buildkitd` writes one, with the paths it reads moved
-    /// under `dir` and `echo` for the runtime.
+    /// under `dir` and `runtime` for the runtime.
     #[cfg(target_os = "linux")]
-    fn runc(dir: &std::path::Path, config: &str, mounts: &[RunMount]) -> (String, String) {
+    fn runc(
+        dir: &std::path::Path,
+        runtime: &str,
+        config: &str,
+        mounts: &[RunMount],
+    ) -> (String, String, Option<i32>) {
         let bundle = dir.join("bundle");
         std::fs::create_dir_all(&bundle).unwrap();
         std::fs::write(bundle.join("config.json"), config).unwrap();
         let fragment = dir.join("mounts.json");
         std::fs::write(&fragment, crate::jobs::run_mounts_json(mounts)).unwrap();
+        let targets = dir.join("targets");
+        let listed: Vec<&str> = mounts.iter().map(|m| m.target.as_str()).collect();
+        std::fs::write(&targets, format!("{}\n", listed.join("\n"))).unwrap();
         let script = crate::jobs::RUNC
             .replace("/tmp/buildkit/mounts.json", fragment.to_str().unwrap())
-            .replace("/buildit-tools/buildkit-runc", "echo");
+            .replace("/tmp/buildkit/targets", targets.to_str().unwrap())
+            .replace("/buildit-tools/buildkit-runc", runtime);
         let out = std::process::Command::new("bash")
             .args(["-c", &script, "runc", "--log", "l", "run", "--bundle"])
             .arg(&bundle)
             .arg("id-1")
             .output()
             .unwrap();
-        assert!(out.status.success(), "{out:?}");
         (
             std::fs::read_to_string(bundle.join("config.json")).unwrap(),
             String::from_utf8(out.stdout).unwrap(),
+            out.status.code(),
         )
     }
 
@@ -1649,7 +1722,8 @@ mod tests {
                 read_only: false,
             },
         ];
-        let (edited, ran) = runc(dir.path(), config, &mounts);
+        let (edited, ran, code) = runc(dir.path(), "echo", config, &mounts);
+        assert_eq!(code, Some(0));
         assert_eq!(
             ran.trim_end(),
             format!(
@@ -1695,6 +1769,56 @@ mod tests {
             "kill id-1 KILL\n",
             "a command with no bundle goes straight to the runtime"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_buildkit_runtime_leaves_no_mount_point_it_made_in_the_steps_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("bundle/rootfs");
+        for there in ["etc", "opt/kept", "srv"] {
+            std::fs::create_dir_all(root.join(there)).unwrap();
+        }
+        let fake = dir.path().join("fake-runc");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nr=$5/rootfs\n\
+             mkdir -p $r/buildit $r/root/.cache/ccache $r/var/lib/deps $r/srv/used/cache\n\
+             : > $r/etc/ccache.conf\necho left > $r/srv/used/file\nexit 7\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let mounts: Vec<RunMount> = [
+            "/buildit",
+            "/etc/ccache.conf",
+            "/root/.cache/ccache",
+            "/var/lib/deps",
+            "/opt/kept",
+            "/srv/used/cache",
+        ]
+        .iter()
+        .map(|target| RunMount {
+            source: "/s".to_string(),
+            target: target.to_string(),
+            read_only: false,
+        })
+        .collect();
+        let config = r#"{"process":{"args":["true"]},"hostname":"h","mounts":[]}"#;
+        let (_, _, code) = runc(dir.path(), fake.to_str().unwrap(), config, &mounts);
+        assert_eq!(code, Some(7), "the step's exit code");
+        for gone in [
+            "buildit",
+            "etc/ccache.conf",
+            "root",
+            "var",
+            "srv/used/cache",
+        ] {
+            assert!(!root.join(gone).exists(), "{gone} is left");
+        }
+        for kept in ["etc", "opt/kept", "srv/used/file"] {
+            assert!(root.join(kept).exists(), "{kept} is gone");
+        }
     }
 
     #[test]
