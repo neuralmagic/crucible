@@ -68,6 +68,7 @@ pub(crate) fn log_pane(
         .scroll(ScrollSpec {
             stick_bottom: app.run.log_task.is_none() && query.is_empty() && mode == LogMode::Stream,
         })
+        .scroll_anchor()
         .scroll_edge_fade(8.0);
     if matched.is_empty() {
         lines = lines.child(
@@ -84,11 +85,13 @@ pub(crate) fn log_pane(
     match mode {
         LogMode::Stream => {
             for line in matched.iter().skip(matched.len().saturating_sub(SHOWN)) {
-                lines = lines.child(line_row(line, style, app.run.log_task.is_some(), p));
+                let row = line_row(line, style, app.run.log_task.is_some(), p);
+                lines = lines.child(keyed(row, log, line));
             }
         }
         LogMode::ByTask => {
             let blocks = Blocks {
+                log,
                 tasks,
                 app,
                 style,
@@ -155,6 +158,7 @@ enum Fold {
 
 /// The pieces every block draws with.
 struct Blocks<'a> {
+    log: &'a [LogLine],
     tasks: &'a [TaskView],
     app: &'a App,
     style: TextStyle,
@@ -194,7 +198,8 @@ impl Blocks<'_> {
         let indent = INDENT * depth as f32;
         let mut rows = vec![self.header(block, fold, indent)];
         let line = |line: &LogLine, scoped: bool| {
-            line_row(line, self.style, scoped, self.p).pl(indent + INDENT)
+            let row = line_row(line, self.style, scoped, self.p).pl(indent + INDENT);
+            keyed(row, self.log, line)
         };
         match fold {
             Fold::Folded => {}
@@ -409,6 +414,15 @@ fn toggle(
         .focusable(true)
         .on_press(on_press)
         .child(text(label.to_string()).font(p.k.ty.small_medium).color(ink))
+}
+
+/// Keys a line's row by where the line sits in `log`, so it stays the same row while the lines
+/// drawn around it change.
+fn keyed(row: El, log: &[LogLine], line: &LogLine) -> El {
+    match log.element_offset(line) {
+        Some(at) => row.key(format!("log-line-{at}")),
+        None => row,
+    }
 }
 
 fn line_row(line: &LogLine, style: TextStyle, scoped: bool, p: &Paint) -> El {

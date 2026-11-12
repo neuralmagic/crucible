@@ -1450,6 +1450,13 @@ const POD_WAITS: u32 = 24;
 const POD_WAIT: Duration = Duration::from_secs(5);
 /// Back-to-back connections that end with nothing on them before a follow gives up.
 const EMPTY_STREAMS: u32 = 5;
+/// How long a follow waits before it resumes a connection that dropped.
+const DROP_WAIT: Duration = Duration::from_secs(1);
+
+/// Whether a live connection failed on the wire, rather than the relay answering with an error.
+fn dropped(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<reqwest::Error>())
+}
 
 /// How one live connection ended.
 #[derive(Debug, PartialEq, Eq)]
@@ -1499,11 +1506,12 @@ impl Client {
         let mut streamed = 0usize;
         let mut pod_waits = 0u32;
         let mut empty = 0u32;
+        let mut attached = false;
         loop {
             let mut reason: Option<String> = None;
             let mut events = 0usize;
             let resume = last_id.clone();
-            {
+            let live = {
                 let mut on_event = |event: SseEvent| -> Result<()> {
                     events += 1;
                     match event.event.as_str() {
@@ -1521,7 +1529,16 @@ impl Client {
                     Ok(())
                 };
                 self.run_live(run_id, resume.as_deref(), &mut on_event)
-                    .await?;
+                    .await
+            };
+            attached |= events > 0;
+            if let Err(error) = live {
+                empty = if events == 0 { empty + 1 } else { 0 };
+                if !attached || !dropped(&error) || empty >= EMPTY_STREAMS {
+                    return Err(error);
+                }
+                pause(DROP_WAIT).await;
+                continue;
             }
             match LiveEnd::of(reason.as_deref(), streamed) {
                 LiveEnd::Stored => {
@@ -1752,6 +1769,171 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(only, sessions, "following the session alone skips the log");
+    }
+
+    /// What a relay does with one connection to a run's `/live`.
+    enum Leg {
+        /// Streams these events, then drops the connection without finishing the response.
+        Drop(Vec<SseEvent>),
+        Finish(Vec<SseEvent>),
+        Refuse(u16),
+    }
+
+    /// A relay on a loopback port that plays one leg per connection, and the `last-event-id`
+    /// each connection asked to resume after.
+    async fn relay(legs: Vec<Leg>) -> (Client, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        let resumed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = resumed.clone();
+        tokio::spawn(async move {
+            for leg in legs {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut request = Vec::new();
+                let mut read = [0u8; 1024];
+                while !request.windows(4).any(|end| end == b"\r\n\r\n") {
+                    match socket.read(&mut read).await.expect("read") {
+                        0 => break,
+                        n => request.extend_from_slice(&read[..n]),
+                    }
+                }
+                let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                let after = request
+                    .lines()
+                    .find_map(|line| line.strip_prefix("last-event-id: "))
+                    .unwrap_or_default();
+                seen.lock().unwrap().push(after.to_string());
+                let (events, finish) = match leg {
+                    Leg::Refuse(status) => {
+                        let head = format!(
+                            "HTTP/1.1 {status} Refused\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        );
+                        socket.write_all(head.as_bytes()).await.expect("write");
+                        continue;
+                    }
+                    Leg::Drop(events) => (events, false),
+                    Leg::Finish(events) => (events, true),
+                };
+                let body: String = events
+                    .iter()
+                    .map(|event| {
+                        format!(
+                            "id: {}\nevent: {}\ndata: {}\n\n",
+                            event.id.as_deref().unwrap_or_default(),
+                            event.event,
+                            event.data
+                        )
+                    })
+                    .collect();
+                let mut response = concat!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n",
+                    "transfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+                )
+                .to_string();
+                if !body.is_empty() {
+                    response.push_str(&format!("{:x}\r\n{body}\r\n", body.len()));
+                }
+                if finish {
+                    response.push_str("0\r\n\r\n");
+                }
+                socket.write_all(response.as_bytes()).await.expect("write");
+                socket.shutdown().await.expect("shutdown");
+            }
+        });
+        let client = Client::connect(&crate::config::Config {
+            url,
+            auth: Auth::None,
+        })
+        .expect("connect");
+        (client, resumed)
+    }
+
+    async fn followed(client: &Client) -> (Result<()>, Vec<String>, Vec<String>) {
+        let (mut sessions, mut logs) = (Vec::new(), Vec::new());
+        let outcome = client
+            .follow_run(
+                "r1",
+                &mut |line| {
+                    sessions.push(line.to_string());
+                    Ok(())
+                },
+                &mut |line| {
+                    logs.push(line.to_string());
+                    Ok(())
+                },
+            )
+            .await;
+        (outcome, sessions, logs)
+    }
+
+    #[tokio::test]
+    async fn a_dropped_connection_resumes_after_the_last_event_it_delivered() {
+        let (client, resumed) = relay(vec![
+            Leg::Drop(vec![
+                event("session", "one", "1"),
+                event("log", "boot", "2"),
+            ]),
+            Leg::Finish(vec![
+                event("session", "two", "3"),
+                event("end", "completed: Succeeded", "3"),
+            ]),
+        ])
+        .await;
+        let (outcome, sessions, logs) = followed(&client).await;
+        outcome.expect("the follow outlives the drop");
+        assert_eq!(
+            sessions,
+            ["one", "two"],
+            "no line lost or handed over twice"
+        );
+        assert_eq!(logs, ["boot"]);
+        assert_eq!(*resumed.lock().unwrap(), ["", "2"]);
+    }
+
+    #[tokio::test]
+    async fn a_relay_that_answers_a_resume_with_an_error_ends_the_follow() {
+        let (client, resumed) = relay(vec![
+            Leg::Drop(vec![event("session", "one", "1")]),
+            Leg::Refuse(500),
+            Leg::Finish(vec![event("session", "late", "2")]),
+        ])
+        .await;
+        let (outcome, sessions, _) = followed(&client).await;
+        let error = format!("{:#}", outcome.expect_err("an HTTP error is not a drop"));
+        assert!(error.contains("HTTP 500"), "{error}");
+        assert_eq!(sessions, ["one"]);
+        assert_eq!(*resumed.lock().unwrap(), ["", "1"]);
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_drops_before_any_event_is_not_retried() {
+        let (client, resumed) = relay(vec![
+            Leg::Drop(Vec::new()),
+            Leg::Finish(vec![event("session", "late", "1")]),
+        ])
+        .await;
+        let (outcome, sessions, _) = followed(&client).await;
+        outcome.expect_err("nothing was ever streamed");
+        assert!(sessions.is_empty());
+        assert_eq!(*resumed.lock().unwrap(), [""]);
+    }
+
+    #[tokio::test]
+    async fn a_follow_gives_up_once_resumed_connections_keep_dropping_empty() {
+        let mut legs = vec![Leg::Drop(vec![event("session", "one", "1")])];
+        legs.extend((0..EMPTY_STREAMS).map(|_| Leg::Drop(Vec::new())));
+        legs.push(Leg::Finish(vec![event("session", "late", "2")]));
+        let (client, resumed) = relay(legs).await;
+        let (outcome, sessions, _) = followed(&client).await;
+        outcome.expect_err("the relay never came back");
+        assert_eq!(sessions, ["one"]);
+        let resumed = resumed.lock().unwrap();
+        assert_eq!(resumed.len(), 1 + EMPTY_STREAMS as usize);
+        assert!(resumed[1..].iter().all(|after| after == "1"), "{resumed:?}");
     }
 
     /// The link a human is handed hangs off the base this client dialled.
