@@ -955,7 +955,7 @@ function DraftStudio({ id }: { id: string }) {
               description="This save compiled no plan. Fix the source and save again."
             />
           ) : (
-            <WorkflowGraph graph={preview.graph} />
+            <WorkflowGraph graph={preview.graph} splitId="crucible.studio-graph" />
           )}
         </SectionBody>
       </Section>

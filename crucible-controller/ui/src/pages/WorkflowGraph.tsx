@@ -90,6 +90,9 @@ export interface WorkflowGraphProps {
   links?: ReadonlyMap<string, NodeLinks>;
   /// What each route node or route instance decided, keyed by its name.
   decisions?: ReadonlyMap<string, RouteDecision[]>;
+  /// The resizable-panels group id. Two graphs on one page must not share one: the group id is
+  /// shared live state in the panels library, and a collision collapses a panel to nothing.
+  splitId?: string;
   className?: string;
 }
 
@@ -749,6 +752,7 @@ function GraphCanvas({
   fanoutState,
   links,
   decisions,
+  splitId,
   className,
 }: WorkflowGraphProps) {
   const marker = useId().replace(/:/g, '');
@@ -1004,7 +1008,7 @@ function GraphCanvas({
             </defs>
           </svg>
 
-          <Split id="crucible.graph" panelIds={panelIds} className="h-full w-full">
+          <Split id={splitId ?? 'crucible.graph'} panelIds={panelIds} className="h-full w-full">
             <SplitPane id="canvas" minSize="30%">
               <div ref={canvasRef} className="relative min-h-0 min-w-0 flex-1">
                 <GraphViewContext.Provider value={view}>
