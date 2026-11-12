@@ -26,6 +26,10 @@ pub struct Runtime {
     /// decisions. `None` decides with the shipped default: a test, or a command that never
     /// dispatches.
     pub policy: Option<ActivePolicy>,
+    /// The local runs this process is supervising — the cancel path's only reach into a locally
+    /// dispatched engine, whose child the supervisor task owns. Entries exist only while
+    /// `CONTROLLER_PLAYBOOK_EXECUTOR=local` dispatches.
+    pub local_runs: crate::runs::local_run::LocalRuns,
 }
 
 impl Default for Runtime {
@@ -41,6 +45,7 @@ impl Default for Runtime {
             builds: Arc::new(crate::builds::backend::StubBuildBackend),
             queue: None,
             policy: None,
+            local_runs: crate::runs::local_run::LocalRuns::default(),
         }
     }
 }

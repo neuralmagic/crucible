@@ -1,6 +1,6 @@
 //! Cancelling a launch's runs: each `running` run on a pod has its pod deleted on the cluster it
-//! ran on and is marked `cancelled`. A run with no pod (local dispatch) is left alone; nothing here
-//! can stop it.
+//! ran on and is marked `cancelled`; a locally dispatched run has its engine signalled to stop
+//! through the registry of live local runs, and settles `cancelled` when its supervisor folds it.
 
 use anyhow::Result;
 
@@ -8,8 +8,10 @@ use crate::client::Db;
 use crate::config::ControllerCfg;
 use crate::runs::workpod::WorkPodState;
 
-/// Cancel `key`'s running pod runs for `actor`. Returns how many it cancelled; a run whose cluster
-/// did not answer the delete stays `running`, for a later cancel or the resync.
+/// Cancel `key`'s running runs for `actor`: a pod run's pod is deleted on the cluster it ran on,
+/// a local run's engine is signalled to stop. Returns how many it stopped; a run whose cluster did
+/// not answer the delete, or whose engine could not be signalled, stays `running`, for a later
+/// cancel or the resync.
 pub async fn cancel_runs(
     db: &Db,
     cfg: &ControllerCfg,
@@ -27,7 +29,17 @@ pub async fn cancel_runs(
     let mut cancelled = 0;
     for (run_id, pod) in runs {
         let Some(pod) = pod else {
-            tracing::warn!(issue_key = %key, run_id = %run_id, "cancel: a run with no pod is not stopped here");
+            if !cfg.runtime.local_runs.cancel(&run_id) {
+                tracing::warn!(issue_key = %key, run_id = %run_id, "cancel: a local run this process is not supervising is not stopped here");
+                continue;
+            }
+            crate::runs::pod_token::revoke(
+                db.pool(),
+                &crate::runs::pod_token::Subject::Run(run_id.clone()),
+            )
+            .await?;
+            tracing::info!(issue_key = %key, run_id = %run_id, "cancel: signalled a locally dispatched run's engine to stop");
+            cancelled += 1;
             continue;
         };
         let row = crate::runs::work_pods::get_work_pod(db.pool(), &pod).await?;

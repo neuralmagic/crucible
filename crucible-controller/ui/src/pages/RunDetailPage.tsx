@@ -10,6 +10,7 @@ import {
   fetchRunFileBlob,
 } from '../api/client';
 import { useRunGraph } from '../api/useRunGraph';
+import { CancelLaunchControl } from './CancelLaunchControl';
 import { flowEnrichedMessage, validTraceId } from './flowEnriched';
 import { MarkdownView } from './MarkdownView';
 import { flowThemeStyle, injectFlowTheme } from './flowTheme';
@@ -307,7 +308,16 @@ export function RunDetailPage() {
             {run.image_digest && <CopyText value={run.image_digest} />}
           </>
         }
-        aside={specs.length > 0 ? <Spec items={specs} /> : undefined}
+        aside={
+          specs.length > 0 || (isLiveRun && launch !== undefined) ? (
+            <div className="flex items-start gap-3">
+              {specs.length > 0 && <Spec items={specs} />}
+              {isLiveRun && launch !== undefined && (
+                <CancelLaunchControl launchKey={launch.key} />
+              )}
+            </div>
+          ) : undefined
+        }
       />
 
       {prUrls.length > 0 && (
