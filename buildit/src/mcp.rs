@@ -176,7 +176,7 @@ pub struct McpArgs {
     /// Directory this server keeps ended builds' and runs' logs in
     #[arg(long, env = "MCP_LOG_DIR", default_value = "/tmp/buildit-mcp-logs")]
     pub log_dir: PathBuf,
-    /// What builds a Dockerfile in a build pod
+    /// What builds a Dockerfile in a build pod; `buildkit` is experimental
     #[arg(long, env = "MCP_BUILDER", value_enum, default_value_t = jobs::Builder::Buildah)]
     pub builder: jobs::Builder,
     /// containers-storage driver of build pods; with `--builder buildkit`, `vfs` is BuildKit's
@@ -284,6 +284,9 @@ pub async fn serve(client: kube::Client, args: McpArgs) -> Result<()> {
     }
     if args.builder == jobs::Builder::Buildkit && !args.bud_args.is_empty() {
         bail!("--bud-arg adds `buildah bud` arguments, which --builder buildkit does not run");
+    }
+    if args.builder == jobs::Builder::Buildkit {
+        tracing::warn!("--builder buildkit is experimental");
     }
     let oidc = match args.run_issuers.is_empty() {
         true => None,

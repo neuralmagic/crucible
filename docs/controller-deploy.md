@@ -353,11 +353,9 @@ pods that name no queue (`manageJobsWithoutQueueName`), or builds wait 10 minute
 `storage_driver`, and `bud_args`.
 `[buildit.cluster_builders.<cluster>]` replaces any of those on one cluster, so a mixed-architecture cluster can pin its builds. Without
 `node_arch`, builder pods run on the loop pod's architecture; unset limits are buildit's defaults
-(4 builds, 7200 s, no requests or limits). `builder` is `buildah` (the default) or `buildkit`,
-which builds Dockerfiles with rootless BuildKit so they behave as under `docker build`; the
-builder pod asks for no more privilege, and `buildit/README.md` lists what differs. The builder
-admission policy admits the BuildKit image by its tag, so apply the policy of the release that
-sets `buildkit`. `storage_driver` is `vfs` (the default), a full copy
+(4 builds, 7200 s, no requests or limits). `builder` is `buildah` (the default) or `buildkit`
+(experimental), which builds Dockerfiles as `docker build` does; `buildit/README.md` lists what
+differs. Apply the builder admission policy of the same release, which admits the BuildKit image. `storage_driver` is `vfs` (the default), a full copy
 of the filesystem per image layer, or `overlay`, each layer stored once with kernel overlayfs in
 the builder's user namespace; `overlay` needs a kernel that allows that (5.13 and later, such as
 RHEL 9's). `bud_args` are extra `buildah bud` arguments for every Dockerfile build, placed after

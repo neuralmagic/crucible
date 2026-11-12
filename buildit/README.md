@@ -196,54 +196,29 @@ shared cache as remote storage (writing to it when the build may write) and logs
 result to `/buildit/ccache-stats.log`. The file overrides any `/etc/ccache.conf` the image has and
 is not part of the image. It needs ccache 4.4 or later, which reads the `secondary_storage` key.
 
-#### Building with BuildKit
+#### Building with BuildKit (experimental)
 
-`--builder buildkit` (`MCP_BUILDER`) builds Dockerfiles with BuildKit, the builder `docker build`
-uses, so a Dockerfile behaves as it does there: a `COPY` whose wildcard matches nothing copies
-nothing where `buildah bud` fails, and `RUN --mount`, heredocs and the rest of the Dockerfile
-frontend are BuildKit's own. `buildah` stays the default, and a build with `base` is built the
-same way under either.
+`--builder buildkit` (`MCP_BUILDER`) builds Dockerfiles with rootless BuildKit, so they behave as
+under `docker build`: a `COPY` whose wildcard matches nothing copies nothing, where `buildah bud`
+fails. `buildah` stays the default, and a build with `base` is unaffected. The server logs a
+warning at start while this is experimental.
 
-The build pod is the same pod. An init container copies `buildkitd`, `buildctl`, `buildkit-runc`
-and `rootlesskit`, static binaries, out of `docker.io/moby/buildkit:v0.35.0-rootless`. The
-`builder` container, still the buildah image at uid 1000, starts a rootless `buildkitd` for the
-one build and runs `buildctl build`, which pushes the image by digest. The registry handling is
-the same: the service account token and the service CA for the cluster's registry, plain HTTP for
-`--registry-auth insecure`, and a `FROM` of an earlier build's image pulls. `target`, build args,
-the timeout, the exit record, cluster cache snapshots, `status` and `logs` work as with buildah.
-`--storage-driver vfs` selects BuildKit's `native` snapshotter and `overlay` its `overlayfs`.
-`--bud-arg` is refused, as nothing runs `buildah bud`.
+The pod and its privileges are the same. An init container copies BuildKit's static binaries from
+`docker.io/moby/buildkit:v0.35.0-rootless`, and the `builder` container starts a `buildkitd` for
+the one build and runs `buildctl build`, which pushes the image. Registry handling, `target`,
+build args, the timeout, cluster caches, `status` and `logs` work as with buildah.
+`--storage-driver vfs` is BuildKit's `native` snapshotter and `overlay` its `overlayfs`;
+`--bud-arg` is refused.
 
-The pod asks for nothing more than a buildah build does: no privilege, no capability, no seccomp
-or AppArmor change, the default `/proc` mount. Three things make that work:
+`buildkitd` runs with `noProcessSandbox` and a wrapper around its runtime that drops each `RUN`
+step's hostname, binds the pod's `/dev/pts`, and adds `/buildit`, `/etc/ccache.conf` and the
+declared caches to the step's mounts, since BuildKit has no `--volume`. Known differences:
 
-- `buildkitd` runs with `noProcessSandbox`, so a `RUN` step shares the builder container's PID
-  namespace and `/proc`. A process a step leaves behind lives until the pod ends, and a step can
-  signal the daemon.
-- `buildkitd`'s OCI runtime is a wrapper around `buildkit-runc` that edits each `RUN` step's
-  config first. It drops the hostname, which the runtime's default seccomp profile does not let a
-  container without `CAP_SYS_ADMIN` set, and binds the pod's `/dev/pts` in place of a devpts
-  mount of the step's own, which SELinux denies a container. A step sees the pod's hostname.
-- BuildKit has no `--volume`. The same wrapper adds `/buildit`, a `ccache` build's
-  `/etc/ccache.conf` and the declared caches to each `RUN` step's mounts, so those reach every
-  step as they do under buildah. BuildKit does not know of them: a step's cache key does not
-  cover what a mount holds, and where a mount's path is not in the image the runtime creates it,
-  so the image keeps an empty `/buildit`, an empty file at `/etc/ccache.conf` and an empty
-  directory at each cache path.
-
-What differs from a buildah build:
-
-- The build log is `buildctl --progress=plain` output. A step's output lines carry its vertex and
-  time, `#9 0.156 hello`, so a `logs` `grep` anchored at the start of a line needs the prefix.
-- `steps.log` stamps BuildKit's lines, each once: `#5 [build 2/3] RUN make` when a step first
-  appears and `#11 exporting to image` in place of buildah's `STEP` and `COMMIT`, with the
-  `CACHE` and `END` lines unchanged. Stages build concurrently, so steps are not in Dockerfile
-  order.
-- A Dockerfile's own `RUN --mount=type=cache` lives in the daemon's state and ends with the pod.
-  To keep a directory between builds, declare it as a cache with `scope: "cluster"`.
-- The image is pushed before the cluster caches are saved, not after.
-- The wrapper edits the config this BuildKit version writes, so the image is pinned by version and
-  `deploy/builder-admission.yaml` names that tag.
+- The log is `buildctl --progress=plain`: output lines are prefixed, `#9 0.156 hello`, and
+  `steps.log` stamps lines like `#5 [build 2/3] RUN make` in place of `STEP` and `COMMIT`.
+- The image keeps an empty mount point for `/buildit`, `/etc/ccache.conf` and each cache path.
+- A Dockerfile's own `RUN --mount=type=cache` ends with the pod; use a `scope: "cluster"` cache.
+- BuildKit resolves every stage's base image before it builds any.
 
 `buildit cache` is that shared cache: blobs over HTTP, open to GET and HEAD, with PUT and DELETE
 behind the token in `--token-file`, sent as a bearer token or a basic-auth password. `buildit mcp`

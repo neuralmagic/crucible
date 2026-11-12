@@ -185,7 +185,7 @@ pub struct BuilderPods {
 pub enum Builder {
     /// `buildah bud`.
     Buildah,
-    /// Rootless BuildKit, the builder `docker build` uses.
+    /// Rootless BuildKit, the builder `docker build` uses. Experimental.
     Buildkit,
 }
 
