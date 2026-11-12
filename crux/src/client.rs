@@ -1216,6 +1216,11 @@ impl Client {
         self.post("/api/playbook-drafts", Some(&body)).await
     }
 
+    /// The drafts rail: what is being authored, and whether it compiles.
+    pub async fn drafts(&self) -> Result<Vec<dto::PlaybookDraft>> {
+        self.get("/api/playbook-drafts").await
+    }
+
     pub async fn draft_files<T: DeserializeOwned>(
         &self,
         id: &str,
@@ -1425,11 +1430,52 @@ impl Client {
             self.hint_for(status)
         );
     }
+
+    /// Hand an intent to the engine's drafting turn and store what it wrote as the next version.
+    /// Rides the save's `base_version` semantics: [`DraftGenerate::Stale`] rather than an error
+    /// when a concurrent writer landed first.
+    pub async fn generate_draft(&self, id: &str, intent: &str) -> Result<DraftGenerate> {
+        let path = format!("/api/playbook-drafts/{}/generate", encode(id));
+        let body = serde_json::json!({ "intent": intent });
+        let (status, text) = self
+            .transport
+            .send(reqwest::Method::POST, &path, Some(&body))
+            .await?;
+        if status.is_success() {
+            return Ok(DraftGenerate::Generated(Box::new(parse(text, &path)?)));
+        }
+        if status == reqwest::StatusCode::CONFLICT
+            && let Ok(stale) = serde_json::from_str::<dto::StaleBase>(&text)
+        {
+            return Ok(DraftGenerate::Stale(stale));
+        }
+        bail!(
+            "{path} -> HTTP {status}: {}{}",
+            text.trim(),
+            self.hint_for(status)
+        );
+    }
+
+    /// The lines of the draft's most recent generate, oldest first.
+    pub async fn draft_generate_progress(&self, id: &str) -> Result<dto::DraftProgress> {
+        self.get(&format!(
+            "/api/playbook-drafts/{}/generate/progress",
+            encode(id)
+        ))
+        .await
+    }
 }
 
 /// What a draft save landed: the stored version, or the refusal naming the save that overtook it.
 pub enum DraftSave {
     Saved(serde_json::Value),
+    Stale(dto::StaleBase),
+}
+
+/// What a draft generate landed: the stored version with the turn's own report, or the refusal
+/// naming the save that overtook it.
+pub enum DraftGenerate {
+    Generated(Box<dto::GeneratedDraft>),
     Stale(dto::StaleBase),
 }
 

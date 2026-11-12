@@ -945,6 +945,30 @@ impl Diagnostic {
     }
 }
 
+/// `GET /api/playbook-drafts`: one draft of the rail, as the studio's list reads it.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PlaybookDraft {
+    pub id: String,
+    #[serde(default)]
+    pub description: String,
+    /// The newest save; 0 when nothing is saved yet.
+    #[serde(default)]
+    pub latest_version: i64,
+    /// True when the newest save compiled, so the draft has a form and a graph to launch from.
+    #[serde(default)]
+    pub compiles: bool,
+    #[serde(default)]
+    pub diagnostics: i64,
+    /// Set once the graduated pack was imported: the draft is read-only from then on.
+    #[serde(default)]
+    pub retired_at: Option<String>,
+    /// `user:<login>` or `team:<slug>`.
+    #[serde(default)]
+    pub owner: String,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
 /// `GET /api/playbook-drafts/{id}/files`: the whole pack at one save, and the base a writer edits
 /// from.
 #[derive(Debug, Clone, Deserialize)]
@@ -1030,10 +1054,167 @@ pub struct DraftCompile {
     /// The params schema this version's launches are validated against.
     #[serde(default)]
     pub params_schema: Option<serde_json::Value>,
+    /// The plan this save compiled to, when it compiled.
+    #[serde(default)]
+    pub graph: Option<WorkflowGraph>,
     #[serde(default)]
     pub diagnostics: Vec<Diagnostic>,
     #[serde(default)]
     pub dispatch: PackDispatch,
+}
+
+/// The typed graph document a compiled plan reduces to, as the controller serves it: nodes, edges
+/// and the per-task metadata a renderer needs.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WorkflowGraph {
+    /// The workflow type the pack declares, `playbook` for anything the registry takes.
+    #[serde(default)]
+    pub workflow_type: String,
+    /// The task whose output is the workflow's result, when one is named.
+    #[serde(default)]
+    pub result: Option<String>,
+    #[serde(default)]
+    pub nodes: Vec<WorkflowNode>,
+    #[serde(default)]
+    pub edges: Vec<WorkflowEdge>,
+}
+
+/// One task of a compiled plan.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WorkflowNode {
+    pub name: String,
+    /// What executes the task: `agent`, `command`, `engine`, `route`, or another word this build
+    /// does not know.
+    #[serde(default)]
+    pub kind: String,
+    /// False for an advisory task: the graph runs on without it.
+    #[serde(default)]
+    pub required: bool,
+    /// Which of a task's dependencies have to be admitted before it runs.
+    #[serde(default)]
+    pub needs: String,
+    /// Which of a task's dependencies have to have passed before it runs.
+    #[serde(default)]
+    pub join: String,
+    /// The workspace the task runs in, as the engine resolved it; null for the shared one.
+    #[serde(default)]
+    pub isolation: Option<String>,
+    /// Result fields the task declares.
+    #[serde(default)]
+    pub emits: Vec<String>,
+    /// Workspace files the task declares.
+    #[serde(default)]
+    pub emits_files: Vec<String>,
+    /// Set when this task is mapped over a producer's emitted field.
+    #[serde(default)]
+    pub fanout: Option<WorkflowFanout>,
+    /// `producer.field` references each instance receives narrowed to its own entry.
+    #[serde(default)]
+    pub keyed: Vec<String>,
+    /// Set when the task runs only on some answers of a route.
+    #[serde(default)]
+    pub when: Option<WorkflowWhen>,
+    /// A route's question ids; empty for any other task.
+    #[serde(default)]
+    pub questions: Vec<String>,
+    /// The conversation an agent turn belongs to; null when the turn stands alone.
+    #[serde(default)]
+    pub session: Option<String>,
+    /// An agent task's prompt, as the engine assembled it.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// What a command task runs.
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub harness: Option<String>,
+}
+
+/// A task mapped over a producer's emitted field: one instance per item, capped.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WorkflowFanout {
+    /// The task whose emitted field is mapped over.
+    #[serde(default)]
+    pub over_task: String,
+    #[serde(default)]
+    pub over_field: String,
+    /// The instance cap the pack declared, if any.
+    #[serde(default)]
+    pub max_fanout: Option<u32>,
+}
+
+/// A task that runs only on some answers to one question of a route it depends on.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WorkflowWhen {
+    #[serde(default)]
+    pub route: String,
+    #[serde(default)]
+    pub question: String,
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+/// One dependency, from producer to consumer.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WorkflowEdge {
+    #[serde(default)]
+    pub from: String,
+    #[serde(default)]
+    pub to: String,
+    /// The consumer's join: which of its dependencies have to have passed.
+    #[serde(default)]
+    pub join: String,
+    /// The consumer's required flag, on the edge that carries it to the renderer.
+    #[serde(default)]
+    pub required: bool,
+    /// The consumer's `when`, on the edge from the route it names.
+    #[serde(default)]
+    pub when: Option<WorkflowWhen>,
+    /// Both ends map over the same `producer.field`: instance k reads the producer's instance k.
+    #[serde(default)]
+    pub aligned: bool,
+    /// The producer's fields the consumer narrows to each instance's entry.
+    #[serde(default)]
+    pub keyed: Vec<String>,
+}
+
+/// `POST /api/playbook-drafts/{id}/generate`: the version the drafting turn stored, and what the
+/// turn itself reported about it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GeneratedDraft {
+    #[serde(flatten)]
+    pub compile: DraftCompile,
+    pub cost_usd: f64,
+    pub rounds: u32,
+    pub ok: bool,
+    pub over_budget: bool,
+    #[serde(default)]
+    pub findings: Vec<String>,
+}
+
+/// One line of a drafting turn's progress, as the studio polls it: the round it belongs to and
+/// what the agent just did.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct DraftProgressEntry {
+    pub round: u32,
+    pub line: String,
+}
+
+/// `GET /api/playbook-drafts/{id}/generate/progress`: the draft's most recent generate, oldest
+/// line first, live while the turn runs and kept after it ends so a poll racing the response
+/// still reads the tail.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DraftProgress {
+    #[serde(default)]
+    pub lines: Vec<DraftProgressEntry>,
+    #[serde(default)]
+    pub running: bool,
+    #[serde(default)]
+    pub intent: Option<String>,
 }
 
 /// What a pack's manifest says about where it runs.
