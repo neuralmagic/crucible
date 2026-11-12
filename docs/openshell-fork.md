@@ -31,11 +31,12 @@ There is one rev, and five consumers use it. All of them get it from `Cargo.lock
 ## The divergence ledger
 
 Fork-only commits on `crucible/v0.1.5`, relative to upstream `v0.1.5` (`bdb956f2`), checked
-2026-10-27:
+2026-11-12:
 
 | sha | What | Why crucible needs it | Upstreamable? |
 | --- | --- | --- | --- |
 | `8350ed52` | `feat(kubernetes): answer driver-supplied static hosts in the supervisor`: the kubernetes driver accepts `pod.host_aliases` (hostname to IP) in a sandbox's `driver_config`, validates it, and the network supervisor answers those names before its resolver, with every policy and destination check still applied. Static hosts are driver-supplied, so they answer both name-authorized and IP-constrained lookups, unlike the sandbox's `/etc/hosts` (upstream #4602) | Deployments reach hosts with no public DNS record (`[cluster].host_aliases`); stock v0.1.5 rejects the key, and sandbox egress is resolved by the supervisor, not by pod `hostAliases` | Yes, no upstream PR yet |
+| `a895315d` | `fix(kubernetes): backfill gateway-id only on unlabelled sandboxes`: the shared-mode startup backfill patches `openshell.ai/gateway-id` only on a Sandbox that has no such label. Stock v0.1.5 also relabels a Sandbox that names another gateway | Crucible runs one gateway per run, and several share a sandbox namespace. A gateway that started while another run's sandbox was alive took that sandbox's label, the owning gateway's label-scoped list came back empty, and its reconcile removed the sandbox from the store after the provisioning grace period. File transfer then failed with `sandbox not found` and the agent exited without a verdict | Yes. The change is needed by any deployment with more than one gateway in a namespace |
 
 Dropped at this pin, relative to `crucible/v0.1.2`:
 
