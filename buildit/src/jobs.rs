@@ -116,6 +116,8 @@ pub struct Site {
     pub node_arch: Option<String>,
     pub resources: Resources,
     pub storage: StorageDriver,
+    /// Extra `buildah bud` arguments for every Dockerfile build.
+    pub bud_args: Vec<String>,
     pub users: PodUsers,
     /// The longest any Job of this server runs.
     pub deadline_secs: i64,
@@ -272,9 +274,10 @@ finish() {
 trap 'finish "$@"' TERM
 while :; do sleep 3600 & wait $!; done"#;
 
-/// The build: storage setup, `step::RUNNER` with its log mirrored to stdout, then on success the
-/// push, and the exit record and digest as the termination message. Arguments: the runner script,
-/// the local tag, the destination, then the runner's arguments.
+/// The build: storage setup, pull access to the registry built images go to, `step::RUNNER` with
+/// its log mirrored to stdout, then on success the push, and the exit record and digest as the
+/// termination message. Arguments: the runner script, the local tag, the destination, then the
+/// runner's arguments.
 const BUILD: &str = r#"trap 'kill -TERM -1 2> /dev/null; exit 143' TERM
 runner=$1; tag=$2; dest=$3; shift 3
 log=/tmp/build.log
@@ -282,6 +285,14 @@ mkdir -p /tmp/containers-run /buildit-out/facts "$TMPDIR" $CACHE_DIRS
 printf '[storage]\ndriver = "%s"\ngraphroot = "%s/storage"\nrunroot = "/tmp/containers-run"\n' \
   "$STORAGE_DRIVER" "$STORAGE" > /tmp/storage.conf
 printf 'unqualified-search-registries = ["docker.io"]\n' > /tmp/registries.conf
+export REGISTRY_AUTH_FILE=/tmp/pull-auth.json; echo '{}' > "$REGISTRY_AUTH_FILE"
+if [ -e /buildit-cluster/token ]; then
+  mkdir -p "$HOME/.config/containers/certs.d/$REGISTRY"
+  cp /buildit-cluster/service-ca.crt "$HOME/.config/containers/certs.d/$REGISTRY/ca.crt"
+  buildah login -u buildit --password-stdin "$REGISTRY" < /buildit-cluster/token 2>&1
+else
+  printf '[[registry]]\nlocation = "%s"\ninsecure = true\n' "$REGISTRY" >> /tmp/registries.conf
+fi
 for f in ccache.conf cache.json; do [ -e "/buildit-inputs/$f" ] && cp "/buildit-inputs/$f" /buildit-out/facts/; done
 : > "$log"
 sh -c "$runner" sh "$log" "$@" &
@@ -1019,6 +1030,7 @@ mod tests {
                 limits: Vec::new(),
             },
             storage: StorageDriver::Overlay,
+            bud_args: Vec::new(),
             users: PodUsers::Namespaced,
             deadline_secs: 3600,
             ttl_secs: 900,
@@ -1153,6 +1165,24 @@ mod tests {
                 r#"printf 'unqualified-search-registries = ["docker.io"]\n' > /tmp/registries.conf"#
             ),
             "an unqualified FROM resolves to docker.io without a prompt"
+        );
+        assert!(
+            command[2].contains(
+                r#"cp /buildit-cluster/service-ca.crt "$HOME/.config/containers/certs.d/$REGISTRY/ca.crt""#
+            ) && command[2].contains(
+                r#"buildah login -u buildit --password-stdin "$REGISTRY" < /buildit-cluster/token"#
+            ),
+            "a FROM of an earlier build's image pulls from the cluster's registry"
+        );
+        assert!(
+            command[2].contains(
+                r#"printf '[[registry]]\nlocation = "%s"\ninsecure = true\n' "$REGISTRY" >> /tmp/registries.conf"#
+            ),
+            "and from a plain HTTP one"
+        );
+        assert_eq!(
+            env("REGISTRY").as_deref(),
+            Some("image-registry.openshift-image-registry.svc:5000")
         );
         assert_eq!(
             env("TMPDIR").as_deref(),

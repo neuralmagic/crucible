@@ -111,6 +111,9 @@ impl Buildit<'_> {
         if let Some(driver) = pods.storage_driver {
             args.extend(["--storage-driver".to_string(), driver.to_string()]);
         }
+        for arg in pods.bud_args.iter().flatten() {
+            args.push(format!("--bud-arg={arg}"));
+        }
         if let Some(cache) = &self.site.cache {
             args.extend(["--cache-url", &cache.url].map(String::from));
             let writers = match cache.writers {
@@ -451,6 +454,7 @@ mod tests {
             ])),
             limits: Some(BTreeMap::from([("cpu".into(), "32".into())])),
             storage_driver: Some(StorageDriver::Overlay),
+            bud_args: Some(vec!["--retry".into(), "5".into()]),
         };
         let on_arm = RunSite {
             run_id: "r",
@@ -475,6 +479,8 @@ mod tests {
                 "cpu=32",
                 "--storage-driver",
                 "overlay",
+                "--bud-arg=--retry",
+                "--bud-arg=5",
             ],
             "the site's arch wins over the loop pod's"
         );

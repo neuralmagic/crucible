@@ -476,12 +476,14 @@ mod tests {
             requests = { cpu = "8" }
             limits = { cpu = "32" }
             storage_driver = "overlay"
+            bud_args = ["--retry", "5"]
             [buildit.cluster_builders.west]
             node_arch = "amd64"
             [buildit.cluster_builders.north]
             node_arch = "arm64"
             limits = { cpu = "16", memory = "32Gi" }
             storage_driver = "vfs"
+            bud_args = []
             "#,
         )
         .agent_servers()
@@ -493,6 +495,7 @@ mod tests {
             requests: Some(BTreeMap::from([("cpu".into(), "8".into())])),
             limits: Some(BTreeMap::from([("cpu".into(), "32".into())])),
             storage_driver: Some(StorageDriver::Overlay),
+            bud_args: Some(vec!["--retry".into(), "5".into()]),
         };
         assert_eq!(builders(&servers[0], "east"), shared);
         assert_eq!(
@@ -511,6 +514,7 @@ mod tests {
                     ("memory".into(), "32Gi".into()),
                 ])),
                 storage_driver: Some(StorageDriver::Vfs),
+                bud_args: Some(Vec::new()),
                 ..shared.clone()
             }
         );

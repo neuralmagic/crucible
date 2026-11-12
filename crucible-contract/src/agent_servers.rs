@@ -171,6 +171,9 @@ pub struct BuilderPods {
     /// Where buildah keeps image layers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_driver: Option<StorageDriver>,
+    /// Extra `buildah bud` arguments for every Dockerfile build, after buildit's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bud_args: Option<Vec<String>>,
 }
 
 /// The containers-storage driver of buildah in a builder pod.
@@ -212,6 +215,7 @@ impl BuilderPods {
             requests: self.requests.clone().or_else(|| base.requests.clone()),
             limits: self.limits.clone().or_else(|| base.limits.clone()),
             storage_driver: self.storage_driver.or(base.storage_driver),
+            bud_args: self.bud_args.clone().or_else(|| base.bud_args.clone()),
         }
     }
 }
@@ -345,6 +349,7 @@ mod tests {
             requests: Some(BTreeMap::from([("cpu".into(), "8".into())])),
             limits: Some(BTreeMap::from([("cpu".into(), "32".into())])),
             storage_driver: Some(StorageDriver::Overlay),
+            bud_args: Some(vec!["--retry".into(), "5".into()]),
         });
         let raw = serde_json::to_value(&pinned).unwrap();
         assert_eq!(
@@ -356,6 +361,7 @@ mod tests {
                 "requests": {"cpu": "8"},
                 "limits": {"cpu": "32"},
                 "storage_driver": "overlay",
+                "bud_args": ["--retry", "5"],
             })
         );
         assert_eq!(serde_json::from_value::<BuilditSite>(raw).unwrap(), pinned);
@@ -382,6 +388,7 @@ mod tests {
             requests: Some(BTreeMap::from([("cpu".into(), "8".into())])),
             limits: Some(BTreeMap::from([("cpu".into(), "32".into())])),
             storage_driver: Some(StorageDriver::Vfs),
+            bud_args: Some(vec!["--retry".into(), "5".into()]),
         };
         let cluster = BuilderPods {
             node_arch: Some(NodeArch::Amd64),
@@ -399,6 +406,7 @@ mod tests {
                 requests: Some(BTreeMap::from([("cpu".into(), "8".into())])),
                 limits: Some(BTreeMap::new()),
                 storage_driver: Some(StorageDriver::Overlay),
+                bud_args: Some(vec!["--retry".into(), "5".into()]),
             }
         );
         assert_eq!(BuilderPods::default().over(&base), base);

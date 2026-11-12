@@ -575,6 +575,22 @@ mod tests {
     }
 
     #[test]
+    fn the_server_takes_bud_arguments_that_start_with_a_dash() {
+        let args = match parse(&[
+            "mcp",
+            "--tokens-file",
+            "/t",
+            "--bud-arg=--retry",
+            "--bud-arg=5",
+        ]) {
+            Ok(Cmd::Mcp(args)) => args,
+            Ok(_) => panic!("not the server"),
+            Err(e) => panic!("{e}"),
+        };
+        assert_eq!(args.bud_args, ["--retry", "5"]);
+    }
+
+    #[test]
     fn a_server_build_declares_caches_as_name_path_and_mode() {
         let Ok(Cmd::Build(args)) = parse(&[
             "build",
