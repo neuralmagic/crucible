@@ -210,8 +210,38 @@ The pod and its privileges are the same. An init container copies BuildKit's sta
 `docker.io/moby/buildkit:v0.35.0-rootless`, and the `builder` container starts a `buildkitd` for
 the one build and runs `buildctl build`, which pushes the image. Registry handling, `target`,
 build args, the timeout, cluster caches, `status` and `logs` work as with buildah.
-`--storage-driver vfs` is BuildKit's `native` snapshotter and `overlay` its `overlayfs`;
 `--bud-arg` reaches buildah builds only.
+
+`buildkitd` keeps layers in its `overlayfs` snapshotter, kernel overlayfs in the pod's user
+namespace, where each layer is stored once. With `--storage-driver overlay` a build whose pod
+cannot mount it fails at once and says so; with `vfs`, buildah's default, BuildKit still uses
+overlayfs where it mounts and otherwise the `native` snapshotter, which copies every layer in
+full. The build's log starts with `buildkit snapshotter: <name>`, `steps.log` with a
+`SNAPSHOTTER` line, and `status` reports `snapshotter`.
+
+A BuildKit build keeps its layers between pods in a registry cache (`--import-cache` and
+`--export-cache type=registry,mode=max`), so a rebuild runs only the steps whose inputs changed,
+in any stage. The cache is a tag of the image repository, `cache-<scope>`, where the scope is a
+hash of the context directory, the Dockerfile path and the target, and it goes through the same
+registry login and CA as the image. `--cache-writers` decides who writes it, as for the shared
+cache: a build that may write there reads and writes `cache-<scope>`; any other build reads it,
+and reads and writes `cache-<sandbox>-<scope>`, which no other sandbox's builds read. A cache
+that is missing or unreadable is a cold build whose log ends by naming the failed import, and a
+cache that cannot be written is a line in the log. `status` reports `layer_cache` once the build has ended, `imported` and how many of the
+Dockerfile's `steps` were `cached`, from the `CACHED`, `importing cache manifest` and `exporting
+cache` lines `steps.log` stamps. `buildctl` marks a step `CACHED` when nothing later needs its
+files; the last cached step before one that runs is pulled instead and not counted. `--layer-cache off` (`MCP_LAYER_CACHE`) builds without one.
+
+Nothing deletes a cache tag. Each scope's shared tag is overwritten in place, so the registry's
+garbage collection bounds it; a sandbox's own tags, like its builds' image tags, stay until
+something deletes the tags of sandboxes that are gone.
+
+The layers a BuildKit build makes are pushed uncompressed in an OCI manifest, in the image and in
+the cache: the registry is on the build's cluster, where compressing costs more time than the
+bytes it saves. A base image's layers keep their compression. Uncompressed layers take their
+full size in the registry, two to three times what gzip or zstd leave of a typical image, in a
+repository nothing prunes. `--layer-compression` (`MCP_LAYER_COMPRESSION`) changes it: `zstd`,
+which containerd from 1.5, Docker from 23 and CRI-O pull, or `gzip`.
 
 `buildkitd` runs with `noProcessSandbox` and a wrapper around its runtime that drops each `RUN`
 step's hostname, binds the pod's `/dev/pts`, and adds `/buildit`, `/etc/ccache.conf` and the
@@ -219,7 +249,8 @@ declared caches to the step's mounts, since BuildKit has no `--volume`; it remov
 points it made once the step ends, so they are not in the image. Known differences:
 
 - The log is `buildctl --progress=plain`: output lines are prefixed, `#9 0.156 hello`, and
-  `steps.log` stamps lines like `#5 [build 2/3] RUN make` in place of `STEP` and `COMMIT`.
+  `steps.log` stamps lines like `#5 [build 2/3] RUN make` and `#5 CACHED` in place of `STEP` and
+  `COMMIT`.
 - A Dockerfile's own `RUN --mount=type=cache` ends with the pod; use a `scope: "cluster"` cache.
 - BuildKit resolves every stage's base image before it builds any.
 
@@ -260,8 +291,10 @@ BUILDIT_E2E_KUBECONTEXT=kind-dev BUILDIT_E2E_IMAGE_REPO=<node-ip>:30500/buildit 
   BUILDIT_E2E_CACHE_FORWARD=127.0.0.1:8850 BUILDIT_E2E_POD_USERS=host cargo test -- --ignored
 ```
 
-`e2e_buildkit_builds_what_docker_build_does_and_keeps_buildits_mounts` builds with BuildKit
-whatever the other tests build with.
+`e2e_buildkit_builds_what_docker_build_does_and_keeps_buildits_mounts` and
+`e2e_a_buildkit_rebuild_takes_its_stages_from_the_layer_cache_its_writers_may_share` build with
+BuildKit whatever the other tests build with; `BUILDIT_E2E_LAYER_COMPRESSION` sets their layers'
+compression.
 
 ### The run's socket and the CLI client
 

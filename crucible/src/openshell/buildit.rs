@@ -117,6 +117,12 @@ impl Buildit<'_> {
         for arg in pods.bud_args.iter().flatten() {
             args.push(format!("--bud-arg={arg}"));
         }
+        if let Some(cache) = pods.layer_cache {
+            args.extend(["--layer-cache".to_string(), cache.to_string()]);
+        }
+        if let Some(compression) = pods.layer_compression {
+            args.extend(["--layer-compression".to_string(), compression.to_string()]);
+        }
         if let Some(cache) = &self.site.cache {
             args.extend(["--cache-url", &cache.url].map(String::from));
             let writers = match cache.writers {
@@ -204,7 +210,9 @@ fn accepts(socket: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::openshell::buildit::*;
-    use crucible_contract::agent_servers::{Builder, BuilderPods, SharedCache, StorageDriver};
+    use crucible_contract::agent_servers::{
+        Builder, BuilderPods, LayerCache, LayerCompression, SharedCache, StorageDriver,
+    };
     use std::collections::BTreeMap;
     use std::num::NonZeroU32;
 
@@ -459,6 +467,8 @@ mod tests {
             builder: Some(Builder::Buildah),
             storage_driver: Some(StorageDriver::Overlay),
             bud_args: Some(vec!["--retry".into(), "5".into()]),
+            layer_cache: Some(LayerCache::Off),
+            layer_compression: Some(LayerCompression::Gzip),
         };
         let on_arm = RunSite {
             run_id: "r",
@@ -487,6 +497,10 @@ mod tests {
                 "overlay",
                 "--bud-arg=--retry",
                 "--bud-arg=5",
+                "--layer-cache",
+                "off",
+                "--layer-compression",
+                "gzip",
             ],
             "the site's arch wins over the loop pod's"
         );

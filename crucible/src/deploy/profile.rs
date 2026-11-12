@@ -442,8 +442,8 @@ pub struct BuilditCfg {
     #[serde(default)]
     pub queue: Option<KubeName>,
     /// Builder pods on every cluster: `node_arch`, `max_builds`, `pod_deadline_secs`, `requests`,
-    /// `limits`, `builder`, `storage_driver` and `bud_args`. Unset, they run on the loop pod's
-    /// architecture with buildit's defaults.
+    /// `limits`, `builder`, `storage_driver`, `bud_args`, `layer_cache` and `layer_compression`.
+    /// Unset, they run on the loop pod's architecture with buildit's defaults.
     #[serde(default)]
     pub builders: BuilderPods,
     /// Builder pods on one cluster, each setting replacing `builders`' there:

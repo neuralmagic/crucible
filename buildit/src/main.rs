@@ -595,6 +595,32 @@ mod tests {
     }
 
     #[test]
+    fn the_server_caches_buildkit_layers_in_the_registry_uncompressed_unless_told_otherwise() {
+        let server = |extra: &[&str]| {
+            let argv = [&["mcp", "--tokens-file", "/t"], extra].concat();
+            match parse(&argv) {
+                Ok(Cmd::Mcp(args)) => (args.layer_cache, args.layer_compression),
+                Ok(_) => panic!("not the server"),
+                Err(e) => panic!("{e}"),
+            }
+        };
+        use crate::jobs::{Compression, LayerCache};
+        assert_eq!(
+            server(&[]),
+            (LayerCache::Registry, Compression::Uncompressed)
+        );
+        assert_eq!(
+            server(&["--layer-cache", "off", "--layer-compression", "gzip"]),
+            (LayerCache::Off, Compression::Gzip)
+        );
+        assert_eq!(
+            server(&["--layer-compression", "zstd"]).1,
+            Compression::Zstd
+        );
+        assert!(refused(&["mcp", "--tokens-file", "/t", "--layer-cache", "s3"]).contains("s3"));
+    }
+
+    #[test]
     fn a_server_build_declares_caches_as_name_path_and_mode() {
         let Ok(Cmd::Build(args)) = parse(&[
             "build",
