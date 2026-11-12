@@ -60,10 +60,12 @@ import {
   draftLaunchBody,
   EMPTY_CLONE,
   EMPTY_STUDIO,
+  fireIsLive,
   flaggedFiles,
   isDirty,
   markersFor,
   pathsOf,
+  redraftIntent,
   saveBody,
   staleBaseOf,
   originLabel,
@@ -72,6 +74,7 @@ import {
   type CloneForm,
   type StaleBase,
 } from './draftStudio';
+import { runPath } from './runFileView';
 
 type CompileDto = components['schemas']['DraftCompileDto'];
 type GeneratedDto = components['schemas']['GeneratedDraftDto'];
@@ -110,6 +113,9 @@ async function fetchGenerateProgress(id: string): Promise<GenerateProgress> {
 
 /// How many progress lines the panel shows; older lines slide off the top.
 const PROGRESS_SHOWN = 12;
+
+/// How often a live test-fire's detail refetches while the run works.
+const FIRE_POLL_MS = 5000;
 
 /// The stored tree, read outside the query cache so the buffers are not reloaded.
 async function fetchDraftFiles(id: string): Promise<Record<string, string>> {
@@ -168,6 +174,23 @@ function DraftStudio({ id }: { id: string }) {
     { enabled: moved !== null }
   );
 
+  // The draft's newest test-fire, adopted on load so a refresh keeps the card and refetched
+  // after a launch so the card follows the fire that launch lit.
+  const fires = $api.useQuery('get', '/api/playbook-runs', {
+    params: { query: { playbook: id, origin: 'draft' } },
+  });
+  const fireKey = fires.data !== undefined && fires.data.length > 0 ? fires.data[0].key : null;
+  const fire = $api.useQuery(
+    'get',
+    '/api/playbook-runs/{key}',
+    { params: { path: { key: fireKey ?? '' } } },
+    {
+      enabled: fireKey !== null,
+      refetchInterval: (query) =>
+        query.state.data !== undefined && fireIsLive(query.state.data) ? FIRE_POLL_MS : false,
+    },
+  );
+
   const save = $api.useMutation('post', '/api/playbook-drafts/{id}/versions');
   const generate = $api.useMutation('post', '/api/playbook-drafts/{id}/generate');
   const drop = $api.useMutation('delete', '/api/playbook-drafts/{id}');
@@ -202,6 +225,7 @@ function DraftStudio({ id }: { id: string }) {
 
   const [intent, setIntent] = useState('');
   const [generateError, setGenerateError] = useState<string | null>(null);
+  const [redraftError, setRedraftError] = useState<string | null>(null);
   const [generateReport, setGenerateReport] = useState<GenerateReport | null>(null);
   const [genElapsed, setGenElapsed] = useState(0);
   useEffect(() => {
@@ -366,7 +390,7 @@ function DraftStudio({ id }: { id: string }) {
 
   /// The turn spends before anything is stored, so a refusal still books its cost; what the
   /// buffers hold is seeded from the newest save, not from unsaved edits.
-  const handleGenerate = async () => {
+  const handleGenerate = async (intentText: string) => {
     if (retired) return;
     setGenerateError(null);
     setStale(null);
@@ -376,7 +400,7 @@ function DraftStudio({ id }: { id: string }) {
     try {
       const dto = await generate.mutateAsync({
         params: { path: { id } },
-        body: { intent: intent.trim() },
+        body: { intent: intentText.trim() },
       });
       setPreview(dto);
       setGenerateReport(reportOf(dto));
@@ -400,6 +424,28 @@ function DraftStudio({ id }: { id: string }) {
     }
   };
 
+  /// Feed a failed test-fire back into a drafting turn: the error becomes the intent and the turn
+  /// runs on it at once — the box keeps the text, so the next round edits it rather than starting
+  /// from a blank slate.
+  const handleRedraft = async (runId: string | null, dispatchFailure: string | null) => {
+    setRedraftError(null);
+    let failure = dispatchFailure;
+    if (failure === null && runId !== null) {
+      try {
+        const { data } = await apiClient.GET('/api/runs/{run_id}/tasks/log', {
+          params: { path: { run_id: runId } },
+        });
+        failure = data?.text ?? null;
+      } catch (err: unknown) {
+        setRedraftError(formatError(err));
+        return;
+      }
+    }
+    const intentText = redraftIntent(failure);
+    setIntent(intentText);
+    await handleGenerate(intentText);
+  };
+
   /// Take the version that overtook this save: the editor reloads onto it, and the buffers the
   /// merge prompt is holding are the ones the writer copies their own edits back out of.
   const handleReload = async () => {
@@ -421,11 +467,13 @@ function DraftStudio({ id }: { id: string }) {
     setLaunchError(null);
     setFieldErrors(NO_ERRORS);
     try {
-      const ack = await launch.mutateAsync({
+      await launch.mutateAsync({
         params: { path: { id } },
         body: draftLaunchBody(specs, values, { maxCost, maxTime, schemaDigest }, agent),
       });
-      void navigate(`/playbook-runs/${encodeURIComponent(ack.key)}`);
+      // The studio keeps the fire: the card below the button follows it, so the next edit and
+      // the next launch never leave this page.
+      void fires.refetch();
     } catch (err: unknown) {
       const rejection = mapServerRejection(
         err,
@@ -569,7 +617,7 @@ function DraftStudio({ id }: { id: string }) {
                 intent.trim().length === 0
               }
               onClick={() => {
-                void handleGenerate();
+                void handleGenerate(intent);
               }}
             >
               {generate.isPending
@@ -974,6 +1022,54 @@ function DraftStudio({ id }: { id: string }) {
               )}
             </FormActions>
           </>
+        )}
+        {fire.data === undefined || fireKey === null ? null : (
+          <SectionBody>
+            <div
+              data-testid="draft-test-fire"
+              className="grid gap-1.5 rounded border border-rule bg-surface p-2 font-mono text-data"
+            >
+              {fire.data.runs.map((run) => (
+                <div key={run.run_id} className="flex flex-wrap items-center gap-2">
+                  <Link to={runPath(run.run_id, fireKey)}>{run.name ?? run.run_id}</Link>
+                  <span className="text-ink-3">{run.status}</span>
+                  {run.cost_usd === null || run.cost_usd === undefined ? null : (
+                    <span className="text-ink-3">{formatCost(run.cost_usd)}</span>
+                  )}
+                  {run.status === 'failed' && writable ? (
+                    <Button
+                      className="uppercase"
+                      disabled={isDirty(state) || generate.isPending || progress.running}
+                      onClick={() => {
+                        void handleRedraft(run.run_id, null);
+                      }}
+                    >
+                      Re-draft from this failure
+                    </Button>
+                  ) : null}
+                </div>
+              ))}
+              {fire.data.runs.length === 0 && fire.data.dispatch.failure != null && (
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-ink-3">never dispatched</span>
+                  <Button
+                    className="uppercase"
+                    disabled={isDirty(state) || generate.isPending || progress.running}
+                    onClick={() => {
+                      void handleRedraft(null, fire.data?.dispatch.failure ?? null);
+                    }}
+                  >
+                    Re-draft from this failure
+                  </Button>
+                </div>
+              )}
+            </div>
+          </SectionBody>
+        )}
+        {redraftError === null ? null : (
+          <SectionBody>
+            <FormError>{redraftError}</FormError>
+          </SectionBody>
         )}
       </Section>
 
