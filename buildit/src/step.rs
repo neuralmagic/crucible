@@ -7,11 +7,13 @@
 //! <log>.exit       `<code>[ timeout]`, hard-linked into place, first writer wins
 //! ```
 //!
-//! A build also stamps each `STEP`, `COMMIT` and `CACHE` line of its log, and its end, into a
-//! steps file: `<unix ns> <line>`, then `<unix ns> END <exit record>` once the runner has exited.
+//! A build also stamps each line of its log that names a step ([`BUILDAH_STAMPS`],
+//! [`BUILDKIT_STAMPS`]), the first time it appears, and its end, into a steps file:
+//! `<unix ns> <line>`, then `<unix ns> END <exit record>` once the runner has exited.
 //!
-//! A build with cluster caches restores their snapshots before `bud` and, when `bud` succeeds and
-//! the build may write to the shared cache, saves them after it ([`RESTORE`], [`SAVE`]).
+//! A build with cluster caches restores their snapshots before the build stage and, when that
+//! succeeds and the build may write to the shared cache, saves them after it ([`RESTORE`],
+//! [`SAVE`]).
 #![allow(clippy::disallowed_macros)]
 
 use std::time::Duration;
@@ -22,8 +24,15 @@ pub const FETCH_LIMIT: u64 = 512 * 1024 * 1024;
 /// Where the runner writes its exit record and log path when the build pod passes no other file.
 pub const TERMINATION_LOG: &str = "/tmp/buildit-runner.term";
 
-/// Arguments: the log, the build's timeout, the termination file, the steps file, the snapshot
-/// plan, the shared cache's URL, the save header file, [`RESTORE`], [`SAVE`], then `bud`'s argv.
+/// The log lines a `buildah bud` build stamps: its steps, its commits and the cache stages.
+pub const BUILDAH_STAMPS: &str = "^(STEP |COMMIT |CACHE )";
+/// The log lines a `buildctl build` build stamps: each vertex `buildctl` names as a step of a
+/// stage, the export, and the cache stages.
+pub const BUILDKIT_STAMPS: &str = r"^(#[0-9]+ \[|#[0-9]+ exporting to image|CACHE )";
+
+/// Arguments: the log, the build's timeout, the termination file, the regex of the log lines to
+/// stamp, the steps file, the snapshot plan, the shared cache's URL, the save header file,
+/// [`RESTORE`], [`SAVE`], then the build stage's argv.
 pub(crate) const RUNNER: &str = r#"log=$1; shift; t=
 stage() {
   secs=$1; shift
@@ -34,15 +43,20 @@ stage() {
   [ "$c" -ne 0 ] && [ $(($(date +%s) - s)) -ge "$secs" ] && t=" timeout"
   return "$c"
 }
-secs=$1; term=$2; steps=$3; plan=$4; url=$5; auth=$6; restore=$7; save=$8; shift 8
+secs=$1; term=$2; stamps=$3; steps=$4; plan=$5; url=$6; auth=$7; restore=$8; save=$9; shift 9
 sleep 2147483647 & hold=$!
 {
   tail -n +1 -f -s 0.1 --pid=$hold "$log" 2> /dev/null \
-    | grep --line-buffered -E '^(STEP |COMMIT |CACHE )' \
-    | while IFS= read -r l; do printf '%s %s\n' "$(date +%s%N)" "$l"; done
+    | grep --line-buffered -E "$stamps" \
+    | while IFS= read -r l; do
+        grep -qxF -e "$l" "$log.stamped" 2> /dev/null && continue
+        printf '%s\n' "$l" >> "$log.stamped"
+        printf '%s %s\n' "$(date +%s%N)" "$l"
+      done
   n=50; while [ ! -s "$log.exit" ] && [ "$n" -gt 0 ]; do sleep 0.1; n=$((n - 1)); done
   printf '%s END %s\n' "$(date +%s%N)" "$(head -n 1 "$log.exit" 2> /dev/null)"
 } >> "$steps" &
+stamper=$!
 if [ -n "$plan" ]; then
   printf '%s\n' "$restore" > "$log.restore"
   stage 900 sh "$log.restore" "$plan" "$url"
@@ -55,6 +69,7 @@ fi
 t=$bt
 kill "$hold" 2> /dev/null; wait "$hold" 2> /dev/null
 printf '%s%s\n' "$c" "$t" > "$log.exit"
+wait "$stamper" 2> /dev/null
 [ -n "$term" ] && { cat "$log.exit"; printf '%s\n' "$log"; } > "$term" 2>/dev/null
 exit 0"#;
 
@@ -234,9 +249,10 @@ pub struct SnapshotFiles {
     pub auth: String,
 }
 
-/// `steps` is the file the build stamps its steps into.
+/// `steps` is the file the build stamps the log lines matching `stamps` into.
 pub fn build_args(
     limit: Duration,
+    stamps: &str,
     steps: &str,
     snapshots: Option<&SnapshotFiles>,
     cmd: &[String],
@@ -248,6 +264,7 @@ pub fn build_args(
     let mut args = vec![
         limit.as_secs().to_string(),
         TERMINATION_LOG.to_string(),
+        stamps.to_string(),
         steps.to_string(),
         plan.to_string(),
         url.to_string(),
@@ -365,11 +382,11 @@ mod tests {
 
     /// The runner as a build pod runs it, to its end.
     #[cfg(target_os = "linux")]
-    fn build(log: &std::path::Path, secs: &str, cmd: &[&str]) {
+    fn build(log: &std::path::Path, secs: &str, stamps: &str, cmd: &[&str]) {
         use std::path::Path;
         std::fs::create_dir_all(log.parent().unwrap()).unwrap();
         let (term, steps) = (ext(log, "term"), ext(log, "steps"));
-        let mut args = vec![log, Path::new(secs), &term, &steps];
+        let mut args = vec![log, Path::new(secs), &term, Path::new(stamps), &steps];
         args.extend(["", "", ""].map(Path::new));
         args.extend([crate::step::RESTORE, crate::step::SAVE].map(Path::new));
         args.extend(cmd.iter().map(Path::new));
@@ -388,7 +405,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let run = |name: &str, secs: &str, cmd: &[&str]| {
             let log = dir.path().join(name).join("build.log");
-            build(&log, secs, cmd);
+            build(&log, secs, crate::step::BUILDAH_STAMPS, cmd);
             let record = format!("{}{}\n", read(&ext(&log, "exit")), log.display());
             assert_eq!(read(&ext(&log, "term")), record, "{name}");
             (
@@ -424,6 +441,57 @@ mod tests {
         );
     }
 
+    /// The steps file of a build, once it holds `lines` lines.
+    #[cfg(target_os = "linux")]
+    fn stamped(log: &std::path::Path, lines: usize) -> Vec<(u128, String)> {
+        let steps = ext(log, "steps");
+        for _ in 0..50 {
+            if read(&steps).lines().count() == lines {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        read(&steps)
+            .lines()
+            .map(|line| {
+                let (at, text) = line.split_once(' ').unwrap();
+                (at.parse().unwrap(), text.to_string())
+            })
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_buildkit_build_stamps_each_vertex_once_and_its_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("logs/build.log");
+        let script = "echo '#1 [internal] load build definition from Dockerfile'; \
+                      echo '#1 DONE 0.0s'; \
+                      echo '#5 [build 2/3] RUN make'; echo '#5 0.100 cc a.c'; \
+                      echo '#6 [stage-1 2/2] COPY --from=build /out /out'; \
+                      echo '#5 [build 2/3] RUN make'; echo '#5 1.200 cc b.c'; echo '#5 DONE 1.3s'; \
+                      echo 'CACHE save deps'; echo '#7 exporting to image'; \
+                      echo '#7 pushing layers 0.1s done'";
+        build(
+            &log,
+            "30",
+            crate::step::BUILDKIT_STAMPS,
+            &["sh", "-c", script],
+        );
+        let texts: Vec<String> = stamped(&log, 6).into_iter().map(|(_, t)| t).collect();
+        assert_eq!(
+            texts,
+            [
+                "#1 [internal] load build definition from Dockerfile",
+                "#5 [build 2/3] RUN make",
+                "#6 [stage-1 2/2] COPY --from=build /out /out",
+                "CACHE save deps",
+                "#7 exporting to image",
+                "END 0",
+            ]
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn a_build_stamps_its_steps_and_its_end() {
@@ -431,21 +499,13 @@ mod tests {
         let log = dir.path().join("logs/build.log");
         let script = "echo 'STEP 1/2: FROM base'; echo noise; sleep 1; \
                       echo 'STEP 2/2: RUN make'; echo 'COMMIT img'; exit 4";
-        build(&log, "30", &["sh", "-c", script]);
-        let steps = ext(&log, "steps");
-        for _ in 0..50 {
-            if read(&steps).lines().count() == 4 {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        let stamped: Vec<(u128, String)> = read(&steps)
-            .lines()
-            .map(|line| {
-                let (at, text) = line.split_once(' ').unwrap();
-                (at.parse().unwrap(), text.to_string())
-            })
-            .collect();
+        build(
+            &log,
+            "30",
+            crate::step::BUILDAH_STAMPS,
+            &["sh", "-c", script],
+        );
+        let stamped = stamped(&log, 4);
         let texts: Vec<&str> = stamped.iter().map(|(_, t)| t.as_str()).collect();
         assert!(texts.contains(&"STEP 1/2: FROM base"), "{texts:?}");
         assert!(texts.contains(&"STEP 2/2: RUN make"), "{texts:?}");
