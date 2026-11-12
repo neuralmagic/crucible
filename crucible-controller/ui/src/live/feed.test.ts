@@ -119,6 +119,20 @@ describe('describeLine tones', () => {
     expect(view.tag).toBe('raw');
     expect(view.title).toContain('zorp');
   });
+
+  it('describes live playbook plan and task events', () => {
+    expect(describeLine(line('{"kind":"plan_admitted","plan_version":2,"tasks":[{},{}]}'))).toMatchObject({
+      tone: 'info',
+      tag: 'plan',
+      title: 'plan v2 admitted',
+      detail: '2 tasks',
+    });
+    expect(describeLine(line('{"kind":"task_result","task":"rate","status":"pass","cost_usd":0.2,"secs":4}'))).toMatchObject({
+      tone: 'success',
+      tag: 'task',
+      title: 'rate · pass',
+    });
+  });
 });
 
 describe('rowCategory / rowMatches / scorePoints', () => {

@@ -7215,6 +7215,15 @@ async fn with_autoresearch_off_only_playbook_launches_move(pool: PgPool) -> Resu
         .await?
         .expect("issue");
     assert_eq!(issue.status, Status::Running);
+    let run_id: String = sqlx::query_scalar("SELECT run_id FROM runs WHERE issue_key = $1")
+        .bind(key)
+        .fetch_one(db.pool())
+        .await?;
+    let graph = crate::runs::task_results::latest_run_plan(db.pool(), &run_id)
+        .await?
+        .expect("a dispatched playbook exposes its graph while it runs");
+    assert_eq!(graph.plan_version, 1);
+    assert!(graph.graph_json.contains("hello"), "{}", graph.graph_json);
     Ok(())
 }
 

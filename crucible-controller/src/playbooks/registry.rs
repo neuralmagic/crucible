@@ -710,6 +710,15 @@ pub(crate) fn check_runnable(
     max_time: &crate::model::MaxTime,
     variant: Option<&VariantName>,
 ) -> Result<(), FieldError> {
+    runnable_plan(root, params, max_time, variant).map(|_| ())
+}
+
+fn runnable_plan(
+    root: &Path,
+    params: &std::collections::BTreeMap<String, String>,
+    max_time: &crate::model::MaxTime,
+    variant: Option<&VariantName>,
+) -> Result<crucible::plan::ir::ValidPlan, FieldError> {
     let plan = compiled_plan(root, params, variant).map_err(|message| FieldError {
         field: String::new(),
         message: format!("the pack does not compile with these values: {message}"),
@@ -718,7 +727,8 @@ pub(crate) fn check_runnable(
         .map_err(|e| FieldError {
             field: "max_time".to_string(),
             message: e.to_string(),
-        })
+        })?;
+    Ok(plan)
 }
 
 /// [`check_runnable`] against `tree`, off the async runtime. The outer `Err` is a failure to
@@ -732,6 +742,25 @@ pub(crate) async fn check_tree_runnable(
     tokio::task::spawn_blocking(move || {
         let pack = crate::playbooks::packs::materialize_tree(&tree)?;
         Ok(check_runnable(
+            pack.path(),
+            &params,
+            &max_time,
+            variant.as_ref(),
+        ))
+    })
+    .await
+    .context("joining the launch plan check")?
+}
+
+pub(crate) async fn compile_tree_runnable(
+    tree: PackTree,
+    params: std::collections::BTreeMap<String, String>,
+    max_time: crate::model::MaxTime,
+    variant: Option<VariantName>,
+) -> Result<Result<crucible::plan::ir::ValidPlan, FieldError>> {
+    tokio::task::spawn_blocking(move || {
+        let pack = crate::playbooks::packs::materialize_tree(&tree)?;
+        Ok(runnable_plan(
             pack.path(),
             &params,
             &max_time,

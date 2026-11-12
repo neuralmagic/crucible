@@ -12,18 +12,18 @@ export type RunGraph = components['schemas']['RunGraphDto'];
 /// admitted a plan (every run from before the work-graph executor), which leaves `data` undefined —
 /// so the whole panel simply isn't there rather than showing an error a reader can do nothing about.
 export function RunTaskGraph({ runId, engineBounds = false }: { runId: string; engineBounds?: boolean }) {
-  const query = $api.useQuery(
-    'get',
-    '/api/runs/{run_id}/graph',
-    { params: { path: { run_id: runId } } },
-    { retry: 2 },
-  );
   const detail = $api.useQuery('get', '/api/runs/{run_id}', {
     params: { path: { run_id: runId } },
   });
   // Until the run's status is in, a task with no result is one the run has not reached yet: a
   // request still in flight is no reason to tell a reader the task will never run.
   const running = detail.data === undefined || detail.data.run.status === 'running';
+  const query = $api.useQuery(
+    'get',
+    '/api/runs/{run_id}/graph',
+    { params: { path: { run_id: runId } } },
+    { retry: 2, refetchInterval: running ? 5_000 : false },
+  );
   const graph: RunGraph | undefined = query.data;
   const view = useMemo(
     () =>

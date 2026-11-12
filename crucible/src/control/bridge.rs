@@ -5,24 +5,32 @@
 //! inbound NDJSON commands against the live loop process.
 
 use crate::args::Paths;
+#[cfg(feature = "autoresearch")]
 use crate::control::admission::{AdmissionLedger, Admitted};
+#[cfg(feature = "autoresearch")]
 use crate::process::STOP;
 use anyhow::{Context, Result};
 use crucible_contract::LoopPhase;
-use crucible_contract::admission::{
-    AdmissionKey, AdmissionOutcome, AdmittedInput, MAX_KEY_LEN, SteerSource,
-};
-use serde::{Deserialize, Serialize};
+use crucible_contract::admission::{AdmissionKey, MAX_KEY_LEN};
+#[cfg(feature = "autoresearch")]
+use crucible_contract::admission::{AdmissionOutcome, AdmittedInput, SteerSource};
+#[cfg(feature = "autoresearch")]
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(feature = "autoresearch")]
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(feature = "autoresearch")]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 type Client = Arc<Mutex<TcpStream>>;
 
@@ -119,13 +127,16 @@ pub(crate) struct ControlState {
     status: Mutex<StatusSnapshot>,
     /// Pending re-scope, drained by the loop at the next iteration head. The key travels
     /// with the regime so the loop can settle the admission where it applies it.
+    #[cfg(feature = "autoresearch")]
     rescope: Mutex<Option<(AdmissionKey, String)>>,
     /// The regime an open approval would grant (attended path): the loop records it from the agent's
     /// pending marker so an operator `approve` keystroke can turn it into a `rescope` without naming
     /// the regime. `None` when there's no approval awaiting an operator.
+    #[cfg(feature = "autoresearch")]
     pending_regime: Mutex<Option<String>>,
     /// A rejected pending approval, drained by the park as the terminal "not granted"
     /// outcome.
+    #[cfg(feature = "autoresearch")]
     deny: Mutex<Option<(AdmissionKey, String)>>,
 }
 
@@ -164,17 +175,19 @@ impl ControlState {
     }
 
     /// Drained by the loop at the iteration head, which re-baselines and settles it.
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn take_rescope(&self) -> Option<(AdmissionKey, String)> {
         self.rescope.lock().ok()?.take()
     }
 
     /// Non-consuming peek: is a re-scope pending? The park polls this so the drain
     /// ([`take_rescope`](Self::take_rescope)) stays the single place that re-baselines.
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn has_rescope(&self) -> bool {
         self.rescope.lock().is_ok_and(|g| g.is_some())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "autoresearch"))]
     pub(crate) fn phase(&self) -> LoopPhase {
         self.status
             .lock()
@@ -203,10 +216,12 @@ impl ControlState {
         }
     }
 
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn pause(&self) {
         self.paused.store(true, Ordering::SeqCst);
     }
 
+    #[cfg(feature = "autoresearch")]
     fn resume(&self) {
         self.paused.store(false, Ordering::SeqCst);
     }
@@ -219,6 +234,7 @@ impl ControlState {
 
     /// Arm the re-scope the next iteration head drains. Returns the key of an undrained
     /// re-scope this displaced, which the caller settles as superseded.
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn set_rescope(&self, key: AdmissionKey, regime: String) -> Option<AdmissionKey> {
         let Ok(mut slot) = self.rescope.lock() else {
             return None;
@@ -228,6 +244,7 @@ impl ControlState {
 
     /// Record the regime an open approval would grant, so an operator `approve` can resolve it.
     /// The loop sets this when it reads the agent's pending-provisioning marker.
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn set_pending_regime(&self, regime: String) {
         if let Ok(mut slot) = self.pending_regime.lock() {
             *slot = Some(regime);
@@ -237,12 +254,14 @@ impl ControlState {
     /// Take the regime an open approval would grant. The caller admits the derived
     /// re-scope BEFORE arming it, and hands the regime back if the record can't be
     /// written.
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn take_pending_regime(&self) -> Option<String> {
         self.pending_regime.lock().ok()?.take()
     }
 
     /// Record a denial, clearing any pending regime so a later `approve` can't resurrect
     /// a denied ask. Returns the key of an undrained denial this displaced.
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn set_deny(&self, key: AdmissionKey, reason: String) -> Option<AdmissionKey> {
         if let Ok(mut pending) = self.pending_regime.lock() {
             *pending = None;
@@ -254,6 +273,7 @@ impl ControlState {
     }
 
     /// Drain a denial if one arrived (the terminal "not granted" outcome the park waits on).
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn take_deny(&self) -> Option<(AdmissionKey, String)> {
         self.deny.lock().ok()?.take()
     }
@@ -281,6 +301,7 @@ impl ControlState {
 /// Start a detached TCP bridge thread. The listener binds to all interfaces so it works
 /// inside a pod behind `kubectl port-forward`, while still being reachable as localhost
 /// for local smoke tests.
+#[cfg(feature = "autoresearch")]
 pub(crate) fn spawn_bridge(
     port: u16,
     paths: Paths,
@@ -303,6 +324,28 @@ pub(crate) fn spawn_bridge(
                     hub.clone(),
                     ledger.clone(),
                 ),
+                Err(_) => thread::sleep(Duration::from_millis(100)),
+            }
+        }
+    });
+
+    Ok(state)
+}
+
+pub(crate) fn spawn_read_only_bridge(port: u16, paths: Paths) -> Result<Arc<ControlState>> {
+    let listener = TcpListener::bind(("0.0.0.0", port))
+        .with_context(|| format!("binding control port {port}"))?;
+    let state = Arc::new(ControlState::default());
+    let hub = Arc::new(Hub::default());
+    spawn_session_tail(paths.session_log.clone(), state.clone(), hub.clone());
+
+    let accept_state = state.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => {
+                    serve_read_only_client(stream, &paths, accept_state.clone(), hub.clone())
+                }
                 Err(_) => thread::sleep(Duration::from_millis(100)),
             }
         }
@@ -417,6 +460,7 @@ fn replay_file_range(path: &Path, writer: &Client, after: u64, upto: u64) -> u64
     idx.min(upto).max(after)
 }
 
+#[cfg(feature = "autoresearch")]
 fn serve_client(
     stream: TcpStream,
     paths: &Paths,
@@ -457,6 +501,44 @@ fn serve_client(
     });
 }
 
+fn serve_read_only_client(
+    stream: TcpStream,
+    paths: &Paths,
+    state: Arc<ControlState>,
+    hub: Arc<Hub>,
+) {
+    let Ok(writer) = stream.try_clone() else {
+        return;
+    };
+    let writer = Arc::new(Mutex::new(writer));
+    let session_log = paths.session_log.clone();
+    thread::spawn(move || {
+        let reader = BufReader::new(stream);
+        for line in reader.lines() {
+            let reply = match line {
+                Ok(line) => match parse_request(&line) {
+                    Ok(ControlRequest {
+                        cmd: ControlCommand::Tail { from_seq },
+                        ..
+                    }) => {
+                        tail_with_file_replay(&session_log, &hub, &writer, from_seq);
+                        json!({"ok": true, "cmd": "tail", "from_seq": from_seq})
+                    }
+                    Ok(ControlRequest {
+                        cmd: ControlCommand::Status,
+                        ..
+                    }) => json!({"ok": true, "cmd": "status", "status": state.snapshot()}),
+                    Ok(_) => json!({"ok": false, "error": "this run exposes read-only control"}),
+                    Err(e) => json!({"ok": false, "error": e}),
+                },
+                Err(e) => json!({"ok": false, "error": e.to_string()}),
+            };
+            write_reply(&writer, &reply);
+        }
+        hub.unsubscribe(&writer);
+    });
+}
+
 fn write_reply(writer: &Client, reply: &Value) {
     let Ok(mut stream) = writer.lock() else {
         return;
@@ -467,6 +549,7 @@ fn write_reply(writer: &Client, reply: &Value) {
 
 /// Nothing mutates the run before its `Admitted` line is on disk; a redelivered command
 /// converges; `stop`/`abort` fire even when the record can't be written.
+#[cfg(feature = "autoresearch")]
 fn apply_command(req: ControlRequest, state: &ControlState, ledger: &AdmissionLedger) -> Value {
     let ControlRequest { id, cmd } = req;
     match cmd {
@@ -537,6 +620,7 @@ fn apply_command(req: ControlRequest, state: &ControlState, ledger: &AdmissionLe
 
 /// The grant is recorded BEFORE the slot is armed, under a key derived from the ASK, so
 /// approvals of the same ask converge and a resume can recognize a recorded grant.
+#[cfg(feature = "autoresearch")]
 fn grant_approval(
     state: &ControlState,
     ledger: &AdmissionLedger,
@@ -599,6 +683,7 @@ fn grant_approval(
 
 /// Admit, then apply. The effect runs only for a fresh admission; a conflict or ledger
 /// write failure refuses the command rather than acting unrecorded.
+#[cfg(feature = "autoresearch")]
 fn admitted(
     ledger: &AdmissionLedger,
     id: Option<AdmissionKey>,
@@ -631,6 +716,7 @@ fn admitted(
 
 /// Stop and abort are safety valves: they apply even when the ledger write fails, and say
 /// so (`unrecorded`) rather than refusing to stop a running loop over a disk error.
+#[cfg(feature = "autoresearch")]
 fn stop_the_run(id: Option<AdmissionKey>, input: AdmittedInput, ledger: &AdmissionLedger) -> Value {
     let cmd = input.cmd();
     let abort = matches!(input, AdmittedInput::Abort);
@@ -654,6 +740,7 @@ fn stop_the_run(id: Option<AdmissionKey>, input: AdmittedInput, ledger: &Admissi
 }
 
 /// Settle the admission a newly-armed one displaced as superseded.
+#[cfg(feature = "autoresearch")]
 fn supersede(ledger: &AdmissionLedger, displaced: Option<AdmissionKey>, by: &AdmissionKey) {
     if let Some(old) = displaced {
         let _ = ledger.settle(
@@ -664,6 +751,7 @@ fn supersede(ledger: &AdmissionLedger, displaced: Option<AdmissionKey>, by: &Adm
     }
 }
 
+#[cfg(feature = "autoresearch")]
 fn with_field(reply: &mut Value, field: &str, value: Value) {
     if let Some(obj) = reply.as_object_mut() {
         obj.insert(field.to_string(), value);
@@ -672,12 +760,14 @@ fn with_field(reply: &mut Value, field: &str, value: Value) {
 
 /// The legacy cross-process stop file external tooling may write.
 /// Unknown fields are ignored so older writers that include debugging metadata still work.
+#[cfg(feature = "autoresearch")]
 #[derive(Deserialize, Default)]
 struct StopFile {
     #[serde(default)]
     stop: bool,
 }
 
+#[cfg(feature = "autoresearch")]
 pub(crate) fn stop_file_says_stop(path: &Path) -> bool {
     std::fs::read_to_string(path)
         .ok()
@@ -816,6 +906,7 @@ fn command_from_name(cmd: &str, value: &Value) -> std::result::Result<ControlCom
 /// Append one steer payload in the marker-wrapped shape [`crate::control::admission::drain_steer`]
 /// reads. `pr_watch`'s reseed sink writes this file when there is no live control bridge;
 /// the bridge itself admits `steer` straight into the ledger.
+#[cfg(feature = "autoresearch")]
 pub(crate) fn append_steer(path: &Path, text: &str) -> std::io::Result<()> {
     if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir)?;
@@ -832,6 +923,7 @@ pub(crate) fn append_steer(path: &Path, text: &str) -> std::io::Result<()> {
         .write_all(payload.as_bytes())
 }
 
+#[cfg(feature = "autoresearch")]
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -848,7 +940,7 @@ fn stamp_session_line(line: &[u8], seq: u64) -> Option<String> {
     serde_json::to_string(&value).ok()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "autoresearch"))]
 mod tests {
     use crate::control::bridge::*;
 
@@ -1415,6 +1507,59 @@ mod tests {
         );
         assert!(got_ack, "the tail command was acked");
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_only_bridge_serves_status_and_refuses_mutation() {
+        let root = tempdir("read-only");
+        let state_dir = root.join("state");
+        std::fs::create_dir_all(&state_dir).expect("state dir");
+        let session_log = state_dir.join("session.jsonl");
+        std::fs::write(&session_log, "").expect("session log");
+        let paths = Paths {
+            workspace: root.clone(),
+            skills: None,
+            steer: root.join("STEER.md"),
+            state: state_dir.clone(),
+            session_log,
+            control: state_dir.join("control.json"),
+            escalation: root.join("ESCALATION.json"),
+            provisioning: root.join("PROVISIONING_PENDING.json"),
+            admissions: state_dir.join("admissions.jsonl"),
+        };
+        let port = {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("free port");
+            listener.local_addr().expect("addr").port()
+        };
+        let state = spawn_read_only_bridge(port, paths).expect("spawn bridge");
+        state.set_phase(LoopPhase::Iteration);
+        state.set_progress(3, None, 1.25);
+
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("timeout");
+        let mut writer = stream.try_clone().expect("clone");
+        let mut reader = BufReader::new(stream);
+
+        writeln!(writer, r#"{{"cmd":"status"}}"#).expect("status");
+        writer.flush().expect("flush");
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("status reply");
+        let status: Value = serde_json::from_str(line.trim()).expect("status json");
+        assert_eq!(status["ok"], true);
+        assert_eq!(status["status"]["phase"], "iteration");
+        assert_eq!(status["status"]["iter"], 3);
+        assert_eq!(status["status"]["spend"], 1.25);
+
+        writeln!(writer, r#"{{"cmd":"stop"}}"#).expect("stop");
+        writer.flush().expect("flush");
+        line.clear();
+        reader.read_line(&mut line).expect("stop reply");
+        let refused: Value = serde_json::from_str(line.trim()).expect("stop json");
+        assert_eq!(refused["ok"], false);
+        assert_eq!(refused["error"], "this run exposes read-only control");
         let _ = std::fs::remove_dir_all(&root);
     }
 

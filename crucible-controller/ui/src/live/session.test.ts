@@ -11,6 +11,12 @@ describe('parseSessionLine', () => {
 
     const budget = parseSessionLine('{"kind":"budget","spent":1.2,"elapsed_secs":30}');
     expect(budget).toMatchObject({ kind: 'budget', spent: 1.2, elapsed_secs: 30 });
+
+    const admitted = parseSessionLine('{"kind":"plan_admitted","plan_version":1,"tasks":[{},{}]}');
+    expect(admitted).toMatchObject({ kind: 'plan_admitted', plan_version: 1, tasks: 2 });
+
+    const task = parseSessionLine('{"kind":"task_result","task":"rate","status":"pass","cost_usd":0.2,"secs":4}');
+    expect(task).toMatchObject({ kind: 'task_result', task: 'rate', status: 'pass', cost_usd: 0.2, secs: 4 });
   });
 
   it('nests agent events and falls back per-layer on unknowns', () => {

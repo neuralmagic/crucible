@@ -36,25 +36,41 @@ pub(crate) async fn launch(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Resul
     Ok(())
 }
 
-/// Why the engine would refuse `launch` at startup, judged against the pack it froze. `None` when
-/// it would start, or when no pack is stored for the dispatch to fail on.
-async fn plan_refusal(
+/// Compile and validate the frozen launch pack. `None` means no pack is stored.
+async fn launch_plan(
     db: &Db,
     key: &str,
     launch: &crate::launches::model::PlaybookLaunch,
-) -> Result<Option<String>> {
+) -> Result<std::result::Result<Option<crucible::plan::ir::ValidPlan>, String>> {
     let slug = crate::model::sanitize_key(key);
     let Some(tree) = crate::runs::blob_store::get_pack(db.pool(), &slug).await? else {
-        return Ok(None);
+        return Ok(Ok(None));
     };
-    let checked = crate::playbooks::registry::check_tree_runnable(
+    let checked = crate::playbooks::registry::compile_tree_runnable(
         tree,
         launch.params.iter().cloned().collect(),
         launch.max_time.clone(),
         launch.variant.clone(),
     )
     .await?;
-    Ok(checked.err().map(|field| field.message))
+    Ok(checked.map(Some).map_err(|field| field.message))
+}
+
+async fn seed_run_plan(
+    db: &Db,
+    run_id: &str,
+    plan: Option<&crucible::plan::ir::ValidPlan>,
+) -> Result<()> {
+    let Some(plan) = plan else { return Ok(()) };
+    let graph = serde_json::to_string(&crucible::plan::record::wire_tasks(plan))
+        .context("serializing the dispatched task graph")?;
+    crate::runs::task_results::upsert_run_plan(
+        db.pool(),
+        run_id,
+        i64::from(plan.plan().version),
+        &graph,
+    )
+    .await
 }
 
 /// The same image preflight the launch endpoint ran, against the catalog as it stands now and the
@@ -127,8 +143,20 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
         .await?;
         return Ok(());
     };
-    let refusal = match plan_refusal(db, &issue.key, &launch).await {
-        Ok(refusal) => refusal,
+    let plan = match launch_plan(db, &issue.key, &launch).await {
+        Ok(Ok(plan)) => plan,
+        Ok(Err(detail)) => {
+            crate::issues::transitions::park(
+                db.pool(),
+                db.events(),
+                &issue.key,
+                Status::New,
+                &ParkReason::PlanRefused { detail },
+                ParkedBy::Machine,
+            )
+            .await?;
+            return Ok(());
+        }
         Err(e) => {
             return Err(crate::runs::claim::record_dispatch_failure(
                 db,
@@ -140,18 +168,6 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
             .await);
         }
     };
-    if let Some(detail) = refusal {
-        crate::issues::transitions::park(
-            db.pool(),
-            db.events(),
-            &issue.key,
-            Status::New,
-            &ParkReason::PlanRefused { detail },
-            ParkedBy::Machine,
-        )
-        .await?;
-        return Ok(());
-    }
 
     let run_id = new_run_id(&issue.key);
     // Both a draft test-fire and a registered launch resolve the playbook scope's bindings, against
@@ -262,12 +278,14 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
         }
         Started::ContractRejected | Started::ClaimLost => Ok(()),
         Started::Pod => {
+            seed_run_plan(db, &run_id, plan.as_ref()).await?;
             crate::runs::agent_tools::attribute_launched(db, cfg, &issue.key, &run_id).await;
             Ok(())
         }
         // The subprocess is supervised out of band, exactly as the pod watch drives a pod's
         // completion — and only once the run row it will fold into is committed.
         Started::Local(run) => {
+            seed_run_plan(db, &run_id, plan.as_ref()).await?;
             crate::runs::agent_tools::attribute_launched(db, cfg, &issue.key, &run_id).await;
             let db = db.clone();
             let key = issue.key.clone();

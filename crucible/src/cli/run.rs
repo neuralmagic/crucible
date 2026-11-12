@@ -223,6 +223,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                 harness,
                 model,
                 resume,
+                control_port,
                 variant,
                 rerun_of,
                 from,
@@ -248,6 +249,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                             model: model.clone(),
                         },
                         resume: *resume,
+                        control_port: *control_port,
                         variant: variant.clone(),
                         engine: Some(engine.handle()),
                         rerun: rerun_of.as_ref().map(|parent| crate::plan::cli::Rerun {

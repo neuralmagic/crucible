@@ -1,9 +1,8 @@
-//! Steering a run from outside the process: the scored loop's control bridge, admission ledger
-//! and signals, and the broker and MCP servers a sandboxed turn reaches.
+//! Observing and steering a run from outside the process, plus the broker and MCP servers a
+//! sandboxed turn reaches.
 
 #[cfg(feature = "autoresearch")]
 pub(crate) mod admission;
-#[cfg(feature = "autoresearch")]
 pub(crate) mod bridge;
 pub(crate) mod broker;
 #[cfg(feature = "autoresearch")]

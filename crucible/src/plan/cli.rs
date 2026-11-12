@@ -525,6 +525,8 @@ pub struct RunOpts {
     pub agent: AgentOverride,
     /// Continue the playbook run the manifest's state dir holds instead of starting one.
     pub resume: bool,
+    /// Read-only TCP relay for the session log of a manifest run.
+    pub control_port: Option<u16>,
     /// The manifest variant the run reads.
     pub variant: Option<crate::manifest::variant::VariantName>,
     /// Rerun a finished playbook run from some of its tasks instead of starting afresh.
@@ -661,6 +663,7 @@ pub fn run(
         compute_driver,
         agent,
         resume,
+        control_port,
         variant,
         rerun,
         engine,
@@ -829,6 +832,19 @@ pub fn run(
     // A log that already ends in a shutdown is closed: the run finished, and nothing may follow
     // its last line.
     let events = events.filter(|_| !prior.as_ref().is_some_and(|p| p.shut_down));
+    let control = match (control_port, evidence.as_ref()) {
+        (Some(port), Some(paths)) => Some(crate::control::bridge::spawn_read_only_bridge(
+            port,
+            paths.clone(),
+        )?),
+        _ => None,
+    };
+    if let Some(control) = &control {
+        control.set_phase(crucible_contract::LoopPhase::Iteration);
+        if let Some(usd) = ceilings.usd {
+            control.set_live_max_cost(usd);
+        }
+    }
     // A run with an ingest surface can open decision requests, which is the `human` capability.
     let desk = crate::plan::desk::HttpDesk::from_env(events.as_ref());
     let mut caps = caps.clone();
@@ -880,6 +896,9 @@ pub fn run(
             }
         }
     }
+    if let Some(control) = &control {
+        control.set_progress(0, None, 0.0);
+    }
     let selected_results: std::collections::BTreeSet<_> = plan
         .tasks_topo()
         .filter_map(|task| match &task.task {
@@ -927,7 +946,14 @@ pub fn run(
     write_report(&report);
     let mut statuses: BTreeMap<TaskName, TaskStatus> = BTreeMap::new();
     let mut completed_early = false;
+    let mut completed = 0_u32;
+    let mut spent = 0.0;
     let mut observe = |task: &crate::plan::ir::Task, result: &crate::plan::exec::TaskResult| {
+        completed = completed.saturating_add(1);
+        spent += result.cost_usd;
+        if let Some(control) = &control {
+            control.set_progress(completed, None, spent);
+        }
         report.tasks.push(crucible_contract::TaskReport {
             name: task.name.0.clone(),
             status: result.status,
@@ -1060,6 +1086,10 @@ pub fn run(
                 reason: exit.clone(),
             },
         );
+    }
+    if let Some(control) = &control {
+        control.set_phase(crucible_contract::LoopPhase::Finished);
+        control.set_spend(out.spent_usd);
     }
     if let Some(p) = &evidence {
         crate::report::evidence_client::deliver_run_evidence(p);
@@ -1302,6 +1332,30 @@ mod tests {
             ]),
             "compile-workflow's file is the source, not a plan"
         );
+    }
+
+    #[test]
+    fn only_a_manifest_plan_run_accepts_a_control_port() {
+        use clap::Parser;
+        let parse = |args: &[&str]| <crate::cli::Cli>::try_parse_from(args).is_ok();
+        assert!(parse(&[
+            "crucible",
+            "plan",
+            "run",
+            "--manifest",
+            "m.toml",
+            "--control-port",
+            "7777",
+        ]));
+        assert!(!parse(&[
+            "crucible",
+            "plan",
+            "run",
+            "--file",
+            "p.toml",
+            "--control-port",
+            "7777",
+        ]));
     }
 
     #[test]

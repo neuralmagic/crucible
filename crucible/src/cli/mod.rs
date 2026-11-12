@@ -336,6 +336,9 @@ pub(crate) enum PlanAction {
         /// ceilings. The graph compiled now must be the one the run started with.
         #[arg(long, requires = "manifest")]
         resume: bool,
+        /// Serve the running plan's session stream on this TCP port. The bridge is read-only.
+        #[arg(long, requires = "manifest")]
+        control_port: Option<u16>,
         /// The `[variant.<name>]` of the manifest to read; the base manifest without it.
         #[arg(long, value_name = "NAME", requires = "manifest")]
         variant: Option<crate::manifest::variant::VariantName>,

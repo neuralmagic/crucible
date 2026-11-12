@@ -62,6 +62,8 @@ export type SessionLine =
   | { kind: 'escalation'; category: string; reason: string; evidence: string }
   | { kind: 'segment'; fingerprint: string; baseline_score: number; regime: string }
   | { kind: 'identity'; digest: string }
+  | { kind: 'plan_admitted'; plan_version: number; tasks: number }
+  | { kind: 'task_result'; task: string; status: string; note: string; cost_usd: number; secs: number }
   | { kind: 'finished' }
   | { kind: 'shutdown'; outcome: string; reason: string }
   | { kind: 'unknown'; raw: string };
@@ -181,6 +183,10 @@ export function parseSessionLine(data: string): SessionLine {
       return { kind: 'segment', fingerprint: str(raw, 'fingerprint'), baseline_score: numOr(raw, 'baseline_score', 0), regime: str(raw, 'regime') };
     case 'identity':
       return { kind: 'identity', digest: isRecord(raw.identity) ? str(raw.identity, 'digest') : '' };
+    case 'plan_admitted':
+      return { kind: 'plan_admitted', plan_version: numOr(raw, 'plan_version', 0), tasks: Array.isArray(raw.tasks) ? raw.tasks.length : 0 };
+    case 'task_result':
+      return { kind: 'task_result', task: str(raw, 'task'), status: str(raw, 'status'), note: str(raw, 'note'), cost_usd: numOr(raw, 'cost_usd', 0), secs: numOr(raw, 'secs', 0) };
     case 'finished':
       return { kind: 'finished' };
     case 'shutdown':
