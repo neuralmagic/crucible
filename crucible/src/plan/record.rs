@@ -62,6 +62,11 @@ pub fn wire_tasks(plan: &ValidPlan) -> Vec<crucible_contract::session::PlanTaskW
                 .unwrap_or_default(),
             history_depth: task.history.unwrap_or_default(),
             definition: definitions.get(&task.name).cloned().unwrap_or_default(),
+            command: match &task.task {
+                crate::plan::ir::TaskKind::Command { command }
+                | crate::plan::ir::TaskKind::Evaluate { command, .. } => command.clone(),
+                _ => String::new(),
+            },
         })
         .collect()
 }
