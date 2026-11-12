@@ -465,9 +465,11 @@ mod tests {
 
         let (ok, out, err) = reported::<Out>(Err("jira said 503\non two lines".to_owned()));
         assert!(!ok);
+        assert_eq!(out.matches('\n').count(), 1, "{out:?}");
+        assert!(out.ends_with('\n'), "{out:?}");
         assert_eq!(
-            out,
-            "{\"note\":\"jira said 503\\non two lines\",\"pass\":false}\n"
+            serde_json::from_str::<serde_json::Value>(&out).unwrap(),
+            serde_json::json!({"pass": false, "note": "jira said 503\non two lines"})
         );
         assert_eq!(err, "jira said 503\non two lines\n");
 
@@ -483,19 +485,21 @@ mod tests {
             result_line(&Measured::score(8.5)).unwrap(),
             "{\"score\":8.5}"
         );
+        let line = result_line(
+            &Measured::passed()
+                .with_score(0.31)
+                .with_digest("sha256:abc")
+                .with("p99_ms", 12),
+        )
+        .unwrap();
         assert_eq!(
-            result_line(
-                &Measured::passed()
-                    .with_score(0.31)
-                    .with_digest("sha256:abc")
-                    .with("p99_ms", 12)
-            )
-            .unwrap(),
-            "{\"digest\":\"sha256:abc\",\"p99_ms\":12,\"pass\":true,\"score\":0.31}"
+            serde_json::from_str::<serde_json::Value>(&line).unwrap(),
+            serde_json::json!({"pass": true, "score": 0.31, "digest": "sha256:abc", "p99_ms": 12})
         );
+        let line = result_line(&Measured::failed("did not build")).unwrap();
         assert_eq!(
-            result_line(&Measured::failed("did not build")).unwrap(),
-            "{\"note\":\"did not build\",\"pass\":false}"
+            serde_json::from_str::<serde_json::Value>(&line).unwrap(),
+            serde_json::json!({"pass": false, "note": "did not build"})
         );
     }
 }
