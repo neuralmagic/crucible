@@ -104,6 +104,16 @@ pub enum Refusal {
     },
 }
 
+impl From<crucible_contract::mcp_message::BadToolCall> for Refusal {
+    fn from(bad: crucible_contract::mcp_message::BadToolCall) -> Self {
+        use crucible_contract::mcp_message::BadToolCall;
+        match bad {
+            BadToolCall::NoToolName => Refusal::NoToolName,
+            BadToolCall::Arguments { tool } => Refusal::Arguments { tool },
+        }
+    }
+}
+
 impl Refusal {
     /// Whether the same call can succeed later: only an access review the reviewer could not
     /// complete.

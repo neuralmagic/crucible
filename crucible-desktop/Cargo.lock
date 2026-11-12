@@ -1649,9 +1649,11 @@ version = "0.6.4"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "base64 0.23.1",
  "crucible",
  "crucible-contract",
+ "crucible-harness",
  "crux",
  "futures-util",
  "gloo-timers",
@@ -1673,6 +1675,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "tokio-util",
  "toml 0.8.23",
  "url",
  "wasm-bindgen",
@@ -6541,7 +6544,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "openshell-core"
 version = "0.0.0"
-source = "git+https://github.com/wseaton/OpenShell.git?rev=1c7e2e9d4293093882c14dab79fc5bf4e83dcf15#1c7e2e9d4293093882c14dab79fc5bf4e83dcf15"
+source = "git+https://github.com/wseaton/OpenShell.git?rev=ae753f2ec44a926d62a1437acbce5c497b98ef56#ae753f2ec44a926d62a1437acbce5c497b98ef56"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6576,7 +6579,7 @@ dependencies = [
 [[package]]
 name = "openshell-crypto"
 version = "0.0.0"
-source = "git+https://github.com/wseaton/OpenShell.git?rev=1c7e2e9d4293093882c14dab79fc5bf4e83dcf15#1c7e2e9d4293093882c14dab79fc5bf4e83dcf15"
+source = "git+https://github.com/wseaton/OpenShell.git?rev=ae753f2ec44a926d62a1437acbce5c497b98ef56#ae753f2ec44a926d62a1437acbce5c497b98ef56"
 dependencies = [
  "aws-lc-rs",
  "jsonwebtoken",
@@ -6594,7 +6597,7 @@ dependencies = [
 [[package]]
 name = "openshell-extension-core"
 version = "0.0.0"
-source = "git+https://github.com/wseaton/OpenShell.git?rev=1c7e2e9d4293093882c14dab79fc5bf4e83dcf15#1c7e2e9d4293093882c14dab79fc5bf4e83dcf15"
+source = "git+https://github.com/wseaton/OpenShell.git?rev=ae753f2ec44a926d62a1437acbce5c497b98ef56#ae753f2ec44a926d62a1437acbce5c497b98ef56"
 dependencies = [
  "hyper-util",
  "serde",
@@ -6607,7 +6610,7 @@ dependencies = [
 [[package]]
 name = "openshell-policy"
 version = "0.0.0"
-source = "git+https://github.com/wseaton/OpenShell.git?rev=1c7e2e9d4293093882c14dab79fc5bf4e83dcf15#1c7e2e9d4293093882c14dab79fc5bf4e83dcf15"
+source = "git+https://github.com/wseaton/OpenShell.git?rev=ae753f2ec44a926d62a1437acbce5c497b98ef56#ae753f2ec44a926d62a1437acbce5c497b98ef56"
 dependencies = [
  "hickory-proto",
  "miette",
@@ -6621,7 +6624,7 @@ dependencies = [
 [[package]]
 name = "openshell-policy-schema"
 version = "0.0.0"
-source = "git+https://github.com/wseaton/OpenShell.git?rev=1c7e2e9d4293093882c14dab79fc5bf4e83dcf15#1c7e2e9d4293093882c14dab79fc5bf4e83dcf15"
+source = "git+https://github.com/wseaton/OpenShell.git?rev=ae753f2ec44a926d62a1437acbce5c497b98ef56#ae753f2ec44a926d62a1437acbce5c497b98ef56"
 dependencies = [
  "miette",
  "noyalib",

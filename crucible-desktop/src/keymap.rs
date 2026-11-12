@@ -45,7 +45,7 @@ pub enum Command {
 }
 
 impl Command {
-    pub const ALL: [Command; 52] = [
+    pub const ALL: [Command; 53] = [
         Command::Palette,
         Command::Search,
         Command::Focus(Edge::Left),
@@ -62,6 +62,7 @@ impl Command {
         Command::Show(PaneKind::Compare),
         Command::Show(PaneKind::Log),
         Command::Show(PaneKind::Pack),
+        Command::Show(PaneKind::Agent),
         Command::LogStream,
         Command::LogByTask,
         Command::CopyLink,
@@ -183,6 +184,7 @@ impl Command {
             Command::Show(PaneKind::Log) => vec![primary("cmd+6", "ctrl+6")],
             Command::Show(PaneKind::Pack) => vec![primary("cmd+7", "ctrl+7")],
             Command::Show(PaneKind::Transcript) => vec![primary("cmd+8", "ctrl+8")],
+            Command::Show(PaneKind::Agent) => vec![primary("cmd+9", "ctrl+9")],
             Command::Open(Page::Settings) => vec![primary("cmd+,", "ctrl+,")],
             Command::Open(Page::Decisions) => vec![primary("cmd+shift+d", "ctrl+shift+d")],
             Command::SaveDraft => vec![primary("cmd+s", "ctrl+s")],

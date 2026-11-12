@@ -1449,6 +1449,11 @@ impl ProviderName {
         ProviderName(std::borrow::Cow::Borrowed(name))
     }
 
+    /// A provider registered outside the engine, by the name its owner gave it.
+    pub fn named(name: impl Into<String>) -> Self {
+        ProviderName(std::borrow::Cow::Owned(name.into()))
+    }
+
     /// The provider carrying the agent server `server`'s token grant.
     pub fn for_server(server: &str) -> Self {
         ProviderName(std::borrow::Cow::Owned(format!("crucible-{server}")))

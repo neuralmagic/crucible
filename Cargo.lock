@@ -2321,6 +2321,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "cel",
+ "crucible-contract",
  "http",
  "http-body-util",
  "jsonwebtoken 11.1.0",
@@ -7090,7 +7091,7 @@ dependencies = [
 [[package]]
 name = "openshell-core"
 version = "0.0.0"
-source = "git+https://github.com/wseaton/OpenShell.git?rev=1c7e2e9d4293093882c14dab79fc5bf4e83dcf15#1c7e2e9d4293093882c14dab79fc5bf4e83dcf15"
+source = "git+https://github.com/wseaton/OpenShell.git?rev=ae753f2ec44a926d62a1437acbce5c497b98ef56#ae753f2ec44a926d62a1437acbce5c497b98ef56"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -7125,7 +7126,7 @@ dependencies = [
 [[package]]
 name = "openshell-crypto"
 version = "0.0.0"
-source = "git+https://github.com/wseaton/OpenShell.git?rev=1c7e2e9d4293093882c14dab79fc5bf4e83dcf15#1c7e2e9d4293093882c14dab79fc5bf4e83dcf15"
+source = "git+https://github.com/wseaton/OpenShell.git?rev=ae753f2ec44a926d62a1437acbce5c497b98ef56#ae753f2ec44a926d62a1437acbce5c497b98ef56"
 dependencies = [
  "aws-lc-rs",
  "jsonwebtoken 10.4.0",
@@ -7143,7 +7144,7 @@ dependencies = [
 [[package]]
 name = "openshell-extension-core"
 version = "0.0.0"
-source = "git+https://github.com/wseaton/OpenShell.git?rev=1c7e2e9d4293093882c14dab79fc5bf4e83dcf15#1c7e2e9d4293093882c14dab79fc5bf4e83dcf15"
+source = "git+https://github.com/wseaton/OpenShell.git?rev=ae753f2ec44a926d62a1437acbce5c497b98ef56#ae753f2ec44a926d62a1437acbce5c497b98ef56"
 dependencies = [
  "hyper-util",
  "serde",
@@ -7156,7 +7157,7 @@ dependencies = [
 [[package]]
 name = "openshell-policy"
 version = "0.0.0"
-source = "git+https://github.com/wseaton/OpenShell.git?rev=1c7e2e9d4293093882c14dab79fc5bf4e83dcf15#1c7e2e9d4293093882c14dab79fc5bf4e83dcf15"
+source = "git+https://github.com/wseaton/OpenShell.git?rev=ae753f2ec44a926d62a1437acbce5c497b98ef56#ae753f2ec44a926d62a1437acbce5c497b98ef56"
 dependencies = [
  "hickory-proto",
  "miette",
@@ -7170,7 +7171,7 @@ dependencies = [
 [[package]]
 name = "openshell-policy-schema"
 version = "0.0.0"
-source = "git+https://github.com/wseaton/OpenShell.git?rev=1c7e2e9d4293093882c14dab79fc5bf4e83dcf15#1c7e2e9d4293093882c14dab79fc5bf4e83dcf15"
+source = "git+https://github.com/wseaton/OpenShell.git?rev=ae753f2ec44a926d62a1437acbce5c497b98ef56#ae753f2ec44a926d62a1437acbce5c497b98ef56"
 dependencies = [
  "miette",
  "noyalib",

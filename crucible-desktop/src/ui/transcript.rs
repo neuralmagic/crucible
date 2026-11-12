@@ -96,7 +96,7 @@ fn instance_chips(task: &str, speakers: &[&str], picked: &str, p: &Paint) -> El 
     chips
 }
 
-fn turn_view(turn: &Turn, app: &App, p: &Paint) -> El {
+pub(crate) fn turn_view(turn: &Turn, app: &App, p: &Paint) -> El {
     let (tools, failed) = turn.tools();
     let mut facts = vec![format!("attempt {}", turn.attempt)];
     if let Some(model) = turn.model {

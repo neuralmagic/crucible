@@ -3,6 +3,7 @@
 mod about;
 mod activity;
 mod admin;
+mod agent;
 mod approvals;
 mod blueprints;
 mod compare;

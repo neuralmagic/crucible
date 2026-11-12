@@ -52,6 +52,8 @@ pub const CACHES: &str = "/buildit-caches";
 const ARCHIVE_AUTH: &str = "/buildit-archive";
 const CLUSTER: &str = "/buildit-cluster";
 const STORAGE: &str = "/home/build/.local/share/containers";
+/// buildah's temporary directory, on the storage volume.
+const BUILD_TMP: &str = "/home/build/.local/share/containers/tmp";
 /// What a pod may leave for the archive: facts, a run's log and the fetched paths `buildit mcp`
 /// takes up to `step::FETCH_LIMIT` of.
 const OUT_LIMIT: &str = "2Gi";
@@ -276,9 +278,10 @@ while :; do sleep 3600 & wait $!; done"#;
 const BUILD: &str = r#"trap 'kill -TERM -1 2> /dev/null; exit 143' TERM
 runner=$1; tag=$2; dest=$3; shift 3
 log=/tmp/build.log
-mkdir -p /tmp/containers-run /buildit-out/facts $CACHE_DIRS
+mkdir -p /tmp/containers-run /buildit-out/facts "$TMPDIR" $CACHE_DIRS
 printf '[storage]\ndriver = "%s"\ngraphroot = "%s/storage"\nrunroot = "/tmp/containers-run"\n' \
   "$STORAGE_DRIVER" "$STORAGE" > /tmp/storage.conf
+printf 'unqualified-search-registries = ["docker.io"]\n' > /tmp/registries.conf
 for f in ccache.conf cache.json; do [ -e "/buildit-inputs/$f" ] && cp "/buildit-inputs/$f" /buildit-out/facts/; done
 : > "$log"
 sh -c "$runner" sh "$log" "$@" &
@@ -361,12 +364,14 @@ pub fn build_job(site: &Site, id: &Ident<'_>, b: &BuildJob<'_>) -> Job {
     command.extend(b.runner_args.iter().cloned());
     let mut vars = vec![
         env("BUILDAH_ISOLATION", "chroot"),
+        env("CONTAINERS_REGISTRIES_CONF", "/tmp/registries.conf"),
         env("CONTAINERS_STORAGE_CONF", "/tmp/storage.conf"),
         env("HOME", "/home/build"),
         env("STORAGE_DRIVER", site.storage.as_str()),
         env("STORAGE", STORAGE),
         env("REGISTRY", site.registry.host()),
         env("CACHE_DIRS", &b.cache_dirs.join(" ")),
+        env("TMPDIR", BUILD_TMP),
     ];
     vars.sort_by(|a, b| a.name.cmp(&b.name));
     let mut mounts = vec![
@@ -1139,6 +1144,21 @@ mod tests {
         };
         assert_eq!(env("CACHE_DIRS").as_deref(), Some("/c/deps /c/ccache"));
         assert_eq!(env("STORAGE_DRIVER").as_deref(), Some("overlay"));
+        assert_eq!(
+            env("CONTAINERS_REGISTRIES_CONF").as_deref(),
+            Some("/tmp/registries.conf")
+        );
+        assert!(
+            command[2].contains(
+                r#"printf 'unqualified-search-registries = ["docker.io"]\n' > /tmp/registries.conf"#
+            ),
+            "an unqualified FROM resolves to docker.io without a prompt"
+        );
+        assert_eq!(
+            env("TMPDIR").as_deref(),
+            Some("/home/build/.local/share/containers/tmp"),
+            "on the storage volume, where an overlay upper directory mounts"
+        );
         assert!(
             !builder["volumeMounts"]
                 .as_array()

@@ -18,8 +18,9 @@ use axum::extract::{Request, State};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
+use crucible_contract::mcp_message::{self, TOOLS_CALL, TOOLS_LIST};
 use http::{Method, StatusCode, header};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 /// Largest request or `tools/list` response body the guard buffers.
@@ -63,12 +64,9 @@ pub async fn enforce(State(guard): State<Arc<PolicyGuard>>, req: Request, next: 
             "JSON-RPC batches are not supported",
         );
     }
-    let method = message
-        .get("method")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let method = mcp_message::method(&message).map(str::to_string);
     let hide = match method.as_deref() {
-        Some("tools/list") => !guard.policy.hides_nothing(),
+        Some(TOOLS_LIST) => !guard.policy.hides_nothing(),
         Some(method)
             if PROTOCOL_METHODS.contains(&method) || method.starts_with("notifications/") =>
         {
@@ -88,7 +86,7 @@ pub async fn enforce(State(guard): State<Arc<PolicyGuard>>, req: Request, next: 
             }
             false
         }
-        None if is_response(&message) => false,
+        None if mcp_message::is_response(&message) => false,
         None => return plain(StatusCode::BAD_REQUEST, "not a JSON-RPC request"),
     };
     let body = match serde_json::to_vec(&message) {
@@ -101,12 +99,6 @@ pub async fn enforce(State(guard): State<Arc<PolicyGuard>>, req: Request, next: 
         return hide_injected(&guard.policy, response).await;
     }
     response
-}
-
-/// A JSON-RPC response from the client to a server request: an `id` and a `result` or `error`.
-fn is_response(message: &Value) -> bool {
-    message.get("id").is_some()
-        && (message.get("result").is_some() || message.get("error").is_some())
 }
 
 async fn review(
@@ -157,8 +149,8 @@ async fn decide(
     principal: &Principal,
     method: &str,
 ) -> Result<(), Refusal> {
-    let checks = if method == "tools/call" {
-        let (tool, args) = tool_call(message)?;
+    let checks = if method == TOOLS_CALL {
+        let (tool, args) = mcp_message::tool_call(message)?;
         require(
             principal,
             &tool,
@@ -195,29 +187,6 @@ fn require(principal: &Principal, call: &str, scopes: &[&str]) -> Result<(), Ref
     })
 }
 
-/// The tool a `tools/call` names and its arguments, an empty object when absent.
-fn tool_call(message: &mut Value) -> Result<(String, &mut Map<String, Value>), Refusal> {
-    let params = message
-        .get_mut("params")
-        .and_then(Value::as_object_mut)
-        .ok_or(Refusal::NoToolName)?;
-    let tool = params
-        .get("name")
-        .and_then(Value::as_str)
-        .ok_or(Refusal::NoToolName)?
-        .to_string();
-    let arguments = params
-        .entry("arguments")
-        .or_insert_with(|| Value::Object(Map::new()));
-    if arguments.is_null() {
-        *arguments = Value::Object(Map::new());
-    }
-    match arguments.as_object_mut() {
-        Some(args) => Ok((tool, args)),
-        None => Err(Refusal::Arguments { tool }),
-    }
-}
-
 /// A missing scope is a step-up challenge when a server is attached. A refused tool call is a tool
 /// result with `isError`, so the model reads why; a call that names no tool and any other method
 /// get a JSON-RPC error.
@@ -236,7 +205,7 @@ fn refuse(
             },
         );
     }
-    let body = if method == "tools/call" && refusal != Refusal::NoToolName {
+    let body = if method == TOOLS_CALL && refusal != Refusal::NoToolName {
         json!({"jsonrpc": "2.0", "id": id, "result": refused_tool_result(&refusal)})
     } else {
         json!({
@@ -295,10 +264,7 @@ async fn hide_injected(policy: &ToolPolicy, response: Response) -> Response {
 
 /// Hide injected parameters in a `tools/list` result; false if `message` is not one.
 fn rewrite_message(policy: &ToolPolicy, message: &mut Value) -> bool {
-    let Some(tools) = message
-        .pointer_mut("/result/tools")
-        .and_then(Value::as_array_mut)
-    else {
+    let Some(tools) = mcp_message::listed_tools(message) else {
         return false;
     };
     for tool in tools {

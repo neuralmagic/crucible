@@ -14,6 +14,7 @@ use crate::pack::{PackFile, PackFiles};
 use crate::settings::LogFont;
 use crate::syntax;
 use crate::ui::Paint;
+use crate::workspace::PaneKind;
 use crate::{App, PackSource};
 
 /// Lines drawn per file; a longer file says how much it left out.
@@ -155,6 +156,19 @@ fn toolbar(app: &App, pack: &PackFiles, p: &Paint) -> El {
         return bar;
     }
     let edited = app.remote.working_edited;
+    if app.agent_available() {
+        bar = bar.child(
+            Button::new("Agent")
+                .variant(if app.workspace().locate(PaneKind::Agent).is_some() {
+                    ButtonVariant::Submit
+                } else {
+                    ButtonVariant::Neutral
+                })
+                .on_press(|app: &mut App| app.toggle_agent())
+                .build(p.k)
+                .key("pack-agent"),
+        );
+    }
     bar.child(
         Button::new("Pull")
             .variant(ButtonVariant::Neutral)
