@@ -143,6 +143,7 @@ static CLAUDE: HarnessSpec = HarnessSpec {
         ("CLAUDE_CODE_SYNC_PLUGIN_INSTALL", "1"),
         ("DISABLE_AUTOUPDATER", "1"),
         ("CLAUDE_CODE_MAX_RETRIES", "20"),
+        ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
     ],
     local_env: &[
         ("DISABLE_AUTOUPDATER", "1"),
