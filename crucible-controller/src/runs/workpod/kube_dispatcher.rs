@@ -347,3 +347,71 @@ pub(crate) fn terminated_message(status: Option<&PodStatus>) -> Option<String> {
         .find_map(|cs| cs.state.as_ref()?.terminated.as_ref()?.message.clone())
         .filter(|m| !m.trim().is_empty())
 }
+
+#[cfg(test)]
+mod tests {
+    /// One request to the core API group, by resource and verb.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct ApiCall {
+        resource: &'static str,
+        verb: &'static str,
+    }
+
+    /// Every call [`KubePodDispatcher`] makes in the namespace a run pod is dispatched into, which the
+    /// identity it runs as on that cluster must be granted.
+    const LOOP_NAMESPACE_CALLS: [ApiCall; 7] = [
+        ApiCall {
+            resource: "pods",
+            verb: "create",
+        },
+        ApiCall {
+            resource: "pods",
+            verb: "get",
+        },
+        ApiCall {
+            resource: "pods",
+            verb: "delete",
+        },
+        ApiCall {
+            resource: "pods/log",
+            verb: "get",
+        },
+        ApiCall {
+            resource: "configmaps",
+            verb: "create",
+        },
+        ApiCall {
+            resource: "secrets",
+            verb: "create",
+        },
+        ApiCall {
+            resource: "secrets",
+            verb: "patch",
+        },
+    ];
+
+    /// A call the dispatcher makes that the rendered dispatch Role does not grant is refused on
+    /// every cluster rendered from a profile, so each one must be in the Role.
+    #[test]
+    fn the_rendered_dispatch_role_grants_every_call_the_dispatcher_makes() {
+        let rules = crucible::deploy::render::dispatch::rules();
+        for call in LOOP_NAMESPACE_CALLS {
+            assert!(
+                crucible::deploy::render::dispatch::grants(&rules, call.resource, call.verb),
+                "the dispatch Role does not grant {} on {}",
+                call.verb,
+                call.resource
+            );
+        }
+    }
+
+    /// The token refresh rewrites a run Secret in place; without this verb every re-mint is
+    /// refused and a run loses GitHub access an hour after dispatch.
+    #[test]
+    fn rewriting_a_run_secret_is_among_the_calls_the_role_must_grant() {
+        assert!(LOOP_NAMESPACE_CALLS.contains(&ApiCall {
+            resource: "secrets",
+            verb: "patch",
+        }));
+    }
+}

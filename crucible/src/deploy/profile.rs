@@ -821,7 +821,7 @@ pub struct Cluster {
     /// Identities (`namespace/name`) granted get/list on OpenShell `Sandbox` resources in
     /// `sandbox_namespace`: the controller's own identity on this cluster, which reads a bound
     /// sandbox's name from them and, under isolated gateways, starts and tears down each run's
-    /// gateway there.
+    /// gateway there. They are also granted what dispatching run pods into `loop_namespace` takes.
     #[serde(default)]
     pub sandbox_readers: Vec<ServiceAccountRef>,
     /// The SPIFFE Workload API socket path the OpenShell driver mounts (`csi.spiffe.io`) into

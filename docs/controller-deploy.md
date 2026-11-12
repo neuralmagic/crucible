@@ -132,12 +132,14 @@ If the controller runs loops in other clusters (spokes):
   A draft-head schedule saved before its draft added a pin fails its firing until it is saved
   again.
 - The identity in each spoke's kubeconfig needs the Role above in that spoke's loop namespace,
-  without `leases`. That includes `secrets` patch. With create and delete alone the hub delivers
-  each run's Secret but every re-mint of its GitHub App token is refused, and the run's GitHub
-  calls answer 401 an hour after dispatch. The verb cannot be limited to run Secrets by
-  `resourceNames`, because each is named after its pod (`<pod>-secrets`) and a Role lists exact
-  names. `kubectl --kubeconfig <spoke kubeconfig> auth can-i patch secrets -n <loop namespace>`
-  answers whether a spoke has it.
+  without `leases`. Name it in the spoke profile's `[cluster] sandbox_readers` and the loop render
+  emits that grant as the Role `crucible-dispatch`, so it is not written by hand. It includes
+  `secrets` patch. With create and delete alone the hub delivers each run's Secret but every
+  re-mint of its GitHub App token is refused, and the run's GitHub calls answer 401 an hour after
+  dispatch. The verb cannot be limited to run Secrets by `resourceNames`, because each is named
+  after its pod (`<pod>-secrets`) and a Role lists exact names.
+  `kubectl --kubeconfig <spoke kubeconfig> auth can-i patch secrets -n <loop namespace>` answers
+  whether a spoke has it.
 - If the hub cannot reach a spoke, the spoke sends reports to the hub.
   `crucible-controller cluster-snapshot` runs on the spoke as a CronJob and posts to the push
   endpoint of the hub with a bearer token that the hub lists in `CONTROLLER_PUSH_TOKENS`.
@@ -228,6 +230,11 @@ For the controller's identity, `sandbox_readers` is granted: `sandboxes` get/lis
 `pods` get/list/create/delete and `pods/finalizers` update (the gateway's Secrets block its
 pod's deletion); `services`, `secrets` and `networkpolicies` list/create/delete in the sandbox
 namespace; and `services` list/create/delete in the loop namespace.
+
+Whatever the gateway mode, `sandbox_readers` is also granted the Role `crucible-dispatch` in the
+loop namespace, which is what the controller dispatches and collects run pods with: `pods`
+create/get/list/watch/delete, `pods/log` get, `pods/finalizers` update, `configmaps`
+create/delete, and `secrets` create/delete/list/patch. It has no `get` on Secrets.
 
 Grounded-rank and scope turns get a gateway of their own the same way, with certificates valid for
 the turn's deadline; a failed launch tears it down, and the gateway sweep removes it once the
