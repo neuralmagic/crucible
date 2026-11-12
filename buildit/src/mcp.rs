@@ -4223,6 +4223,12 @@ mod tests {
                 ),
             ),
             (
+                "tolerate memory pressure eviction",
+                escape(
+                    &|p| p["spec"]["tolerations"] = serde_json::json!([{"key": "node.kubernetes.io/memory-pressure", "operator": "Exists", "effect": "NoExecute"}]),
+                ),
+            ),
+            (
                 "tolerate everything",
                 escape(&|p| p["spec"]["tolerations"] = serde_json::json!([{"operator": "Exists"}])),
             ),
@@ -4304,6 +4310,7 @@ mod tests {
             p["spec"]["tolerations"] = serde_json::json!([
                 {"key": "node.kubernetes.io/not-ready", "operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 300},
                 {"key": "node.kubernetes.io/unreachable", "operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 300},
+                {"key": "node.kubernetes.io/memory-pressure", "operator": "Exists", "effect": "NoSchedule"},
             ]);
             p["spec"]["priorityClassName"] = serde_json::json!("default-priority");
             p["spec"]["securityContext"] =

@@ -8,8 +8,8 @@
 # namespaces, no service account token mount or other Secret (an OpenShift internal registry's
 # pull Secret, which the account admission plugin adds, aside), no node, runtime, toleration,
 # sysctl or SELinux overrides. Admission defaults are admitted: the not-ready and unreachable
-# tolerations every pod gets, a global default PriorityClass, and an SELinux level an OpenShift SCC
-# assigns.
+# tolerations every pod gets, the memory-pressure toleration a pod with resource requests gets, a
+# global default PriorityClass, and an SELinux level an OpenShift SCC assigns.
 # `crucible deploy` renders it with a binding to the builder namespace; buildit's tests check its
 # own pods pass and the escapes do not.
 apiVersion: admissionregistration.k8s.io/v1
@@ -117,9 +117,11 @@ spec:
       message: a pod here uses the default runtime and no system priority class
     - expression: >-
         !has(object.spec.tolerations) || object.spec.tolerations.all(t, has(t.key) &&
-        t.key in ['node.kubernetes.io/not-ready', 'node.kubernetes.io/unreachable'] &&
-        has(t.effect) && t.effect == 'NoExecute')
-      message: a pod here tolerates only the not-ready and unreachable taints every pod gets
+        has(t.effect) &&
+        ((t.key in ['node.kubernetes.io/not-ready', 'node.kubernetes.io/unreachable'] &&
+        t.effect == 'NoExecute') ||
+        (t.key == 'node.kubernetes.io/memory-pressure' && t.effect == 'NoSchedule')))
+      message: a pod here tolerates only the not-ready, unreachable and memory-pressure taints admission adds
     - expression: >-
         (!has(object.spec.hostNetwork) || object.spec.hostNetwork == false) &&
         (!has(object.spec.hostPID) || object.spec.hostPID == false) &&
