@@ -1902,6 +1902,20 @@ fn settings_pane(app: &App, p: &Paint) -> El {
                     .key("text-size"),
                     p,
                 ),
+                rule("compact-graph-sep", false, p),
+                setting_row(
+                    "Compact graph",
+                    Switch::new(app.settings.compact_graph)
+                        .label("Compact graph")
+                        .hide_label()
+                        .on_toggle(|app: &mut App| {
+                            let on = !app.settings.compact_graph;
+                            app.settings.set_compact_graph(on);
+                        })
+                        .build(p.k)
+                        .key("compact-graph-switch"),
+                    p,
+                ),
             ],
             p,
         ))

@@ -174,6 +174,11 @@ on its task's own track, from the `at` stamps on its session events, with a stri
 from before those stamps is placed from each task's duration, starting when its dependencies
 settle.
 
+The Graph draws a fan-out that has run as a frame holding its instances; the chevron at the
+frame's corner folds them away. The wheel or a drag on empty space moves the graph, and a pinch
+or `Cmd` with the wheel zooms it. Its controls zoom, reset the view, fold every fan-out and switch
+between the compact and roomy drawing; `Compact graph` in Settings picks which one a run starts in.
+
 ## The Pack pane
 
 The Pack pane shows a pack's files, highlighted, with `crucible-lsp`'s diagnostics: underlined in
