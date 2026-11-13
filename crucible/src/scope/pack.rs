@@ -149,18 +149,10 @@ pub(super) fn repo_pin(repo: &str) -> (String, Option<String>) {
 /// `git -C <dir> <args>` capturing trimmed stdout, `None` on any failure (missing repo, no origin,
 /// no commit), every caller has a sane fallback for the absent case.
 fn git_capture(dir: &str, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8(out.stdout)
+    crucible_vcs::cli::git(Path::new(dir), args)
+        .read()
         .ok()
-        .map(|s| s.trim().to_string())
+        .map(|out| out.trim().to_string())
 }
 
 /// Rewrite a freshly-drafted pack manifest into a RUNNABLE one, in place, preserving the agent's

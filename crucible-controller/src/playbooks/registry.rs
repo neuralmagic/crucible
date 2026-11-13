@@ -26,7 +26,6 @@ use crucible_contract::pack_tree::{PackTree, ReadPack, TreeDigest};
 use serde::Deserialize;
 use sqlx::{PgPool, Row};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 
 /// Upper bound on a registry id. It rides a launch key and a pod label hint, so it stays short.
 const ID_MAX_LEN: usize = 64;
@@ -383,19 +382,11 @@ pub(crate) fn pack_root(checkout: &Path, path: &str) -> Result<PathBuf, Register
 
 /// `git` with the given args, mapping a nonzero exit (or a missing `git`) to [`RegisterError::Fetch`]
 /// with the command's own stderr.
-fn git(args: &[&str]) -> Result<String, RegisterError> {
-    let out = Command::new("git")
-        .args(args)
-        .output()
-        .map_err(|e| RegisterError::Fetch(format!("running `git` (is it on PATH?): {e}")))?;
-    if !out.status.success() {
-        return Err(RegisterError::Fetch(format!(
-            "git {} failed: {}",
-            args.first().unwrap_or(&""),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, RegisterError> {
+    crucible_vcs::cli::git(dir, args)
+        .read()
+        .map(|out| out.trim().to_string())
+        .map_err(|e| RegisterError::Fetch(format!("{:#}", anyhow::Error::new(e))))
 }
 
 /// A scratch clone of a pack repo at a ref: the commit it resolved to, and the tree it landed in.
@@ -469,8 +460,8 @@ impl PackGit {
             args.extend_from_slice(&["--branch", r]);
         }
         args.extend_from_slice(&["--", url.as_str(), checkout_arg.as_str()]);
-        git(&args).map_err(|e| self.scrub(e))?;
-        let rev = git(&["-C", &checkout_arg, "rev-parse", "HEAD"])?;
+        git(None, &args).map_err(|e| self.scrub(e))?;
+        let rev = git(Some(&checkout), &["rev-parse", "HEAD"])?;
         Ok(Checkout { rev, scratch })
     }
 }
@@ -1602,6 +1593,7 @@ mod tests {
         PLAYBOOK_REPO_MANIFEST, WORKFLOW_TOPIC, WORKFLOW_TOPIC_DEPTH, WORKFLOW_UNPARSABLE,
         git_pack_repo, run_git, schema_of,
     };
+    use std::process::Command;
 
     /// The schema is the pack's declaration; a launcher's values are checked against it field by
     /// field, so the form can pin each message to the input that produced it.

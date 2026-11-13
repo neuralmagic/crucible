@@ -3,6 +3,7 @@
 use crate::args::Paths;
 use crate::errors::FileError;
 use crate::manifest::{self, GitRef};
+use crucible_vcs::cli::{GitError, git};
 use std::path::{Path, PathBuf};
 
 /// What preparing a workspace can fail on: the setup command, the clone, the toolbox copy.
@@ -25,22 +26,33 @@ pub(crate) enum WorkspaceError {
         #[source]
         source: std::io::Error,
     },
-    #[error("running git")]
-    SpawnGit(#[source] std::io::Error),
     #[error("git clone {src} -> {} failed", .dest.display())]
-    GitCloneFailed { src: String, dest: PathBuf },
-    #[error("fetching {git_ref} from {src} failed: it names no branch, tag or commit there")]
-    GitFetchFailed { src: String, git_ref: GitRef },
-    #[error("checking out {git_ref} in {} failed", .dest.display())]
-    GitCheckoutFailed { git_ref: GitRef, dest: PathBuf },
-    #[error("git {command} failed in {}: {stderr}", .dir.display())]
-    GitFailed {
-        command: String,
-        dir: PathBuf,
-        stderr: String,
+    GitCloneFailed {
+        src: String,
+        dest: PathBuf,
+        #[source]
+        source: GitError,
     },
-    #[error("writing git's input to a temporary file")]
-    GitInput(#[source] std::io::Error),
+    #[error("fetching {git_ref} from {src} failed: it names no branch, tag or commit there")]
+    GitFetchFailed {
+        src: String,
+        git_ref: GitRef,
+        #[source]
+        source: GitError,
+    },
+    #[error("checking out {git_ref} in {} failed", .dest.display())]
+    GitCheckoutFailed {
+        git_ref: GitRef,
+        dest: PathBuf,
+        #[source]
+        source: GitError,
+    },
+    #[error("in {}", .dir.display())]
+    Git {
+        dir: PathBuf,
+        #[source]
+        source: GitError,
+    },
     #[error("reading the packs of {}", .dir.display())]
     ReadPacks {
         dir: PathBuf,
@@ -113,17 +125,17 @@ pub(crate) fn clone_repo(
     filter: Option<crate::manifest::CloneFilter>,
     dest: &Path,
 ) -> Result<(), WorkspaceError> {
-    let dest_arg = dest.to_string_lossy();
     let filter_arg = filter.map(|f| format!("--filter={}", f.as_str()));
-    let mut args = vec!["clone", "--quiet"];
-    args.extend(filter_arg.as_deref());
-    args.extend([src, &dest_arg]);
-    if !git(None, &args)? {
-        return Err(WorkspaceError::GitCloneFailed {
+    let mut args: Vec<&std::ffi::OsStr> = vec!["clone".as_ref(), "--quiet".as_ref()];
+    args.extend(filter_arg.as_deref().map(std::ffi::OsStr::new));
+    args.extend([src.as_ref(), dest.as_os_str()]);
+    git(None, args)
+        .run()
+        .map_err(|source| WorkspaceError::GitCloneFailed {
             src: src.to_owned(),
             dest: dest.to_path_buf(),
-        });
-    }
+            source,
+        })?;
     let Some(r) = git_ref else {
         return Ok(());
     };
@@ -139,84 +151,50 @@ pub(crate) fn clone_repo(
 /// Fetch `r` from origin and check it out detached. A commit the clone already holds is checked
 /// out without a fetch, since a server need not serve a commit by id.
 fn checkout(src: &str, dest: &Path, r: &GitRef) -> Result<(), WorkspaceError> {
-    let held = r.is_commit() && git(Some(dest), &["cat-file", "-e", &format!("{r}^{{commit}}")])?;
+    let held = r.is_commit()
+        && git(dest, ["cat-file", "-e", &format!("{r}^{{commit}}")])
+            .succeeds()
+            .map_err(in_dir(dest))?;
     let target = if held {
         r.as_str()
     } else {
-        if !git(Some(dest), &["fetch", "--quiet", "origin", r.as_str()])? {
-            return Err(WorkspaceError::GitFetchFailed {
+        git(dest, ["fetch", "--quiet", "origin", r.as_str()])
+            .run()
+            .map_err(|source| WorkspaceError::GitFetchFailed {
                 src: src.to_owned(),
                 git_ref: r.clone(),
-            });
-        }
+                source,
+            })?;
         "FETCH_HEAD"
     };
-    if !git(Some(dest), &["checkout", "--quiet", "--detach", target])? {
-        return Err(WorkspaceError::GitCheckoutFailed {
+    git(dest, ["checkout", "--quiet", "--detach", target])
+        .run()
+        .map_err(|source| WorkspaceError::GitCheckoutFailed {
             git_ref: r.clone(),
             dest: dest.to_path_buf(),
-        });
-    }
-    Ok(())
+            source,
+        })
 }
 
-/// Run git, in `dir` when given; `Ok(false)` is a git that ran and failed.
-fn git(dir: Option<&Path>, args: &[&str]) -> Result<bool, WorkspaceError> {
-    let mut command = std::process::Command::new("git");
-    if let Some(dir) = dir {
-        command.arg("-C").arg(dir);
+/// A `map_err` argument naming the repository a git failed in.
+fn in_dir(dir: &Path) -> impl Fn(GitError) -> WorkspaceError {
+    let dir = dir.to_path_buf();
+    move |source| WorkspaceError::Git {
+        dir: dir.clone(),
+        source,
     }
-    Ok(command
-        .args(args)
-        .status()
-        .map_err(WorkspaceError::SpawnGit)?
-        .success())
-}
-
-/// Run git in `dir` with `stdin`, returning its stdout. `Err` is a git that failed.
-fn git_stdout(
-    dir: &Path,
-    args: &[&str],
-    stdin: std::process::Stdio,
-) -> Result<String, WorkspaceError> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .stdin(stdin)
-        .output()
-        .map_err(WorkspaceError::SpawnGit)?;
-    if !out.status.success() {
-        return Err(WorkspaceError::GitFailed {
-            command: args.join(" "),
-            dir: dir.to_path_buf(),
-            stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
-        });
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-/// `lines` in an unnamed temporary file, opened at its start, for a git that reads its stdin.
-fn lines_as_stdin<'a>(
-    lines: impl IntoIterator<Item = &'a str>,
-) -> Result<std::process::Stdio, WorkspaceError> {
-    use std::io::{Seek, Write};
-    let mut file = tempfile::tempfile().map_err(WorkspaceError::GitInput)?;
-    for line in lines {
-        writeln!(file, "{line}").map_err(WorkspaceError::GitInput)?;
-    }
-    file.rewind().map_err(WorkspaceError::GitInput)?;
-    Ok(file.into())
 }
 
 /// The remote a partial clone fetches missing objects from; `None` for a full clone.
 fn promisor_remote(workspace: &Path) -> Result<Option<String>, WorkspaceError> {
-    use std::process::Stdio;
-    for remote in git_stdout(workspace, &["remote"], Stdio::null())?.lines() {
+    let remotes = git(workspace, ["remote"])
+        .read()
+        .map_err(in_dir(workspace))?;
+    for remote in remotes.lines() {
         let key = format!("remote.{remote}.promisor");
-        let promisor = git_stdout(
+        let promisor = git(
             workspace,
-            &[
+            [
                 "config",
                 "--get",
                 "--type",
@@ -225,8 +203,9 @@ fn promisor_remote(workspace: &Path) -> Result<Option<String>, WorkspaceError> {
                 "false",
                 &key,
             ],
-            Stdio::null(),
-        )?;
+        )
+        .read()
+        .map_err(in_dir(workspace))?;
         if promisor.trim() == "true" {
             return Ok(Some(remote.to_owned()));
         }
@@ -237,20 +216,20 @@ fn promisor_remote(workspace: &Path) -> Result<Option<String>, WorkspaceError> {
 /// The blobs a partial clone has fetched from origin, by id, sorted: those its checkout needed
 /// and those anything since read. None for a full clone, which holds every blob from the start.
 pub(crate) fn fetched_blobs(workspace: &Path) -> Result<Vec<String>, WorkspaceError> {
-    use std::process::Stdio;
     if promisor_remote(workspace)?.is_none() {
         return Ok(Vec::new());
     }
-    let packs = git_stdout(
+    let packs = git(
         workspace,
-        &[
+        [
             "rev-parse",
             "--path-format=absolute",
             "--git-path",
             "objects/pack",
         ],
-        Stdio::null(),
-    )?;
+    )
+    .read()
+    .map_err(in_dir(workspace))?;
     let packs = PathBuf::from(packs.trim_end_matches('\n'));
     let read = |source| WorkspaceError::ReadPacks {
         dir: packs.clone(),
@@ -263,7 +242,10 @@ pub(crate) fn fetched_blobs(workspace: &Path) -> Result<Vec<String>, WorkspaceEr
             continue;
         }
         let index = std::fs::File::open(marker.with_extension("idx")).map_err(read)?;
-        let listed = git_stdout(workspace, &["show-index"], index.into())?;
+        let listed = git(workspace, ["show-index"])
+            .stdin_file(index)
+            .read()
+            .map_err(in_dir(workspace))?;
         fetched.extend(
             listed
                 .lines()
@@ -271,11 +253,13 @@ pub(crate) fn fetched_blobs(workspace: &Path) -> Result<Vec<String>, WorkspaceEr
                 .map(str::to_owned),
         );
     }
-    let typed = git_stdout(
+    let typed = git(
         workspace,
-        &["cat-file", "--batch-check=%(objecttype) %(objectname)"],
-        lines_as_stdin(fetched.iter().map(String::as_str))?,
-    )?;
+        ["cat-file", "--batch-check=%(objecttype) %(objectname)"],
+    )
+    .stdin_bytes(fetched.join("\n"))
+    .read()
+    .map_err(in_dir(workspace))?;
     let mut blobs: Vec<String> = typed
         .lines()
         .filter_map(|line| line.strip_prefix("blob "))
@@ -289,23 +273,23 @@ pub(crate) fn fetched_blobs(workspace: &Path) -> Result<Vec<String>, WorkspaceEr
 /// Fetch those of `blobs` a partial clone does not hold from the remote it was cloned from. A
 /// full clone holds every blob its remote serves, so there is nothing to fetch.
 pub(crate) fn fetch_blobs(workspace: &Path, blobs: &[String]) -> Result<(), WorkspaceError> {
-    use std::process::Stdio;
     if blobs.is_empty() {
         return Ok(());
     }
     let Some(remote) = promisor_remote(workspace)? else {
         return Ok(());
     };
-    let held = git_stdout(
+    let held = git(
         workspace,
-        &[
+        [
             "cat-file",
             "--batch-all-objects",
             "--unordered",
             "--batch-check=%(objectname)",
         ],
-        Stdio::null(),
-    )?;
+    )
+    .read()
+    .map_err(in_dir(workspace))?;
     let held: std::collections::HashSet<&str> = held.lines().collect();
     let missing: Vec<&str> = blobs
         .iter()
@@ -315,9 +299,9 @@ pub(crate) fn fetch_blobs(workspace: &Path, blobs: &[String]) -> Result<(), Work
     if missing.is_empty() {
         return Ok(());
     }
-    git_stdout(
+    git(
         workspace,
-        &[
+        [
             "-c",
             "fetch.negotiationAlgorithm=noop",
             "fetch",
@@ -328,8 +312,10 @@ pub(crate) fn fetch_blobs(workspace: &Path, blobs: &[String]) -> Result<(), Work
             "--stdin",
             &remote,
         ],
-        lines_as_stdin(missing)?,
-    )?;
+    )
+    .stdin_bytes(missing.join("\n"))
+    .read()
+    .map_err(in_dir(workspace))?;
     Ok(())
 }
 
@@ -577,7 +563,7 @@ mod tests {
         assert!(
             matches!(
                 fetch_blobs(&second, &unknown),
-                Err(WorkspaceError::GitFailed { .. })
+                Err(WorkspaceError::Git { .. })
             ),
             "a blob origin does not serve fails the fetch"
         );

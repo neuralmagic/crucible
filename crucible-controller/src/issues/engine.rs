@@ -16,6 +16,7 @@ use crate::runs::engine::{ITEM_ENV, open_draft_pr, repo_clone_url};
 use anyhow::{Context, Result, bail};
 use crucible_contract::verdict::Ruled;
 use crucible_contract::{ScopeReport, Tier};
+use crucible_vcs::cli::git;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -69,18 +70,6 @@ pub(crate) fn checkout_dir(scratch_dir: &Path, repo: &str) -> PathBuf {
     scratch_dir.join("checkouts").join(repo.replace('/', "-"))
 }
 
-/// `git -C <dir?> <args>` returning `Ok` only on success.
-fn run_git(args: &[&str]) -> Result<()> {
-    let status = Command::new("git")
-        .args(args)
-        .status()
-        .context("running `git` (is it on PATH?)")?;
-    if !status.success() {
-        bail!("git {:?} failed ({status})", args.first().unwrap_or(&""));
-    }
-    Ok(())
-}
-
 /// Ensure the per-repo checkout at `dir` exists and is current: clone `repo_url` if absent, else
 /// fetch + hard-reset it to the remote's tracked branch. A refresh failure on an existing checkout
 /// is best-effort (a transient fetch hiccup falls back to the checkout as-is rather than failing the
@@ -102,17 +91,17 @@ pub(crate) fn ensure_checkout(repo_url: &str, dir: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating checkouts dir {}", parent.display()))?;
     }
-    run_git(&["clone", repo_url, &dir.to_string_lossy()])
+    git(None, ["clone".as_ref(), repo_url.as_ref(), dir.as_os_str()])
+        .run()
         .with_context(|| format!("cloning {repo_url} into {}", dir.display()))
 }
 
 /// Fetch + hard-reset an existing checkout to its tracked upstream (`@{u}`), then drop any stray
 /// files. Keeps the shared checkout deterministic between grounded turns.
 fn refresh_checkout(dir: &Path) -> Result<()> {
-    let d = dir.to_string_lossy().to_string();
-    run_git(&["-C", &d, "fetch", "--prune", "origin"])?;
-    run_git(&["-C", &d, "reset", "--hard", "@{u}"])?;
-    run_git(&["-C", &d, "clean", "-fdx"])?;
+    git(dir, ["fetch", "--prune", "origin"]).run()?;
+    git(dir, ["reset", "--hard", "@{u}"]).run()?;
+    git(dir, ["clean", "-fdx"]).run()?;
     Ok(())
 }
 
