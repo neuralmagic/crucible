@@ -60,6 +60,7 @@ const PlaybookImportReviewPage = page(() => import('./pages/PlaybookImportReview
 const PlaybookDraftsPage = page(() => import('./pages/PlaybookDraftsPage'), 'PlaybookDraftsPage');
 const BlueprintsPage = page(() => import('./pages/BlueprintsPage'), 'BlueprintsPage');
 const DraftStudioPage = page(() => import('./pages/DraftStudioPage'), 'DraftStudioPage');
+const DraftHistoryPage = page(() => import('./pages/DraftHistoryPage'), 'DraftHistoryPage');
 const PlaybookLaunchPage = page(() => import('./pages/PlaybookLaunchPage'), 'PlaybookLaunchPage');
 const PlaybookRunsPage = page(() => import('./pages/PlaybookRunsPage'), 'PlaybookRunsPage');
 const SchedulesPage = page(() => import('./pages/SchedulesPage'), 'SchedulesPage');
@@ -557,6 +558,7 @@ export function App() {
             <Route path="/playbooks/import/:id" element={<PlaybookImportReviewPage />} />
             <Route path="/playbooks/drafts" element={<PlaybookDraftsPage />} />
             <Route path="/playbooks/drafts/:id" element={<DraftStudioPage />} />
+            <Route path="/playbooks/drafts/:id/history" element={<DraftHistoryPage />} />
             <Route path="/blueprints" element={<BlueprintsPage />} />
             <Route path="/playbooks/:id/launch" element={<PlaybookLaunchPage />} />
             <Route path="/playbook-runs" element={<PlaybookRunsPage />} />
