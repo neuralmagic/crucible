@@ -395,7 +395,7 @@ pub struct DraftVersionRow {
 }
 
 impl DraftVersionRow {
-    fn from_row(row: &sqlx::postgres::PgRow) -> Result<Self> {
+    pub(crate) fn from_row(row: &sqlx::postgres::PgRow) -> Result<Self> {
         let diagnostics: serde_json::Value = row.try_get("diagnostics")?;
         Ok(DraftVersionRow {
             version: row.try_get("version")?,

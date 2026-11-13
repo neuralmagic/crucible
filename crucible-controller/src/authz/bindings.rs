@@ -476,7 +476,21 @@ pub static BINDINGS: &[Binding] = &[
     ),
     bind(
         "GET",
+        "/api/playbook-drafts/{id}/diff",
+        R::PlaybookDraft,
+        V::Read,
+        Route,
+    ),
+    bind(
+        "GET",
         "/api/playbook-drafts/{id}/files",
+        R::PlaybookDraft,
+        V::Read,
+        Route,
+    ),
+    bind(
+        "GET",
+        "/api/playbook-drafts/{id}/history",
         R::PlaybookDraft,
         V::Read,
         Route,
