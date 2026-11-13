@@ -33,6 +33,24 @@ pub(crate) enum WorkspaceError {
     GitFetchFailed { src: String, git_ref: GitRef },
     #[error("checking out {git_ref} in {} failed", .dest.display())]
     GitCheckoutFailed { git_ref: GitRef, dest: PathBuf },
+    #[error("git {command} failed in {}: {stderr}", .dir.display())]
+    GitFailed {
+        command: String,
+        dir: PathBuf,
+        stderr: String,
+    },
+    #[error("reading the packs of {}", .dir.display())]
+    ReadPacks {
+        dir: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("opening the repository in {}", .dir.display())]
+    OpenRepo {
+        dir: PathBuf,
+        #[source]
+        source: git2::Error,
+    },
     #[error("reading the refs of {}", .dest.display())]
     ReadRefs {
         dest: PathBuf,
@@ -157,6 +175,129 @@ fn git(dir: Option<&Path>, args: &[&str]) -> Result<bool, WorkspaceError> {
         .status()
         .map_err(WorkspaceError::SpawnGit)?
         .success())
+}
+
+/// Run git in `dir` with `input` on its stdin, returning its stdout.
+fn git_piped(dir: &Path, args: &[&str], input: Vec<u8>) -> Result<Vec<u8>, WorkspaceError> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(WorkspaceError::SpawnGit)?;
+    let stdin = child.stdin.take();
+    let writer = std::thread::spawn(move || {
+        if let Some(mut stdin) = stdin {
+            let _ = stdin.write_all(&input);
+        }
+    });
+    let out = child.wait_with_output().map_err(WorkspaceError::SpawnGit)?;
+    let _ = writer.join();
+    if !out.status.success() {
+        return Err(WorkspaceError::GitFailed {
+            command: args.join(" "),
+            dir: dir.to_path_buf(),
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        });
+    }
+    Ok(out.stdout)
+}
+
+/// The blobs a partial clone has fetched from origin, by id, sorted: those its checkout needed
+/// and those anything since read. None for a full clone, which holds every blob from the start.
+pub(crate) fn fetched_blobs(workspace: &Path) -> Result<Vec<String>, WorkspaceError> {
+    let repo = git2::Repository::open(workspace).map_err(|source| WorkspaceError::OpenRepo {
+        dir: workspace.to_path_buf(),
+        source,
+    })?;
+    let partial = repo
+        .config()
+        .and_then(|config| config.get_bool("remote.origin.promisor"))
+        .unwrap_or(false);
+    if !partial {
+        return Ok(Vec::new());
+    }
+    let packs = repo.path().join("objects").join("pack");
+    let read = |source| WorkspaceError::ReadPacks {
+        dir: packs.clone(),
+        source,
+    };
+    let mut fetched = Vec::new();
+    for entry in std::fs::read_dir(&packs).map_err(read)? {
+        let marker = entry.map_err(read)?.path();
+        if marker.extension().is_none_or(|ext| ext != "promisor") {
+            continue;
+        }
+        let index = std::fs::read(marker.with_extension("idx")).map_err(read)?;
+        let listed = git_piped(workspace, &["show-index"], index)?;
+        for line in String::from_utf8_lossy(&listed).lines() {
+            if let Some(id) = line.split_whitespace().nth(1) {
+                fetched.extend_from_slice(id.as_bytes());
+                fetched.push(b'\n');
+            }
+        }
+    }
+    let typed = git_piped(
+        workspace,
+        &["cat-file", "--batch-check=%(objecttype) %(objectname)"],
+        fetched,
+    )?;
+    let mut blobs: Vec<String> = String::from_utf8_lossy(&typed)
+        .lines()
+        .filter_map(|line| line.strip_prefix("blob "))
+        .map(str::to_owned)
+        .collect();
+    blobs.sort();
+    blobs.dedup();
+    Ok(blobs)
+}
+
+/// Fetch from origin those of `blobs` the workspace does not hold.
+pub(crate) fn fetch_blobs(workspace: &Path, blobs: &[String]) -> Result<(), WorkspaceError> {
+    if blobs.is_empty() {
+        return Ok(());
+    }
+    let held = git_piped(
+        workspace,
+        &[
+            "cat-file",
+            "--batch-all-objects",
+            "--unordered",
+            "--batch-check=%(objectname)",
+        ],
+        Vec::new(),
+    )?;
+    let held = String::from_utf8_lossy(&held);
+    let held: std::collections::HashSet<&str> = held.lines().collect();
+    let missing: Vec<&str> = blobs
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !held.contains(id))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    git_piped(
+        workspace,
+        &[
+            "-c",
+            "fetch.negotiationAlgorithm=noop",
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--recurse-submodules=no",
+            "--stdin",
+            "origin",
+        ],
+        missing.join("\n").into_bytes(),
+    )?;
+    Ok(())
 }
 
 /// The branches and tags of a fresh clone whose history holds `commit`, by short name.
@@ -334,6 +475,84 @@ mod tests {
             .success(),
             "the partial clone holds the history merge-base walks"
         );
+    }
+
+    #[test]
+    fn a_partial_clone_lists_the_blobs_it_fetched_and_another_fetches_them() {
+        let origin = crate::testing::git_origin("clone-fetched");
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .expect("git runs");
+            (
+                out.status.success(),
+                String::from_utf8_lossy(&out.stdout).trim().to_owned(),
+            )
+        };
+        for key in ["uploadpack.allowFilter", "uploadpack.allowAnySHA1InWant"] {
+            assert!(git(&origin.path, &["config", key, "true"]).0);
+        }
+        let src = format!("file://{}", origin.path.display());
+        let partial = |name: &str| {
+            let dest = origin.path.with_extension(name);
+            clone_repo(
+                &src,
+                None,
+                Some(crate::manifest::CloneFilter::BlobNone),
+                &dest,
+            )
+            .expect("clones");
+            dest
+        };
+        let on_main = git(&origin.path, &["rev-parse", "main:a.txt"]).1;
+        let on_feature = git(&origin.path, &["rev-parse", "feature/x:a.txt"]).1;
+        let feature_blob = format!("{}:a.txt", origin.feature);
+        let offline = |dir: &std::path::Path| {
+            git(
+                dir,
+                &[
+                    "-c",
+                    "url./nonexistent/.insteadOf=file://",
+                    "cat-file",
+                    "-p",
+                    &feature_blob,
+                ],
+            )
+        };
+
+        let first = partial("first");
+        assert_eq!(fetched_blobs(&first).expect("lists"), [on_main.clone()]);
+        assert_eq!(git(&first, &["cat-file", "-p", &feature_blob]).1, "feature");
+        let mut both = vec![on_main.clone(), on_feature];
+        both.sort();
+        assert_eq!(fetched_blobs(&first).expect("lists"), both);
+
+        let second = partial("second");
+        assert!(!offline(&second).0, "a fresh clone lacks the blob");
+        fetch_blobs(&second, &both).expect("fetches the one it lacks");
+        assert_eq!(offline(&second), (true, "feature".to_owned()));
+        assert_eq!(fetched_blobs(&second).expect("lists"), both);
+        fetch_blobs(&second, &both).expect("nothing left to fetch");
+
+        let unknown = vec!["0".repeat(40)];
+        assert!(
+            matches!(
+                fetch_blobs(&second, &unknown),
+                Err(WorkspaceError::GitFailed { .. })
+            ),
+            "a blob origin does not serve fails the fetch"
+        );
+
+        let full = origin.path.with_extension("full");
+        clone_repo(&src, None, None, &full).expect("clones");
+        assert_eq!(fetched_blobs(&full).expect("lists"), Vec::<String>::new());
+        fetch_blobs(&full, &both).expect("a full clone holds them already");
+        for dir in [first, second, full] {
+            let _ = fs::remove_dir_all(dir);
+        }
     }
 
     #[test]
