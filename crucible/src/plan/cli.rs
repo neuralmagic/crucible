@@ -974,6 +974,7 @@ pub fn run(
         .as_ref()
         .map(|p| crate::plan::files::CapturedFiles::new(&p.state));
     let clock = crate::plan::admission::TaskClock::default();
+    let mut took = BTreeMap::new();
     let out = execute(
         &plan,
         &substrate,
@@ -993,6 +994,11 @@ pub fn run(
         runner.as_mut(),
         |task, result| {
             observe(task, result);
+            let started = clock.since_started(&task.name);
+            if let Some(secs) = started {
+                took.insert(task.name.clone(), secs);
+            }
+            let secs = started.unwrap_or(0.0);
             if let Some(f) = &events {
                 append(
                     f,
@@ -1002,7 +1008,7 @@ pub fn run(
                         task,
                         result,
                         agent_args.as_ref(),
-                        clock.secs(&task.name),
+                        secs,
                     ),
                 );
             }
@@ -1013,11 +1019,14 @@ pub fn run(
     for t in plan.tasks_topo() {
         if let Some(r) = out.results.get(&t.name) {
             println!(
-                "  {:<20} {:<10} attempts={} cost=${:.4}{}{}",
+                "  {:<20} {:<10} attempts={} cost=${:.4}{}{}{}",
                 t.name.0,
                 r.status.as_str(),
                 r.attempts,
                 r.cost_usd,
+                took.get(&t.name)
+                    .map(|secs| format!(" elapsed={}", elapsed(*secs)))
+                    .unwrap_or_default(),
                 r.output
                     .as_ref()
                     .map(|v| format!("  out={v}"))
@@ -1084,10 +1093,30 @@ pub fn run(
     Ok(())
 }
 
+/// `secs` as the run summary prints a task's wall time: `4.2s`, `12m03s`, `1h05m09s`.
+fn elapsed(secs: f64) -> String {
+    if secs < 60.0 {
+        return format!("{secs:.1}s");
+    }
+    let whole = secs as u64;
+    let (h, m, s) = (whole / 3600, whole / 60 % 60, whole % 60);
+    match h {
+        0 => format!("{m}m{s:02}s"),
+        _ => format!("{h}h{m:02}m{s:02}s"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::manifest::variant::VariantName;
+
+    #[test]
+    fn a_tasks_wall_time_reads_in_the_largest_unit_it_reaches() {
+        assert_eq!(elapsed(4.24), "4.2s");
+        assert_eq!(elapsed(723.9), "12m03s");
+        assert_eq!(elapsed(3909.0), "1h05m09s");
+    }
 
     const SRC: &str = r#"
         version = 1

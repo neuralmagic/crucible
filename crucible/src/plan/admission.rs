@@ -34,6 +34,11 @@ impl TaskClock {
 
     /// Seconds since `task`, or the earliest of its instances, first started; zero when none did.
     pub fn secs(&self, task: &TaskName) -> f64 {
+        self.since_started(task).unwrap_or(0.0)
+    }
+
+    /// Seconds since `task`, or the earliest of its instances, first started; `None` when none did.
+    pub fn since_started(&self, task: &TaskName) -> Option<f64> {
         let instance = format!("{}[", task.0);
         self.0
             .lock()
@@ -42,7 +47,7 @@ impl TaskClock {
             .filter(|(name, _)| **name == task.0 || name.starts_with(&instance))
             .map(|(_, at)| *at)
             .min()
-            .map_or(0.0, |at| at.elapsed().as_secs_f64())
+            .map(|at| at.elapsed().as_secs_f64())
     }
 }
 
@@ -600,8 +605,8 @@ mod tests {
             "the node runs from its earliest instance: {edit} vs {edit_b}"
         );
         assert_eq!(
-            clock.secs(&crate::plan::ir::TaskName("editor".into())),
-            0.0,
+            clock.since_started(&crate::plan::ir::TaskName("editor".into())),
+            None,
             "a task that only shares a prefix never started"
         );
     }
