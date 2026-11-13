@@ -17,6 +17,7 @@ strum.workspace = true
 # source of truth, no cross-crate "keep in sync" drift.
 crucible-contract = { path = "../crucible-contract", features = ["openapi"] }
 crucible = { path = "../crucible", default-features = false }
+crucible-vcs = { path = "../crucible-vcs" }
 # The cluster-boundary traits (PodDispatcher, ConfigMapApi) are async + used as `dyn`, which
 # native async-fn-in-trait can't do; async-trait boxes the futures.
 async-trait = "0.1"

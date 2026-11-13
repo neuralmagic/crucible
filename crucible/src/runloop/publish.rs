@@ -23,6 +23,7 @@ use crate::report::reporter::Reporter;
 use crate::report::session::Row;
 use anyhow::{Context, Result};
 use crucible_contract::outputs::{BoundViolation, OutputKind};
+use crucible_vcs::cli::{GitError, git};
 use serde::Serialize;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1060,23 +1061,14 @@ fn pr_token() -> Result<String> {
 /// carry the PAT, so it is deliberately excluded from the error.
 fn push_ref(workspace: &Path, url: &str, local_ref: &str, branch: &str) -> Result<()> {
     let refspec = format!("{local_ref}:refs/heads/{branch}");
-    let status = std::process::Command::new("git")
-        .arg("-C")
-        .arg(workspace)
-        .arg("push")
-        .arg("--force")
-        .arg(url)
-        .arg(&refspec)
-        .status()
-        .context("running `git push` (is git on PATH?)")?;
-    if !status.success() {
-        return Err(PublishError::GitPushFailed {
-            refspec: refspec.to_owned(),
-            status,
-        }
-        .into());
-    }
-    Ok(())
+    git(workspace, ["push", "--force", url, &refspec])
+        .run()
+        .map_err(|e| match e {
+            GitError::Failed { status, .. } => {
+                PublishError::GitPushFailed { refspec, status }.into()
+            }
+            spawn @ GitError::Spawn(_) => anyhow::Error::new(spawn),
+        })
 }
 
 /// Open a draft PR via the `gh` CLI (already in the loop image; the approval watcher shells `gh api`
