@@ -40,8 +40,12 @@ pub const LABEL_KIND: &str = "buildit.dev/kind";
 pub const LABEL_RUN: &str = "buildit.dev/run";
 pub const ANNOTATION_CANCELLED: &str = "buildit.dev/cancelled";
 const LABEL_QUEUE: &str = "kueue.x-k8s.io/queue-name";
+const OPENSHIFT_BUILDER: &str = "io.openshift.builder";
+const CRIO_USERNS_MODE: &str = "io.kubernetes.cri-o.userns-mode";
+const CRIO_USERNS_AUTO: &str = "auto:size=65536;map-to-root=true";
 
-const BUILDAH_IMAGE: &str = "quay.io/buildah/stable:latest";
+const BUILDAH_IMAGE: &str = "quay.io/buildah/stable@sha256:7bb110e1d8b761d08e87d004ea4086e295a52319f3ea70ecef65da6dff7ceef0";
+const KANIKO_IMAGE: &str = "gcr.io/kaniko-project/executor@sha256:9e22d0ba2c78cffbd47e2269aa6d3dc43fc3e3ecc6b61262399279dec5e67d45";
 /// Where a BuildKit build's pod copies `buildkitd`, `buildctl`, `buildkit-runc` and `rootlesskit`
 /// from.
 const BUILDKIT_IMAGE: &str = "docker.io/moby/buildkit:v0.35.0-rootless";
@@ -103,6 +107,10 @@ impl Registry {
             Self::Cluster { host } | Self::Insecure { host } => host,
         }
     }
+
+    pub fn is_cluster(&self) -> bool {
+        matches!(self, Self::Cluster { .. })
+    }
 }
 
 /// What builds a Dockerfile in a build pod.
@@ -125,6 +133,8 @@ pub enum Builder {
     Buildah,
     /// Rootless BuildKit, the builder `docker build` uses: a `buildkitd` for the one build.
     Buildkit,
+    /// Kaniko's userspace executor, for restricted clusters that forbid builder mount syscalls.
+    Kaniko,
 }
 
 impl Builder {
@@ -132,11 +142,12 @@ impl Builder {
         match self {
             Self::Buildah => "buildah",
             Self::Buildkit => "buildkit",
+            Self::Kaniko => "kaniko",
         }
     }
 
     pub fn parse(raw: &str) -> Option<Self> {
-        [Self::Buildah, Self::Buildkit]
+        [Self::Buildah, Self::Buildkit, Self::Kaniko]
             .into_iter()
             .find(|b| b.as_str() == raw)
     }
@@ -178,6 +189,19 @@ pub enum PodUsers {
     Namespaced,
     /// The node's, for clusters whose nodes cannot give pods user namespaces.
     Host,
+    /// A CRI-O user namespace selected by OpenShift's builder workload.
+    #[value(name = "openshift-builder")]
+    OpenShiftBuilder,
+}
+
+fn pod_annotations(users: PodUsers) -> Option<BTreeMap<String, String>> {
+    match users {
+        PodUsers::OpenShiftBuilder => Some(BTreeMap::from([
+            (OPENSHIFT_BUILDER.to_string(), "true".to_string()),
+            (CRIO_USERNS_MODE.to_string(), CRIO_USERNS_AUTO.to_string()),
+        ])),
+        PodUsers::Namespaced | PodUsers::Host => None,
+    }
 }
 
 /// Where and how every Job of one server runs.
@@ -239,6 +263,8 @@ pub enum Engine<'a> {
     Buildah { local_tag: &'a str },
     /// `buildctl build`, which pushes, against a `buildkitd` whose `RUN` steps get `mounts`.
     Buildkit { mounts: &'a [RunMount] },
+    /// Kaniko builds and pushes entirely in userspace; its pod mounts provide Dockerfile caches.
+    Kaniko { mounts: &'a [RunMount] },
 }
 
 /// The reference a build of `sandbox` pushes its image to.
@@ -338,6 +364,15 @@ if [ -s /buildit-inputs/snapshots ] && [ -s /buildit-inputs/snapshots.auth ]; th
   sh -c "$SAVE" sh /buildit-inputs/snapshots "$CACHE" /buildit-inputs/snapshots.auth
 fi"#;
 
+/// Kaniko's registry credentials. It builds and pushes in userspace.
+const KANIKO_SETUP: &str = r#"mkdir -p /tmp /kaniko/.docker /buildit-out/facts $CACHE_DIRS
+if [ -e /buildit-cluster/token ]; then
+  auth=$(printf 'buildit:%s' "$(cat /buildit-cluster/token)" | base64 | tr -d '\n')
+  printf '{"auths":{"%s":{"auth":"%s"}}}\n' "$REGISTRY" "$auth" > /kaniko/.docker/config.json
+else
+  printf '{"auths":{}}\n' > /kaniko/.docker/config.json
+fi"#;
+
 /// The archive sidecar: waits for SIGTERM, then uploads what the pod left in /buildit-out, each
 /// upload bounded so all of them fit the grace period. An upload that fails is noted in the
 /// error file, which goes up after the others; the exit record goes up last. Arguments: the exit
@@ -368,7 +403,7 @@ runner=$1; tag=$2; dest=$3; shift 3
 log=/tmp/build.log"#;
 
 /// buildah's storage, and pull access to the registry built images go to.
-const BUILDAH_SETUP: &str = r#"mkdir -p /tmp/containers-run /buildit-out/facts "$TMPDIR" $CACHE_DIRS
+const BUILDAH_SETUP: &str = r#"mkdir -p /tmp/containers-run /buildit-out/facts "$HOME" "$TMPDIR" $CACHE_DIRS
 printf '[storage]\ndriver = "%s"\ngraphroot = "%s/storage"\nrunroot = "/tmp/containers-run"\n' \
   "$STORAGE_DRIVER" "$STORAGE" > /tmp/storage.conf
 printf 'unqualified-search-registries = ["docker.io"]\n' > /tmp/registries.conf
@@ -464,7 +499,17 @@ const BUILD_RUN: &str = r#"for f in ccache.conf cache.json; do [ -e "/buildit-in
 : > "$log"
 sh -c "$runner" sh "$log" "$@" &
 r=$!
-tail -n +1 -f -s 0.2 --pid=$r "$log" &
+mirror() {
+  seen=0
+  while kill -0 "$r" 2> /dev/null; do
+    lines=$(wc -l < "$log")
+    if [ "$lines" -gt "$seen" ]; then sed -n "$((seen + 1)),${lines}p" "$log"; seen=$lines; fi
+    sleep 1
+  done
+  lines=$(wc -l < "$log")
+  [ "$lines" -le "$seen" ] || sed -n "$((seen + 1)),${lines}p" "$log"
+}
+mirror &
 wait $r
 wait
 rec=$(head -n 1 "$log.exit" 2> /dev/null)
@@ -553,6 +598,7 @@ pub fn build_job(site: &Site, id: &Ident<'_>, b: &BuildJob<'_>) -> Job {
     let (setup, publish, local_tag) = match b.engine {
         Engine::Buildah { local_tag } => (BUILDAH_SETUP, BUILDAH_PUBLISH, local_tag),
         Engine::Buildkit { .. } => (BUILDKIT_SETUP, BUILDKIT_PUBLISH, ""),
+        Engine::Kaniko { .. } => (KANIKO_SETUP, "", ""),
     };
     let script = [BUILD_OPEN, setup, BUILD_RUN, publish, BUILD_RECORD].join("\n");
     let mut command = sh(&script);
@@ -562,12 +608,13 @@ pub fn build_job(site: &Site, id: &Ident<'_>, b: &BuildJob<'_>) -> Job {
         build_dest(site, id.sandbox, id.build),
     ]);
     command.extend(b.runner_args.iter().cloned());
+    let kaniko = matches!(b.engine, Engine::Kaniko { .. });
     let mut vars = vec![
-        env("HOME", "/home/build"),
+        env("HOME", if kaniko { "/tmp" } else { "/home/build" }),
         env("STORAGE", STORAGE),
         env("REGISTRY", site.registry.host()),
         env("CACHE_DIRS", &b.cache_dirs.join(" ")),
-        env("TMPDIR", BUILD_TMP),
+        env("TMPDIR", if kaniko { "/tmp" } else { BUILD_TMP }),
     ];
     let mut mounts = vec![
         mount("workspace", WORKSPACE, false),
@@ -631,27 +678,64 @@ pub fn build_job(site: &Site, id: &Ident<'_>, b: &BuildJob<'_>) -> Job {
             });
             volumes.push(limited_dir("tools", BUILDKIT_TOOLS_LIMIT));
         }
+        Engine::Kaniko { mounts: run_mounts } => {
+            mounts.push(mount("kaniko-tmp", "/tmp", false));
+            mounts.push(mount("kaniko-docker", "/kaniko/.docker", false));
+            volumes.push(empty_dir("kaniko-tmp"));
+            volumes.push(empty_dir("kaniko-docker"));
+            for (i, run_mount) in run_mounts.iter().enumerate() {
+                if run_mount.source == FACTS {
+                    mounts.push(mount("facts-run", &run_mount.source, false));
+                    mounts.push(mount("facts-run", &run_mount.target, run_mount.read_only));
+                    volumes.push(empty_dir("facts-run"));
+                } else if run_mount.target == "/etc/ccache.conf" {
+                    mounts.push(core::VolumeMount {
+                        sub_path: Some("ccache.conf".to_string()),
+                        ..mount("inputs", &run_mount.target, true)
+                    });
+                } else {
+                    let name = format!("run-cache-{i}");
+                    mounts.push(mount(&name, &run_mount.source, false));
+                    mounts.push(mount(&name, &run_mount.target, run_mount.read_only));
+                    volumes.push(empty_dir(&name));
+                }
+            }
+        }
     }
     vars.sort_by(|a, b| a.name.cmp(&b.name));
     mounts.extend(cluster_mount(site));
     let builder = core::Container {
         name: BUILDER.to_string(),
-        image: Some(BUILDAH_IMAGE.to_string()),
+        image: Some(match b.engine {
+            Engine::Kaniko { .. } => KANIKO_IMAGE.to_string(),
+            Engine::Buildah { .. } | Engine::Buildkit { .. } => BUILDAH_IMAGE.to_string(),
+        }),
         command: Some(command),
         env: Some(vars),
-        security_context: Some(as_user(1000)),
+        security_context: Some(as_user(if matches!(b.engine, Engine::Kaniko { .. }) {
+            0
+        } else {
+            1000
+        })),
         resources: site.resources.requirements(),
         termination_message_policy: Some("FallbackToLogsOnError".to_string()),
         volume_mounts: Some(mounts),
         ..Default::default()
     };
-    init.push(archive(
+    let mut archive = archive(
         site,
         id,
         "build.exit",
         "build.archive-err",
         &["facts.tar", "image"],
-    ));
+    );
+    if matches!(b.engine, Engine::Kaniko { .. }) {
+        archive
+            .volume_mounts
+            .get_or_insert_default()
+            .push(mount("facts-run", FACTS, false));
+    }
+    init.push(archive);
     volumes.extend(cluster_volume(site));
     job(site, id, Kind::Build, b.limit_secs, init, builder, volumes)
 }
@@ -1062,13 +1146,14 @@ fn job(
             template: core::PodTemplateSpec {
                 metadata: Some(ObjectMeta {
                     labels: Some(pod_labels),
+                    annotations: pod_annotations(site.users),
                     ..Default::default()
                 }),
                 spec: Some(core::PodSpec {
                     restart_policy: Some("Never".to_string()),
                     host_users: match site.users {
                         PodUsers::Namespaced => Some(false),
-                        PodUsers::Host => None,
+                        PodUsers::Host | PodUsers::OpenShiftBuilder => None,
                     },
                     automount_service_account_token: Some(false),
                     enable_service_links: Some(false),
@@ -1252,8 +1337,9 @@ mod tests {
 
     use crate::backend::{Resources, StorageDriver};
     use crate::jobs::{
-        BuildJob, Builder, Engine, Ident, LayerJob, Observed, PodUsers, PushJob, Registry, RunJob,
-        RunMount, Site, build_job, layer_job, observe, push_job, run_job,
+        BuildJob, Builder, Engine, FACTS, Ident, KANIKO_IMAGE, LayerJob, Observed, PodUsers,
+        PushJob, Registry, RunJob, RunMount, Site, build_job, layer_job, observe, push_job,
+        run_job,
     };
     use crate::step::State;
 
@@ -1481,6 +1567,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_openshift_builder_uses_the_crio_user_namespace() {
+        let labels = labels();
+        let mut site = site(None, cluster());
+        site.users = PodUsers::OpenShiftBuilder;
+        let args = ["1800".to_string(), "/tmp/t".to_string()];
+        let job = serde_json::to_value(build_job(
+            &site,
+            &ident("buildit-00000000000000a1", &labels),
+            &BuildJob {
+                context_digest: "sha256:ab",
+                cache_dirs: &[],
+                runner_args: &args,
+                engine: Engine::Buildah {
+                    local_tag: "localhost/buildit/x:latest",
+                },
+                limit_secs: 600,
+            },
+        ))
+        .unwrap();
+        let template = &job["spec"]["template"];
+        assert!(template["spec"].get("hostUsers").is_none());
+        assert_eq!(
+            template["metadata"]["annotations"]["io.openshift.builder"],
+            "true"
+        );
+        assert_eq!(
+            template["metadata"]["annotations"]["io.kubernetes.cri-o.userns-mode"],
+            "auto:size=65536;map-to-root=true"
+        );
+    }
+
     fn buildkit_job(registry: Registry, storage: StorageDriver) -> serde_json::Value {
         let labels = labels();
         let args = ["1800".to_string(), "buildctl".to_string()];
@@ -1517,6 +1635,88 @@ mod tests {
     }
 
     #[test]
+    fn a_kaniko_build_mounts_caches_and_facts_without_privilege() {
+        let labels = labels();
+        let site = site(None, cluster());
+        let runner_args = ["1800".to_string(), "/kaniko/executor".to_string()];
+        let mounts = [
+            RunMount {
+                source: "/home/build/.local/share/containers/buildit-caches/deps".to_string(),
+                target: "/cache".to_string(),
+                read_only: false,
+            },
+            RunMount {
+                source: FACTS.to_string(),
+                target: "/buildit".to_string(),
+                read_only: false,
+            },
+            RunMount {
+                source: format!("{FACTS}/ccache.conf"),
+                target: "/etc/ccache.conf".to_string(),
+                read_only: true,
+            },
+        ];
+        let job = serde_json::to_value(build_job(
+            &site,
+            &ident("buildit-00000000000000a1", &labels),
+            &BuildJob {
+                context_digest: "sha256:ab",
+                cache_dirs: &[mounts[0].source.clone()],
+                runner_args: &runner_args,
+                engine: Engine::Kaniko { mounts: &mounts },
+                limit_secs: 600,
+            },
+        ))
+        .unwrap();
+        let pod = &job["spec"]["template"]["spec"];
+        assert_eq!(pod["hostUsers"], false);
+        let builder = &pod["containers"][0];
+        assert_eq!(builder["image"], KANIKO_IMAGE);
+        assert_eq!(builder["securityContext"]["runAsUser"], 0);
+        assert!(builder["securityContext"].get("privileged").is_none());
+        let script = builder["command"][2].as_str().unwrap();
+        assert!(script.contains("mirror()"));
+        assert!(!script.contains("tail -n +1 -f"));
+        assert!(!script.contains("--pid"));
+        let mounts = builder["volumeMounts"].as_array().unwrap();
+        assert!(mounts.iter().any(|m| m["mountPath"] == "/cache"));
+        assert!(mounts.iter().any(|m| m["mountPath"] == "/buildit"));
+        assert!(mounts.iter().any(|m| m["mountPath"] == "/tmp"));
+        assert!(mounts.iter().any(|m| m["mountPath"] == "/kaniko/.docker"));
+        assert_eq!(
+            builder["env"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["name"] == "HOME")
+                .unwrap()["value"],
+            "/tmp"
+        );
+        assert_eq!(
+            builder["env"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["name"] == "TMPDIR")
+                .unwrap()["value"],
+            "/tmp"
+        );
+        assert!(
+            mounts
+                .iter()
+                .any(|m| { m["mountPath"] == "/etc/ccache.conf" && m["subPath"] == "ccache.conf" })
+        );
+        let archive = &pod["initContainers"].as_array().unwrap().last().unwrap();
+        assert!(
+            archive["volumeMounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["name"] == "facts-run" && m["mountPath"] == FACTS)
+        );
+    }
+
+    #[test]
     fn a_buildkit_build_runs_buildkitd_from_copied_binaries_in_the_buildah_builder() {
         let job = buildkit_job(cluster(), StorageDriver::Overlay);
         let pod = &job["spec"]["template"]["spec"];
@@ -1532,7 +1732,10 @@ mod tests {
             [
                 ("fetch", "gcr.io/go-containerregistry/crane:debug"),
                 ("buildkit", "docker.io/moby/buildkit:v0.35.0-rootless"),
-                ("archive", "quay.io/buildah/stable:latest"),
+                (
+                    "archive",
+                    "quay.io/buildah/stable@sha256:7bb110e1d8b761d08e87d004ea4086e295a52319f3ea70ecef65da6dff7ceef0",
+                ),
             ]
         );
         let tools = &pod["initContainers"][1];
@@ -1552,7 +1755,10 @@ mod tests {
 
         let builder = &pod["containers"][0];
         assert_eq!(builder["name"], "builder");
-        assert_eq!(builder["image"], "quay.io/buildah/stable:latest");
+        assert_eq!(
+            builder["image"],
+            "quay.io/buildah/stable@sha256:7bb110e1d8b761d08e87d004ea4086e295a52319f3ea70ecef65da6dff7ceef0"
+        );
         assert_eq!(builder["securityContext"]["runAsUser"], 1000);
         assert!(builder["securityContext"].get("privileged").is_none());
         assert!(builder["securityContext"].get("seccompProfile").is_none());

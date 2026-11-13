@@ -3,7 +3,8 @@
 # account) gets only pods shaped like buildit/src/jobs.rs makes: a build (buildah, BuildKit run
 # from the buildah image, or a script in an image by digest), a run (a built image by digest) or a
 # push (crane), with the fetch, buildkit and prepare init containers and the archive sidecar beside
-# them; every pod in a user namespace, so root in a container is no one on the node; no
+# them; every pod in a Kubernetes or OpenShift builder user namespace, so root in a container is
+# no one on the node; no
 # privilege, added capability or seccomp Unconfined; emptyDir volumes, the build's own inputs
 # Secret, and a projection of the default account's token and the cluster's service CA; no host
 # namespaces, no service account token mount or other Secret (an OpenShift internal registry's
@@ -47,26 +48,37 @@ spec:
       message: a pod here must carry buildit.dev/managed-by=mcp
     - expression: variables.build != ''
       message: a pod here must name its build in buildit.dev/build-id
-    - expression: has(object.spec.hostUsers) && object.spec.hostUsers == false
-      message: a pod here runs in a user namespace (hostUsers false)
+    - expression: >-
+        (has(object.spec.hostUsers) && object.spec.hostUsers == false) ||
+        (!has(object.spec.hostUsers) && has(object.metadata.annotations) &&
+        'io.openshift.builder' in object.metadata.annotations &&
+        object.metadata.annotations['io.openshift.builder'] == 'true' &&
+        'io.kubernetes.cri-o.userns-mode' in object.metadata.annotations &&
+        object.metadata.annotations['io.kubernetes.cri-o.userns-mode'] ==
+        'auto:size=65536;map-to-root=true')
+      message: a pod here runs in a Kubernetes or OpenShift builder user namespace
     - expression: >-
         size(object.spec.containers) == 1 &&
         object.spec.containers.all(c,
         (c.name == 'builder' && c.image in
-        ['quay.io/buildah/stable:latest', 'gcr.io/go-containerregistry/crane:debug']) ||
+        ['quay.io/buildah/stable@sha256:7bb110e1d8b761d08e87d004ea4086e295a52319f3ea70ecef65da6dff7ceef0',
+        'gcr.io/kaniko-project/executor@sha256:9e22d0ba2c78cffbd47e2269aa6d3dc43fc3e3ecc6b61262399279dec5e67d45',
+        'gcr.io/go-containerregistry/crane:debug']) ||
         (c.name in ['run', 'layer'] && c.image.contains('@sha256:')))
       message: >-
-        a pod here runs one container: builder from buildah or crane, or a run or a layer build
-        from an image by digest
+        a pod here runs one container: builder from buildah, kaniko or crane, or a run or a layer
+        build from an image by digest
     - expression: >-
         variables.inits.all(c,
         (c.name == 'fetch' && c.image == 'gcr.io/go-containerregistry/crane:debug' &&
         !has(c.restartPolicy)) ||
         (c.name == 'buildkit' && c.image == 'docker.io/moby/buildkit:v0.35.0-rootless' &&
         !has(c.restartPolicy)) ||
-        (c.name == 'prepare' && c.image == 'quay.io/buildah/stable:latest' &&
+        (c.name == 'prepare' && c.image ==
+        'quay.io/buildah/stable@sha256:7bb110e1d8b761d08e87d004ea4086e295a52319f3ea70ecef65da6dff7ceef0' &&
         !has(c.restartPolicy)) ||
-        (c.name == 'archive' && c.image == 'quay.io/buildah/stable:latest' &&
+        (c.name == 'archive' && c.image ==
+        'quay.io/buildah/stable@sha256:7bb110e1d8b761d08e87d004ea4086e295a52319f3ea70ecef65da6dff7ceef0' &&
         has(c.restartPolicy) && c.restartPolicy == 'Always'))
       message: >-
         a pod here has init containers fetch (crane), buildkit (BuildKit), prepare (buildah) and

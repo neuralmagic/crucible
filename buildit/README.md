@@ -254,6 +254,12 @@ Jobs run.
 ```sh
 MCP_TOKENS_FILE=/run/crucible/buildit.tokens buildit mcp --cache-url http://buildit-cache:8850 \
   --cache-token-file /etc/buildit-cache/token
+# OpenShift clusters whose CRI-O builder workload provides the user namespace
+MCP_POD_USERS=openshift-builder buildit mcp --cache-url http://buildit-cache:8850 \
+  --cache-token-file /etc/buildit-cache/token
+# Restricted clusters can select Kaniko's userspace builder (no mount capabilities required)
+MCP_BUILDER=kaniko buildit mcp --cache-url http://buildit-cache:8850 \
+  --cache-token-file /etc/buildit-cache/token
 # e2e on a disposable kind cluster with a registry and a `buildit cache` in it
 BUILDIT_E2E_KUBECONTEXT=kind-dev BUILDIT_E2E_IMAGE_REPO=<node-ip>:30500/buildit \
   BUILDIT_E2E_CACHE_URL=http://e2e-cache.default.svc:8850 BUILDIT_E2E_CACHE_TOKEN_FILE=token \

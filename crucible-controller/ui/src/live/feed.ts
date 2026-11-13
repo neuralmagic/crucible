@@ -132,6 +132,15 @@ export function describeLine(line: SessionLine): LineView {
       return { tone: 'info', tag: 'segment', title: `re-scoped · ${line.regime}`, detail: `baseline ${line.baseline_score.toFixed(1)}` };
     case 'identity':
       return { tone: 'muted', tag: 'identity', title: line.digest || 'run identity' };
+    case 'plan_admitted':
+      return { tone: 'info', tag: 'plan', title: `plan v${line.plan_version} admitted`, detail: `${line.tasks} tasks` };
+    case 'task_result':
+      return {
+        tone: line.status === 'pass' ? 'success' : line.status === 'fail' || line.status === 'transport' ? 'error' : 'muted',
+        tag: 'task',
+        title: `${line.task} · ${line.status}`,
+        detail: line.note || `${line.secs.toFixed(1)}s · $${line.cost_usd.toFixed(2)}`,
+      };
     case 'finished':
       return { tone: 'success', tag: 'finished', title: 'run finished' };
     case 'shutdown':

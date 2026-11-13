@@ -29,6 +29,8 @@ pub const BUILDAH_STAMPS: &str = "^(STEP |COMMIT |CACHE )";
 /// The log lines a `buildctl build` build stamps: each vertex `buildctl` names as a step of a
 /// stage, the export, and the cache stages.
 pub const BUILDKIT_STAMPS: &str = r"^(#[0-9]+ \[|#[0-9]+ exporting to image|CACHE )";
+/// The log lines a Kaniko build stamps: Dockerfile commands, snapshot/push progress and caches.
+pub const KANIKO_STAMPS: &str = r"^(INFO.*(RUN|COPY|Taking snapshot|Pushing image)|CACHE )";
 
 /// Arguments: the log, the build's timeout, the termination file, the regex of the log lines to
 /// stamp, the steps file, the snapshot plan, the shared cache's URL, the save header file,
@@ -45,14 +47,17 @@ stage() {
 }
 secs=$1; term=$2; stamps=$3; steps=$4; plan=$5; url=$6; auth=$7; restore=$8; save=$9; shift 9
 sleep 2147483647 & hold=$!
-{
-  tail -n +1 -f -s 0.1 --pid=$hold "$log" 2> /dev/null \
-    | grep --line-buffered -E "$stamps" \
+stamp() {
+  grep -E "$stamps" "$log" 2> /dev/null \
     | while IFS= read -r l; do
         grep -qxF -e "$l" "$log.stamped" 2> /dev/null && continue
         printf '%s\n' "$l" >> "$log.stamped"
         printf '%s %s\n' "$(date +%s%N)" "$l"
       done
+}
+{
+  while kill -0 "$hold" 2> /dev/null; do stamp; sleep 0.1; done
+  stamp
   n=50; while [ ! -s "$log.exit" ] && [ "$n" -gt 0 ]; do sleep 0.1; n=$((n - 1)); done
   printf '%s END %s\n' "$(date +%s%N)" "$(head -n 1 "$log.exit" 2> /dev/null)"
 } >> "$steps" &

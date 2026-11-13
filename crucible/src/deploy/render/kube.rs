@@ -1125,7 +1125,7 @@ mkdir -p "$D/state"
 n=$(( $(cat "$D/state/starts" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$D/state/starts"
 if [ "$n" -le {MAX_PLAYBOOK_STARTS} ]; then{rerun_setup}{echo_setup}
-  crucible plan run --manifest "$D/{manifest_file}" --max-cost {max_cost} --max-time {max_time}{driver_flag}{harness_flag}{model_flag}{variant_flag}{param_flags}{resume_flag}
+  crucible plan run --manifest "$D/{manifest_file}" --max-cost {max_cost} --max-time {max_time} --control-port={CONTROL_PORT}{driver_flag}{harness_flag}{model_flag}{variant_flag}{param_flags}{resume_flag}
   rc=$?{echo_stop}
 else
   echo "[crucible] this run has started $n times; leaving it unfinished" >&2
@@ -6090,17 +6090,13 @@ mod tests {
             yaml.contains(r#"crucible plan run --manifest "$D/crucible.toml""#),
             "{yaml}"
         );
-        for loop_only in [
-            "--ui=stream",
-            "--agent-backend",
-            "--iterations",
-            "--control-port",
-        ] {
+        for loop_only in ["--ui=stream", "--agent-backend", "--iterations"] {
             assert!(
                 !yaml.contains(loop_only),
                 "{loop_only} in a playbook: {yaml}"
             );
         }
+        assert!(yaml.contains("--control-port=7777"), "{yaml}");
     }
 
     /// The ceilings ride as `plan run` spells them: space-separated, the duration canonicalized to

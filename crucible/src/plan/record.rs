@@ -10,6 +10,67 @@ use crate::plan::exec::TaskResult;
 use crate::plan::ir::{Task, TaskName, ValidPlan};
 use crate::plan::machine::BlockedReason;
 
+/// The task definitions persisted by a run's `plan_admitted` event.
+pub fn wire_tasks(plan: &ValidPlan) -> Vec<crucible_contract::session::PlanTaskWire> {
+    let definitions = crate::plan::rerun::definition_digests(plan);
+    plan.tasks_topo()
+        .map(|task| crucible_contract::session::PlanTaskWire {
+            name: task.name.0.clone(),
+            kind: task.task.label().to_string(),
+            depends_on: task.depends_on.iter().map(|name| name.0.clone()).collect(),
+            optional: task.optional.iter().map(|name| name.0.clone()).collect(),
+            session: task.session.clone().unwrap_or_default(),
+            needs: task.needs.clone(),
+            required: task.required,
+            join: task.join.as_str().to_string(),
+            stage: task.stage.as_str().to_string(),
+            over: task
+                .over
+                .as_ref()
+                .map(crate::plan::ir::OutputRef::to_string)
+                .unwrap_or_default(),
+            max_fanout: task.max_fanout.unwrap_or_default(),
+            when: task
+                .when
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            keyed: task.keyed.iter().map(ToString::to_string).collect(),
+            revise: task
+                .revise
+                .as_ref()
+                .map(|revision| revision.tasks.iter().map(|name| name.0.clone()).collect())
+                .unwrap_or_default(),
+            max_rounds: task
+                .revise
+                .as_ref()
+                .map_or(0, |revision| revision.max_rounds),
+            emits: task
+                .emits
+                .fields()
+                .into_iter()
+                .map(|(field, ty)| crucible_contract::emits::EmitWire {
+                    field: field.0.clone(),
+                    ty: ty.cloned(),
+                })
+                .collect(),
+            emits_files: task.emits_files.clone(),
+            timeout: task
+                .timeout
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            history_depth: task.history.unwrap_or_default(),
+            definition: definitions.get(&task.name).cloned().unwrap_or_default(),
+            command: match &task.task {
+                crate::plan::ir::TaskKind::Command { command }
+                | crate::plan::ir::TaskKind::Evaluate { command, .. } => command.clone(),
+                _ => String::new(),
+            },
+        })
+        .collect()
+}
+
 /// A passing task's output, cut down to the fields it declares in `emits`.
 pub fn declared_output(task: &Task, result: &TaskResult) -> Option<Value> {
     if result.status != TaskStatus::Pass {
