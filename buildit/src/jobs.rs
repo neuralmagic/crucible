@@ -598,12 +598,13 @@ pub fn build_job(site: &Site, id: &Ident<'_>, b: &BuildJob<'_>) -> Job {
         build_dest(site, id.sandbox, id.build),
     ]);
     command.extend(b.runner_args.iter().cloned());
+    let kaniko = matches!(b.engine, Engine::Kaniko { .. });
     let mut vars = vec![
-        env("HOME", "/home/build"),
+        env("HOME", if kaniko { "/tmp" } else { "/home/build" }),
         env("STORAGE", STORAGE),
         env("REGISTRY", site.registry.host()),
         env("CACHE_DIRS", &b.cache_dirs.join(" ")),
-        env("TMPDIR", BUILD_TMP),
+        env("TMPDIR", if kaniko { "/tmp" } else { BUILD_TMP }),
     ];
     let mut mounts = vec![
         mount("workspace", WORKSPACE, false),
@@ -668,6 +669,10 @@ pub fn build_job(site: &Site, id: &Ident<'_>, b: &BuildJob<'_>) -> Job {
             volumes.push(limited_dir("tools", BUILDKIT_TOOLS_LIMIT));
         }
         Engine::Kaniko { mounts: run_mounts } => {
+            mounts.push(mount("kaniko-tmp", "/tmp", false));
+            mounts.push(mount("kaniko-docker", "/kaniko/.docker", false));
+            volumes.push(empty_dir("kaniko-tmp"));
+            volumes.push(empty_dir("kaniko-docker"));
             for (i, run_mount) in run_mounts.iter().enumerate() {
                 if run_mount.source == FACTS {
                     mounts.push(mount("facts-run", &run_mount.source, false));
@@ -1662,6 +1667,26 @@ mod tests {
         let mounts = builder["volumeMounts"].as_array().unwrap();
         assert!(mounts.iter().any(|m| m["mountPath"] == "/cache"));
         assert!(mounts.iter().any(|m| m["mountPath"] == "/buildit"));
+        assert!(mounts.iter().any(|m| m["mountPath"] == "/tmp"));
+        assert!(mounts.iter().any(|m| m["mountPath"] == "/kaniko/.docker"));
+        assert_eq!(
+            builder["env"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["name"] == "HOME")
+                .unwrap()["value"],
+            "/tmp"
+        );
+        assert_eq!(
+            builder["env"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["name"] == "TMPDIR")
+                .unwrap()["value"],
+            "/tmp"
+        );
         assert!(
             mounts
                 .iter()
