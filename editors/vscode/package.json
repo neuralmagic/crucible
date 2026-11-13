@@ -2,7 +2,7 @@
   "name": "crucible-starlark",
   "displayName": "Crucible Starlark",
   "description": "Syntax highlighting for crucible workflow files, plus errors, completion, hover, and go to definition from crucible-lsp.",
-  "version": "0.6.4",
+  "version": "0.6.5",
   "publisher": "crucible",
   "license": "MIT OR Apache-2.0",
   "private": true,
