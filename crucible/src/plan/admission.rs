@@ -18,36 +18,59 @@ use crate::plan::attempt::{Attempt, BatchItem};
 use crate::plan::ir::{Task, TaskName};
 use crate::plan::machine::BlockedReason;
 
-/// When each task's first attempt started in this process, so its result can say how long the
-/// task took. A fan-out node's time runs from its earliest instance.
+/// When each attempt of each task ran in this process, so a task's result can say how long the
+/// task took: the time at least one of its attempts, instances or rounds was running. Gaps while
+/// other tasks ran, such as between a revise loop's rounds, do not count.
 #[derive(Debug, Default)]
-pub struct TaskClock(Mutex<HashMap<String, Instant>>);
+pub struct TaskClock(Mutex<HashMap<String, Vec<Run>>>);
+
+/// One attempt's start, and its end once it settled.
+type Run = (Instant, Option<Instant>);
 
 impl TaskClock {
-    fn started(&self, task: &TaskName) {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entry(task.0.clone())
-            .or_insert_with(Instant::now);
+    fn started(&self, task: &TaskName) -> usize {
+        let mut spans = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let runs = spans.entry(task.0.clone()).or_default();
+        runs.push((Instant::now(), None));
+        runs.len() - 1
     }
 
-    /// Seconds since `task`, or the earliest of its instances, first started; zero when none did.
+    fn finished(&self, task: &TaskName, run: usize) {
+        let mut spans = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, end @ None)) = spans.get_mut(&task.0).and_then(|runs| runs.get_mut(run)) {
+            *end = Some(Instant::now());
+        }
+    }
+
+    /// Seconds `task`, or any of its instances, had an attempt running; zero when none started.
     pub fn secs(&self, task: &TaskName) -> f64 {
-        self.since_started(task).unwrap_or(0.0)
+        self.ran(task).unwrap_or(0.0)
     }
 
-    /// Seconds since `task`, or the earliest of its instances, first started; `None` when none did.
-    pub fn since_started(&self, task: &TaskName) -> Option<f64> {
+    /// Seconds `task`, or any of its instances, had an attempt running; `None` when none started.
+    pub fn ran(&self, task: &TaskName) -> Option<f64> {
         let instance = format!("{}[", task.0);
-        self.0
+        let now = Instant::now();
+        let mut runs: Vec<(Instant, Instant)> = self
+            .0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
             .filter(|(name, _)| **name == task.0 || name.starts_with(&instance))
-            .map(|(_, at)| *at)
-            .min()
-            .map(|at| at.elapsed().as_secs_f64())
+            .flat_map(|(_, runs)| runs.iter().map(|(start, end)| (*start, end.unwrap_or(now))))
+            .collect();
+        runs.sort();
+        let mut runs = runs.into_iter();
+        let (mut from, mut to) = runs.next()?;
+        let mut total = 0.0;
+        for (start, end) in runs {
+            if start > to {
+                total += (to - from).as_secs_f64();
+                from = start;
+            }
+            to = to.max(end);
+        }
+        Some(total + (to - from).as_secs_f64())
     }
 }
 
@@ -141,6 +164,7 @@ pub struct Lane<'a> {
     task: TaskName,
     attempt: u32,
     deadline: Option<Deadline>,
+    run: Option<usize>,
 }
 
 impl Lane<'_> {
@@ -186,6 +210,9 @@ impl Lane<'_> {
 impl Drop for Lane<'_> {
     fn drop(&mut self) {
         self.admission.tally().live.remove(&self.id);
+        if let (Some(clock), Some(run)) = (self.admission.clock, self.run) {
+            clock.finished(&self.task, run);
+        }
     }
 }
 
@@ -251,9 +278,7 @@ impl<'j> Admission<'j> {
         tally.next += 1;
         tally.live.insert(id, 0.0);
         drop(tally);
-        if let Some(clock) = self.clock {
-            clock.started(&task.name);
-        }
+        let run = self.clock.map(|clock| clock.started(&task.name));
         // Synced, so a resumed run can charge an attempt whose process died before it settled
         // (RFC-0002:C-PLAYBOOK-RESUME).
         if let Err(error) = self.append(
@@ -273,6 +298,7 @@ impl<'j> Admission<'j> {
             task: task.name.clone(),
             attempt: lane.attempt,
             deadline: Deadline::for_attempt(Instant::now(), task.timeout, self.run_ceiling),
+            run,
         })
     }
 
@@ -572,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn a_task_is_timed_from_its_first_attempt_and_a_fan_out_from_its_earliest_instance() {
+    fn a_task_is_timed_by_how_long_any_of_its_attempts_instances_or_rounds_ran() {
         let clock = TaskClock::default();
         let admission = Admission::new(10.0, 0.0, None, width(4)).clocked(Some(&clock));
         let fetch = command("fetch");
@@ -593,19 +619,35 @@ mod tests {
             "a retry does not restart the task's clock: {fetch_secs}"
         );
 
+        let first = command("check[round-1]");
+        let second = command("check[round-2]");
+        let nap = |_: &super::Lane<'_>| {
+            std::thread::sleep(Duration::from_millis(150));
+            costing(0.0)
+        };
+        assert!(admission.run(&one(&first), nap).is_ok());
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(admission.run(&one(&second), nap).is_ok());
+        let check = clock.secs(&crate::plan::ir::TaskName("check".into()));
+        assert!(
+            (0.29..0.45).contains(&check),
+            "a revise loop's rounds count, the wait between them does not: {check}"
+        );
+
         let a = agent("edit[a]");
         let b = agent("edit[b]");
-        assert!(admission.run(&one(&a), |_| costing(0.0)).is_ok());
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(admission.run(&one(&b), |_| costing(0.0)).is_ok());
+        let both = admission.run_all(&[one(&a), one(&b)], |_, _| {
+            std::thread::sleep(Duration::from_millis(200));
+            costing(0.0)
+        });
+        assert!(both.iter().all(Result::is_ok));
         let edit = clock.secs(&crate::plan::ir::TaskName("edit".into()));
-        let edit_b = clock.secs(&b.name);
         assert!(
-            edit >= edit_b + 0.09,
-            "the node runs from its earliest instance: {edit} vs {edit_b}"
+            (0.19..0.35).contains(&edit),
+            "instances running together count once: {edit}"
         );
         assert_eq!(
-            clock.since_started(&crate::plan::ir::TaskName("editor".into())),
+            clock.ran(&crate::plan::ir::TaskName("editor".into())),
             None,
             "a task that only shares a prefix never started"
         );

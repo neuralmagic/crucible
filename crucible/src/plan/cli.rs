@@ -994,7 +994,7 @@ pub fn run(
         runner.as_mut(),
         |task, result| {
             observe(task, result);
-            let started = clock.since_started(&task.name);
+            let started = clock.ran(&task.name);
             if let Some(secs) = started {
                 took.insert(task.name.clone(), secs);
             }
