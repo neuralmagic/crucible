@@ -595,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn the_server_caches_buildkit_layers_in_the_registry_uncompressed_unless_told_otherwise() {
+    fn the_server_caches_buildkit_layers_in_the_registry_as_zstd_unless_told_otherwise() {
         let server = |extra: &[&str]| {
             let argv = [&["mcp", "--tokens-file", "/t"], extra].concat();
             match parse(&argv) {
@@ -605,17 +605,14 @@ mod tests {
             }
         };
         use crate::jobs::{Compression, LayerCache};
-        assert_eq!(
-            server(&[]),
-            (LayerCache::Registry, Compression::Uncompressed)
-        );
+        assert_eq!(server(&[]), (LayerCache::Registry, Compression::Zstd));
         assert_eq!(
             server(&["--layer-cache", "off", "--layer-compression", "gzip"]),
             (LayerCache::Off, Compression::Gzip)
         );
         assert_eq!(
-            server(&["--layer-compression", "zstd"]).1,
-            Compression::Zstd
+            server(&["--layer-compression", "uncompressed"]).1,
+            Compression::Uncompressed
         );
         assert!(refused(&["mcp", "--tokens-file", "/t", "--layer-cache", "s3"]).contains("s3"));
     }

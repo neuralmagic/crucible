@@ -377,9 +377,8 @@ not mount, with `vfs` it falls back to copying and says so in its log and `statu
 buildit's own. `layer_cache` is where BuildKit builds keep their layers between builder pods:
 `registry` (the default), `cache-` tags of the repository builds push to, which a registry that
 is never garbage-collected grows with, or `off`. `layer_compression` is how a BuildKit build
-compresses the layers it makes: `uncompressed` (the default, for a registry on the same cluster,
-at the layers' full size in it), `zstd`, or `gzip` for runtimes older than containerd 1.5 or
-Docker 23.
+compresses the layers it makes: `zstd` (the default), `gzip` for runtimes older than containerd
+1.5 or Docker 23, or `uncompressed`, which keeps the layers' full size in the registry.
 
 ```toml
 [buildit]
@@ -403,7 +402,7 @@ bud_args          = ["--retry", "5"]
 node_arch         = "amd64"
 builder           = "buildkit"
 layer_cache       = "registry"
-layer_compression = "zstd"                          # a registry short of space
+layer_compression = "gzip"                          # nodes that cannot pull zstd layers
 
 [buildit.cache]                                     # optional, a cache builds share
 clusters     = ["spoke-a"]                          # default the hub; deploy it on each

@@ -192,7 +192,7 @@ pub struct McpArgs {
     #[arg(long, env = "MCP_LAYER_CACHE", value_enum, default_value_t = jobs::LayerCache::Registry)]
     pub layer_cache: jobs::LayerCache,
     /// How a BuildKit build compresses the layers it makes, in its image and its layer cache
-    #[arg(long, env = "MCP_LAYER_COMPRESSION", value_enum, default_value_t = jobs::Compression::Uncompressed)]
+    #[arg(long, env = "MCP_LAYER_COMPRESSION", value_enum, default_value_t = jobs::Compression::Zstd)]
     pub layer_compression: jobs::Compression,
     /// Builds per sandbox that may be running at once; `build` is refused past this
     #[arg(long, default_value_t = 4)]

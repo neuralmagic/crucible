@@ -158,8 +158,8 @@ pub enum LayerCache {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum Compression {
     Gzip,
-    Zstd,
     #[default]
+    Zstd,
     Uncompressed,
 }
 
@@ -1357,7 +1357,7 @@ mod tests {
             storage: StorageDriver::Overlay,
             bud_args: Vec::new(),
             layer_cache: LayerCache::Registry,
-            compression: Compression::Uncompressed,
+            compression: Compression::Zstd,
             users: PodUsers::Namespaced,
             deadline_secs: 3600,
             ttl_secs: 900,

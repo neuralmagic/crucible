@@ -236,12 +236,13 @@ Nothing deletes a cache tag. Each scope's shared tag is overwritten in place, so
 garbage collection bounds it; a sandbox's own tags, like its builds' image tags, stay until
 something deletes the tags of sandboxes that are gone.
 
-The layers a BuildKit build makes are pushed uncompressed in an OCI manifest, in the image and in
-the cache: the registry is on the build's cluster, where compressing costs more time than the
-bytes it saves. A base image's layers keep their compression. Uncompressed layers take their
-full size in the registry, two to three times what gzip or zstd leave of a typical image, in a
-repository nothing prunes. `--layer-compression` (`MCP_LAYER_COMPRESSION`) changes it: `zstd`,
-which containerd from 1.5, Docker from 23 and CRI-O pull, or `gzip`.
+The layers a BuildKit build makes are zstd-compressed in an OCI manifest, in the image and in the
+cache, which containerd from 1.5, Docker from 23 and CRI-O pull. A base image's layers keep
+their compression. `--layer-compression` (`MCP_LAYER_COMPRESSION`) changes it: `gzip`, which is
+several times slower to export, or `uncompressed`, which exports about as fast as zstd and takes
+the layers' full size in the registry. With `mode=max` the cache holds every stage's layers, so
+that is large: one cold build of a 25 GB uncompressed image left about 69 GB there, in a
+repository nothing prunes.
 
 `buildkitd` runs with `noProcessSandbox` and a wrapper around its runtime that drops each `RUN`
 step's hostname, binds the pod's `/dev/pts`, and adds `/buildit`, `/etc/ccache.conf` and the
