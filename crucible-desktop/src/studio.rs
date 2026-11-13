@@ -222,6 +222,7 @@ impl App {
                 self.run.pack_source = Some(PackSource::Working);
                 self.run.pack_file = None;
                 self.run.draft_note = note.map(Ok);
+                self.reread_history();
             }
             Err(error) => self.run.draft_note = Some(Err(error)),
         }

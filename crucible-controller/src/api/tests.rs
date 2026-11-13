@@ -3482,6 +3482,8 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/playbook-drafts/{id}/files",
         "/api/playbook-drafts/{id}/preview",
         "/api/playbook-drafts/{id}/origin/files",
+        "/api/playbook-drafts/{id}/history",
+        "/api/playbook-drafts/{id}/diff",
         "/api/playbook-drafts/{id}/tarball",
         "/api/playbook-drafts/{id}/versions",
         "/api/playbook-drafts/{id}/rename",
@@ -6860,6 +6862,99 @@ async fn any_draft_version_downloads_as_its_tree(pool: PgPool) -> Result<()> {
     assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _) = get_json_object(&app, "/api/playbook-drafts/nope/tarball").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_draft_history_lists_what_each_save_changed_and_any_two_saves_diff(
+    pool: PgPool,
+) -> Result<()> {
+    let (db, _d) = db_with(pool);
+    let app = app_with_admins(db, vec!["wren".to_string()]);
+    let (status, created) = post_admin(
+        &app,
+        "/api/playbook-drafts",
+        serde_json::json!({"id": "studio", "description": "a drafted pack"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let (status, files) = get_json_object(&app, "/api/playbook-drafts/studio/files").await;
+    assert_eq!(status, StatusCode::OK);
+    let mut files = files["files"].clone();
+    files["skills/review.md"] = serde_json::json!("review\n");
+    let (status, saved) = post_admin(
+        &app,
+        "/api/playbook-drafts/studio/versions",
+        serde_json::json!({"files": files, "base_version": 1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+
+    let (status, history) = get_json(&app, "/api/playbook-drafts/studio/history").await;
+    assert_eq!(status, StatusCode::OK);
+    let [second, first] = history.as_slice() else {
+        panic!("expected two saves, got {history:?}");
+    };
+    assert_eq!(second["version"], 2);
+    assert_eq!(second["previous_version"], 1);
+    assert_eq!(second["created_by"], "wren");
+    assert!(second["schema_digest"].is_string(), "{second}");
+    assert_eq!(
+        second["changes"],
+        serde_json::json!([{"path": "skills/review.md", "change": "added"}])
+    );
+    assert_eq!(first["version"], 1);
+    assert_eq!(first["previous_version"], serde_json::Value::Null);
+    assert_eq!(
+        first["changes"],
+        serde_json::json!([
+            {"path": "crucible.toml", "change": "added"},
+            {"path": "workflow.star", "change": "added"},
+        ])
+    );
+
+    let (status, diff) = get_json_object(&app, "/api/playbook-drafts/studio/diff").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        diff,
+        serde_json::json!({
+            "from": 1,
+            "to": 2,
+            "files": [{
+                "path": "skills/review.md",
+                "change": "added",
+                "additions": 1,
+                "deletions": 0,
+                "unified": "--- /dev/null\n+++ b/skills/review.md\n@@ -0,0 +1 @@\n+review\n",
+            }],
+        })
+    );
+    let (status, reversed) =
+        get_json_object(&app, "/api/playbook-drafts/studio/diff?from=2&to=1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(reversed["files"][0]["change"], "removed");
+    assert_eq!(reversed["files"][0]["deletions"], 1);
+
+    for uri in [
+        "/api/playbook-drafts/studio/diff?to=9",
+        "/api/playbook-drafts/studio/diff?from=9",
+        "/api/playbook-drafts/nope/diff",
+        "/api/playbook-drafts/nope/history",
+    ] {
+        let (status, _) = send(&app, "GET", uri, "wren", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+    }
+    for uri in [
+        "/api/playbook-drafts/studio/history",
+        "/api/playbook-drafts/studio/diff",
+    ] {
+        let (status, _) = send(&app, "GET", uri, "mallory", None).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{uri} must not tell a stranger the draft exists"
+        );
+    }
     Ok(())
 }
 

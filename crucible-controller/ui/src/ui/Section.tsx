@@ -45,14 +45,26 @@ export interface FoldSectionProps {
   note?: ReactNode;
   /** Trailing slot that stays on the header line while the section is closed. */
   actions?: ReactNode;
+  defaultOpen?: boolean;
   children: ReactNode;
   className?: string;
 }
 
-/** A section that starts closed: its header is the toggle. */
-export function FoldSection({ title, note, actions, children, className }: FoldSectionProps) {
+/** A section whose header is the toggle; closed until opened unless `defaultOpen`. */
+export function FoldSection({
+  title,
+  note,
+  actions,
+  defaultOpen = false,
+  children,
+  className,
+}: FoldSectionProps) {
   const fold = (
-    <details data-ui="section" className={cn('group border-b border-rule-hard', className)}>
+    <details
+      data-ui="section"
+      open={defaultOpen}
+      className={cn('group border-b border-rule-hard', className)}
+    >
       <summary
         data-ui="section-header"
         className={cn(

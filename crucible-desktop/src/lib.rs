@@ -49,6 +49,7 @@ mod principals;
 mod profile;
 mod provider;
 mod remote;
+mod revisions;
 mod runs;
 mod runs_on;
 mod search;
@@ -363,6 +364,9 @@ pub struct RunView {
     pub compact_graph: Option<bool>,
     /// The launch picked to compare against; `None` takes the one before.
     pub compare_to: Option<String>,
+    /// The saves the History pane compares, once picked by hand; `None` opens on the save the
+    /// run ran.
+    pub history_range: Option<revisions::Range>,
     /// Only lines from this task or fan-out instance.
     pub log_task: Option<String>,
     /// Log blocks opened or folded by hand, by task or instance name.
@@ -435,6 +439,7 @@ pub struct App {
     pub pane_drag: Option<PaneDrag>,
     /// The divider being dragged and its neighbours' shares when the drag began.
     pub resizing: Option<(Divider, (f32, f32))>,
+    pub rail_drag: Option<workspace::RailDrag>,
     pub geometry: Geometry,
     /// The flare on the run a launch just started.
     pub ignition: ignition::Ignition,
@@ -450,6 +455,7 @@ pub struct App {
     pub keys_error: Option<String>,
     /// The account row's menu of profiles and local packs, while open.
     pub source_menu: bool,
+    pub panes_menu: bool,
     /// What the Dock and the menu bar were last told to show.
     tray: Option<tray::Shown>,
     /// The profiles not in use, as the background worker last read them, and which it reads.
@@ -1120,6 +1126,7 @@ impl App {
         self.answer_draft(snapshot.synced);
         self.answer_drop(snapshot.dropped);
         self.answer_file(snapshot.file);
+        self.answer_revisions(snapshot.revisions);
         self.announce(&snapshot.finished);
         self.reconcile();
     }
@@ -1199,6 +1206,55 @@ impl App {
             }
             self.remote.file_sent = file;
         }
+        let history = self.wanted_revisions();
+        if history != self.remote.revisions_sent {
+            if let Some(wanted) = &history {
+                self.remote.live_client.revisions(wanted.clone());
+            }
+            self.remote.revisions_sent = history;
+        }
+    }
+
+    fn wanted_revisions(&self) -> Option<revisions::Wanted> {
+        if !self.workspace().showing(PaneKind::History) {
+            return None;
+        }
+        let (draft, _) = self.draft_target()?;
+        let ran = self
+            .selected_detail()
+            .and_then(|detail| detail.launch.as_ref())
+            .and_then(|record| record.launch.draft_version);
+        Some(revisions::Wanted {
+            draft,
+            range: self.run.history_range,
+            ran,
+        })
+    }
+
+    fn answer_revisions(&mut self, read: Option<std::sync::Arc<revisions::Revisions>>) {
+        let Some(read) = read else {
+            return;
+        };
+        let held = self.remote.revisions.as_ref();
+        if held.is_some_and(|held| std::sync::Arc::ptr_eq(held, &read))
+            || Some(&read.wanted) != self.remote.revisions_sent.as_ref()
+        {
+            return;
+        }
+        if let Ok(history) = &read.result {
+            self.remote
+                .revisions_diff
+                .set_files(rune_kit::diff::parse(&revisions::patch(&history.diff)));
+        }
+        self.remote.revisions = Some(read);
+    }
+
+    pub fn pick_range(&mut self, range: revisions::Range) {
+        self.run.history_range = Some(range);
+    }
+
+    pub fn reread_history(&mut self) {
+        self.remote.revisions_sent = None;
     }
 
     /// The run, key and listed size of the captured file the Files tab shows, while it is open
@@ -1664,6 +1720,7 @@ fn init() -> App {
         shown: Vec::new(),
         pane_drag: None,
         resizing: None,
+        rail_drag: None,
         geometry: Geometry::default(),
         ignition: ignition::Ignition::default(),
         logo_clicks: 0,
@@ -1672,6 +1729,7 @@ fn init() -> App {
         profile_form: None,
         keys_error: None,
         source_menu: false,
+        panes_menu: false,
         tray: None,
         fleet: Vec::new(),
         fleet_client: fleet::Client::spawn(net.handle()),
@@ -1934,6 +1992,8 @@ pub fn run() {
             }),
             // `CRUCIBLE_LIVE_SCENE=<playbook id>` opens that live playbook headlessly, and
             // `CRUCIBLE_LINK=<crucible-playbooks:// link>` follows a link as the system would.
+            // `CRUCIBLE_RANGE=<from>..<to>` picks the saves the History pane compares, and
+            // `CRUCIBLE_DIFF=split` draws them side by side.
             ("live", |app: &mut App| {
                 app.backend = Backend::Controller;
                 scene_tab(app);
@@ -1945,6 +2005,14 @@ pub fn run() {
                     .and_then(|url| Link::parse(&url))
                 {
                     app.follow(&link);
+                }
+                app.run.history_range = std::env::var("CRUCIBLE_RANGE")
+                    .ok()
+                    .and_then(|range| revisions::Range::parse(&range));
+                if std::env::var("CRUCIBLE_DIFF").is_ok_and(|mode| mode == "split") {
+                    app.remote
+                        .revisions_diff
+                        .set_mode(rune_kit::diff::DiffMode::Split);
                 }
             }),
         ],

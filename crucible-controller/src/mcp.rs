@@ -311,6 +311,100 @@ mod tests {
         assert!(left.is_empty(), "{left:?}");
     }
 
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn crux_reads_a_drafts_changelog_and_diffs_two_saves(pool: sqlx::PgPool) {
+        use crux::ops::Operation;
+        use crux::ops::drafts::{DraftDiff, DraftLog, DraftSaveFiles};
+        let api = crate::api::router(crate::api::state::ApiState::test(crate::client::Db::new(
+            pool.clone(),
+        )));
+        let client = crux::Client::new(Arc::new(RouterTransport {
+            api,
+            caller: Resolved::named("alice"),
+            base: "https://crucible.example.com".to_string(),
+        }));
+        crux::ops::drafts::draft_create(&client, "studio", "a drafted pack", None, false)
+            .await
+            .expect("create");
+        DraftSaveFiles {
+            draft_id: "studio".into(),
+            base_version: 1,
+            files: std::collections::BTreeMap::from([
+                (
+                    "crucible.toml".to_string(),
+                    crate::playbooks::drafts::SKELETON_MANIFEST.to_string(),
+                ),
+                ("workflow.star".to_string(), "params = {}\n".to_string()),
+                ("skills/review.md".to_string(), "review\n".to_string()),
+            ]),
+            json: false,
+        }
+        .run(&client)
+        .await
+        .expect("save");
+
+        let log = DraftLog {
+            draft_id: "studio".into(),
+            json: false,
+        }
+        .run(&client)
+        .await
+        .expect("log");
+        let lines: Vec<&str> = log.lines().collect();
+        let [head, second, added, modified, first, manifest, workflow] = lines.as_slice() else {
+            panic!("unexpected changelog: {log}");
+        };
+        assert_eq!(*head, "draft studio: 2 saves");
+        assert!(second.starts_with("v2  "), "{second}");
+        assert!(second.ends_with("  alice  compiles"), "{second}");
+        assert_eq!(
+            [*added, *modified],
+            ["  A skills/review.md", "  M workflow.star"]
+        );
+        assert!(first.starts_with("v1  "), "{first}");
+        assert!(first.ends_with("  alice  compiles"), "{first}");
+        assert_eq!(
+            [*manifest, *workflow],
+            ["  A crucible.toml", "  A workflow.star"]
+        );
+
+        let diff = |from, to, stat| DraftDiff {
+            draft_id: "studio".into(),
+            from,
+            to,
+            stat,
+            json: false,
+        };
+        let newest = diff(None, None, false).run(&client).await.expect("diff");
+        assert!(
+            newest.starts_with(
+                "draft studio v1 -> v2: 2 files changed, +1 -4\n\
+                 A skills/review.md  +1 -0\n\
+                 M workflow.star  +0 -4\n\
+                 \n--- /dev/null\n+++ b/skills/review.md\n@@ -0,0 +1 @@\n+review\n\
+                 \n--- a/workflow.star\n+++ b/workflow.star\n@@ -1,5 +1 @@\n params = {}\n-\n"
+            ),
+            "{newest}"
+        );
+        assert_eq!(
+            diff(Some(2), Some(1), true)
+                .run(&client)
+                .await
+                .expect("stat"),
+            "draft studio v2 -> v1: 2 files changed, +4 -1\n\
+             D skills/review.md  +0 -1\n\
+             M workflow.star  +4 -0\n"
+        );
+        assert!(
+            diff(Some(7), None, false)
+                .run(&client)
+                .await
+                .expect_err("the draft holds no version 7")
+                .to_string()
+                .contains("draft studio has no version 7")
+        );
+    }
+
     const BLUEPRINT_MANIFEST: &str = "[repo]\npath = \".\"\n\n[agent]\n\n[workflow]\n\
         type = \"playbook\"\nfile = \"workflow.star\"\n\n\
         [[secret]]\nname = \"gh_token\"\nenv = \"GH_TOKEN\"\n\n\
