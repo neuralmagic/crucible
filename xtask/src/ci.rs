@@ -24,6 +24,9 @@ const DEFAULT_FEATURE_CRATES: &[&str] = &[ENGINE, CONTROLLER, "crux"];
 /// What scripts/kind-e2e.sh builds.
 const KIND_E2E_CRATES: &[&str] = &[ENGINE, CONTROLLER, "crux"];
 
+/// This file names paths as rules, so its literals are not reads.
+const THIS_FILE: &str = file!();
+
 const UI: &str = "crucible-controller/ui/";
 const SQLX_CACHE: &str = ".sqlx/";
 
@@ -560,7 +563,7 @@ impl Planner {
         let sources: Vec<(&Crate, &str)> = tree
             .files
             .iter()
-            .filter(|file| file.ends_with(".rs"))
+            .filter(|file| file.ends_with(".rs") && *file != THIS_FILE)
             .filter_map(|file| Some((workspace.crate_at(file)?, file.as_str())))
             .collect();
         let files: Vec<&str> = sources.iter().map(|(_, file)| *file).collect();
