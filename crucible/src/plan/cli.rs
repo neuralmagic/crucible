@@ -599,15 +599,16 @@ pub fn parse_params(pairs: &[String]) -> Result<BTreeMap<String, String>> {
 fn record_git_memory(paths: &crate::args::Paths) -> Result<()> {
     let start = RunStart::read(&paths.state)?;
     let commits = crucible_vcs::git_memory::task_commits(&paths.workspace, &start.base)?;
-    crate::plan::rerun::write_git_memory(&paths.state, &start, &commits)?;
+    let fetched = crate::cli::workspace::fetched_blobs(&paths.workspace)?;
+    crate::plan::rerun::write_git_memory(&paths.state, &start, &commits, &fetched)?;
     Ok(())
 }
 
 /// Where a rerun fetches a parent named by URL, inside its own state directory.
 const FETCHED_PARENT_DIR: &str = "rerun-parent";
 
-/// Seed a rerun: rebuild the workspace from the parent's base and the reused tasks' commits,
-/// restore their captured files, and record where this run started.
+/// Seed a rerun: rebuild the workspace from the parent's base, the blobs its partial clone held
+/// and the reused tasks' commits, restore their captured files, and record where this run started.
 fn start_rerun(
     manifest: &Path,
     loaded: &crate::manifest::Manifest,
@@ -637,7 +638,9 @@ fn start_rerun(
     let parent = crate::plan::rerun::ParentDir::read(&dir)?;
     let seeded = crate::plan::rerun::plan(plan, &parent.parent, &rerun.from)?;
     let commits = seeded.evidence(plan, &parent)?;
-    let base = crate::cli::setup::restore_for_rerun(manifest, loaded, &parent.start, &commits)?;
+    let fetched = crate::plan::rerun::read_fetched_blobs(&parent.dir)?;
+    let base =
+        crate::cli::setup::restore_for_rerun(manifest, loaded, &parent.start, &commits, &fetched)?;
     seeded
         .restore_captured(&parent, &paths.state)
         .context("restoring the parent's captured files")?;
