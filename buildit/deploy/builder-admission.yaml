@@ -3,7 +3,8 @@
 # account) gets only pods shaped like buildit/src/jobs.rs makes: a build (buildah, BuildKit run
 # from the buildah image, or a script in an image by digest), a run (a built image by digest) or a
 # push (crane), with the fetch, buildkit and prepare init containers and the archive sidecar beside
-# them; every pod in a user namespace, so root in a container is no one on the node; no
+# them; every pod in a Kubernetes or OpenShift builder user namespace, so root in a container is
+# no one on the node; no
 # privilege, added capability or seccomp Unconfined; emptyDir volumes, the build's own inputs
 # Secret, and a projection of the default account's token and the cluster's service CA; no host
 # namespaces, no service account token mount or other Secret (an OpenShift internal registry's
@@ -47,8 +48,15 @@ spec:
       message: a pod here must carry buildit.dev/managed-by=mcp
     - expression: variables.build != ''
       message: a pod here must name its build in buildit.dev/build-id
-    - expression: has(object.spec.hostUsers) && object.spec.hostUsers == false
-      message: a pod here runs in a user namespace (hostUsers false)
+    - expression: >-
+        (has(object.spec.hostUsers) && object.spec.hostUsers == false) ||
+        (!has(object.spec.hostUsers) && has(object.metadata.annotations) &&
+        'io.openshift.builder' in object.metadata.annotations &&
+        object.metadata.annotations['io.openshift.builder'] == 'true' &&
+        'io.kubernetes.cri-o.userns-mode' in object.metadata.annotations &&
+        object.metadata.annotations['io.kubernetes.cri-o.userns-mode'] ==
+        'auto:size=65536;map-to-root=true')
+      message: a pod here runs in a Kubernetes or OpenShift builder user namespace
     - expression: >-
         size(object.spec.containers) == 1 &&
         object.spec.containers.all(c,

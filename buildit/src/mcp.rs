@@ -171,7 +171,7 @@ pub struct McpArgs {
     /// How build pods reach the image repository's registry
     #[arg(long, env = "MCP_REGISTRY_AUTH", value_enum, default_value_t = RegistryAuth::Cluster)]
     pub registry_auth: RegistryAuth,
-    /// Whose user ids build and run pods run under
+    /// User-namespace mode for build and run pods
     #[arg(long, env = "MCP_POD_USERS", value_enum, default_value_t = jobs::PodUsers::Namespaced)]
     pub pod_users: jobs::PodUsers,
     /// Directory this server keeps ended builds' and runs' logs in
@@ -3144,10 +3144,12 @@ mod tests {
                     .map(|d| <StorageDriver as clap::ValueEnum>::from_str(&d, false).unwrap())
                     .unwrap_or_default(),
                 bud_args: Vec::new(),
-                users: match std::env::var("BUILDIT_E2E_POD_USERS").as_deref() {
-                    Ok("host") => jobs::PodUsers::Host,
-                    _ => jobs::PodUsers::Namespaced,
-                },
+                users: std::env::var("BUILDIT_E2E_POD_USERS")
+                    .ok()
+                    .and_then(|mode| {
+                        <jobs::PodUsers as clap::ValueEnum>::from_str(&mode, false).ok()
+                    })
+                    .unwrap_or(jobs::PodUsers::Namespaced),
                 deadline_secs: 900,
                 ttl_secs: 600,
                 cache: shared_cache
@@ -4121,6 +4123,33 @@ mod tests {
             },
         ));
         assert_eq!(refused_by_admission(&pod), Vec::<String>::new());
+        let openshift = {
+            let mut site = broker.site.clone();
+            site.users = jobs::PodUsers::OpenShiftBuilder;
+            pod_of(&jobs::build_job(
+                &site,
+                &ident(id.as_str()),
+                &jobs::BuildJob {
+                    context_digest: "sha256:00",
+                    cache_dirs: &[],
+                    runner_args: &runner_args,
+                    engine: jobs::Engine::Buildah {
+                        local_tag: &id.tag(),
+                    },
+                    limit_secs: 60,
+                },
+            ))
+        };
+        assert_eq!(refused_by_admission(&openshift), Vec::<String>::new());
+        let mut incomplete_openshift = openshift.clone();
+        incomplete_openshift["metadata"]["annotations"]
+            .as_object_mut()
+            .unwrap()
+            .remove("io.kubernetes.cri-o.userns-mode");
+        assert!(
+            !refused_by_admission(&incomplete_openshift).is_empty(),
+            "an OpenShift builder needs the exact CRI-O user namespace"
+        );
         let run_mounts = run_mounts(Vec::new(), true);
         let buildkit = pod_of(&jobs::build_job(
             &broker.site,

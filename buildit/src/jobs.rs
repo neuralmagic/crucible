@@ -40,6 +40,9 @@ pub const LABEL_KIND: &str = "buildit.dev/kind";
 pub const LABEL_RUN: &str = "buildit.dev/run";
 pub const ANNOTATION_CANCELLED: &str = "buildit.dev/cancelled";
 const LABEL_QUEUE: &str = "kueue.x-k8s.io/queue-name";
+const OPENSHIFT_BUILDER: &str = "io.openshift.builder";
+const CRIO_USERNS_MODE: &str = "io.kubernetes.cri-o.userns-mode";
+const CRIO_USERNS_AUTO: &str = "auto:size=65536;map-to-root=true";
 
 const BUILDAH_IMAGE: &str = "quay.io/buildah/stable:latest";
 /// Where a BuildKit build's pod copies `buildkitd`, `buildctl`, `buildkit-runc` and `rootlesskit`
@@ -178,6 +181,19 @@ pub enum PodUsers {
     Namespaced,
     /// The node's, for clusters whose nodes cannot give pods user namespaces.
     Host,
+    /// A CRI-O user namespace selected by OpenShift's builder workload.
+    #[value(name = "openshift-builder")]
+    OpenShiftBuilder,
+}
+
+fn pod_annotations(users: PodUsers) -> Option<BTreeMap<String, String>> {
+    match users {
+        PodUsers::OpenShiftBuilder => Some(BTreeMap::from([
+            (OPENSHIFT_BUILDER.to_string(), "true".to_string()),
+            (CRIO_USERNS_MODE.to_string(), CRIO_USERNS_AUTO.to_string()),
+        ])),
+        PodUsers::Namespaced | PodUsers::Host => None,
+    }
 }
 
 /// Where and how every Job of one server runs.
@@ -1062,13 +1078,14 @@ fn job(
             template: core::PodTemplateSpec {
                 metadata: Some(ObjectMeta {
                     labels: Some(pod_labels),
+                    annotations: pod_annotations(site.users),
                     ..Default::default()
                 }),
                 spec: Some(core::PodSpec {
                     restart_policy: Some("Never".to_string()),
                     host_users: match site.users {
                         PodUsers::Namespaced => Some(false),
-                        PodUsers::Host => None,
+                        PodUsers::Host | PodUsers::OpenShiftBuilder => None,
                     },
                     automount_service_account_token: Some(false),
                     enable_service_links: Some(false),
@@ -1478,6 +1495,38 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|v| v["name"] == "cluster")
+        );
+    }
+
+    #[test]
+    fn an_openshift_builder_uses_the_crio_user_namespace() {
+        let labels = labels();
+        let mut site = site(None, cluster());
+        site.users = PodUsers::OpenShiftBuilder;
+        let args = ["1800".to_string(), "/tmp/t".to_string()];
+        let job = serde_json::to_value(build_job(
+            &site,
+            &ident("buildit-00000000000000a1", &labels),
+            &BuildJob {
+                context_digest: "sha256:ab",
+                cache_dirs: &[],
+                runner_args: &args,
+                engine: Engine::Buildah {
+                    local_tag: "localhost/buildit/x:latest",
+                },
+                limit_secs: 600,
+            },
+        ))
+        .unwrap();
+        let template = &job["spec"]["template"];
+        assert!(template["spec"].get("hostUsers").is_none());
+        assert_eq!(
+            template["metadata"]["annotations"]["io.openshift.builder"],
+            "true"
+        );
+        assert_eq!(
+            template["metadata"]["annotations"]["io.kubernetes.cri-o.userns-mode"],
+            "auto:size=65536;map-to-root=true"
         );
     }
 
