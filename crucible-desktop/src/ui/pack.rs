@@ -13,13 +13,12 @@ use crate::lsp::{self, Problem, Severity};
 use crate::pack::{PackFile, PackFiles};
 use crate::settings::LogFont;
 use crate::syntax;
-use crate::ui::Paint;
+use crate::ui::{Paint, rail};
 use crate::workspace::PaneKind;
 use crate::{App, PackSource};
 
 /// Lines drawn per file; a longer file says how much it left out.
 const LINES: usize = 4000;
-const FILE_LIST: f32 = 190.0;
 /// Problems listed under a file before the list scrolls.
 const LISTED: usize = 4;
 
@@ -44,7 +43,7 @@ pub(crate) fn pack_view(pack: Result<&PackFiles, &str>, font: LogFont, app: &App
 
     let mut list = col()
         .key("pack-files")
-        .w(FILE_LIST)
+        .w(rail::width(PaneKind::Pack, app))
         .h_full()
         .min_h(0.0)
         .gap(1.0)
@@ -90,8 +89,8 @@ pub(crate) fn pack_view(pack: Result<&PackFiles, &str>, font: LogFont, app: &App
                 .w_full()
                 .grow(1.0)
                 .min_h(0.0)
-                .gap(10.0)
                 .child(list)
+                .child(rail::handle(PaneKind::Pack, app, p))
                 .child(match open {
                     Some(file) => source(file, problems(app, pack, &file.path), font, app, p),
                     None => el().grow(1.0),

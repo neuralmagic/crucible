@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::editor::Editor;
 use crate::profile::Profile;
-use crate::workspace::Workspace;
+use crate::workspace::{Rails, Workspace};
 
 /// The colours the app paints with.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,6 +170,7 @@ pub struct Settings {
     pub tx02: Option<PathBuf>,
     /// The run workspace as the user last arranged it; `None` lays each run out by its graph.
     pub layout: Option<Workspace>,
+    pub rails: Rails,
     pub theme: Theme,
     pub appearance: Appearance,
     pub text_size: TextSize,
@@ -224,6 +225,8 @@ struct Config {
     tx02_path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     layout: Option<Workspace>,
+    #[serde(skip_serializing_if = "Rails::is_fitted")]
+    rails: Rails,
     theme: Theme,
     appearance: Appearance,
     text_size: TextSize,
@@ -293,6 +296,7 @@ impl Settings {
             log_font,
             tx02,
             layout: config.layout.and_then(Workspace::repaired),
+            rails: config.rails,
             theme: config.theme,
             appearance: config.appearance,
             text_size: config.text_size,
@@ -468,6 +472,13 @@ impl Settings {
         }
     }
 
+    pub fn set_rails(&mut self, rails: Rails) {
+        if self.rails != rails {
+            self.rails = rails;
+            self.save();
+        }
+    }
+
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
         self.save();
@@ -552,6 +563,7 @@ impl Settings {
             log_font: Some(self.log_font),
             tx02_path: None,
             layout: self.layout.clone(),
+            rails: self.rails,
             theme: self.theme,
             appearance: self.appearance,
             text_size: self.text_size,

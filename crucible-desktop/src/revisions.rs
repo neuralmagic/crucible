@@ -36,7 +36,6 @@ impl Range {
     }
 }
 
-/// One test-fire of a save.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fire {
     pub key: String,
@@ -44,27 +43,21 @@ pub struct Fire {
     pub status: LaunchStatus,
 }
 
-/// What the controller holds of one draft: its saves newest first, their test-fires, and the
-/// diff of the range on screen.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Read {
     pub history: Vec<DraftHistoryEntry>,
-    /// When each save landed, in `history`'s order.
     pub landed: Vec<Landed>,
     pub fires: Vec<Fire>,
     pub range: Range,
     pub diff: DraftDiff,
 }
 
-/// When a save landed: its Unix second, and `Nov 6 18:00` in the local zone.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Landed {
     pub at: Option<i64>,
     pub label: String,
 }
 
-/// What the window asks the worker to read: a draft, the range picked by hand if one was, and
-/// the save the run on screen ran.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Wanted {
     pub draft: String,
@@ -72,7 +65,6 @@ pub struct Wanted {
     pub ran: Option<i64>,
 }
 
-/// The answer to one request for a draft's history.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Revisions {
     pub wanted: Wanted,
@@ -96,7 +88,6 @@ fn holds(history: &[DraftHistoryEntry], version: i64) -> bool {
     history.iter().any(|entry| entry.version == version)
 }
 
-/// What one save changed: that save against the one before it.
 pub fn single(history: &[DraftHistoryEntry], version: i64) -> Range {
     Range {
         from: history
@@ -116,7 +107,6 @@ pub fn held(history: &[DraftHistoryEntry], range: Range) -> Option<Range> {
     })
 }
 
-/// How a save's newest test-fire went, when it has one that finished.
 pub fn verdict(fires: &[Fire], version: i64) -> Option<bool> {
     fires
         .iter()
@@ -182,7 +172,6 @@ pub fn halves(history: &[DraftHistoryEntry], range: Range) -> Option<(Range, Ran
     ))
 }
 
-/// The single save on either side of the one `range` ends at: the older and the newer.
 pub fn neighbours(history: &[DraftHistoryEntry], range: Range) -> (Option<Range>, Option<Range>) {
     let mut versions: Vec<i64> = history.iter().map(|entry| entry.version).collect();
     versions.sort_unstable();
@@ -196,7 +185,6 @@ pub fn neighbours(history: &[DraftHistoryEntry], range: Range) -> (Option<Range>
     )
 }
 
-/// Where a save sits against the range on screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Placement {
     From,
@@ -245,7 +233,6 @@ pub fn patch(diff: &DraftDiff) -> String {
     out
 }
 
-/// The lines `diff` adds and removes across its files.
 pub fn totals(diff: &DraftDiff) -> (u64, u64) {
     diff.files.iter().fold((0, 0), |(added, removed), file| {
         (added + file.additions, removed + file.deletions)

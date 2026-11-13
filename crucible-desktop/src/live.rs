@@ -308,9 +308,15 @@ enum Action {
     /// Read a target's params schema and the admin caps, for a launch form.
     Prepare(Target),
     /// Launch a target with this body (`params`, `max_cost`, `max_time`, maybe `rerun`).
-    Launch { target: Target, body: Value },
+    Launch {
+        target: Target,
+        body: Value,
+    },
     /// What rerunning a finished run from these tasks would reuse.
-    Rerun { run: String, from: Vec<String> },
+    Rerun {
+        run: String,
+        from: Vec<String>,
+    },
     /// Pull a draft's newest save into its working copy, creating the draft from `template`
     /// first when it does not exist.
     Pull {
@@ -334,7 +340,6 @@ enum Action {
         size: u64,
         settled: bool,
     },
-    /// Read a draft's saves, their test-fires, and the diff of one range of them.
     Revisions(Wanted),
 }
 
@@ -1780,7 +1785,6 @@ pub struct Snapshot {
     pub dropped: Option<Dropped>,
     /// The captured file last fetched for the Files pane.
     pub file: Option<Opened>,
-    /// The draft history last read for the History pane.
     pub revisions: Option<Arc<Revisions>>,
 }
 
@@ -2015,7 +2019,6 @@ impl Client {
         });
     }
 
-    /// Read `wanted`'s draft: its saves, their test-fires and the diff of its range.
     pub fn revisions(&self, wanted: Wanted) {
         self.start(Action::Revisions(wanted));
     }

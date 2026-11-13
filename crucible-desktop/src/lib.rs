@@ -439,6 +439,7 @@ pub struct App {
     pub pane_drag: Option<PaneDrag>,
     /// The divider being dragged and its neighbours' shares when the drag began.
     pub resizing: Option<(Divider, (f32, f32))>,
+    pub rail_drag: Option<workspace::RailDrag>,
     pub geometry: Geometry,
     /// The flare on the run a launch just started.
     pub ignition: ignition::Ignition,
@@ -454,6 +455,7 @@ pub struct App {
     pub keys_error: Option<String>,
     /// The account row's menu of profiles and local packs, while open.
     pub source_menu: bool,
+    pub panes_menu: bool,
     /// What the Dock and the menu bar were last told to show.
     tray: Option<tray::Shown>,
     /// The profiles not in use, as the background worker last read them, and which it reads.
@@ -1213,7 +1215,6 @@ impl App {
         }
     }
 
-    /// The draft history the History pane shows, while it is open on a run that has a draft.
     fn wanted_revisions(&self) -> Option<revisions::Wanted> {
         if !self.workspace().showing(PaneKind::History) {
             return None;
@@ -1248,12 +1249,10 @@ impl App {
         self.remote.revisions = Some(read);
     }
 
-    /// Compare these two saves in the History pane.
     pub fn pick_range(&mut self, range: revisions::Range) {
         self.run.history_range = Some(range);
     }
 
-    /// Read the History pane's draft again.
     pub fn reread_history(&mut self) {
         self.remote.revisions_sent = None;
     }
@@ -1721,6 +1720,7 @@ fn init() -> App {
         shown: Vec::new(),
         pane_drag: None,
         resizing: None,
+        rail_drag: None,
         geometry: Geometry::default(),
         ignition: ignition::Ignition::default(),
         logo_clicks: 0,
@@ -1729,6 +1729,7 @@ fn init() -> App {
         profile_form: None,
         keys_error: None,
         source_menu: false,
+        panes_menu: false,
         tray: None,
         fleet: Vec::new(),
         fleet_client: fleet::Client::spawn(net.handle()),

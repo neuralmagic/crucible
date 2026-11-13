@@ -70,6 +70,57 @@ impl PaneKind {
     }
 }
 
+/// How wide each pane's list is beside its content, once dragged; `None` is the pane's own width.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Rails {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    history: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pack: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    files: Option<f32>,
+}
+
+impl Rails {
+    pub const MIN: f32 = 140.0;
+
+    fn slot(&mut self, kind: PaneKind) -> Option<&mut Option<f32>> {
+        match kind {
+            PaneKind::History => Some(&mut self.history),
+            PaneKind::Pack => Some(&mut self.pack),
+            PaneKind::Files => Some(&mut self.files),
+            _ => None,
+        }
+    }
+
+    pub fn width(mut self, kind: PaneKind) -> f32 {
+        let fitted = match kind {
+            PaneKind::History => 236.0,
+            PaneKind::Files => 210.0,
+            _ => 190.0,
+        };
+        self.slot(kind).and_then(|slot| *slot).unwrap_or(fitted)
+    }
+
+    pub fn set(&mut self, kind: PaneKind, width: Option<f32>) {
+        if let Some(slot) = self.slot(kind) {
+            *slot = width.map(|width| width.max(Rails::MIN));
+        }
+    }
+
+    pub fn is_fitted(&self) -> bool {
+        *self == Rails::default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RailDrag {
+    pub kind: PaneKind,
+    pub from: f32,
+    pub now: f32,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Group {
     pub tabs: Vec<PaneKind>,
@@ -522,7 +573,9 @@ fn normalize<'a>(shares: impl Iterator<Item = &'a mut f32>) {
 
 #[cfg(test)]
 mod tests {
-    use crate::workspace::{Dock, Edge, MIN_SHARE, PaneKind, Workspace, depth, hit, neighbour};
+    use crate::workspace::{
+        Dock, Edge, MIN_SHARE, PaneKind, Rails, Workspace, depth, hit, neighbour,
+    };
 
     use PaneKind::{
         Agent, Compare, Data, Files, Graph, History, Launch, Log, Pack, Tasks, Timeline, Transcript,
@@ -591,6 +644,38 @@ mod tests {
         );
         sums_to_one(&w);
         assert_eq!(w.closed().collect::<Vec<_>>(), vec![Agent]);
+    }
+
+    #[test]
+    fn a_dragged_list_keeps_its_width_and_a_reset_goes_back_to_the_fitted_one() {
+        let mut rails = Rails::default();
+        assert!(rails.is_fitted());
+        let fitted = rails.width(History);
+        assert!(fitted > rails.width(Pack), "the saves list is the widest");
+
+        rails.set(History, Some(320.0));
+        assert_eq!(rails.width(History), 320.0);
+        assert_eq!(rails.width(Pack), Rails::default().width(Pack));
+        assert!(!rails.is_fitted());
+
+        rails.set(Files, Some(12.0));
+        assert_eq!(rails.width(Files), Rails::MIN, "no narrower than the least");
+
+        rails.set(Tasks, Some(400.0));
+        assert_eq!(
+            rails.width(Tasks),
+            Rails::default().width(Tasks),
+            "a pane without a list keeps none"
+        );
+
+        let stored = toml::to_string(&rails).unwrap();
+        assert_eq!(stored, "history = 320.0\nfiles = 140.0\n");
+        assert_eq!(toml::from_str::<Rails>(&stored).unwrap(), rails);
+
+        rails.set(History, None);
+        rails.set(Files, None);
+        assert_eq!(rails.width(History), fitted);
+        assert!(rails.is_fitted());
     }
 
     #[test]

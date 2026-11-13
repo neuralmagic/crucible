@@ -162,12 +162,19 @@ on `PATH`.
 A run's views are panes: Tasks, Timeline, Graph, Data, Files, Transcript, Compare, Pack, History,
 Launch and Log. Panes sit as tabs in groups,
 groups stack in columns, and the gutters between them resize (double-click evens a pair). Drag a
-tab onto another group's tab bar or middle to join it, or onto an edge to split that group. A pane
-can be closed and reopened from the header.
+tab onto another group's tab bar or middle to join it, or onto an edge to split that group. A tab
+bar too narrow for its labels draws every tab but the active one as its icon. `Panes` in the
+header lists every pane with its shortcut: a pick shows it, reopening it if it was closed, and the
+checked ones are on screen.
+
+![the Panes menu](docs/panes.png)
+
+The list beside the content of the Pack, Files and History panes drags by the handle between
+them, and a double-click on the handle takes its width back. The widths are kept in the config.
 
 Until a pane is moved, resized or closed, each run gets a fitted layout: the graph stacked over the
 tasks, taller the deeper the graph, beside the log. Once arranged, the layout is saved to the app's
-config and kept across runs; `Reset layout` goes back to the fitted one.
+config and kept across runs; `Reset layout` in the `Panes` menu goes back to the fitted one.
 
 The Timeline draws each task and fan-out instance when it ran, and each round of a revise loop
 on its task's own track, from the `at` stamps on its session events, with a strip of how many ran at once and the critical path drawn solid. A log
@@ -227,14 +234,17 @@ down a rail, newest first, with who saved it, the files it added (`A`), modified
 (`D`), whether it compiled, and how its newest test-fire went. A click on a test-fire's mark opens
 that launch. Beside the rail is the diff of two saves, unified or split.
 
+![a failed draft run's history, opened on the saves since a test-fire last passed](docs/history.png)
+
 A click on a save shows what it changed. `from` and `to` on a save, shown under the pointer, set
 either end of the range, so any two saves compare in either order. The arrows step one save older
 or newer.
 
 On a draft run that failed, the pane opens on everything saved since a test-fire last passed.
-While a range covers more than one save, the Bisect bar offers its older and newer half, split at
-the middle save; when that save was test-fired, the half its verdict points at is the highlighted
-one. Halving until one save is left finds the save that made the change.
+While a range covers more than one save, the two buttons beside the fork icon narrow it to its
+older or newer half, split at the middle save; when that save was test-fired, the half its
+verdict rules out is the muted one. Halving until one save is left finds the save that made the
+change.
 
 `CRUCIBLE_RANGE=4..6 CRUCIBLE_TAB=history` opens a headless scene on that range, and
 `CRUCIBLE_DIFF=split` draws it side by side.

@@ -3,9 +3,10 @@
 //! to join it, or to one of its edges to split it.
 
 use rune::{Color, Cursor, Drag, El, Icon, Phase, Tx, col, el, icon, row, text};
-use rune_kit::{Button, ButtonVariant, ControlSize};
+use rune_kit::{Button, ButtonVariant, ControlSize, Menu, MenuItem, Placement};
 use rune_theme_opencode::icons as oc;
 
+use crate::keymap::Command;
 use crate::ui::{
     Paint, Pane, agent, compare, data, empty_run, files, fx, graph, launch, log, pack, revisions,
     tasks, timeline, transcript, tube,
@@ -53,37 +54,48 @@ pub(crate) fn workspace(pane: &Pane, app: &App, p: &Paint) -> El {
     area
 }
 
-/// The tools above the workspace: reopen a closed pane, or go back to the fitted layout.
-pub(crate) fn tools(app: &App, p: &Paint) -> Option<El> {
-    let layout = app.layout.as_ref()?;
-    let mut bar = row().key("ws-tools").gap(4.0).center_y();
-    for kind in layout
-        .closed()
+/// Every pane in one menu: a pick shows it, opening it if it was closed. The checked ones are
+/// on screen now.
+pub(crate) fn tools(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
+    let ws = app.workspace();
+    let trigger = Button::new("Panes")
+        .icon(&oc::DOT_GRID)
+        .variant(ButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .on_press(|app: &mut App| app.panes_menu = !app.panes_menu)
+        .build(p.k)
+        .key("panes-menu-button");
+    let mut menu = Menu::new("panes-menu")
+        .trigger(trigger)
+        .placement(Placement::BottomEnd)
+        .min_width(200.0);
+    for kind in PaneKind::ALL
+        .into_iter()
         .filter(|kind| *kind != PaneKind::Agent || app.agent_available())
     {
-        bar = bar.child(
-            Button::new(kind.label())
-                .icon(&oc::PLUS)
-                .variant(ButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .on_press(move |app: &mut App| {
-                    app.arrange(|layout| layout.activate(kind));
-                    app.save_layout();
-                })
-                .build(p.k)
-                .key(format!("reopen-{}", slug(kind))),
-        );
+        let mut item = MenuItem::new(kind.label())
+            .icon(glyph(kind))
+            .checked(ws.showing(kind));
+        if let Some(keys) = app.keymap.keys(Command::Show(kind)).first() {
+            item = item.shortcut(keys.keycaps().join(""));
+        }
+        menu = menu.item(item.on_select(move |app: &mut App| {
+            app.panes_menu = false;
+            app.show_pane(kind);
+        }));
     }
-    Some(
-        bar.child(
-            Button::new("Reset layout")
-                .variant(ButtonVariant::GhostMuted)
-                .control_size(ControlSize::Small)
-                .on_press(|app: &mut App| app.reset_layout())
-                .build(p.k)
-                .key("reset-layout"),
-        ),
-    )
+    menu.separator()
+        .item(
+            MenuItem::new("Reset layout")
+                .disabled(app.layout.is_none())
+                .on_select(|app: &mut App| {
+                    app.panes_menu = false;
+                    app.reset_layout();
+                }),
+        )
+        .open(app.panes_menu)
+        .on_close(|app: &mut App| app.panes_menu = false)
+        .build(p.k, layer)
 }
 
 fn slug(kind: PaneKind) -> String {
@@ -117,8 +129,17 @@ fn group_view(at: At, group: &Group, pane: &Pane, app: &App, p: &Paint) -> El {
         .gap(2.0)
         .center_y()
         .fill(p.c.layer_01);
+    let crowded = app.geometry.groups.get(&at).is_some_and(|rect| {
+        let labelled: f32 = group
+            .tabs
+            .iter()
+            .map(|kind| tab_width(*kind, closable, p))
+            .sum();
+        labelled + 2.0 * group.tabs.len() as f32 + 10.0 > rect[2]
+    });
     for kind in &group.tabs {
-        bar = bar.child(tab(*kind, *kind == group.active, closable, app, p));
+        let active = *kind == group.active;
+        bar = bar.child(tab(*kind, active, closable, crowded && !active, app, p));
     }
 
     let mut frame = col()
@@ -214,7 +235,14 @@ fn content(kind: PaneKind, pane: &Pane, app: &App, p: &Paint) -> El {
     }
 }
 
-fn tab(kind: PaneKind, active: bool, closable: bool, app: &App, p: &Paint) -> El {
+/// What a tab takes with its label and close button, near enough to tell when a bar overflows.
+fn tab_width(kind: PaneKind, closable: bool, p: &Paint) -> f32 {
+    let label = kind.label().len() as f32 * 7.6 * p.text;
+    9.0 + 14.0 + 6.0 + label + if closable { 6.0 + 18.0 + 3.0 } else { 9.0 }
+}
+
+/// A tab; `folded` draws it as its icon alone, for a bar too narrow for every label.
+fn tab(kind: PaneKind, active: bool, closable: bool, folded: bool, app: &App, p: &Paint) -> El {
     let dragging = app
         .pane_drag
         .is_some_and(|drag| drag.kind == kind && drag.moved);
@@ -225,7 +253,7 @@ fn tab(kind: PaneKind, active: bool, closable: bool, app: &App, p: &Paint) -> El
         .checked(active)
         .h(26.0)
         .pl(9.0)
-        .pr(if closable { 3.0 } else { 9.0 })
+        .pr(if closable && !folded { 3.0 } else { 9.0 })
         .gap(6.0)
         .center_y()
         .radius(p.k.radius.md)
@@ -251,12 +279,15 @@ fn tab(kind: PaneKind, active: bool, closable: bool, app: &App, p: &Paint) -> El
             p.c.icon_base
         } else {
             p.c.icon_muted
-        }))
-        .child(text(kind.label()).font(p.k.ty.ui_medium).color(if active {
-            p.c.text_base
-        } else {
-            p.c.text_muted
         }));
+    if folded {
+        return t.help(kind.label());
+    }
+    t = t.child(text(kind.label()).font(p.k.ty.ui_medium).color(if active {
+        p.c.text_base
+    } else {
+        p.c.text_muted
+    }));
     if closable {
         let close = row()
             .key("close")
