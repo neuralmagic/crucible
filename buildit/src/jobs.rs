@@ -499,7 +499,17 @@ const BUILD_RUN: &str = r#"for f in ccache.conf cache.json; do [ -e "/buildit-in
 : > "$log"
 sh -c "$runner" sh "$log" "$@" &
 r=$!
-tail -n +1 -f -s 0.2 --pid=$r "$log" &
+mirror() {
+  seen=0
+  while kill -0 "$r" 2> /dev/null; do
+    lines=$(wc -l < "$log")
+    if [ "$lines" -gt "$seen" ]; then sed -n "$((seen + 1)),${lines}p" "$log"; seen=$lines; fi
+    sleep 1
+  done
+  lines=$(wc -l < "$log")
+  [ "$lines" -le "$seen" ] || sed -n "$((seen + 1)),${lines}p" "$log"
+}
+mirror &
 wait $r
 wait
 rec=$(head -n 1 "$log.exit" 2> /dev/null)
@@ -1664,6 +1674,10 @@ mod tests {
         assert_eq!(builder["image"], KANIKO_IMAGE);
         assert_eq!(builder["securityContext"]["runAsUser"], 0);
         assert!(builder["securityContext"].get("privileged").is_none());
+        let script = builder["command"][2].as_str().unwrap();
+        assert!(script.contains("mirror()"));
+        assert!(!script.contains("tail -n +1 -f"));
+        assert!(!script.contains("--pid"));
         let mounts = builder["volumeMounts"].as_array().unwrap();
         assert!(mounts.iter().any(|m| m["mountPath"] == "/cache"));
         assert!(mounts.iter().any(|m| m["mountPath"] == "/buildit"));
