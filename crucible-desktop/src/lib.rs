@@ -49,6 +49,7 @@ mod principals;
 mod profile;
 mod provider;
 mod remote;
+mod revisions;
 mod runs;
 mod runs_on;
 mod search;
@@ -363,6 +364,9 @@ pub struct RunView {
     pub compact_graph: Option<bool>,
     /// The launch picked to compare against; `None` takes the one before.
     pub compare_to: Option<String>,
+    /// The saves the History pane compares, once picked by hand; `None` opens on the save the
+    /// run ran.
+    pub history_range: Option<revisions::Range>,
     /// Only lines from this task or fan-out instance.
     pub log_task: Option<String>,
     /// Log blocks opened or folded by hand, by task or instance name.
@@ -1120,6 +1124,7 @@ impl App {
         self.answer_draft(snapshot.synced);
         self.answer_drop(snapshot.dropped);
         self.answer_file(snapshot.file);
+        self.answer_revisions(snapshot.revisions);
         self.announce(&snapshot.finished);
         self.reconcile();
     }
@@ -1199,6 +1204,58 @@ impl App {
             }
             self.remote.file_sent = file;
         }
+        let history = self.wanted_revisions();
+        if history != self.remote.revisions_sent {
+            if let Some(wanted) = &history {
+                self.remote.live_client.revisions(wanted.clone());
+            }
+            self.remote.revisions_sent = history;
+        }
+    }
+
+    /// The draft history the History pane shows, while it is open on a run that has a draft.
+    fn wanted_revisions(&self) -> Option<revisions::Wanted> {
+        if !self.workspace().showing(PaneKind::History) {
+            return None;
+        }
+        let (draft, _) = self.draft_target()?;
+        let ran = self
+            .selected_detail()
+            .and_then(|detail| detail.launch.as_ref())
+            .and_then(|record| record.launch.draft_version);
+        Some(revisions::Wanted {
+            draft,
+            range: self.run.history_range,
+            ran,
+        })
+    }
+
+    fn answer_revisions(&mut self, read: Option<std::sync::Arc<revisions::Revisions>>) {
+        let Some(read) = read else {
+            return;
+        };
+        let held = self.remote.revisions.as_ref();
+        if held.is_some_and(|held| std::sync::Arc::ptr_eq(held, &read))
+            || Some(&read.wanted) != self.remote.revisions_sent.as_ref()
+        {
+            return;
+        }
+        if let Ok(history) = &read.result {
+            self.remote
+                .revisions_diff
+                .set_files(rune_kit::diff::parse(&revisions::patch(&history.diff)));
+        }
+        self.remote.revisions = Some(read);
+    }
+
+    /// Compare these two saves in the History pane.
+    pub fn pick_range(&mut self, range: revisions::Range) {
+        self.run.history_range = Some(range);
+    }
+
+    /// Read the History pane's draft again.
+    pub fn reread_history(&mut self) {
+        self.remote.revisions_sent = None;
     }
 
     /// The run, key and listed size of the captured file the Files tab shows, while it is open
@@ -1934,6 +1991,8 @@ pub fn run() {
             }),
             // `CRUCIBLE_LIVE_SCENE=<playbook id>` opens that live playbook headlessly, and
             // `CRUCIBLE_LINK=<crucible-playbooks:// link>` follows a link as the system would.
+            // `CRUCIBLE_RANGE=<from>..<to>` picks the saves the History pane compares, and
+            // `CRUCIBLE_DIFF=split` draws them side by side.
             ("live", |app: &mut App| {
                 app.backend = Backend::Controller;
                 scene_tab(app);
@@ -1945,6 +2004,14 @@ pub fn run() {
                     .and_then(|url| Link::parse(&url))
                 {
                     app.follow(&link);
+                }
+                app.run.history_range = std::env::var("CRUCIBLE_RANGE")
+                    .ok()
+                    .and_then(|range| revisions::Range::parse(&range));
+                if std::env::var("CRUCIBLE_DIFF").is_ok_and(|mode| mode == "split") {
+                    app.remote
+                        .revisions_diff
+                        .set_mode(rune_kit::diff::DiffMode::Split);
                 }
             }),
         ],

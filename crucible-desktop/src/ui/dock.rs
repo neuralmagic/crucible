@@ -7,8 +7,8 @@ use rune_kit::{Button, ButtonVariant, ControlSize};
 use rune_theme_opencode::icons as oc;
 
 use crate::ui::{
-    Paint, Pane, agent, compare, data, empty_run, files, fx, graph, launch, log, pack, tasks,
-    timeline, transcript, tube,
+    Paint, Pane, agent, compare, data, empty_run, files, fx, graph, launch, log, pack, revisions,
+    tasks, timeline, transcript, tube,
 };
 use crate::workspace::{At, Divider, Dock, Edge, Group, PaneDrag, PaneKind, hit};
 use crate::{App, gfx};
@@ -103,6 +103,7 @@ pub(crate) fn glyph(kind: PaneKind) -> &'static Icon {
         PaneKind::Launch => &oc::GLOBE,
         PaneKind::Log => &oc::CONSOLE,
         PaneKind::Agent => &oc::SPEECH_BUBBLE,
+        PaneKind::History => &oc::OUTLINE_LIST_CHANGELOG,
     }
 }
 
@@ -209,6 +210,7 @@ fn content(kind: PaneKind, pane: &Pane, app: &App, p: &Paint) -> El {
             log::log_pane(pane.transcript, pane.log, pane.tasks, pane.log_font, app, p)
         }
         PaneKind::Agent => agent::panel(pane.log_font, app, p),
+        PaneKind::History => revisions::history_view(app, p),
     }
 }
 

@@ -59,6 +59,13 @@ pub struct Remote {
     /// The fetched file read as a patch, when it is one.
     pub file_diff: rune_kit::diff::DiffState,
 
+    /// The draft history last asked of the live worker.
+    pub revisions_sent: Option<crate::revisions::Wanted>,
+    /// The draft history the live worker last read.
+    pub revisions: Option<Arc<crate::revisions::Revisions>>,
+    /// That read's diff, as the History pane draws it.
+    pub revisions_diff: rune_kit::diff::DiffState,
+
     /// The working copy of the draft the shown pack edits, and its files as last read.
     pub working: Option<Working>,
     pub working_pack: Option<PackFiles>,
@@ -124,6 +131,9 @@ impl Remote {
             file_sent: None,
             opened_file: None,
             file_diff: rune_kit::diff::DiffState::default(),
+            revisions_sent: None,
+            revisions: None,
+            revisions_diff: rune_kit::diff::DiffState::default(),
             working: None,
             working_pack: None,
             working_preview: None,

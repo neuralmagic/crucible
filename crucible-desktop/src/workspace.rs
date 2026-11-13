@@ -33,10 +33,11 @@ pub enum PaneKind {
     Launch,
     Log,
     Agent,
+    History,
 }
 
 impl PaneKind {
-    pub const ALL: [PaneKind; 11] = [
+    pub const ALL: [PaneKind; 12] = [
         PaneKind::Tasks,
         PaneKind::Timeline,
         PaneKind::Graph,
@@ -48,6 +49,7 @@ impl PaneKind {
         PaneKind::Launch,
         PaneKind::Log,
         PaneKind::Agent,
+        PaneKind::History,
     ];
 
     pub fn label(self) -> &'static str {
@@ -63,6 +65,7 @@ impl PaneKind {
             PaneKind::Launch => "Launch",
             PaneKind::Log => "Log",
             PaneKind::Agent => "Agent",
+            PaneKind::History => "History",
         }
     }
 }
@@ -147,6 +150,7 @@ impl Workspace {
                                 PaneKind::Tasks,
                                 PaneKind::Compare,
                                 PaneKind::Pack,
+                                PaneKind::History,
                                 PaneKind::Launch,
                             ],
                             1.0 - graph,
@@ -521,7 +525,7 @@ mod tests {
     use crate::workspace::{Dock, Edge, MIN_SHARE, PaneKind, Workspace, depth, hit, neighbour};
 
     use PaneKind::{
-        Agent, Compare, Data, Files, Graph, Launch, Log, Pack, Tasks, Timeline, Transcript,
+        Agent, Compare, Data, Files, Graph, History, Launch, Log, Pack, Tasks, Timeline, Transcript,
     };
 
     #[test]
@@ -578,7 +582,10 @@ mod tests {
         assert_eq!(
             tabs(&w),
             vec![
-                vec![vec![Graph, Timeline], vec![Tasks, Compare, Pack, Launch]],
+                vec![
+                    vec![Graph, Timeline],
+                    vec![Tasks, Compare, Pack, History, Launch]
+                ],
                 vec![vec![Log, Data, Files, Transcript]]
             ]
         );
@@ -623,7 +630,7 @@ mod tests {
             vec![
                 vec![
                     vec![Graph, Timeline],
-                    vec![Tasks, Compare, Pack, Launch, Log]
+                    vec![Tasks, Compare, Pack, History, Launch, Log]
                 ],
                 vec![vec![Data, Files, Transcript]]
             ]
@@ -641,7 +648,7 @@ mod tests {
             tabs(&w)[0],
             vec![
                 vec![Graph, Timeline],
-                vec![Tasks, Compare, Launch],
+                vec![Tasks, Compare, History, Launch],
                 vec![Pack]
             ]
         );
@@ -652,7 +659,11 @@ mod tests {
         assert_eq!(
             tabs(&w),
             vec![
-                vec![vec![Timeline], vec![Tasks, Compare, Launch], vec![Pack]],
+                vec![
+                    vec![Timeline],
+                    vec![Tasks, Compare, History, Launch],
+                    vec![Pack]
+                ],
                 vec![vec![Log, Data, Files, Transcript]],
                 vec![vec![Graph]]
             ]
@@ -673,7 +684,7 @@ mod tests {
             vec![
                 vec![Graph, Timeline],
                 vec![Pack],
-                vec![Tasks, Compare, Launch]
+                vec![Tasks, Compare, History, Launch]
             ]
         );
         let before = w.clone();
@@ -698,9 +709,10 @@ mod tests {
         w.close(Pack);
         w.close(Launch);
         w.close(Compare);
+        w.close(History);
         w.close(Tasks);
         assert_eq!(tabs(&w), vec![vec![vec![Tasks]]]);
-        assert_eq!(w.closed().count(), 10);
+        assert_eq!(w.closed().count(), 11);
         w.activate(Log);
         assert_eq!(tabs(&w), vec![vec![vec![Tasks, Log]]]);
         assert_eq!(w.columns[0].groups[0].active, Log);
@@ -723,7 +735,7 @@ mod tests {
             tabs(&w),
             vec![vec![
                 vec![Graph, Timeline, Data],
-                vec![Tasks, Compare, Pack, Launch]
+                vec![Tasks, Compare, Pack, History, Launch]
             ]]
         );
     }
@@ -737,7 +749,7 @@ mod tests {
             tabs(&w)[0],
             vec![
                 vec![Graph, Timeline],
-                vec![Tasks, Compare, Pack, Launch],
+                vec![Tasks, Compare, Pack, History, Launch],
                 vec![Agent]
             ]
         );

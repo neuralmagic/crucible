@@ -24,6 +24,7 @@ mod palette;
 mod policy;
 mod profiles;
 mod providers;
+mod revisions;
 mod runs;
 mod schedules;
 mod secrets;
