@@ -288,6 +288,20 @@ fn draft_files() {
 }
 
 #[test]
+fn draft_log() {
+    same::<ops::drafts::DraftLog>(&["cal"], json!({"draft_id": "cal"}));
+}
+
+#[test]
+fn draft_diff() {
+    same::<ops::drafts::DraftDiff>(
+        &["cal", "--from", "2", "--to", "5", "--stat"],
+        json!({"draft_id": "cal", "from": 2, "to": 5, "stat": true}),
+    );
+    same::<ops::drafts::DraftDiff>(&["cal"], json!({"draft_id": "cal"}));
+}
+
+#[test]
 fn draft_create() {
     same::<ops::drafts::DraftCreate>(
         &["cal", "--description", "d", "--template", "survey"],

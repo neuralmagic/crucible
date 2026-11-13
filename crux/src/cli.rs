@@ -187,6 +187,14 @@ enum Command {
     /// A draft pack's files at one save, with the version a save must be based on.
     DraftFiles(ops::drafts::DraftFiles),
 
+    /// A draft's saves as a changelog, newest first: who saved each, whether it compiled, and
+    /// which files it changed.
+    DraftLog(ops::drafts::DraftLog),
+
+    /// The unified diff between two saves of a draft. Defaults to the newest save against the one
+    /// before it; any two versions compare, in either order.
+    DraftDiff(ops::drafts::DraftDiff),
+
     /// Create a draft pack in the authoring studio, from a template or a skeleton.
     DraftCreate(ops::drafts::DraftCreate),
 
@@ -485,6 +493,8 @@ pub async fn run() -> Result<()> {
         Command::Approvals(op) => op.run(&c).await?,
         Command::PlaybookImport(op) => op.run(&c).await?,
         Command::DraftFiles(op) => op.run(&c).await?,
+        Command::DraftLog(op) => op.run(&c).await?,
+        Command::DraftDiff(op) => op.run(&c).await?,
         Command::DraftCreate(op) => op.run(&c).await?,
         Command::DraftSave(args) => args.into_op()?.run(&c).await?,
         Command::DraftPull(op) => op.run(&c).await?,

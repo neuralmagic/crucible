@@ -845,6 +845,83 @@ pub fn draft_files(id: &str, f: &dto::DraftFiles) -> String {
     out
 }
 
+fn change_letter(change: dto::FileChange) -> char {
+    match change {
+        dto::FileChange::Added => 'A',
+        dto::FileChange::Removed => 'D',
+        dto::FileChange::Modified => 'M',
+    }
+}
+
+/// A draft's saves as a changelog, newest first: who saved each, whether it compiled, and the
+/// files it changed from the save before it.
+pub fn draft_log(id: &str, history: &[dto::DraftHistoryEntry]) -> String {
+    let mut out = format!("draft {id}: {} saves\n", history.len());
+    for entry in history {
+        let compiled = match (&entry.schema_digest, entry.diagnostics) {
+            (Some(_), _) => "compiles".to_string(),
+            (None, n) => format!("does not compile, {n} diagnostics"),
+        };
+        out.push_str(&format!(
+            "v{}  {}  {}  {compiled}\n",
+            entry.version,
+            blank_as_dash(&entry.created_at),
+            or_dash(entry.created_by.as_deref()),
+        ));
+        match entry.changes.as_deref() {
+            None => out.push_str("  changes unknown: no stored tree to compare\n"),
+            Some([]) => out.push_str("  no file changes\n"),
+            Some(changes) => {
+                for file in changes {
+                    out.push_str(&format!("  {} {}\n", change_letter(file.change), file.path));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// What differs between two saves: one summary line per file, then each file's unified diff
+/// unless `stat` asked for the summary alone.
+pub fn draft_diff(id: &str, diff: &dto::DraftDiff, stat: bool) -> String {
+    let from = diff
+        .from
+        .map_or_else(|| "empty".to_string(), |v| format!("v{v}"));
+    let mut out = format!("draft {id} {from} -> v{}: ", diff.to);
+    if diff.files.is_empty() {
+        out.push_str("no changes\n");
+        return out;
+    }
+    let additions: u64 = diff.files.iter().map(|f| f.additions).sum();
+    let deletions: u64 = diff.files.iter().map(|f| f.deletions).sum();
+    out.push_str(&format!(
+        "{} files changed, +{additions} -{deletions}\n",
+        diff.files.len()
+    ));
+    for file in &diff.files {
+        let counts = match file.unified {
+            Some(_) => format!("+{} -{}", file.additions, file.deletions),
+            None => "not text".to_string(),
+        };
+        out.push_str(&format!(
+            "{} {}  {counts}\n",
+            change_letter(file.change),
+            file.path
+        ));
+    }
+    if stat {
+        return out;
+    }
+    for file in &diff.files {
+        out.push('\n');
+        match &file.unified {
+            Some(unified) => out.push_str(unified),
+            None => out.push_str(&format!("Binary file {} differs\n", file.path)),
+        }
+    }
+    out
+}
+
 /// A pull that landed: where the pack is, and the version a push back must be based on.
 pub fn draft_pulled(id: &str, version: i64, dir: &std::path::Path, files: &[String]) -> String {
     let mut out = format!(
@@ -2791,6 +2868,63 @@ mod tests {
             "a file without a trailing newline still ends one: {out}"
         );
         assert!(out.contains("\n--- crucible.toml\n[workflow]\n"), "{out}");
+    }
+
+    #[test]
+    fn a_draft_log_reads_as_a_changelog_newest_first() {
+        let history: Vec<dto::DraftHistoryEntry> = serde_json::from_str(
+            r#"[{"version":4,"created_by":"wynn","created_at":"2026-08-23T12:00:00Z",
+                 "schema_digest":null,"diagnostics":2,"previous_version":3,"changes":null},
+                {"version":3,"created_by":"agent-7","created_at":"2026-08-23T11:00:00Z",
+                 "schema_digest":"sha256:cc","diagnostics":0,"previous_version":2,"changes":[]},
+                {"version":2,"created_by":"wynn","created_at":"2026-08-23T10:00:00Z",
+                 "schema_digest":"sha256:bb","diagnostics":0,"previous_version":1,
+                 "changes":[{"path":"old.md","change":"removed"},
+                            {"path":"skills/review.md","change":"added"},
+                            {"path":"wf.crux","change":"modified"}]}]"#,
+        )
+        .expect("the history fixture parses");
+        assert_eq!(
+            draft_log("calibrate", &history),
+            "draft calibrate: 3 saves\n\
+             v4  2026-08-23T12:00:00Z  wynn  does not compile, 2 diagnostics\n\
+             \x20 changes unknown: no stored tree to compare\n\
+             v3  2026-08-23T11:00:00Z  agent-7  compiles\n\
+             \x20 no file changes\n\
+             v2  2026-08-23T10:00:00Z  wynn  compiles\n\
+             \x20 D old.md\n\
+             \x20 A skills/review.md\n\
+             \x20 M wf.crux\n"
+        );
+    }
+
+    #[test]
+    fn a_draft_diff_summarizes_then_prints_each_unified_diff() {
+        let diff: dto::DraftDiff = serde_json::from_str(
+            r#"{"from":2,"to":4,"files":[
+                 {"path":"logo.png","change":"modified","additions":0,"deletions":0,"unified":null},
+                 {"path":"wf.crux","change":"modified","additions":1,"deletions":1,
+                  "unified":"--- a/wf.crux\n+++ b/wf.crux\n@@ -1 +1 @@\n-task a {}\n+task b {}\n"}]}"#,
+        )
+        .expect("the diff fixture parses");
+        let summary = "draft calibrate v2 -> v4: 2 files changed, +1 -1\n\
+                       M logo.png  not text\n\
+                       M wf.crux  +1 -1\n";
+        assert_eq!(draft_diff("calibrate", &diff, true), summary);
+        assert_eq!(
+            draft_diff("calibrate", &diff, false),
+            format!(
+                "{summary}\nBinary file logo.png differs\n\
+                 \n--- a/wf.crux\n+++ b/wf.crux\n@@ -1 +1 @@\n-task a {{}}\n+task b {{}}\n"
+            )
+        );
+
+        let first: dto::DraftDiff =
+            serde_json::from_str(r#"{"from":null,"to":1,"files":[]}"#).expect("parses");
+        assert_eq!(
+            draft_diff("calibrate", &first, false),
+            "draft calibrate empty -> v1: no changes\n"
+        );
     }
 
     #[test]

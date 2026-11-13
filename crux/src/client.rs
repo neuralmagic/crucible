@@ -1231,6 +1231,31 @@ impl Client {
         .await
     }
 
+    /// A draft's saves, newest first, each with the files it changed.
+    pub async fn draft_history<T: DeserializeOwned>(&self, id: &str) -> Result<T> {
+        self.get(&format!("/api/playbook-drafts/{}/history", encode(id)))
+            .await
+    }
+
+    /// What differs between two saves of a draft. `to` defaults to the newest save and `from` to
+    /// the one before `to`.
+    pub async fn draft_diff<T: DeserializeOwned>(
+        &self,
+        id: &str,
+        from: Option<i64>,
+        to: Option<i64>,
+    ) -> Result<T> {
+        let mut q = Query::new();
+        q.push("from", from.map(|v| v.to_string()).as_deref());
+        q.push("to", to.map(|v| v.to_string()).as_deref());
+        self.get(&format!(
+            "/api/playbook-drafts/{}/diff{}",
+            encode(id),
+            q.finish()
+        ))
+        .await
+    }
+
     /// What a stored version compiled to: the same form, graph and diagnostics the studio paints,
     /// without launching it.
     pub async fn draft_preview<T: DeserializeOwned>(
