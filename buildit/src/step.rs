@@ -47,14 +47,17 @@ stage() {
 }
 secs=$1; term=$2; stamps=$3; steps=$4; plan=$5; url=$6; auth=$7; restore=$8; save=$9; shift 9
 sleep 2147483647 & hold=$!
-{
-  tail -n +1 -f -s 0.1 --pid=$hold "$log" 2> /dev/null \
-    | grep --line-buffered -E "$stamps" \
+stamp() {
+  grep -E "$stamps" "$log" 2> /dev/null \
     | while IFS= read -r l; do
         grep -qxF -e "$l" "$log.stamped" 2> /dev/null && continue
         printf '%s\n' "$l" >> "$log.stamped"
         printf '%s %s\n' "$(date +%s%N)" "$l"
       done
+}
+{
+  while kill -0 "$hold" 2> /dev/null; do stamp; sleep 0.1; done
+  stamp
   n=50; while [ ! -s "$log.exit" ] && [ "$n" -gt 0 ]; do sleep 0.1; n=$((n - 1)); done
   printf '%s END %s\n' "$(date +%s%N)" "$(head -n 1 "$log.exit" 2> /dev/null)"
 } >> "$steps" &
