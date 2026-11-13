@@ -29,6 +29,8 @@ pub const BUILDAH_STAMPS: &str = "^(STEP |COMMIT |CACHE )";
 /// The log lines a `buildctl build` build stamps: each vertex `buildctl` names as a step of a
 /// stage, the export, and the cache stages.
 pub const BUILDKIT_STAMPS: &str = r"^(#[0-9]+ \[|#[0-9]+ exporting to image|CACHE )";
+/// The log lines a Kaniko build stamps: Dockerfile commands, snapshot/push progress and caches.
+pub const KANIKO_STAMPS: &str = r"^(INFO.*(RUN|COPY|Taking snapshot|Pushing image)|CACHE )";
 
 /// Arguments: the log, the build's timeout, the termination file, the regex of the log lines to
 /// stamp, the steps file, the snapshot plan, the shared cache's URL, the save header file,

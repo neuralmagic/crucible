@@ -61,20 +61,24 @@ spec:
         size(object.spec.containers) == 1 &&
         object.spec.containers.all(c,
         (c.name == 'builder' && c.image in
-        ['quay.io/buildah/stable:latest', 'gcr.io/go-containerregistry/crane:debug']) ||
+        ['quay.io/buildah/stable@sha256:7bb110e1d8b761d08e87d004ea4086e295a52319f3ea70ecef65da6dff7ceef0',
+        'gcr.io/kaniko-project/executor@sha256:9e22d0ba2c78cffbd47e2269aa6d3dc43fc3e3ecc6b61262399279dec5e67d45',
+        'gcr.io/go-containerregistry/crane:debug']) ||
         (c.name in ['run', 'layer'] && c.image.contains('@sha256:')))
       message: >-
-        a pod here runs one container: builder from buildah or crane, or a run or a layer build
-        from an image by digest
+        a pod here runs one container: builder from buildah, kaniko or crane, or a run or a layer
+        build from an image by digest
     - expression: >-
         variables.inits.all(c,
         (c.name == 'fetch' && c.image == 'gcr.io/go-containerregistry/crane:debug' &&
         !has(c.restartPolicy)) ||
         (c.name == 'buildkit' && c.image == 'docker.io/moby/buildkit:v0.35.0-rootless' &&
         !has(c.restartPolicy)) ||
-        (c.name == 'prepare' && c.image == 'quay.io/buildah/stable:latest' &&
+        (c.name == 'prepare' && c.image ==
+        'quay.io/buildah/stable@sha256:7bb110e1d8b761d08e87d004ea4086e295a52319f3ea70ecef65da6dff7ceef0' &&
         !has(c.restartPolicy)) ||
-        (c.name == 'archive' && c.image == 'quay.io/buildah/stable:latest' &&
+        (c.name == 'archive' && c.image ==
+        'quay.io/buildah/stable@sha256:7bb110e1d8b761d08e87d004ea4086e295a52319f3ea70ecef65da6dff7ceef0' &&
         has(c.restartPolicy) && c.restartPolicy == 'Always'))
       message: >-
         a pod here has init containers fetch (crane), buildkit (BuildKit), prepare (buildah) and

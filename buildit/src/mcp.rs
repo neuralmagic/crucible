@@ -980,7 +980,8 @@ pub struct BuildParams {
     /// /buildit/ccache-stats.log. Needs ccache 4.4 or later in the image
     #[serde(default)]
     pub ccache: bool,
-    /// What builds the Dockerfile: "buildah" or "buildkit" (default the server's, which `build`
+    /// What builds the Dockerfile: "buildah", "buildkit" or "kaniko" (default the server's,
+    /// which `build`
     /// and `status` report). They differ where buildah departs from `docker build`: under
     /// buildah a COPY whose wildcard matches nothing fails the build, under buildkit it copies
     /// nothing. buildkit is experimental
@@ -1175,6 +1176,38 @@ fn buildctl_argv(
         "--metadata-file".to_string(),
         jobs::buildkit_metadata(),
     ]);
+    Ok(out)
+}
+
+fn kaniko_argv(
+    dockerfile: &RelPath,
+    target: Option<&str>,
+    build_args: &BTreeMap<String, String>,
+    dest: &str,
+    registry: &jobs::Registry,
+) -> Result<Vec<String>> {
+    let mut out = vec![
+        "/kaniko/executor".to_string(),
+        format!("--context=dir://{}", jobs::WORKSPACE),
+        format!("--dockerfile={}/{}", jobs::WORKSPACE, dockerfile.as_str()),
+        format!("--destination={dest}"),
+        format!("--digest-file={}/image", jobs::OUT),
+    ];
+    if let Some(target) = target {
+        out.push(format!("--target={target}"));
+    }
+    for (key, value) in checked_build_args(build_args)? {
+        out.push(format!("--build-arg={key}={value}"));
+    }
+    if registry.is_cluster() {
+        out.push(format!(
+            "--registry-certificate={}={}/service-ca.crt",
+            registry.host(),
+            "/buildit-cluster"
+        ));
+    } else {
+        out.extend(["--insecure".to_string(), "--skip-tls-verify".to_string()]);
+    }
     Ok(out)
 }
 
@@ -1821,6 +1854,16 @@ impl Broker {
                 )?,
                 step::BUILDKIT_STAMPS,
             ),
+            jobs::Builder::Kaniko => (
+                kaniko_argv(
+                    &dockerfile,
+                    p.target.as_deref(),
+                    &p.build_args,
+                    &jobs::build_dest(&self.site, caller.sandbox.as_str(), id.as_str()),
+                    &self.site.registry,
+                )?,
+                step::KANIKO_STAMPS,
+            ),
         };
         let files = (!snapshots.plan.is_empty()).then(|| step::SnapshotFiles {
             plan: format!("{INPUTS_DIR}/snapshots"),
@@ -1880,6 +1923,7 @@ impl Broker {
                                 local_tag: &local_tag,
                             },
                             jobs::Builder::Buildkit => jobs::Engine::Buildkit { mounts: &mounts },
+                            jobs::Builder::Kaniko => jobs::Engine::Kaniko { mounts: &mounts },
                         },
                         limit_secs: limit_secs(limit) + RESTORE_SAVE_SECS,
                     },
@@ -3098,8 +3142,8 @@ mod tests {
         CacheWriters, Caller, Launcher, LogsParams, MCP_PATH, PushParams, PushTarget,
         ResourceServer, ResourceServerConfig, Response, SCOPE_BUILD, SCOPE_READ, SharedCache,
         Snapshots, Starter, StatusCode, TokenLine, ToolPolicy, TrustedIssuer, bind_socket,
-        bud_argv, buildctl_argv, cache_mounts, ccache_conf, parse_tokens, router, run_mounts,
-        run_sandbox, socket_router, unpack,
+        bud_argv, buildctl_argv, cache_mounts, ccache_conf, kaniko_argv, parse_tokens, router,
+        run_mounts, run_sandbox, socket_router, unpack,
     };
     use crate::sandbox::{RelPath, SandboxDir, SandboxName, Workspace};
     use crucible_mcp_auth::access::{AccessRules, Call};
@@ -3928,7 +3972,7 @@ mod tests {
     #[test]
     fn a_build_may_name_its_builder_and_a_layer_build_has_none() {
         use crate::context::ContextDigest;
-        use crate::jobs::Builder::{Buildah, Buildkit};
+        use crate::jobs::Builder::{Buildah, Buildkit, Kaniko};
         use crate::mcp::{BuildReply, Recipe};
         let parse = |v: serde_json::Value| serde_json::from_value::<BuildParams>(v);
         let p = parse(serde_json::json!({ "context": "svc", "builder": "buildkit" })).unwrap();
@@ -3939,13 +3983,19 @@ mod tests {
                 .builder,
             None
         );
-        assert!(parse(serde_json::json!({ "context": "svc", "builder": "kaniko" })).is_err());
+        assert_eq!(
+            parse(serde_json::json!({ "context": "svc", "builder": "kaniko" }))
+                .unwrap()
+                .builder,
+            Some(Kaniko)
+        );
         let schema = serde_json::to_value(rmcp::schemars::schema_for!(BuildParams)).unwrap();
         assert!(schema.to_string().contains("\"buildkit\""), "{schema}");
 
         let dockerfile = Recipe::of(&p).unwrap();
         assert_eq!(dockerfile.builder(None, Buildah).unwrap(), Some(Buildah));
         assert_eq!(dockerfile.builder(None, Buildkit).unwrap(), Some(Buildkit));
+        assert_eq!(dockerfile.builder(None, Kaniko).unwrap(), Some(Kaniko));
         assert_eq!(
             dockerfile.builder(Some(Buildkit), Buildah).unwrap(),
             Some(Buildkit)
@@ -4150,6 +4200,18 @@ mod tests {
             !refused_by_admission(&incomplete_openshift).is_empty(),
             "an OpenShift builder needs the exact CRI-O user namespace"
         );
+        let kaniko = pod_of(&jobs::build_job(
+            &broker.site,
+            &ident(id.as_str()),
+            &jobs::BuildJob {
+                context_digest: "sha256:00",
+                cache_dirs: &[],
+                runner_args: &runner_args,
+                engine: jobs::Engine::Kaniko { mounts: &[] },
+                limit_secs: 60,
+            },
+        ));
+        assert_eq!(refused_by_admission(&kaniko), Vec::<String>::new());
         let run_mounts = run_mounts(Vec::new(), true);
         let buildkit = pod_of(&jobs::build_job(
             &broker.site,
@@ -4852,6 +4914,31 @@ mod tests {
     }
 
     #[test]
+    fn a_kaniko_build_is_one_userspace_build_that_pushes() {
+        let df = RelPath::parse("containers/Dockerfile").unwrap();
+        let args = BTreeMap::from([("ARCH".to_string(), "9.0".to_string())]);
+        let registry = jobs::Registry::Cluster {
+            host: "registry.builds.svc:5000".to_string(),
+        };
+        let argv = kaniko_argv(
+            &df,
+            Some("base"),
+            &args,
+            "registry.builds.svc:5000/builds/image:tag",
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(argv[0], "/kaniko/executor");
+        assert!(argv.contains(&"--target=base".to_string()));
+        assert!(argv.contains(&"--build-arg=ARCH=9.0".to_string()));
+        assert!(
+            argv.iter()
+                .any(|v| v.starts_with("--registry-certificate="))
+        );
+        assert!(!argv.contains(&"--insecure".to_string()));
+    }
+
+    #[test]
     fn every_run_step_sees_the_caches_the_facts_and_the_ccache_conf() {
         let cache = jobs::RunMount {
             source: format!("{CACHE_ROOT}/deps"),
@@ -4891,6 +4978,10 @@ mod tests {
         assert_eq!(
             parsed(&["--builder", "buildkit"]).builder,
             jobs::Builder::Buildkit
+        );
+        assert_eq!(
+            parsed(&["--builder", "kaniko"]).builder,
+            jobs::Builder::Kaniko
         );
     }
 
