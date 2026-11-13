@@ -11522,6 +11522,30 @@ async fn run_log_serves_local_output_and_points_a_pod_run_at_its_pod(pool: PgPoo
     assert!(text.contains("gateway_boot: driver=kubernetes"), "{engine}");
     assert!(!text.contains("task roundup: pass"), "{engine}");
 
+    // A log longer than one response serves its tail by default, and reads back from its first
+    // line by following `next` from 0.
+    let long: String = (0..2000)
+        .map(|i| format!("line {i:04} {}\n", "z".repeat(500)))
+        .collect();
+    crate::runs::blob_store::put_run_engine_log(&pool, "run-pod", &long).await?;
+    let (status, tail) = get_json_value(&app, "/api/runs/run-pod/log").await;
+    assert_eq!(status, StatusCode::OK, "{tail}");
+    assert_eq!(tail["truncated"], true);
+    assert_eq!(tail["next"], serde_json::Value::Null);
+    assert_eq!(tail["total_bytes"], long.len());
+    assert!(tail["start"].as_u64().expect("start") > 0);
+    let mut read = String::new();
+    let mut from = Some(0);
+    while let Some(at) = from {
+        let (status, page) =
+            get_json_value(&app, &format!("/api/runs/run-pod/log?from={at}")).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["start"], at);
+        read.push_str(page["text"].as_str().expect("text"));
+        from = page["next"].as_u64();
+    }
+    assert_eq!(read, long);
+
     let (status, unknown) = get_json_value(&app, "/api/runs/nobody/log").await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{unknown}");
     Ok(())
