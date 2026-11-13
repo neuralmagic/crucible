@@ -123,6 +123,8 @@ tower-sessions-sqlx-store = { git = "https://github.com/wseaton/tower-sessions-s
 # The tier-ranking cache key (stage 2, lane J): sha256 of an issue's title+body+labels, and the
 # digest an api key's secret half is stored as.
 sha2 = "0.10"
+# Line diffs between two saves of a draft.
+similar = "2"
 # The CSPRNG an api key's secret half comes out of. Already in the tree; named here because the
 # secret's unpredictability is the whole security property.
 rand = "0.10"

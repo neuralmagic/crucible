@@ -8,8 +8,8 @@
 use crate::client::Client;
 use crate::ops::blueprints::{BlueprintUse, Blueprints};
 use crate::ops::drafts::{
-    DraftCreate, DraftDelete, DraftFiles, DraftGraduate, DraftLaunch, DraftPreview, DraftPublish,
-    DraftPull, DraftPush, DraftSaveFiles,
+    DraftCreate, DraftDelete, DraftDiff, DraftFiles, DraftGraduate, DraftLaunch, DraftLog,
+    DraftPreview, DraftPublish, DraftPull, DraftPush, DraftSaveFiles,
 };
 use crate::ops::issues::{
     Adopt, ApprovalDetail, Approvals, Approve, Bump, Contracts, Issue, Issues, Park, Reconcile,
@@ -235,6 +235,25 @@ impl CrucibleMcp {
         returns is the base_version a save needs."
     )]
     async fn crucible_draft_files(&self, Parameters(a): Parameters<DraftFiles>) -> String {
+        self.run(&a).await
+    }
+
+    #[tool(
+        description = "A draft pack's saves as a changelog, newest first: who saved each, whether \
+        it compiled, and which files it added, removed or modified from the save before it. Read \
+        the text of a change with crucible_draft_diff."
+    )]
+    async fn crucible_draft_log(&self, Parameters(a): Parameters<DraftLog>) -> String {
+        self.run(&a).await
+    }
+
+    #[tool(
+        description = "The unified diff between two saves of a draft pack. With no versions, the \
+        newest save against the one before it. Any two versions from crucible_draft_log compare, \
+        so a save that broke the pack is found by halving the range between a good one and a bad \
+        one."
+    )]
+    async fn crucible_draft_diff(&self, Parameters(a): Parameters<DraftDiff>) -> String {
         self.run(&a).await
     }
 
@@ -482,7 +501,7 @@ mod tests {
             .into_iter()
             .map(|t| t.name.to_string())
             .collect();
-        assert_eq!(names.len(), 46, "tools: {names:?}");
+        assert_eq!(names.len(), 48, "tools: {names:?}");
         for required in [
             "crucible_issues",
             "crucible_draft_delete",
@@ -512,6 +531,8 @@ mod tests {
             "crucible_draft_pull",
             "crucible_draft_push",
             "crucible_draft_files",
+            "crucible_draft_log",
+            "crucible_draft_diff",
             "crucible_draft_save",
             "crucible_draft_preview",
             "crucible_draft_launch",

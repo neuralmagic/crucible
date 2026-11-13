@@ -25,6 +25,7 @@ use crate::logline::LogLine;
 use crate::model::Verdict;
 use crate::net::{Connection, Connector, Down, Task, reaching, within};
 use crate::pack::PackFiles;
+use crate::revisions::{self, Revisions, Wanted};
 use crate::session::RunFold;
 
 /// How long streamed session lines gather before they are folded and shown, so a burst of agent
@@ -307,9 +308,15 @@ enum Action {
     /// Read a target's params schema and the admin caps, for a launch form.
     Prepare(Target),
     /// Launch a target with this body (`params`, `max_cost`, `max_time`, maybe `rerun`).
-    Launch { target: Target, body: Value },
+    Launch {
+        target: Target,
+        body: Value,
+    },
     /// What rerunning a finished run from these tasks would reuse.
-    Rerun { run: String, from: Vec<String> },
+    Rerun {
+        run: String,
+        from: Vec<String>,
+    },
     /// Pull a draft's newest save into its working copy, creating the draft from `template`
     /// first when it does not exist.
     Pull {
@@ -333,6 +340,7 @@ enum Action {
         size: u64,
         settled: bool,
     },
+    Revisions(Wanted),
 }
 
 /// What an [`Action`] came to.
@@ -360,6 +368,7 @@ enum Reply {
         result: Result<DropOutcome, String>,
     },
     File(Opened),
+    Revisions(Revisions),
 }
 
 impl Action {
@@ -417,6 +426,10 @@ impl Action {
                     None => fetch_file(&c, files, run, key).await,
                 })
             }
+            Action::Revisions(wanted) => Reply::Revisions(Revisions {
+                result: read_revisions(&c, &wanted).await,
+                wanted,
+            }),
         }
     }
 
@@ -460,8 +473,52 @@ impl Action {
                     },
                 })
             }
+            Action::Revisions(wanted) => Reply::Revisions(Revisions {
+                wanted,
+                result: Err(why),
+            }),
         }
     }
+}
+
+/// A draft's saves and test-fires, and the diff of the range asked for, or of the one the pane
+/// opens on when none was picked or the picked one names a save the draft no longer holds.
+async fn read_revisions(c: &Connection, wanted: &Wanted) -> Result<revisions::Read, String> {
+    let draft = wanted.draft.as_str();
+    let (history, runs) = tokio::join!(
+        within("the draft's history", c.client.draft_history(draft)),
+        within(
+            "the draft's test-fires",
+            c.client.playbook_runs(None, Some(draft))
+        ),
+    );
+    let history: Vec<crux::dto::DraftHistoryEntry> = history?;
+    let fires = revisions::fires(runs.unwrap_or_default());
+    let range = wanted
+        .range
+        .and_then(|range| revisions::held(&history, range))
+        .or_else(|| revisions::opening(&history, &fires, wanted.ran))
+        .ok_or_else(|| format!("draft {draft} has no saves"))?;
+    let diff = within(
+        "the diff",
+        c.client.draft_diff(draft, range.from, Some(range.to)),
+    )
+    .await?;
+    let zone = TimeZone::system();
+    let landed = history
+        .iter()
+        .map(|entry| revisions::Landed {
+            at: epoch(&entry.created_at),
+            label: landed_label(&entry.created_at, &zone),
+        })
+        .collect();
+    Ok(revisions::Read {
+        history,
+        landed,
+        fires,
+        range,
+        diff,
+    })
 }
 
 async fn prepare(c: &Connection, target: &Target) -> Result<Form, String> {
@@ -1728,6 +1785,7 @@ pub struct Snapshot {
     pub dropped: Option<Dropped>,
     /// The captured file last fetched for the Files pane.
     pub file: Option<Opened>,
+    pub revisions: Option<Arc<Revisions>>,
 }
 
 /// What one pass of the poll loop read.
@@ -1818,6 +1876,7 @@ impl Shared {
                 });
             }
             Reply::File(opened) => self.snapshot.file = Some(opened),
+            Reply::Revisions(revisions) => self.snapshot.revisions = Some(Arc::new(revisions)),
         }
     }
 }
@@ -1958,6 +2017,10 @@ impl Client {
             size,
             settled,
         });
+    }
+
+    pub fn revisions(&self, wanted: Wanted) {
+        self.start(Action::Revisions(wanted));
     }
 
     pub fn take(&self, seen: u64) -> Option<(u64, Snapshot)> {
@@ -2723,6 +2786,126 @@ mod tests {
             assert!(Instant::now() < until, "no such snapshot within {within:?}");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// A controller holding draft `studio` at three saves, test-fired at v1 (passed) and v3
+    /// (failed), that records each diff query it is asked.
+    fn history_server(asked: Arc<Mutex<Vec<String>>>) -> String {
+        let save = |version: i64, previous: Option<i64>| {
+            serde_json::json!({
+                "version": version, "previous_version": previous, "created_by": "wren",
+                "created_at": format!("2026-08-22T09:0{version}:00Z"),
+                "schema_digest": "sha256:aa", "diagnostics": 0,
+                "changes": [{"path": "wf.star", "change": "modified"}],
+            })
+        };
+        let (url, _) = crate::testserver::serve(move |request| {
+            let path = request.split(' ').nth(1).unwrap_or_default();
+            if path == "/api/playbook-drafts/studio/history" {
+                return serde_json::json!([save(3, Some(2)), save(2, Some(1)), save(1, None)])
+                    .to_string();
+            }
+            if path == "/api/playbook-runs?playbook=studio" {
+                return serde_json::json!([
+                    {"key": "playbook:studio:b", "status": "parked",
+                     "parked_reason": "run errored", "draft_version": 3},
+                    {"key": "playbook:studio:a", "status": "done", "draft_version": 1},
+                    {"key": "playbook:survey:z", "status": "done"},
+                ])
+                .to_string();
+            }
+            if let Some(query) = path.strip_prefix("/api/playbook-drafts/studio/diff?") {
+                asked.lock().unwrap().push(query.to_string());
+                let end = |name: &str| {
+                    query
+                        .split('&')
+                        .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
+                        .and_then(|value| value.parse::<i64>().ok())
+                };
+                return serde_json::json!({
+                    "from": end("from"), "to": end("to"),
+                    "files": [{
+                        "path": "wf.star", "change": "modified", "additions": 1, "deletions": 1,
+                        "unified": "--- a/wf.star\n+++ b/wf.star\n@@ -1 +1 @@\n-a\n+b\n",
+                    }],
+                })
+                .to_string();
+            }
+            "[]".into()
+        });
+        url
+    }
+
+    #[test]
+    fn a_drafts_history_reads_its_saves_its_test_fires_and_the_diff_of_one_range() {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let url = history_server(Arc::clone(&asked));
+        let keys = tempfile::tempdir().unwrap();
+        let net = crate::net::Net::uncached_for_tests();
+        let client = Client::spawn_with(
+            net.connector(crate::testserver::target("t", &url, keys.path())),
+            no_dirs(),
+        );
+        let range = |from: i64, to: i64| revisions::Range {
+            from: Some(from),
+            to,
+        };
+        let read = |draft: &str, picked: Option<revisions::Range>| {
+            let wanted = Wanted {
+                draft: draft.into(),
+                range: picked,
+                ran: Some(3),
+            };
+            client.revisions(wanted.clone());
+            snapshot_when(&client, Duration::from_secs(5), |s| {
+                s.revisions.as_ref().is_some_and(|r| r.wanted == wanted)
+            })
+            .revisions
+            .unwrap()
+        };
+
+        let opened = read("studio", None);
+        let history = opened.result.as_ref().expect("the draft reads");
+        assert_eq!(
+            history.range,
+            range(1, 3),
+            "the failed run opens on everything saved since v1 passed"
+        );
+        assert_eq!(history.history.len(), 3);
+        assert_eq!(
+            history
+                .fires
+                .iter()
+                .map(|fire| (fire.version, fire.status.clone()))
+                .collect::<Vec<_>>(),
+            vec![(3, LaunchStatus::Error), (1, LaunchStatus::Done)],
+            "a registered playbook's launch is no test-fire"
+        );
+        assert_eq!(history.landed[0].at, epoch("2026-08-22T09:03:00Z"));
+        assert_eq!(revisions::totals(&history.diff), (1, 1));
+
+        let picked = read("studio", Some(range(3, 2)));
+        assert_eq!(picked.result.as_ref().expect("reads").range, range(3, 2));
+
+        let lost = read("studio", Some(range(9, 3)));
+        assert_eq!(
+            lost.result.as_ref().expect("reads").range,
+            range(1, 3),
+            "a range naming a save the draft does not hold opens afresh"
+        );
+        assert_eq!(
+            *asked.lock().unwrap(),
+            ["from=1&to=3", "from=3&to=2", "from=1&to=3"]
+        );
+
+        assert_eq!(
+            read("empty", None)
+                .result
+                .as_ref()
+                .err()
+                .map(String::as_str),
+            Some("draft empty has no saves")
+        );
     }
 
     #[test]

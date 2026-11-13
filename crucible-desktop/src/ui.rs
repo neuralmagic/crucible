@@ -24,6 +24,8 @@ mod palette;
 mod policy;
 mod profiles;
 mod providers;
+mod rail;
+mod revisions;
 mod runs;
 mod schedules;
 mod secrets;
@@ -312,7 +314,7 @@ pub fn view(app: &App, cx: &mut Cx<App>) -> El {
         .child(sidebar(app, &p, &mut layer))
         .child(rule("sidebar-edge", true, &p));
     let window = window
-        .child(detail(app, &p))
+        .child(detail(app, &p, &mut layer))
         .children(dock::ghost(app, &p))
         .child(fx(gfx::GRAIN, gfx::data(Color::WHITE, p.tune.grain), 0.0));
     let window = rune_knobs::side(
@@ -1314,7 +1316,7 @@ fn verdict_icon(verdict: Verdict) -> Option<&'static Icon> {
     }
 }
 
-fn detail(app: &App, p: &Paint) -> El {
+fn detail(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
     match app.page {
         crate::Page::Settings => return settings_pane(app, p),
         crate::Page::Triggers => return triggers::page(app, p),
@@ -1389,7 +1391,7 @@ fn detail(app: &App, p: &Paint) -> El {
         .px(28.0)
         .pb(20.0)
         .gap(16.0)
-        .child(header(&pane, app, p));
+        .child(header(&pane, app, p, layer));
 
     if let Some(problem) = &pane.problem {
         body = body.child(banner(problem, p));
@@ -1498,7 +1500,7 @@ fn link_button(app: &App, p: &Paint) -> Option<El> {
     )
 }
 
-fn header(pane: &Pane, app: &App, p: &Paint) -> El {
+fn header(pane: &Pane, app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
     let about = match &pane.meta {
         Some(meta) => format!("{}\n{meta}", pane.path),
         None => pane.path.clone(),
@@ -1533,7 +1535,7 @@ fn header(pane: &Pane, app: &App, p: &Paint) -> El {
                     .help("Streaming")
                 }))
                 .child(el().grow(1.0))
-                .children(dock::tools(app, p))
+                .child(dock::tools(app, p, layer))
                 .children(link_button(app, p))
                 .children(cancel_button(app, p))
                 .children(

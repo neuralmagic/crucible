@@ -13,6 +13,10 @@ use crate::playbooks::blueprints::{Placeholder, PlaceholderReason};
 
 use crate::playbooks::co_draft::CoDraft;
 
+use crate::playbooks::draft_history::{
+    ChangedFile, FileChange, FileDiff, HistoryEntry, VersionDiff,
+};
+
 use crate::playbooks::drafts::{
     DraftError, DraftFiles, DraftOrigin, DraftRow, DraftSummary, DraftVersionRow, SavedVersion,
     StaleBase,
@@ -653,6 +657,137 @@ pub(crate) async fn get_playbook_draft_origin_files(
         })
         .into_response(),
         Ok(None) => not_found(format!("draft {id:?} has no origin to rebase onto")),
+        Err(e) => draft_refusal(e),
+    }
+}
+
+dto! {
+    pub struct DraftChangedFileDto: From<f: ChangedFile> {
+        pub path: String,
+        pub change: FileChange,
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DraftHistoryEntryDto {
+    #[serde(flatten)]
+    pub version: DraftVersionDto,
+    /// The save this one is compared against; null for the first, which is compared against an
+    /// empty pack.
+    pub previous_version: Option<i64>,
+    /// The files that differ from `previous_version`; null when either save has no stored tree
+    /// to compare.
+    pub changes: Option<Vec<DraftChangedFileDto>>,
+}
+
+impl From<HistoryEntry> for DraftHistoryEntryDto {
+    fn from(e: HistoryEntry) -> Self {
+        DraftHistoryEntryDto {
+            version: e.version.into(),
+            previous_version: e.previous,
+            changes: e
+                .changes
+                .map(|changes| changes.into_iter().map(Into::into).collect()),
+        }
+    }
+}
+
+/// `GET /api/playbook-drafts/{id}/history` — the draft's saves as a changelog, newest first: who
+/// saved each, whether it compiled, and which files it changed.
+#[utoipa::path(
+    get,
+    path = "/api/playbook-drafts/{id}/history",
+    params(("id" = String, Path, description = "Draft id")),
+    responses(
+        (status = 200, description = "Every save with its changed files", body = Vec<DraftHistoryEntryDto>),
+        (status = 404, description = "No draft with that id", body = ErrorBody)
+    )
+)]
+pub(crate) async fn get_playbook_draft_history(
+    State(state): State<ApiState>,
+    caller: crate::authz::Caller,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    if let Err(refused) =
+        readable_draft(&state, &caller, &id, crate::authz::action::Verb::Read).await
+    {
+        return Ok(refused);
+    }
+    let history = crate::playbooks::draft_history::history(state.db.pool(), &id).await?;
+    Ok(Json(
+        history
+            .into_iter()
+            .map(DraftHistoryEntryDto::from)
+            .collect::<Vec<_>>(),
+    )
+    .into_response())
+}
+
+dto! {
+    pub struct DraftFileDiffDto: From<f: FileDiff> {
+        pub path: String,
+        pub change: FileChange,
+        pub additions: usize,
+        pub deletions: usize,
+        /// The unified diff, `a/` the `from` side; null when either side is not text.
+        pub unified: Option<String>,
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DraftDiffDto {
+    /// Null when `to` is the draft's first save, diffed against an empty pack.
+    pub from: Option<i64>,
+    pub to: i64,
+    pub files: Vec<DraftFileDiffDto>,
+}
+
+impl From<VersionDiff> for DraftDiffDto {
+    fn from(d: VersionDiff) -> Self {
+        DraftDiffDto {
+            from: d.from,
+            to: d.to,
+            files: d.files.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub(crate) struct DiffQuery {
+    /// The older side; omitted ⇒ the save before `to`.
+    #[serde(default)]
+    from: Option<i64>,
+    /// The newer side; omitted ⇒ the newest save.
+    #[serde(default)]
+    to: Option<i64>,
+}
+
+/// `GET /api/playbook-drafts/{id}/diff` — what differs between two saves, one unified diff per
+/// file. Any two versions compare, in either order.
+#[utoipa::path(
+    get,
+    path = "/api/playbook-drafts/{id}/diff",
+    params(("id" = String, Path, description = "Draft id"), DiffQuery),
+    responses(
+        (status = 200, description = "The files that differ", body = DraftDiffDto),
+        (status = 404, description = "No draft or no such version", body = ErrorBody)
+    )
+)]
+pub(crate) async fn get_playbook_draft_diff(
+    State(state): State<ApiState>,
+    caller: crate::authz::Caller,
+    Path(id): Path<String>,
+    Query(query): Query<DiffQuery>,
+) -> Response {
+    if let Err(refused) =
+        readable_draft(&state, &caller, &id, crate::authz::action::Verb::Read).await
+    {
+        return refused;
+    }
+    match crate::playbooks::draft_history::diff(state.db.pool(), &id, query.from, query.to).await {
+        Ok(Some(diff)) => Json(DraftDiffDto::from(diff)).into_response(),
+        Ok(None) => not_found(format!("no draft {id:?} at that version")),
         Err(e) => draft_refusal(e),
     }
 }

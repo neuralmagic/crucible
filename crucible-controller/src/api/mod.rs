@@ -92,6 +92,8 @@ pub(crate) mod tests;
         crate::playbooks::api::drafts::get_playbook_draft_files,
         crate::playbooks::api::drafts::get_playbook_draft_preview,
         crate::playbooks::api::drafts::get_playbook_draft_origin_files,
+        crate::playbooks::api::drafts::get_playbook_draft_history,
+        crate::playbooks::api::drafts::get_playbook_draft_diff,
         crate::playbooks::api::drafts::get_playbook_draft_tarball,
         crate::playbooks::api::drafts::save_playbook_draft,
         crate::playbooks::api::drafts::delete_playbook_draft,
@@ -297,6 +299,11 @@ pub(crate) mod tests;
         crate::playbooks::api::drafts::DraftVersionDto,
         crate::playbooks::api::drafts::DraftCompileDto,
         crate::playbooks::api::drafts::DraftFilesDto,
+        crate::playbooks::api::drafts::DraftHistoryEntryDto,
+        crate::playbooks::api::drafts::DraftChangedFileDto,
+        crate::playbooks::api::drafts::DraftDiffDto,
+        crate::playbooks::api::drafts::DraftFileDiffDto,
+        crate::playbooks::draft_history::FileChange,
         crate::playbooks::api::drafts::StaleBaseBody,
         crate::playbooks::api::drafts::CoDraftDto,
         crate::playbooks::api::drafts::CoDraftStepDto,
@@ -513,6 +520,12 @@ pub fn router(state: ApiState) -> Router {
         ))
         .routes(routes!(
             crate::playbooks::api::drafts::get_playbook_draft_origin_files
+        ))
+        .routes(routes!(
+            crate::playbooks::api::drafts::get_playbook_draft_history
+        ))
+        .routes(routes!(
+            crate::playbooks::api::drafts::get_playbook_draft_diff
         ))
         .routes(routes!(
             crate::playbooks::api::drafts::get_playbook_draft_tarball

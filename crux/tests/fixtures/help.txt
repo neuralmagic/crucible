@@ -76,6 +76,10 @@ Commands:
   playbook-import       Propose a playbook pack import: fetch, compile, and store the preview an
                         admin registers
   draft-files           A draft pack's files at one save, with the version a save must be based on
+  draft-log             A draft's saves as a changelog, newest first: who saved each, whether it
+                        compiled, and which files it changed
+  draft-diff            The unified diff between two saves of a draft. Defaults to the newest save
+                        against the one before it; any two versions compare, in either order
   draft-create          Create a draft pack in the authoring studio, from a template or a skeleton
   draft-save            Save a draft pack version from a `{path: content}` JSON map
   draft-pull            Write a draft pack into a directory, to edit it in your own editor
@@ -219,6 +223,10 @@ Commands:
   playbook-import       Propose a playbook pack import: fetch, compile, and store the preview an
                         admin registers
   draft-files           A draft pack's files at one save, with the version a save must be based on
+  draft-log             A draft's saves as a changelog, newest first: who saved each, whether it
+                        compiled, and which files it changed
+  draft-diff            The unified diff between two saves of a draft. Defaults to the newest save
+                        against the one before it; any two versions compare, in either order
   draft-create          Create a draft pack in the authoring studio, from a template or a skeleton
   draft-save            Save a draft pack version from a `{path: content}` JSON map
   draft-pull            Write a draft pack into a directory, to edit it in your own editor
@@ -3082,6 +3090,128 @@ Options:
                                who minted it, or the controller's static token, which authenticates
                                as nobody [env: CONTROLLER_API_TOKEN]
   -h, --help                   Print help
+==== crux draft-log --help ====
+A draft's saves as a changelog, newest first: who saved each, whether it compiled, and which files
+it changed
+
+Usage: crux draft-log [OPTIONS] <DRAFT_ID>
+
+Arguments:
+  <DRAFT_ID>
+          
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else
+          `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var
+          wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine,
+          `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the
+          controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux draft-log -h ====
+A draft's saves as a changelog, newest first: who saved each, whether it compiled, and which files
+it changed
+
+Usage: crux draft-log [OPTIONS] <DRAFT_ID>
+
+Arguments:
+  <DRAFT_ID>  
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux`
+                               (else `~/.config/crux`), which may be absent; a path given here must
+                               exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this
+                               machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person
+                               who minted it, or the controller's static token, which authenticates
+                               as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux draft-diff --help ====
+The unified diff between two saves of a draft. Defaults to the newest save against the one before
+it; any two versions compare, in either order
+
+Usage: crux draft-diff [OPTIONS] <DRAFT_ID>
+
+Arguments:
+  <DRAFT_ID>
+          
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else
+          `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var
+          wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --from <FROM>
+          The older save. Omit for the save before --to
+
+      --to <TO>
+          The newer save. Omit for the newest
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine,
+          `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the
+          controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+      --stat
+          Print the changed files and line counts without the diff text
+
+      --json
+          
+
+  -h, --help
+          Print help
+==== crux draft-diff -h ====
+The unified diff between two saves of a draft. Defaults to the newest save against the one before
+it; any two versions compare, in either order
+
+Usage: crux draft-diff [OPTIONS] <DRAFT_ID>
+
+Arguments:
+  <DRAFT_ID>  
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux`
+                               (else `~/.config/crux`), which may be absent; a path given here must
+                               exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --from <FROM>            The older save. Omit for the save before --to
+      --to <TO>                The newer save. Omit for the newest
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this
+                               machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person
+                               who minted it, or the controller's static token, which authenticates
+                               as nobody [env: CONTROLLER_API_TOKEN]
+      --stat                   Print the changed files and line counts without the diff text
+      --json                   
+  -h, --help                   Print help
 ==== crux draft-create --help ====
 Create a draft pack in the authoring studio, from a template or a skeleton
 
@@ -4439,6 +4569,10 @@ Commands:
   playbook-import       Propose a playbook pack import: fetch, compile, and store the preview an
                         admin registers
   draft-files           A draft pack's files at one save, with the version a save must be based on
+  draft-log             A draft's saves as a changelog, newest first: who saved each, whether it
+                        compiled, and which files it changed
+  draft-diff            The unified diff between two saves of a draft. Defaults to the newest save
+                        against the one before it; any two versions compare, in either order
   draft-create          Create a draft pack in the authoring studio, from a template or a skeleton
   draft-save            Save a draft pack version from a `{path: content}` JSON map
   draft-pull            Write a draft pack into a directory, to edit it in your own editor
@@ -4556,6 +4690,10 @@ Commands:
   playbook-import       Propose a playbook pack import: fetch, compile, and store the preview an
                         admin registers
   draft-files           A draft pack's files at one save, with the version a save must be based on
+  draft-log             A draft's saves as a changelog, newest first: who saved each, whether it
+                        compiled, and which files it changed
+  draft-diff            The unified diff between two saves of a draft. Defaults to the newest save
+                        against the one before it; any two versions compare, in either order
   draft-create          Create a draft pack in the authoring studio, from a template or a skeleton
   draft-save            Save a draft pack version from a `{path: content}` JSON map
   draft-pull            Write a draft pack into a directory, to edit it in your own editor

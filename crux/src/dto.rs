@@ -960,6 +960,63 @@ pub struct DraftFiles {
     pub files: std::collections::BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileChange {
+    Added,
+    Removed,
+    Modified,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DraftChangedFile {
+    pub path: String,
+    pub change: FileChange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DraftHistoryEntry {
+    pub version: i64,
+    #[serde(default)]
+    pub created_by: Option<String>,
+    #[serde(default)]
+    pub created_at: String,
+    /// Absent when the save did not compile.
+    #[serde(default)]
+    pub schema_digest: Option<String>,
+    #[serde(default)]
+    pub diagnostics: i64,
+    /// The save this one is compared against; absent for the first.
+    #[serde(default)]
+    pub previous_version: Option<i64>,
+    /// Absent when the controller has no stored tree to compare.
+    #[serde(default)]
+    pub changes: Option<Vec<DraftChangedFile>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DraftFileDiff {
+    pub path: String,
+    pub change: FileChange,
+    #[serde(default)]
+    pub additions: u64,
+    #[serde(default)]
+    pub deletions: u64,
+    /// Absent when either side is not text.
+    #[serde(default)]
+    pub unified: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DraftDiff {
+    /// Absent when `to` is the first save, diffed against an empty pack.
+    #[serde(default)]
+    pub from: Option<i64>,
+    pub to: i64,
+    #[serde(default)]
+    pub files: Vec<DraftFileDiff>,
+}
+
 /// `POST /api/playbook-drafts/{id}/versions`: the version stored, and what the engine made of it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DraftCompile {
@@ -1504,6 +1561,9 @@ pub struct PlaybookRun {
     /// What authorized it: `manual`, `schedule`, `draft`, `watch`, `webhook`, `deferred`.
     #[serde(default)]
     pub origin: String,
+    /// The draft save a test-fire froze; absent for a registered playbook's launch.
+    #[serde(default)]
+    pub draft_version: Option<i64>,
     #[serde(default)]
     pub max_time: String,
     #[serde(default)]

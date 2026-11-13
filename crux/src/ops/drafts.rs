@@ -432,6 +432,69 @@ impl Operation for DraftPreview {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args, Deserialize, schemars::JsonSchema)]
+pub struct DraftLog {
+    pub draft_id: String,
+    #[arg(long)]
+    #[serde(default)]
+    pub json: bool,
+}
+
+impl Operation for DraftLog {
+    type Output = Vec<dto::DraftHistoryEntry>;
+
+    async fn call(&self, c: &Client) -> Result<Value> {
+        c.draft_history(&self.draft_id).await
+    }
+
+    fn render(&self, _c: &Client, history: Self::Output) -> Result<String> {
+        Ok(render::draft_log(&self.draft_id, &history))
+    }
+
+    fn json(&self) -> bool {
+        self.json
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args, Deserialize, schemars::JsonSchema)]
+pub struct DraftDiff {
+    pub draft_id: String,
+    /// The older save. Omit for the save before --to.
+    #[arg(long)]
+    #[serde(default)]
+    #[schemars(description = "The older save. Omit for the save before `to`.")]
+    pub from: Option<i64>,
+    /// The newer save. Omit for the newest.
+    #[arg(long)]
+    #[serde(default)]
+    #[schemars(description = "The newer save. Omit for the newest.")]
+    pub to: Option<i64>,
+    /// Print the changed files and line counts without the diff text.
+    #[arg(long)]
+    #[serde(default)]
+    #[schemars(description = "List the changed files and line counts without the diff text.")]
+    pub stat: bool,
+    #[arg(long)]
+    #[serde(default)]
+    pub json: bool,
+}
+
+impl Operation for DraftDiff {
+    type Output = dto::DraftDiff;
+
+    async fn call(&self, c: &Client) -> Result<Value> {
+        c.draft_diff(&self.draft_id, self.from, self.to).await
+    }
+
+    fn render(&self, _c: &Client, diff: Self::Output) -> Result<String> {
+        Ok(render::draft_diff(&self.draft_id, &diff, self.stat))
+    }
+
+    fn json(&self) -> bool {
+        self.json
+    }
+}
+
 fn parse_string_map(s: &str) -> Result<BTreeMap<String, String>, String> {
     serde_json::from_str(s).map_err(|e| {
         format!(

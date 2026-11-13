@@ -260,6 +260,49 @@
     "name": "crucible_draft_delete"
   },
   {
+    "description": "The unified diff between two saves of a draft pack. With no versions, the newest save against the one before it. Any two versions from crucible_draft_log compare, so a save that broke the pack is found by halving the range between a good one and a bad one.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "draft_id": {
+          "type": "string"
+        },
+        "from": {
+          "default": null,
+          "description": "The older save. Omit for the save before `to`.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "json": {
+          "default": false,
+          "type": "boolean"
+        },
+        "stat": {
+          "default": false,
+          "description": "List the changed files and line counts without the diff text.",
+          "type": "boolean"
+        },
+        "to": {
+          "default": null,
+          "description": "The newer save. Omit for the newest.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "draft_id"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_draft_diff"
+  },
+  {
     "description": "Read a draft pack's files at one save inline: the whole `{path: content}` map, the version, who saved it, and its diagnostics. Use crucible_draft_pull instead for anything bigger than a one-file look — it puts the same files on disk. The version this returns is the base_version a save needs.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -391,6 +434,26 @@
       "type": "object"
     },
     "name": "crucible_draft_launch"
+  },
+  {
+    "description": "A draft pack's saves as a changelog, newest first: who saved each, whether it compiled, and which files it added, removed or modified from the save before it. Read the text of a change with crucible_draft_diff.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "draft_id": {
+          "type": "string"
+        },
+        "json": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "draft_id"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_draft_log"
   },
   {
     "description": "What a draft version compiled to, without launching it: the schema digest its params are validated against and the engine's diagnostics. Read this before crucible_draft_launch — a version with no schema digest never compiled and cannot be launched.",
