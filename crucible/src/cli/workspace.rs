@@ -524,7 +524,10 @@ mod tests {
         };
 
         let first = partial("first");
-        assert_eq!(fetched_blobs(&first).expect("lists"), [on_main.clone()]);
+        assert_eq!(
+            fetched_blobs(&first).expect("lists"),
+            std::slice::from_ref(&on_main)
+        );
         assert_eq!(git(&first, &["cat-file", "-p", &feature_blob]).1, "feature");
         let mut both = vec![on_main.clone(), on_feature];
         both.sort();
