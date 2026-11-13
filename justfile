@@ -177,6 +177,10 @@ hooks:
 forge-capture-e2e:
     scripts/forge-capture-e2e.sh
 
+# Tests the CI job selection (`cargo xtask ci plan`) against its rules and this tree.
+ci-jobs-test:
+    scripts/ci-jobs-test.sh
+
 # End-to-end proof of the pod executor on a throwaway kind cluster: the controller from this
 # checkout launches command-only drafts and playbooks as pods, across restarts and contract
 # mismatches (scenarios in the script header). Needs docker, kind, kubectl, jq, curl, git, shasum.
