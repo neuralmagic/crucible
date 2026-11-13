@@ -853,8 +853,6 @@ fn change_letter(change: dto::FileChange) -> char {
     }
 }
 
-/// A draft's saves as a changelog, newest first: who saved each, whether it compiled, and the
-/// files it changed from the save before it.
 pub fn draft_log(id: &str, history: &[dto::DraftHistoryEntry]) -> String {
     let mut out = format!("draft {id}: {} saves\n", history.len());
     for entry in history {
@@ -881,8 +879,6 @@ pub fn draft_log(id: &str, history: &[dto::DraftHistoryEntry]) -> String {
     out
 }
 
-/// What differs between two saves: one summary line per file, then each file's unified diff
-/// unless `stat` asked for the summary alone.
 pub fn draft_diff(id: &str, diff: &dto::DraftDiff, stat: bool) -> String {
     let from = diff
         .from

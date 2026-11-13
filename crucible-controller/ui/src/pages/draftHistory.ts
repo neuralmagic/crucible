@@ -21,7 +21,6 @@ function previousOf(history: readonly HistoryEntry[], version: number): number |
   return history.find((entry) => entry.version === version)?.previous_version ?? null;
 }
 
-/// What one save changed: that save against the one before it.
 export function singleSave(history: readonly HistoryEntry[], version: number): Range {
   return { from: previousOf(history, version), to: version };
 }
@@ -70,8 +69,6 @@ export function halvesOf(
   return { older: { from: range.from, to: middle }, newer: { from: middle, to: range.to } };
 }
 
-/// The single save on either side of the one a range ends at, for walking the history one save
-/// at a time.
 export function neighborsOf(
   history: readonly HistoryEntry[],
   range: Range,
@@ -86,7 +83,6 @@ export function neighborsOf(
   };
 }
 
-/// Where a save sits against the range being compared.
 export type Placement = 'from' | 'to' | 'inside' | 'outside';
 
 export function placementOf(range: Range, version: number): Placement {
@@ -103,7 +99,6 @@ export const CHANGE_LETTER: Record<FileChange, string> = {
   modified: 'M',
 };
 
-/// The test-fires of each save, newest first, so a save reads as good or bad by what its runs did.
 export function launchesByVersion<R extends Pick<PlaybookRun, 'draft_version'>>(
   runs: readonly R[],
 ): Map<number, R[]> {

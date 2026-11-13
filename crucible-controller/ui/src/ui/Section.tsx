@@ -45,7 +45,6 @@ export interface FoldSectionProps {
   note?: ReactNode;
   /** Trailing slot that stays on the header line while the section is closed. */
   actions?: ReactNode;
-  /** Start open instead of closed. */
   defaultOpen?: boolean;
   children: ReactNode;
   className?: string;

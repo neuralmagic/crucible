@@ -26,14 +26,12 @@ pub enum FileChange {
     Modified,
 }
 
-/// One path a save touched.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 pub struct ChangedFile {
     pub path: String,
     pub change: FileChange,
 }
 
-/// One save with what it changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryEntry {
     pub version: DraftVersionRow,
@@ -44,7 +42,6 @@ pub struct HistoryEntry {
     pub changes: Option<Vec<ChangedFile>>,
 }
 
-/// A draft's saves, newest first, each with the files it changed from the save before it.
 pub async fn history(pool: &PgPool, id: &str) -> Result<Vec<HistoryEntry>> {
     let rows = sqlx::query(
         r#"WITH v AS (
@@ -96,7 +93,6 @@ pub async fn history(pool: &PgPool, id: &str) -> Result<Vec<HistoryEntry>> {
         .collect()
 }
 
-/// One file's difference between two saves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileDiff {
     pub path: String,
@@ -107,7 +103,6 @@ pub struct FileDiff {
     pub unified: Option<String>,
 }
 
-/// Every file that differs between two saves of one draft.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionDiff {
     /// `None` when `to` is the draft's first save, diffed against an empty pack.

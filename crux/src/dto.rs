@@ -968,15 +968,12 @@ pub enum FileChange {
     Modified,
 }
 
-/// One path a draft save touched.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct DraftChangedFile {
     pub path: String,
     pub change: FileChange,
 }
 
-/// One `GET /api/playbook-drafts/{id}/history` entry: a save and what it changed from the one
-/// before it.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct DraftHistoryEntry {
     pub version: i64,
@@ -997,7 +994,6 @@ pub struct DraftHistoryEntry {
     pub changes: Option<Vec<DraftChangedFile>>,
 }
 
-/// One file of a `GET /api/playbook-drafts/{id}/diff`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct DraftFileDiff {
     pub path: String,
@@ -1011,7 +1007,6 @@ pub struct DraftFileDiff {
     pub unified: Option<String>,
 }
 
-/// `GET /api/playbook-drafts/{id}/diff`: every file that differs between two saves.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct DraftDiff {
     /// Absent when `to` is the first save, diffed against an empty pack.

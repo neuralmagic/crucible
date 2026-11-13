@@ -311,7 +311,6 @@ mod tests {
         assert!(left.is_empty(), "{left:?}");
     }
 
-    /// `crux draft-log` and `crux draft-diff` against this controller's own router.
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn crux_reads_a_drafts_changelog_and_diffs_two_saves(pool: sqlx::PgPool) {
         use crux::ops::Operation;

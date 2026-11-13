@@ -662,14 +662,12 @@ pub(crate) async fn get_playbook_draft_origin_files(
 }
 
 dto! {
-    /// One path a save touched.
     pub struct DraftChangedFileDto: From<f: ChangedFile> {
         pub path: String,
         pub change: FileChange,
     }
 }
 
-/// One save with what it changed from the save before it.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DraftHistoryEntryDto {
     #[serde(flatten)]
@@ -726,7 +724,6 @@ pub(crate) async fn get_playbook_draft_history(
 }
 
 dto! {
-    /// One file's difference between two saves.
     pub struct DraftFileDiffDto: From<f: FileDiff> {
         pub path: String,
         pub change: FileChange,
@@ -737,7 +734,6 @@ dto! {
     }
 }
 
-/// Every file that differs between two saves of one draft.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DraftDiffDto {
     /// Null when `to` is the draft's first save, diffed against an empty pack.

@@ -6865,8 +6865,6 @@ async fn any_draft_version_downloads_as_its_tree(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
-/// A draft's saves read as a changelog, and any two of them as a unified diff, to whoever may read
-/// the draft and to nobody else.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn a_draft_history_lists_what_each_save_changed_and_any_two_saves_diff(
     pool: PgPool,

@@ -49,8 +49,6 @@ function diffOf(from: number | null, to: number) {
   };
 }
 
-/// Serves the history and answers each diff request with the range it was asked for, recording
-/// the requests so a test can tell what the page fetched.
 async function stubHistory(page: Page): Promise<string[]> {
   const asked: string[] = [];
   await stubApi(page);
@@ -99,7 +97,8 @@ test('a wide range halves down to the one save that made the change', async ({ p
   await expect(page.getByTestId('draft-history-range')).toHaveText('v1 → v4');
   await expect(page).toHaveURL(/\?from=1&to=4$/);
   await expect(page.getByTestId('draft-history-save-2')).toHaveAttribute('data-placement', 'inside');
-  await expect(page.getByTestId('draft-history-bisect')).toContainText('spans 3 saves');
+  await expect(page.getByTestId('draft-history-older-half')).toHaveText('v1 → v3');
+  await expect(page.getByTestId('draft-history-newer-half')).toHaveText('v3 → v4');
 
   await page.getByTestId('draft-history-newer-half').click();
   await expect(page.getByTestId('draft-history-range')).toHaveText('v3 → v4');

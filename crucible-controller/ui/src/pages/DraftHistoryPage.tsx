@@ -30,7 +30,6 @@ import {
   rangeLabel,
   rangeOf,
   rangeSearch,
-  savesIn,
   singleSave,
   type DiffLineKind,
   type FileChange,
@@ -43,7 +42,6 @@ import {
 type PlaybookRun = components['schemas']['PlaybookRunDto'];
 
 const WIDE = '(min-width: 1200px)';
-/// A file's diff past this many rows starts folded, so one generated file does not bury the rest.
 const LARGE_DIFF_ROWS = 1500;
 const NO_HISTORY: readonly HistoryEntry[] = [];
 const NO_RUNS: readonly PlaybookRun[] = [];
@@ -77,9 +75,6 @@ const SIGN: Record<DiffLineKind, string> = {
   note: '',
 };
 
-/// A draft's saves as a changelog beside the diff of any two of them. The range lives in the URL,
-/// so a diff can be linked, and the halving buttons narrow it toward the one save that made a
-/// change.
 export function DraftHistoryPage() {
   const { id = '' } = useParams<{ id: string }>();
   const [search] = useSearchParams();
@@ -108,7 +103,6 @@ export function DraftHistoryPage() {
       <PageHeader
         eyebrow="Draft history"
         title={id}
-        description="Every save, the files it changed, and the diff between any two."
         actions={
           <Button className="uppercase" render={<Link to={studio} />}>
             Open studio
@@ -117,7 +111,7 @@ export function DraftHistoryPage() {
       />
       <QueryState query={history} noun="history">
         {range === null ? (
-          <Empty title="No saves" description="This draft has no stored version yet." />
+          <Empty title="No saves" />
         ) : (
           <div className={cn('flex min-h-0 flex-1', wide ? 'flex-row' : 'flex-col')}>
             <div
@@ -172,7 +166,7 @@ function Changelog({
 }) {
   return (
     <Section className="border-b-0">
-      <SectionHeader title="Saves" note={`${entries.length}, newest first`} />
+      <SectionHeader title="Saves" />
       <ol data-testid="draft-history-saves">
         {entries.map((entry) => (
           <SaveRow
@@ -212,7 +206,6 @@ function SaveRow({
           to={rangeSearch(singleSave(entries, entry.version))}
           replace
           className="font-mono text-data-lg font-semibold text-ink hover:underline"
-          title="Show what this save changed"
         >
           {`v${entry.version}`}
         </Link>
@@ -224,7 +217,6 @@ function SaveRow({
           <Button
             className="uppercase"
             selected={placement === 'from'}
-            title="Compare from this save"
             render={<Link to={rangeSearch({ from: entry.version, to: range.to })} replace />}
           >
             From
@@ -232,7 +224,6 @@ function SaveRow({
           <Button
             className="uppercase"
             selected={placement === 'to'}
-            title="Compare to this save"
             render={
               <Link
                 to={rangeSearch(
@@ -254,9 +245,6 @@ function SaveRow({
       <ChangedFiles changes={entry.changes} />
       {launches.length > 0 && (
         <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1">
-          <Mono size="micro" tone="ink-3" uppercase>
-            Test-fires
-          </Mono>
           {launches.map((run) => (
             <Link key={run.key} to={launchPath(run.key)} title={run.key} className="hover:underline">
               <Status
@@ -275,7 +263,7 @@ function ChangedFiles({ changes }: { changes: HistoryEntry['changes'] }) {
   if (changes === null || changes === undefined) {
     return (
       <Mono size="label" tone="ink-3" className="mt-1 block">
-        Changes unknown: this save has no stored tree to compare.
+        Changes unknown
       </Mono>
     );
   }
@@ -317,7 +305,6 @@ function RangeDiff({
   });
   const halves = halvesOf(entries, range);
   const neighbors = neighborsOf(entries, range);
-  const covered = savesIn(entries, range).length;
   const files = diff.data?.files;
   const additions = files?.reduce((sum, file) => sum + file.additions, 0) ?? 0;
   const deletions = files?.reduce((sum, file) => sum + file.deletions, 0) ?? 0;
@@ -326,15 +313,19 @@ function RangeDiff({
     <>
       <SectionHeader
         title={<span data-testid="draft-history-range">{rangeLabel(range)}</span>}
-        note={
-          files === undefined
-            ? undefined
-            : `${files.length} files changed, +${additions} −${deletions}${
-                covered > 1 ? `, across ${covered} saves` : ''
-              }`
-        }
+        note={files === undefined ? undefined : `+${additions} −${deletions}`}
         actions={
           <>
+            {halves !== null && (
+              <span data-testid="draft-history-bisect" className="flex items-center gap-2">
+                <RangeLink range={halves.older} testId="draft-history-older-half">
+                  {rangeLabel(halves.older)}
+                </RangeLink>
+                <RangeLink range={halves.newer} testId="draft-history-newer-half">
+                  {rangeLabel(halves.newer)}
+                </RangeLink>
+              </span>
+            )}
             <RangeLink range={neighbors.older} testId="draft-history-older">
               Older save
             </RangeLink>
@@ -345,28 +336,9 @@ function RangeDiff({
         }
         className="sticky top-0 z-10 flex-wrap"
       />
-      {halves !== null && (
-        <div
-          data-testid="draft-history-bisect"
-          className="flex flex-wrap items-center gap-2.5 border-b border-rule bg-surface px-4.5 py-2"
-        >
-          <Mono size="label" tone="ink-3">
-            {`This diff spans ${covered} saves. Narrow it to the half that holds the change:`}
-          </Mono>
-          <RangeLink range={halves.older} testId="draft-history-older-half">
-            {`Older half (${rangeLabel(halves.older)})`}
-          </RangeLink>
-          <RangeLink range={halves.newer} testId="draft-history-newer-half">
-            {`Newer half (${rangeLabel(halves.newer)})`}
-          </RangeLink>
-        </div>
-      )}
       <QueryState query={diff} noun="diff">
         {files === undefined || files.length === 0 ? (
-          <Empty
-            title="No changes"
-            description={`${rangeLabel(range)} holds the same files on both sides.`}
-          />
+          <Empty title="No changes" />
         ) : (
           <div data-testid="draft-history-diff">
             {files.map((file) => (
@@ -400,7 +372,7 @@ function FileDiffSection({ file }: { file: FileDiff }) {
       {rows === null ? (
         <SectionBody>
           <Mono size="label" tone="ink-3">
-            This file is not text, so there is no line diff to show.
+            Not text
           </Mono>
         </SectionBody>
       ) : (
