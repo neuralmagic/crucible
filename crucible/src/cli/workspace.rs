@@ -39,17 +39,13 @@ pub(crate) enum WorkspaceError {
         dir: PathBuf,
         stderr: String,
     },
+    #[error("writing git's input to a temporary file")]
+    GitInput(#[source] std::io::Error),
     #[error("reading the packs of {}", .dir.display())]
     ReadPacks {
         dir: PathBuf,
         #[source]
         source: std::io::Error,
-    },
-    #[error("opening the repository in {}", .dir.display())]
-    OpenRepo {
-        dir: PathBuf,
-        #[source]
-        source: git2::Error,
     },
     #[error("reading the refs of {}", .dest.display())]
     ReadRefs {
@@ -177,27 +173,19 @@ fn git(dir: Option<&Path>, args: &[&str]) -> Result<bool, WorkspaceError> {
         .success())
 }
 
-/// Run git in `dir` with `input` on its stdin, returning its stdout.
-fn git_piped(dir: &Path, args: &[&str], input: Vec<u8>) -> Result<Vec<u8>, WorkspaceError> {
-    use std::io::Write;
-    use std::process::Stdio;
-    let mut child = std::process::Command::new("git")
+/// Run git in `dir` with `stdin`, returning its stdout. `Err` is a git that failed.
+fn git_stdout(
+    dir: &Path,
+    args: &[&str],
+    stdin: std::process::Stdio,
+) -> Result<String, WorkspaceError> {
+    let out = std::process::Command::new("git")
         .arg("-C")
         .arg(dir)
         .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stdin(stdin)
+        .output()
         .map_err(WorkspaceError::SpawnGit)?;
-    let stdin = child.stdin.take();
-    let writer = std::thread::spawn(move || {
-        if let Some(mut stdin) = stdin {
-            let _ = stdin.write_all(&input);
-        }
-    });
-    let out = child.wait_with_output().map_err(WorkspaceError::SpawnGit)?;
-    let _ = writer.join();
     if !out.status.success() {
         return Err(WorkspaceError::GitFailed {
             command: args.join(" "),
@@ -205,24 +193,65 @@ fn git_piped(dir: &Path, args: &[&str], input: Vec<u8>) -> Result<Vec<u8>, Works
             stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
         });
     }
-    Ok(out.stdout)
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// `lines` in an unnamed temporary file, opened at its start, for a git that reads its stdin.
+fn lines_as_stdin<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+) -> Result<std::process::Stdio, WorkspaceError> {
+    use std::io::{Seek, Write};
+    let mut file = tempfile::tempfile().map_err(WorkspaceError::GitInput)?;
+    for line in lines {
+        writeln!(file, "{line}").map_err(WorkspaceError::GitInput)?;
+    }
+    file.rewind().map_err(WorkspaceError::GitInput)?;
+    Ok(file.into())
+}
+
+/// The remote a partial clone fetches missing objects from; `None` for a full clone.
+fn promisor_remote(workspace: &Path) -> Result<Option<String>, WorkspaceError> {
+    use std::process::Stdio;
+    for remote in git_stdout(workspace, &["remote"], Stdio::null())?.lines() {
+        let key = format!("remote.{remote}.promisor");
+        let promisor = git_stdout(
+            workspace,
+            &[
+                "config",
+                "--get",
+                "--type",
+                "bool",
+                "--default",
+                "false",
+                &key,
+            ],
+            Stdio::null(),
+        )?;
+        if promisor.trim() == "true" {
+            return Ok(Some(remote.to_owned()));
+        }
+    }
+    Ok(None)
 }
 
 /// The blobs a partial clone has fetched from origin, by id, sorted: those its checkout needed
 /// and those anything since read. None for a full clone, which holds every blob from the start.
 pub(crate) fn fetched_blobs(workspace: &Path) -> Result<Vec<String>, WorkspaceError> {
-    let repo = git2::Repository::open(workspace).map_err(|source| WorkspaceError::OpenRepo {
-        dir: workspace.to_path_buf(),
-        source,
-    })?;
-    let partial = repo
-        .config()
-        .and_then(|config| config.get_bool("remote.origin.promisor"))
-        .unwrap_or(false);
-    if !partial {
+    use std::process::Stdio;
+    if promisor_remote(workspace)?.is_none() {
         return Ok(Vec::new());
     }
-    let packs = repo.path().join("objects").join("pack");
+    let packs = git_stdout(
+        workspace,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects/pack",
+        ],
+        Stdio::null(),
+    )?;
+    let packs = PathBuf::from(packs.trim_end_matches('\n'));
     let read = |source| WorkspaceError::ReadPacks {
         dir: packs.clone(),
         source,
@@ -233,21 +262,21 @@ pub(crate) fn fetched_blobs(workspace: &Path) -> Result<Vec<String>, WorkspaceEr
         if marker.extension().is_none_or(|ext| ext != "promisor") {
             continue;
         }
-        let index = std::fs::read(marker.with_extension("idx")).map_err(read)?;
-        let listed = git_piped(workspace, &["show-index"], index)?;
-        for line in String::from_utf8_lossy(&listed).lines() {
-            if let Some(id) = line.split_whitespace().nth(1) {
-                fetched.extend_from_slice(id.as_bytes());
-                fetched.push(b'\n');
-            }
-        }
+        let index = std::fs::File::open(marker.with_extension("idx")).map_err(read)?;
+        let listed = git_stdout(workspace, &["show-index"], index.into())?;
+        fetched.extend(
+            listed
+                .lines()
+                .filter_map(|line| line.split_whitespace().nth(1))
+                .map(str::to_owned),
+        );
     }
-    let typed = git_piped(
+    let typed = git_stdout(
         workspace,
         &["cat-file", "--batch-check=%(objecttype) %(objectname)"],
-        fetched,
+        lines_as_stdin(fetched.iter().map(String::as_str))?,
     )?;
-    let mut blobs: Vec<String> = String::from_utf8_lossy(&typed)
+    let mut blobs: Vec<String> = typed
         .lines()
         .filter_map(|line| line.strip_prefix("blob "))
         .map(str::to_owned)
@@ -257,12 +286,17 @@ pub(crate) fn fetched_blobs(workspace: &Path) -> Result<Vec<String>, WorkspaceEr
     Ok(blobs)
 }
 
-/// Fetch from origin those of `blobs` the workspace does not hold.
+/// Fetch those of `blobs` a partial clone does not hold from the remote it was cloned from. A
+/// full clone holds every blob its remote serves, so there is nothing to fetch.
 pub(crate) fn fetch_blobs(workspace: &Path, blobs: &[String]) -> Result<(), WorkspaceError> {
+    use std::process::Stdio;
     if blobs.is_empty() {
         return Ok(());
     }
-    let held = git_piped(
+    let Some(remote) = promisor_remote(workspace)? else {
+        return Ok(());
+    };
+    let held = git_stdout(
         workspace,
         &[
             "cat-file",
@@ -270,9 +304,8 @@ pub(crate) fn fetch_blobs(workspace: &Path, blobs: &[String]) -> Result<(), Work
             "--unordered",
             "--batch-check=%(objectname)",
         ],
-        Vec::new(),
+        Stdio::null(),
     )?;
-    let held = String::from_utf8_lossy(&held);
     let held: std::collections::HashSet<&str> = held.lines().collect();
     let missing: Vec<&str> = blobs
         .iter()
@@ -282,7 +315,7 @@ pub(crate) fn fetch_blobs(workspace: &Path, blobs: &[String]) -> Result<(), Work
     if missing.is_empty() {
         return Ok(());
     }
-    git_piped(
+    git_stdout(
         workspace,
         &[
             "-c",
@@ -293,9 +326,9 @@ pub(crate) fn fetch_blobs(workspace: &Path, blobs: &[String]) -> Result<(), Work
             "--no-write-fetch-head",
             "--recurse-submodules=no",
             "--stdin",
-            "origin",
+            &remote,
         ],
-        missing.join("\n").into_bytes(),
+        lines_as_stdin(missing)?,
     )?;
     Ok(())
 }
@@ -554,6 +587,69 @@ mod tests {
         assert_eq!(fetched_blobs(&full).expect("lists"), Vec::<String>::new());
         fetch_blobs(&full, &both).expect("a full clone holds them already");
         for dir in [first, second, full] {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn listing_and_fetching_carry_more_blobs_than_a_pipe_buffers() {
+        let origin = crate::testing::git_origin("clone-many");
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.email=c@l", "-c", "user.name=c"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        const FILES: usize = 4000;
+        git(&origin.path, &["checkout", "-q", "-b", "many"]);
+        fs::create_dir(origin.path.join("many")).expect("mkdir");
+        for i in 0..FILES {
+            fs::write(origin.path.join(format!("many/{i}.txt")), format!("{i}\n")).expect("write");
+        }
+        git(&origin.path, &["add", "-A"]);
+        git(&origin.path, &["commit", "-q", "-m", "many"]);
+        git(&origin.path, &["checkout", "-q", "main"]);
+        for key in ["uploadpack.allowFilter", "uploadpack.allowAnySHA1InWant"] {
+            git(&origin.path, &["config", key, "true"]);
+        }
+        let src = format!("file://{}", origin.path.display());
+        let filter = Some(crate::manifest::CloneFilter::BlobNone);
+
+        let wide = origin.path.with_extension("wide");
+        clone_repo(&src, Some(&at("many")), filter, &wide).expect("clones");
+        let blobs = fetched_blobs(&wide).expect("lists");
+        assert_eq!(
+            blobs.len(),
+            FILES + 1,
+            "every file of the checkout, a.txt included"
+        );
+        assert!(
+            blobs.iter().map(|id| id.len() + 1).sum::<usize>() > 2 * 65536,
+            "the list outgrows a pipe's buffer"
+        );
+
+        let narrow = origin.path.with_extension("narrow");
+        clone_repo(&src, None, filter, &narrow).expect("clones");
+        assert_eq!(fetched_blobs(&narrow).expect("lists").len(), 1);
+        fetch_blobs(&narrow, &blobs).expect("fetches");
+        assert_eq!(fetched_blobs(&narrow).expect("lists"), blobs);
+        git(
+            &narrow,
+            &[
+                "-c",
+                "url./nonexistent/.insteadOf=file://",
+                "checkout",
+                "-q",
+                "origin/many",
+            ],
+        );
+        for dir in [wide, narrow] {
             let _ = fs::remove_dir_all(dir);
         }
     }
