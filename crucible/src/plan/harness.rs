@@ -1963,7 +1963,7 @@ mod tests {
         let (overridden, _) = crate::cli::setup::prep_plan_runner_with_params(
             &manifest,
             None,
-            &BTreeMap::new(),
+            (&BTreeMap::new()).into(),
             crate::openshell::gateway::ComputeDriver::Podman,
             crate::args::AgentOverride {
                 harness: Some(crate::knobs::Harness::Codex),
@@ -2039,7 +2039,7 @@ workflow(type = "playbook", tasks = [plan, review, ship])
             let (runner, m) = crate::cli::setup::prep_plan_runner_with_params(
                 &manifest,
                 None,
-                &params(pairs),
+                (&params(pairs)).into(),
                 crate::openshell::gateway::ComputeDriver::Podman,
                 flags,
                 None,
@@ -2096,7 +2096,7 @@ workflow(type = "playbook", tasks = [plan, review, ship])
         let twice = crate::cli::setup::prep_plan_runner_with_params(
             &manifest,
             None,
-            &params(&[("*.model", "launched-all")]),
+            (&params(&[("*.model", "launched-all")])).into(),
             crate::openshell::gateway::ComputeDriver::Podman,
             crate::args::AgentOverride {
                 harness: None,
@@ -2143,7 +2143,7 @@ workflow(type = "playbook", tasks = [plan, review, ship])
             crate::cli::setup::prep_plan_runner_with_params(
                 &manifest,
                 None,
-                &BTreeMap::from([("repo.ref".to_string(), r.to_string())]),
+                (&BTreeMap::from([("repo.ref".to_string(), r.to_string())])).into(),
                 crate::openshell::gateway::ComputeDriver::Podman,
                 crate::args::AgentOverride::default(),
                 None,
@@ -5169,7 +5169,7 @@ workflow(type = "playbook", tasks = [echo])
         let mut runner = crate::cli::setup::prep_plan_runner_with_params(
             &manifest_path,
             None,
-            &supplied,
+            (&supplied).into(),
             crate::openshell::gateway::ComputeDriver::Podman,
             crate::args::AgentOverride::default(),
             None,

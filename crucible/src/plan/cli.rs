@@ -531,6 +531,8 @@ pub struct RunOpts {
     pub rerun: Option<Rerun>,
     /// The engine runtime the run's sandboxed turns run on.
     pub engine: Option<tokio::runtime::Handle>,
+    /// The compiled graph to run instead of compiling the manifest's workflow source.
+    pub resolved_workflow: Option<std::path::PathBuf>,
 }
 
 /// A rerun's parent and the tasks it dispatches again.
@@ -667,6 +669,7 @@ pub fn run(
         variant,
         rerun,
         engine,
+        resolved_workflow,
     } = opts;
 
     if let (None, Some(raw)) = (ceilings.wall_clock, ceilings.wall_clock_raw.as_ref()) {
@@ -699,7 +702,10 @@ pub fn run(
                 let (mut prepared, loaded) = crate::cli::setup::prep_plan_runner_with_params(
                     m,
                     variant.as_ref(),
-                    params,
+                    crate::cli::setup::Supplied {
+                        params,
+                        resolved_workflow: resolved_workflow.as_deref(),
+                    },
                     compute_driver,
                     agent,
                     engine,

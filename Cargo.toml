@@ -15,6 +15,7 @@ members = [
     "buildit",
     "crucible-git",
     "capability",
+    "crucible-task",
     "xtask",
 ]
 # Vendored upstream sources (see third_party/NOTICE). Excluded from the workspace so

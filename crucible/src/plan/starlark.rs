@@ -1,7 +1,7 @@
 //! Deterministic Starlark frontend for [`WorkflowCfg`]. Scope freezes the compiled IR, so runtime
 //! never evaluates the source. Only `prompt_file`, `schema_file`, and `load` can read files, and
-//! all are confined to the pack directory; process, environment, network, clock, and randomness APIs are
-//! unavailable.
+//! all are confined to the pack directory and the dependencies its lock pins; process, environment,
+//! network, clock, and randomness APIs are unavailable.
 
 pub mod error;
 mod globals;
@@ -26,6 +26,7 @@ use crate::crucible::Direction;
 use crate::duration::TaskTimeout;
 use crate::errors::FileError;
 use crate::knobs::{Harness, ReasoningEffort};
+use crate::plan::deps::{self, DepName, Root};
 use crate::plan::diag;
 use crate::plan::ir::{
     Decider, Emits, EngineOp, Isolation, Join, MAX_FANOUT_CEILING, MAX_REPAIR_CEILING,
@@ -68,6 +69,8 @@ pub struct CompiledWorkflow {
 #[derive(Debug)]
 struct CompileContext {
     pack_dir: PathBuf,
+    /// The dependencies `crucible.lock` lists, by the name `@name//path` uses.
+    deps: BTreeMap<DepName, deps::Located>,
     /// Parameter values bound before evaluation, so `param()` is a lookup and the compiled graph
     /// carries no unresolved reference.
     params: BTreeMap<String, ParamValue>,
@@ -199,20 +202,82 @@ impl PathRejection {
     }
 }
 
+/// A path resolved to a file in the pack or in a dependency.
+struct Resolved {
+    root: Root,
+    /// The path as recorded for the author: pack-relative, or `@name//path` in a dependency.
+    shown: PathBuf,
+    canonical: PathBuf,
+}
+
 impl CompileContext {
-    /// The pack-relative and canonical forms of `raw`, or why the pack refuses it. Every
+    /// The tree the file holding `at` belongs to. A path written in a dependency's file resolves
+    /// in that dependency.
+    fn root_of(&self, at: &FileSpan) -> Root {
+        let file = Path::new(at.file.filename());
+        self.deps
+            .iter()
+            .find(|(_, dep)| dep.dir.as_deref().is_some_and(|dir| file.starts_with(dir)))
+            .map_or(Root::Pack, |(name, _)| Root::Dep(name.clone()))
+    }
+
+    /// Resolve `raw` as written in a file under `from`: `@name//path` in that dependency, anything
+    /// else in `from` itself.
+    fn resolve(&self, from: &Root, raw: &str, kind: PathKind) -> Result<Resolved> {
+        let (root, path) = match deps::split(raw) {
+            None => (from.clone(), raw),
+            Some(Ok((name, path))) => (Root::Dep(name), path),
+            Some(Err(error)) => {
+                return Err(CompileError::PathRejected {
+                    call: kind.call(),
+                    raw: raw.to_owned(),
+                    why: error.to_string(),
+                });
+            }
+        };
+        let dir = match &root {
+            Root::Pack => self.pack_dir.clone(),
+            Root::Dep(name) => {
+                let dep = self
+                    .deps
+                    .get(name)
+                    .ok_or_else(|| CompileError::DepUnknown {
+                        call: kind.call(),
+                        raw: raw.to_owned(),
+                        name: name.clone(),
+                    })?;
+                dep.dir.clone().ok_or_else(|| CompileError::DepNotFetched {
+                    name: name.clone(),
+                    tree: dep.tree.clone(),
+                })?
+            }
+        };
+        let (relative, canonical) =
+            Self::resolve_under(&dir, path, kind).map_err(|rejection| rejection.at(kind, raw))?;
+        let shown = match &root {
+            Root::Pack => relative,
+            Root::Dep(name) => PathBuf::from(format!("@{name}//{}", relative.display())),
+        };
+        Ok(Resolved {
+            root,
+            shown,
+            canonical,
+        })
+    }
+
+    /// The relative and canonical forms of `raw` under `dir`, or why it is refused. Every
     /// component is stat'd with `symlink_metadata`, so a symlinked intermediate directory is
     /// refused as well as a symlinked leaf.
-    fn resolve_in_pack(
-        &self,
+    fn resolve_under(
+        dir: &Path,
         raw: &str,
         kind: PathKind,
     ) -> std::result::Result<(PathBuf, PathBuf), PathRejection> {
         let relative = safe_relative_path(raw)?;
-        let root = std::fs::canonicalize(&self.pack_dir)
-            .map_err(FileError::at("resolving pack directory", &self.pack_dir))
+        let root = std::fs::canonicalize(dir)
+            .map_err(FileError::at("resolving pack directory", dir))
             .map_err(PathRejection::File)?;
-        let mut path = self.pack_dir.clone();
+        let mut path = dir.to_path_buf();
         let mut metadata = None;
         for component in relative.components() {
             let Component::Normal(component) = component else {
@@ -290,10 +355,18 @@ impl CompileContext {
 
     /// The bytes of a pack file a constructor embeds in the IR, charged to the workflow's embed
     /// budget.
-    fn embed(&mut self, raw: &str, kind: PathKind, max: usize) -> Result<(PathBuf, Vec<u8>)> {
-        let (relative, canonical) = self
-            .resolve_in_pack(raw, kind)
-            .map_err(|rejection| rejection.at(kind, raw))?;
+    fn embed(
+        &mut self,
+        raw: &str,
+        at: &FileSpan,
+        kind: PathKind,
+        max: usize,
+    ) -> Result<(PathBuf, Vec<u8>)> {
+        let Resolved {
+            shown: relative,
+            canonical,
+            ..
+        } = self.resolve(&self.root_of(at), raw, kind)?;
         let too_large = |bytes: u64| CompileError::EmbedTooLarge {
             call: kind.call(),
             raw: raw.to_owned(),
@@ -319,14 +392,14 @@ impl CompileContext {
         Ok((relative, bytes))
     }
 
-    fn prompt_file(&mut self, raw: &str) -> Result<String> {
-        let (relative, bytes) = self.embed(raw, PathKind::Prompt, MAX_PROMPT_BYTES)?;
+    fn prompt_file(&mut self, raw: &str, at: &FileSpan) -> Result<String> {
+        let (relative, bytes) = self.embed(raw, at, PathKind::Prompt, MAX_PROMPT_BYTES)?;
         self.prompt_files.insert(relative);
         Ok(String::from_utf8(bytes)?)
     }
 
-    fn schema_file(&mut self, raw: &str) -> Result<SchemaFile> {
-        let (relative, bytes) = self.embed(raw, PathKind::Schema, MAX_SCHEMA_BYTES)?;
+    fn schema_file(&mut self, raw: &str, at: &FileSpan) -> Result<SchemaFile> {
+        let (relative, bytes) = self.embed(raw, at, PathKind::Schema, MAX_SCHEMA_BYTES)?;
         let invalid = |error| CompileError::InvalidSchema {
             raw: raw.to_owned(),
             error,
@@ -373,6 +446,7 @@ impl CompileState {
             site: FileSpan { file, span },
             inner: RefCell::new(CompileContext {
                 pack_dir: pack_dir.to_path_buf(),
+                deps: BTreeMap::new(),
                 params: BTreeMap::new(),
                 supplied: BTreeSet::new(),
                 prompt_files: BTreeSet::new(),
@@ -907,7 +981,7 @@ fn constructor(
             .map_err(|error| CompileError::InvalidQuestion { error })?;
         return Ok(Value::Question(question));
     }
-    if let Some(value) = value_constructor(function, &mut named, state)? {
+    if let Some(value) = value_constructor(function, &mut named, state, at)? {
         no_unknown_kwargs(function, &named)?;
         return Ok(value);
     }
@@ -924,7 +998,7 @@ fn constructor(
         "agent" | "skill" => {
             let name = take_declared_name(&mut named, "name")?;
             let prompt = if function == "skill" {
-                skill_prompt(&mut named, state, &name.0)?
+                skill_prompt(&mut named, state, &name.0, at)?
             } else {
                 take_prompt(&mut named, "prompt")?
             };
@@ -999,7 +1073,7 @@ fn constructor(
                 destination: take_report_destination(&mut named)?,
                 template: {
                     let path = take_string(&mut named, "template")?;
-                    state.context_mut().prompt_file(&path)?
+                    state.context_mut().prompt_file(&path, at)?
                 },
                 result: take_optional_task_name(&mut named, "result")?,
                 severity_field: take_optional_string(&mut named, "severity_field")?
@@ -1071,7 +1145,7 @@ fn constructor(
         "route" => {
             let name = take_declared_name(&mut named, "name")?;
             let questions = take_questions(&mut named)?;
-            let DeciderSpec { decider, timeout } = take_decider(&mut named, state, &name)?;
+            let DeciderSpec { decider, timeout } = take_decider(&mut named, state, &name, at)?;
             let needs = match decider {
                 Decider::Model { .. } => crate::plan::ir::NEEDS_DECISION,
                 Decider::Output { .. } => "any",
@@ -1193,6 +1267,7 @@ fn value_constructor(
     function: &str,
     named: &mut BTreeMap<String, Value>,
     state: &CompileState,
+    at: &FileSpan,
 ) -> Result<Option<Value>> {
     let value = match function {
         "each" => {
@@ -1264,7 +1339,7 @@ fn value_constructor(
         }
         "human" => {
             let review = match take_optional_string(named, "review")? {
-                Some(path) => Some(state.context_mut().prompt_file(&path)?),
+                Some(path) => Some(state.context_mut().prompt_file(&path, at)?),
                 None => None,
             };
             Value::Decider(DeciderSpec {
@@ -2290,6 +2365,7 @@ fn take_decider(
     named: &mut BTreeMap<String, Value>,
     state: &CompileState,
     name: &TaskName,
+    at: &FileSpan,
 ) -> Result<DeciderSpec> {
     let decider = match named.remove("decider") {
         None | Some(Value::None) => None,
@@ -2322,7 +2398,7 @@ fn take_decider(
     let human = take_bool_default(named, "human", false)?;
     let review = match take_optional_string(named, "review")? {
         Some(_) if !human => return Err(CompileError::ReviewWithoutHuman { task: task() }),
-        Some(path) => Some(state.context_mut().prompt_file(&path)?),
+        Some(path) => Some(state.context_mut().prompt_file(&path, at)?),
         None => None,
     };
     let timeout = take_timeout(named)?;
@@ -2619,10 +2695,11 @@ fn skill_prompt(
     named: &mut BTreeMap<String, Value>,
     state: &CompileState,
     task: &str,
+    at: &FileSpan,
 ) -> Result<String> {
     let directory = take_string(named, "skill")?;
     let path = format!("{}/{SKILL_FILE}", directory.trim_end_matches('/'));
-    let body = strip_frontmatter(&state.context_mut().prompt_file(&path)?);
+    let body = strip_frontmatter(&state.context_mut().prompt_file(&path, at)?);
 
     let mut segments = vec![values::Segment {
         text: body,
@@ -3319,6 +3396,7 @@ fn compile_source_here(
     let idents = idents::scan(&ast, lane);
     let globals = lane_globals(lane);
     let state = CompileState::new(pack_dir, filename);
+    state.context_mut().deps = deps::locate(pack_dir)?;
     let declared_params = params::Params::read(&ast)?;
     let declares_params = !declared_params.is_empty();
     {
