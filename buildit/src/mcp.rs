@@ -103,6 +103,8 @@ const CCACHE_STATS: &str = "ccache-stats.log";
 const STEPS_LOG: &str = "steps.log";
 const CCACHE_USER: &str = "buildit";
 const MAX_FACTS: u64 = 64 * 1024;
+/// How much of `ccache-stats.log` a summary reads: about a line per compiled object.
+const MAX_CCACHE_STATS: u64 = 64 * 1024 * 1024;
 const DEFAULT_LOG_BYTES: u64 = 16 * 1024;
 const MAX_LOG_BYTES: u64 = 64 * 1024;
 
@@ -891,6 +893,23 @@ impl SharedCache {
     }
 }
 
+type Facts = serde_json::Map<String, serde_json::Value>;
+type CcacheSummary = std::collections::BTreeMap<String, u64>;
+
+/// Each result's count in a ccache `stats_log`, which holds a `# <input file>` line per
+/// compilation followed by one line per result it recorded. `None` when it recorded none.
+fn ccache_summary(log: impl std::io::BufRead) -> Option<CcacheSummary> {
+    let mut counts = CcacheSummary::new();
+    for line in log.lines() {
+        let Ok(line) = line else { break };
+        let result = line.trim();
+        if !result.is_empty() && !result.starts_with('#') {
+            *counts.entry(result.to_string()).or_default() += 1;
+        }
+    }
+    (!counts.is_empty()).then_some(counts)
+}
+
 /// The /etc/ccache.conf of a build that asks for ccache.
 fn ccache_conf(cache: Option<&SharedCache>, starter: Starter) -> String {
     let mut conf = format!("stats_log = {FACTS_MOUNT}/{CCACHE_STATS}\n");
@@ -1090,6 +1109,10 @@ pub struct StatusReply {
     /// The JSON object the build wrote to `/buildit/facts.json`, once it has ended
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub facts: Option<serde_json::Map<String, serde_json::Value>>,
+    /// How many times each ccache result occurred, from `ccache-stats.log`, once a build with
+    /// `ccache` has ended: `direct_cache_hit`, `remote_storage_hit`, `cache_miss` and so on
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ccache: Option<std::collections::BTreeMap<String, u64>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2117,8 +2140,8 @@ impl Broker {
                     .await?,
             ),
         };
-        let facts = match seen.snap.state {
-            step::State::Running => None,
+        let (facts, ccache) = match seen.snap.state {
+            step::State::Running => (None, None),
             _ => self.facts(sandbox, id).await,
         };
         Ok(StatusReply {
@@ -2130,36 +2153,64 @@ impl Broker {
             context_digest: seen.context_digest.clone(),
             builder: seen.builder,
             facts,
+            ccache,
         })
     }
 
-    /// The object the build wrote to `facts.json`, from the facts it archived.
+    /// From the facts the build archived: the object it wrote to `facts.json`, and the summary
+    /// of its `ccache-stats.log`.
     async fn facts(
         &self,
         sandbox: &SandboxName,
         id: &BuildId,
-    ) -> Option<serde_json::Map<String, serde_json::Value>> {
+    ) -> (Option<Facts>, Option<CcacheSummary>) {
         let prefix = jobs::archive_prefix(sandbox.as_str(), id.as_str());
-        let tar = self.blob(&format!("{prefix}/facts.tar")).await.ok()??;
+        let Some(tar) = self
+            .blob(&format!("{prefix}/facts.tar"))
+            .await
+            .ok()
+            .flatten()
+        else {
+            return (None, None);
+        };
+        let (mut facts, mut ccache) = (None, None);
         let mut archive = tar::Archive::new(tar.as_slice());
-        for entry in archive.entries().ok()? {
-            let mut entry = entry.ok()?;
-            let path = entry.path().ok()?.to_string_lossy().into_owned();
-            if path.trim_start_matches("./") != "facts.json" {
+        let Ok(entries) = archive.entries() else {
+            return (None, None);
+        };
+        for entry in entries {
+            let Ok(mut entry) = entry else { break };
+            let Ok(path) = entry.path().map(|p| p.to_string_lossy().into_owned()) else {
                 continue;
-            }
-            let mut raw = Vec::new();
-            std::io::Read::read_to_end(&mut std::io::Read::take(&mut entry, MAX_FACTS), &mut raw)
-                .ok()?;
-            return match serde_json::from_slice(&raw) {
-                Ok(serde_json::Value::Object(facts)) => Some(facts),
-                _ => {
-                    tracing::warn!("build {} left a facts.json that is not a JSON object", id.0);
-                    None
-                }
             };
+            match path.trim_start_matches("./") {
+                "facts.json" => {
+                    let mut raw = Vec::new();
+                    let read = std::io::Read::read_to_end(
+                        &mut std::io::Read::take(&mut entry, MAX_FACTS),
+                        &mut raw,
+                    );
+                    facts = match (read, serde_json::from_slice(&raw)) {
+                        (Ok(_), Ok(serde_json::Value::Object(object))) => Some(object),
+                        _ => {
+                            tracing::warn!(
+                                "build {} left a facts.json that is not a JSON object",
+                                id.0
+                            );
+                            None
+                        }
+                    };
+                }
+                CCACHE_STATS => {
+                    ccache = ccache_summary(std::io::BufReader::new(std::io::Read::take(
+                        &mut entry,
+                        MAX_CCACHE_STATS,
+                    )));
+                }
+                _ => {}
+            }
         }
-        None
+        (facts, ccache)
     }
 
     async fn start_run(
@@ -3098,8 +3149,8 @@ mod tests {
         CacheWriters, Caller, Launcher, LogsParams, MCP_PATH, PushParams, PushTarget,
         ResourceServer, ResourceServerConfig, Response, SCOPE_BUILD, SCOPE_READ, SharedCache,
         Snapshots, Starter, StatusCode, TokenLine, ToolPolicy, TrustedIssuer, bind_socket,
-        bud_argv, buildctl_argv, cache_mounts, ccache_conf, parse_tokens, router, run_mounts,
-        run_sandbox, socket_router, unpack,
+        bud_argv, buildctl_argv, cache_mounts, ccache_conf, ccache_summary, parse_tokens, router,
+        run_mounts, run_sandbox, socket_router, unpack,
     };
     use crate::sandbox::{RelPath, SandboxDir, SandboxName, Workspace};
     use crucible_mcp_auth::access::{AccessRules, Call};
@@ -4703,6 +4754,22 @@ mod tests {
             cache(CacheWriters::Run).base(),
             "http://cache.example.svc:8850"
         );
+    }
+
+    #[test]
+    fn a_ccache_stats_log_counts_each_result_across_compilations() {
+        let log = "# /src/a.c\ndirect_cache_hit\n# /src/b.c\ncache_miss\nremote_storage_miss\n\
+                   # /src/c.c\ndirect_cache_hit\n";
+        let summary = ccache_summary(log.as_bytes()).unwrap();
+        assert_eq!(
+            summary.into_iter().collect::<Vec<_>>(),
+            [
+                ("cache_miss".to_string(), 1),
+                ("direct_cache_hit".to_string(), 2),
+                ("remote_storage_miss".to_string(), 1),
+            ]
+        );
+        assert_eq!(ccache_summary("# /src/a.c\n".as_bytes()), None);
     }
 
     #[test]

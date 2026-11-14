@@ -195,6 +195,8 @@ A build with `ccache: true` (`--ccache` on the CLI) gets a generated `/etc/ccach
 shared cache as remote storage (writing to it when the build may write) and logs each object's
 result to `/buildit/ccache-stats.log`. The file overrides any `/etc/ccache.conf` the image has and
 is not part of the image. It needs ccache 4.4 or later, which reads the `secondary_storage` key.
+Once the build ends, `status.ccache` counts each result in that log (`direct_cache_hit`,
+`remote_storage_hit`, `cache_miss`, ...), so a caller can see how much the cache saved.
 
 #### Building with BuildKit (experimental)
 
