@@ -72,50 +72,57 @@ impl LogWindow {
     }
 }
 
-/// The window of `bytes` starting at `from`, or the tail when `from` is `None`. A `from` inside a
-/// line starts at the next whole line, and a window that stops short of the end stops after its
-/// last whole line, so paging from 0 by `next` reads every line exactly once.
+/// The window of `bytes` starting at `from`, or the tail when `from` is `None`. A window that
+/// stops short of the end stops after its last whole line, or inside a line longer than the cap on
+/// a character boundary, and the next one starts at that byte, so paging from 0 by `next` reads
+/// every byte exactly once.
 pub fn log_window(bytes: &[u8], from: Option<u64>) -> LogWindow {
     let cap = usize::try_from(MAX_LOG_BYTES).unwrap_or(usize::MAX);
     let len = bytes.len();
-    let after_newline = |at: usize| {
-        bytes[at..]
-            .iter()
-            .position(|b| *b == b'\n')
-            .map_or(len, |i| at + i + 1)
-    };
     let (start, end) = match from {
         None if len <= cap => (0, len),
         None => {
             let from = len - cap;
-            let start = after_newline(from);
+            let start = bytes[from..]
+                .iter()
+                .position(|b| *b == b'\n')
+                .map_or(from, |i| from + i + 1);
             (if start == len { from } else { start }, len)
         }
         Some(from) => {
-            let from = usize::try_from(from).unwrap_or(usize::MAX).min(len);
-            let start = if from == 0 || bytes[from - 1] == b'\n' {
-                from
-            } else {
-                after_newline(from)
-            };
-            let end = (start + cap).min(len);
+            let start = usize::try_from(from).unwrap_or(usize::MAX).min(len);
+            let end = start.saturating_add(cap).min(len);
             let end = if end == len {
                 end
             } else {
                 bytes[start..end]
                     .iter()
                     .rposition(|b| *b == b'\n')
-                    .map_or(end, |i| start + i + 1)
+                    .map_or_else(|| char_boundary(bytes, start, end), |i| start + i + 1)
             };
             (start, end)
         }
     };
     LogWindow {
         text: String::from_utf8_lossy(&bytes[start..end]).into_owned(),
-        start: start as u64,
-        next: (end < len).then_some(end as u64),
-        total_bytes: len as u64,
+        start: offset(start),
+        next: (end < len).then(|| offset(end)),
+        total_bytes: offset(len),
     }
+}
+
+/// The last UTF-8 character boundary in `(start, end]`, or `end` when the bytes there are not
+/// UTF-8.
+fn char_boundary(bytes: &[u8], start: usize, end: usize) -> usize {
+    (start + 1..=end)
+        .rev()
+        .take(4)
+        .find(|at| bytes.get(*at).is_none_or(|b| b & 0xC0 != 0x80))
+        .unwrap_or(end)
+}
+
+fn offset(at: usize) -> u64 {
+    u64::try_from(at).unwrap_or(u64::MAX)
 }
 
 /// A local run's engine log. `None` when the run kept no log.
@@ -231,7 +238,7 @@ pub fn fanout_width(session: &str, task: &str, over: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::runs::task_evidence::*;
 
     /// The fanned-out instance names a real triage run wrote, brackets and all.
     const SESSION: &str = concat!(
@@ -361,12 +368,33 @@ mod tests {
         let tail = log_window(body.as_bytes(), None);
         assert!(tail.truncated(), "the head was dropped");
         assert_eq!(tail.text, "last line\n", "cut on a line boundary");
-        assert_eq!(tail.start, body.len() as u64 - 10);
+        assert_eq!(tail.start, offset(body.len() - 10));
         assert_eq!(tail.next, None);
     }
 
-    /// A log several caps long reads back whole by following `next` from 0, each window ending on
-    /// a whole line, and an offset inside a line starts at the next one.
+    fn paged(body: &[u8]) -> (Vec<u8>, usize) {
+        let mut read = Vec::new();
+        let mut from = Some(0);
+        let mut windows = 0;
+        while let Some(at) = from {
+            let window = log_window(body, Some(at));
+            assert!(window.text.len() <= usize::try_from(MAX_LOG_BYTES).unwrap());
+            assert_eq!(window.start, at);
+            assert_eq!(window.total_bytes, offset(body.len()));
+            assert_eq!(window.truncated(), body.len() > window.text.len());
+            if window.next.is_some() {
+                assert!(
+                    !window.text.is_empty(),
+                    "a window short of the end makes progress"
+                );
+            }
+            read.extend_from_slice(window.text.as_bytes());
+            from = window.next;
+            windows += 1;
+        }
+        (read, windows)
+    }
+
     #[test]
     fn paging_from_the_start_reads_every_line_once() {
         let line = format!("{}\n", "y".repeat(999));
@@ -374,26 +402,39 @@ mod tests {
         for i in 0..1600 {
             body.push_str(&format!("{i:05} {line}"));
         }
-        let mut read = String::new();
-        let mut from = Some(0);
-        let mut windows = 0;
-        while let Some(at) = from {
-            let window = log_window(body.as_bytes(), Some(at));
-            assert!(window.text.len() as u64 <= MAX_LOG_BYTES);
-            assert!(window.text.ends_with('\n'));
-            assert_eq!(window.start, at);
-            assert_eq!(window.total_bytes, body.len() as u64);
-            read.push_str(&window.text);
-            from = window.next;
-            windows += 1;
-        }
-        assert_eq!(read, body);
+        let (read, windows) = paged(body.as_bytes());
+        assert_eq!(read, body.as_bytes());
         assert!(windows > 1, "the log spans several windows");
+        let first = log_window(body.as_bytes(), Some(0));
+        assert!(first.text.ends_with('\n'), "a window ends on a whole line");
 
         let mid = log_window(body.as_bytes(), Some(3));
-        assert!(mid.text.starts_with("00001 "), "{}", &mid.text[..12]);
+        assert_eq!(
+            (mid.start, &mid.text[..3]),
+            (3, "00 "),
+            "an offset is served as asked"
+        );
         let past = log_window(body.as_bytes(), Some(u64::MAX));
         assert_eq!((past.text.as_str(), past.next), ("", None));
+    }
+
+    #[test]
+    fn a_line_longer_than_one_response_pages_back_whole() {
+        let cap = usize::try_from(MAX_LOG_BYTES).unwrap();
+        let long = "é".repeat(cap);
+        let body = format!("head\n{long}\ntail\n");
+        let (read, windows) = paged(body.as_bytes());
+        assert_eq!(
+            String::from_utf8(read).unwrap(),
+            body,
+            "no byte lost or replaced"
+        );
+        assert!(windows >= 3, "the long line spans windows: {windows}");
+
+        let unbroken = "x".repeat(3 * cap);
+        let (read, windows) = paged(unbroken.as_bytes());
+        assert_eq!(read, unbroken.as_bytes());
+        assert_eq!(windows, 3);
     }
 
     #[tokio::test]

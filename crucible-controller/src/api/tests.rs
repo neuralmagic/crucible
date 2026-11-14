@@ -11479,6 +11479,7 @@ async fn run_log_serves_local_output_and_points_a_pod_run_at_its_pod(pool: PgPoo
             .contains("admitted 3 tasks")
     );
     assert!(!log["truncated"].as_bool().expect("truncated"));
+    assert_eq!(log["source"], "local");
 
     // No cluster to reach and nothing ingested yet: the pod run says where its output lives, and
     // names the cluster as well as the namespace so the hint is runnable.
@@ -11486,6 +11487,7 @@ async fn run_log_serves_local_output_and_points_a_pod_run_at_its_pod(pool: PgPoo
     assert_eq!(status, StatusCode::OK, "{pod}");
     assert_eq!(pod["dispatch"], "pod");
     assert_eq!(pod["text"], serde_json::Value::Null);
+    assert_eq!(pod["source"], serde_json::Value::Null);
     assert_eq!(
         pod["location"],
         "pod loop-abc in namespace autoresearch on cluster hub"
@@ -11508,6 +11510,7 @@ async fn run_log_serves_local_output_and_points_a_pod_run_at_its_pod(pool: PgPoo
         "{stored}"
     );
     assert_eq!(stored["location"], serde_json::Value::Null);
+    assert_eq!(stored["source"], "session");
 
     // The engine log kept at completion is the pod's own output and wins over the session.
     crate::runs::blob_store::put_run_engine_log(
@@ -11521,6 +11524,7 @@ async fn run_log_serves_local_output_and_points_a_pod_run_at_its_pod(pool: PgPoo
     let text = engine["text"].as_str().expect("text");
     assert!(text.contains("gateway_boot: driver=kubernetes"), "{engine}");
     assert!(!text.contains("task roundup: pass"), "{engine}");
+    assert_eq!(engine["source"], "stored");
 
     // A log longer than one response serves its tail by default, and reads back from its first
     // line by following `next` from 0.
