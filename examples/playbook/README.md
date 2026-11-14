@@ -30,13 +30,13 @@ Expected, exactly:
 
 ```text
 [audit-freshness] inbox/.last-release is missing: cannot date the entries
-  draft                pass       attempts=1 cost=$0.0000  out={"entries":3}
-  shape                pass       attempts=1 cost=$0.0000  out={"bullets":3,"declared":3,"matches":true}
-  polish               pass       attempts=1 cost=$0.0000  out={"continued":true,"session":"scribe","titled":true}
-  audit-headings       pass       attempts=1 cost=$0.0000  out={"findings":[],"topic":"headings"}
-  audit-bullets        pass       attempts=1 cost=$0.0000  out={"findings":[],"topic":"bullets"}
-  audit-freshness      fail       attempts=1 cost=$0.0000  (turn ended without writing PLAN_TASK_RESULT.json — nothing to grade)
-  roundup              pass       attempts=1 cost=$0.0000  out={"findings":[],"reporting":["audit-bullets","audit-headings"],"silent":["audit-freshness"]}
+  draft                pass       attempts=1 cost=$0.0000 elapsed=0.1s  out={"entries":3}
+  shape                pass       attempts=1 cost=$0.0000 elapsed=0.1s  out={"bullets":3,"declared":3,"matches":true}
+  polish               pass       attempts=1 cost=$0.0000 elapsed=0.1s  out={"continued":true,"session":"scribe","titled":true}
+  audit-headings       pass       attempts=1 cost=$0.0000 elapsed=0.1s  out={"findings":[],"topic":"headings"}
+  audit-bullets        pass       attempts=1 cost=$0.0000 elapsed=0.1s  out={"findings":[],"topic":"bullets"}
+  audit-freshness      fail       attempts=1 cost=$0.0000 elapsed=0.1s  (turn ended without writing PLAN_TASK_RESULT.json — nothing to grade)
+  roundup              pass       attempts=1 cost=$0.0000 elapsed=0.1s  out={"findings":[],"reporting":["audit-bullets","audit-headings"],"silent":["audit-freshness"]}
 plan v1: completed — spent $0.0000 of $1
 verdict: valid
 ```
