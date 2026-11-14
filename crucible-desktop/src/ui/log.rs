@@ -1,10 +1,10 @@
 //! The engine's console, one typed row per line.
 
 use rune::{Color, El, ScrollSpec, TextStyle, Tx, col, el, icon, row, text};
-use rune_kit::{SegmentedControl, TextInput};
+use rune_kit::{IconButton, IconButtonVariant, SegmentedControl, TextInput};
 use rune_theme_opencode::icons as oc;
 
-use crate::logline::{Body, Level, LogLine, LogView};
+use crate::logline::{self, Body, Level, LogLine, LogView};
 use crate::session::{TaskState, TaskView, split_name};
 use crate::settings::LogFont;
 use crate::ui::Paint;
@@ -29,29 +29,13 @@ pub(crate) fn log_pane(
     app: &App,
     p: &Paint,
 ) -> El {
-    let reading = if transcript.is_empty() {
-        LogSource::Console
-    } else {
-        app.log_source
-    };
-    let log = match reading {
-        LogSource::Transcript => transcript,
-        LogSource::Console => console,
-    };
-    let query = app.log_search.text.trim().to_ascii_lowercase();
-    let in_scope = |line: &&LogLine| {
-        app.run
-            .log_task
-            .as_deref()
-            .is_none_or(|task| line.is_for(task))
-            && (query.is_empty() || line.raw.to_ascii_lowercase().contains(&query))
-    };
-    let scoped: Vec<&LogLine> = log.iter().filter(in_scope).collect();
-    let matched: Vec<&LogLine> = scoped
-        .iter()
-        .copied()
-        .filter(|line| app.log_view.keeps(line, app.log_chatter))
-        .collect();
+    let Shown {
+        reading,
+        log,
+        scoped,
+        matched,
+    } = shown(transcript, console, app);
+    let query = app.log_search.text.trim();
 
     let style = p.sized(TextStyle::new(11.5, 400.0).lh(17.0).family(font.family()));
     let mode = app
@@ -118,7 +102,8 @@ pub(crate) fn log_pane(
                 .center_y()
                 .child(scope_row(app, p).grow(1.0).min_w(0.0))
                 .child(modes(mode, p))
-                .children((!transcript.is_empty()).then(|| sources(reading, p))),
+                .children((!transcript.is_empty()).then(|| sources(reading, p)))
+                .child(copy_button(p)),
         )
         .children((!log.is_empty()).then(|| views(&scoped, app, p)))
         .child(
@@ -131,6 +116,61 @@ pub(crate) fn log_pane(
                 .border(p.hair, p.c.border_muted)
                 .clip_rounded(p.k.radius.md),
         )
+}
+
+/// The lines the pane reads from, and the ones its task, filter and view keep.
+struct Shown<'a> {
+    reading: LogSource,
+    log: &'a [LogLine],
+    scoped: Vec<&'a LogLine>,
+    matched: Vec<&'a LogLine>,
+}
+
+fn shown<'a>(transcript: &'a [LogLine], console: &'a [LogLine], app: &App) -> Shown<'a> {
+    let reading = if transcript.is_empty() {
+        LogSource::Console
+    } else {
+        app.log_source
+    };
+    let log = match reading {
+        LogSource::Transcript => transcript,
+        LogSource::Console => console,
+    };
+    let query = app.log_search.text.trim().to_ascii_lowercase();
+    let scoped: Vec<&LogLine> = log
+        .iter()
+        .filter(|line| {
+            app.run
+                .log_task
+                .as_deref()
+                .is_none_or(|task| line.is_for(task))
+                && (query.is_empty() || line.raw.to_ascii_lowercase().contains(&query))
+        })
+        .collect();
+    let matched = scoped
+        .iter()
+        .copied()
+        .filter(|line| app.log_view.keeps(line, app.log_chatter))
+        .collect();
+    Shown {
+        reading,
+        log,
+        scoped,
+        matched,
+    }
+}
+
+/// Copies every line the pane's task, filter and view keep, drawn or not.
+fn copy_button(p: &Paint) -> El {
+    IconButton::new(&oc::COPY)
+        .variant(IconButtonVariant::GhostMuted)
+        .label("Copy log")
+        .on_press_tx(|app: &mut App, tx: &mut Tx| {
+            let (transcript, console) = app.log_lines();
+            tx.copy(logline::copy_text(shown(transcript, console, app).matched));
+        })
+        .build(p.k)
+        .key("log-copy")
 }
 
 /// One stream, or a block per task.

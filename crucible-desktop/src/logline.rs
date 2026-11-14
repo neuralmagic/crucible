@@ -110,6 +110,31 @@ pub struct LogLine {
     pub raw: String,
 }
 
+/// `lines` as text, one each. A line whose text does not name its task gets the console's
+/// `[task]` prefix.
+pub fn copy_text<'a>(lines: impl IntoIterator<Item = &'a LogLine>) -> String {
+    let mut text = String::new();
+    for line in lines {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        if let Some(task) = &line.task {
+            let named = line
+                .raw
+                .strip_prefix('[')
+                .and_then(|rest| rest.strip_prefix(task.as_str()))
+                .is_some_and(|rest| rest.starts_with(']'));
+            if !named {
+                text.push('[');
+                text.push_str(task);
+                text.push_str("] ");
+            }
+        }
+        text.push_str(&line.raw);
+    }
+    text
+}
+
 /// Which switch in the log pane a line answers to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Group {
@@ -597,7 +622,7 @@ fn task_row(raw: &str) -> Option<Body> {
 
 #[cfg(test)]
 mod tests {
-    use crate::logline::{Activity, Body, Group, Level, LogLine, LogView, activity};
+    use crate::logline::{Activity, Body, Group, Level, LogLine, LogView, activity, copy_text};
 
     #[test]
     fn engine_notices_and_traces_read_as_engine_lines() {
@@ -793,6 +818,44 @@ mod tests {
         assert_eq!(shown(LogView::Problems, false), 3);
         assert_eq!(shown(LogView::Engine, false), 3);
         assert_eq!(shown(LogView::Engine, true), 4);
+    }
+
+    #[test]
+    fn copied_text_keeps_every_line_and_names_each_task_once() {
+        let console = [
+            LogLine::parse("[crucible] OTLP span export enabled"),
+            LogLine::parse(
+                "\u{1b}[31m[edit[cache]] \u{1f527} Bash $ git init -q build/vllm\u{1b}[0m",
+            ),
+            LogLine::parse("plan v1: completed"),
+        ];
+        assert_eq!(
+            copy_text(&console),
+            "[crucible] OTLP span export enabled\n[edit[cache]] \u{1f527} Bash $ git init -q build/vllm\nplan v1: completed"
+        );
+
+        let output = LogLine::from_output(
+            "build",
+            false,
+            &[
+                "[127/130] Building CUDA object".into(),
+                String::new(),
+                "done".into(),
+            ],
+        );
+        assert_eq!(
+            copy_text(&output),
+            "[build] [127/130] Building CUDA object\n[build] \n[build] done"
+        );
+
+        let many: Vec<LogLine> = (0..5000)
+            .map(|i| LogLine::parse(&format!("line {i}")))
+            .collect();
+        let text = copy_text(many.iter().filter(|line| !line.raw.ends_with('7')));
+        assert_eq!(text.lines().count(), 4500);
+        assert!(text.starts_with("line 0\nline 1\n"));
+        assert!(text.ends_with("\nline 4999"));
+        assert_eq!(copy_text(&[]), "");
     }
 
     #[test]

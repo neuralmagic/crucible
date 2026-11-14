@@ -2,7 +2,8 @@ import { useState } from 'react';
 import { cn } from './cn';
 
 export interface CopyButtonProps {
-  value: string;
+  /** The text to copy, or a function that builds it when the button is pressed. */
+  value: string | (() => string);
   /** What the value is, for the accessible name: "Copy <label>". */
   label: string;
   className?: string;
@@ -21,7 +22,7 @@ export function CopyButton({ value, label, className }: CopyButtonProps) {
         className,
       )}
       onClick={() => {
-        void navigator.clipboard.writeText(value).then(() => {
+        void navigator.clipboard.writeText(typeof value === 'function' ? value() : value).then(() => {
           setCopied(true);
           window.setTimeout(() => {
             setCopied(false);
