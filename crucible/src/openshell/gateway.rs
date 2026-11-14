@@ -314,6 +314,14 @@ struct PodmanDriverConfig {
     sandbox_runtime_image: Option<String>,
 }
 
+/// The driver's `workspace_persistence`: what backs a sandbox's `/sandbox` volume.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkspacePersistence {
+    #[default]
+    Ephemeral,
+}
+
 /// The `[openshell.drivers.kubernetes]` config, emitted from a typed struct so the serde field
 /// names track the driver's own `KubernetesComputeConfig`. Every optional field is
 /// skip-if-empty: an omitted key means "use the driver's default". `deny_unknown_fields` on the
@@ -358,6 +366,7 @@ pub struct KubernetesDriverConfig {
     /// The SPIFFE Workload API socket the driver mounts into supervisor pods.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_spiffe_workload_api_socket_path: Option<String>,
+    pub workspace_persistence: WorkspacePersistence,
 }
 
 impl KubernetesDriverConfig {
@@ -576,6 +585,7 @@ pub(crate) const UPSTREAM_KUBERNETES_COMPUTE_CONFIG_FIELDS: &[&str] = &[
     "enable_user_namespaces",
     "workspace_default_storage_size",
     "workspace_storage_class",
+    "workspace_persistence",
     "default_runtime_class_name",
     "allowed_pod_annotations",
     "allowed_pod_labels",
@@ -1698,6 +1708,15 @@ mod tests {
         let k8s = &parsed["openshell"]["drivers"]["kubernetes"];
         assert!(k8s.get("supervisor_image").is_none());
         assert!(k8s.get("sandbox_runtime_image").is_none());
+    }
+
+    #[test]
+    fn kubernetes_rendering_asks_for_an_ephemeral_workspace() {
+        let parsed = kubernetes_toml(&DriverImages::default());
+        let k8s = &parsed["openshell"]["drivers"]["kubernetes"];
+        assert_eq!(k8s["workspace_persistence"].as_str(), Some("ephemeral"));
+        assert!(k8s.get("workspace_storage_class").is_none());
+        assert!(k8s.get("workspace_default_storage_size").is_none());
     }
 
     #[test]

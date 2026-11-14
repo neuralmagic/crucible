@@ -37,6 +37,7 @@ Fork-only commits on `crucible/v0.1.5`, relative to upstream `v0.1.5` (`bdb956f2
 | --- | --- | --- | --- |
 | `8350ed52` | `feat(kubernetes): answer driver-supplied static hosts in the supervisor`: the kubernetes driver accepts `pod.host_aliases` (hostname to IP) in a sandbox's `driver_config`, validates it, and the network supervisor answers those names before its resolver, with every policy and destination check still applied. Static hosts are driver-supplied, so they answer both name-authorized and IP-constrained lookups, unlike the sandbox's `/etc/hosts` (upstream #4602) | Deployments reach hosts with no public DNS record (`[cluster].host_aliases`); stock v0.1.5 rejects the key, and sandbox egress is resolved by the supervisor, not by pod `hostAliases` | Yes, no upstream PR yet |
 | `a895315d` | `fix(kubernetes): backfill gateway-id only on unlabelled sandboxes`: the shared-mode startup backfill patches `openshell.ai/gateway-id` only on a Sandbox that has no such label. Stock v0.1.5 also relabels a Sandbox that names another gateway | Crucible runs one gateway per run, and several share a sandbox namespace. A gateway that started while another run's sandbox was alive took that sandbox's label, the owning gateway's label-scoped list came back empty, and its reconcile removed the sandbox from the store after the provisioning grace period. File transfer then failed with `sandbox not found` and the agent exited without a verdict | Yes. The change is needed by any deployment with more than one gateway in a namespace |
+| `ae753f2e` | `feat(kubernetes): add an ephemeral sandbox workspace mode`: `workspace_persistence = "ephemeral"` backs a sandbox's `/sandbox` with an `emptyDir` instead of a PersistentVolumeClaim. The default, `pvc`, is unchanged. | The workspace claim takes one StorageClass for the whole gateway. Where the classes are node-local, a sandbox with a node selector, a GPU sandbox for example, cannot schedule on nodes the class does not serve. A Crucible sandbox lives for one turn, so it does not need the claim. Crucible always renders `ephemeral`. | Yes. It is additive and off by default. |
 
 Dropped at this pin, relative to `crucible/v0.1.2`:
 
@@ -89,7 +90,8 @@ Dropped at the `crucible/v0.1.2` pin, relative to the previous `crucible/grpc-ba
 
 Changes that would remove the fork:
 
-- **Static hosts** (`8350ed52`). When upstream merges it, the fork is only a release pin.
+- **Static hosts** (`8350ed52`) and the **ephemeral workspace** (`ae753f2e`). When upstream
+  merges both, the fork is only a release pin.
 - **Upload and download RPCs.** File transfer still uses the `openshell` CLI (SSH-tar over the
   `CreateSshSession` relay of the gateway), because no RPC supports it. This is one of the two
   remaining CLI uses that `crucible/src/openshell/mod.rs` names. With a native upload and
