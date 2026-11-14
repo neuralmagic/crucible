@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 /// Cap on a captured file served inline. Bigger files list their name and size only.
 pub const MAX_INLINE_BYTES: u64 = 256 * 1024;
 
-/// How much of the engine log a run's log response carries, counted from the end.
+/// How much of the engine log one run log response carries.
 pub const MAX_LOG_BYTES: u64 = 512 * 1024;
 
 /// A path segment that cannot leave the directory it is joined onto: no separators, no `.`/`..`,
@@ -54,34 +54,78 @@ pub fn task_segment(task: &str) -> Option<String> {
     safe_segment(&segment).then_some(segment)
 }
 
-/// The tail of `bytes` within [`MAX_LOG_BYTES`], plus whether the head was dropped.
-pub fn tail_within_cap(bytes: &[u8]) -> (String, bool) {
-    let cap = usize::try_from(MAX_LOG_BYTES).unwrap_or(usize::MAX);
-    let truncated = bytes.len() > cap;
-    let tail = if truncated {
-        // Cut on a line boundary so the first line served is a whole one.
-        let from = bytes.len() - cap;
-        let start = bytes[from..]
-            .iter()
-            .position(|b| *b == b'\n')
-            .map_or(from, |i| from + i + 1);
-        &bytes[start..]
-    } else {
-        bytes
-    };
-    (String::from_utf8_lossy(tail).into_owned(), truncated)
+/// One window of a log within [`MAX_LOG_BYTES`], cut on line boundaries.
+#[derive(Debug, PartialEq, Eq)]
+pub struct LogWindow {
+    pub text: String,
+    /// Byte offset of the window's first byte in the whole log.
+    pub start: u64,
+    /// Byte offset to ask for next, when the log continues past this window.
+    pub next: Option<u64>,
+    pub total_bytes: u64,
 }
 
-/// The tail of a local run's engine log, plus whether the head was dropped. `None` when the run
-/// kept no log.
-pub async fn engine_log_tail(scratch_root: &Path, run_id: &str) -> Option<(String, bool)> {
+impl LogWindow {
+    /// True when the window is not the whole log.
+    pub fn truncated(&self) -> bool {
+        self.start > 0 || self.next.is_some()
+    }
+}
+
+/// The window of `bytes` starting at `from`, or the tail when `from` is `None`. A `from` inside a
+/// line starts at the next whole line, and a window that stops short of the end stops after its
+/// last whole line, so paging from 0 by `next` reads every line exactly once.
+pub fn log_window(bytes: &[u8], from: Option<u64>) -> LogWindow {
+    let cap = usize::try_from(MAX_LOG_BYTES).unwrap_or(usize::MAX);
+    let len = bytes.len();
+    let after_newline = |at: usize| {
+        bytes[at..]
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(len, |i| at + i + 1)
+    };
+    let (start, end) = match from {
+        None if len <= cap => (0, len),
+        None => {
+            let from = len - cap;
+            let start = after_newline(from);
+            (if start == len { from } else { start }, len)
+        }
+        Some(from) => {
+            let from = usize::try_from(from).unwrap_or(usize::MAX).min(len);
+            let start = if from == 0 || bytes[from - 1] == b'\n' {
+                from
+            } else {
+                after_newline(from)
+            };
+            let end = (start + cap).min(len);
+            let end = if end == len {
+                end
+            } else {
+                bytes[start..end]
+                    .iter()
+                    .rposition(|b| *b == b'\n')
+                    .map_or(end, |i| start + i + 1)
+            };
+            (start, end)
+        }
+    };
+    LogWindow {
+        text: String::from_utf8_lossy(&bytes[start..end]).into_owned(),
+        start: start as u64,
+        next: (end < len).then_some(end as u64),
+        total_bytes: len as u64,
+    }
+}
+
+/// A local run's engine log. `None` when the run kept no log.
+pub async fn engine_log_bytes(scratch_root: &Path, run_id: &str) -> Option<Vec<u8>> {
     if !safe_segment(run_id) {
         return None;
     }
-    let bytes = tokio::fs::read(engine_log(&run_dir(scratch_root, run_id)))
+    tokio::fs::read(engine_log(&run_dir(scratch_root, run_id)))
         .await
-        .ok()?;
-    Some(tail_within_cap(&bytes))
+        .ok()
 }
 
 /// The session log a local run published inside its own directory, read when the artifact store
@@ -311,20 +355,52 @@ mod tests {
         assert_eq!(local_session(scratch, "..").await, None);
     }
 
-    #[tokio::test]
-    async fn the_log_tail_keeps_whole_lines() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let scratch = root.path();
-        assert_eq!(engine_log_tail(scratch, "run-1").await, None, "no log yet");
-
-        let dir = run_dir(scratch, "run-1");
-        std::fs::create_dir_all(&dir).expect("mkdir");
+    #[test]
+    fn the_log_tail_keeps_whole_lines() {
         let body = format!("{}\nlast line\n", "x".repeat(MAX_LOG_BYTES as usize));
-        std::fs::write(engine_log(&dir), &body).expect("write");
+        let tail = log_window(body.as_bytes(), None);
+        assert!(tail.truncated(), "the head was dropped");
+        assert_eq!(tail.text, "last line\n", "cut on a line boundary");
+        assert_eq!(tail.start, body.len() as u64 - 10);
+        assert_eq!(tail.next, None);
+    }
 
-        let (tail, truncated) = engine_log_tail(scratch, "run-1").await.expect("a log");
-        assert!(truncated, "the head was dropped");
-        assert_eq!(tail, "last line\n", "cut on a line boundary");
+    /// A log several caps long reads back whole by following `next` from 0, each window ending on
+    /// a whole line, and an offset inside a line starts at the next one.
+    #[test]
+    fn paging_from_the_start_reads_every_line_once() {
+        let line = format!("{}\n", "y".repeat(999));
+        let mut body = String::new();
+        for i in 0..1600 {
+            body.push_str(&format!("{i:05} {line}"));
+        }
+        let mut read = String::new();
+        let mut from = Some(0);
+        let mut windows = 0;
+        while let Some(at) = from {
+            let window = log_window(body.as_bytes(), Some(at));
+            assert!(window.text.len() as u64 <= MAX_LOG_BYTES);
+            assert!(window.text.ends_with('\n'));
+            assert_eq!(window.start, at);
+            assert_eq!(window.total_bytes, body.len() as u64);
+            read.push_str(&window.text);
+            from = window.next;
+            windows += 1;
+        }
+        assert_eq!(read, body);
+        assert!(windows > 1, "the log spans several windows");
+
+        let mid = log_window(body.as_bytes(), Some(3));
+        assert!(mid.text.starts_with("00001 "), "{}", &mid.text[..12]);
+        let past = log_window(body.as_bytes(), Some(u64::MAX));
+        assert_eq!((past.text.as_str(), past.next), ("", None));
+    }
+
+    #[tokio::test]
+    async fn a_local_run_without_a_log_has_none() {
+        let root = tempfile::tempdir().expect("tempdir");
+        assert_eq!(engine_log_bytes(root.path(), "run-1").await, None);
+        assert_eq!(engine_log_bytes(root.path(), "..").await, None);
     }
 
     /// The fold the executor writes for a mapped node counts the instances it made, so that is

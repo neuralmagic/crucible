@@ -7,13 +7,13 @@ use crate::runs::task_evidence;
 
 use anyhow::Context as _;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 
 use axum::response::{IntoResponse, Response};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 
 dto! {
     // --- per-task evidence and the run's engine log -------------------------------------------------
@@ -160,24 +160,41 @@ pub struct RunLogDto {
     pub run_id: String,
     /// `local` (a supervised subprocess on this machine) or `pod` (a work pod).
     pub dispatch: String,
-    /// The engine output, tail-first-line-aligned and capped; null when this machine holds none.
+    /// One window of the engine output, on line boundaries and capped: the tail, or the window
+    /// starting at `from`. Null when this machine holds none.
     pub text: Option<String>,
-    /// True when the head of the log was dropped to fit the cap.
+    /// True when `text` is not the whole log.
     pub truncated: bool,
+    /// Byte offset of `text` in the whole log.
+    pub start: u64,
+    /// The `from` that reads the window after this one; null at the end of the log.
+    pub next: Option<u64>,
+    /// Size of the whole log in bytes.
+    pub total_bytes: u64,
     /// Where the output lives when the controller holds none: the work pod for a pod run, the run's
     /// own directory for a local run that kept no log.
     pub location: Option<String>,
+}
+
+/// Which window of a run's log to serve.
+#[derive(Debug, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct RunLogQuery {
+    /// Byte offset to start at, as a previous response's `start` or `next` gave it. Omit for the
+    /// tail.
+    pub from: Option<u64>,
 }
 
 /// `GET /api/runs/{run_id}/log` — a run's engine output: the supervised subprocess for a local run,
 /// and for a pod run the live pod while it runs, then the pod log kept at completion, or the
 /// ingested session for a run that finished before pod logs were kept.
 /// A run whose output is reachable from neither answers with where it lives; only an unknown run
-/// is a 404.
+/// is a 404. One response carries at most [`task_evidence::MAX_LOG_BYTES`]: the tail by default,
+/// and with `from` the window starting there, so following `next` from 0 reads the whole log.
 #[utoipa::path(
     get,
     path = "/api/runs/{run_id}/log",
-    params(("run_id" = String, Path, description = "Run identifier")),
+    params(("run_id" = String, Path, description = "Run identifier"), RunLogQuery),
     responses(
         (status = 200, description = "The run's engine output, or where it lives", body = RunLogDto),
         (status = 400, description = "The run id is not a single path segment", body = ErrorBody),
@@ -187,6 +204,7 @@ pub struct RunLogDto {
 pub(crate) async fn get_run_log(
     State(state): State<ApiState>,
     Path(run_id): Path<String>,
+    Query(query): Query<RunLogQuery>,
 ) -> ApiResult<Response> {
     if !task_evidence::safe_segment(&run_id) {
         return Ok(bad_request("a run id is one path segment"));
@@ -195,13 +213,12 @@ pub(crate) async fn get_run_log(
         return Ok(not_found(format!("run not found: {run_id}")));
     };
     let dispatch = run.dispatch.as_str().to_string();
-    let (text, truncated, location) = match run.dispatch {
+    let (bytes, location) = match run.dispatch {
         crate::runs::model::RunDispatch::Local => {
-            match task_evidence::engine_log_tail(&state.scratch_dir, &run_id).await {
-                Some((text, truncated)) => (Some(text), truncated, None),
+            match task_evidence::engine_log_bytes(&state.scratch_dir, &run_id).await {
+                Some(bytes) => (Some(bytes), None),
                 None => (
                     None,
-                    false,
                     Some(format!(
                         "no engine log under {}",
                         task_evidence::run_dir(&state.scratch_dir, &run_id).display()
@@ -211,11 +228,17 @@ pub(crate) async fn get_run_log(
         }
         crate::runs::model::RunDispatch::Pod => pod_run_log(&state, &run, &run_id).await,
     };
+    let window = bytes.map(|b| task_evidence::log_window(&b, query.from));
     Ok(Json(RunLogDto {
         run_id,
         dispatch,
-        text,
-        truncated,
+        truncated: window
+            .as_ref()
+            .is_some_and(task_evidence::LogWindow::truncated),
+        start: window.as_ref().map_or(0, |w| w.start),
+        next: window.as_ref().and_then(|w| w.next),
+        total_bytes: window.as_ref().map_or(0, |w| w.total_bytes),
+        text: window.map(|w| w.text),
         location,
     })
     .into_response())
@@ -228,32 +251,25 @@ async fn pod_run_log(
     state: &ApiState,
     run: &crate::runs::model::Run,
     run_id: &str,
-) -> (Option<String>, bool, Option<String>) {
+) -> (Option<Vec<u8>>, Option<String>) {
     if run.status == "running"
         && let Some(text) = live_pod_log(state, run).await
     {
-        let (tail, truncated) = task_evidence::tail_within_cap(text.as_bytes());
-        return (Some(tail), truncated, None);
+        return (Some(text.into_bytes()), None);
     }
     match crate::runs::blob_store::get_run_engine_log(state.db.pool(), run_id).await {
-        Ok(Some(log)) => {
-            let (tail, truncated) = task_evidence::tail_within_cap(log.as_bytes());
-            return (Some(tail), truncated, None);
-        }
+        Ok(Some(log)) => return (Some(log.into_bytes()), None),
         Ok(None) => {}
         Err(e) => {
             tracing::warn!(run_id, error = %e, "reading the stored engine log failed");
         }
     }
     match crate::runs::blob_store::get_run_session(state.db.pool(), run_id).await {
-        Ok(Some(session)) => {
-            let (tail, truncated) = task_evidence::tail_within_cap(session.as_bytes());
-            (Some(tail), truncated, None)
-        }
-        Ok(None) => (None, false, Some(pod_location(run, &state.pod_namespace))),
+        Ok(Some(session)) => (Some(session.into_bytes()), None),
+        Ok(None) => (None, Some(pod_location(run, &state.pod_namespace))),
         Err(e) => {
             tracing::warn!(run_id, error = %e, "reading the stored run session failed");
-            (None, false, Some(pod_location(run, &state.pod_namespace)))
+            (None, Some(pod_location(run, &state.pod_namespace)))
         }
     }
 }
