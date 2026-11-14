@@ -49,6 +49,8 @@ const TOOLS_IMAGE: &str = "gcr.io/go-containerregistry/crane:debug";
 pub const WORKSPACE: &str = "/workspace";
 pub const OUT: &str = "/buildit-out";
 pub const FACTS: &str = "/buildit-out/facts";
+/// Where in a build's facts its steps are stamped (`step::build_args`).
+pub const STEPS_LOG: &str = "steps.log";
 const TOOLS: &str = "/buildit-tools";
 const INPUTS: &str = "/buildit-inputs";
 const LAYER_DIR: &str = "/buildit-layer";
@@ -142,6 +144,77 @@ impl Builder {
     }
 }
 
+/// Where BuildKit builds keep their layers between build pods.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum LayerCache {
+    /// Nowhere: every build starts from nothing.
+    Off,
+    /// In the repository builds push to, under `cache-` tags.
+    #[default]
+    Registry,
+}
+
+/// How a BuildKit build compresses the layers it makes; a base image's layers keep theirs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum Compression {
+    Gzip,
+    #[default]
+    Zstd,
+    Uncompressed,
+}
+
+impl Compression {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Gzip => "gzip",
+            Self::Zstd => "zstd",
+            Self::Uncompressed => "uncompressed",
+        }
+    }
+}
+
+/// The registry refs a BuildKit build reads its layer cache from and writes it to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerCacheRefs {
+    pub import: Vec<String>,
+    pub export: String,
+}
+
+/// Who may write the layer cache that every build of a scope reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerCacheWriter {
+    /// This build: it reads and writes the shared ref.
+    Shared,
+    /// Not this build: it reads the shared ref, and reads and writes one only `sandbox` reads.
+    Own,
+}
+
+/// The layer cache refs of a build of `sandbox`, for builds that share `scope`.
+pub fn layer_cache_refs(
+    site: &Site,
+    sandbox: &str,
+    scope: &str,
+    writer: LayerCacheWriter,
+) -> Option<LayerCacheRefs> {
+    if site.layer_cache == LayerCache::Off {
+        return None;
+    }
+    let shared = format!("{}:cache-{scope}", site.image_repo);
+    Some(match writer {
+        LayerCacheWriter::Shared => LayerCacheRefs {
+            import: vec![shared.clone()],
+            export: shared,
+        },
+        LayerCacheWriter::Own => {
+            let own = format!("{}:cache-{sandbox}-{scope}", site.image_repo);
+            LayerCacheRefs {
+                import: vec![shared, own.clone()],
+                export: own,
+            }
+        }
+    })
+}
+
 /// A directory or file of the build pod that every `RUN` step of a Dockerfile build sees.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunMount {
@@ -191,6 +264,8 @@ pub struct Site {
     pub storage: StorageDriver,
     /// Extra `buildah bud` arguments for every Dockerfile build.
     pub bud_args: Vec<String>,
+    pub layer_cache: LayerCache,
+    pub compression: Compression,
     pub users: PodUsers,
     /// The longest any Job of this server runs.
     pub deadline_secs: i64,
@@ -419,7 +494,17 @@ until buildctl debug workers > /dev/null 2>&1; do
     exit 0
   fi
   sleep 0.1
-done"#;
+done
+snap=$(buildctl debug workers -v 2> /dev/null | sed -n 's/.*worker\.snapshotter:[[:space:]]*//p' | head -n 1)
+case "$SNAPSHOTTER:$snap" in
+  auto:overlayfs | overlayfs:overlayfs) echo "buildkit snapshotter: $snap" ;;
+  auto:*) echo "buildkit snapshotter: ${snap:-unknown}, which copies each layer; overlayfs did not mount here" ;;
+  *)
+    echo "buildkit snapshotter is ${snap:-unknown}, not the $SNAPSHOTTER the site asks for"
+    echo 1 > /buildit-out/build.exit; echo 1 > /dev/termination-log
+    exit 0 ;;
+esac
+printf '%s SNAPSHOTTER %s\n' "$(date +%s%N)" "${snap:-unknown}" > "$STEPS""#;
 
 /// `buildkitd`'s OCI runtime: `buildkit-runc`, after three edits to the config of the `RUN` step
 /// it is about to start. The hostname goes, /dev/pts becomes a bind of the pod's, and the build's
@@ -618,6 +703,7 @@ pub fn build_job(site: &Site, id: &Ident<'_>, b: &BuildJob<'_>) -> Job {
                         .join("\n"),
                 ),
                 env("SNAPSHOTTER", snapshotter(site.storage)),
+                env("STEPS", &format!("{FACTS}/{STEPS_LOG}")),
                 env("XDG_RUNTIME_DIR", &format!("{BUILDKIT_DIR}/run")),
             ]);
             mounts.push(mount("tools", TOOLS, true));
@@ -666,10 +752,10 @@ pub fn buildkit_metadata() -> String {
     format!("{BUILDKIT_DIR}/metadata.json")
 }
 
-/// BuildKit's snapshotter for a storage driver: `native` copies each layer in full, as `vfs` does.
+/// `buildkitd`'s snapshotter setting for a storage driver: `auto` is overlayfs where it mounts.
 fn snapshotter(storage: StorageDriver) -> &'static str {
     match storage {
-        StorageDriver::Vfs => "native",
+        StorageDriver::Vfs => "auto",
         StorageDriver::Overlay => "overlayfs",
     }
 }
@@ -1252,8 +1338,9 @@ mod tests {
 
     use crate::backend::{Resources, StorageDriver};
     use crate::jobs::{
-        BuildJob, Builder, Engine, Ident, LayerJob, Observed, PodUsers, PushJob, Registry, RunJob,
-        RunMount, Site, build_job, layer_job, observe, push_job, run_job,
+        BuildJob, Builder, Compression, Engine, Ident, LayerCache, LayerCacheRefs,
+        LayerCacheWriter, LayerJob, Observed, PodUsers, PushJob, Registry, RunJob, RunMount, Site,
+        build_job, layer_cache_refs, layer_job, observe, push_job, run_job,
     };
     use crate::step::State;
 
@@ -1269,6 +1356,8 @@ mod tests {
             builder: Builder::Buildah,
             storage: StorageDriver::Overlay,
             bud_args: Vec::new(),
+            layer_cache: LayerCache::Registry,
+            compression: Compression::Zstd,
             users: PodUsers::Namespaced,
             deadline_secs: 3600,
             ttl_secs: 900,
@@ -1481,6 +1570,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_layer_cache_only_its_writers_sandbox_reads_takes_the_sandboxs_name() {
+        let site = site(None, cluster());
+        let repo = "registry.builds.svc:5000/builds/buildit";
+        let scope = "00000000000000aa";
+        assert_eq!(
+            layer_cache_refs(&site, "sb-a", scope, LayerCacheWriter::Shared),
+            Some(LayerCacheRefs {
+                import: vec![format!("{repo}:cache-{scope}")],
+                export: format!("{repo}:cache-{scope}"),
+            })
+        );
+        let own = layer_cache_refs(&site, "sb-a", scope, LayerCacheWriter::Own).unwrap();
+        assert_eq!(
+            own,
+            LayerCacheRefs {
+                import: vec![
+                    format!("{repo}:cache-{scope}"),
+                    format!("{repo}:cache-sb-a-{scope}"),
+                ],
+                export: format!("{repo}:cache-sb-a-{scope}"),
+            }
+        );
+        let other = layer_cache_refs(&site, "sb-b", scope, LayerCacheWriter::Own).unwrap();
+        assert!(
+            !other.import.contains(&own.export) && other.export != own.export,
+            "{other:?}"
+        );
+        let off = Site {
+            layer_cache: LayerCache::Off,
+            ..site
+        };
+        for writer in [LayerCacheWriter::Shared, LayerCacheWriter::Own] {
+            assert_eq!(layer_cache_refs(&off, "sb-a", scope, writer), None);
+        }
+    }
+
     fn buildkit_job(registry: Registry, storage: StorageDriver) -> serde_json::Value {
         let labels = labels();
         let args = ["1800".to_string(), "buildctl".to_string()];
@@ -1577,6 +1703,9 @@ mod tests {
             r#"printf '[worker.oci]\n  rootless = true\n  noProcessSandbox = true\n  binary = "%s/runc"\n  snapshotter = "%s"\n'"#,
             r#"printf '  ca = ["/buildit-cluster/service-ca.crt"]\n'"#,
             r#"printf '  http = true\n'"#,
+            r#"auto:overlayfs | overlayfs:overlayfs) echo "buildkit snapshotter: $snap" ;;"#,
+            r#"echo "buildkit snapshotter is ${snap:-unknown}, not the $SNAPSHOTTER the site asks for""#,
+            r#"printf '%s SNAPSHOTTER %s\n' "$(date +%s%N)" "${snap:-unknown}" > "$STEPS""#,
             r#""$(printf 'buildit:%s' "$(cat /buildit-cluster/token)" | base64 -w 0)" > "$bk/config.json""#,
             r#"sh -c "$runner" sh "$log" "$@" &"#,
             r#""$bk/metadata.json""#,
@@ -1598,6 +1727,10 @@ mod tests {
             Some("unix:///tmp/buildkit/buildkitd.sock")
         );
         assert_eq!(env("SNAPSHOTTER").as_deref(), Some("overlayfs"));
+        assert_eq!(
+            env("STEPS").as_deref(),
+            Some("/buildit-out/facts/steps.log")
+        );
         assert_eq!(env("XDG_RUNTIME_DIR").as_deref(), Some("/tmp/buildkit/run"));
         assert_eq!(env("CACHE_DIRS").as_deref(), Some("/c/deps"));
         assert_eq!(env("RUNC").as_deref(), Some(crate::jobs::RUNC));
@@ -1660,7 +1793,10 @@ mod tests {
             .iter()
             .find(|e| e["name"] == "SNAPSHOTTER")
             .unwrap();
-        assert_eq!(snapshotter["value"], "native");
+        assert_eq!(
+            snapshotter["value"], "auto",
+            "overlayfs where it mounts, even when buildah's driver is vfs"
+        );
         assert!(
             !builder["volumeMounts"]
                 .as_array()

@@ -27,8 +27,9 @@ pub const TERMINATION_LOG: &str = "/tmp/buildit-runner.term";
 /// The log lines a `buildah bud` build stamps: its steps, its commits and the cache stages.
 pub const BUILDAH_STAMPS: &str = "^(STEP |COMMIT |CACHE )";
 /// The log lines a `buildctl build` build stamps: each vertex `buildctl` names as a step of a
-/// stage, the export, and the cache stages.
-pub const BUILDKIT_STAMPS: &str = r"^(#[0-9]+ \[|#[0-9]+ exporting to image|CACHE )";
+/// stage or as `CACHED`, the layer cache's imports and export, the image's export, and the cache
+/// stages.
+pub const BUILDKIT_STAMPS: &str = r"^(#[0-9]+ (\[|CACHED$|exporting to image|importing cache manifest from |inferred cache manifest type|exporting cache to )|CACHE )";
 
 /// Arguments: the log, the build's timeout, the termination file, the regex of the log lines to
 /// stamp, the steps file, the snapshot plan, the shared cache's URL, the save header file,
@@ -127,6 +128,69 @@ while read -r name key dir use; do
   fi
   rm -f "$dir.snap"
 done < "$plan""#;
+
+/// How much of a BuildKit build came from its layer cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayerCacheUse {
+    /// Whether a cache was there to read
+    pub imported: bool,
+    /// The Dockerfile steps the build reached, its FROMs aside
+    pub steps: usize,
+    /// The steps taken from the cache instead of run
+    pub cached: usize,
+}
+
+/// The snapshotter a BuildKit build's pod recorded at the head of its steps file.
+pub fn snapshotter(steps: &str) -> Option<String> {
+    steps
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .find_map(|(_, text)| text.strip_prefix("SNAPSHOTTER "))
+        .map(str::to_string)
+}
+
+/// What a build's steps file says of its layer cache; None for a build that read none.
+pub fn layer_cache_use(steps: &str) -> Option<LayerCacheUse> {
+    use std::collections::BTreeSet;
+    let (mut asked, mut found) = (BTreeSet::new(), BTreeSet::new());
+    let (mut reached, mut cached) = (BTreeSet::new(), BTreeSet::new());
+    for line in steps.lines() {
+        let vertex = line
+            .split_once(' ')
+            .and_then(|(_, text)| text.strip_prefix('#'))
+            .and_then(|text| text.split_once(' '));
+        let Some((vertex, what)) = vertex else {
+            continue;
+        };
+        if what.starts_with("importing cache manifest from ") {
+            asked.insert(vertex);
+        } else if what.starts_with("inferred cache manifest type") {
+            found.insert(vertex);
+        } else if what == "CACHED" {
+            cached.insert(vertex);
+        } else if is_dockerfile_step(what) {
+            reached.insert(vertex);
+        }
+    }
+    (!asked.is_empty()).then(|| LayerCacheUse {
+        imported: asked.intersection(&found).next().is_some(),
+        steps: reached.len(),
+        cached: reached.intersection(&cached).count(),
+    })
+}
+
+fn is_dockerfile_step(vertex: &str) -> bool {
+    let Some((stage, instruction)) = vertex.strip_prefix('[').and_then(|v| v.split_once("] "))
+    else {
+        return false;
+    };
+    let numbered = stage
+        .rsplit(' ')
+        .next()
+        .and_then(|position| position.split_once('/'))
+        .is_some_and(|(i, n)| i.parse::<u32>().is_ok() && n.parse::<u32>().is_ok());
+    numbered && !instruction.starts_with("FROM ")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -370,6 +434,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_steps_file_says_how_much_of_a_build_came_from_the_layer_cache() {
+        use crate::step::{LayerCacheUse, layer_cache_use};
+        let stamped = |lines: &[&str]| -> String {
+            lines
+                .iter()
+                .enumerate()
+                .map(|(at, line)| format!("17000000000000000{at:02} {line}\n"))
+                .collect()
+        };
+        let hit = stamped(&[
+            "#1 [internal] load build definition from Dockerfile",
+            "#3 [auth] library/alpine:pull token for registry-1.docker.io",
+            "#4 importing cache manifest from r:5000/b:cache-00000000000000aa",
+            "#5 importing cache manifest from r:5000/b:cache-sb-a-00000000000000aa",
+            "#5 inferred cache manifest type: application/vnd.oci.image.manifest.v1+json done",
+            "#6 [build 1/3] FROM docker.io/library/alpine:3.20@sha256:ab",
+            "#7 [build 2/3] RUN make",
+            "#7 CACHED",
+            "#8 [build 3/3] COPY . .",
+            "#9 [stage-1 2/2] COPY --from=build /out /out",
+            "#6 CACHED",
+            "#10 exporting to image",
+            "#11 exporting cache to registry",
+            "CACHE save deps",
+            "END 0",
+        ]);
+        assert_eq!(
+            layer_cache_use(&hit),
+            Some(LayerCacheUse {
+                imported: true,
+                steps: 3,
+                cached: 1
+            }),
+            "a FROM is no step, and one of two refs is enough"
+        );
+        let cold = stamped(&[
+            "#4 importing cache manifest from r:5000/b:cache-00000000000000aa",
+            "#5 [2/2] RUN make",
+            "END 0",
+        ]);
+        assert_eq!(
+            layer_cache_use(&cold),
+            Some(LayerCacheUse {
+                imported: false,
+                steps: 1,
+                cached: 0
+            })
+        );
+        let without = stamped(&["#5 [2/2] RUN make", "#5 CACHED", "END 0"]);
+        assert_eq!(layer_cache_use(&without), None);
+        assert_eq!(
+            layer_cache_use(&stamped(&["STEP 1/2: FROM base", "COMMIT img", "END 0"])),
+            None
+        );
+        assert_eq!(layer_cache_use(""), None);
+        assert_eq!(crate::step::snapshotter(&hit), None);
+        let recorded = stamped(&["SNAPSHOTTER overlayfs", "#5 [2/2] RUN make", "END 0"]);
+        assert_eq!(
+            crate::step::snapshotter(&recorded).as_deref(),
+            Some("overlayfs")
+        );
+    }
+
     #[cfg(target_os = "linux")]
     fn read(p: &std::path::Path) -> String {
         std::fs::read_to_string(p).unwrap_or_default()
@@ -470,25 +598,41 @@ mod tests {
                       echo '#5 [build 2/3] RUN make'; echo '#5 0.100 cc a.c'; \
                       echo '#6 [stage-1 2/2] COPY --from=build /out /out'; \
                       echo '#5 [build 2/3] RUN make'; echo '#5 1.200 cc b.c'; echo '#5 DONE 1.3s'; \
+                      echo '#2 importing cache manifest from r:5000/b:cache-aa'; \
+                      echo '#2 inferred cache manifest type: application/vnd.oci.image.manifest.v1+json done'; \
+                      echo '#2 DONE 0.0s'; echo '#6 CACHED'; echo '#3 ERROR: not found'; \
                       echo 'CACHE save deps'; echo '#7 exporting to image'; \
-                      echo '#7 pushing layers 0.1s done'";
+                      echo '#7 pushing layers 0.1s done'; echo '#8 exporting cache to registry'; \
+                      echo '#8 writing layer sha256:ab done'";
         build(
             &log,
             "30",
             crate::step::BUILDKIT_STAMPS,
             &["sh", "-c", script],
         );
-        let texts: Vec<String> = stamped(&log, 6).into_iter().map(|(_, t)| t).collect();
+        let texts: Vec<String> = stamped(&log, 11).into_iter().map(|(_, t)| t).collect();
         assert_eq!(
             texts,
             [
                 "#1 [internal] load build definition from Dockerfile",
                 "#5 [build 2/3] RUN make",
                 "#6 [stage-1 2/2] COPY --from=build /out /out",
+                "#2 importing cache manifest from r:5000/b:cache-aa",
+                "#2 inferred cache manifest type: application/vnd.oci.image.manifest.v1+json done",
+                "#6 CACHED",
                 "CACHE save deps",
                 "#7 exporting to image",
+                "#8 exporting cache to registry",
                 "END 0",
             ]
+        );
+        assert_eq!(
+            crate::step::layer_cache_use(&read(&ext(&log, "steps"))),
+            Some(crate::step::LayerCacheUse {
+                imported: true,
+                steps: 2,
+                cached: 1
+            })
         );
     }
 

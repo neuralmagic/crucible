@@ -364,7 +364,7 @@ pods to that Kueue LocalQueue in `namespace`; set it where Kueue manages the nam
 pods that name no queue (`manageJobsWithoutQueueName`), or builds wait 10 minutes and fail.
 `[buildit.builders]` sizes builder pods on every cluster: `node_arch` (their `kubernetes.io/arch`),
 `max_builds` live per sandbox, `pod_deadline_secs`, `requests`/`limits`, `builder`,
-`storage_driver`, and `bud_args`.
+`storage_driver`, `bud_args`, `layer_cache`, and `layer_compression`.
 `[buildit.cluster_builders.<cluster>]` replaces any of those on one cluster, so a mixed-architecture cluster can pin its builds. Without
 `node_arch`, builder pods run on the loop pod's architecture; unset limits are buildit's defaults
 (4 builds, 7200 s, no requests or limits). `builder` is what builds a Dockerfile when the
@@ -372,8 +372,13 @@ build names no builder: `buildah` (the default) or `buildkit` (experimental), wh
 `docker build` does; `buildit/README.md` lists what differs. Apply the builder admission policy of the same release, which admits the BuildKit image. `storage_driver` is `vfs` (the default), a full copy
 of the filesystem per image layer, or `overlay`, each layer stored once with kernel overlayfs in
 the builder's user namespace; `overlay` needs a kernel that allows that (5.13 and later, such as
-RHEL 9's). `bud_args` are extra `buildah bud` arguments for every Dockerfile build, placed after
-buildit's own.
+RHEL 9's). BuildKit builds use overlayfs either way: with `overlay` a build fails where it does
+not mount, with `vfs` it falls back to copying and says so in its log and `status`. `bud_args` are extra `buildah bud` arguments for every Dockerfile build, placed after
+buildit's own. `layer_cache` is where BuildKit builds keep their layers between builder pods:
+`registry` (the default), `cache-` tags of the repository builds push to, which a registry that
+is never garbage-collected grows with, or `off`. `layer_compression` is how a BuildKit build
+compresses the layers it makes: `zstd` (the default), `gzip` for runtimes older than containerd
+1.5 or Docker 23, or `uncompressed`, which keeps the layers' full size in the registry.
 
 ```toml
 [buildit]
@@ -394,8 +399,10 @@ storage_driver    = "overlay"
 bud_args          = ["--retry", "5"]
 
 [buildit.cluster_builders.spoke-b]                  # optional, per cluster
-node_arch = "amd64"
-builder   = "buildkit"
+node_arch         = "amd64"
+builder           = "buildkit"
+layer_cache       = "registry"
+layer_compression = "gzip"                          # nodes that cannot pull zstd layers
 
 [buildit.cache]                                     # optional, a cache builds share
 clusters     = ["spoke-a"]                          # default the hub; deploy it on each

@@ -464,7 +464,9 @@ mod tests {
     /// shares the rest of `builders`; a cluster setting replaces the default one whole.
     #[test]
     fn builder_pods_come_from_builders_and_each_cluster_s_overrides() {
-        use crucible_contract::agent_servers::{Builder, NodeArch, StorageDriver};
+        use crucible_contract::agent_servers::{
+            Builder, LayerCache, LayerCompression, NodeArch, StorageDriver,
+        };
         use std::num::NonZeroU32;
         let servers = profile(
             r#"
@@ -481,6 +483,8 @@ mod tests {
             node_arch = "amd64"
             builder = "buildkit"
             bud_args = []
+            layer_cache = "off"
+            layer_compression = "gzip"
             [buildit.cluster_builders.north]
             node_arch = "arm64"
             limits = { cpu = "16", memory = "32Gi" }
@@ -499,6 +503,8 @@ mod tests {
             builder: None,
             storage_driver: Some(StorageDriver::Overlay),
             bud_args: Some(vec!["--retry".into(), "5".into()]),
+            layer_cache: None,
+            layer_compression: None,
         };
         assert_eq!(builders(&servers[0], "east"), shared);
         assert_eq!(
@@ -507,6 +513,8 @@ mod tests {
                 node_arch: Some(NodeArch::Amd64),
                 builder: Some(Builder::Buildkit),
                 bud_args: Some(Vec::new()),
+                layer_cache: Some(LayerCache::Off),
+                layer_compression: Some(LayerCompression::Gzip),
                 ..shared.clone()
             }
         );

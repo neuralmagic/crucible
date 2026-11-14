@@ -99,10 +99,9 @@ const MAX_CACHES: usize = 8;
 pub(crate) const FACTS_MOUNT: &str = "/buildit";
 const CCACHE_CONF: &str = "ccache.conf";
 const CCACHE_STATS: &str = "ccache-stats.log";
-/// Where in the facts mount a build's steps are stamped (`step::build_args`).
-const STEPS_LOG: &str = "steps.log";
 const CCACHE_USER: &str = "buildit";
 const MAX_FACTS: u64 = 64 * 1024;
+const MAX_STEPS: u64 = 1024 * 1024;
 const DEFAULT_LOG_BYTES: u64 = 16 * 1024;
 const MAX_LOG_BYTES: u64 = 64 * 1024;
 
@@ -180,14 +179,21 @@ pub struct McpArgs {
     /// What builds a Dockerfile when the build names no builder; `buildkit` is experimental
     #[arg(long, env = "MCP_BUILDER", value_enum, default_value_t = jobs::Builder::Buildah)]
     pub builder: jobs::Builder,
-    /// containers-storage driver of build pods; with `--builder buildkit`, `vfs` is BuildKit's
-    /// `native` snapshotter and `overlay` its `overlayfs`
+    /// containers-storage driver of build pods. BuildKit builds use its `overlayfs` snapshotter:
+    /// with `overlay` or fail, with `vfs` where it mounts, else `native`
     #[arg(long, env = "MCP_STORAGE_DRIVER", value_enum, default_value_t = StorageDriver::Vfs)]
     pub storage_driver: StorageDriver,
     /// Extra `buildah bud` argument for every Dockerfile build buildah runs, after buildit's own
     /// (repeatable)
     #[arg(long = "bud-arg", allow_hyphen_values = true)]
     pub bud_args: Vec<String>,
+    /// Where BuildKit builds keep their layers between build pods: `registry` is the image
+    /// repository, under `cache-` tags
+    #[arg(long, env = "MCP_LAYER_CACHE", value_enum, default_value_t = jobs::LayerCache::Registry)]
+    pub layer_cache: jobs::LayerCache,
+    /// How a BuildKit build compresses the layers it makes, in its image and its layer cache
+    #[arg(long, env = "MCP_LAYER_COMPRESSION", value_enum, default_value_t = jobs::Compression::Zstd)]
+    pub layer_compression: jobs::Compression,
     /// Builds per sandbox that may be running at once; `build` is refused past this
     #[arg(long, default_value_t = 4)]
     pub max_builds: usize,
@@ -349,6 +355,8 @@ pub async fn serve(client: kube::Client, args: McpArgs) -> Result<()> {
         builder: args.builder,
         storage: args.storage_driver,
         bud_args: args.bud_args,
+        layer_cache: args.layer_cache,
+        compression: args.layer_compression,
         users: args.pod_users,
         deadline_secs: args.pod_deadline,
         ttl_secs: args.job_ttl,
@@ -773,7 +781,7 @@ struct Snapshots {
     auth: Option<String>,
 }
 
-/// The builds that may write ccache objects and cache snapshots to the shared cache.
+/// The builds that may write what other builds read: the shared cache and the shared layer cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum CacheWriters {
     /// No build: every build reads only.
@@ -782,6 +790,15 @@ pub enum CacheWriters {
     Run,
     /// The run's builds and every sandbox's.
     All,
+}
+
+impl CacheWriters {
+    fn admits(self, starter: Starter) -> bool {
+        match (self, starter) {
+            (Self::All, _) | (Self::Run, Starter::Run) => true,
+            (Self::Run, Starter::Sandbox) | (Self::None, _) => false,
+        }
+    }
 }
 
 /// Who started a build.
@@ -853,9 +870,13 @@ impl SharedCache {
 
     /// The write token for a build `starter` started, if it may write.
     fn token_for(&self, starter: Starter) -> Option<String> {
-        match (self.writers, starter) {
-            (CacheWriters::All, _) | (CacheWriters::Run, Starter::Run) => self.token(),
-            (CacheWriters::Run, Starter::Sandbox) | (CacheWriters::None, _) => None,
+        self.writers.admits(starter).then(|| self.token()).flatten()
+    }
+
+    fn layer_cache_writer(&self, starter: Starter) -> jobs::LayerCacheWriter {
+        match self.writers.admits(starter) {
+            true => jobs::LayerCacheWriter::Shared,
+            false => jobs::LayerCacheWriter::Own,
         }
     }
 
@@ -1087,6 +1108,13 @@ pub struct StatusReply {
     /// What built the Dockerfile, while Kubernetes keeps the build's Job
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub builder: Option<jobs::Builder>,
+    /// The snapshotter an ended BuildKit build kept its layers in: "overlayfs", or "native",
+    /// which copies each layer in full
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshotter: Option<String>,
+    /// How much of a BuildKit build came from its layer cache, once it has ended
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer_cache: Option<step::LayerCacheUse>,
     /// The JSON object the build wrote to `/buildit/facts.json`, once it has ended
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub facts: Option<serde_json::Map<String, serde_json::Value>>,
@@ -1143,6 +1171,20 @@ fn bud_argv(
     Ok(out)
 }
 
+/// The builds whose layers serve each other: one Dockerfile, target and context directory.
+fn layer_cache_scope(context: &RelPath, dockerfile: &RelPath, target: Option<&str>) -> String {
+    use sha2::Digest;
+    let mut hash = sha2::Sha256::new();
+    for part in [context.as_str(), dockerfile.as_str(), target.unwrap_or("")] {
+        hash.update(part.as_bytes());
+        hash.update([0]);
+    }
+    hash.finalize()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// The build of the workspace's Dockerfile that pushes its image to `dest` and leaves the digest
 /// in `jobs::buildkit_metadata`.
 fn buildctl_argv(
@@ -1150,6 +1192,8 @@ fn buildctl_argv(
     target: Option<&str>,
     build_args: &BTreeMap<String, String>,
     dest: &str,
+    compression: jobs::Compression,
+    layer_cache: Option<&jobs::LayerCacheRefs>,
 ) -> Result<Vec<String>> {
     let mut out = argv(["buildctl", "build", "--progress=plain"]);
     out.extend(argv(["--frontend", "dockerfile.v0"]));
@@ -1169,13 +1213,61 @@ fn buildctl_argv(
     for (k, v) in checked_build_args(build_args)? {
         out.extend(["--opt".to_string(), format!("build-arg:{k}={v}")]);
     }
+    let layers = match compression {
+        jobs::Compression::Gzip => String::new(),
+        other => format!(",compression={},oci-mediatypes=true", other.as_str()),
+    };
+    if let Some(cache) = layer_cache {
+        for from in &cache.import {
+            out.extend([
+                "--import-cache".to_string(),
+                format!("type=registry,ref={from}"),
+            ]);
+        }
+        out.extend([
+            "--export-cache".to_string(),
+            format!(
+                "type=registry,ref={},mode=max,image-manifest=true,oci-mediatypes=true,\
+                 compression={},ignore-error=true",
+                cache.export,
+                compression.as_str()
+            ),
+        ]);
+    }
     out.extend([
         "--output".to_string(),
-        format!("type=image,name={dest},push=true"),
+        format!("type=image,name={dest},push=true{layers}"),
         "--metadata-file".to_string(),
         jobs::buildkit_metadata(),
     ]);
     Ok(out)
+}
+
+/// The first `limit` bytes of the file `name` in a build's archived facts.
+fn fact(tar: &[u8], name: &str, limit: u64) -> Option<Vec<u8>> {
+    let mut archive = tar::Archive::new(tar);
+    for entry in archive.entries().ok()? {
+        let mut entry = entry.ok()?;
+        let path = entry.path().ok()?.to_string_lossy().into_owned();
+        if path.trim_start_matches("./") != name {
+            continue;
+        }
+        let mut raw = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::Read::take(&mut entry, limit), &mut raw).ok()?;
+        return Some(raw);
+    }
+    None
+}
+
+/// The object the build wrote to `facts.json`.
+fn facts(id: &BuildId, tar: &[u8]) -> Option<serde_json::Map<String, serde_json::Value>> {
+    match serde_json::from_slice(&fact(tar, "facts.json", MAX_FACTS)?) {
+        Ok(serde_json::Value::Object(facts)) => Some(facts),
+        _ => {
+            tracing::warn!("build {} left a facts.json that is not a JSON object", id.0);
+            None
+        }
+    }
 }
 
 fn checked_build_args(
@@ -1695,7 +1787,9 @@ impl Broker {
         };
         seen.context_digest = context_digest;
         seen.builder = annotation(&job.metadata, ANNOTATION_BUILDER).and_then(jobs::Builder::parse);
-        let archived = matches!(log, LogName::Run(_)) || is_layer(&job);
+        let archived = matches!(log, LogName::Run(_))
+            || is_layer(&job)
+            || seen.builder == Some(jobs::Builder::Buildkit);
         if archived
             && matches!(
                 seen.snap.state,
@@ -1818,6 +1912,14 @@ impl Broker {
                     p.target.as_deref(),
                     &p.build_args,
                     &jobs::build_dest(&self.site, caller.sandbox.as_str(), id.as_str()),
+                    self.site.compression,
+                    jobs::layer_cache_refs(
+                        &self.site,
+                        caller.sandbox.as_str(),
+                        &layer_cache_scope(&context, &dockerfile, p.target.as_deref()),
+                        cache.layer_cache_writer(starter),
+                    )
+                    .as_ref(),
                 )?,
                 step::BUILDKIT_STAMPS,
             ),
@@ -1827,7 +1929,7 @@ impl Broker {
             url: cache.base(),
             auth: format!("{INPUTS_DIR}/snapshots.auth"),
         });
-        let steps = format!("{}/{STEPS_LOG}", jobs::FACTS);
+        let steps = format!("{}/{}", jobs::FACTS, jobs::STEPS_LOG);
         let runner_args = step::build_args(limit, stamps, &steps, files.as_ref(), &stage);
         let mut inputs = BTreeMap::from([
             ("cache.json".to_string(), cache.document(starter)),
@@ -2117,10 +2219,16 @@ impl Broker {
                     .await?,
             ),
         };
-        let facts = match seen.snap.state {
+        let archived = match seen.snap.state {
             step::State::Running => None,
-            _ => self.facts(sandbox, id).await,
+            _ => self.archived_facts(sandbox, id).await,
         };
+        let facts = archived.as_deref().and_then(|tar| facts(id, tar));
+        let steps = archived
+            .as_deref()
+            .and_then(|tar| fact(tar, jobs::STEPS_LOG, MAX_STEPS))
+            .map(|steps| String::from_utf8_lossy(&steps).into_owned())
+            .unwrap_or_default();
         Ok(StatusReply {
             build_id: id.0.clone(),
             status: seen.snap.state.status(),
@@ -2129,37 +2237,15 @@ impl Broker {
             log_tail,
             context_digest: seen.context_digest.clone(),
             builder: seen.builder,
+            snapshotter: step::snapshotter(&steps),
+            layer_cache: step::layer_cache_use(&steps),
             facts,
         })
     }
 
-    /// The object the build wrote to `facts.json`, from the facts it archived.
-    async fn facts(
-        &self,
-        sandbox: &SandboxName,
-        id: &BuildId,
-    ) -> Option<serde_json::Map<String, serde_json::Value>> {
+    async fn archived_facts(&self, sandbox: &SandboxName, id: &BuildId) -> Option<Vec<u8>> {
         let prefix = jobs::archive_prefix(sandbox.as_str(), id.as_str());
-        let tar = self.blob(&format!("{prefix}/facts.tar")).await.ok()??;
-        let mut archive = tar::Archive::new(tar.as_slice());
-        for entry in archive.entries().ok()? {
-            let mut entry = entry.ok()?;
-            let path = entry.path().ok()?.to_string_lossy().into_owned();
-            if path.trim_start_matches("./") != "facts.json" {
-                continue;
-            }
-            let mut raw = Vec::new();
-            std::io::Read::read_to_end(&mut std::io::Read::take(&mut entry, MAX_FACTS), &mut raw)
-                .ok()?;
-            return match serde_json::from_slice(&raw) {
-                Ok(serde_json::Value::Object(facts)) => Some(facts),
-                _ => {
-                    tracing::warn!("build {} left a facts.json that is not a JSON object", id.0);
-                    None
-                }
-            };
-        }
-        None
+        self.blob(&format!("{prefix}/facts.tar")).await.ok()?
     }
 
     async fn start_run(
@@ -2956,8 +3042,9 @@ impl BuilditMcp {
 
     #[tool(
         description = "Report a build's status (params: build_id): running, succeeded, failed or \
-        cancelled, with exit, timed_out and the build log's last lines. Poll it after `build`; \
-        `clean` when done."
+        cancelled, with exit, timed_out and the build log's last lines. An ended buildkit build \
+        also reports its snapshotter and layer_cache: whether a cache was imported and how many \
+        of its steps were cached. Poll it after `build`; `clean` when done."
     )]
     async fn status(
         &self,
@@ -3098,8 +3185,8 @@ mod tests {
         CacheWriters, Caller, Launcher, LogsParams, MCP_PATH, PushParams, PushTarget,
         ResourceServer, ResourceServerConfig, Response, SCOPE_BUILD, SCOPE_READ, SharedCache,
         Snapshots, Starter, StatusCode, TokenLine, ToolPolicy, TrustedIssuer, bind_socket,
-        bud_argv, buildctl_argv, cache_mounts, ccache_conf, parse_tokens, router, run_mounts,
-        run_sandbox, socket_router, unpack,
+        bud_argv, buildctl_argv, cache_mounts, ccache_conf, layer_cache_scope, parse_tokens,
+        router, run_mounts, run_sandbox, socket_router, unpack,
     };
     use crate::sandbox::{RelPath, SandboxDir, SandboxName, Workspace};
     use crucible_mcp_auth::access::{AccessRules, Call};
@@ -3144,6 +3231,10 @@ mod tests {
                     .map(|d| <StorageDriver as clap::ValueEnum>::from_str(&d, false).unwrap())
                     .unwrap_or_default(),
                 bud_args: Vec::new(),
+                layer_cache: jobs::LayerCache::Registry,
+                compression: std::env::var("BUILDIT_E2E_LAYER_COMPRESSION")
+                    .map(|c| <jobs::Compression as clap::ValueEnum>::from_str(&c, false).unwrap())
+                    .unwrap_or_default(),
                 users: match std::env::var("BUILDIT_E2E_POD_USERS").as_deref() {
                     Ok("host") => jobs::PodUsers::Host,
                     _ => jobs::PodUsers::Namespaced,
@@ -4778,8 +4869,9 @@ mod tests {
             ("B".to_string(), "x y=z".to_string()),
         ]);
         let dest = "r:5000/builds/buildit:sb-a-buildit-00000000000000a1";
+        let gzip = jobs::Compression::Gzip;
         assert_eq!(
-            buildctl_argv(&df, Some("base"), &args, dest).unwrap(),
+            buildctl_argv(&df, Some("base"), &args, dest, gzip, None).unwrap(),
             [
                 "buildctl",
                 "build",
@@ -4804,7 +4896,7 @@ mod tests {
                 "/tmp/buildkit/metadata.json",
             ]
         );
-        let plain = buildctl_argv(&df, None, &BTreeMap::new(), dest).unwrap();
+        let plain = buildctl_argv(&df, None, &BTreeMap::new(), dest, gzip, None).unwrap();
         assert!(
             !plain
                 .iter()
@@ -4813,11 +4905,104 @@ mod tests {
         );
         for bad in ["", "A=B"] {
             let args = BTreeMap::from([(bad.to_string(), "1".to_string())]);
-            assert!(buildctl_argv(&df, None, &args, dest).is_err(), "{bad:?}");
+            assert!(
+                buildctl_argv(&df, None, &args, dest, gzip, None).is_err(),
+                "{bad:?}"
+            );
             let id = BuildId::fresh();
             assert!(
                 bud_argv(&id, &df, None, &args, &[], &[]).is_err(),
                 "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_buildkit_build_reads_and_writes_a_layer_cache_and_compresses_its_layers() {
+        let df = RelPath::parse("Dockerfile").unwrap();
+        let dest = "r:5000/builds/buildit:sb-a-buildit-00000000000000a1";
+        let refs = jobs::LayerCacheRefs {
+            import: vec![
+                "r:5000/builds/buildit:cache-00aa".to_string(),
+                "r:5000/builds/buildit:cache-sb-a-00aa".to_string(),
+            ],
+            export: "r:5000/builds/buildit:cache-sb-a-00aa".to_string(),
+        };
+        let none = BTreeMap::new();
+        let built = |compression, cache| {
+            let all = buildctl_argv(&df, None, &none, dest, compression, cache).unwrap();
+            let at = all.iter().position(|a| a == "filename=Dockerfile").unwrap();
+            all[at + 1..].to_vec()
+        };
+        assert_eq!(
+            built(jobs::Compression::Zstd, Some(&refs)),
+            [
+                "--import-cache",
+                "type=registry,ref=r:5000/builds/buildit:cache-00aa",
+                "--import-cache",
+                "type=registry,ref=r:5000/builds/buildit:cache-sb-a-00aa",
+                "--export-cache",
+                "type=registry,ref=r:5000/builds/buildit:cache-sb-a-00aa,mode=max,\
+                 image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true",
+                "--output",
+                "type=image,name=r:5000/builds/buildit:sb-a-buildit-00000000000000a1,push=true,\
+                 compression=zstd,oci-mediatypes=true",
+                "--metadata-file",
+                "/tmp/buildkit/metadata.json",
+            ]
+        );
+        assert_eq!(
+            built(jobs::Compression::Uncompressed, None),
+            [
+                "--output",
+                "type=image,name=r:5000/builds/buildit:sb-a-buildit-00000000000000a1,push=true,\
+                 compression=uncompressed,oci-mediatypes=true",
+                "--metadata-file",
+                "/tmp/buildkit/metadata.json",
+            ]
+        );
+        let cached = built(jobs::Compression::Gzip, Some(&refs));
+        assert!(
+            cached[5].ends_with(",compression=gzip,ignore-error=true"),
+            "the cache's layers are compressed as the image's: {cached:?}"
+        );
+    }
+
+    #[test]
+    fn a_layer_cache_is_shared_by_one_dockerfile_target_and_context_and_written_by_the_trusted() {
+        let path = |raw: &str| RelPath::parse(raw).unwrap();
+        let scope = layer_cache_scope(&path("svc/api"), &path("Dockerfile"), None);
+        assert_eq!(scope.len(), 16, "{scope}");
+        assert!(scope.bytes().all(|b| b.is_ascii_hexdigit()), "{scope}");
+        assert_eq!(
+            scope,
+            layer_cache_scope(&path("svc/api"), &path("Dockerfile"), None)
+        );
+        for other in [
+            layer_cache_scope(&path("svc"), &path("api/Dockerfile"), None),
+            layer_cache_scope(&path("svc/api"), &path("Dockerfile.gpu"), None),
+            layer_cache_scope(&path("svc/api"), &path("Dockerfile"), Some("base")),
+        ] {
+            assert_ne!(other, scope);
+        }
+
+        let cache = |writers| SharedCache {
+            url: url::Url::parse("http://cache.example.svc:8850/").unwrap(),
+            token_file: None,
+            writers,
+        };
+        use jobs::LayerCacheWriter::{Own, Shared};
+        for (writers, run, sandbox) in [
+            (CacheWriters::Run, Shared, Own),
+            (CacheWriters::All, Shared, Shared),
+            (CacheWriters::None, Own, Own),
+        ] {
+            let cache = cache(writers);
+            assert_eq!(cache.layer_cache_writer(Starter::Run), run, "{writers:?}");
+            assert_eq!(
+                cache.layer_cache_writer(Starter::Sandbox),
+                sandbox,
+                "{writers:?}"
             );
         }
     }
@@ -5693,6 +5878,191 @@ mod tests {
         .unwrap();
         assert_ne!(ran["exit"], 0, "a cache is no part of the image: {ran}");
         a("clean", serde_json::json!({})).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs a cluster: BUILDIT_E2E_KUBECONTEXT=kind-x and either \
+                BUILDIT_E2E_HOST_ADDR=<this host's address from a pod> for a cache on this host, or \
+                BUILDIT_E2E_CACHE_URL and BUILDIT_E2E_CACHE_TOKEN_FILE for a deployed one"]
+    async fn e2e_a_buildkit_rebuild_takes_its_stages_from_the_layer_cache_its_writers_may_share() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let context = std::env::var("BUILDIT_E2E_KUBECONTEXT").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().canonicalize().unwrap();
+        let cache_token = work.join("cache-token");
+        let run = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let (cache_url, _) = e2e_cache(&work, &cache_token).await;
+        let dir = format!("lc-{run}");
+        std::fs::create_dir_all(work.join(&dir)).unwrap();
+        std::fs::write(work.join(&dir).join("note.txt"), "first\n").unwrap();
+        std::fs::write(
+            work.join(&dir).join("Dockerfile"),
+            library(
+                "FROM docker.io/library/alpine:3.20 AS deps\n\
+                 RUN head -c 1048576 /dev/urandom > /blob && date +%s%N > /stamp && echo lc-deps-\"ran\"\n\
+                 FROM docker.io/library/alpine:3.20\n\
+                 COPY --from=deps /stamp /stamp\n\
+                 COPY --from=deps /blob /blob\n\
+                 COPY note.txt /note.txt\n\
+                 RUN echo \"lc-late $(cat /note.txt)\"\n",
+            ),
+        )
+        .unwrap();
+        let file = tokens(
+            &work,
+            "tok-lc-a sb-lc-a\ntok-lc-b sb-lc-b\ntok-lc-c sb-lc-c\n",
+        );
+        let mut addrs = Vec::new();
+        let mut servers = Vec::new();
+        for writers in [CacheWriters::Run, CacheWriters::All] {
+            let client = crate::client_for(Some(&context)).await.unwrap();
+            let mut broker = Broker {
+                shared_cache: Some(SharedCache {
+                    url: url::Url::parse(&cache_url).unwrap(),
+                    token_file: Some(cache_token.clone()),
+                    writers,
+                }),
+                ..broker_value(client, &file, Some(&work))
+            };
+            broker.site.cache = cache_url.trim_end_matches('/').to_string();
+            let (addr, server) = serve(Arc::new(broker)).await;
+            addrs.push(addr);
+            servers.push(server);
+        }
+        let (sandboxes_keep_their_own, all_share) = (addrs[0].clone(), addrs[1].clone());
+        for token in ["tok-lc-a", "tok-lc-b", "tok-lc-c"] {
+            call(&all_share, token, "clean", serde_json::json!({}))
+                .await
+                .unwrap();
+        }
+        let build = |addr: &str, token: &'static str| {
+            let (addr, dir) = (addr.to_string(), dir.clone());
+            async move {
+                let args = serde_json::json!({
+                    "context": dir, "timeout_s": 600, "builder": "buildkit",
+                });
+                let started = call(&addr, token, "build", args).await.unwrap();
+                let id = started["build_id"].as_str().unwrap().to_string();
+                let only_id = serde_json::json!({ "build_id": id });
+                for _ in 0..300 {
+                    let status = call(&addr, token, "status", only_id.clone()).await.unwrap();
+                    if status["status"] != "running" {
+                        let grep = serde_json::json!({
+                            "build_id": id, "grep": "lc-|cache|CACHED|snapshotter", "max_bytes": 65536,
+                        });
+                        let log = call(&addr, token, "logs", grep).await.unwrap();
+                        let lines = log["lines"].as_str().unwrap_or_default().to_string();
+                        assert_eq!(status["status"], "succeeded", "{status}\n{lines}");
+                        let snapshotter = status["snapshotter"].as_str().unwrap_or_default();
+                        match std::env::var("BUILDIT_E2E_STORAGE_DRIVER").as_deref() {
+                            Ok("overlay") => assert_eq!(snapshotter, "overlayfs", "{status}"),
+                            _ => {
+                                assert!(["overlayfs", "native"].contains(&snapshotter), "{status}")
+                            }
+                        }
+                        assert!(
+                            lines.contains(&format!("buildkit snapshotter: {snapshotter}")),
+                            "{lines}"
+                        );
+                        return (id, status["layer_cache"].clone(), lines);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                panic!("build {id} still running after 600s");
+            }
+        };
+        let ran = |addr: &str, token: &'static str, id: &str, cmd: &'static str| {
+            let (addr, id) = (addr.to_string(), id.to_string());
+            async move {
+                let args = serde_json::json!({ "build_id": id, "cmd": ["sh", "-c", cmd] });
+                let ran = call(&addr, token, "run", args).await.unwrap();
+                assert_eq!(ran["exit"], 0, "{ran}");
+                ran["log_tail"].as_str().unwrap_or_default().to_string()
+            }
+        };
+        let used = |imported: bool, cached: usize| serde_json::json!({ "imported": imported, "steps": 5, "cached": cached });
+
+        let (first, cache, log) = build(&sandboxes_keep_their_own, "tok-lc-a").await;
+        assert_eq!(cache, used(false, 0), "nothing to read yet: {log}");
+        assert!(log.contains("lc-deps-ran"), "{log}");
+        let stamp = ran(&sandboxes_keep_their_own, "tok-lc-a", &first, "cat /stamp").await;
+        let steps = ran(
+            &sandboxes_keep_their_own,
+            "tok-lc-a",
+            &first,
+            "cat /buildit/steps.log",
+        )
+        .await;
+        for line in [
+            "importing cache manifest from ",
+            "exporting to image",
+            "exporting cache to registry",
+        ] {
+            assert!(steps.contains(line), "{line:?} is not stamped: {steps}");
+        }
+
+        let (second, cache, log) = build(&sandboxes_keep_their_own, "tok-lc-a").await;
+        assert_eq!(
+            cache,
+            used(true, 5),
+            "an unchanged rebuild runs no step: {log}"
+        );
+        assert!(!log.contains("lc-deps-ran"), "{log}");
+        assert_eq!(
+            ran(&sandboxes_keep_their_own, "tok-lc-a", &second, "cat /stamp").await,
+            stamp,
+            "the image holds what the first build made"
+        );
+
+        std::fs::write(work.join(&dir).join("note.txt"), "second\n").unwrap();
+        let (third, cache, log) = build(&sandboxes_keep_their_own, "tok-lc-a").await;
+        assert_eq!(
+            cache,
+            used(true, 2),
+            "the stage the final image only copies from is cached too, and the last cached step \
+             before the changed one is pulled for it, which buildctl does not mark: {log}"
+        );
+        assert!(
+            log.contains("lc-late second") && !log.contains("lc-deps-ran"),
+            "{log}"
+        );
+        assert_eq!(
+            ran(&sandboxes_keep_their_own, "tok-lc-a", &third, "cat /stamp").await,
+            stamp
+        );
+
+        let (_, cache, log) = build(&sandboxes_keep_their_own, "tok-lc-b").await;
+        assert_eq!(
+            cache,
+            used(false, 0),
+            "a sandbox reads no cache another sandbox wrote: {log}"
+        );
+        assert!(log.contains("lc-deps-ran"), "{log}");
+
+        let (_, cache, log) = build(&all_share, "tok-lc-b").await;
+        assert_eq!(
+            cache,
+            used(false, 0),
+            "a build that writes the shared cache reads no sandbox's own: {log}"
+        );
+        let (shared, cache, log) = build(&sandboxes_keep_their_own, "tok-lc-c").await;
+        assert_eq!(
+            cache,
+            used(true, 5),
+            "every sandbox reads the cache a trusted build wrote: {log}"
+        );
+        assert_ne!(
+            ran(&sandboxes_keep_their_own, "tok-lc-c", &shared, "cat /stamp").await,
+            stamp
+        );
+        for token in ["tok-lc-a", "tok-lc-b", "tok-lc-c"] {
+            call(&all_share, token, "clean", serde_json::json!({}))
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
