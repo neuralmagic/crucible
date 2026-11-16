@@ -1,6 +1,6 @@
-//! Cancelling a launch's runs: each `running` run on a pod has its pod deleted on the cluster it
-//! ran on and is marked `cancelled`. A run with no pod (local dispatch) is left alone; nothing here
-//! can stop it.
+//! Cancelling a launch's runs: each `running` run on a pod has its engine log kept, its pod and
+//! its gateway deleted on the cluster it ran on, and is marked `cancelled`. A run with no pod
+//! (local dispatch) is left alone; nothing here can stop it.
 
 use anyhow::Result;
 
@@ -24,6 +24,7 @@ pub async fn cancel_runs(
     .fetch_all(db.pool())
     .await?;
     let note = format!("cancelled by {}", actor.unwrap_or("an operator"));
+    let profile = crate::runs::completion::collection_profile(cfg).await;
     let mut cancelled = 0;
     for (run_id, pod) in runs {
         let Some(pod) = pod else {
@@ -41,9 +42,26 @@ pub async fn cancel_runs(
         else {
             continue;
         };
+        crate::runs::completion::keep_engine_log(
+            db,
+            dispatcher.as_ref(),
+            &cluster,
+            &ns,
+            &pod,
+            &run_id,
+        )
+        .await;
         if !crate::runs::workpod::delete_for_sweep(dispatcher.as_ref(), &cluster, &ns, &pod).await {
             continue;
         }
+        crate::runs::workpod::teardown_run_gateway(
+            dispatcher.as_ref(),
+            &cluster,
+            profile.as_deref(),
+            &pod,
+            &ns,
+        )
+        .await;
         if row.is_some() {
             crate::runs::work_pods::set_work_pod_state(
                 db.pool(),

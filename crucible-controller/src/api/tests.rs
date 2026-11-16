@@ -7849,6 +7849,93 @@ async fn a_launch_is_cancelled_by_its_owner_or_an_administrator_and_no_one_else(
     Ok(())
 }
 
+/// Parking a playbook launch admits whoever may cancel it, and a platform operator as for any
+/// issue. Anyone else does not learn the launch is there, and an issue that is not a launch
+/// stays operator-only.
+#[cfg(feature = "autoresearch")]
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_launch_is_parked_by_its_owner_or_an_operator_and_no_one_else(
+    pool: PgPool,
+) -> Result<()> {
+    let (db, dir) = db_with(pool);
+    let sink = test_sink(&db);
+    let app = app_with_sink(
+        db.clone(),
+        sink.clone(),
+        vec!["wren".to_string()],
+        vec!["olive".to_string()],
+    );
+    register_survey(&app, dir.path(), LAUNCH_WORKFLOW).await;
+    let (status, ack) = post_launch(
+        &app,
+        "survey",
+        serde_json::json!({"params": {"topic": "t", "depth": "deep"}, "max_cost": 1.0, "max_time": "30m"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{ack}");
+    let key = ack["key"].as_str().expect("key").to_string();
+    sqlx::query(
+        "UPDATE playbook_launches SET created_by = 'alice', owner = 'user:alice' WHERE key = $1",
+    )
+    .bind(&key)
+    .execute(db.pool())
+    .await?;
+    let park = format!("/api/issues/{}/park", urlencoding_encode(&key));
+    let reason = || Some(serde_json::json!({"reason": "stop"}));
+
+    let (status, _) = send(&app, "POST", &park, "mallory", reason()).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a stranger may not park, nor learn the launch is there"
+    );
+    assert!(sink.pending().await?.is_empty());
+
+    let (status, body) = send(&app, "POST", &park, "alice", reason()).await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "the launcher may: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let calls = sink.pending().await?;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].key.0, key);
+    assert_eq!(calls[0].kind, OverrideKind::Park);
+    assert_eq!(calls[0].actor.as_deref(), Some("alice"));
+
+    for (user, role) in [("olive", "an operator"), ("wren", "an administrator")] {
+        let (status, _) = send(&app, "POST", &park, user, reason()).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{role} may");
+        assert_eq!(sink.pending().await?[0].actor.as_deref(), Some(user));
+    }
+    let denials: Vec<String> =
+        sqlx::query_scalar("SELECT actor FROM authz_audit WHERE decision = 'deny' ORDER BY id")
+            .fetch_all(db.pool())
+            .await?;
+    assert_eq!(
+        denials,
+        ["user:mallory"],
+        "an operator's park of another's launch is not recorded as a denial"
+    );
+
+    crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#1")).await?;
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/api/issues/owner%2Frepo%231/park",
+        "alice",
+        reason(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "an issue that is not a launch stays operator-only"
+    );
+    Ok(())
+}
+
 /// The runs section is the relaunch source: every launch, a schedule's firings included, with the
 /// values and ceilings it froze, its outcome, and its cost.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
@@ -9052,6 +9139,50 @@ fn draft_files() -> serde_json::Value {
         "crucible.toml": "[repo]\npath = \".\"\n\n[agent]\n\n[workflow]\ntype = \"playbook\"\nfile = \"workflow.star\"\n",
         "workflow.star": "params = {}\nhello = command(name = \"hello\", run = \"echo hello\")\nworkflow(type = \"playbook\", tasks = [hello], result = hello)\n",
     })
+}
+
+/// Deleting a draft is decided against its owner, not the caller's platform role: a viewer
+/// deletes their own draft, and another viewer's draft does not exist for them.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_viewer_deletes_their_own_draft_and_no_one_elses(pool: PgPool) -> Result<()> {
+    let (db, _dir) = db_with(pool);
+    let app = app_with_roles(db, vec!["wren".to_string()], vec![]);
+    for (user, id) in [("alice", "alices"), ("bob", "bobs")] {
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/playbook-drafts",
+            user,
+            Some(serde_json::json!({"id": id, "description": "a drafted pack"})),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    let (status, _) = send(&app, "DELETE", "/api/playbook-drafts/bobs", "alice", None).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a viewer may not delete another's draft, nor learn it is there"
+    );
+    let (status, _) = send(&app, "GET", "/api/playbook-drafts/bobs", "bob", None).await;
+    assert_eq!(status, StatusCode::OK, "the refused delete dropped nothing");
+
+    let (status, body) = send(&app, "DELETE", "/api/playbook-drafts/alices", "alice", None).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "a viewer deletes their own draft: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let (status, _) = send(&app, "GET", "/api/playbook-drafts/alices", "alice", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    Ok(())
 }
 
 /// A draft is not a registered pack: it lists on its own rail, with its version history, and never

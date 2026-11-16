@@ -199,7 +199,7 @@ pub async fn ingest_completion(db: &Db, cfg: &ControllerCfg, key: &str) -> Resul
 
 /// The deploy profile for collection's cleanup of an isolated gateway. A profile that cannot be
 /// read leaves the gateway to the gateway sweep rather than failing the collection.
-async fn collection_profile(
+pub(crate) async fn collection_profile(
     cfg: &ControllerCfg,
 ) -> Option<std::sync::Arc<crucible::deploy::DeployProfile>> {
     match cfg.profile().await {
@@ -443,25 +443,7 @@ async fn pod_session(
             return Ok(None);
         }
     }
-    // The pod is deleted minutes after this, and its log is the only copy of the engine's own
-    // output (gateway boot, agent stderr, the wrapper's exit), so keep it whichever way the session
-    // arrives. Best-effort: a run completes without it.
-    let logs = match dispatcher.logs(&cluster, &ns, pod).await {
-        Ok(logs) => Some(logs),
-        Err(e) => {
-            tracing::warn!(issue_key = %key, run_id = %run.run_id, pod_name = %pod, error = format!("{e:#}"), "run completion: reading the finished pod's logs failed");
-            None
-        }
-    };
-    if let Some(logs) = &logs {
-        let engine = crate::runs::workpod::engine_log_of(logs);
-        if !engine.trim().is_empty()
-            && let Err(e) =
-                crate::runs::blob_store::put_run_engine_log(db.pool(), &run.run_id, &engine).await
-        {
-            tracing::warn!(issue_key = %key, run_id = %run.run_id, pod_name = %pod, error = format!("{e:#}"), "run completion: keeping the pod's engine log failed");
-        }
-    }
+    let logs = keep_engine_log(db, dispatcher.as_ref(), &cluster, &ns, pod, &run.run_id).await;
     match locate_session(db, run).await {
         Ok(Some(session)) => return Ok(Some(session)),
         Ok(None) => {}
@@ -508,6 +490,34 @@ async fn pod_session(
     )
     .await?;
     Ok(None)
+}
+
+/// Read `pod`'s log and keep the engine's own output in it as run `run_id`'s engine log, returning
+/// the log. Called before the pod is deleted: the pod's log is the only copy of the engine's
+/// output (gateway boot, agent stderr, the wrapper's exit). Best-effort: a failure is logged.
+pub(crate) async fn keep_engine_log(
+    db: &Db,
+    dispatcher: &dyn crate::runs::workpod::PodDispatcher,
+    cluster: &str,
+    namespace: &str,
+    pod: &str,
+    run_id: &str,
+) -> Option<String> {
+    let logs = match dispatcher.logs(cluster, namespace, pod).await {
+        Ok(logs) => logs,
+        Err(e) => {
+            tracing::warn!(%run_id, pod_name = %pod, error = format!("{e:#}"), "reading the run pod's logs failed");
+            return None;
+        }
+    };
+    let engine = crate::runs::workpod::engine_log_of(&logs);
+    if !engine.trim().is_empty()
+        && let Err(e) =
+            crate::runs::blob_store::put_run_engine_log(db.pool(), run_id, &engine).await
+    {
+        tracing::warn!(%run_id, pod_name = %pod, error = format!("{e:#}"), "keeping the run pod's engine log failed");
+    }
+    Some(logs)
 }
 
 /// Slack past a playbook run's own `max_time` for scheduling, image pulls, and init before its
