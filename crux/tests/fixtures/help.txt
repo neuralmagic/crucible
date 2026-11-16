@@ -2536,7 +2536,7 @@ Options:
           [env: CONTROLLER_CONFIG=]
 
       --cursor <CURSOR>
-          Line to resume from, as the previous window's `cursor=` line reported it
+          Byte offset to resume from, as the previous window's `cursor=` line reported it
           
           [default: 0]
 
@@ -2580,8 +2580,8 @@ Options:
       --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux`
                                (else `~/.config/crux`), which may be absent; a path given here must
                                exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
-      --cursor <CURSOR>        Line to resume from, as the previous window's `cursor=` line reported
-                               it [default: 0]
+      --cursor <CURSOR>        Byte offset to resume from, as the previous window's `cursor=` line
+                               reported it [default: 0]
       --limit <LIMIT>          Lines in this window. Capped at 200, which is also the default
       --url <URL>              Controller base URL: the API route. Defaults to a controller on this
                                machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]

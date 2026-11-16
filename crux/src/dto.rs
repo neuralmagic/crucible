@@ -319,11 +319,34 @@ pub struct RunLog {
     pub dispatch: String,
     #[serde(default)]
     pub text: Option<String>,
-    /// True when the head was dropped to fit the controller's cap.
+    /// True when `text` is not the whole log.
     #[serde(default)]
     pub truncated: bool,
+    /// Byte offset of `text` in the whole log.
+    #[serde(default)]
+    pub start: u64,
+    /// Where the next window starts, when the log already holds more.
+    #[serde(default)]
+    pub next: Option<u64>,
+    #[serde(default)]
+    pub total_bytes: u64,
+    /// Which copy of the output `text` came from. Absent from a controller that only serves the
+    /// tail.
+    #[serde(default)]
+    pub source: Option<String>,
     #[serde(default)]
     pub location: Option<String>,
+}
+
+impl RunLog {
+    /// Where a read after this window picks up.
+    pub fn resume(&self) -> anyhow::Result<u64> {
+        anyhow::ensure!(
+            self.source.is_some() || self.text.is_none(),
+            "this controller serves only a log's tail and cannot resume one; it needs upgrading"
+        );
+        Ok(self.next.unwrap_or(self.total_bytes))
+    }
 }
 
 /// `GET /api/runs/{run_id}/files`: what the run's tasks captured.

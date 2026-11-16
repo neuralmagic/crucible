@@ -11553,6 +11553,18 @@ async fn run_log_serves_local_output_and_points_a_pod_run_at_its_pod(pool: PgPoo
     }
     assert_eq!(read, long);
 
+    let line = long.lines().next().expect("a line").len() + 1;
+    let (_, few) = get_json_value(&app, "/api/runs/run-pod/log?from=0&lines=2").await;
+    assert_eq!(few["text"].as_str().expect("text").lines().count(), 2);
+    assert_eq!(few["next"], 2 * line);
+    let (_, small) = get_json_value(&app, "/api/runs/run-pod/log?from=0&bytes=600").await;
+    assert_eq!(small["next"], line, "one line fits in 600 bytes");
+    let (_, caught_up) =
+        get_json_value(&app, &format!("/api/runs/run-pod/log?from={}", long.len())).await;
+    assert_eq!(caught_up["text"], "");
+    assert_eq!(caught_up["next"], serde_json::Value::Null);
+    assert_eq!(caught_up["total_bytes"], long.len());
+
     let (status, unknown) = get_json_value(&app, "/api/runs/nobody/log").await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{unknown}");
     Ok(())

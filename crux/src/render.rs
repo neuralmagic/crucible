@@ -317,76 +317,50 @@ pub fn deployed(endpoint: &str, v: &dto::Version, expected: Option<&str>) -> Str
     out
 }
 
-/// A log window's shape: the lines it carries and where to resume. `next` is `None` at the end of
-/// what the controller served, which is the only signal a caller has that it is caught up.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LogWindow {
-    lines: Vec<String>,
-    next: Option<usize>,
-    remaining: usize,
-}
-
 /// The default line ceiling on one window. A run log is unbounded and a tool result is not, so a
 /// window is a handle to a position rather than the log itself.
 pub const LOG_WINDOW_LINES: usize = 200;
 
 /// The byte ceiling on one window, applied before the line ceiling: a run that prints one enormous
 /// line must not blow the result cap just because it is a single line.
-const LOG_WINDOW_BYTES: usize = 16 * 1024;
+pub const LOG_WINDOW_BYTES: usize = 16 * 1024;
 
-/// One window of `text` from line `cursor`, bounded by both ceilings. A cursor past the end yields
-/// an empty window rather than an error, so polling a finished run is not a failure case.
-fn log_window(text: &str, cursor: usize, limit: usize) -> LogWindow {
-    let all: Vec<&str> = text.lines().collect();
-    let start = cursor.min(all.len());
-    let mut lines = Vec::new();
-    let mut bytes = 0;
-    for line in &all[start..] {
-        if lines.len() >= limit || (!lines.is_empty() && bytes + line.len() > LOG_WINDOW_BYTES) {
-            break;
-        }
-        bytes += line.len() + 1;
-        lines.push((*line).to_string());
-    }
-    let end = start + lines.len();
-    LogWindow {
-        lines,
-        next: (end < all.len()).then_some(end),
-        remaining: all.len() - end,
-    }
-}
-
-/// One window of a run's log, headed by where it came from and how to resume.
-pub fn run_log(run_id: &str, log: &dto::RunLog, cursor: usize, limit: usize) -> String {
-    let Some(text) = log.text.as_deref().filter(|t| !t.is_empty()) else {
+/// One window of a run's log read from byte `cursor`, with the cursor to resume from.
+pub fn run_log(run_id: &str, log: &dto::RunLog, cursor: u64) -> anyhow::Result<String> {
+    let Some(text) = log.text.as_deref() else {
         let where_it_is = log
             .location
             .as_deref()
             .unwrap_or("no output recorded for this run");
-        return format!("run {run_id} [{}]: {where_it_is}\n", log.dispatch);
+        return Ok(format!("run {run_id} [{}]: {where_it_is}\n", log.dispatch));
     };
-    let w = log_window(text, cursor, limit);
-    let mut out = format!("run {run_id} [{}]", log.dispatch);
-    if log.truncated {
-        out.push_str(" (head dropped by the controller's cap)");
-    }
-    let _ = writeln!(
-        out,
-        " lines {}..{}, {} remaining",
-        cursor,
-        cursor + w.lines.len(),
-        w.remaining
+    let end = log.resume()?;
+    let mut out = format!(
+        "run {run_id} [{}]",
+        log.source.as_deref().unwrap_or(&log.dispatch)
     );
-    for line in &w.lines {
-        let _ = writeln!(out, "{line}");
+    if log.total_bytes < cursor {
+        let _ = writeln!(
+            out,
+            ": the log is {} bytes, shorter than cursor={cursor}\n-- read it again with cursor=0",
+            log.total_bytes
+        );
+        return Ok(out);
     }
-    match w.next {
+    let _ = writeln!(out, " bytes {}..{end} of {}", log.start, log.total_bytes);
+    out.push_str(text);
+    if !text.is_empty() && !text.ends_with('\n') {
+        out.push('\n');
+    }
+    match log.next {
         Some(next) => {
             let _ = writeln!(out, "-- resume with cursor={next}");
         }
-        None => out.push_str("-- end of log\n"),
+        None => {
+            let _ = writeln!(out, "-- end of log; later output starts at cursor={end}");
+        }
     }
-    out
+    Ok(out)
 }
 
 pub fn run_files(run_id: &str, listing: &dto::RunFiles) -> String {
@@ -1699,12 +1673,18 @@ mod tests {
     use crate::config::Auth;
     use crate::render::*;
 
-    fn log_of(text: Option<&str>, location: Option<&str>) -> dto::RunLog {
+    /// The controller's answer for the window `start..end` of a log `total` bytes long.
+    fn log_of(text: &str, start: u64, total: u64) -> dto::RunLog {
+        let end = start + text.len() as u64;
         dto::RunLog {
             dispatch: "pod".to_string(),
-            text: text.map(str::to_string),
-            truncated: false,
-            location: location.map(str::to_string),
+            text: Some(text.to_string()),
+            truncated: start > 0 || end < total,
+            start,
+            next: (end < total).then_some(end),
+            total_bytes: total,
+            source: Some("live_pod".to_string()),
+            location: None,
         }
     }
 
@@ -1748,59 +1728,58 @@ mod tests {
         );
     }
 
-    /// A window ends where the caller can resume, and the last one says so instead of handing back
-    /// a cursor that would read nothing.
     #[test]
-    fn a_log_window_reports_where_to_resume_and_where_it_ends() {
-        let text = (0..5)
-            .map(|i| format!("line {i}\n"))
-            .collect::<Vec<_>>()
-            .concat();
+    fn a_log_window_always_reports_where_to_resume() {
+        let mid = run_log("run-1", &log_of("line 0\nline 1\n", 0, 35), 0).unwrap();
+        assert_eq!(
+            mid,
+            "run run-1 [live_pod] bytes 0..14 of 35\nline 0\nline 1\n-- resume with cursor=14\n"
+        );
 
-        let first = log_window(&text, 0, 2);
-        assert_eq!(first.lines, vec!["line 0", "line 1"]);
-        assert_eq!(first.next, Some(2));
-        assert_eq!(first.remaining, 3);
+        let last = run_log("run-1", &log_of("line 4\n", 28, 35), 28).unwrap();
+        assert_eq!(
+            last,
+            "run run-1 [live_pod] bytes 28..35 of 35\nline 4\n\
+             -- end of log; later output starts at cursor=35\n"
+        );
 
-        let last = log_window(&text, 4, 2);
-        assert_eq!(last.lines, vec!["line 4"]);
-        assert_eq!(last.next, None, "the final window resumes nowhere");
-        assert_eq!(last.remaining, 0);
+        let caught_up = run_log("run-1", &log_of("", 35, 35), 35).unwrap();
+        assert_eq!(
+            caught_up,
+            "run run-1 [live_pod] bytes 35..35 of 35\n-- end of log; later output starts at cursor=35\n"
+        );
     }
 
-    /// Polling past the end of a finished run is an empty window, not an error.
     #[test]
-    fn a_cursor_past_the_end_reads_empty() {
-        let w = log_window("only\n", 99, 10);
-        assert!(w.lines.is_empty());
-        assert_eq!(w.next, None);
-        assert_eq!(w.remaining, 0);
+    fn a_cursor_past_a_shorter_log_says_to_start_over() {
+        let out = run_log("run-1", &log_of("", 20, 20), 500).unwrap();
+        assert_eq!(
+            out,
+            "run run-1 [live_pod]: the log is 20 bytes, shorter than cursor=500\n\
+             -- read it again with cursor=0\n"
+        );
     }
 
-    /// One enormous line still comes back — the byte ceiling only stops a window growing past it,
-    /// so a log that never breaks a line cannot stall on an empty window forever.
     #[test]
-    fn one_oversize_line_is_served_rather_than_stalling() {
-        let text = format!("{}\nnext\n", "x".repeat(LOG_WINDOW_BYTES * 2));
-        let w = log_window(&text, 0, LOG_WINDOW_LINES);
-        assert_eq!(w.lines.len(), 1);
-        assert_eq!(w.next, Some(1));
+    fn a_tail_only_controller_is_refused_rather_than_misread() {
+        let mut log = log_of("line\n", 0, 5);
+        log.source = None;
+        let error = run_log("run-1", &log, 0).unwrap_err();
+        assert!(error.to_string().contains("needs upgrading"), "{error}");
     }
 
     /// A run with no output says where to look instead of printing an empty window.
     #[test]
     fn no_output_names_where_it_lives() {
-        let out = run_log(
-            "run-1",
-            &log_of(
-                None,
-                Some("pod loop-abc in namespace crucible-system on cluster wharf"),
-            ),
-            0,
-            10,
-        );
+        let log = dto::RunLog {
+            text: None,
+            source: None,
+            location: Some("pod loop-abc in namespace crucible-system on cluster wharf".into()),
+            ..log_of("", 0, 0)
+        };
+        let out = run_log("run-1", &log, 0).unwrap();
         assert!(out.contains("on cluster wharf"), "{out}");
-        assert!(!out.contains("resume with cursor"), "{out}");
+        assert!(!out.contains("cursor"), "{out}");
     }
 
     /// Every whoami test reads the same controller answer, serialized the way

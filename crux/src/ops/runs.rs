@@ -83,13 +83,13 @@ impl Operation for Run {
 #[derive(Debug, Clone, PartialEq, Eq, clap::Args, Deserialize, schemars::JsonSchema)]
 pub struct RunLog {
     pub run_id: String,
-    /// Line to resume from, as the previous window's `cursor=` line reported it.
+    /// Byte offset to resume from, as the previous window's `cursor=` line reported it.
     #[arg(long, default_value = "0")]
     #[serde(default)]
     #[schemars(
-        description = "Line to resume from, as a previous window's `cursor=` line reported it. Omit to start at\nthe first line the controller served."
+        description = "Byte offset to resume from, as a previous window's `cursor=` line reported it. Omit to\nstart at the first line of the log."
     )]
-    pub cursor: Option<usize>,
+    pub cursor: Option<u64>,
     /// Lines in this window. Capped at 200, which is also the default.
     #[arg(long, conflicts_with = "follow")]
     #[serde(default)]
@@ -115,20 +115,21 @@ impl Operation for RunLog {
     type Output = dto::RunLog;
 
     async fn call(&self, c: &Client) -> Result<Value> {
-        c.run_log(&self.run_id).await
-    }
-
-    fn render(&self, _c: &Client, log: Self::Output) -> Result<String> {
         let limit = self
             .limit
             .unwrap_or(render::LOG_WINDOW_LINES)
             .clamp(1, render::LOG_WINDOW_LINES);
-        Ok(render::run_log(
+        c.run_log_from(
             &self.run_id,
-            &log,
             self.cursor.unwrap_or(0),
-            limit,
-        ))
+            Some(limit),
+            Some(render::LOG_WINDOW_BYTES),
+        )
+        .await
+    }
+
+    fn render(&self, _c: &Client, log: Self::Output) -> Result<String> {
+        render::run_log(&self.run_id, &log, self.cursor.unwrap_or(0))
     }
 
     fn json(&self) -> bool {
@@ -138,99 +139,61 @@ impl Operation for RunLog {
 
 impl RunLog {
     /// Follow the log until the run leaves `running`, printing each new line as it appears.
-    ///
-    /// The controller serves the whole log on every read, tail-capped, so this polls and prints
-    /// only what is past `cursor`. When the cap drops the head, line numbers stop meaning
-    /// anything; the last printed line is then used to find where to resume, and if it is gone
-    /// too, the whole window is printed with a marker rather than silently skipped.
     pub async fn follow(
         &self,
         c: &Client,
         interval: Duration,
         out: &mut (impl std::io::Write + ?Sized),
     ) -> Result<String> {
-        let mut follow = Follow {
-            seen: self.cursor.unwrap_or(0),
-            last_line: None,
-            headed: false,
-        };
+        let mut at = self.cursor.unwrap_or(0);
+        let mut lines = 0usize;
+        let mut headed = false;
+        let mut mid_line = false;
         loop {
-            let log: dto::RunLog = c.run_log(&self.run_id).await?;
-            follow.emit(&self.run_id, &log, out)?;
             let detail: dto::RunDetail = c.run(&self.run_id).await?;
+            loop {
+                let log: dto::RunLog = c.run_log_from(&self.run_id, at, None, None).await?;
+                if log.total_bytes < at {
+                    if std::mem::take(&mut mid_line) {
+                        writeln!(out)?;
+                    }
+                    writeln!(
+                        out,
+                        "-- the log is shorter than byte {at}; following it from its start"
+                    )?;
+                    at = 0;
+                    continue;
+                }
+                if let Some(text) = log.text.as_deref().filter(|t| !t.is_empty()) {
+                    if !headed {
+                        writeln!(
+                            out,
+                            "run {} [{}] following from byte {at}",
+                            self.run_id, log.dispatch
+                        )?;
+                        headed = true;
+                    }
+                    out.write_all(text.as_bytes())?;
+                    lines += text.matches('\n').count();
+                    mid_line = !text.ends_with('\n');
+                }
+                at = log.resume()?;
+                if log.next.is_none() {
+                    break;
+                }
+            }
+            out.flush()?;
             if !matches!(detail.run.status.as_str(), "running" | "pending") {
+                if mid_line {
+                    writeln!(out)?;
+                }
                 return Ok(format!(
-                    "-- run {} is {}, {} lines seen\n",
-                    self.run_id, detail.run.status, follow.seen
+                    "-- run {} is {}, {lines} lines seen\n",
+                    self.run_id, detail.run.status
                 ));
             }
             tokio::time::sleep(interval).await;
         }
-    }
-}
-
-/// The index after the last printed line inside a window whose head the controller dropped, or
-/// `None` when that line is gone too.
-fn resume_after(all: &[&str], last_line: Option<&str>) -> Option<usize> {
-    let last = last_line?;
-    all.iter().rposition(|x| *x == last).map(|pos| pos + 1)
-}
-
-/// What one `run-log -f` has printed so far: the line to resume from, the last line printed (to
-/// find that point again once the controller drops the head), and whether the header is out.
-struct Follow {
-    seen: usize,
-    last_line: Option<String>,
-    headed: bool,
-}
-
-impl Follow {
-    /// Print what is new in this window.
-    fn emit(
-        &mut self,
-        run_id: &str,
-        log: &dto::RunLog,
-        out: &mut (impl std::io::Write + ?Sized),
-    ) -> Result<()> {
-        let Some(text) = log.text.as_deref().filter(|t| !t.is_empty()) else {
-            return Ok(());
-        };
-        if !self.headed {
-            writeln!(
-                out,
-                "run {run_id} [{}] following from line {}",
-                log.dispatch, self.seen
-            )?;
-            self.headed = true;
-        }
-        let all: Vec<&str> = text.lines().collect();
-        let start = if log.truncated {
-            match resume_after(&all, self.last_line.as_deref()) {
-                Some(pos) => pos,
-                None => {
-                    if self.last_line.is_some() {
-                        writeln!(
-                            out,
-                            "-- head dropped by the controller's cap; resuming from what it kept"
-                        )?;
-                    }
-                    0
-                }
-            }
-        } else {
-            self.seen.min(all.len())
-        };
-        for line in &all[start..] {
-            writeln!(out, "{line}")?;
-            self.last_line = Some((*line).to_string());
-        }
-        self.seen = if log.truncated {
-            self.seen + all.len().saturating_sub(start)
-        } else {
-            all.len()
-        };
-        out.flush()?;
-        Ok(())
     }
 }
 
@@ -425,48 +388,80 @@ mod tests {
 
     use crate::ops::test_client;
 
-    /// Following prints only what is new on each poll and stops the moment the run is no
-    /// longer running, with the final status in the trailer.
-    #[tokio::test]
-    async fn follow_prints_new_lines_and_stops_when_the_run_settles() {
-        use axum::extract::State;
-        use axum::http::StatusCode;
-        use axum::routing::get;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+    /// A log that grows on each status read, served from the byte asked in windows of at most
+    /// `window` bytes.
+    #[derive(Clone)]
+    struct Growing {
+        log: std::sync::Arc<str>,
+        window: usize,
+        status_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        log_reads: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+    }
 
-        // Each poll sees one more line; the run settles on the third.
-        async fn log(State(polls): State<Arc<AtomicUsize>>) -> (StatusCode, String) {
-            let n = polls.fetch_add(1, Ordering::SeqCst) + 1;
-            let text = (1..=n)
-                .map(|i| format!("line {i}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            (
-                StatusCode::OK,
-                serde_json::json!({ "run_id": "r1", "dispatch": "pod", "text": text, "truncated": false })
-                    .to_string(),
-            )
+    impl Growing {
+        const SETTLES_AFTER: usize = 3;
+
+        fn visible(&self) -> usize {
+            let reads = self.status_reads.load(std::sync::atomic::Ordering::SeqCst);
+            (self.log.len() * reads / Self::SETTLES_AFTER).min(self.log.len())
         }
-        async fn run(State(polls): State<Arc<AtomicUsize>>) -> (StatusCode, String) {
-            let status = if polls.load(Ordering::SeqCst) >= 3 {
+    }
+
+    async fn serve(growing: Growing) -> String {
+        use axum::extract::{Query, State};
+        use axum::routing::get;
+
+        async fn log(
+            State(growing): State<Growing>,
+            Query(query): Query<std::collections::HashMap<String, String>>,
+        ) -> axum::Json<Value> {
+            let from: usize = query
+                .get("from")
+                .expect("a follow reads from an offset")
+                .parse()
+                .expect("a byte offset");
+            growing.log_reads.lock().expect("lock").push(from as u64);
+            let visible = &growing.log[..growing.visible()];
+            let start = from.min(visible.len());
+            let end = (start + growing.window).min(visible.len());
+            let end = if end == visible.len() {
+                end
+            } else {
+                visible[start..end]
+                    .rfind('\n')
+                    .map_or(end, |at| start + at + 1)
+            };
+            axum::Json(serde_json::json!({
+                "run_id": "r1",
+                "dispatch": "pod",
+                "text": &visible[start..end],
+                "truncated": start > 0 || end < visible.len(),
+                "start": start,
+                "next": (end < visible.len()).then_some(end),
+                "total_bytes": visible.len(),
+                "source": "live_pod",
+            }))
+        }
+        async fn run(State(growing): State<Growing>) -> axum::Json<Value> {
+            let reads = growing
+                .status_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let status = if reads >= Growing::SETTLES_AFTER {
                 "finished"
             } else {
                 "running"
             };
-            (
-                StatusCode::OK,
-                serde_json::json!({ "run": { "run_id": "r1", "status": status }, "candidates": [] })
-                    .to_string(),
+            axum::Json(
+                serde_json::json!({ "run": { "run_id": "r1", "status": status }, "candidates": [] }),
             )
         }
 
-        let polls = Arc::new(AtomicUsize::new(0));
         let app = axum::Router::new()
             .route("/healthz", get(|| async { "ok" }))
             .route("/api/runs/{id}/log", get(log))
             .route("/api/runs/{id}", get(run))
-            .with_state(polls);
+            .with_state(growing);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -474,26 +469,72 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve");
         });
-        let client = test_client(&url);
+        url
+    }
 
-        let mut out: Vec<u8> = Vec::new();
-        let op = RunLog {
+    fn following(cursor: u64) -> RunLog {
+        RunLog {
             run_id: "r1".into(),
-            cursor: Some(0),
+            cursor: Some(cursor),
             limit: None,
             follow: true,
             interval: 1,
             json: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn follow_prints_a_long_repetitive_log_once_and_whole() {
+        let log: String = (0..300)
+            .map(|i| format!("[task] {{\n[task]   \"n\": {i}\n[task] }}\n"))
+            .collect();
+        let growing = Growing {
+            log: log.as_str().into(),
+            window: 512,
+            status_reads: Default::default(),
+            log_reads: Default::default(),
         };
-        let trailer = op
+        let client = test_client(&serve(growing.clone()).await);
+
+        let mut out: Vec<u8> = Vec::new();
+        let trailer = following(0)
             .follow(&client, Duration::from_millis(10), &mut out)
             .await
             .expect("follow");
         let printed = String::from_utf8(out).expect("utf8");
         assert_eq!(
-            printed, "run r1 [pod] following from line 0\nline 1\nline 2\nline 3\n",
+            printed,
+            format!("run r1 [pod] following from byte 0\n{log}"),
             "each line exactly once"
         );
-        assert_eq!(trailer, "-- run r1 is finished, 3 lines seen\n");
+        assert_eq!(trailer, "-- run r1 is finished, 900 lines seen\n");
+        let reads = growing.log_reads.lock().expect("lock").clone();
+        assert!(reads.len() > 3, "the log spans many windows: {reads:?}");
+        assert!(
+            reads.windows(2).all(|pair| pair[0] <= pair[1]),
+            "no read goes back over what was printed: {reads:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn follow_restarts_a_log_shorter_than_its_cursor() {
+        let growing = Growing {
+            log: "one\ntwo".into(),
+            window: 512,
+            status_reads: std::sync::Arc::new(Growing::SETTLES_AFTER.into()),
+            log_reads: Default::default(),
+        };
+        let client = test_client(&serve(growing).await);
+
+        let mut out: Vec<u8> = Vec::new();
+        following(4096)
+            .follow(&client, Duration::from_millis(10), &mut out)
+            .await
+            .expect("follow");
+        assert_eq!(
+            String::from_utf8(out).expect("utf8"),
+            "-- the log is shorter than byte 4096; following it from its start\n\
+             run r1 [pod] following from byte 0\none\ntwo\n"
+        );
     }
 }

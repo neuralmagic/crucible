@@ -1003,14 +1003,14 @@
     "name": "crucible_run"
   },
   {
-    "description": "One window of a run's engine output, resumable by cursor. A running pod is read live; once it finishes its ingested session is served, which is the only copy that outlives the pod. Returns at most 200 lines and reports the cursor to resume from, so read it in windows rather than expecting the whole log.",
+    "description": "One window of a run's engine output, resumable by cursor. A running pod is read live; once it finishes its ingested session is served, which is the only copy that outlives the pod. Returns at most 200 lines and always reports the cursor to resume from, so read it in windows rather than expecting the whole log, and poll a running run with the cursor the last window gave.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "cursor": {
           "default": null,
-          "description": "Line to resume from, as a previous window's `cursor=` line reported it. Omit to start at\nthe first line the controller served.",
-          "format": "uint",
+          "description": "Byte offset to resume from, as a previous window's `cursor=` line reported it. Omit to\nstart at the first line of the log.",
+          "format": "uint64",
           "minimum": 0,
           "type": [
             "integer",

@@ -72,12 +72,23 @@ impl LogWindow {
     }
 }
 
+/// The most one window may hold, within [`MAX_LOG_BYTES`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LogCap {
+    pub bytes: Option<u64>,
+    /// Lines, for a window read with `from`.
+    pub lines: Option<u64>,
+}
+
 /// The window of `bytes` starting at `from`, or the tail when `from` is `None`. A window that
 /// stops short of the end stops after its last whole line, or inside a line longer than the cap on
 /// a character boundary, and the next one starts at that byte, so paging from 0 by `next` reads
 /// every byte exactly once.
-pub fn log_window(bytes: &[u8], from: Option<u64>) -> LogWindow {
-    let cap = usize::try_from(MAX_LOG_BYTES).unwrap_or(usize::MAX);
+pub fn log_window(bytes: &[u8], from: Option<u64>, most: LogCap) -> LogWindow {
+    let hard = usize::try_from(MAX_LOG_BYTES).unwrap_or(usize::MAX);
+    let cap = most.bytes.map_or(hard, |bytes| {
+        usize::try_from(bytes).unwrap_or(usize::MAX).clamp(1, hard)
+    });
     let len = bytes.len();
     let (start, end) = match from {
         None if len <= cap => (0, len),
@@ -100,6 +111,15 @@ pub fn log_window(bytes: &[u8], from: Option<u64>) -> LogWindow {
                     .rposition(|b| *b == b'\n')
                     .map_or_else(|| char_boundary(bytes, start, end), |i| start + i + 1)
             };
+            let end = most.lines.map_or(end, |lines| {
+                let last = usize::try_from(lines.max(1) - 1).unwrap_or(usize::MAX);
+                bytes[start..end]
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, b)| **b == b'\n')
+                    .nth(last)
+                    .map_or(end, |(i, _)| start + i + 1)
+            });
             (start, end)
         }
     };
@@ -365,7 +385,7 @@ mod tests {
     #[test]
     fn the_log_tail_keeps_whole_lines() {
         let body = format!("{}\nlast line\n", "x".repeat(MAX_LOG_BYTES as usize));
-        let tail = log_window(body.as_bytes(), None);
+        let tail = log_window(body.as_bytes(), None, LogCap::default());
         assert!(tail.truncated(), "the head was dropped");
         assert_eq!(tail.text, "last line\n", "cut on a line boundary");
         assert_eq!(tail.start, offset(body.len() - 10));
@@ -377,7 +397,7 @@ mod tests {
         let mut from = Some(0);
         let mut windows = 0;
         while let Some(at) = from {
-            let window = log_window(body, Some(at));
+            let window = log_window(body, Some(at), LogCap::default());
             assert!(window.text.len() <= usize::try_from(MAX_LOG_BYTES).unwrap());
             assert_eq!(window.start, at);
             assert_eq!(window.total_bytes, offset(body.len()));
@@ -405,17 +425,54 @@ mod tests {
         let (read, windows) = paged(body.as_bytes());
         assert_eq!(read, body.as_bytes());
         assert!(windows > 1, "the log spans several windows");
-        let first = log_window(body.as_bytes(), Some(0));
+        let first = log_window(body.as_bytes(), Some(0), LogCap::default());
         assert!(first.text.ends_with('\n'), "a window ends on a whole line");
 
-        let mid = log_window(body.as_bytes(), Some(3));
+        let mid = log_window(body.as_bytes(), Some(3), LogCap::default());
         assert_eq!(
             (mid.start, &mid.text[..3]),
             (3, "00 "),
             "an offset is served as asked"
         );
-        let past = log_window(body.as_bytes(), Some(u64::MAX));
+        let past = log_window(body.as_bytes(), Some(u64::MAX), LogCap::default());
         assert_eq!((past.text.as_str(), past.next), ("", None));
+    }
+
+    #[test]
+    fn a_line_cap_and_a_byte_cap_each_shorten_a_window() {
+        let body: String = (0..10).map(|i| format!("line {i}\n")).collect();
+        let capped =
+            |from, bytes, lines| log_window(body.as_bytes(), Some(from), LogCap { bytes, lines });
+
+        let by_lines = capped(0, None, Some(3));
+        assert_eq!(by_lines.text, "line 0\nline 1\nline 2\n");
+        assert_eq!(by_lines.next, Some(21));
+        let by_bytes = capped(21, Some(16), None);
+        assert_eq!(by_bytes.text, "line 3\nline 4\n");
+        assert_eq!(by_bytes.next, Some(35));
+        let tighter = capped(0, Some(16), Some(1));
+        assert_eq!(tighter.text, "line 0\n", "the smaller cap wins");
+        let inside_a_line = capped(0, Some(4), Some(3));
+        assert_eq!(
+            (inside_a_line.text.as_str(), inside_a_line.next),
+            ("line", Some(4))
+        );
+
+        let mut read = String::new();
+        let mut from = Some(0);
+        while let Some(at) = from {
+            let window = capped(at, Some(20), Some(2));
+            assert!(!window.text.is_empty() && window.text.lines().count() <= 2);
+            read.push_str(&window.text);
+            from = window.next;
+        }
+        assert_eq!(read, body);
+
+        for none in [capped(0, Some(0), None), capped(0, None, Some(0))] {
+            assert!(!none.text.is_empty(), "a window always moves forward");
+        }
+        let caught_up = capped(offset(body.len()), Some(16), Some(3));
+        assert_eq!((caught_up.text.as_str(), caught_up.next), ("", None));
     }
 
     #[test]

@@ -526,6 +526,27 @@ impl Client {
         self.get(&format!("/api/runs/{}/log", encode(run_id))).await
     }
 
+    /// The window of a run's log starting at byte `from`, within `lines` lines and `bytes` bytes
+    /// where given.
+    pub async fn run_log_from<T: DeserializeOwned>(
+        &self,
+        run_id: &str,
+        from: u64,
+        lines: Option<usize>,
+        bytes: Option<usize>,
+    ) -> Result<T> {
+        let mut query = Query::new();
+        query.push("from", Some(&from.to_string()));
+        query.push("lines", lines.map(|n| n.to_string()).as_deref());
+        query.push("bytes", bytes.map(|n| n.to_string()).as_deref());
+        self.get(&format!(
+            "/api/runs/{}/log{}",
+            encode(run_id),
+            query.finish()
+        ))
+        .await
+    }
+
     pub async fn run_files<T: DeserializeOwned>(&self, run_id: &str) -> Result<T> {
         self.get(&format!("/api/runs/{}/files", encode(run_id)))
             .await
