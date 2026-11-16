@@ -449,7 +449,9 @@ mod tests {
         let state = crate::api::state::ApiState::new(
             db.clone(),
             crate::daemon::overrides::QueueOverrideSink::new(
-                Arc::new(crate::daemon::overrides::OverrideStore::new()),
+                Arc::new(crate::daemon::overrides::OverrideStore::new(
+                    db.pool().clone(),
+                )),
                 crate::daemon::queue::WorkQueue::new(),
             ),
             crate::daemon::queue::WorkQueue::new(),
