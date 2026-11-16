@@ -47,6 +47,14 @@ type ViewNode =
         series: { label: string; tone?: Tone; points: [number, number][] }[];
       };
     }
+  | {
+      /** Quantities flowing between stages, drawn as ribbons: a Sankey diagram. */
+      flow: {
+        nodes: { id: string; label: string; tone?: Tone }[];
+        /** `value` is greater than zero, and no ribbon leads back to an earlier stage. */
+        links: { from: string; to: string; value: number; tone?: Tone }[];
+      };
+    }
   | { grid: { columns: string[]; rows: ViewCell[][] } }
   | {
       table: {

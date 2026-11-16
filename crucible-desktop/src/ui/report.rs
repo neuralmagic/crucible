@@ -1,6 +1,7 @@
 //! The Report tab: the view a pack's plugin built from the run's captured files.
 
 mod canvas;
+mod flow;
 
 use std::borrow::Cow;
 
@@ -61,8 +62,12 @@ fn node(node_: &Node, fills: bool, app: &App, p: &Paint) -> El {
             if fills {
                 stack = stack.grow(1.0).min_h(0.0);
             }
-            for child in children {
-                stack = stack.child(node(child, fills, app, p));
+            for (i, child) in children.iter().enumerate() {
+                let drawn = node(child, fills, app, p);
+                stack = stack.child(match child {
+                    Node::Tabs { .. } | Node::Table { .. } => drawn,
+                    _ => drawn.key(format!("report-part-{i}")),
+                });
             }
             stack
         }
@@ -70,6 +75,17 @@ fn node(node_: &Node, fills: bool, app: &App, p: &Paint) -> El {
         Node::Stats { items } => stats(items, p),
         Node::Bars { bars: all } => bars(all, p),
         Node::Plot { kind, x, y, series } => plot(*kind, x, y, series, p),
+        Node::Flow { nodes, links } => match flow::drawing(nodes, links) {
+            Some((height, commands)) => col()
+                .w_full()
+                .max_w(720.0)
+                .padding(12.0)
+                .radius(p.k.radius.lg)
+                .fill(p.c.layer_01)
+                .border(p.hair, p.c.border_muted)
+                .child(canvas::canvas_view(flow::WIDTH, height, &commands, p)),
+            None => el(),
+        },
         Node::Canvas {
             width,
             height,

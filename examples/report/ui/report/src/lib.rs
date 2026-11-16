@@ -3,8 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crucible_view::{
-    Bar, Cell, Column, ColumnKind, Context2d, LineCap, Node, PlotKind, Request, Row, Segment,
-    Series, Stat, Tab, TextAlign, Tone, View, Width,
+    Bar, Cell, Column, ColumnKind, Context2d, FlowLink, FlowNode, LineCap, Node, PlotKind, Request,
+    Row, Segment, Series, Stat, Tab, TextAlign, Tone, View, Width,
 };
 use serde::Deserialize;
 
@@ -199,7 +199,11 @@ fn report(request: Request) -> Result<View, String> {
             label: "Charts".into(),
             count: None,
             body: Node::Stack {
-                children: vec![across_releases(&tickets), age_by_score(&tickets)],
+                children: vec![
+                    across_releases(&tickets),
+                    age_by_score(&tickets),
+                    how_decided(&tickets),
+                ],
             },
         },
         Tab {
@@ -298,6 +302,66 @@ fn across_releases(tickets: &[Ticket]) -> Node {
                         Some([release.parse().ok()?, count as f64])
                     })
                     .collect(),
+            })
+            .collect(),
+    }
+}
+
+/// Tickets flowing from the lane that triaged them, through what the decision rested on, to
+/// their category.
+fn how_decided(tickets: &[Ticket]) -> Node {
+    let mut nodes: Vec<FlowNode> = Vec::new();
+    let mut links: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut stage = |id: String, label: &str, tone: Tone| {
+        if !nodes.iter().any(|node| node.id == id) {
+            nodes.push(FlowNode {
+                id: id.clone(),
+                label: label.into(),
+                tone,
+            });
+        }
+        id
+    };
+    let mut flows = Vec::new();
+    for ticket in tickets {
+        let basis = match ticket.verdict.proposed_actions.lane.as_str() {
+            "" => "unknown",
+            basis => basis,
+        };
+        flows.push((
+            stage(
+                format!("lane:{}", ticket.source),
+                &ticket.source,
+                Tone::Muted,
+            ),
+            stage(format!("basis:{basis}"), basis, Tone::Neutral),
+            ticket.category,
+        ));
+    }
+    for category in Category::ALL {
+        if flows.iter().any(|(.., reached)| *reached == category) {
+            stage(
+                format!("category:{}", category.label()),
+                category.label(),
+                category.tone(),
+            );
+        }
+    }
+    for (lane, basis, category) in flows {
+        *links.entry((lane, basis.clone())).or_default() += 1;
+        *links
+            .entry((basis, format!("category:{}", category.label())))
+            .or_default() += 1;
+    }
+    Node::Flow {
+        nodes,
+        links: links
+            .into_iter()
+            .map(|((from, to), count)| FlowLink {
+                from,
+                to,
+                value: count as f64,
+                tone: None,
             })
             .collect(),
     }

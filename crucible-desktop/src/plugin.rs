@@ -641,10 +641,33 @@ mod tests {
                 series: marks,
                 ..
             },
+            Node::Flow { nodes, links },
         ] = charts.as_slice()
         else {
-            panic!("Charts is a line plot over a scatter plot");
+            panic!("Charts is a line plot, a scatter plot and a flow");
         };
+        let columns = crucible_view::flow_columns(nodes, links).unwrap();
+        let reaching = |column: usize| -> f64 {
+            links
+                .iter()
+                .filter(|link| {
+                    nodes
+                        .iter()
+                        .zip(&columns)
+                        .any(|(node, at)| node.id == link.to && *at == column)
+                })
+                .map(|link| link.value)
+                .sum()
+        };
+        assert_eq!(columns.iter().max(), Some(&2));
+        assert_eq!((reaching(1), reaching(2)), (64.0, 64.0));
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|node| node.id.starts_with("lane:"))
+                .count(),
+            2
+        );
         assert!(lines.iter().all(|series| series.points.len() == 3));
         let lined: f64 = lines.iter().flat_map(|s| &s.points).map(|p| p[1]).sum();
         assert_eq!(lined, 64.0);

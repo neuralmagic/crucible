@@ -398,6 +398,7 @@ impl Shown {
             Node::Stats { .. }
             | Node::Bars { .. }
             | Node::Plot { .. }
+            | Node::Flow { .. }
             | Node::Canvas { .. }
             | Node::Grid { .. }
             | Node::Text { .. } => None,
@@ -558,6 +559,7 @@ mod tests {
             Node::Stats { .. } => "stats",
             Node::Bars { .. } => "bars",
             Node::Plot { .. } => "plot",
+            Node::Flow { .. } => "flow",
             Node::Canvas { .. } => "canvas",
             Node::Grid { .. } => "grid",
             Node::Table { .. } => "table",
@@ -583,7 +585,7 @@ mod tests {
         assert_eq!(
             names.into_iter().collect::<Vec<_>>(),
             [
-                "bars", "canvas", "grid", "plot", "stack", "stats", "table", "tabs", "text"
+                "bars", "canvas", "flow", "grid", "plot", "stack", "stats", "table", "tabs", "text"
             ],
             "every component has an example"
         );

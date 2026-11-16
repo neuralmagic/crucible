@@ -117,6 +117,39 @@ A series is coloured by its tone, and there are six tones, so two series with on
 same. Past five or six series, split the chart or use a table. At most 1,000 segments in one
 set of bars and 20,000 points in one plot.
 
+`flow` is quantities moving between stages, drawn as ribbons: a Sankey diagram. Use it to show
+how a total splits and where each part ended up. A node is a stage and a link is a ribbon as
+wide as its `value`. The app puts a stage with nothing flowing into it in the first column and
+every other stage one column past the furthest stage that flows into it; stages in a column
+are stacked in the order given. A ribbon takes the tone of the stage it reaches unless it has
+its own.
+
+```json
+{"flow": {
+  "nodes": [
+    {"id": "go", "label": "Go", "tone": "muted"},
+    {"id": "python", "label": "Python", "tone": "muted"},
+    {"id": "reachability", "label": "reachability"},
+    {"id": "scope", "label": "scope"},
+    {"id": "affected", "label": "affected", "tone": "bad"},
+    {"id": "cleared", "label": "not affected", "tone": "good"}
+  ],
+  "links": [
+    {"from": "go", "to": "reachability", "value": 22},
+    {"from": "go", "to": "scope", "value": 12},
+    {"from": "python", "to": "reachability", "value": 18},
+    {"from": "python", "to": "scope", "value": 12},
+    {"from": "reachability", "to": "affected", "value": 8},
+    {"from": "reachability", "to": "cleared", "value": 32},
+    {"from": "scope", "to": "cleared", "value": 24}
+  ]
+}}
+```
+
+A node `id` is unique in its flow, a link names two of them, a `value` is greater than zero,
+and no chain of links leads back to a stage it left. At most 60 stages and 400 links. Keep
+labels short: the first and last columns have about 120 points for theirs.
+
 ## Canvas
 
 `canvas` is free drawing with the commands of the HTML canvas's 2D context, under the same

@@ -9,10 +9,12 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 mod canvas;
+mod flow;
 #[cfg(target_arch = "wasm32")]
 pub mod guest;
 
 pub use crate::canvas::{Context2d, Draw, LineCap, NotAStyle, Style, TextAlign};
+pub use crate::flow::{FlowLink, FlowNode, flow_columns};
 
 /// The export that reserves `len` bytes in the plugin's memory and returns their address.
 pub const ALLOC: &str = "crucible_alloc";
@@ -71,6 +73,11 @@ pub enum Node {
         /// What the vertical axis measures.
         y: String,
         series: Vec<Series>,
+    },
+    /// Quantities flowing between stages, drawn as ribbons: a Sankey diagram.
+    Flow {
+        nodes: Vec<FlowNode>,
+        links: Vec<FlowLink>,
     },
     /// Free drawing, built with [`Context2d`].
     Canvas {
@@ -242,6 +249,9 @@ pub struct Limits {
     pub segments: usize,
     /// Points across one plot.
     pub points: usize,
+    /// Stages and ribbons in one flow.
+    pub flow_nodes: usize,
+    pub flow_links: usize,
     /// Commands in one canvas.
     pub commands: usize,
     /// The longest side of a canvas, in points.
@@ -256,6 +266,8 @@ impl Limits {
         grid_cells: 600,
         segments: 1_000,
         points: 20_000,
+        flow_nodes: 60,
+        flow_links: 400,
         commands: 20_000,
         canvas_side: 4_000,
     };
@@ -275,6 +287,18 @@ pub enum Problem {
     Segments(usize),
     #[error("the bar segment {0} is negative or not a number")]
     Value(String),
+    #[error("a flow holds more than {0} stages")]
+    FlowNodes(usize),
+    #[error("a flow holds more than {0} ribbons")]
+    FlowLinks(usize),
+    #[error("a flow has two stages named {0}")]
+    FlowDuplicate(String),
+    #[error("a flow's ribbon names the stage {0}, which it does not have")]
+    FlowUnknown(String),
+    #[error("the ribbon from {0} to {1} has a value that is not greater than zero")]
+    FlowValue(String, String),
+    #[error("a flow's ribbons lead back to a stage they came from")]
+    FlowCycle,
     #[error("a canvas is not between 1 and {0} points on each side")]
     CanvasSize(u16),
     #[error("a canvas holds more than {0} commands")]
@@ -373,6 +397,15 @@ impl Node {
                     Some(segment) => Err(Problem::Value(segment.label.clone())),
                     None => Ok(0),
                 }
+            }
+            Node::Flow { nodes, links } => {
+                if nodes.len() > limits.flow_nodes {
+                    return Err(Problem::FlowNodes(limits.flow_nodes));
+                }
+                if links.len() > limits.flow_links {
+                    return Err(Problem::FlowLinks(limits.flow_links));
+                }
+                flow_columns(nodes, links).map(|_| 0)
             }
             Node::Canvas {
                 width,
@@ -691,6 +724,8 @@ mod tests {
             points: 2,
             commands: 2,
             canvas_side: 10,
+            flow_nodes: 2,
+            flow_links: 2,
         };
         let deep = Node::Stack {
             children: vec![Node::Stack {
