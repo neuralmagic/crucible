@@ -1,0 +1,29 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-LOOP-SURFACE"
+title = "Declaring a loop"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+A playbook source MAY declare a loop by calling loop(body, again, rounds) and listing the value it returns in the tasks of workflow().
+
+```python
+turn = agent(name = "turn", prompt = prompt_file("turn.md"), session = "work", emits = ["summary"])
+score = command(name = "score", run = "./score.sh", depends_on = [turn],
+                emits = {"go": "boolean", "points": "integer"})
+final = command(name = "final", run = "./final.sh", depends_on = [score])
+
+workflow(type = "playbook", tasks = [
+    loop(body = [turn, score], again = score.go, rounds = 60),
+    final,
+])
+```
+
+body is a list of tasks. again is the condition: a reference to a field that one body task declares in its emits under [[RFC-0001:C-WORKFLOW]]. A bare reference names a field typed boolean and holds when the field is true. A reference followed by any_of(...) names a field typed as a list of labels and holds when the field is one of the labels listed. The body task whose field the condition reads is the deciding task. rounds is the most rounds the loop may run, the first included, and has no default.
+
+The compiler MUST reject a loop whose body is empty or names one task twice. It MUST reject an again that is absent, that is not a field reference, that names a task outside the body, that names a field the task does not declare, that names a field typed as anything other than boolean or a list of labels, that lists a label the field does not declare, or that uses otherwise(). It MUST reject a rounds that is absent or outside 1 to 256 inclusive. The upper bound is the engine's, and a source MUST NOT be able to raise it. The compiler MUST reject any other argument to loop().
+
+Listing a loop in tasks lists its body's tasks, and each keeps the name the source gave it. The compiler MUST reject a task listed both through a loop and on its own, and MUST reject a loop that the source constructs and does not list. The engine MUST reject a loop in every workflow type other than "playbook"."""

@@ -1,0 +1,21 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-LOOP-ROUNDS"
+title = "Running rounds"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+The engine MUST NOT dispatch a loop's first round until every dependency outside the body of every body task has settled, and MUST NOT dispatch a task outside the body that depends on a body task until every body task has settled under its own name. Where any body task cannot run on the substrate, the engine MUST dispatch the body's tasks once as tasks outside any loop and MUST settle each one that cannot run as [[RFC-0002:C-PLAYBOOK-CAPS]] requires.
+
+A round dispatches the body's tasks one at a time in dependency order, each under its own join and when against this round's results for the body and the settled results outside it. A body task whose join those results do not satisfy MUST settle blocked for that round, and one whose when excludes it MUST settle not taken for that round, as any task would. A retry of a transport failure belongs to the round its first attempt was in.
+
+The condition is checked after a round, never before the first. Once a round has settled, the engine MUST begin another round when all four of these hold, and MUST NOT begin one when any of them does not. First, the deciding task settled passing in that round and the field in its output satisfies the condition. Second, every other body task settled passing or not taken in that round. Third, fewer than rounds rounds have run. Fourth, no ceiling is exhausted under [[RFC-0007:C-LOOP-BUDGET]] and dispatch has not stopped for any other reason.
+
+A loop that ends because its rounds are spent while the condition still holds is not a failure. The engine MUST NOT change a body task's status, the run's verdict, or the shutdown outcome on that ground. An early completion the engine accepts from a body task under [[RFC-0002:C-PLAYBOOK-LANE]] MUST end the loop with that round.
+
+Every round settles its work as any task does. A body task's workspace changes MUST be committed to the run's git memory when its round settles passing and MUST be discarded otherwise, as [[RFC-0002:C-PLAYBOOK-LANE]] requires, so a later round runs on top of every earlier passing round. A round's captured file set MUST replace the set its task published in an earlier round under the rules of [[RFC-0002:C-TASK-FILES]] and [[RFC-0002:C-SETTLED-JOIN]]. A body task that declares a session MUST resume that session in every round.
+
+Once the loop has ended, each body task settles as its last round did, and a dependent of a body task MUST read that round's output and captured files."""
