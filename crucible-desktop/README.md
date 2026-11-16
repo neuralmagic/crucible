@@ -95,6 +95,9 @@ controller's `/auth/native` page, you sign in and approve, and the controller ha
 browser cannot reach, paste a `crk_` key instead. Keys can be revoked in the controller's Settings
 like any other key.
 
+Browser sign-in needs a profile URL that serves `/auth/native` and `/auth/native/token`.
+An API-only hostname exposing `/api` and `/mcp` needs a pasted key instead.
+
 Settings' `Keys in keychain` switch (`keychain = true` in the config) keeps those keys in the
 system credential store instead: the macOS Keychain, or the Secret Service on Linux, under the
 service `crucible-playbooks` and the profile's name. Turning it on or off moves the keys kept so
