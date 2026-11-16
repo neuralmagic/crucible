@@ -29,11 +29,9 @@ async fn metrics_handler(
             body,
         )
             .into_response(),
-        Err(e) => (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            format!("gathering metrics failed: {e:#}\n"),
-        )
-            .into_response(),
+        Err(e) => {
+            crate::api::state::ApiError::Internal(e.context("gathering metrics")).into_response()
+        }
     }
 }
 
