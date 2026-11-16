@@ -84,11 +84,11 @@ pub use core::{WorkKind, WorkPodState};
 pub use dispatcher::{PodDispatcher, TerminalState, TurnPhase};
 pub(crate) use gateway::GatewaySweep;
 pub use kube_dispatcher::KubePodDispatcher;
-pub(crate) use run::dispatch_run;
 pub use run::{
     LaunchSecrets, RunAdmission, RunDisposition, RunDocs, RunRenderOpts, collect_run_pod,
     render_run_docs, run_pod_name, stamp_run_pod,
 };
 #[cfg(feature = "autoresearch")]
 pub use run::{ScopeOutcome, dispatch_scope};
+pub(crate) use run::{dispatch_run, teardown_run_gateway};
 pub use sweep::reconcile_on_startup;

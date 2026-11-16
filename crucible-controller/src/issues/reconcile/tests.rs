@@ -8182,8 +8182,11 @@ impl crate::runs::workpod::PodDispatcher for ClusterRunPodDispatcher {
             message: self.message.clone(),
         })
     }
-    async fn logs(&self, cluster: &str, _ns: &str, _name: &str) -> Result<String> {
+    async fn logs(&self, cluster: &str, _ns: &str, name: &str) -> Result<String> {
         self.reachable(cluster)?;
+        if self.deleted().iter().any(|(_, pod)| pod == name) {
+            return Err(Self::not_found());
+        }
         Ok(self.logs.clone())
     }
     async fn delete(&self, cluster: &str, _ns: &str, name: &str) -> Result<()> {
@@ -8460,10 +8463,10 @@ async fn a_cancel_parks_the_launch_deletes_its_pod_and_marks_the_run_cancelled(
         std::time::Duration::from_secs(5 * 60),
     )
     .await?;
-    let dispatcher = std::sync::Arc::new(ClusterRunPodDispatcher::on(
-        "pirate",
-        crate::runs::workpod::TurnPhase::TimedOut,
-    ));
+    let dispatcher = std::sync::Arc::new(ClusterRunPodDispatcher {
+        logs: "gateway_boot: ok\nsetup: cloning vllm\n".to_string(),
+        ..ClusterRunPodDispatcher::on("pirate", crate::runs::workpod::TurnPhase::TimedOut)
+    });
     let mut cfg = cfg_with(dir.path(), Profile::default());
     cfg.runtime.dispatcher = dispatcher.clone();
 
@@ -8495,6 +8498,13 @@ async fn a_cancel_parks_the_launch_deletes_its_pod_and_marks_the_run_cancelled(
         dispatcher.deleted(),
         vec![("pirate".to_string(), pod.to_string())],
         "the pod is deleted on the spoke it runs on"
+    );
+    assert_eq!(
+        crate::runs::blob_store::get_run_engine_log(db.pool(), "run-cancel-1")
+            .await?
+            .as_deref(),
+        Some("gateway_boot: ok\nsetup: cloning vllm\n"),
+        "the pod's log is read before the pod is deleted"
     );
     let row = work_pod(&db, pod).await?;
     assert_eq!(row.state, crate::runs::workpod::WorkPodState::Collected);
