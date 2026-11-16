@@ -8,7 +8,7 @@
 //!                   ▼
 //!  browser ◀── approval page ── POST /auth/native (pending id from the session)
 //!                   ▼
-//!  browser ──303──▶ http://127.0.0.1:<port>/callback?code&state ──▶ app
+//!  browser ──return page──▶ http://127.0.0.1:<port>/callback?code&state ──▶ app
 //!  app ──POST /auth/native/token {code, code_verifier, redirect_uri}──▶ {key, id, name, expires_at}
 //! ```
 //!
@@ -125,7 +125,17 @@ fn back_to_app(redirect: &str, params: &[(&str, &str)]) -> Response {
     match Url::parse(redirect) {
         Ok(mut url) => {
             url.query_pairs_mut().extend_pairs(params);
-            Redirect::to(url.as_str()).into_response()
+            let target = escape(url.as_str());
+            // Browsers enforce the approval form's form-action policy across HTTP redirects.
+            form_page(
+                StatusCode::OK,
+                "Return to the app",
+                &format!(
+                    "<meta http-equiv=\"refresh\" content=\"0;url={target}\">\
+                     <p>Returning to the app on this computer. If it does not open, \
+                     <a href=\"{target}\">continue to the app</a>.</p>"
+                ),
+            )
         }
         Err(_) => refused("the app's callback is not a URL"),
     }
@@ -194,8 +204,7 @@ pub struct Decision {
     decision: String,
 }
 
-/// `POST /auth/native`: the person's answer. Approval records a one-minute code and sends the
-/// browser back to the app with it.
+/// Approval records a one-minute code and returns a page that navigates back to the app.
 pub async fn decide(
     State(pool): State<sqlx::PgPool>,
     session: Session,
@@ -330,7 +339,48 @@ pub async fn redeem(State(pool): State<sqlx::PgPool>, Json(body): Json<Redeem>) 
 
 #[cfg(test)]
 mod tests {
-    use crate::identity::native_sign_in::{NativeQuery, validate};
+    use axum::http::{StatusCode, header};
+
+    use crate::identity::native_sign_in::{NativeQuery, back_to_app, validate};
+
+    #[tokio::test]
+    async fn approval_returns_to_the_app_without_a_cross_origin_form_redirect() {
+        let response = back_to_app(
+            "http://127.0.0.1:53111/callback",
+            &[("code", "one-use-code"), ("state", "s1")],
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key(header::LOCATION));
+        assert!(
+            response.headers()[header::CONTENT_SECURITY_POLICY]
+                .to_str()
+                .unwrap()
+                .contains("form-action 'self'")
+        );
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        let callback = "http://127.0.0.1:53111/callback?code=one-use-code&amp;state=s1";
+        assert!(html.contains(&format!("content=\"0;url={callback}\"")));
+        assert!(html.contains(&format!("href=\"{callback}\"")));
+    }
+
+    #[tokio::test]
+    async fn denial_returns_to_the_app_with_the_original_state() {
+        let response = back_to_app(
+            "http://127.0.0.1:53111/callback",
+            &[("error", "access_denied"), ("state", "s+1")],
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("error=access_denied&amp;state=s%2B1"));
+        assert!(!html.contains("code="));
+    }
 
     const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
 
