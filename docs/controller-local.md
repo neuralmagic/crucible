@@ -1,6 +1,9 @@
 # Running the controller locally
 
 The controller can run on a laptop without an identity provider, Vault, or a cluster.
+The installed Playbooks app includes the controller and engine and starts them automatically
+for a local profile. It does not need a source checkout or build tools. The commands below are
+for running a development controller from source.
 Playbook launches run as `crucible plan run` subprocesses on the same machine. If the agent
 turns of a pack need an OpenShell sandbox, the engine starts one on the podman of the host.
 

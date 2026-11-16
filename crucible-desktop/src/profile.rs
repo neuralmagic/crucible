@@ -18,7 +18,7 @@
 //! shell = "/bin/bash"                    # what runs it, `-l -c`; `$SHELL` when unset
 //!
 //! [profiles.local]
-//! url = "http://127.0.0.1:8870"         # starts `just controller-local 8870` in the repo
+//! url = "http://127.0.0.1:8870"         # starts the bundled local controller
 //! ```
 //!
 //! macOS cannot tie a child's life to its parent's, so a tunnel runs under the app's own binary
@@ -43,7 +43,7 @@ use crate::keys::Store;
 
 /// How long a tunnel has to start answering.
 const TUNNEL_WAIT: Duration = Duration::from_secs(60);
-/// How long the local controller has to build and bind.
+/// The first start may need to download and initialize Postgres.
 const LOCAL_WAIT: Duration = Duration::from_mins(15);
 const PROBE: Duration = Duration::from_millis(800);
 /// How often a kept command is looked at.
@@ -344,7 +344,7 @@ impl Target {
     }
 
     /// The command this profile keeps running, and how long it has to answer: its tunnel, or for
-    /// a profile on this machine with none, the local controller from `repo`.
+    /// a profile on this machine with none, the bundled local controller.
     fn kept(&self) -> Option<(String, Duration, &'static str)> {
         if cfg!(target_arch = "wasm32") {
             return None;
@@ -361,9 +361,9 @@ impl Target {
             .filter(|_| self.profile.loopback())?
             .port_or_known_default()?;
         Some((
-            format!("just controller-local {port}"),
+            format!("exec \"$CRUCIBLE_PLAYBOOKS_EXECUTABLE\" --local-controller {port}"),
             LOCAL_WAIT,
-            "Building and starting the local controller",
+            "Starting the local controller",
         ))
     }
 
@@ -392,7 +392,11 @@ impl Target {
             target: self.clone(),
             command,
             shell: self.profile.shell.as_deref().map(|s| s.trim().to_string()),
-            dir: repo.to_path_buf(),
+            dir: if self.profile.tunnel.is_some() {
+                repo.to_path_buf()
+            } else {
+                std::env::temp_dir()
+            },
             addr,
             wait,
             what,
@@ -680,7 +684,9 @@ impl Kept {
 
 /// The app itself as a supervisor: `crucible-playbooks --keep`, the command in [`KEEP`].
 pub fn supervisor() -> std::io::Result<Command> {
-    let mut command = Command::new(std::env::current_exe()?);
+    let exe = std::env::current_exe()?;
+    let mut command = Command::new(&exe);
+    command.env("CRUCIBLE_PLAYBOOKS_EXECUTABLE", exe);
     command.arg(KEEP_FLAG);
     Ok(command)
 }
@@ -1264,7 +1270,7 @@ url = "https://crucible.ext.wdc.example.com"
         );
         assert_eq!(
             local.kept().map(|k| k.0),
-            Some("just controller-local 8870".to_string())
+            Some("exec \"$CRUCIBLE_PLAYBOOKS_EXECUTABLE\" --local-controller 8870".to_string())
         );
         assert!(profile("http://localhost:9000").loopback());
         assert!(profile("http://[::1]:9000").loopback());
