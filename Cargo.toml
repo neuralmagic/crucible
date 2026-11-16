@@ -46,10 +46,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 uuid = { version = "1", features = ["v7"] }
 # The OpenShell gateway's native gRPC clients + auth interceptor — one pin for every crate that
 # talks to the gateway (engine + broker), so the two can never link different protos.
-openshell-core = { git = "https://github.com/wseaton/OpenShell.git", rev = "a895315d0e9f551ffbf3f5b4f129ea29744a3688", default-features = false }
+openshell-core = { git = "https://github.com/wseaton/OpenShell.git", rev = "ae753f2ec44a926d62a1437acbce5c497b98ef56", default-features = false }
 # Same rev as openshell-core: the sandbox filesystem defaults (/dev/null, /usr, /etc ...) live here,
 # and crucible extends them rather than restating them.
-openshell-policy = { git = "https://github.com/wseaton/OpenShell.git", rev = "a895315d0e9f551ffbf3f5b4f129ea29744a3688", default-features = false }
+openshell-policy = { git = "https://github.com/wseaton/OpenShell.git", rev = "ae753f2ec44a926d62a1437acbce5c497b98ef56", default-features = false }
 tonic = { version = "0.14", features = ["channel", "tls-native-roots", "tls-ring"] }
 thiserror = "2"
 # One rmcp pin for every MCP server and client in the tree; members add features.
