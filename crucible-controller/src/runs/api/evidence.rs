@@ -200,6 +200,10 @@ pub struct RunLogQuery {
     /// Byte offset to start at, as a previous response's `next` gave it, or 0 for the first
     /// window. Omit for the tail.
     pub from: Option<u64>,
+    /// Most lines to return, with `from`.
+    pub lines: Option<u64>,
+    /// Most bytes to return.
+    pub bytes: Option<u64>,
 }
 
 /// `GET /api/runs/{run_id}/log` — a run's engine output: the supervised subprocess for a local run,
@@ -246,7 +250,11 @@ pub(crate) async fn get_run_log(
         crate::runs::model::RunDispatch::Pod => pod_run_log(&state, &run, &run_id).await,
     };
     let source = log.as_ref().map(|(_, source)| *source);
-    let window = log.map(|(bytes, _)| task_evidence::log_window(&bytes, query.from));
+    let most = task_evidence::LogCap {
+        bytes: query.bytes,
+        lines: query.lines,
+    };
+    let window = log.map(|(bytes, _)| task_evidence::log_window(&bytes, query.from, most));
     Ok(Json(RunLogDto {
         run_id,
         dispatch,

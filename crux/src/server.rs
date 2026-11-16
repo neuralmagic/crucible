@@ -126,8 +126,9 @@ impl CrucibleMcp {
     #[tool(
         description = "One window of a run's engine output, resumable by cursor. A running pod is \
         read live; once it finishes its ingested session is served, which is the only copy that \
-        outlives the pod. Returns at most 200 lines and reports the cursor to resume from, so \
-        read it in windows rather than expecting the whole log."
+        outlives the pod. Returns at most 200 lines and always reports the cursor to resume from, \
+        so read it in windows rather than expecting the whole log, and poll a running run with \
+        the cursor the last window gave."
     )]
     async fn crucible_run_log(&self, Parameters(a): Parameters<RunLog>) -> String {
         self.run(&a).await
