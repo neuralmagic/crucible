@@ -15,7 +15,9 @@ use crate::ops::issues::{
     Adopt, ApprovalDetail, Approvals, Approve, Bump, Contracts, Issue, Issues, Park, Reconcile,
     Redispatch, Turn, Turns, Unpark,
 };
-use crate::ops::launches::{Schedules, Watch, Watches, Webhook, WebhookDeliveries, Webhooks};
+use crate::ops::launches::{
+    ScheduleFire, ScheduleTestFire, Schedules, Watch, Watches, Webhook, WebhookDeliveries, Webhooks,
+};
 use crate::ops::playbooks::{
     Launch, PlaybookCaps, PlaybookImport, PlaybookRun, PlaybookRuns, PlaybookSchema, Playbooks,
 };
@@ -411,6 +413,28 @@ impl CrucibleMcp {
     }
 
     #[tool(
+        description = "Fire a schedule now instead of at its next window. A real firing: the run \
+        gets the stored cursor and advances it. Refused while the schedule is disabled or a \
+        launch that may still advance its cursor is in flight."
+    )]
+    async fn crucible_schedule_fire(&self, Parameters(a): Parameters<ScheduleFire>) -> String {
+        self.run(&a).await
+    }
+
+    #[tool(
+        description = "Launch a schedule once without moving it: the run gets the stored cursor, \
+        the cursor given here, or none, and never writes it back. Works on a disabled schedule. \
+        Costs money against the schedule's max_cost. Returns the issue key to watch it by with \
+        crucible_playbook_run."
+    )]
+    async fn crucible_schedule_test_fire(
+        &self,
+        Parameters(a): Parameters<ScheduleTestFire>,
+    ) -> String {
+        self.run(&a).await
+    }
+
+    #[tool(
         description = "Tracker watches: ID PLAYBOOK TRACKER QUERY STATE SWEPT LAUNCHED FAILS OWNER. \
         A watch launches its playbook once per item its query matches, never again for the same \
         item."
@@ -502,7 +526,7 @@ mod tests {
             .into_iter()
             .map(|t| t.name.to_string())
             .collect();
-        assert_eq!(names.len(), 48, "tools: {names:?}");
+        assert_eq!(names.len(), 50, "tools: {names:?}");
         for required in [
             "crucible_issues",
             "crucible_draft_delete",
@@ -549,6 +573,8 @@ mod tests {
             "crucible_runs",
             "crucible_run",
             "crucible_schedules",
+            "crucible_schedule_fire",
+            "crucible_schedule_test_fire",
             "crucible_whoami",
         ] {
             assert!(

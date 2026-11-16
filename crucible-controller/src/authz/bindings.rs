@@ -648,6 +648,20 @@ pub static BINDINGS: &[Binding] = &[
         V::Delete,
         Route,
     ),
+    bind(
+        "POST",
+        "/api/schedules/{id}/fire",
+        R::StandingLaunch,
+        V::Launch,
+        Route,
+    ),
+    bind(
+        "POST",
+        "/api/schedules/{id}/test-fire",
+        R::StandingLaunch,
+        V::Launch,
+        Route,
+    ),
     bind("GET", "/api/watches", R::StandingLaunch, V::Read, Route),
     bind("POST", "/api/watches", R::StandingLaunch, V::Create, Route),
     bind(
