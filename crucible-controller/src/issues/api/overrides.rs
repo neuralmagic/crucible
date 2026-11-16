@@ -107,16 +107,21 @@ async fn submit_override(
     responses(
         (status = 202, description = "Park override enqueued", body = OverrideAck),
         (status = 303, description = "Park override enqueued (form POST, redirects to /inbox)"),
-        (status = 403, description = "Caller is not an operator", body = ErrorBody)
+        (status = 403, description = "Caller is neither an operator nor allowed to update the launch", body = ErrorBody),
+        (status = 404, description = "A playbook launch the caller may not read", body = ErrorBody)
     )
 )]
 pub(crate) async fn park_issue(
     State(state): State<ApiState>,
     Path(key): Path<String>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     identity: crate::identity::session::Identity,
-    _operator: crate::authz::guard::OperatorGuard,
+    caller: crate::authz::Caller,
     body: AnyBody<ParkBody>,
 ) -> ApiResult<Response> {
+    if let Some(refusal) = refuse_park(&state, &caller, &key, uri.path()).await? {
+        return Ok(refusal);
+    }
     submit_override(
         &state,
         Override {
@@ -131,6 +136,43 @@ pub(crate) async fn park_issue(
         body.origin,
     )
     .await
+}
+
+/// The refusal for a caller who may not park `key`, `None` for one who may: a platform operator
+/// parks any issue, and whoever may update a playbook launch parks that launch.
+async fn refuse_park(
+    state: &ApiState,
+    caller: &crate::authz::Caller,
+    key: &str,
+    path: &str,
+) -> ApiResult<Option<Response>> {
+    use crate::authz::action::{Action, ResourceType, Verb};
+    use crate::launches::api::playbook_runs::LaunchUpdate;
+
+    let platform = crate::authz::decision::Resource::platform(ResourceType::Issue, path);
+    if crate::authz::guard::is_operator(caller)
+        && crate::authz::owner::may(state, caller, Verb::Update, &platform)
+    {
+        return Ok(None);
+    }
+    Ok(
+        match crate::launches::api::playbook_runs::decide_launch_update(state, caller, key).await? {
+            LaunchUpdate::Allowed => None,
+            LaunchUpdate::Refused(refusal) => Some(refusal.into_response()),
+            LaunchUpdate::NoLaunch => {
+                let curate = Action {
+                    resource: ResourceType::Issue,
+                    verb: Verb::Update,
+                };
+                Some(
+                    match crate::authz::owner::decide(state, caller, curate, &platform).await {
+                        Err(denied) => denied.into_response(),
+                        Ok(_) => crate::authz::guard::not_operator(caller),
+                    },
+                )
+            }
+        },
+    )
 }
 
 #[derive(Debug, Deserialize, Default, ToSchema)]

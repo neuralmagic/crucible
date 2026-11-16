@@ -7849,6 +7849,93 @@ async fn a_launch_is_cancelled_by_its_owner_or_an_administrator_and_no_one_else(
     Ok(())
 }
 
+/// Parking a playbook launch admits whoever may cancel it, and a platform operator as for any
+/// issue. Anyone else does not learn the launch is there, and an issue that is not a launch
+/// stays operator-only.
+#[cfg(feature = "autoresearch")]
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_launch_is_parked_by_its_owner_or_an_operator_and_no_one_else(
+    pool: PgPool,
+) -> Result<()> {
+    let (db, dir) = db_with(pool);
+    let sink = test_sink(&db);
+    let app = app_with_sink(
+        db.clone(),
+        sink.clone(),
+        vec!["wren".to_string()],
+        vec!["olive".to_string()],
+    );
+    register_survey(&app, dir.path(), LAUNCH_WORKFLOW).await;
+    let (status, ack) = post_launch(
+        &app,
+        "survey",
+        serde_json::json!({"params": {"topic": "t", "depth": "deep"}, "max_cost": 1.0, "max_time": "30m"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{ack}");
+    let key = ack["key"].as_str().expect("key").to_string();
+    sqlx::query(
+        "UPDATE playbook_launches SET created_by = 'alice', owner = 'user:alice' WHERE key = $1",
+    )
+    .bind(&key)
+    .execute(db.pool())
+    .await?;
+    let park = format!("/api/issues/{}/park", urlencoding_encode(&key));
+    let reason = || Some(serde_json::json!({"reason": "stop"}));
+
+    let (status, _) = send(&app, "POST", &park, "mallory", reason()).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a stranger may not park, nor learn the launch is there"
+    );
+    assert!(sink.pending().await?.is_empty());
+
+    let (status, body) = send(&app, "POST", &park, "alice", reason()).await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "the launcher may: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let calls = sink.pending().await?;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].key.0, key);
+    assert_eq!(calls[0].kind, OverrideKind::Park);
+    assert_eq!(calls[0].actor.as_deref(), Some("alice"));
+
+    for (user, role) in [("olive", "an operator"), ("wren", "an administrator")] {
+        let (status, _) = send(&app, "POST", &park, user, reason()).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{role} may");
+        assert_eq!(sink.pending().await?[0].actor.as_deref(), Some(user));
+    }
+    let denials: Vec<String> =
+        sqlx::query_scalar("SELECT actor FROM authz_audit WHERE decision = 'deny' ORDER BY id")
+            .fetch_all(db.pool())
+            .await?;
+    assert_eq!(
+        denials,
+        ["user:mallory"],
+        "an operator's park of another's launch is not recorded as a denial"
+    );
+
+    crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#1")).await?;
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/api/issues/owner%2Frepo%231/park",
+        "alice",
+        reason(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "an issue that is not a launch stays operator-only"
+    );
+    Ok(())
+}
+
 /// The runs section is the relaunch source: every launch, a schedule's firings included, with the
 /// values and ceilings it froze, its outcome, and its cost.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]

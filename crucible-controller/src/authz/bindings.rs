@@ -180,13 +180,7 @@ pub static BINDINGS: &[Binding] = &[
         V::Activate,
         Platform,
     ),
-    bind(
-        "POST",
-        "/api/issues/{key}/park",
-        R::Issue,
-        V::Update,
-        Platform,
-    ),
+    bind("POST", "/api/issues/{key}/park", R::Issue, V::Update, Route),
     bind(
         "POST",
         "/api/issues/{key}/unpark",
