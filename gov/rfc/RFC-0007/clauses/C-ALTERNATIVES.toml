@@ -20,4 +20,6 @@ Loop inside one task, as [[RFC-0002:C-PLAYBOOK-SHAPE]] advises for polling. It i
 
 Reuse the scored loop. Its iteration is propose, apply, measure, decide against a judge and a baseline, with keep or discard and operator parking between iterations. A playbook has no judge under [[RFC-0002:C-PLAYBOOK-LANE]], and a loop round keeps no best candidate and discards nothing on a score. The two share the session log and the task rows and nothing of the driver. Rejected.
 
+On the duration. It bounds when the last round may begin and not when the loop ends. A deadline for the end would cut an agent turn in flight and discard its work, and the run's wall-clock ceiling and each task's timeout already bound the end. It is measured from the loop's first dispatch and not from the run's start, so tasks ahead of the loop do not spend its time.
+
 On the name. The construct is called loop because that is the established name for the pattern it serves: an agent turn run again and again on the same prompt until a check says stop, widely known as a Ralph loop. repeat was the other candidate and was dropped so the DSL matches the term authors already use. while is a reserved word in Starlark, so the condition is again."""

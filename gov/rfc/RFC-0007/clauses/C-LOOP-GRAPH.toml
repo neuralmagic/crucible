@@ -12,7 +12,7 @@ Four views draw a playbook's graph: the mermaid source crucible plan show prints
 
 Each of the three flowcharts MUST enclose the nodes of a loop's body, and no other node, in one subgraph titled "loop". It MUST draw one dotted edge from the deciding task's node to the node of the first task named under "loop" in the admitted-plan event, and MUST draw that edge where the two are the same task. It MUST NOT draw any other edge for the loop. Edges between body tasks, and between a body task and a task outside the body, are drawn as they are outside a loop.
 
-That edge's label MUST name the field the condition reads and the values it holds on, in the form the view labels an edge that a when on that field gates, followed by the bound. The bound is written as in "≤60" in the compiled-plan view, and in a run view before any round has begun. After that a run view writes the number of rounds begun over the bound, as in "12/60".
+That edge's label MUST name the field the condition reads and the values it holds on, in the form the view labels an edge that a when on that field gates, followed by the bound. The bound is written as in "≤60" in the compiled-plan view, and in a run view before any round has begun. After that a run view writes the number of rounds begun over the bound, as in "12/60". Where the loop declares a duration the label MUST show it after the round bound, as in "≤256 8h" and "12/256 8h".
 
 ```text
 flowchart TD
@@ -27,7 +27,7 @@ flowchart TD
 
 In the two run flowcharts each body task's node MUST also show a round counter in the form a revised task's node uses in the desktop app: the round in flight, or the last round settled when none is in flight, over the bound, as in "r12/60". Before any round has run, the node MUST show the bound alone. The node's status MUST be the status of the round the counter names until the task's own-name row is written, and that row's status after.
 
-The table crux graph prints MUST mark each body task's row as part of the loop, MUST show the loop's condition and bound, and MUST show each body task's round counter.
+The table crux graph prints MUST mark each body task's row as part of the loop, MUST show the loop's condition, round bound, and duration where it declares one, and MUST show each body task's round counter.
 
 The desktop app MUST list a body task's rounds under that task, each with its status and spend, as it lists the rounds of a revised task.
 
