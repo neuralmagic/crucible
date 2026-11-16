@@ -1004,6 +1004,10 @@ pub struct BuildParams {
     /// buildah a COPY whose wildcard matches nothing fails the build, under buildkit it copies
     /// nothing. buildkit is experimental
     pub builder: Option<jobs::Builder>,
+    /// How the layers the build adds are compressed: "gzip" (default) or "zstd". zstd exports a
+    /// large image several times faster and makes it an OCI image, which the registries and
+    /// runtimes it reaches must take. Only buildkit builds zstd layers
+    pub compression: Option<jobs::Compression>,
 }
 
 /// A cache a build declares.
@@ -1172,6 +1176,7 @@ fn buildctl_argv(
     dockerfile: &RelPath,
     target: Option<&str>,
     build_args: &BTreeMap<String, String>,
+    compression: jobs::Compression,
     dest: &str,
 ) -> Result<Vec<String>> {
     let mut out = argv(["buildctl", "build", "--progress=plain"]);
@@ -1192,13 +1197,30 @@ fn buildctl_argv(
     for (k, v) in checked_build_args(build_args)? {
         out.extend(["--opt".to_string(), format!("build-arg:{k}={v}")]);
     }
+    let layers = match compression {
+        jobs::Compression::Gzip => "",
+        jobs::Compression::Zstd => ",compression=zstd,oci-mediatypes=true",
+    };
     out.extend([
         "--output".to_string(),
-        format!("type=image,name={dest},push=true"),
+        format!("type=image,name={dest},push=true{layers}"),
         "--metadata-file".to_string(),
         jobs::buildkit_metadata(),
     ]);
     Ok(out)
+}
+
+/// How a build that asks for `asked` compresses its layers when `builder` builds it.
+fn compression(
+    asked: Option<jobs::Compression>,
+    builder: Option<jobs::Builder>,
+) -> Result<jobs::Compression> {
+    match (asked.unwrap_or_default(), builder) {
+        (jobs::Compression::Zstd, Some(jobs::Builder::Buildah) | None) => {
+            bail!("only a buildkit build compresses its layers with zstd")
+        }
+        (compression, _) => Ok(compression),
+    }
 }
 
 fn checked_build_args(
@@ -1787,6 +1809,7 @@ impl Broker {
         let context = caller.workspace.context(&p.context)?;
         let recipe = Recipe::of(&p)?;
         let builder = recipe.builder(p.builder, self.site.builder)?;
+        let compression = compression(p.compression, builder)?;
         let dockerfile = RelPath::parse(p.dockerfile.as_deref().unwrap_or("Dockerfile"))?;
         let limit = timeout(p.timeout_s, DEFAULT_BUILD_TIMEOUT_S);
         let mounts = run_mounts(cache_mounts(&p.caches)?, p.ccache);
@@ -1840,6 +1863,7 @@ impl Broker {
                     &dockerfile,
                     p.target.as_deref(),
                     &p.build_args,
+                    compression,
                     &jobs::build_dest(&self.site, caller.sandbox.as_str(), id.as_str()),
                 )?,
                 step::BUILDKIT_STAMPS,
@@ -3975,6 +3999,45 @@ mod tests {
     }
 
     #[test]
+    fn a_build_may_ask_for_zstd_layers_which_only_buildkit_builds() {
+        use crate::jobs::Builder::{Buildah, Buildkit};
+        use crate::jobs::Compression::{Gzip, Zstd};
+        use crate::mcp::compression;
+        let parse = |v: serde_json::Value| serde_json::from_value::<BuildParams>(v);
+        let asked = |v: &str| {
+            parse(serde_json::json!({ "context": "svc", "compression": v })).map(|p| p.compression)
+        };
+        assert_eq!(asked("zstd").unwrap(), Some(Zstd));
+        assert_eq!(asked("gzip").unwrap(), Some(Gzip));
+        assert!(asked("estargz").is_err());
+        assert_eq!(
+            parse(serde_json::json!({ "context": "svc" }))
+                .unwrap()
+                .compression,
+            None
+        );
+        let schema = serde_json::to_value(rmcp::schemars::schema_for!(BuildParams)).unwrap();
+        assert!(schema.to_string().contains("\"zstd\""), "{schema}");
+
+        assert_eq!(compression(Some(Zstd), Some(Buildkit)).unwrap(), Zstd);
+        for builder in [Some(Buildah), Some(Buildkit), None] {
+            assert_eq!(compression(None, builder).unwrap(), Gzip, "{builder:?}");
+            assert_eq!(
+                compression(Some(Gzip), builder).unwrap(),
+                Gzip,
+                "{builder:?}"
+            );
+        }
+        for builder in [Some(Buildah), None] {
+            let refused = compression(Some(Zstd), builder).unwrap_err().to_string();
+            assert!(
+                refused.contains("only a buildkit build"),
+                "{builder:?}: {refused}"
+            );
+        }
+    }
+
+    #[test]
     fn a_build_may_name_its_builder_and_a_layer_build_has_none() {
         use crate::context::ContextDigest;
         use crate::jobs::Builder::{Buildah, Buildkit};
@@ -4839,6 +4902,7 @@ mod tests {
 
     #[test]
     fn a_buildkit_build_is_one_buildctl_that_builds_and_pushes() {
+        use crate::jobs::Compression::{Gzip, Zstd};
         let df = RelPath::parse("docker/Dockerfile.gpu").unwrap();
         let args = BTreeMap::from([
             ("A".to_string(), "1".to_string()),
@@ -4846,7 +4910,7 @@ mod tests {
         ]);
         let dest = "r:5000/builds/buildit:sb-a-buildit-00000000000000a1";
         assert_eq!(
-            buildctl_argv(&df, Some("base"), &args, dest).unwrap(),
+            buildctl_argv(&df, Some("base"), &args, Gzip, dest).unwrap(),
             [
                 "buildctl",
                 "build",
@@ -4871,16 +4935,31 @@ mod tests {
                 "/tmp/buildkit/metadata.json",
             ]
         );
-        let plain = buildctl_argv(&df, None, &BTreeMap::new(), dest).unwrap();
+        let plain = buildctl_argv(&df, None, &BTreeMap::new(), Gzip, dest).unwrap();
         assert!(
             !plain
                 .iter()
                 .any(|a| a.starts_with("target=") || a.starts_with("build-arg:")),
             "{plain:?}"
         );
+        let zstd = buildctl_argv(&df, None, &BTreeMap::new(), Zstd, dest).unwrap();
+        assert_eq!(
+            zstd.iter()
+                .zip(&plain)
+                .filter(|(z, p)| z != p)
+                .collect::<Vec<_>>(),
+            [(
+                &format!("type=image,name={dest},push=true,compression=zstd,oci-mediatypes=true"),
+                &format!("type=image,name={dest},push=true")
+            )]
+        );
+        assert_eq!(zstd.len(), plain.len());
         for bad in ["", "A=B"] {
             let args = BTreeMap::from([(bad.to_string(), "1".to_string())]);
-            assert!(buildctl_argv(&df, None, &args, dest).is_err(), "{bad:?}");
+            assert!(
+                buildctl_argv(&df, None, &args, Gzip, dest).is_err(),
+                "{bad:?}"
+            );
             let id = BuildId::fresh();
             assert!(
                 bud_argv(&id, &df, None, &args, &[], &[]).is_err(),
@@ -5445,6 +5524,7 @@ mod tests {
                     caches: caches(),
                     ccache: true,
                     builder: None,
+                    compression: None,
                     base: None,
                     script: None,
                     path: None,
@@ -5844,6 +5924,7 @@ mod tests {
                             }],
                             ccache: false,
                             builder: None,
+                            compression: None,
                             base: None,
                             script: None,
                             path: None,
@@ -6532,6 +6613,7 @@ mod tests {
                 caches: Vec::new(),
                 ccache: false,
                 builder: None,
+                compression: None,
                 base: None,
                 script: None,
                 path: None,

@@ -160,6 +160,9 @@ pub async fn assemble(
         Arc::new(crate::launches::pending::PendingLaunches::new(
             db.pool().clone(),
         )),
+        Arc::new(crate::daemon::overrides::PendingOverrides::new(
+            db.pool().clone(),
+        )),
     ]));
     let mut sources: Vec<Arc<dyn DiscoverySource>> = vec![
         Arc::new(trigger_sweep(vec![Arc::new(

@@ -8467,7 +8467,9 @@ async fn a_cancel_parks_the_launch_deletes_its_pod_and_marks_the_run_cancelled(
     let mut cfg = cfg_with(dir.path(), Profile::default());
     cfg.runtime.dispatcher = dispatcher.clone();
 
-    let store = std::sync::Arc::new(crate::daemon::overrides::OverrideStore::new());
+    let store = std::sync::Arc::new(crate::daemon::overrides::OverrideStore::new(
+        db.pool().clone(),
+    ));
     crate::daemon::overrides::QueueOverrideSink::new(
         store.clone(),
         crate::daemon::queue::WorkQueue::new(),
@@ -8478,7 +8480,8 @@ async fn a_cancel_parks_the_launch_deletes_its_pod_and_marks_the_run_cancelled(
         reason: None,
         priority: None,
         actor: Some("wseaton".into()),
-    });
+    })
+    .await?;
     let applied = crate::daemon::overrides::apply_pending(&db, &store, key, false)
         .await?
         .expect("the cancel was pending");

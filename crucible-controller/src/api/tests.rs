@@ -49,8 +49,11 @@ fn sample_issue(key: &str) -> NewIssue {
 }
 
 /// A sink the test can read back: POSTs enqueue overrides without ever touching the DB.
-fn test_sink() -> QueueOverrideSink {
-    QueueOverrideSink::new(Arc::new(OverrideStore::new()), WorkQueue::new())
+fn test_sink(db: &Db) -> QueueOverrideSink {
+    QueueOverrideSink::new(
+        Arc::new(OverrideStore::new(db.pool().clone())),
+        WorkQueue::new(),
+    )
 }
 
 fn app(db: Db) -> Router {
@@ -198,7 +201,7 @@ async fn spawn_mock_jira(
 }
 
 fn app_with_roles(db: Db, admins: Vec<String>, operators: Vec<String>) -> Router {
-    app_with_sink(db, test_sink(), admins, operators)
+    app_with_sink(db.clone(), test_sink(&db), admins, operators)
 }
 
 fn app_with_sink(
@@ -1956,10 +1959,10 @@ async fn events_stream_emits_a_transition_as_sse_json(pool: PgPool) -> Result<()
 
 #[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn park_json_enqueues_override_without_touching_the_db(pool: PgPool) -> Result<()> {
+async fn park_json_enqueues_override_without_parking_the_issue(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#1")).await?;
-    let sink = test_sink();
+    let sink = test_sink(&db);
     let app = app_with_sink(
         db.clone(),
         sink.clone(),
@@ -1982,14 +1985,14 @@ async fn park_json_enqueues_override_without_touching_the_db(pool: PgPool) -> Re
     assert_eq!(v["reason"], "no repro");
 
     {
-        let calls = sink.pending();
+        let calls = sink.pending().await?;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].key.0, "owner/repo#1");
         assert_eq!(calls[0].kind, OverrideKind::Park);
         assert_eq!(calls[0].reason.as_deref(), Some("no repro"));
     }
 
-    // The POST must never write the DB: the issue is still `new`, not `parked`.
+    // The POST must not park the issue itself: it is still `new`, not `parked`.
     let issue = crate::issues::store::get_issue(db.pool(), "owner/repo#1")
         .await?
         .expect("issue");
@@ -2002,7 +2005,7 @@ async fn park_json_enqueues_override_without_touching_the_db(pool: PgPool) -> Re
 async fn park_carries_the_proxy_identity_as_the_actor(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#1")).await?;
-    let sink = test_sink();
+    let sink = test_sink(&db);
     let app = app_with_sink(db, sink.clone(), vec![], vec!["wren".to_string()]);
 
     let res = app
@@ -2018,7 +2021,7 @@ async fn park_carries_the_proxy_identity_as_the_actor(pool: PgPool) -> Result<()
     let v: serde_json::Value = serde_json::from_slice(&body)?;
     assert_eq!(v["actor"], "wren", "ack echoes the actor");
 
-    let calls = sink.pending();
+    let calls = sink.pending().await?;
     assert_eq!(calls[0].actor.as_deref(), Some("wren"));
     Ok(())
 }
@@ -2028,7 +2031,7 @@ async fn park_carries_the_proxy_identity_as_the_actor(pool: PgPool) -> Result<()
 async fn park_form_redirects_and_enqueues(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#1")).await?;
-    let sink = test_sink();
+    let sink = test_sink(&db);
     let app = app_with_sink(
         db.clone(),
         sink.clone(),
@@ -2048,7 +2051,7 @@ async fn park_form_redirects_and_enqueues(pool: PgPool) -> Result<()> {
     assert_eq!(res.headers().get(header::LOCATION).unwrap(), "/inbox");
 
     {
-        let calls = sink.pending();
+        let calls = sink.pending().await?;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].reason.as_deref(), Some("no repro"));
     }
@@ -2064,7 +2067,7 @@ async fn park_form_redirects_and_enqueues(pool: PgPool) -> Result<()> {
 async fn unpark_and_bump_enqueue_without_a_body(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#1")).await?;
-    let sink = test_sink();
+    let sink = test_sink(&db);
     let app = app_with_sink(db, sink.clone(), vec![], vec!["operator".to_string()]);
 
     let res = app
@@ -2077,7 +2080,7 @@ async fn unpark_and_bump_enqueue_without_a_body(pool: PgPool) -> Result<()> {
         )
         .await?;
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
-    let pending = sink.pending();
+    let pending = sink.pending().await?;
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].kind, OverrideKind::Unpark);
 
@@ -2091,7 +2094,7 @@ async fn unpark_and_bump_enqueue_without_a_body(pool: PgPool) -> Result<()> {
         .await?;
     assert_eq!(res.status(), StatusCode::ACCEPTED);
 
-    let pending = sink.pending();
+    let pending = sink.pending().await?;
     assert_eq!(
         pending.len(),
         1,
@@ -3135,7 +3138,7 @@ async fn pause_resume_unwatch_require_admin_and_transition_correctly(pool: PgPoo
 async fn scope_now_post_enqueues_override_with_justification(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#1")).await?;
-    let sink = test_sink();
+    let sink = test_sink(&db);
     let app = router(ApiState {
         roles: crate::identity::auth::Roles::new(vec!["wren".to_string()], vec![], vec![]),
         sink: sink.clone(),
@@ -3171,7 +3174,7 @@ async fn scope_now_post_enqueues_override_with_justification(pool: PgPool) -> Re
     assert_eq!(v["reason"], "customer escalation");
     assert_eq!(v["actor"], "wren");
 
-    let calls = sink.pending();
+    let calls = sink.pending().await?;
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].key.0, "owner/repo#1");
     assert!(
@@ -3191,7 +3194,7 @@ async fn scope_now_post_enqueues_override_with_justification(pool: PgPool) -> Re
 async fn redispatch_post_enqueues_override_and_is_admin_gated(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#1")).await?;
-    let sink = test_sink();
+    let sink = test_sink(&db);
     let app = router(ApiState {
         roles: crate::identity::auth::Roles::new(vec!["wren".to_string()], vec![], vec![]),
         sink: sink.clone(),
@@ -3228,7 +3231,7 @@ async fn redispatch_post_enqueues_override_and_is_admin_gated(pool: PgPool) -> R
     assert_eq!(v["actor"], "wren");
 
     // The POST only enqueued an intent — it never wrote the DB (reconcile is the only writer).
-    let calls = sink.pending();
+    let calls = sink.pending().await?;
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].key.0, "owner/repo#1");
     assert!(
@@ -7776,7 +7779,7 @@ async fn a_launch_is_cancelled_by_its_owner_or_an_administrator_and_no_one_else(
     pool: PgPool,
 ) -> Result<()> {
     let (db, dir) = db_with(pool);
-    let sink = test_sink();
+    let sink = test_sink(&db);
     let app = app_with_sink(
         db.clone(),
         sink.clone(),
@@ -7806,7 +7809,7 @@ async fn a_launch_is_cancelled_by_its_owner_or_an_administrator_and_no_one_else(
         StatusCode::NOT_FOUND,
         "a stranger may not cancel, nor learn the launch is there"
     );
-    assert!(sink.pending().is_empty());
+    assert!(sink.pending().await?.is_empty());
 
     let (status, body) = send(&app, "POST", &cancel, "alice", None).await;
     assert_eq!(
@@ -7817,7 +7820,7 @@ async fn a_launch_is_cancelled_by_its_owner_or_an_administrator_and_no_one_else(
     );
     let v: serde_json::Value = serde_json::from_slice(&body)?;
     assert_eq!(v["reason"], "cancelled by alice");
-    let calls = sink.pending();
+    let calls = sink.pending().await?;
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].key.0, key);
     assert_eq!(calls[0].kind, crate::daemon::queue::OverrideKind::Cancel);
@@ -7825,7 +7828,7 @@ async fn a_launch_is_cancelled_by_its_owner_or_an_administrator_and_no_one_else(
 
     let (status, _) = send(&app, "POST", &cancel, "wren", None).await;
     assert_eq!(status, StatusCode::ACCEPTED, "an administrator may");
-    assert_eq!(sink.pending()[0].actor.as_deref(), Some("wren"));
+    assert_eq!(sink.pending().await?[0].actor.as_deref(), Some("wren"));
 
     let issue = crate::issues::store::get_issue(db.pool(), &key)
         .await?
@@ -11640,6 +11643,7 @@ async fn run_log_serves_local_output_and_points_a_pod_run_at_its_pod(pool: PgPoo
             .contains("admitted 3 tasks")
     );
     assert!(!log["truncated"].as_bool().expect("truncated"));
+    assert_eq!(log["source"], "local");
 
     // No cluster to reach and nothing ingested yet: the pod run says where its output lives, and
     // names the cluster as well as the namespace so the hint is runnable.
@@ -11647,6 +11651,7 @@ async fn run_log_serves_local_output_and_points_a_pod_run_at_its_pod(pool: PgPoo
     assert_eq!(status, StatusCode::OK, "{pod}");
     assert_eq!(pod["dispatch"], "pod");
     assert_eq!(pod["text"], serde_json::Value::Null);
+    assert_eq!(pod["source"], serde_json::Value::Null);
     assert_eq!(
         pod["location"],
         "pod loop-abc in namespace autoresearch on cluster hub"
@@ -11669,6 +11674,7 @@ async fn run_log_serves_local_output_and_points_a_pod_run_at_its_pod(pool: PgPoo
         "{stored}"
     );
     assert_eq!(stored["location"], serde_json::Value::Null);
+    assert_eq!(stored["source"], "session");
 
     // The engine log kept at completion is the pod's own output and wins over the session.
     crate::runs::blob_store::put_run_engine_log(
@@ -11682,6 +11688,7 @@ async fn run_log_serves_local_output_and_points_a_pod_run_at_its_pod(pool: PgPoo
     let text = engine["text"].as_str().expect("text");
     assert!(text.contains("gateway_boot: driver=kubernetes"), "{engine}");
     assert!(!text.contains("task roundup: pass"), "{engine}");
+    assert_eq!(engine["source"], "stored");
 
     // A log longer than one response serves its tail by default, and reads back from its first
     // line by following `next` from 0.

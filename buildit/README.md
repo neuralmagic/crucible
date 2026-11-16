@@ -215,6 +215,13 @@ build args, the timeout, cluster caches, `status` and `logs` work as with builda
 `--storage-driver vfs` is BuildKit's `native` snapshotter and `overlay` its `overlayfs`;
 `--bud-arg` reaches buildah builds only.
 
+A BuildKit build may ask for zstd layers with `compression: "zstd"` (`--compression zstd` on the
+CLI). BuildKit compresses the layers a build adds before it pushes them, and for an image with
+several gigabytes of new layers gzip takes most of the export; zstd is several times faster. The
+image is then an OCI image whose new layers are `tar+zstd`, so the registries it is pushed or
+copied to and the runtimes that pull it must take those. Layers from the base image keep the
+compression they came with. A buildah or `base` build that asks for zstd is refused.
+
 `buildkitd` runs with `noProcessSandbox` and a wrapper around its runtime that drops each `RUN`
 step's hostname, binds the pod's `/dev/pts`, and adds `/buildit`, `/etc/ccache.conf` and the
 declared caches to the step's mounts, since BuildKit has no `--volume`; it removes the mount

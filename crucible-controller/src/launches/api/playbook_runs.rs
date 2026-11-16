@@ -354,13 +354,16 @@ pub(crate) async fn cancel_playbook_run(
         "cancelled by {}",
         identity.0.as_deref().unwrap_or("an operator")
     );
-    state.sink.submit(crate::daemon::queue::Override {
-        key: crate::daemon::queue::IssueKey(key.clone()),
-        kind: crate::daemon::queue::OverrideKind::Cancel,
-        reason: Some(reason.clone()),
-        priority: None,
-        actor: identity.0.clone(),
-    });
+    state
+        .sink
+        .submit(crate::daemon::queue::Override {
+            key: crate::daemon::queue::IssueKey(key.clone()),
+            kind: crate::daemon::queue::OverrideKind::Cancel,
+            reason: Some(reason.clone()),
+            priority: None,
+            actor: identity.0.clone(),
+        })
+        .await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(CancelAck {

@@ -564,7 +564,7 @@ fn ancestors(tasks: &[TaskView]) -> Vec<HashSet<usize>> {
 const UNFOLDED: usize = 24;
 
 /// The nodes, edges and subgraphs rune-mermaid reads before it gives a source up.
-const ITEMS: usize = 400;
+const ITEMS: usize = rune_mermaid::MAX_ITEMS;
 
 /// How many instances a fan-out draws side by side.
 const ROW: usize = 6;
@@ -1187,6 +1187,49 @@ mod tests {
         let two_rows = source(&triaged(&keys, |_| "fix"), None, &[]);
         contains_all(&two_rows, &["g1 -->|fix| t2\n", &format!("t2i{ROW}[")]);
         assert!(!two_rows.contains("-->|fix| t2i"), "{two_rows}");
+    }
+
+    #[test]
+    fn a_gated_loop_of_62_turns_draws() {
+        let mut tasks = vec![r#"{"name":"start","kind":"command","required":true}"#.to_string()];
+        let mut scored = "start".to_string();
+        for i in 1..=62 {
+            let gate = format!("{scored}-go");
+            tasks.push(format!(
+                r#"{{"name":"{gate}","kind":"route","depends_on":["{scored}"],"required":true}}"#
+            ));
+            tasks.push(format!(
+                r#"{{"name":"turn_{i}","kind":"agent","depends_on":["{gate}"],"required":false,"when":"{gate}.go in yes"}}"#
+            ));
+            scored = format!("score_{i}");
+            tasks.push(format!(
+                r#"{{"name":"{scored}","kind":"command","depends_on":["turn_{i}","{gate}"],"required":true,"when":"{gate}.go in yes"}}"#
+            ));
+        }
+        tasks.push(format!(
+            r#"{{"name":"final","kind":"command","depends_on":["{scored}"],"required":true}}"#
+        ));
+        let admitted = format!(
+            r#"{{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":1.0,"tasks":[{}]}}"#,
+            tasks.join(",")
+        );
+        let source = source(&fold(&admitted), None, &[]);
+        assert_eq!(
+            (tasks.len(), source.matches("-->").count()),
+            (188, 249),
+            "{source}"
+        );
+        let style = rune_mermaid::DiagramStyle::neutral(true);
+        assert!(
+            rune_mermaid::render_with_hover(
+                &source,
+                &style,
+                rune_mermaid::Hover::Off,
+                Color::WHITE
+            )
+            .is_some(),
+            "{source}"
+        );
     }
 
     #[test]

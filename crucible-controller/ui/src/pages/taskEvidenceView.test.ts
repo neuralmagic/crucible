@@ -63,11 +63,11 @@ describe('a task with no result', () => {
 
 describe('the run log', () => {
   it('marks a dropped head and falls back to where the output lives', () => {
-    expect(logBody({ run_id: 'r', dispatch: 'local', text: 'done\n', truncated: false, start: 0, next: null, total_bytes: 0, location: null })).toBe(
+    expect(logBody({ run_id: 'r', dispatch: 'local', text: 'done\n', truncated: false, start: 0, next: null, total_bytes: 0, source: null, location: null })).toBe(
       'done\n',
     );
     expect(
-      logBody({ run_id: 'r', dispatch: 'local', text: 'tail\n', truncated: true, start: 0, next: null, total_bytes: 0, location: null }),
+      logBody({ run_id: 'r', dispatch: 'local', text: 'tail\n', truncated: true, start: 0, next: null, total_bytes: 0, source: null, location: null }),
     ).toBe('… earlier output dropped\ntail\n');
     expect(
       logBody({
@@ -78,17 +78,18 @@ describe('the run log', () => {
         start: 0,
         next: null,
         total_bytes: 0,
+        source: null,
         location: 'pod loop-abc in namespace autoresearch',
       }),
     ).toBe('pod loop-abc in namespace autoresearch');
-    expect(logBody({ run_id: 'r', dispatch: 'pod', text: null, truncated: false, start: 0, next: null, total_bytes: 0, location: null })).toBe(
+    expect(logBody({ run_id: 'r', dispatch: 'pod', text: null, truncated: false, start: 0, next: null, total_bytes: 0, source: null, location: null })).toBe(
       'no output recorded for this run',
     );
   });
 
   it('sends real output to the editor and a location hint to prose', () => {
     expect(
-      logPath({ run_id: 'r', dispatch: 'pod', text: '{"task":"scan"}\n', truncated: false, start: 0, next: null, total_bytes: 0, location: null }),
+      logPath({ run_id: 'r', dispatch: 'pod', text: '{"task":"scan"}\n', truncated: false, start: 0, next: null, total_bytes: 0, source: null, location: null }),
     ).toBe('run.log');
     expect(
       logPath({
@@ -99,6 +100,7 @@ describe('the run log', () => {
         start: 0,
         next: null,
         total_bytes: 0,
+        source: null,
         location: 'pod loop-abc in namespace crucible-system on cluster wharf',
       }),
     ).toBeNull();
