@@ -1,0 +1,15 @@
+diff --git a/crates/rune-mermaid/src/lib.rs b/crates/rune-mermaid/src/lib.rs
+index f0284d4..e432066 100644
+--- a/crates/rune-mermaid/src/lib.rs
++++ b/crates/rune-mermaid/src/lib.rs
+@@ -331,8 +331,8 @@ pub(crate) struct Parsed {
+     pub diagram: Diagram,
+ }
+ 
+-/// Diagrams bigger than this are left as source: they would be unreadable at markdown width.
+-pub(crate) const MAX_ITEMS: usize = 400;
++/// Diagrams bigger than this are left as source.
++pub const MAX_ITEMS: usize = 1024;
+ 
+ /// How deep subgraphs, composite states, frames and other blocks may nest.
+ pub(crate) const MAX_DEPTH: usize = 8;
