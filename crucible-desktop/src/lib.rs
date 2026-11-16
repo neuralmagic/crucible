@@ -44,11 +44,13 @@ mod opened;
 mod overrides;
 mod pack;
 mod palette;
+mod plugin;
 mod preview;
 mod principals;
 mod profile;
 mod provider;
 mod remote;
+mod report;
 mod revisions;
 mod runs;
 mod runs_on;
@@ -432,6 +434,8 @@ pub struct App {
     /// The captured file the Files tab shows, by key; the first listed when none is picked.
     pub run_file: Option<String>,
     pub files_md_source: bool,
+    /// The Report pane's picked tabs and its table's sort.
+    pub report_shown: report::Shown,
     /// The workspace the user arranged; `None` lays each run out by its graph's depth.
     pub layout: Option<Workspace>,
     /// Panes picked from a tab bar while the layout follows the run, oldest first.
@@ -512,6 +516,31 @@ impl App {
             }
             _ => None,
         }
+    }
+
+    /// The table the shown report shows.
+    pub fn report_table(&self) -> Option<report::Table<'_>> {
+        let view = self.shown_report()?.view.as_ref().ok()?;
+        self.report_shown.table(view)
+    }
+
+    /// Row `i` of the shown report table, as sorted.
+    pub fn report_row(&self, i: usize) -> Option<&crucible_view::Row> {
+        self.report_shown.row(&self.report_table()?, i)
+    }
+
+    pub fn sort_report(&mut self, column: &str, dir: rune_kit::SortDir) {
+        let order = self
+            .report_table()
+            .and_then(|table| report::Order::of(&table, column, dir));
+        self.report_shown.sort(order);
+    }
+
+    /// The first address the shown report table's row `id` links to.
+    pub fn report_link(&self, id: &str) -> Option<String> {
+        let table = self.report_table()?;
+        let row = table.rows.iter().find(|row| row.id == id)?;
+        row.cells.iter().find_map(|cell| cell.href.clone())
     }
 
     /// The local packs matching the sidebar's search field.
@@ -1126,6 +1155,7 @@ impl App {
         self.answer_draft(snapshot.synced);
         self.answer_drop(snapshot.dropped);
         self.answer_file(snapshot.file);
+        self.answer_report(snapshot.report);
         self.answer_revisions(snapshot.revisions);
         self.announce(&snapshot.finished);
         self.reconcile();
@@ -1206,6 +1236,19 @@ impl App {
             }
             self.remote.file_sent = file;
         }
+        let report = self.wanted_report();
+        if report != self.remote.report_sent {
+            let asked = report.as_ref().and_then(|wanted| {
+                let detail = self.selected_detail()?;
+                let (_, plugin) = report::text_plugin(detail.pack.as_ref().ok()?)?;
+                let listed = detail.files.as_ref()?.as_ref().ok()?.clone();
+                Some((wanted.clone(), plugin.to_string(), listed))
+            });
+            if let Some((wanted, plugin, listed)) = asked {
+                self.remote.live_client.report(wanted, plugin, listed);
+            }
+            self.remote.report_sent = report;
+        }
         let history = self.wanted_revisions();
         if history != self.remote.revisions_sent {
             if let Some(wanted) = &history {
@@ -1255,6 +1298,52 @@ impl App {
 
     pub fn reread_history(&mut self) {
         self.remote.revisions_sent = None;
+    }
+
+    /// The selected live run's report, while the Report tab is open, its pack carries a plugin
+    /// and its captured files are listed.
+    fn wanted_report(&self) -> Option<report::Wanted> {
+        if !self.workspace().showing(PaneKind::Report) {
+            return None;
+        }
+        let detail = self.selected_detail()?;
+        let (plugin, text) = report::text_plugin(detail.pack.as_ref().ok()?)?;
+        let files = detail.files.as_ref()?.as_ref().ok()?;
+        Some(report::Wanted {
+            run: detail.run_id.clone()?,
+            plugin: (plugin.to_string(), text.len()),
+            listed: files.iter().map(|f| (f.key.clone(), f.size)).collect(),
+            settled: self
+                .selected_live()
+                .is_some_and(|launch| !launch.status.is_running()),
+        })
+    }
+
+    fn answer_report(&mut self, built: Option<std::sync::Arc<report::Built>>) {
+        if let Some(built) = built
+            && Some(&built.wanted) == self.remote.report_sent.as_ref()
+        {
+            self.remote.report = Some(built);
+        }
+    }
+
+    /// The report the Report tab shows: the selected local pack's, or the one built for the
+    /// selected live run.
+    pub fn shown_report(&self) -> Option<&report::Report> {
+        if let Some(pack) = self.selected_pack() {
+            return pack.report.as_ref();
+        }
+        let run = self.selected_detail()?.run_id.as_deref()?;
+        self.remote
+            .report
+            .as_deref()
+            .filter(|built| built.wanted.run == run)
+            .map(|built| &built.report)
+    }
+
+    /// Whether the live worker has been asked for a report it has not built yet.
+    pub fn awaits_report(&self) -> bool {
+        self.remote.report_sent.is_some() && self.shown_report().is_none()
     }
 
     /// The run, key and listed size of the captured file the Files tab shows, while it is open
@@ -1757,6 +1846,7 @@ fn init() -> App {
         pack_md_source: false,
         run_file: None,
         files_md_source: false,
+        report_shown: report::Shown::default(),
         knobs: rune_knobs::Knobs::default(),
         page: Page::Runs,
         flight: None,
@@ -1940,12 +2030,14 @@ pub fn run() {
         poll: Some(poll),
         on_key: Some(commands::on_key),
         scenes: &[
-            // `CRUCIBLE_TAB` shows that pane (tasks, timeline, graph, pack, files, launch or log),
+            // `CRUCIBLE_PACK` opens that example pack (`playbook` when unset), `CRUCIBLE_TAB`
+            // shows that pane (tasks, timeline, graph, pack, files, report, launch or log),
             // `CRUCIBLE_FILE` the captured file the Files pane shows, by key, and `CRUCIBLE_PICK`
             // opens that task's card.
             ("local", |app: &mut App| {
                 app.backend = Backend::Local;
-                app.select(Selection::Local("playbook".into()));
+                let pack = std::env::var("CRUCIBLE_PACK").unwrap_or_else(|_| "playbook".into());
+                app.select(Selection::Local(pack));
                 app.run.expanded = std::env::var("CRUCIBLE_PICK").ok();
                 scene_tab(app);
             }),

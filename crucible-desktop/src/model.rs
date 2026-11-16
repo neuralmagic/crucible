@@ -96,6 +96,8 @@ pub struct PackView {
     pub agent_events: Vec<crate::session::AgentStep>,
     pub pack: PackFiles,
     pub preview: Preview,
+    /// The pack's own view of the run, when it ships one.
+    pub report: Option<crate::report::Report>,
 }
 
 impl PackView {
@@ -266,6 +268,7 @@ struct Pack {
     files: PackFiles,
     /// The pack as it compiles now, redone whenever its files change.
     preview: Preview,
+    reporter: crate::report::Reporter,
     started: bool,
     since: Option<Instant>,
     stderr: PathBuf,
@@ -321,6 +324,8 @@ impl Pack {
         run.read_new();
         let started = dir.join(RUN_START).is_file();
         let files = PackFiles::read_dir(&dir);
+        let mut reporter = crate::report::Reporter::default();
+        reporter.refresh(&dir);
         Some(Pack {
             workflow,
             manifest: manifest_path
@@ -336,6 +341,7 @@ impl Pack {
             budget_usd,
             run,
             preview: crate::preview::compile(&dir),
+            reporter,
             files,
             started,
             since: None,
@@ -365,6 +371,7 @@ impl Pack {
             self.preview = crate::preview::compile(&self.dir);
             changed = true;
         }
+        changed |= self.reporter.refresh(&self.dir);
         if let Some(mut child) = self.run.child.take() {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -444,6 +451,7 @@ impl Pack {
             agent_events: self.run.fold.agent_events.clone(),
             pack: self.files.clone(),
             preview: self.preview.clone(),
+            report: self.reporter.report().cloned(),
         }
     }
 }

@@ -34,10 +34,11 @@ pub enum PaneKind {
     Log,
     Agent,
     History,
+    Report,
 }
 
 impl PaneKind {
-    pub const ALL: [PaneKind; 12] = [
+    pub const ALL: [PaneKind; 13] = [
         PaneKind::Tasks,
         PaneKind::Timeline,
         PaneKind::Graph,
@@ -50,6 +51,7 @@ impl PaneKind {
         PaneKind::Log,
         PaneKind::Agent,
         PaneKind::History,
+        PaneKind::Report,
     ];
 
     pub fn label(self) -> &'static str {
@@ -66,6 +68,7 @@ impl PaneKind {
             PaneKind::Log => "Log",
             PaneKind::Agent => "Agent",
             PaneKind::History => "History",
+            PaneKind::Report => "Report",
         }
     }
 }
@@ -254,12 +257,15 @@ impl Workspace {
 
     /// Shows `kind`: brings it to the front of its group, or reopens it when it was closed,
     /// beside a pane it shares a group with by default, else in the first group. The agent
-    /// reopens in a group of its own under the pack.
+    /// reopens in a group of its own under the pack, and the report beside the files.
     pub fn activate(&mut self, kind: PaneKind) {
         let at = match self.locate(kind) {
             Some(at) => at,
             None if kind == PaneKind::Agent && self.locate(PaneKind::Pack).is_some() => {
                 return self.place(kind, PaneKind::Pack, Some(Edge::Bottom));
+            }
+            None if kind == PaneKind::Report && self.locate(PaneKind::Files).is_some() => {
+                return self.place(kind, PaneKind::Files, None);
             }
             None => {
                 let default = Workspace::for_depth(0);
@@ -578,7 +584,8 @@ mod tests {
     };
 
     use PaneKind::{
-        Agent, Compare, Data, Files, Graph, History, Launch, Log, Pack, Tasks, Timeline, Transcript,
+        Agent, Compare, Data, Files, Graph, History, Launch, Log, Pack, Report, Tasks, Timeline,
+        Transcript,
     };
 
     #[test]
@@ -643,7 +650,7 @@ mod tests {
             ]
         );
         sums_to_one(&w);
-        assert_eq!(w.closed().collect::<Vec<_>>(), vec![Agent]);
+        assert_eq!(w.closed().collect::<Vec<_>>(), vec![Agent, Report]);
     }
 
     #[test]
@@ -797,10 +804,27 @@ mod tests {
         w.close(History);
         w.close(Tasks);
         assert_eq!(tabs(&w), vec![vec![vec![Tasks]]]);
-        assert_eq!(w.closed().count(), 11);
+        assert_eq!(w.closed().count(), 12);
         w.activate(Log);
         assert_eq!(tabs(&w), vec![vec![vec![Tasks, Log]]]);
         assert_eq!(w.columns[0].groups[0].active, Log);
+    }
+
+    #[test]
+    fn the_report_opens_beside_the_files_or_in_the_first_group() {
+        let mut w = Workspace::for_depth(2);
+        w.activate(Report);
+        assert_eq!(
+            tabs(&w)[1],
+            vec![vec![Log, Data, Files, Transcript, Report]]
+        );
+        assert!(w.showing(Report));
+        sums_to_one(&w);
+        w.close(Report);
+        w.close(Files);
+        w.activate(Report);
+        assert_eq!(tabs(&w)[0][0], vec![Graph, Timeline, Report]);
+        assert!(w.showing(Report));
     }
 
     #[test]

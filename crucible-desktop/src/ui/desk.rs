@@ -363,3 +363,32 @@ pub(crate) fn heading(label: &str, p: &Paint) -> El {
 pub(crate) fn now() -> i64 {
     jiff::Timestamp::now().as_second()
 }
+
+/// A pane's empty or failed state: what happened, and the detail to read or copy.
+pub(crate) fn note(key: &str, headline: &str, detail: &str, p: &Paint) -> El {
+    let mut card = col()
+        .key(key.to_string())
+        .w_full()
+        .padding(24.0)
+        .gap(6.0)
+        .radius(p.k.radius.lg)
+        .fill(p.c.layer_01)
+        .border(p.hair, p.c.border_muted)
+        .child(
+            text(headline.to_string())
+                .font(p.k.ty.ui_medium)
+                .color(p.c.text_base)
+                .wrap(),
+        );
+    if !detail.is_empty() {
+        card = card.child(
+            text(detail.to_string())
+                .font(p.mono(11.0, 400.0))
+                .color(p.c.text_muted)
+                .selectable(true)
+                .selection_color(p.k.selection())
+                .wrap(),
+        );
+    }
+    card
+}

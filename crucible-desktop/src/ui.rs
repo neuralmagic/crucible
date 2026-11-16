@@ -25,6 +25,7 @@ mod policy;
 mod profiles;
 mod providers;
 mod rail;
+mod report;
 mod revisions;
 mod runs;
 mod schedules;

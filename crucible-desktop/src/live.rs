@@ -341,6 +341,13 @@ enum Action {
         settled: bool,
     },
     Revisions(Wanted),
+    /// Build a run's report from its pack's plugin, as the text the pack holds, and the files it
+    /// captured.
+    Report {
+        wanted: crate::report::Wanted,
+        plugin: String,
+        listed: Vec<Captured>,
+    },
 }
 
 /// What an [`Action`] came to.
@@ -369,6 +376,7 @@ enum Reply {
     },
     File(Opened),
     Revisions(Revisions),
+    Report(crate::report::Built),
 }
 
 impl Action {
@@ -430,6 +438,21 @@ impl Action {
                 result: read_revisions(&c, &wanted).await,
                 wanted,
             }),
+            Action::Report {
+                wanted,
+                plugin,
+                listed,
+            } => {
+                let view = build_report(&c, dirs.files.as_deref(), &wanted, plugin, listed).await;
+                Reply::Report(crate::report::Built {
+                    report: crate::report::Report {
+                        name: crate::report::name_of(&wanted.plugin.0),
+                        author: None,
+                        view,
+                    },
+                    wanted,
+                })
+            }
         }
     }
 
@@ -476,6 +499,14 @@ impl Action {
             Action::Revisions(wanted) => Reply::Revisions(Revisions {
                 wanted,
                 result: Err(why),
+            }),
+            Action::Report { wanted, .. } => Reply::Report(crate::report::Built {
+                report: crate::report::Report {
+                    name: crate::report::name_of(&wanted.plugin.0),
+                    author: None,
+                    view: Err(why),
+                },
+                wanted,
             }),
         }
     }
@@ -713,6 +744,50 @@ async fn save(
         }
         crux::client::DraftSave::Stale(stale) => Err(stale.error),
     }
+}
+
+/// A run's report: load the plugin, fetch the captured files it asks for, and run it.
+async fn build_report(
+    c: &Connection,
+    files: Option<&Path>,
+    wanted: &crate::report::Wanted,
+    plugin: String,
+    listed: Vec<Captured>,
+) -> Result<crucible_view::View, String> {
+    let stopped = || "building the view stopped early".to_string();
+    let path = wanted.plugin.0.clone();
+    let (plugin, inputs) =
+        crate::net::blocking(move || crate::report::load(&path, plugin.as_bytes()))
+            .await
+            .ok_or_else(stopped)??;
+    let mut read = Vec::new();
+    for file in listed.iter().filter(|file| inputs.contains(&file.path)) {
+        if !file.shown() {
+            return Err(format!(
+                "{} is {} bytes, more than a view reads.",
+                file.key, file.size
+            ));
+        }
+        let kept = file_on_disk(files, &wanted.run, &file.key)
+            .filter(|(_, bytes)| wanted.settled && *bytes == file.size);
+        let opened = match kept {
+            Some((opened, _)) => opened,
+            None => fetch_file(c, files, wanted.run.clone(), file.key.clone()).await,
+        };
+        let text = match opened.body {
+            Ok(Body::Text(text)) => text,
+            Ok(Body::Binary(_)) => return Err(format!("{} is not text.", file.key)),
+            Err(error) => return Err(format!("reading {}: {error}", file.key)),
+        };
+        read.push(crucible_view::File {
+            path: file.path.clone(),
+            task: file.owner(),
+            text,
+        });
+    }
+    crate::net::blocking(move || crate::report::run(&plugin, &inputs, read))
+        .await
+        .ok_or_else(stopped)?
 }
 
 /// A captured file's copy on disk and its length, when it has been fetched before.
@@ -1786,6 +1861,8 @@ pub struct Snapshot {
     /// The captured file last fetched for the Files pane.
     pub file: Option<Opened>,
     pub revisions: Option<Arc<Revisions>>,
+    /// The report last built for the Report pane.
+    pub report: Option<Arc<crate::report::Built>>,
 }
 
 /// What one pass of the poll loop read.
@@ -1877,6 +1954,7 @@ impl Shared {
             }
             Reply::File(opened) => self.snapshot.file = Some(opened),
             Reply::Revisions(revisions) => self.snapshot.revisions = Some(Arc::new(revisions)),
+            Reply::Report(built) => self.snapshot.report = Some(Arc::new(built)),
         }
     }
 }
@@ -2021,6 +2099,16 @@ impl Client {
 
     pub fn revisions(&self, wanted: Wanted) {
         self.start(Action::Revisions(wanted));
+    }
+
+    /// Build the report `wanted` names from `plugin`, the pack's plugin as its text, and the
+    /// run's `listed` captured files.
+    pub fn report(&self, wanted: crate::report::Wanted, plugin: String, listed: Vec<Captured>) {
+        self.start(Action::Report {
+            wanted,
+            plugin,
+            listed,
+        });
     }
 
     pub fn take(&self, seen: u64) -> Option<(u64, Snapshot)> {
@@ -2766,6 +2854,110 @@ mod tests {
         client.file("r1", "report/out.md", 5, true);
         shows("third");
         assert_eq!(count(), 3, "a copy of another size is stale");
+    }
+
+    #[test]
+    fn a_report_is_built_from_the_plugin_and_the_captured_files_it_asks_for() {
+        use base64::Engine;
+        let pack = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/report");
+        let wasm = std::fs::read(pack.join("ui/report.wasm"))
+            .expect("build it with `just example-report-view`");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&wasm);
+        let plugin: String = encoded
+            .as_bytes()
+            .chunks(76)
+            .map(|line| format!("{}\n", String::from_utf8_lossy(line)))
+            .collect();
+        let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (seen, lanes) = (Arc::clone(&asked), pack.clone());
+        let (url, _) = crate::testserver::serve(move |line| {
+            if !line.contains("/files/") {
+                return "[]".into();
+            }
+            seen.lock().unwrap().push(line.to_string());
+            let lane = if line.contains("triage-go") {
+                "go"
+            } else {
+                "python"
+            };
+            std::fs::read_to_string(lanes.join(format!("inbox/{lane}.json"))).unwrap()
+        });
+        let (keys, files) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let net = crate::net::Net::uncached_for_tests();
+        let client = Client::spawn_with(
+            net.connector(crate::testserver::target("t", &url, keys.path())),
+            Dirs {
+                drafts: None,
+                files: Some(files.path().to_path_buf()),
+            },
+        );
+        let captured = |task: &str, path: &str, size: u64| Captured {
+            task: task.into(),
+            instance: None,
+            path: path.into(),
+            size,
+            key: format!("{task}/{path}"),
+        };
+        let size = |lane: &str| {
+            std::fs::metadata(pack.join(format!("inbox/{lane}.json")))
+                .unwrap()
+                .len()
+        };
+        let listed = vec![
+            captured("triage-go", "verdicts.json", size("go")),
+            captured("triage-go", "notes.md", 3),
+            captured("triage-python", "verdicts.json", size("python")),
+        ];
+        let wanted = |run: &str, settled: bool| crate::report::Wanted {
+            run: run.into(),
+            plugin: ("ui/report.wasm.b64".into(), plugin.len()),
+            listed: listed.iter().map(|f| (f.key.clone(), f.size)).collect(),
+            settled,
+        };
+        let built = |wanted: &crate::report::Wanted| {
+            let snapshot = snapshot_when(&client, Duration::from_secs(30), |s| {
+                s.report.as_ref().is_some_and(|b| &b.wanted == wanted)
+            });
+            snapshot.report.unwrap()
+        };
+        let triaged = |built: &crate::report::Built| {
+            let view = built.report.view.as_ref().unwrap();
+            let crucible_view::Node::Stack { children } = &view.body else {
+                panic!("the report is a stack");
+            };
+            let crucible_view::Node::Stats { items } = &children[0] else {
+                panic!("the report starts with its stats");
+            };
+            items[0].value.clone()
+        };
+
+        client.report(wanted("r1", false), plugin.clone(), listed.clone());
+        let first = built(&wanted("r1", false));
+        assert_eq!(first.report.name, "report");
+        assert_eq!(triaged(&first), "64");
+        let fetched = asked.lock().unwrap().clone();
+        assert_eq!(fetched.len(), 2, "{fetched:?}");
+        assert!(fetched.iter().all(|line| line.contains("verdicts.json")));
+
+        client.report(wanted("r1", true), plugin.clone(), listed.clone());
+        assert_eq!(triaged(&built(&wanted("r1", true))), "64");
+        assert_eq!(
+            asked.lock().unwrap().len(),
+            2,
+            "a settled run's copies stand in"
+        );
+
+        client.report(wanted("r2", true), "not base64!".into(), listed.clone());
+        let refused = built(&wanted("r2", true));
+        let error = refused.report.view.clone().unwrap_err();
+        assert!(error.starts_with("the plugin is not base64"), "{error}");
+        assert_eq!(asked.lock().unwrap().len(), 2, "nothing is fetched for it");
+
+        client.report(wanted("r3", false), plugin.clone(), Vec::new());
+        assert_eq!(
+            built(&wanted("r3", false)).report.view,
+            Err("No task has captured verdicts.json yet.".into())
+        );
     }
 
     /// The first snapshot `ready` accepts, within `within`.
