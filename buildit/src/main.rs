@@ -269,6 +269,10 @@ pub struct BuildArgs {
     /// What builds the Dockerfile on the server (default the server's); buildkit is experimental
     #[arg(long, value_enum, requires = "server", conflicts_with_all = ["image", "base"])]
     pub builder: Option<jobs::Builder>,
+    /// How the layers the build adds are compressed (default gzip); zstd needs --builder buildkit
+    /// or a server that defaults to it
+    #[arg(long, value_enum, requires = "server", conflicts_with_all = ["image", "base"])]
+    pub compression: Option<jobs::Compression>,
     /// Run --script in this image instead of building the Dockerfile; the build is the image plus
     /// --path as one new layer
     #[arg(long, requires_all = ["server", "script", "path"], conflicts_with = "image")]
@@ -382,6 +386,7 @@ impl BuildArgs {
             caches,
             ccache: self.ccache,
             builder: self.builder,
+            compression: self.compression,
             base: self.base.clone(),
             script: self.script.clone(),
             path: self.path.clone(),
@@ -592,6 +597,34 @@ mod tests {
             Err(e) => panic!("{e}"),
         };
         assert_eq!(args.bud_args, ["--retry", "5"]);
+    }
+
+    #[test]
+    fn a_server_build_may_ask_for_zstd_layers() {
+        use crate::jobs::Compression;
+        let build = |extra: &[&str]| {
+            let argv = [&["build", "--server", "/s", "-c", "."], extra].concat();
+            match parse(&argv) {
+                Ok(Cmd::Build(args)) => args.params().unwrap().compression,
+                _ => panic!("{argv:?} is a server build"),
+            }
+        };
+        assert_eq!(build(&[]), None);
+        assert_eq!(build(&["--compression", "zstd"]), Some(Compression::Zstd));
+        assert_eq!(build(&["--compression", "gzip"]), Some(Compression::Gzip));
+        assert!(refused(&["build", "--server", "/s", "--compression", "lz4"]).contains("lz4"));
+        assert!(refused(&["build", "img:t", "--compression", "zstd"]).contains("--compression"));
+        let layer = ["--base", "b:1", "--script", "make", "--path", "/src"];
+        assert!(
+            refused(
+                &[
+                    &["build", "--server", "/s", "--compression", "zstd"],
+                    &layer[..]
+                ]
+                .concat()
+            )
+            .contains("--base")
+        );
     }
 
     #[test]
