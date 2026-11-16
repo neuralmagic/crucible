@@ -278,7 +278,7 @@ pub fn plan(plan: &ValidPlan, parent: &Parent, from: &[TaskName]) -> Result<Reru
             .filter(|name| !passed(name) || !parent.definitions.contains_key(*name))
             .map(|name| (*name).clone()),
     );
-    let loops = plan.revise_loops();
+    let loops = plan.round_loops();
     loop {
         let before = rerun.len();
         for task in plan.tasks_topo() {
@@ -286,9 +286,9 @@ pub fn plan(plan: &ValidPlan, parent: &Parent, from: &[TaskName]) -> Result<Reru
                 rerun.insert(task.name.clone());
             }
         }
-        for revise in &loops {
-            if revise.body.iter().any(|t| rerun.contains(&t.name)) {
-                rerun.extend(revise.body.iter().map(|t| t.name.clone()));
+        for rounds in &loops {
+            if rounds.body.iter().any(|t| rerun.contains(&t.name)) {
+                rerun.extend(rounds.body.iter().map(|t| t.name.clone()));
             }
         }
         if rerun.len() == before {

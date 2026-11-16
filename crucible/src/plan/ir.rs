@@ -32,6 +32,9 @@ pub const PARAMS_INPUT: &str = "params";
 /// The reserved input a revised task receives its reviewer's last verdict under, from its second
 /// round on.
 pub const REVISION_INPUT: &str = "revision";
+/// The input every task of a loop's body receives its round and the round before under. Reserved
+/// for body tasks only.
+pub const LOOP_INPUT: &str = "loop";
 /// Every key the engine writes into a task's inputs itself. A dependency named after one of
 /// them would have its entry overwritten, so [`crate::plan::ir::Plan::validate`] refuses it.
 pub const RESERVED_INPUTS: [&str; 6] = [
@@ -827,6 +830,9 @@ pub struct Task {
     /// Sends a failing verdict back to a dependency (see [`Revise`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revise: Option<Revise>,
+    /// The bounded loop this task decides (see [`Loop`]).
+    #[serde(default, rename = "loop", skip_serializing_if = "Option::is_none")]
+    pub loop_while: Option<Loop>,
     /// How long one attempt may run before its runner kills it and it settles failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<TaskTimeout>,
@@ -922,6 +928,51 @@ impl From<Revise> for ReviseRepr {
 /// The most rounds one revise loop may run. Operator-owned, like [`MAX_FANOUT_CEILING`].
 pub const MAX_ROUNDS_CEILING: u32 = 5;
 
+/// A bounded loop, declared on the task that decides it: `body` runs in rounds while that task's
+/// `again` field holds, for at most `rounds` rounds. `body` includes the deciding task.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Loop {
+    pub body: Vec<TaskName>,
+    pub again: Again,
+    pub rounds: u32,
+}
+
+/// The field a loop's deciding task emits, and the values another round runs on.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Again {
+    pub field: OutputField,
+    /// The labels another round runs on. Empty for a boolean field, which continues on `true`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub is: Vec<Label>,
+}
+
+impl Again {
+    /// Whether the deciding task's `output` asks for another round.
+    pub fn holds(&self, output: Option<&serde_json::Value>) -> bool {
+        match output.and_then(|output| output.get(&self.field.0)) {
+            Some(serde_json::Value::Bool(go)) => self.is.is_empty() && *go,
+            Some(serde_json::Value::String(label)) => self.is.iter().any(|l| l.as_str() == label),
+            _ => false,
+        }
+    }
+
+    /// The condition as the admitted-plan event writes it, `task.field in a|b`.
+    pub fn wire(&self, task: &TaskName) -> String {
+        let labels = match self.is.as_slice() {
+            [] => crucible_contract::decision::NOUL_YES.to_owned(),
+            labels => labels
+                .iter()
+                .map(Label::as_str)
+                .collect::<Vec<_>>()
+                .join("|"),
+        };
+        format!("{task}.{} in {labels}", self.field.0)
+    }
+}
+
+/// The most rounds one loop may run. Operator-owned, like [`MAX_FANOUT_CEILING`].
+pub const MAX_LOOP_ROUNDS: u32 = 256;
+
 /// The most repair turns one agent attempt may take.
 pub const MAX_REPAIR_CEILING: u32 = 3;
 
@@ -974,17 +1025,26 @@ impl ValidPlan {
         self.plan.tasks.iter().find(|t| &t.name == name)
     }
 
-    pub fn revise_loops(&self) -> Vec<ReviseLoop<'_>> {
+    /// Every body the plan runs in rounds: its revise loops and its loops, each in dispatch
+    /// order.
+    pub fn round_loops(&self) -> Vec<RoundLoop<'_>> {
         self.tasks_topo()
-            .filter_map(|reviewer| {
-                let revise = reviewer.revise.as_ref()?;
-                Some(ReviseLoop {
-                    reviewer,
+            .filter_map(|decider| {
+                let (members, max_rounds, on) = match (&decider.revise, &decider.loop_while) {
+                    (Some(revise), _) => (&revise.tasks, revise.max_rounds, Continue::Failing),
+                    (None, Some(looped)) => {
+                        (&looped.body, looped.rounds, Continue::While(&looped.again))
+                    }
+                    (None, None) => return None,
+                };
+                Some(RoundLoop {
+                    decider,
                     body: self
                         .tasks_topo()
-                        .filter(|t| t.name == reviewer.name || revise.tasks.contains(&t.name))
+                        .filter(|t| t.name == decider.name || members.contains(&t.name))
                         .collect(),
-                    max_rounds: revise.max_rounds,
+                    max_rounds,
+                    on,
                 })
             })
             .collect()
@@ -1020,13 +1080,26 @@ pub struct TimeoutPastCeiling {
     pub ceiling: std::time::Duration,
 }
 
-pub struct ReviseLoop<'a> {
-    pub reviewer: &'a Task,
+/// A body of tasks the executor runs in rounds: a revise loop or a loop.
+pub struct RoundLoop<'a> {
+    /// The task whose result decides another round: a revise loop's reviewer, a loop's deciding
+    /// task.
+    pub decider: &'a Task,
     pub body: Vec<&'a Task>,
     pub max_rounds: u32,
+    pub on: Continue<'a>,
 }
 
-impl ReviseLoop<'_> {
+/// What sends a [`RoundLoop`] into another round.
+#[derive(Clone, Copy, Debug)]
+pub enum Continue<'a> {
+    /// A revise loop: the reviewer settled failing.
+    Failing,
+    /// A loop: the round passed and the deciding task's field holds.
+    While(&'a Again),
+}
+
+impl RoundLoop<'_> {
     pub fn contains(&self, name: &TaskName) -> bool {
         self.body.iter().any(|t| &t.name == name)
     }
@@ -1568,6 +1641,75 @@ pub enum PlanError {
     ReviseTargetUnreachable { task: String, target: String },
     #[error("task {task:?}: max_rounds = {got} is outside 2..={MAX_ROUNDS_CEILING}")]
     RoundsOutOfRange { task: String, got: u32 },
+    #[error("task {task:?}: loop rounds = {got} is outside 1..={MAX_LOOP_ROUNDS}")]
+    LoopRoundsOutOfRange { task: String, got: u32 },
+    #[error("task {task:?} decides a loop whose body does not list it")]
+    LoopBodyOmitsDecider { task: String },
+    #[error("task {task:?}'s loop names {member:?} twice")]
+    LoopMemberRepeated { task: String, member: String },
+    #[error("task {task:?}'s loop names unknown task {member:?}")]
+    LoopUnknownMember { task: String, member: String },
+    #[error(
+        "task {task:?} loops while its field {field:?} holds, but declares it as {declared}; a \
+         loop condition reads a boolean or a list of labels"
+    )]
+    LoopFieldNotAnswerable {
+        task: String,
+        field: String,
+        declared: String,
+    },
+    #[error(
+        "task {task:?} loops while {field:?} is {label:?}, which is not one of the labels the \
+         field declares"
+    )]
+    LoopLabelUndeclared {
+        task: String,
+        field: String,
+        label: String,
+    },
+    #[error(
+        "task {task:?}'s loop includes {member:?}, a {kind} task; only agent, command, and \
+         evaluate tasks take part in a loop"
+    )]
+    LoopOnUnsupportedTask {
+        task: String,
+        member: String,
+        kind: &'static str,
+    },
+    #[error(
+        "task {task:?}'s loop includes {member:?}, which maps over a list; a round re-runs tasks, \
+         not a fan-out"
+    )]
+    LoopWithFanout { task: String, member: String },
+    #[error(
+        "tasks {left:?} and {right:?} both run {member:?} in rounds; a task is in at most one loop \
+         or revise loop, and they do not nest"
+    )]
+    LoopBodiesOverlap {
+        left: String,
+        right: String,
+        member: String,
+    },
+    #[error(
+        "task {task:?}'s loop runs {}, but {skipped:?} lies between two of them; list {skipped:?} \
+         in the body, or a round would leave it reading a result the loop replaces",
+        .body.join(", ")
+    )]
+    LoopSkipsATask {
+        task: String,
+        skipped: String,
+        body: Vec<String>,
+    },
+    #[error(
+        "task {task:?}'s loop holds both a main-graph task and the epilogue task {member:?}; a \
+         body runs in one stage"
+    )]
+    LoopMixesStages { task: String, member: String },
+    #[error(
+        "task {task:?}'s loop includes {member:?}, which depends on a task named \"{LOOP_INPUT}\"; \
+         a body task receives its round under that name"
+    )]
+    LoopInputTaken { task: String, member: String },
     #[error("task {task:?}: repair = {got} is outside 0..={MAX_REPAIR_CEILING}")]
     RepairOutOfRange { task: String, got: u32 },
     #[error(
@@ -2644,6 +2786,55 @@ impl Plan {
                     }
                 }
             }
+            if let Some(looped) = &t.loop_while {
+                if !(1..=MAX_LOOP_ROUNDS).contains(&looped.rounds) {
+                    return Err(PlanError::LoopRoundsOutOfRange {
+                        task: task(),
+                        got: looped.rounds,
+                    });
+                }
+                if !looped.body.contains(&t.name) {
+                    return Err(PlanError::LoopBodyOmitsDecider { task: task() });
+                }
+                for (i, member) in looped.body.iter().enumerate() {
+                    if looped.body[..i].contains(member) {
+                        return Err(PlanError::LoopMemberRepeated {
+                            task: task(),
+                            member: member.0.clone(),
+                        });
+                    }
+                    if !index.contains_key(member) {
+                        return Err(PlanError::LoopUnknownMember {
+                            task: task(),
+                            member: member.0.clone(),
+                        });
+                    }
+                }
+                let field = &looped.again.field.0;
+                let not_answerable = |declared: String| PlanError::LoopFieldNotAnswerable {
+                    task: task(),
+                    field: field.clone(),
+                    declared,
+                };
+                match (t.emits.field(field), looped.again.is.as_slice()) {
+                    (Declared::Typed(FieldType::Boolean), []) => {}
+                    (Declared::Typed(FieldType::OneOf(declared)), [_, ..]) => {
+                        if let Some(label) = looped.again.is.iter().find(|l| !declared.contains(l))
+                        {
+                            return Err(PlanError::LoopLabelUndeclared {
+                                task: task(),
+                                field: field.clone(),
+                                label: label.to_string(),
+                            });
+                        }
+                    }
+                    (Declared::Typed(ty), _) => return Err(not_answerable(ty.to_string())),
+                    (Declared::Untyped, _) => return Err(not_answerable("untyped".to_owned())),
+                    (Declared::Unchecked | Declared::Omitted, _) => {
+                        return Err(not_answerable("undeclared".to_owned()));
+                    }
+                }
+            }
         }
         let conditional = may_settle_not_taken(&self.tasks);
         for t in &self.tasks {
@@ -2832,6 +3023,57 @@ impl Plan {
                 });
             }
         }
+        for t in &self.tasks {
+            let Some(looped) = &t.loop_while else {
+                continue;
+            };
+            let body: Vec<usize> = looped.body.iter().map(|member| index[member]).collect();
+            for &m in &body {
+                let member = &self.tasks[m];
+                let offending = || (t.name.0.clone(), member.name.0.clone());
+                if !matches!(
+                    member.task,
+                    TaskKind::Agent { .. } | TaskKind::Command { .. } | TaskKind::Evaluate { .. }
+                ) {
+                    let (task, member_name) = offending();
+                    return Err(PlanError::LoopOnUnsupportedTask {
+                        task,
+                        member: member_name,
+                        kind: member.task.label(),
+                    });
+                }
+                if member.over.is_some() {
+                    let (task, member) = offending();
+                    return Err(PlanError::LoopWithFanout { task, member });
+                }
+                if member.stage != t.stage {
+                    let (task, member) = offending();
+                    return Err(PlanError::LoopMixesStages { task, member });
+                }
+                if member.depends_on.iter().any(|d| d.0 == LOOP_INPUT) {
+                    let (task, member) = offending();
+                    return Err(PlanError::LoopInputTaken { task, member });
+                }
+                if let Some(other) = loop_of.insert(&member.name, &t.name) {
+                    return Err(PlanError::LoopBodiesOverlap {
+                        left: other.0.clone(),
+                        right: t.name.0.clone(),
+                        member: member.name.0.clone(),
+                    });
+                }
+            }
+            if let Some(skipped) = (0..n).find(|&x| {
+                !body.contains(&x)
+                    && body.iter().any(|&from| reaches(from, x))
+                    && body.iter().any(|&to| reaches(x, to))
+            }) {
+                return Err(PlanError::LoopSkipsATask {
+                    task: t.name.0.clone(),
+                    skipped: self.tasks[skipped].name.0.clone(),
+                    body: body.iter().map(|&m| self.tasks[m].name.0.clone()).collect(),
+                });
+            }
+        }
         Ok(ValidPlan { plan: self, topo })
     }
 }
@@ -2864,6 +3106,7 @@ mod tests {
             keyed: Vec::new(),
             when: None,
             revise: None,
+            loop_while: None,
             timeout: None,
             history: None,
             repair: 0,
@@ -3861,6 +4104,7 @@ mod tests {
             keyed: Vec::new(),
             when: None,
             revise: None,
+            loop_while: None,
             timeout: None,
             history: None,
             repair: 0,
@@ -4014,6 +4258,7 @@ mod tests {
             keyed: Vec::new(),
             when: None,
             revise: None,
+            loop_while: None,
             timeout: None,
             history: None,
             repair: 0,
@@ -5687,11 +5932,11 @@ emits = ["lines"]
         ])
         .validate()
         .expect("a chain with inputs and dependents outside it");
-        let loops = ok.revise_loops();
+        let loops = ok.round_loops();
         assert_eq!(loops.len(), 1);
         let names: Vec<&str> = loops[0].body.iter().map(|t| t.name.0.as_str()).collect();
         assert_eq!(names, ["pick", "build", "rig", "confirm"]);
-        assert_eq!(loops[0].reviewer.name.0, "confirm");
+        assert_eq!(loops[0].decider.name.0, "confirm");
         assert_eq!(loops[0].max_rounds, 3);
     }
 

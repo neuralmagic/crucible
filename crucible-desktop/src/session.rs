@@ -66,17 +66,24 @@ pub struct TaskView {
     pub revise: Vec<String>,
     /// The most rounds `revise` may run, the first included.
     pub max_rounds: u32,
-    /// The revise loop it runs in, as the reviser or one of its targets.
+    /// The tasks of the loop it decides, itself among them.
+    pub looped: Vec<String>,
+    /// `task.field in a|b`, the condition of the loop it decides.
+    pub again: String,
+    /// The most rounds the loop it decides may run.
+    pub loop_rounds: u32,
+    /// The revise loop or loop it runs in.
     pub revised: Option<Revised>,
     pub rounds: Vec<Round>,
     /// When its first attempt started, from logs that record it.
     pub started_at: Option<jiff::Timestamp>,
 }
 
-/// A revise loop as one of its tasks sees it.
+/// A revise loop or a loop as one of its tasks sees it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Revised {
-    /// The task whose failing result starts another round.
+    /// The task whose result starts another round: a reviser by failing, a loop's deciding task
+    /// by passing with its condition true.
     pub by: String,
     pub max_rounds: u32,
 }
@@ -192,6 +199,9 @@ impl TaskView {
             revise: task.revise,
             max_rounds: task.max_rounds,
             revised: None,
+            looped: task.r#loop,
+            again: task.again,
+            loop_rounds: task.loop_rounds,
             rounds: Vec::new(),
         }
     }
@@ -361,12 +371,18 @@ pub fn round_key(key: &str) -> Option<u32> {
     key.strip_prefix("round-")?.parse().ok().filter(|n| *n >= 1)
 }
 
-/// Each loop task's reviser and round cap, from the revisers' `revise` lists.
+/// Each task's round body and cap: a reviser's `revise` list, a deciding task's loop.
 fn loops(tasks: &mut [TaskView]) {
     let revisers: Vec<(String, Vec<String>, u32)> = tasks
         .iter()
         .filter(|task| !task.revise.is_empty())
         .map(|task| (task.name.clone(), task.revise.clone(), task.max_rounds))
+        .chain(
+            tasks
+                .iter()
+                .filter(|task| !task.looped.is_empty())
+                .map(|task| (task.name.clone(), task.looped.clone(), task.loop_rounds)),
+        )
         .collect();
     for task in tasks.iter_mut() {
         task.revised = revisers

@@ -175,6 +175,8 @@ pub enum WorkflowError {
          a failed candidate back through its next iteration"
     )]
     ReviseOutsidePlaybook { task: String },
+    #[error("task {task:?} decides a loop, which only a playbook runs")]
+    LoopOutsidePlaybook { task: String },
     #[error("task {task:?} declares history, which only a playbook launched in a series receives")]
     HistoryOutsidePlaybook { task: String },
     #[error(
@@ -346,6 +348,13 @@ impl WorkflowCfg {
             && let Some(task) = self.tasks.iter().find(|task| task.revise.is_some())
         {
             return Err(WorkflowError::ReviseOutsidePlaybook {
+                task: task.name.0.clone(),
+            });
+        }
+        if self.workflow_type != WorkflowType::Playbook
+            && let Some(task) = self.tasks.iter().find(|task| task.loop_while.is_some())
+        {
+            return Err(WorkflowError::LoopOutsidePlaybook {
                 task: task.name.0.clone(),
             });
         }

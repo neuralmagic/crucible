@@ -193,6 +193,21 @@ kind-e2e:
 revise-loop-e2e:
     scripts/revise-loop-e2e.sh
 
+# Run the bounded loop example (examples/loop) in a scratch copy, with tools/fake-agent.py as the
+# agent. Takes three of its five rounds and prints the rows.
+loop-example:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    root="$(pwd)"
+    work="$(mktemp -d)"
+    mkdir -p "$work/examples" "$work/tools"
+    cp -R examples/loop "$work/examples/loop"
+    cp tools/fake-agent.py "$work/tools/"
+    cd "$work/examples/loop"
+    cargo run --quiet --manifest-path "$root/Cargo.toml" -p crucible -- \
+        plan run --manifest crucible.toml --max-cost 1 --max-time 5m
+    echo "session log: $work/examples/loop/state/session.jsonl"
+
 # End-to-end proof that a sandboxed agent reaches crucible-kueue with an agent token its own
 # supervisor obtained: a controller in the cluster dispatches e2e/kueue/pack, and the script checks
 # the issued token, the Job and the agent's whoami (scenario in the script header). Images come

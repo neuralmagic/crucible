@@ -146,6 +146,16 @@ Takes one positional argument, `list`.
 | `list` | `producer.field` | A list field a dependency emits; each item is one instance's key. |
 | `max` | `int` | Instance cap, within the engine's ceiling of 256. A longer list fails the task. |
 
+### `loop()`
+
+A bounded loop, listed in `workflow(tasks = ...)` in place of its body: the body's tasks run in rounds while a field one of them emits holds. Each round reports as `task[round-N]`, and a dependent reads the last round. Playbooks only.
+
+| Argument | Type | Purpose |
+| --- | --- | --- |
+| `body` | `list[task]` | The agent, command, and evaluate tasks a round runs, with every task between two of them. |
+| `again` | `task.field \| task.field.any_of(...)` | A field a body task emits: a boolean, which continues on true, or a list of labels with the labels to continue on. Read after each round. |
+| `rounds` | `int` | Round cap, counting the first, from 1 to the engine's ceiling of 256. Reaching it is not a failure. |
+
 ### `others()`
 
 An entry of `depends_on` that stands for every main-graph task no `others()` task feeds. With `join = "settled"` the task reads how each of them settled. Not in the epilogue, where `outcome` already carries that.
@@ -448,3 +458,4 @@ Present alongside the dependency entries, never wrapped in one.
 | `outcome` | `object` | How the main graph ended and what each of its tasks settled as, as `{"exit": str, "tasks": {name: {"status", "note", "output", "files"}}}`, in an epilogue task only: each entry is what a `settled` join receives, `per_instance` included for a mapped task. `files` says whether that task's declared files, passing or failing, are staged under `inputs/<name>/`. |
 | `params` | `object` | Every declared parameter's bound value under its name, in its declared type, and `{}` where the source declares none, in a command or evaluate task only. |
 | `revision` | `object` | The verdict that sent this task back, as `{"round": int, "max_rounds": int, "reviewer": str, "review": {"status", "note", "output", "files"}}`, from the second round of a revise loop on. |
+| `loop` | `object` | The round about to run and the round before, as `{"round": int, "max_rounds": int, "previous": {task: output}}`, in a task of a loop's body only. `previous` holds each body task that passed in the round before and is empty in the first. |

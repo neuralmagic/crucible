@@ -306,6 +306,64 @@ under `revision`. The engine stages the declared files of the reviewer under
 
 `examples/revise-loop` runs a revise pair through a real OpenShell sandbox with a fake model.
 
+## Loop
+
+`loop(body, again, rounds)` runs a set of tasks in rounds while a field that one of them emits
+holds. List the loop in `workflow(tasks = [...])` in place of the tasks in its body.
+
+```python
+turn = agent(
+    name = "turn",
+    prompt = "Take one more step toward the goal.",
+    session = "work",
+    emits = ["summary"],
+)
+
+score = command(
+    name = "score",
+    run = "./score.sh",
+    depends_on = [turn],
+    emits = {"go": "boolean", "points": "integer"},
+)
+
+report = command(name = "report", run = "./report.sh", depends_on = [score])
+
+workflow(type = "playbook", tasks = [
+    loop(body = [turn, score], again = score.go, rounds = 5),
+    report,
+])
+```
+
+The first round always runs. After each round the engine reads `score.go`. If it is true, the
+round passed, and rounds remain, the body runs again. `again` also takes a field typed as a
+list of labels: `again = score.verdict.any_of("more", "retry")`.
+
+Every round, each body task reads the round and the output of the round before under `loop`:
+
+```json
+{"round": 3, "max_rounds": 5,
+ "previous": {"turn": {"summary": "tightened the parser"}, "score": {"go": true, "points": 2}}}
+```
+
+- **Rounds have a limit.** `rounds` is 1 to 256. It has no default. If the loop reaches the
+  limit while the field still holds, the loop ends and that is not a failure.
+- **Each round settles.** A passing round makes a commit, so the next round starts from it.
+  The session log records `turn[round-1]`, `score[round-1]`, and so on, and then one row for
+  each task with the status of its last round. A task after the loop reads the last round.
+- **A failed round ends the loop.** The task that failed settles failed, as it does outside a
+  loop.
+- **Sessions continue.** A body task with a `session` continues the same conversation in each
+  round. A task without one starts a new conversation in each round.
+- **Ceilings apply between rounds.** The engine checks the cost and time ceilings of the run
+  before each round and before each task. `rounds` is not a budget.
+- **The graph has one copy of the body.** The body compiles to one task each, whatever
+  `rounds` is. The graph views draw a frame around the body and one dotted edge from the
+  deciding task back to the first task, with the condition and the round count.
+- **Body limits.** A body holds agent, command, and evaluate tasks, and every task between
+  two of them. It cannot contain a route, a fan-out, a reviewer, or another loop.
+
+`examples/loop` is this pack.
+
 ## Fan out
 
 `over = producer.field` maps a task over a list that its dependency emits. There is one instance for each item:

@@ -379,6 +379,22 @@ impl Display for SendBackValue {
 #[starlark_value(type = "send_back")]
 impl<'v> StarlarkValue<'v> for SendBackValue {}
 
+/// `loop(body, again, rounds)`: the body's tasks, the deciding one carrying the loop.
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+pub(crate) struct LoopValue(#[allocative(skip)] pub(crate) Vec<Task>);
+
+starlark_simple_value!(LoopValue);
+
+impl Display for LoopValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let body: Vec<&str> = self.0.iter().map(|task| task.name.as_str()).collect();
+        write!(f, "loop({})", body.join(", "))
+    }
+}
+
+#[starlark_value(type = "loop")]
+impl<'v> StarlarkValue<'v> for LoopValue {}
+
 /// `at_least(n)` or `at_most(n)`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Bound {

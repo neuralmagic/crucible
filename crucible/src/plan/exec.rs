@@ -25,9 +25,9 @@ use crate::plan::attempt::{Attempt, AttemptOutcome, BatchItem, TransportFailure}
 use crate::plan::files::CapturedFiles;
 use crate::plan::history::SeriesHistory;
 use crate::plan::ir::{
-    COMPLETE_FIELD, Decider, FILES_INPUT, HISTORY_INPUT, ITEM_INPUT, ItemKey, Join, OUTCOME_INPUT,
-    PARAMS_INPUT, REASON_FIELD, REVISION_INPUT, ReviseLoop, Stage, Task, TaskKind, TaskName,
-    ValidPlan, aligned, declared_questions,
+    COMPLETE_FIELD, Continue, Decider, FILES_INPUT, HISTORY_INPUT, ITEM_INPUT, ItemKey, Join,
+    LOOP_INPUT, OUTCOME_INPUT, PARAMS_INPUT, REASON_FIELD, REVISION_INPUT, RoundLoop, Stage, Task,
+    TaskKind, TaskName, ValidPlan, aligned, declared_questions,
 };
 use crate::plan::machine::{
     BlockedReason, PlanEvent, PlanMachine, TaskEvent, TaskMachine, TaskState,
@@ -538,12 +538,12 @@ pub fn execute(
     }
     ledger.plan.advance(PlanEvent::Started)?;
 
-    let loops: Vec<ReviseLoop<'_>> = plan
-        .revise_loops()
+    let loops: Vec<RoundLoop<'_>> = plan
+        .round_loops()
         .into_iter()
         .filter(|l| l.body.iter().all(|t| runnable.contains(&t.name)))
         .collect();
-    let loop_of: BTreeMap<&TaskName, &ReviseLoop<'_>> = loops
+    let loop_of: BTreeMap<&TaskName, &RoundLoop<'_>> = loops
         .iter()
         .flat_map(|l| l.body.iter().map(move |t| (&t.name, l)))
         .collect();
@@ -1367,6 +1367,7 @@ fn file_producers(
                     max_fanout: None,
                     when: None,
                     revise: None,
+                    loop_while: None,
                     ..p.clone()
                 };
                 if contributes(p, &instance, r) {
@@ -1689,13 +1690,14 @@ struct RoundRow<'a> {
 }
 
 fn run_loop(
-    body: &ReviseLoop<'_>,
+    body: &RoundLoop<'_>,
     plan: &ValidPlan,
     cfg: ExecCfg<'_>,
     runner: &mut dyn TaskRunner,
     ledger: &mut Ledger<'_>,
 ) -> Result<(), IllegalTransition> {
-    let reviewer = body.reviewer;
+    let decider = body.decider;
+    let revising = matches!(body.on, Continue::Failing);
     let spends = body.spends();
     let mut view = ledger.results.clone();
     let mut rounds: Vec<Vec<RoundRow<'_>>> = Vec::new();
@@ -1720,13 +1722,13 @@ fn run_loop(
     for round in 1..=body.max_rounds {
         let verdict = rounds
             .last()
-            .and_then(|rows| rows.iter().find(|row| row.task.name == reviewer.name))
+            .and_then(|rows| rows.iter().find(|row| row.task.name == decider.name))
             .map(|row| row.result.clone());
         if verdict.is_some() && !resumed(round) {
             if ledger
                 .halted
                 .as_ref()
-                .is_some_and(|halt| halt.stops(reviewer.stage, spends))
+                .is_some_and(|halt| halt.stops(decider.stage, spends))
             {
                 break;
             }
@@ -1742,7 +1744,7 @@ fn run_loop(
             if let Some(result) = folded(t, round) {
                 stopped |= cfg.early_completion
                     && t.stage == Stage::Iteration
-                    && t.name != reviewer.name
+                    && !(revising && t.name == decider.name)
                     && declared_completion(t, &result).is_some();
                 view.insert(t.name.clone(), result.clone());
                 rows.push(RoundRow {
@@ -1777,13 +1779,13 @@ fn run_loop(
             let (result, event) = match settled {
                 Err((result, event)) => (result, event),
                 Ok(()) => {
-                    let is_target = t.name != reviewer.name;
+                    let is_target = revising && t.name != decider.name;
                     let mut producers = file_producers(plan, t, &view, ledger.files);
                     let review_files = is_target
                         && verdict.is_some()
-                        && ledger.files.is_some_and(|files| files.has(&reviewer.name));
+                        && ledger.files.is_some_and(|files| files.has(&decider.name));
                     if review_files {
-                        producers.push(reviewer.clone());
+                        producers.push(decider.clone());
                     }
                     let staged: Vec<&Task> = producers.iter().collect();
                     match runner.stage(t, &staged) {
@@ -1806,9 +1808,15 @@ fn run_loop(
                                     serde_json::json!({
                                         "round": round,
                                         "max_rounds": body.max_rounds,
-                                        "reviewer": reviewer.name.0,
+                                        "reviewer": decider.name.0,
                                         "review": Value::Object(settled_entry(verdict, review_files)),
                                     }),
+                                );
+                            }
+                            if let Continue::While(_) = body.on {
+                                inputs.insert(
+                                    TaskName::reserved(LOOP_INPUT),
+                                    loop_input(round, body.max_rounds, rounds.last()),
                                 );
                             }
                             if !entered {
@@ -1842,7 +1850,7 @@ fn run_loop(
                             }
                             if cfg.early_completion
                                 && t.stage == Stage::Iteration
-                                && t.name != reviewer.name
+                                && !(revising && t.name == decider.name)
                                 && declared_completion(t, &result).is_some()
                             {
                                 stopped = true;
@@ -1867,9 +1875,22 @@ fn run_loop(
                 break;
             }
         }
-        let again = rows
-            .iter()
-            .any(|row| row.task.name == reviewer.name && row.result.status == TaskStatus::Fail);
+        let again = match body.on {
+            Continue::Failing => rows
+                .iter()
+                .any(|row| row.task.name == decider.name && row.result.status == TaskStatus::Fail),
+            Continue::While(again) => {
+                rows.len() == body.body.len()
+                    && rows.iter().all(|row| {
+                        if row.task.name == decider.name {
+                            row.result.status == TaskStatus::Pass
+                                && again.holds(row.result.output.as_ref())
+                        } else {
+                            matches!(row.result.status, TaskStatus::Pass | TaskStatus::NotTaken)
+                        }
+                    })
+            }
+        };
         rounds.push(rows);
         if stopped || !again {
             break;
@@ -1914,13 +1935,33 @@ fn run_loop(
     Ok(())
 }
 
-/// One round of a revise loop, as the task it runs as.
+/// One round of a revise loop or a loop, as the task it runs as.
 fn round_task(t: &Task, round: u32) -> Task {
     Task {
         name: TaskName::round(&t.name, round),
         revise: None,
+        loop_while: None,
         ..t.clone()
     }
+}
+
+/// What a loop's body task receives under [`LOOP_INPUT`]: the round about to run, the bound, and
+/// the output of each task that passed in the round before.
+fn loop_input(round: u32, max_rounds: u32, previous: Option<&Vec<RoundRow<'_>>>) -> Value {
+    let previous: serde_json::Map<String, Value> = previous
+        .into_iter()
+        .flatten()
+        .filter(|row| row.result.status == TaskStatus::Pass)
+        .map(|row| {
+            let output = row.result.output.clone().unwrap_or(Value::Null);
+            (row.task.name.0.clone(), output)
+        })
+        .collect();
+    serde_json::json!({
+        "round": round,
+        "max_rounds": max_rounds,
+        "previous": previous,
+    })
 }
 
 fn ledger_round(
@@ -1940,6 +1981,7 @@ fn instance_task(node: &Task, key: &ItemKey) -> Task {
         max_fanout: None,
         when: None,
         revise: None,
+        loop_while: None,
         ..node.clone()
     }
 }
@@ -1957,7 +1999,7 @@ pub fn row_task(plan: &ValidPlan, name: &TaskName) -> Option<Task> {
         .and_then(|round| round.parse::<u32>().ok())
         .filter(|round| *round >= 1);
     let in_loop = plan
-        .revise_loops()
+        .round_loops()
         .iter()
         .find(|l| l.body.iter().any(|t| t.name == node.name))
         .map(|l| l.max_rounds);
@@ -3342,6 +3384,7 @@ mod tests {
             keyed: Vec::new(),
             when: None,
             revise: None,
+            loop_while: None,
             timeout: None,
             history: None,
             repair: 0,
@@ -4165,6 +4208,7 @@ mod tests {
             keyed: Vec::new(),
             when: None,
             revise: None,
+            loop_while: None,
             timeout: None,
             history: None,
             repair: 0,
@@ -4230,6 +4274,7 @@ mod tests {
             keyed: Vec::new(),
             when: None,
             revise: None,
+            loop_while: None,
             timeout: None,
             history: None,
             repair: 0,
@@ -4442,6 +4487,7 @@ mod tests {
             keyed: Vec::new(),
             when: None,
             revise: None,
+            loop_while: None,
             timeout: None,
             history: None,
             repair: 0,
@@ -10628,6 +10674,206 @@ mod tests {
         assert_resumes_from_every_cut(&plan, ExecCfg::default(), |r| {
             r.rounds("author", &[drafted, drafted, drafted]);
             r.rounds("repro", &[rejected, rejected, approved]);
+        });
+    }
+
+    /// `name` as the deciding task of a loop over `body`, continuing while its boolean `go` holds.
+    fn looping(name: &str, deps: &[&str], body: &[&str], rounds: u32) -> Task {
+        let mut t = task(name, deps, "any", true);
+        t.emits = crate::plan::ir::Emits::Typed(BTreeMap::from([(
+            crate::plan::ir::OutputField("go".into()),
+            crucible_contract::emits::FieldType::Boolean,
+        )]));
+        t.loop_while = Some(crate::plan::ir::Loop {
+            body: body.iter().map(|member| (*member).into()).collect(),
+            again: crate::plan::ir::Again {
+                field: crate::plan::ir::OutputField("go".into()),
+                is: Vec::new(),
+            },
+            rounds,
+        });
+        t
+    }
+
+    fn go() -> AttemptOutcome {
+        AttemptOutcome::Pass(serde_json::json!({"go": true}))
+    }
+
+    fn stop() -> AttemptOutcome {
+        AttemptOutcome::Pass(serde_json::json!({"go": false}))
+    }
+
+    /// turn -> score (loop, `rounds` rounds) -> last
+    fn turn_and_score(rounds: u32) -> ValidPlan {
+        valid(
+            vec![
+                agent("turn", &[], "any", true),
+                looping("score", &["turn"], &["turn", "score"], rounds),
+                task("last", &["score"], "any", true),
+            ],
+            10.0,
+        )
+    }
+
+    fn loop_inputs<'a>(r: &'a ScriptRunner, task: &str) -> Vec<&'a Value> {
+        r.runs
+            .iter()
+            .filter(|(name, _)| name == task)
+            .map(|(_, inputs)| &inputs[&TaskName(LOOP_INPUT.into())])
+            .collect()
+    }
+
+    #[test]
+    fn a_loop_runs_rounds_while_its_field_holds_and_each_round_reads_the_one_before() {
+        let plan = turn_and_score(5);
+        let mut r = ScriptRunner::new();
+        r.rounds("turn", &[drafted, drafted, drafted]);
+        r.rounds("score", &[go, go, stop]);
+        let (out, rows) = rows_of(&plan, &mut r);
+
+        assert!(out.valid, "{:?}", out.results);
+        assert_eq!(out.exit, PlanExit::Completed);
+        assert_eq!(
+            rows,
+            [
+                row("turn[round-1]", TaskStatus::Pass),
+                row("score[round-1]", TaskStatus::Pass),
+                row("turn[round-2]", TaskStatus::Pass),
+                row("score[round-2]", TaskStatus::Pass),
+                row("turn[round-3]", TaskStatus::Pass),
+                row("score[round-3]", TaskStatus::Pass),
+                row("turn", TaskStatus::Pass),
+                row("score", TaskStatus::Pass),
+                row("last", TaskStatus::Pass),
+            ]
+        );
+
+        let turns = loop_inputs(&r, "turn");
+        assert_eq!(
+            *turns[0],
+            serde_json::json!({"round": 1, "max_rounds": 5, "previous": {}})
+        );
+        assert_eq!(
+            *turns[2],
+            serde_json::json!({
+                "round": 3,
+                "max_rounds": 5,
+                "previous": {"turn": {"draft": "probe"}, "score": {"go": true}},
+            })
+        );
+        assert_eq!(loop_inputs(&r, "score")[1]["round"], 2);
+        assert!(
+            !r.seen_values["last"].contains_key(&TaskName(LOOP_INPUT.into())),
+            "a task outside the body reads no round"
+        );
+        assert_eq!(
+            r.seen_values["last"][&TaskName("score".into())],
+            serde_json::json!({"go": false}),
+            "a dependent reads the last round"
+        );
+        let turn = &out.results[&"turn".into()];
+        assert!(
+            (turn.cost_usd - 0.3).abs() < 1e-9,
+            "the node row carries every round's spend: {}",
+            turn.cost_usd
+        );
+        assert!((out.spent_usd - 0.3).abs() < 1e-9, "{}", out.spent_usd);
+    }
+
+    #[test]
+    fn a_loop_that_spends_its_rounds_with_the_field_still_true_is_not_a_failure() {
+        let plan = turn_and_score(2);
+        let mut r = ScriptRunner::new();
+        r.rounds("score", &[go, go, go]);
+        let (out, rows) = rows_of(&plan, &mut r);
+
+        assert!(out.valid, "{:?}", out.results);
+        assert_eq!(out.exit, PlanExit::Completed);
+        assert_eq!(dispatches(&r), ["turn", "score", "turn", "score", "last"]);
+        assert_eq!(rows.len(), 7, "{rows:?}");
+        assert_eq!(out.results[&"score".into()].status, TaskStatus::Pass);
+    }
+
+    #[test]
+    fn a_failed_round_ends_the_loop_and_fails_its_task() {
+        let plan = turn_and_score(5);
+        let mut r = ScriptRunner::new();
+        r.rounds("turn", &[drafted, broken]);
+        r.rounds("score", &[go]);
+        let (out, rows) = rows_of(&plan, &mut r);
+
+        assert!(!out.valid);
+        assert_eq!(dispatches(&r), ["turn", "score", "turn"]);
+        assert_eq!(
+            rows,
+            [
+                row("turn[round-1]", TaskStatus::Pass),
+                row("score[round-1]", TaskStatus::Pass),
+                row("turn[round-2]", TaskStatus::Fail),
+                row("score[round-2]", TaskStatus::Blocked),
+                row("turn", TaskStatus::Fail),
+                row("score", TaskStatus::Blocked),
+                row("last", TaskStatus::Blocked),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_deciding_task_that_omits_its_field_fails_and_ends_the_loop() {
+        let plan = turn_and_score(5);
+        let mut r = ScriptRunner::new();
+        r.rounds("score", &[go, approved]);
+        let (out, _) = rows_of(&plan, &mut r);
+
+        assert_eq!(dispatches(&r), ["turn", "score", "turn", "score"]);
+        assert_eq!(out.results[&"score".into()].status, TaskStatus::Fail);
+        assert_eq!(out.results[&"last".into()].status, TaskStatus::Blocked);
+        assert!(!out.valid);
+    }
+
+    #[test]
+    fn a_budget_spent_by_a_round_ends_the_loop_before_the_next() {
+        let plan = valid(
+            vec![
+                task("turn", &[], "any", true),
+                spending(looping("score", &["turn"], &["turn", "score"], 5)),
+                agent("last", &["score"], "any", true),
+            ],
+            0.25,
+        );
+        let mut r = ScriptRunner::new();
+        r.default_cost = 0.3;
+        r.rounds("score", &[go, go]);
+        let (out, rows) = rows_of(&plan, &mut r);
+
+        assert_eq!(out.exit, PlanExit::BudgetExceeded);
+        assert_eq!(dispatches(&r), ["turn", "score"]);
+        assert_eq!(
+            rows,
+            [
+                row("turn[round-1]", TaskStatus::Pass),
+                row("score[round-1]", TaskStatus::Pass),
+                row("turn", TaskStatus::Pass),
+                row("score", TaskStatus::Pass),
+                row("last", TaskStatus::Blocked),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_loop_resumes_from_every_cut_including_mid_round() {
+        let plan = valid(
+            vec![
+                task("turn", &[], "any", true),
+                looping("score", &["turn"], &["turn", "score"], 4),
+                task("last", &["score"], "any", true),
+                epilogue("report", &[], false),
+            ],
+            10.0,
+        );
+        assert_resumes_from_every_cut(&plan, ExecCfg::default(), |r| {
+            r.rounds("turn", &[drafted, drafted, drafted]);
+            r.rounds("score", &[go, go, stop]);
         });
     }
 

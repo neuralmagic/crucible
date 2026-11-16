@@ -41,6 +41,18 @@ pub fn plan_admitted(
                     .map(|r| r.tasks.iter().map(|task| task.0.clone()).collect())
                     .unwrap_or_default(),
                 max_rounds: t.revise.as_ref().map_or(0, |r| r.max_rounds),
+                r#loop: t.loop_while.as_ref().map_or_else(Vec::new, |looped| {
+                    plan.tasks_topo()
+                        .filter(|member| looped.body.contains(&member.name))
+                        .map(|member| member.name.0.clone())
+                        .collect()
+                }),
+                again: t
+                    .loop_while
+                    .as_ref()
+                    .map(|looped| looped.again.wire(&t.name))
+                    .unwrap_or_default(),
+                loop_rounds: t.loop_while.as_ref().map_or(0, |looped| looped.rounds),
                 emits: t
                     .emits
                     .fields()
