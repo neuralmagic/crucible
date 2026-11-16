@@ -5649,6 +5649,40 @@ workflow(type = "playbook", tasks = [
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// One round outlasts the duration, so no second round begins although `go` is still true.
+    #[test]
+    fn a_loop_past_its_duration_ends_after_the_round_in_flight() {
+        let dir = playbook_pack(
+            "loop-duration",
+            r#"
+tick = command(
+    name = "tick",
+    run = "sleep 1.1 && printf '{\"go\": true}\n'",
+    emits = {"go": "boolean"},
+)
+last = command(name = "last", run = "printf '{\"done\": true}\n'", depends_on = [tick])
+workflow(type = "playbook", tasks = [
+    loop(body = [tick], again = tick.go, duration = "1s"),
+    last,
+])
+"#,
+        );
+        let out = run_playbook(&dir);
+
+        assert!(out.valid, "{:?}", out.results);
+        assert_eq!(
+            out.results[&"tick[round-1]".into()].status,
+            TaskStatus::Pass
+        );
+        assert!(
+            !out.results.contains_key(&"tick[round-2]".into()),
+            "a round began after the duration passed"
+        );
+        assert_eq!(out.results[&"tick".into()].status, TaskStatus::Pass);
+        assert_eq!(out.results[&"last".into()].status, TaskStatus::Pass);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_chain_revise_loop_rebuilds_from_the_revised_pick() {
         let dir = playbook_pack(

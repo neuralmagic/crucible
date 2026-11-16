@@ -743,7 +743,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
         "top_k" => &["name", "k", "direction", "depends_on", "required"],
         "each" => &["list", "max"],
         "send_back" => &["tasks", "rounds"],
-        "loop" => &["body", "again", "rounds"],
+        "loop" => &["body", "again", "rounds", "duration"],
         "at_least" | "at_most" => &["bound"],
         "model" => &["min_confidence", "files"],
         "human" => &["review", "timeout"],
@@ -1251,15 +1251,30 @@ fn value_constructor(
                         .map_or_else(|| "untyped".to_owned(), |ty| ty.to_string()),
                 });
             }
-            let rounds = match take_value(named, "rounds")? {
-                Value::Int(rounds) => u32::try_from(rounds)
-                    .ok()
-                    .filter(|rounds| (1..=MAX_LOOP_ROUNDS).contains(rounds))
-                    .ok_or(CompileError::LoopRoundsOutOfRange {
-                        got: i64::from(rounds),
-                    })?,
-                _ => return Err(wrong_type("rounds", "an integer")),
+            let rounds = match named.remove("rounds") {
+                None | Some(Value::None) => None,
+                Some(Value::Int(rounds)) => Some(
+                    u32::try_from(rounds)
+                        .ok()
+                        .filter(|rounds| (1..=MAX_LOOP_ROUNDS).contains(rounds))
+                        .ok_or(CompileError::LoopRoundsOutOfRange {
+                            got: i64::from(rounds),
+                        })?,
+                ),
+                Some(_) => return Err(wrong_type("rounds", "an integer")),
             };
+            let duration = match named.remove("duration") {
+                None | Some(Value::None) => None,
+                Some(Value::String(raw)) => Some(
+                    raw.parse::<TaskTimeout>()
+                        .map_err(|_| CompileError::LoopDurationInvalid { raw })?,
+                ),
+                Some(_) => return Err(wrong_type("duration", "a duration string")),
+            };
+            if rounds.is_none() && duration.is_none() {
+                return Err(CompileError::LoopUnbounded);
+            }
+            let rounds = rounds.unwrap_or(MAX_LOOP_ROUNDS);
             let names: Vec<TaskName> = body.iter().map(|task| task.name.clone()).collect();
             let Some(decider) = body
                 .iter_mut()
@@ -1281,6 +1296,7 @@ fn value_constructor(
                     is,
                 },
                 rounds,
+                duration,
             });
             state
                 .context_mut()
@@ -5977,7 +5993,7 @@ workflow(type = \"playbook\", tasks = [classify, gate, fix, rest, now, later])\n
             ),
             (
                 "loop",
-                "t = command(name = \"t\", run = \"true\", emits = {\"go\": \"boolean\"})\nworkflow(type = \"playbook\", tasks = [loop(body = [t], again = t.go, rounds = 2{extra})])\n",
+                "t = command(name = \"t\", run = \"true\", emits = {\"go\": \"boolean\"})\nworkflow(type = \"playbook\", tasks = [loop(body = [t], again = t.go, rounds = 2, duration = \"1h\"{extra})])\n",
             ),
             (
                 "at_least",
@@ -9693,6 +9709,7 @@ workflow(type = "playbook", tasks = [LOOP, last])
                     is: Vec::new(),
                 },
                 rounds: 60,
+                duration: None,
             })
         );
         assert!(workflow.tasks[0].loop_while.is_none());
@@ -9772,11 +9789,42 @@ workflow(type = "playbook", tasks = [LOOP, last])
                 "loop(body = [turn, score], again = score.go, rounds = 3, until = score.go)",
                 "until",
             ),
+            (
+                "loop(body = [turn, score], again = score.go, duration = 3600)",
+                "argument \"duration\" must be",
+            ),
+            (
+                "loop(body = [turn, score], again = score.go, duration = \"soon\")",
+                "loop duration = \"soon\" is not a positive duration",
+            ),
+            (
+                "loop(body = [turn, score], again = score.go, duration = \"0s\")",
+                "loop duration = \"0s\" is not a positive duration",
+            ),
         ];
         for (call, expected) in cases {
             let error = refused("loop-refused", &looped(call));
             assert!(error.contains(expected), "{call}: {error}");
         }
+    }
+
+    #[test]
+    fn a_loop_takes_a_duration_beside_or_in_place_of_rounds() {
+        let looped = |call: &str| {
+            compiled("loop-duration", &looped(call)).workflow.tasks[1]
+                .loop_while
+                .clone()
+                .unwrap()
+        };
+        let only = looped("loop(body = [turn, score], again = score.go, duration = \"8h\")");
+        assert_eq!(only.duration, Some("8h".parse().unwrap()));
+        assert_eq!(only.rounds, MAX_LOOP_ROUNDS, "the engine's bound stands in");
+        let both =
+            looped("loop(body = [turn, score], again = score.go, rounds = 12, duration = \"90m\")");
+        assert_eq!(
+            (both.rounds, both.duration),
+            (12, Some("90m".parse().unwrap()))
+        );
     }
 
     #[test]

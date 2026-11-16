@@ -418,6 +418,9 @@ dto! {
         pub again: String,
         /// The most rounds `loop` may run; 0 when the task decides no loop.
         pub loop_rounds: u32,
+        /// How long after its first round begins `loop` may still begin a round; empty when the
+        /// loop declares none.
+        pub loop_duration: String,
     }
 }
 

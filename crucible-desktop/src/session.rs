@@ -72,6 +72,8 @@ pub struct TaskView {
     pub again: String,
     /// The most rounds the loop it decides may run.
     pub loop_rounds: u32,
+    /// How long after its first round begins the loop may still begin a round; empty for none.
+    pub loop_duration: String,
     /// The revise loop or loop it runs in.
     pub revised: Option<Revised>,
     pub rounds: Vec<Round>,
@@ -202,6 +204,7 @@ impl TaskView {
             looped: task.r#loop,
             again: task.again,
             loop_rounds: task.loop_rounds,
+            loop_duration: task.loop_duration,
             rounds: Vec::new(),
         }
     }

@@ -581,7 +581,8 @@ fn again_label(decider: &dto::PlanTask) -> String {
     format!("{field}: {}", values.replace('|', " / "))
 }
 
-/// The rounds a loop has begun over its bound, `12/60`, or `≤60` before the first.
+/// The rounds a loop has begun over its bound, `12/60`, or `≤60` before the first, then its
+/// duration where it declares one.
 fn rounds_begun(g: &dto::RunGraph, decider: &dto::PlanTask) -> String {
     let begun = decider
         .r#loop
@@ -589,9 +590,13 @@ fn rounds_begun(g: &dto::RunGraph, decider: &dto::PlanTask) -> String {
         .filter_map(|member| last_round(g, member))
         .map(|(round, _)| round)
         .max();
-    match begun {
+    let rounds = match begun {
         Some(round) => format!("{round}/{}", decider.loop_rounds),
         None => format!("\u{2264}{}", decider.loop_rounds),
+    };
+    match decider.loop_duration.as_str() {
+        "" => rounds,
+        duration => format!("{rounds} {duration}"),
     }
 }
 
@@ -2725,6 +2730,17 @@ mod tests {
         assert!(
             !graph("0192run", &run_graph()).contains("loops:"),
             "a graph with no loop prints no loop block"
+        );
+
+        let mut timed = looped_graph(TWO_ROUNDS);
+        timed.tasks[1].loop_duration = "8h".into();
+        assert!(
+            graph("0192run", &timed).contains("rounds 2/5 8h\n"),
+            "a duration follows the round bound"
+        );
+        assert!(
+            graph_mermaid(&timed).contains("|\"go: yes 2/5 8h\"|"),
+            "and on the edge back"
         );
     }
 

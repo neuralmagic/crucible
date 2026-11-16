@@ -935,6 +935,9 @@ pub struct Loop {
     pub body: Vec<TaskName>,
     pub again: Again,
     pub rounds: u32,
+    /// How long after its first round begins the loop may still begin a round.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration: Option<TaskTimeout>,
 }
 
 /// The field a loop's deciding task emits, and the values another round runs on.
@@ -1030,13 +1033,19 @@ impl ValidPlan {
     pub fn round_loops(&self) -> Vec<RoundLoop<'_>> {
         self.tasks_topo()
             .filter_map(|decider| {
-                let (members, max_rounds, on) = match (&decider.revise, &decider.loop_while) {
-                    (Some(revise), _) => (&revise.tasks, revise.max_rounds, Continue::Failing),
-                    (None, Some(looped)) => {
-                        (&looped.body, looped.rounds, Continue::While(&looped.again))
-                    }
-                    (None, None) => return None,
-                };
+                let (members, max_rounds, on, duration) =
+                    match (&decider.revise, &decider.loop_while) {
+                        (Some(revise), _) => {
+                            (&revise.tasks, revise.max_rounds, Continue::Failing, None)
+                        }
+                        (None, Some(looped)) => (
+                            &looped.body,
+                            looped.rounds,
+                            Continue::While(&looped.again),
+                            looped.duration.map(TaskTimeout::get),
+                        ),
+                        (None, None) => return None,
+                    };
                 Some(RoundLoop {
                     decider,
                     body: self
@@ -1045,6 +1054,7 @@ impl ValidPlan {
                         .collect(),
                     max_rounds,
                     on,
+                    duration,
                 })
             })
             .collect()
@@ -1088,6 +1098,8 @@ pub struct RoundLoop<'a> {
     pub body: Vec<&'a Task>,
     pub max_rounds: u32,
     pub on: Continue<'a>,
+    /// How long after the first round begins another may still begin; a loop's own bound.
+    pub duration: Option<std::time::Duration>,
 }
 
 /// What sends a [`RoundLoop`] into another round.

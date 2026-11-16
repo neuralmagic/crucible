@@ -882,10 +882,13 @@ fn mermaid_source<'a>(tasks: &'a [TaskView], shown: &Shown, ink: &Ink) -> String
             .filter_map(|t| t.rounds.last())
             .map(|round| round.n)
             .max();
-        let rounds = match begun {
+        let mut rounds = match begun {
             Some(n) => format!("{n}/{}", task.loop_rounds),
             None => format!("\u{2264}{}", task.loop_rounds),
         };
+        if !task.loop_duration.is_empty() {
+            rounds.push_str(&format!(" {}", clean(&task.loop_duration)));
+        }
         source.push_str(&format!(
             "  t{decider} -.->|{}: {} {rounds}| {}\n",
             clean(field),
@@ -1342,7 +1345,7 @@ mod tests {
     const LOOPED: &str = concat!(
         r#"{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":1.0,"tasks":["#,
         r#"{"name":"turn","kind":"agent","required":true},"#,
-        r#"{"name":"score","kind":"command","depends_on":["turn"],"required":true,"loop":["turn","score"],"again":"score.go in yes","loop_rounds":5},"#,
+        r#"{"name":"score","kind":"command","depends_on":["turn"],"required":true,"loop":["turn","score"],"again":"score.go in yes","loop_rounds":5,"loop_duration":"8h"},"#,
         r#"{"name":"last","kind":"command","depends_on":["score"],"required":true}"#,
         r#"]}"#,
         "\n",
@@ -1363,7 +1366,7 @@ mod tests {
             &[
                 "t0(\"\u{2726} turn\")",
                 "  subgraph l1 [\"loop\"]\n    t0\n    t1\n  end\n",
-                "t1 -.->|go: yes \u{2264}5| t0",
+                "t1 -.->|go: yes \u{2264}5 8h| t0",
                 "t0 --> t1",
                 "t1 --> t2",
             ],
@@ -1377,7 +1380,7 @@ mod tests {
                 "t0(\"\u{2726} turn r2/5\")",
                 "t1[\"\u{203a} score r1/5\"]",
                 "t2[\"\u{203a} last\"]",
-                "t1 -.->|go: yes 2/5| t0",
+                "t1 -.->|go: yes 2/5 8h| t0",
             ],
         );
     }

@@ -154,7 +154,8 @@ A bounded loop, listed in `workflow(tasks = ...)` in place of its body: the body
 | --- | --- | --- |
 | `body` | `list[task]` | The agent, command, and evaluate tasks a round runs, with every task between two of them. |
 | `again` | `task.field \| task.field.any_of(...)` | A field a body task emits: a boolean, which continues on true, or a list of labels with the labels to continue on. Read after each round. |
-| `rounds` | `int` | Round cap, counting the first, from 1 to the engine's ceiling of 256. Reaching it is not a failure. |
+| `rounds` | `int` | Round cap, counting the first, from 1 to the engine's ceiling of 256. Reaching it is not a failure. Optional beside `duration`, where it defaults to that ceiling. |
+| `duration` | `str` | How long after the first round begins another round may still begin (`90s`, `30m`, `8h`), on the wall clock. A round in flight is not cut, and the loop ends without failing. Give `rounds`, `duration`, or both. |
 
 ### `others()`
 

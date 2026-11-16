@@ -345,8 +345,12 @@ Every round, each body task reads the round and the output of the round before u
  "previous": {"turn": {"summary": "tightened the parser"}, "score": {"go": true, "points": 2}}}
 ```
 
-- **Rounds have a limit.** `rounds` is 1 to 256. It has no default. If the loop reaches the
-  limit while the field still holds, the loop ends and that is not a failure.
+- **Rounds have a limit.** `rounds` is 1 to 256. If the loop reaches the limit while the field
+  still holds, the loop ends and that is not a failure.
+- **A loop can run for a duration.** `duration = "8h"` lets a round start until that much
+  time has passed since the first round started. A round that is running then finishes, and
+  the loop ends without a failure. Give `rounds`, `duration`, or both. With `duration` alone,
+  the limit on rounds is 256.
 - **Each round settles.** A passing round makes a commit, so the next round starts from it.
   The session log records `turn[round-1]`, `score[round-1]`, and so on, and then one row for
   each task with the status of its last round. A task after the loop reads the last round.

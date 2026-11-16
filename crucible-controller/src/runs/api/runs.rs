@@ -648,6 +648,7 @@ mod tests {
             r#loop: Vec::new(),
             again: String::new(),
             loop_rounds: 0,
+            loop_duration: String::new(),
         }
     }
 

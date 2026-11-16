@@ -529,6 +529,10 @@ pub enum CompileError {
     LoopAgainOutsideBody { reference: String, body: String },
     #[error("loop rounds = {got} is outside 1..={MAX_LOOP_ROUNDS}")]
     LoopRoundsOutOfRange { got: i64 },
+    #[error("loop needs a bound: give rounds, duration, or both")]
+    LoopUnbounded,
+    #[error("loop duration = {raw:?} is not a positive duration (try `90s`, `30m`, `8h`)")]
+    LoopDurationInvalid { raw: String },
     #[error(
         "loop(s) constructed but not included in the workflow: {}; list the loop itself in \
          workflow(tasks = ...), in place of its body's tasks",

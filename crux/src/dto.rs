@@ -291,6 +291,9 @@ pub struct PlanTask {
     /// The most rounds `loop` may run; 0 when the task decides no loop.
     #[serde(default)]
     pub loop_rounds: u32,
+    /// How long after its first round begins `loop` may still begin a round; empty for none.
+    #[serde(default)]
+    pub loop_duration: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

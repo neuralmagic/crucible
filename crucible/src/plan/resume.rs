@@ -198,8 +198,14 @@ pub fn fold(log: &str, plan: &ValidPlan, elapsed: Duration) -> Result<Prior, Res
         match event {
             SessionEvent::PlanAdmitted { .. } => prior.admitted = true,
             SessionEvent::TaskStarted {
-                task, estimate_usd, ..
+                task,
+                estimate_usd,
+                at,
+                ..
             } => {
+                if let Some(at) = at.and_then(|at| at.parse::<jiff::Timestamp>().ok()) {
+                    prior.started.entry(TaskName(task.clone())).or_insert(at);
+                }
                 if estimate_usd.is_finite() && estimate_usd > 0.0 {
                     *held.entry(task).or_default() += estimate_usd;
                 }
@@ -491,6 +497,31 @@ mod tests {
         assert_eq!(prior.results[&"discover".into()].status, TaskStatus::Pass);
         assert_eq!(prior.elapsed, Duration::from_secs(7));
         assert!(prior.admitted && !prior.shut_down && !prior.recorded_history);
+    }
+
+    #[test]
+    fn a_log_folds_into_when_each_task_first_started() {
+        let started = |task: &str, at: &str| {
+            format!(
+                r#"{{"v":1,"kind":"task_started","task":"{task}","attempt":1,"estimate_usd":0.0,"at":"{at}"}}"#
+            )
+        };
+        let text = log(&[
+            ADMITTED,
+            &started("discover", "2026-09-29T12:00:05Z"),
+            &row("discover", "pass", 0.5),
+            &started("discover", "2026-09-29T12:30:00Z"),
+            r#"{"v":1,"kind":"task_started","task":"audit","attempt":1,"estimate_usd":0.0}"#,
+        ]);
+        let prior = fold(&text, &graph(1.0), Duration::from_secs(7)).unwrap();
+        assert_eq!(
+            prior.started,
+            std::collections::BTreeMap::from([(
+                TaskName::from("discover"),
+                "2026-09-29T12:00:05Z".parse().unwrap()
+            )]),
+            "the first start of each task, and none for a start that records no time"
+        );
     }
 
     #[test]

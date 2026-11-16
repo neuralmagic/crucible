@@ -166,7 +166,7 @@ mod tests {
             command = "true"
             depends_on = ["turn"]
             emits = { go = "boolean" }
-            loop = { body = ["score", "turn"], again = { field = "go" }, rounds = 60 }
+            loop = { body = ["score", "turn"], again = { field = "go" }, rounds = 60, duration = "90m" }
             [[task]]
             name = "last"
             kind = "command"
@@ -191,20 +191,24 @@ mod tests {
         );
         assert_eq!(score.again, "score.go in yes");
         assert_eq!(score.loop_rounds, 60);
+        assert_eq!(score.loop_duration, "90m");
         assert!(score.revise.is_empty());
         assert_eq!(score.max_rounds, 0);
         for other in tasks.iter().filter(|t| t.name != "score") {
             assert!(other.r#loop.is_empty() && other.again.is_empty());
             assert_eq!(other.loop_rounds, 0);
+            assert!(other.loop_duration.is_empty());
         }
         let line =
             crucible_contract::encode(&crate::plan::events::plan_admitted_event(&plan, None));
         assert!(
-            line.contains(r#""loop":["turn","score"],"again":"score.go in yes","loop_rounds":60"#),
+            line.contains(
+                r#""loop":["turn","score"],"again":"score.go in yes","loop_rounds":60,"loop_duration":"90m""#
+            ),
             "{line}"
         );
         assert!(
-            line.contains(r#""loop":[],"again":"","loop_rounds":0"#),
+            line.contains(r#""loop":[],"again":"","loop_rounds":0,"loop_duration":"""#),
             "a task outside a loop carries the empty values: {line}"
         );
     }

@@ -146,10 +146,13 @@ pub fn render(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
         if let Some(looped) = &t.loop_while {
             let body: Vec<&str> = looped.body.iter().map(TaskName::as_str).collect();
             detail.push_str(&format!(
-                " loop[{}; {}; max {}]",
+                " loop[{}; {}; max {}{}]",
                 body.join(", "),
                 looped.again.wire(&t.name),
-                looped.rounds
+                looped.rounds,
+                looped
+                    .duration
+                    .map_or(String::new(), |duration| format!(", {duration}"))
             ));
         }
         out.push_str(&format!(
@@ -398,11 +401,15 @@ fn render_mermaid_styled(
                 .join(" / "),
         };
         out.push_str(&format!(
-            "    {} -.->|\"{}: {} \u{2264}{}\"| {}\n",
+            "    {} -.->|\"{}: {} \u{2264}{}{}\"| {}\n",
             ids[&rounds.decider.name],
             mermaid_label(&again.field.0),
             mermaid_label(&values),
             rounds.max_rounds,
+            rounds.duration.map_or(String::new(), |duration| format!(
+                " {}",
+                crucible::duration::Shown(duration)
+            )),
             ids[&first.name],
         ));
     }
@@ -1449,7 +1456,7 @@ mod tests {
             command = "true"
             depends_on = ["turn"]
             emits = { verdict = ["more", "retry", "done"] }
-            loop = { body = ["turn", "score"], again = { field = "verdict", is = ["more", "retry"] }, rounds = 60 }
+            loop = { body = ["turn", "score"], again = { field = "verdict", is = ["more", "retry"] }, rounds = 60, duration = "8h" }
             [[task]]
             name = "last"
             kind = "command"
@@ -1474,7 +1481,7 @@ mod tests {
             "a body task is framed once, by its loop: {out}"
         );
         assert!(
-            out.contains("    t1 -.->|\"verdict: more / retry \u{2264}60\"| t0\n"),
+            out.contains("    t1 -.->|\"verdict: more / retry \u{2264}60 8h\"| t0\n"),
             "{out}"
         );
         assert_eq!(out.matches("-.->").count(), 1, "{out}");
@@ -1484,7 +1491,7 @@ mod tests {
         );
         let table = render(&plan, &BTreeSet::new());
         assert!(
-            table.contains("loop[turn, score; score.verdict in more|retry; max 60]"),
+            table.contains("loop[turn, score; score.verdict in more|retry; max 60, 8h]"),
             "{table}"
         );
     }

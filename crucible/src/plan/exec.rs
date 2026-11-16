@@ -172,6 +172,8 @@ pub struct Prior {
     pub results: BTreeMap<TaskName, TaskResult>,
     /// The same names, in the order they settled.
     pub order: Vec<TaskName>,
+    /// When each task's first attempt started, under the name its `task_started` carries.
+    pub started: BTreeMap<TaskName, jiff::Timestamp>,
     pub elapsed: Duration,
     /// The run already logged its admitted graph.
     pub admitted: bool,
@@ -1706,6 +1708,13 @@ fn run_loop(
     let folded = |t: &Task, round: u32| ledger_round(&prior_rounds, t, round);
     let resumed = |round: u32| body.body.iter().any(|t| folded(t, round).is_some());
     let mut entered = resumed(1);
+    let mut began: Option<jiff::Timestamp> = cfg.prior.filter(|_| entered).and_then(|prior| {
+        body.body
+            .iter()
+            .filter_map(|t| prior.started.get(&t.name))
+            .min()
+            .copied()
+    });
     if entered {
         for b in body
             .body
@@ -1734,6 +1743,13 @@ fn run_loop(
             }
             if let Some(halt) = ledger.ceiling_reached(cfg.wall_clock, spends) {
                 ledger.halt(halt)?;
+                break;
+            }
+            if body
+                .duration
+                .zip(began)
+                .is_some_and(|(limit, began)| passed(began, limit))
+            {
                 break;
             }
         }
@@ -1838,6 +1854,7 @@ fn run_loop(
                                 }
                             }
                             let name = round_task(t, round);
+                            began.get_or_insert_with(jiff::Timestamp::now);
                             let (result, event, overrun) = run_one(t, inputs, cfg, runner, ledger);
                             ledger.overrun(t.stage, overrun)?;
                             if result.attempts > 0 {
@@ -1943,6 +1960,11 @@ fn round_task(t: &Task, round: u32) -> Task {
         loop_while: None,
         ..t.clone()
     }
+}
+
+/// Whether `limit` has passed on the wall clock since `began`.
+fn passed(began: jiff::Timestamp, limit: Duration) -> bool {
+    Duration::try_from(jiff::Timestamp::now().duration_since(began)).is_ok_and(|gone| gone >= limit)
 }
 
 /// What a loop's body task receives under [`LOOP_INPUT`]: the round about to run, the bound, and
@@ -10691,8 +10713,124 @@ mod tests {
                 is: Vec::new(),
             },
             rounds,
+            duration: None,
         });
         t
+    }
+
+    /// A run that settled round one of `turn_and_score` with `go` true, its loop begun `ago`.
+    fn after_round_one(ago: Duration) -> Prior {
+        let pass = |output: Value| TaskResult {
+            output: Some(output),
+            ..TaskResult::undispatched(TaskStatus::Pass, "")
+        };
+        let rows = vec![
+            (
+                TaskName("turn[round-1]".into()),
+                pass(serde_json::json!({"draft": "probe"})),
+            ),
+            (
+                TaskName("score[round-1]".into()),
+                pass(serde_json::json!({"go": true})),
+            ),
+        ];
+        let began = jiff::Timestamp::now() - jiff::SignedDuration::try_from(ago).unwrap();
+        Prior {
+            started: BTreeMap::from([(TaskName("turn".into()), began)]),
+            ..prior_of(&rows)
+        }
+    }
+
+    fn within(mut plan: Vec<Task>, duration: &str) -> ValidPlan {
+        for t in &mut plan {
+            if let Some(looped) = &mut t.loop_while {
+                looped.duration = Some(duration.parse().unwrap());
+            }
+        }
+        valid(plan, 10.0)
+    }
+
+    fn timed(duration: &str) -> ValidPlan {
+        within(
+            vec![
+                agent("turn", &[], "any", true),
+                looping("score", &["turn"], &["turn", "score"], 5),
+                task("last", &["score"], "any", true),
+            ],
+            duration,
+        )
+    }
+
+    #[test]
+    fn a_loop_past_its_duration_begins_no_round_and_does_not_fail() {
+        let prior = after_round_one(Duration::from_secs(2 * 3600));
+        let mut r = ScriptRunner::new();
+        let out = execute(
+            &timed("1h"),
+            &any_substrate(),
+            ExecCfg {
+                prior: Some(&prior),
+                ..ExecCfg::default()
+            },
+            &mut r,
+            |_, _| {},
+        );
+
+        assert_eq!(dispatches(&r), ["last"], "no second round begins");
+        assert!(out.valid, "{:?}", out.results);
+        assert_eq!(out.exit, PlanExit::Completed);
+        assert_eq!(
+            out.results[&"score".into()].output,
+            Some(serde_json::json!({"go": true})),
+            "the task settles as its last round did"
+        );
+    }
+
+    #[test]
+    fn a_loop_inside_its_duration_begins_the_next_round() {
+        let prior = after_round_one(Duration::from_secs(600));
+        let mut r = ScriptRunner::new();
+        r.rounds("score", &[stop]);
+        let out = execute(
+            &timed("1h"),
+            &any_substrate(),
+            ExecCfg {
+                prior: Some(&prior),
+                ..ExecCfg::default()
+            },
+            &mut r,
+            |_, _| {},
+        );
+
+        assert_eq!(dispatches(&r), ["turn", "score", "last"]);
+        assert!(out.valid, "{:?}", out.results);
+    }
+
+    #[test]
+    fn a_duration_does_not_cut_the_round_in_flight() {
+        let mut prior = after_round_one(Duration::from_secs(2 * 3600));
+        let turn = prior.results[&TaskName("turn[round-1]".into())].clone();
+        prior.results.insert(TaskName("turn[round-2]".into()), turn);
+        prior.order.push(TaskName("turn[round-2]".into()));
+        let mut r = ScriptRunner::new();
+        r.rounds("score", &[go]);
+        let out = execute(
+            &timed("1h"),
+            &any_substrate(),
+            ExecCfg {
+                prior: Some(&prior),
+                ..ExecCfg::default()
+            },
+            &mut r,
+            |_, _| {},
+        );
+
+        assert_eq!(
+            dispatches(&r),
+            ["score", "last"],
+            "round two finishes, and no round three begins"
+        );
+        assert!(out.valid, "{:?}", out.results);
     }
 
     fn go() -> AttemptOutcome {

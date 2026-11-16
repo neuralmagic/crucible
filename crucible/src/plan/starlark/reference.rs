@@ -388,8 +388,16 @@ pub fn functions() -> Vec<Function> {
                     "int",
                     format!(
                         "Round cap, counting the first, from 1 to the engine's ceiling of \
-                         {MAX_LOOP_ROUNDS}. Reaching it is not a failure."
+                         {MAX_LOOP_ROUNDS}. Reaching it is not a failure. Optional beside \
+                         `duration`, where it defaults to that ceiling."
                     ),
+                ),
+                Kwarg::new(
+                    "duration",
+                    "str",
+                    "How long after the first round begins another round may still begin \
+                     (`90s`, `30m`, `8h`), on the wall clock. A round in flight is not cut, and \
+                     the loop ends without failing. Give `rounds`, `duration`, or both.",
                 ),
             ],
         },

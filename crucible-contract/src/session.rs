@@ -175,6 +175,10 @@ pub struct PlanTaskWire {
     /// The most rounds `loop` may run, the first included; 0 when the task decides no loop.
     #[serde(default)]
     pub loop_rounds: u32,
+    /// How long after its first round begins `loop` may still begin a round (`90s`, `30m`,
+    /// `8h`); empty when the loop declares none.
+    #[serde(default)]
+    pub loop_duration: String,
     /// The fields the task's output promises, each with its type when the declaration gave one.
     /// Empty when the task declares none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1133,6 +1137,7 @@ mod tests {
                 r#loop: Vec::new(),
                 again: String::new(),
                 loop_rounds: 0,
+                loop_duration: String::new(),
                 emits: vec![
                     crate::emits::EmitWire {
                         field: "targets".into(),
@@ -1237,6 +1242,7 @@ mod tests {
             r#loop: Vec::new(),
             again: String::new(),
             loop_rounds: 0,
+            loop_duration: String::new(),
             emits: Vec::new(),
             emits_files: Vec::new(),
             timeout: String::new(),

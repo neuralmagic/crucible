@@ -16,6 +16,7 @@ const task = (name: string, depends_on: string[] = []): PlanTask => ({
   loop: [],
   again: '',
   loop_rounds: 0,
+  loop_duration: '',
 });
 
 const result = (
