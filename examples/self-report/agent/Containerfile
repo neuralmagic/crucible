@@ -1,0 +1,35 @@
+# produces: localhost/crucible-view-agent
+# What the self-report example's agent runs in: pi, a Rust toolchain that builds view plugins
+# with the crates one needs already fetched, TypeScript, and `view-check`, which runs a
+# JavaScript plugin and checks its view as the app would. Built from the pack's directory,
+# after `kit/` is in place.
+FROM docker.io/library/node:22-bookworm-slim AS node
+
+FROM docker.io/library/rust:1-bookworm
+
+ARG PI_VERSION=1.5.2
+ARG TYPESCRIPT_VERSION=5.9.3
+
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && npm install -g "@earendil-works/pi-coding-agent@${PI_VERSION}" "typescript@${TYPESCRIPT_VERSION}" \
+    && rustup target add wasm32-unknown-unknown
+
+RUN mkdir -p /tmp/warm/src && cd /tmp/warm \
+    && printf '[package]\nname = "warm"\nversion = "0.0.0"\nedition = "2024"\n\n[dependencies]\nserde = { version = "1", features = ["derive"] }\nserde_json = "1"\nthiserror = "2"\n' > Cargo.toml \
+    && touch src/lib.rs \
+    && cargo build --release --target wasm32-unknown-unknown \
+    && cargo build \
+    && rm -rf /tmp/warm
+
+COPY kit/crucible-view /usr/local/src/crucible-view
+RUN cd /usr/local/src/crucible-view \
+    && cargo build --release --bin crucible-view-check \
+    && cp target/release/crucible-view-check /usr/local/bin/ \
+    && mkdir -p /usr/local/share/crucible-view \
+    && cp -R js /usr/local/share/crucible-view/js \
+    && rm -rf target
+
+ENV CARGO_TARGET_DIR=/tmp/target
+COPY agent/turn agent/view-check /usr/local/bin/

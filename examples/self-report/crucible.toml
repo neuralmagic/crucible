@@ -1,0 +1,23 @@
+# self-report: the run's last task is an agent that writes its own view of the run. It gets
+# the component reference and the plugin types, writes a plugin in TypeScript, checks it with
+# `view-check`, and captures the JavaScript as `report.view.js`. The desktop app's Report pane
+# compiles and draws that, marked with the task's name.
+#
+#   just example-self-report-kit        # the agent image and the files it is given
+#   just desktop-js-engine              # the engine the app runs JavaScript plugins in
+#   VIEW_AGENT_URL=https://models.example.com/v1 VIEW_AGENT_KEY=... VIEW_AGENT_MODEL=... \
+#     crucible plan run --manifest examples/self-report/crucible.toml --max-cost 1 --max-time 30m
+#
+# The agent is pi in a container that sees only the task's workspace (`agent.sh`).
+
+[workspace]
+inject = ["triage.sh", "agent.sh", "inbox", "kit"]
+
+[agent]
+backend   = "command"
+agent_cmd = "./agent.sh"
+goal      = "Triage the inbox by lane, then have an agent write the view that explains the run."
+
+[workflow]
+type = "playbook"
+file = "workflow.star"

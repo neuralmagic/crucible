@@ -1,0 +1,17 @@
+# report: a playbook whose pack ships a view of its own results. Two command tasks stand in for
+# triage lanes and each captures a `verdicts.json`; `ui/report.wasm` (built from `ui/report/` by
+# `just example-report-view`) merges them into the tables the desktop app's Report pane draws.
+#
+#   crucible plan run --manifest examples/report/crucible.toml --max-cost 1 --max-time 5m
+
+[workspace]
+inject = ["triage.sh", "inbox"]
+
+[agent]
+backend   = "command"
+agent_cmd = "./triage.sh"
+goal      = "Triage the inbox by lane and report the verdicts."
+
+[workflow]
+type = "playbook"
+file = "workflow.star"

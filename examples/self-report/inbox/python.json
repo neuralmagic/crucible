@@ -1,0 +1,902 @@
+[
+ {
+  "ticket_key": "DEMO-201",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "affected",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-94612"
+   ],
+   "package": {
+    "name": "jinja2",
+    "ecosystem": "python",
+    "version": "3.1.4"
+   },
+   "release": {
+    "name": "3.4"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/cache:3.4"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 8.4
+    }
+   },
+   "rationale": "The vulnerable handler is reachable from the public listener.\nWhy review: confirm the fix version before closing"
+  },
+  "age_days": 21
+ },
+ {
+  "ticket_key": "DEMO-202",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-98907"
+   ],
+   "package": {
+    "name": "pillow",
+    "ecosystem": "python",
+    "version": "11.0.0"
+   },
+   "release": {
+    "name": "3.4"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/model-server:3.4"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 6.8
+    }
+   },
+   "rationale": "The vulnerable function is never reached from the shipped entry points."
+  },
+  "age_days": 47
+ },
+ {
+  "ticket_key": "DEMO-203",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-97365"
+   ],
+   "package": {
+    "name": "aiohttp",
+    "ecosystem": "python",
+    "version": "3.11.2"
+   },
+   "release": {
+    "name": "3.4"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/cache:3.4"
+   },
+   "proposed_actions": {
+    "lane": "scope",
+    "cvss": {
+     "score": 4.4
+    }
+   },
+   "rationale": "The component is not part of this release.\nClose recommendation: not_shipped"
+  },
+  "age_days": 78
+ },
+ {
+  "ticket_key": "DEMO-204",
+  "jira_status": "In Progress",
+  "verdict_property": {
+   "verdict": "needs_review",
+   "confidence": "medium",
+   "cve_ids": [
+    "CVE-2026-92421"
+   ],
+   "package": {
+    "name": "pillow",
+    "ecosystem": "python",
+    "version": "11.0.0"
+   },
+   "release": {
+    "name": "3.4"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/model-server:3.4"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 4.0
+    }
+   },
+   "rationale": "Reachability could not be decided from the call graph.\nWhy review: dynamic dispatch hides the call target"
+  },
+  "age_days": 75
+ },
+ {
+  "ticket_key": "DEMO-205",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "needs_review",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-93785"
+   ],
+   "package": {
+    "name": "example-tokenizers",
+    "ecosystem": "python",
+    "version": "0.21.0"
+   },
+   "release": {
+    "name": "3.4"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/cache:3.4"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 3.9
+    }
+   },
+   "rationale": "Reachability could not be decided from the call graph.\nWhy review: dynamic dispatch hides the call target"
+  },
+  "age_days": 63
+ },
+ {
+  "ticket_key": "DEMO-206",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "low",
+   "cve_ids": [
+    "CVE-2026-96741"
+   ],
+   "package": {
+    "name": "aiohttp",
+    "ecosystem": "python",
+    "version": "3.11.2"
+   },
+   "release": {
+    "name": "3.3"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/cache:3.3"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 4.5
+    }
+   },
+   "rationale": "The affected module is imported but its parser is not called."
+  },
+  "age_days": 50
+ },
+ {
+  "ticket_key": "DEMO-207",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-98107"
+   ],
+   "package": {
+    "name": "pillow",
+    "ecosystem": "python",
+    "version": "11.0.0"
+   },
+   "release": {
+    "name": "3.3"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/model-server:3.3"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 9.6
+    }
+   },
+   "rationale": "The affected module is imported but its parser is not called."
+  },
+  "age_days": 50
+ },
+ {
+  "ticket_key": "DEMO-208",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "needs_review",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-95799"
+   ],
+   "package": {
+    "name": "pillow",
+    "ecosystem": "python",
+    "version": "11.0.0"
+   },
+   "release": {
+    "name": "3.3"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/model-server:3.3"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 5.1
+    }
+   },
+   "rationale": "Reachability could not be decided from the call graph.\nWhy review: dynamic dispatch hides the call target"
+  },
+  "age_days": 82
+ },
+ {
+  "ticket_key": "DEMO-209",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "low",
+   "cve_ids": [
+    "CVE-2026-93147"
+   ],
+   "package": {
+    "name": "pillow",
+    "ecosystem": "python",
+    "version": "11.0.0"
+   },
+   "release": {
+    "name": "3.5"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/cache:3.5"
+   },
+   "proposed_actions": {
+    "lane": "scope",
+    "cvss": {
+     "score": 4.5
+    }
+   },
+   "rationale": "The component is not part of this release.\nClose recommendation: not_shipped"
+  },
+  "age_days": 57
+ },
+ {
+  "ticket_key": "DEMO-210",
+  "jira_status": "Review",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-99713"
+   ],
+   "package": {
+    "name": "jinja2",
+    "ecosystem": "python",
+    "version": "3.1.4"
+   },
+   "release": {
+    "name": "3.4"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/cache:3.4"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 8.8
+    }
+   },
+   "rationale": "The vulnerable function is never reached from the shipped entry points."
+  },
+  "age_days": 46
+ },
+ {
+  "ticket_key": "DEMO-211",
+  "jira_status": "Review",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-93454"
+   ],
+   "package": {
+    "name": "aiohttp",
+    "ecosystem": "python",
+    "version": "3.11.2"
+   },
+   "release": {
+    "name": "3.4"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/model-server:3.4"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 3.8
+    }
+   },
+   "rationale": "The affected module is imported but its parser is not called."
+  },
+  "age_days": 96
+ },
+ {
+  "ticket_key": "DEMO-212",
+  "jira_status": "Review",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-96340"
+   ],
+   "package": {
+    "name": "pillow",
+    "ecosystem": "python",
+    "version": "11.0.0"
+   },
+   "release": {
+    "name": "3.4"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/model-server:3.4"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 4.5
+    }
+   },
+   "rationale": "The affected module is imported but its parser is not called."
+  },
+  "age_days": 49
+ },
+ {
+  "ticket_key": "DEMO-213",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "affected",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-95537"
+   ],
+   "package": {
+    "name": "example-tokenizers",
+    "ecosystem": "python",
+    "version": "0.21.0"
+   },
+   "release": {
+    "name": "3.3"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/model-server:3.3"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 8.3
+    }
+   },
+   "rationale": "The vulnerable handler is reachable from the public listener.\nWhy review: confirm the fix version before closing"
+  },
+  "age_days": 31
+ },
+ {
+  "ticket_key": "DEMO-214",
+  "jira_status": "Review",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-92038"
+   ],
+   "package": {
+    "name": "aiohttp",
+    "ecosystem": "python",
+    "version": "3.11.2"
+   },
+   "release": {
+    "name": "3.5"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/cache:3.5"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 5.1
+    }
+   },
+   "rationale": "The vulnerable function is never reached from the shipped entry points."
+  },
+  "age_days": 35
+ },
+ {
+  "ticket_key": "DEMO-215",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "low",
+   "cve_ids": [
+    "CVE-2026-99325"
+   ],
+   "package": {
+    "name": "jinja2",
+    "ecosystem": "python",
+    "version": "3.1.4"
+   },
+   "release": {
+    "name": "3.5"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/model-server:3.5"
+   },
+   "proposed_actions": {
+    "lane": "version",
+    "cvss": {
+     "score": 3.7
+    }
+   },
+   "rationale": "The shipped version already carries the fix.\nClose recommendation: already_fixed"
+  },
+  "age_days": 73
+ },
+ {
+  "ticket_key": "DEMO-216",
+  "jira_status": "Review",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "medium",
+   "cve_ids": [
+    "CVE-2026-94319"
+   ],
+   "package": {
+    "name": "example-tokenizers",
+    "ecosystem": "python",
+    "version": "0.21.0"
+   },
+   "release": {
+    "name": "3.5"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/model-server:3.5"
+   },
+   "proposed_actions": {
+    "lane": "scope",
+    "cvss": {
+     "score": 4.7
+    }
+   },
+   "rationale": "The component is not part of this release.\nClose recommendation: not_shipped"
+  },
+  "age_days": 68
+ },
+ {
+  "ticket_key": "DEMO-217",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "needs_review",
+   "confidence": "low",
+   "cve_ids": [
+    "CVE-2026-98243"
+   ],
+   "package": {
+    "name": "example-tokenizers",
+    "ecosystem": "python",
+    "version": "0.21.0"
+   },
+   "release": {
+    "name": "3.3"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/cache:3.3"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 5.6
+    }
+   },
+   "rationale": "Reachability could not be decided from the call graph.\nWhy review: dynamic dispatch hides the call target"
+  },
+  "age_days": 54
+ },
+ {
+  "ticket_key": "DEMO-218",
+  "jira_status": "In Progress",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-94484"
+   ],
+   "package": {
+    "name": "aiohttp",
+    "ecosystem": "python",
+    "version": "3.11.2"
+   },
+   "release": {
+    "name": "3.5"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/model-server:3.5"
+   },
+   "proposed_actions": {
+    "lane": "absent",
+    "cvss": {
+     "score": 9.5
+    }
+   },
+   "rationale": "The final-artifact package scan for the image reported absent."
+  },
+  "age_days": 33
+ },
+ {
+  "ticket_key": "DEMO-219",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "affected",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-95146"
+   ],
+   "package": {
+    "name": "jinja2",
+    "ecosystem": "python",
+    "version": "3.1.4"
+   },
+   "release": {
+    "name": "3.3"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/model-server:3.3"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 6.9
+    }
+   },
+   "rationale": "The vulnerable handler is reachable from the public listener.\nWhy review: confirm the fix version before closing"
+  },
+  "age_days": 70
+ },
+ {
+  "ticket_key": "DEMO-220",
+  "jira_status": "In Progress",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "low",
+   "cve_ids": [
+    "CVE-2026-93667"
+   ],
+   "package": {
+    "name": "example-tokenizers",
+    "ecosystem": "python",
+    "version": "0.21.0"
+   },
+   "release": {
+    "name": "3.3"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/model-server:3.3"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 4.3
+    }
+   },
+   "rationale": "The affected module is imported but its parser is not called."
+  },
+  "age_days": 45
+ },
+ {
+  "ticket_key": "DEMO-221",
+  "jira_status": "Review",
+  "verdict_property": {
+   "verdict": "affected",
+   "confidence": "low",
+   "cve_ids": [
+    "CVE-2026-96556"
+   ],
+   "package": {
+    "name": "pillow",
+    "ecosystem": "python",
+    "version": "11.0.0"
+   },
+   "release": {
+    "name": "3.3"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/cache:3.3"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 9.2
+    }
+   },
+   "rationale": "The vulnerable handler is reachable from the public listener.\nWhy review: confirm the fix version before closing"
+  },
+  "age_days": 54
+ },
+ {
+  "ticket_key": "DEMO-222",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "medium",
+   "cve_ids": [
+    "CVE-2026-91319"
+   ],
+   "package": {
+    "name": "pillow",
+    "ecosystem": "python",
+    "version": "11.0.0"
+   },
+   "release": {
+    "name": "3.4"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/cache:3.4"
+   },
+   "proposed_actions": {
+    "lane": "version",
+    "cvss": {
+     "score": 4.8
+    }
+   },
+   "rationale": "The shipped version already carries the fix.\nClose recommendation: already_fixed"
+  },
+  "age_days": 44
+ },
+ {
+  "ticket_key": "DEMO-223",
+  "jira_status": "In Progress",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "medium",
+   "cve_ids": [
+    "CVE-2026-99477"
+   ],
+   "package": {
+    "name": "example-tokenizers",
+    "ecosystem": "python",
+    "version": "0.21.0"
+   },
+   "release": {
+    "name": "3.4"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/model-server:3.4"
+   },
+   "proposed_actions": {
+    "lane": "absent",
+    "cvss": {
+     "score": 8.1
+    }
+   },
+   "rationale": "The final-artifact package scan for the image reported absent."
+  },
+  "age_days": 67
+ },
+ {
+  "ticket_key": "DEMO-224",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-92716"
+   ],
+   "package": {
+    "name": "jinja2",
+    "ecosystem": "python",
+    "version": "3.1.4"
+   },
+   "release": {
+    "name": "3.5"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/model-server:3.5"
+   },
+   "proposed_actions": {
+    "lane": "scope",
+    "cvss": {
+     "score": 4.4
+    }
+   },
+   "rationale": "The component is not part of this release.\nClose recommendation: not_shipped"
+  },
+  "age_days": 90
+ },
+ {
+  "ticket_key": "DEMO-225",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "medium",
+   "cve_ids": [
+    "CVE-2026-93122"
+   ],
+   "package": {
+    "name": "jinja2",
+    "ecosystem": "python",
+    "version": "3.1.4"
+   },
+   "release": {
+    "name": "3.4"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/model-server:3.4"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 9.0
+    }
+   },
+   "rationale": "The vulnerable function is never reached from the shipped entry points."
+  },
+  "age_days": 43
+ },
+ {
+  "ticket_key": "DEMO-226",
+  "jira_status": "In Progress",
+  "verdict_property": {
+   "verdict": "needs_review",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-99791"
+   ],
+   "package": {
+    "name": "example-tokenizers",
+    "ecosystem": "python",
+    "version": "0.21.0"
+   },
+   "release": {
+    "name": "3.5"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/cache:3.5"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 5.9
+    }
+   },
+   "rationale": "Reachability could not be decided from the call graph.\nWhy review: dynamic dispatch hides the call target"
+  },
+  "age_days": 32
+ },
+ {
+  "ticket_key": "DEMO-227",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "medium",
+   "cve_ids": [
+    "CVE-2026-91942"
+   ],
+   "package": {
+    "name": "example-tokenizers",
+    "ecosystem": "python",
+    "version": "0.21.0"
+   },
+   "release": {
+    "name": "3.5"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/cache:3.5"
+   },
+   "proposed_actions": {
+    "lane": "scope",
+    "cvss": {
+     "score": 3.4
+    }
+   },
+   "rationale": "The component is not part of this release.\nClose recommendation: not_shipped"
+  },
+  "age_days": 97
+ },
+ {
+  "ticket_key": "DEMO-228",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "needs_review",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-92451"
+   ],
+   "package": {
+    "name": "pillow",
+    "ecosystem": "python",
+    "version": "11.0.0"
+   },
+   "release": {
+    "name": "3.4"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/model-server:3.4"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 4.7
+    }
+   },
+   "rationale": "Reachability could not be decided from the call graph.\nWhy review: dynamic dispatch hides the call target"
+  },
+  "age_days": 74
+ },
+ {
+  "ticket_key": "DEMO-229",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "needs_review",
+   "confidence": "medium",
+   "cve_ids": [
+    "CVE-2026-92993"
+   ],
+   "package": {
+    "name": "jinja2",
+    "ecosystem": "python",
+    "version": "3.1.4"
+   },
+   "release": {
+    "name": "3.3"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/model-server:3.3"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 4.8
+    }
+   },
+   "rationale": "Reachability could not be decided from the call graph.\nWhy review: dynamic dispatch hides the call target"
+  },
+  "age_days": 80
+ },
+ {
+  "ticket_key": "DEMO-230",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-91707"
+   ],
+   "package": {
+    "name": "aiohttp",
+    "ecosystem": "python",
+    "version": "3.11.2"
+   },
+   "release": {
+    "name": "3.4"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/cache:3.4"
+   },
+   "proposed_actions": {
+    "lane": "version",
+    "cvss": {
+     "score": 7.1
+    }
+   },
+   "rationale": "The shipped version already carries the fix.\nClose recommendation: already_fixed"
+  },
+  "age_days": 36
+ }
+]

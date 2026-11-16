@@ -1,0 +1,94 @@
+#!/usr/bin/env -S node --experimental-vm-modules --no-warnings
+// Checks a view plugin the way the app will run it: type-checks a `.ts` and writes its
+// JavaScript to `report.view.js`, runs the script on the captured files given, and checks the
+// view it returns against every rule the app applies.
+//
+//   view-check view.ts inputs/triage-go/verdicts.json inputs/triage-python/verdicts.json
+import { spawnSync } from "node:child_process";
+import { copyFileSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, join } from "node:path";
+import vm from "node:vm";
+
+const share = "/usr/local/share/crucible-view/js";
+const [source, ...captured] = process.argv.slice(2);
+if (!source) {
+  console.error("usage: view-check <view.ts|view.js> <captured file>...");
+  process.exit(2);
+}
+
+let script = source;
+if (source.endsWith(".ts")) {
+  const work = mkdtempSync(join(tmpdir(), "view-check-"));
+  copyFileSync(source, join(work, "view.ts"));
+  copyFileSync(join(share, "crucible-view.d.ts"), join(work, "crucible-view.d.ts"));
+  const built = spawnSync(
+    "tsc",
+    ["--strict", "--noEmitOnError", "--target", "es2022", "--module", "es2022", "--lib", "es2022",
+     "--outDir", "out", "crucible-view.d.ts", "view.ts"],
+    { cwd: work, encoding: "utf8" },
+  );
+  if (built.status !== 0) {
+    process.stderr.write((built.stdout + built.stderr).replaceAll("view.ts", source));
+    process.exit(1);
+  }
+  script = "report.view.js";
+  copyFileSync(join(work, "out", "view.js"), script);
+  console.log(`types ok; wrote ${script}`);
+}
+
+const module = [readFileSync(script, "utf8"), readFileSync(join(share, "prelude.js"), "utf8"),
+  readFileSync(join(share, "epilogue.js"), "utf8")].join("\n");
+
+async function ask(asked) {
+  const input = new TextEncoder().encode(JSON.stringify(asked));
+  let taken = 0;
+  const output = [];
+  const printed = [];
+  const context = vm.createContext({
+    TextEncoder,
+    TextDecoder,
+    console: { log: (...parts) => printed.push(parts.join(" ")), error: (...parts) => printed.push(parts.join(" ")) },
+    Javy: { IO: {
+      readSync(fd, buffer) {
+        const rest = input.subarray(taken, taken + buffer.length);
+        buffer.set(rest);
+        taken += rest.length;
+        return rest.length;
+      },
+      writeSync(fd, buffer) { output.push(Buffer.from(buffer)); },
+    } },
+  });
+  const run = new vm.SourceTextModule(module, { context, identifier: "function.mjs" });
+  await run.link(() => { throw new Error("a view plugin has no imports"); });
+  await run.evaluate({ timeout: 20000 });
+  for (const line of printed) console.log(`[printed] ${line}`);
+  const text = Buffer.concat(output).toString("utf8");
+  return JSON.parse(text.slice(text.lastIndexOf("\u001e") + 1));
+}
+
+const files = captured.map((path) => {
+  const parts = path.split("/");
+  const at = parts.lastIndexOf("inputs");
+  return at >= 0 && parts.length > at + 2
+    ? { path: parts.slice(at + 2).join("/"), task: parts[at + 1], text: readFileSync(path, "utf8") }
+    : { path: basename(path), task: "task", text: readFileSync(path, "utf8") };
+});
+
+try {
+  const named = await ask({});
+  if (!Array.isArray(named.inputs)) {
+    console.error(`the script must export \`inputs\`, a list of captured file paths: ${JSON.stringify(named)}`);
+    process.exit(1);
+  }
+  const wanted = files.filter((file) => named.inputs.includes(file.path));
+  console.log(`inputs ${JSON.stringify(named.inputs)}: ${wanted.length} of the ${files.length} files given`);
+  const answer = await ask({ view: { files: wanted } });
+  const checked = spawnSync("crucible-view-check", { input: JSON.stringify(answer), encoding: "utf8" });
+  process.stdout.write(checked.stdout);
+  process.stderr.write(checked.stderr);
+  process.exit(checked.status ?? 1);
+} catch (error) {
+  console.error(`the script failed: ${(error && error.stack) || error}`);
+  process.exit(1);
+}

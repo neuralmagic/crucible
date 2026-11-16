@@ -11,6 +11,10 @@ target/
 examples/*/workspace/
 e2e/*/pack/workspace/
 examples/*/state/
+# The self-report example's kit is copied in by `just example-self-report-kit`.
+examples/self-report/kit/
+# Fetched by `just desktop-js-engine`.
+crucible-desktop/assets/js-engine/
 # Python noise.
 __pycache__/
 *.pyc
@@ -41,3 +45,5 @@ formal/.lake/
 
 # Per-cluster e2e values (just kueue-e2e-cluster); the *.env.example files are committed.
 e2e/kueue/clusters/*.env
+# Built by `just example-report-view-go`.
+examples/report/ui/report-go/report-go.wasm

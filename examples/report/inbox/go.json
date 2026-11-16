@@ -1,0 +1,1022 @@
+[
+ {
+  "ticket_key": "DEMO-101",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-96991"
+   ],
+   "package": {
+    "name": "google.golang.org/grpc",
+    "ecosystem": "go",
+    "version": "1.64.0"
+   },
+   "release": {
+    "name": "3.4"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/router:3.4"
+   },
+   "proposed_actions": {
+    "lane": "absent",
+    "cvss": {
+     "score": 6.1
+    }
+   },
+   "rationale": "The final-artifact package scan for the image reported absent."
+  },
+  "age_days": 57
+ },
+ {
+  "ticket_key": "DEMO-102",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-98104"
+   ],
+   "package": {
+    "name": "golang.org/x/net",
+    "ecosystem": "go",
+    "version": "0.30.0"
+   },
+   "release": {
+    "name": "3.5"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/router:3.5"
+   },
+   "proposed_actions": {
+    "lane": "scope",
+    "cvss": {
+     "score": 9.3
+    }
+   },
+   "rationale": "The component is not part of this release.\nClose recommendation: not_shipped"
+  },
+  "age_days": 33
+ },
+ {
+  "ticket_key": "DEMO-103",
+  "jira_status": "Review",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "low",
+   "cve_ids": [
+    "CVE-2026-91968"
+   ],
+   "package": {
+    "name": "golang.org/x/net",
+    "ecosystem": "go",
+    "version": "0.30.0"
+   },
+   "release": {
+    "name": "3.3"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/router:3.3"
+   },
+   "proposed_actions": {
+    "lane": "version",
+    "cvss": {
+     "score": 6.5
+    }
+   },
+   "rationale": "The shipped version already carries the fix.\nClose recommendation: already_fixed"
+  },
+  "age_days": 57
+ },
+ {
+  "ticket_key": "DEMO-104",
+  "jira_status": "Review",
+  "verdict_property": {
+   "verdict": "needs_review",
+   "confidence": "low",
+   "cve_ids": [
+    "CVE-2026-91812"
+   ],
+   "package": {
+    "name": "golang.org/x/net",
+    "ecosystem": "go",
+    "version": "0.30.0"
+   },
+   "release": {
+    "name": "3.3"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/router:3.3"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 4.3
+    }
+   },
+   "rationale": "Reachability could not be decided from the call graph.\nWhy review: dynamic dispatch hides the call target"
+  },
+  "age_days": 65
+ },
+ {
+  "ticket_key": "DEMO-105",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "low",
+   "cve_ids": [
+    "CVE-2026-93363"
+   ],
+   "package": {
+    "name": "golang.org/x/net",
+    "ecosystem": "go",
+    "version": "0.30.0"
+   },
+   "release": {
+    "name": "3.5"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/router:3.5"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 7.3
+    }
+   },
+   "rationale": "The affected module is imported but its parser is not called."
+  },
+  "age_days": 64
+ },
+ {
+  "ticket_key": "DEMO-106",
+  "jira_status": "Review",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-92688"
+   ],
+   "package": {
+    "name": "golang.org/x/net",
+    "ecosystem": "go",
+    "version": "0.30.0"
+   },
+   "release": {
+    "name": "3.5"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/scheduler:3.5"
+   },
+   "proposed_actions": {
+    "lane": "scope",
+    "cvss": {
+     "score": 3.7
+    }
+   },
+   "rationale": "The component is not part of this release.\nClose recommendation: not_shipped"
+  },
+  "age_days": 57
+ },
+ {
+  "ticket_key": "DEMO-107",
+  "jira_status": "Review",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-91976"
+   ],
+   "package": {
+    "name": "google.golang.org/grpc",
+    "ecosystem": "go",
+    "version": "1.64.0"
+   },
+   "release": {
+    "name": "3.4"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/router:3.4"
+   },
+   "proposed_actions": {
+    "lane": "scope",
+    "cvss": {
+     "score": 3.7
+    }
+   },
+   "rationale": "The component is not part of this release.\nClose recommendation: not_shipped"
+  },
+  "age_days": 86
+ },
+ {
+  "ticket_key": "DEMO-108",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "low",
+   "cve_ids": [
+    "CVE-2026-98424"
+   ],
+   "package": {
+    "name": "google.golang.org/grpc",
+    "ecosystem": "go",
+    "version": "1.64.0"
+   },
+   "release": {
+    "name": "3.4"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/scheduler:3.4"
+   },
+   "proposed_actions": {
+    "lane": "scope",
+    "cvss": {
+     "score": 7.7
+    }
+   },
+   "rationale": "The component is not part of this release.\nClose recommendation: not_shipped"
+  },
+  "age_days": 18
+ },
+ {
+  "ticket_key": "DEMO-109",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-95919"
+   ],
+   "package": {
+    "name": "stdlib",
+    "ecosystem": "go",
+    "version": "1.23.4"
+   },
+   "release": {
+    "name": "3.3"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/router:3.3"
+   },
+   "proposed_actions": {
+    "lane": "absent",
+    "cvss": {
+     "score": 9.7
+    }
+   },
+   "rationale": "The final-artifact package scan for the image reported absent."
+  },
+  "age_days": 59
+ },
+ {
+  "ticket_key": "DEMO-110",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-92934"
+   ],
+   "package": {
+    "name": "github.com/example/router",
+    "ecosystem": "go",
+    "version": "0.9.1"
+   },
+   "release": {
+    "name": "3.4"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/scheduler:3.4"
+   },
+   "proposed_actions": {
+    "lane": "scope",
+    "cvss": {
+     "score": 7.5
+    }
+   },
+   "rationale": "The component is not part of this release.\nClose recommendation: not_shipped"
+  },
+  "age_days": 52
+ },
+ {
+  "ticket_key": "DEMO-111",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "low",
+   "cve_ids": [
+    "CVE-2026-97909"
+   ],
+   "package": {
+    "name": "github.com/example/router",
+    "ecosystem": "go",
+    "version": "0.9.1"
+   },
+   "release": {
+    "name": "3.3"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/scheduler:3.3"
+   },
+   "proposed_actions": {
+    "lane": "scope",
+    "cvss": {
+     "score": 4.2
+    }
+   },
+   "rationale": "The component is not part of this release.\nClose recommendation: not_shipped"
+  },
+  "age_days": 37
+ },
+ {
+  "ticket_key": "DEMO-112",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "medium",
+   "cve_ids": [
+    "CVE-2026-99137"
+   ],
+   "package": {
+    "name": "golang.org/x/net",
+    "ecosystem": "go",
+    "version": "0.30.0"
+   },
+   "release": {
+    "name": "3.5"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/scheduler:3.5"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 6.6
+    }
+   },
+   "rationale": "The vulnerable function is never reached from the shipped entry points."
+  },
+  "age_days": 25
+ },
+ {
+  "ticket_key": "DEMO-113",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "low",
+   "cve_ids": [
+    "CVE-2026-92064"
+   ],
+   "package": {
+    "name": "github.com/example/router",
+    "ecosystem": "go",
+    "version": "0.9.1"
+   },
+   "release": {
+    "name": "3.3"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/router:3.3"
+   },
+   "proposed_actions": {
+    "lane": "scope",
+    "cvss": {
+     "score": 4.4
+    }
+   },
+   "rationale": "The component is not part of this release.\nClose recommendation: not_shipped"
+  },
+  "age_days": 49
+ },
+ {
+  "ticket_key": "DEMO-114",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "low",
+   "cve_ids": [
+    "CVE-2026-96685"
+   ],
+   "package": {
+    "name": "stdlib",
+    "ecosystem": "go",
+    "version": "1.23.4"
+   },
+   "release": {
+    "name": "3.5"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/scheduler:3.5"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 3.3
+    }
+   },
+   "rationale": "The vulnerable function is never reached from the shipped entry points."
+  },
+  "age_days": 69
+ },
+ {
+  "ticket_key": "DEMO-115",
+  "jira_status": "Review",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-99088"
+   ],
+   "package": {
+    "name": "github.com/example/router",
+    "ecosystem": "go",
+    "version": "0.9.1"
+   },
+   "release": {
+    "name": "3.4"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/router:3.4"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 6.1
+    }
+   },
+   "rationale": "The vulnerable function is never reached from the shipped entry points."
+  },
+  "age_days": 74
+ },
+ {
+  "ticket_key": "DEMO-116",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "low",
+   "cve_ids": [
+    "CVE-2026-97405"
+   ],
+   "package": {
+    "name": "google.golang.org/grpc",
+    "ecosystem": "go",
+    "version": "1.64.0"
+   },
+   "release": {
+    "name": "3.4"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/router:3.4"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 6.6
+    }
+   },
+   "rationale": "The vulnerable function is never reached from the shipped entry points."
+  },
+  "age_days": 59
+ },
+ {
+  "ticket_key": "DEMO-117",
+  "jira_status": "In Progress",
+  "verdict_property": {
+   "verdict": "needs_review",
+   "confidence": "low",
+   "cve_ids": [
+    "CVE-2026-95552"
+   ],
+   "package": {
+    "name": "github.com/example/router",
+    "ecosystem": "go",
+    "version": "0.9.1"
+   },
+   "release": {
+    "name": "3.3"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/router:3.3"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 6.4
+    }
+   },
+   "rationale": "Reachability could not be decided from the call graph.\nWhy review: dynamic dispatch hides the call target"
+  },
+  "age_days": 62
+ },
+ {
+  "ticket_key": "DEMO-118",
+  "jira_status": "In Progress",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "medium",
+   "cve_ids": [
+    "CVE-2026-97233"
+   ],
+   "package": {
+    "name": "github.com/example/router",
+    "ecosystem": "go",
+    "version": "0.9.1"
+   },
+   "release": {
+    "name": "3.5"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/scheduler:3.5"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 6.2
+    }
+   },
+   "rationale": "The affected module is imported but its parser is not called."
+  },
+  "age_days": 40
+ },
+ {
+  "ticket_key": "DEMO-119",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-94822"
+   ],
+   "package": {
+    "name": "google.golang.org/grpc",
+    "ecosystem": "go",
+    "version": "1.64.0"
+   },
+   "release": {
+    "name": "3.3"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/router:3.3"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 9.8
+    }
+   },
+   "rationale": "The affected module is imported but its parser is not called."
+  },
+  "age_days": 60
+ },
+ {
+  "ticket_key": "DEMO-120",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "medium",
+   "cve_ids": [
+    "CVE-2026-91067"
+   ],
+   "package": {
+    "name": "github.com/example/router",
+    "ecosystem": "go",
+    "version": "0.9.1"
+   },
+   "release": {
+    "name": "3.5"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/router:3.5"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 8.7
+    }
+   },
+   "rationale": "The vulnerable function is never reached from the shipped entry points."
+  },
+  "age_days": 50
+ },
+ {
+  "ticket_key": "DEMO-121",
+  "jira_status": "Review",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "medium",
+   "cve_ids": [
+    "CVE-2026-93056"
+   ],
+   "package": {
+    "name": "github.com/example/router",
+    "ecosystem": "go",
+    "version": "0.9.1"
+   },
+   "release": {
+    "name": "3.5"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/scheduler:3.5"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 5.2
+    }
+   },
+   "rationale": "The affected module is imported but its parser is not called."
+  },
+  "age_days": 44
+ },
+ {
+  "ticket_key": "DEMO-122",
+  "jira_status": "In Progress",
+  "verdict_property": {
+   "verdict": "affected",
+   "confidence": "low",
+   "cve_ids": [
+    "CVE-2026-97457"
+   ],
+   "package": {
+    "name": "golang.org/x/net",
+    "ecosystem": "go",
+    "version": "0.30.0"
+   },
+   "release": {
+    "name": "3.4"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/scheduler:3.4"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 5.0
+    }
+   },
+   "rationale": "The vulnerable handler is reachable from the public listener.\nWhy review: confirm the fix version before closing"
+  },
+  "age_days": 36
+ },
+ {
+  "ticket_key": "DEMO-123",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-92103"
+   ],
+   "package": {
+    "name": "github.com/example/router",
+    "ecosystem": "go",
+    "version": "0.9.1"
+   },
+   "release": {
+    "name": "3.5"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/scheduler:3.5"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 8.2
+    }
+   },
+   "rationale": "The vulnerable function is never reached from the shipped entry points."
+  },
+  "age_days": 36
+ },
+ {
+  "ticket_key": "DEMO-124",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-92677"
+   ],
+   "package": {
+    "name": "github.com/example/router",
+    "ecosystem": "go",
+    "version": "0.9.1"
+   },
+   "release": {
+    "name": "3.3"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/router:3.3"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 8.8
+    }
+   },
+   "rationale": "The affected module is imported but its parser is not called."
+  },
+  "age_days": 31
+ },
+ {
+  "ticket_key": "DEMO-125",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-92152"
+   ],
+   "package": {
+    "name": "google.golang.org/grpc",
+    "ecosystem": "go",
+    "version": "1.64.0"
+   },
+   "release": {
+    "name": "3.5"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/router:3.5"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 9.5
+    }
+   },
+   "rationale": "The vulnerable function is never reached from the shipped entry points."
+  },
+  "age_days": 54
+ },
+ {
+  "ticket_key": "DEMO-126",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "needs_review",
+   "confidence": "medium",
+   "cve_ids": [
+    "CVE-2026-96691"
+   ],
+   "package": {
+    "name": "google.golang.org/grpc",
+    "ecosystem": "go",
+    "version": "1.64.0"
+   },
+   "release": {
+    "name": "3.5"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/scheduler:3.5"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 3.1
+    }
+   },
+   "rationale": "Reachability could not be decided from the call graph.\nWhy review: dynamic dispatch hides the call target"
+  },
+  "age_days": 55
+ },
+ {
+  "ticket_key": "DEMO-127",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "low",
+   "cve_ids": [
+    "CVE-2026-98634"
+   ],
+   "package": {
+    "name": "stdlib",
+    "ecosystem": "go",
+    "version": "1.23.4"
+   },
+   "release": {
+    "name": "3.4"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/router:3.4"
+   },
+   "proposed_actions": {
+    "lane": "scope",
+    "cvss": {
+     "score": 9.2
+    }
+   },
+   "rationale": "The component is not part of this release.\nClose recommendation: not_shipped"
+  },
+  "age_days": 34
+ },
+ {
+  "ticket_key": "DEMO-128",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-96613"
+   ],
+   "package": {
+    "name": "github.com/example/router",
+    "ecosystem": "go",
+    "version": "0.9.1"
+   },
+   "release": {
+    "name": "3.4"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/router:3.4"
+   },
+   "proposed_actions": {
+    "lane": "version",
+    "cvss": {
+     "score": 9.7
+    }
+   },
+   "rationale": "The shipped version already carries the fix.\nClose recommendation: already_fixed"
+  },
+  "age_days": 26
+ },
+ {
+  "ticket_key": "DEMO-129",
+  "jira_status": "Review",
+  "verdict_property": {
+   "verdict": "affected",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-94362"
+   ],
+   "package": {
+    "name": "stdlib",
+    "ecosystem": "go",
+    "version": "1.23.4"
+   },
+   "release": {
+    "name": "3.4"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/router:3.4"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 3.6
+    }
+   },
+   "rationale": "The vulnerable handler is reachable from the public listener.\nWhy review: confirm the fix version before closing"
+  },
+  "age_days": 76
+ },
+ {
+  "ticket_key": "DEMO-130",
+  "jira_status": "Review",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "medium",
+   "cve_ids": [
+    "CVE-2026-92491"
+   ],
+   "package": {
+    "name": "stdlib",
+    "ecosystem": "go",
+    "version": "1.23.4"
+   },
+   "release": {
+    "name": "3.3"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/router:3.3"
+   },
+   "proposed_actions": {
+    "lane": "scope",
+    "cvss": {
+     "score": 8.3
+    }
+   },
+   "rationale": "The component is not part of this release.\nClose recommendation: not_shipped"
+  },
+  "age_days": 27
+ },
+ {
+  "ticket_key": "DEMO-131",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "affected",
+   "confidence": "medium",
+   "cve_ids": [
+    "CVE-2026-94650"
+   ],
+   "package": {
+    "name": "stdlib",
+    "ecosystem": "go",
+    "version": "1.23.4"
+   },
+   "release": {
+    "name": "3.5"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/scheduler:3.5"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 3.7
+    }
+   },
+   "rationale": "The vulnerable handler is reachable from the public listener.\nWhy review: confirm the fix version before closing"
+  },
+  "age_days": 59
+ },
+ {
+  "ticket_key": "DEMO-132",
+  "jira_status": "Review",
+  "verdict_property": {
+   "verdict": "not_affected",
+   "confidence": "high",
+   "cve_ids": [
+    "CVE-2026-94922"
+   ],
+   "package": {
+    "name": "stdlib",
+    "ecosystem": "go",
+    "version": "1.23.4"
+   },
+   "release": {
+    "name": "3.5"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/router:3.5"
+   },
+   "proposed_actions": {
+    "lane": "scope",
+    "cvss": {
+     "score": 9.6
+    }
+   },
+   "rationale": "The component is not part of this release.\nClose recommendation: not_shipped"
+  },
+  "age_days": 48
+ },
+ {
+  "ticket_key": "DEMO-133",
+  "jira_status": "New",
+  "verdict_property": {
+   "verdict": "needs_review",
+   "confidence": "low",
+   "cve_ids": [
+    "CVE-2026-96825"
+   ],
+   "package": {
+    "name": "github.com/example/router",
+    "ecosystem": "go",
+    "version": "0.9.1"
+   },
+   "release": {
+    "name": "3.5"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/router:3.5"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 3.9
+    }
+   },
+   "rationale": "Reachability could not be decided from the call graph.\nWhy review: dynamic dispatch hides the call target"
+  },
+  "age_days": 52
+ },
+ {
+  "ticket_key": "DEMO-134",
+  "jira_status": "In Progress",
+  "verdict_property": {
+   "verdict": "affected",
+   "confidence": "medium",
+   "cve_ids": [
+    "CVE-2026-94172"
+   ],
+   "package": {
+    "name": "golang.org/x/net",
+    "ecosystem": "go",
+    "version": "0.30.0"
+   },
+   "release": {
+    "name": "3.3"
+   },
+   "artifact": {
+    "locator": "registry.example.com/demo/scheduler:3.3"
+   },
+   "proposed_actions": {
+    "lane": "reachability",
+    "cvss": {
+     "score": 3.8
+    }
+   },
+   "rationale": "The vulnerable handler is reachable from the public listener.\nWhy review: confirm the fix version before closing"
+  },
+  "age_days": 42
+ }
+]

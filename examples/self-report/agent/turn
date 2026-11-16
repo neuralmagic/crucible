@@ -1,0 +1,24 @@
+#!/bin/sh
+# Points pi at the model gateway the environment names and runs one prompt, printing each of
+# pi's events with the time it arrived.
+set -eu
+mkdir -p "$HOME/.pi/agent"
+node -e '
+const fs = require("fs");
+const model = process.env.VIEW_AGENT_MODEL;
+fs.writeFileSync(process.env.HOME + "/.pi/agent/models.json", JSON.stringify({
+  providers: { gateway: {
+    name: "gateway",
+    baseUrl: process.env.VIEW_AGENT_URL,
+    api: "openai-completions",
+    apiKey: "!printenv VIEW_AGENT_KEY",
+    models: [{ id: model, name: model, reasoning: true, input: ["text"],
+               contextWindow: 1000000, maxTokens: 65536 }],
+  } },
+}));'
+pi --print "$CRUCIBLE_PROMPT" --provider gateway --model "$VIEW_AGENT_MODEL" --no-session \
+    --mode json < /dev/null \
+    | node -e '
+const lines = require("readline").createInterface({ input: process.stdin });
+lines.on("line", (line) => console.log(JSON.stringify({ at: Date.now(), event: line })));'
+

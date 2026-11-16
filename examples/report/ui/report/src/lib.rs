@@ -1,0 +1,493 @@
+//! The report view: every lane's `verdicts.json` as one row per ticket, by disposition.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use crucible_view::{
+    Bar, Cell, Column, ColumnKind, Context2d, LineCap, Node, PlotKind, Request, Row, Segment,
+    Series, Stat, Tab, TextAlign, Tone, View, Width,
+};
+use serde::Deserialize;
+
+crucible_view::plugin!(inputs = ["verdicts.json"], view = report);
+
+const TICKETS: &str = "https://issues.example.com/browse/";
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Category {
+    Affected,
+    NeedsReview,
+    SbomInaccurate,
+    AlreadyFixed,
+    NotShipped,
+    NotAffected,
+}
+
+impl Category {
+    const ALL: [Category; 6] = [
+        Category::Affected,
+        Category::NeedsReview,
+        Category::SbomInaccurate,
+        Category::AlreadyFixed,
+        Category::NotShipped,
+        Category::NotAffected,
+    ];
+
+    fn of(lane: &str, verdict: &str, close: &str, rationale: &str) -> Category {
+        let scan_absent =
+            rationale.contains("final-artifact package scan for") && rationale.contains("absent");
+        match (close, verdict) {
+            ("not_shipped", _) => Category::NotShipped,
+            _ if lane == "absent" || scan_absent => Category::SbomInaccurate,
+            ("already_fixed", _) => Category::AlreadyFixed,
+            (_, "affected") => Category::Affected,
+            (_, "not_affected") => Category::NotAffected,
+            _ => Category::NeedsReview,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Category::Affected => "affected",
+            Category::NeedsReview => "needs_review",
+            Category::SbomInaccurate => "sbom_inaccurate",
+            Category::AlreadyFixed => "already_fixed",
+            Category::NotShipped => "not_shipped",
+            Category::NotAffected => "not_affected",
+        }
+    }
+
+    fn tone(self) -> Tone {
+        match self {
+            Category::Affected => Tone::Bad,
+            Category::NeedsReview => Tone::Warn,
+            Category::SbomInaccurate => Tone::Info,
+            Category::AlreadyFixed | Category::NotAffected => Tone::Good,
+            Category::NotShipped => Tone::Muted,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct Record {
+    ticket_key: String,
+    #[serde(default)]
+    jira_status: String,
+    #[serde(default)]
+    age_days: f64,
+    #[serde(default)]
+    verdict_property: Verdict,
+}
+
+#[derive(Default, Deserialize)]
+struct Verdict {
+    #[serde(default)]
+    verdict: String,
+    #[serde(default)]
+    confidence: String,
+    #[serde(default)]
+    cve_ids: Vec<String>,
+    #[serde(default)]
+    package: Package,
+    #[serde(default)]
+    release: Named,
+    #[serde(default)]
+    artifact: Artifact,
+    #[serde(default)]
+    proposed_actions: Actions,
+    #[serde(default)]
+    rationale: String,
+}
+
+#[derive(Default, Deserialize)]
+struct Package {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    version: String,
+}
+
+#[derive(Default, Deserialize)]
+struct Named {
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Default, Deserialize)]
+struct Artifact {
+    #[serde(default)]
+    locator: String,
+}
+
+#[derive(Default, Deserialize)]
+struct Actions {
+    #[serde(default)]
+    lane: String,
+    #[serde(default)]
+    cvss: Option<Cvss>,
+}
+
+#[derive(Deserialize)]
+struct Cvss {
+    score: f64,
+}
+
+struct Ticket {
+    key: String,
+    status: String,
+    age_days: f64,
+    category: Category,
+    verdict: Verdict,
+    source: String,
+}
+
+/// The rest of the line after `label` in `text`.
+fn noted<'a>(text: &'a str, label: &str) -> &'a str {
+    text.lines()
+        .find_map(|line| line.strip_prefix(label))
+        .map_or("", str::trim)
+}
+
+fn report(request: Request) -> Result<View, String> {
+    let mut tickets: BTreeMap<String, Ticket> = BTreeMap::new();
+    for file in &request.files {
+        let records: Vec<Record> = serde_json::from_str(&file.text)
+            .map_err(|e| format!("{} from {}: {e}", file.path, file.task))?;
+        for record in records {
+            let verdict = record.verdict_property;
+            let category = Category::of(
+                &verdict.proposed_actions.lane,
+                &verdict.verdict,
+                noted(&verdict.rationale, "Close recommendation:"),
+                &verdict.rationale,
+            );
+            tickets.insert(
+                record.ticket_key.clone(),
+                Ticket {
+                    key: record.ticket_key,
+                    status: record.jira_status,
+                    age_days: record.age_days,
+                    category,
+                    verdict,
+                    source: file.task.clone(),
+                },
+            );
+        }
+    }
+    let mut tickets: Vec<Ticket> = tickets.into_values().collect();
+    tickets.sort_by(|a, b| (a.category, &a.key).cmp(&(b.category, &b.key)));
+
+    let count = |category: Category| tickets.iter().filter(|t| t.category == category).count();
+    let closable = tickets.len() - count(Category::Affected) - count(Category::NeedsReview);
+    let stats = Node::Stats {
+        items: vec![
+            stat("Triaged", tickets.len(), Tone::Neutral),
+            stat("Affected", count(Category::Affected), Tone::Bad),
+            stat("Needs review", count(Category::NeedsReview), Tone::Warn),
+            stat("Closable", closable, Tone::Good),
+        ],
+    };
+
+    let mut tabs = vec![
+        Tab {
+            label: "Summary".into(),
+            count: None,
+            body: Node::Stack {
+                children: vec![by_release(&tickets), pivot(&tickets)],
+            },
+        },
+        Tab {
+            label: "Charts".into(),
+            count: None,
+            body: Node::Stack {
+                children: vec![across_releases(&tickets), age_by_score(&tickets)],
+            },
+        },
+        Tab {
+            label: "Canvas".into(),
+            count: None,
+            body: drawing(&tickets),
+        },
+        Tab {
+            label: "All".into(),
+            count: Some(tickets.len() as u64),
+            body: table("all", tickets.iter()),
+        },
+    ];
+    for category in Category::ALL {
+        tabs.push(Tab {
+            label: category.label().into(),
+            count: Some(count(category) as u64),
+            body: table(
+                category.label(),
+                tickets.iter().filter(|t| t.category == category),
+            ),
+        });
+    }
+    Ok(View {
+        title: "Triage report".into(),
+        body: Node::Stack {
+            children: vec![
+                stats,
+                Node::Tabs {
+                    id: "category".into(),
+                    tabs,
+                },
+            ],
+        },
+    })
+}
+
+fn stat(label: &str, value: usize, tone: Tone) -> Stat {
+    Stat {
+        label: label.into(),
+        value: value.to_string(),
+        tone,
+    }
+}
+
+fn by_release(tickets: &[Ticket]) -> Node {
+    let releases: BTreeSet<&str> = tickets
+        .iter()
+        .map(|t| t.verdict.release.name.as_str())
+        .collect();
+    Node::Bars {
+        bars: releases
+            .into_iter()
+            .map(|release| Bar {
+                label: release.into(),
+                segments: Category::ALL
+                    .into_iter()
+                    .map(|category| Segment {
+                        label: category.label().into(),
+                        value: tickets
+                            .iter()
+                            .filter(|t| t.verdict.release.name == release)
+                            .filter(|t| t.category == category)
+                            .count() as f64,
+                        tone: category.tone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
+/// Each category's count per release, on the release number.
+fn across_releases(tickets: &[Ticket]) -> Node {
+    let releases: BTreeSet<&str> = tickets
+        .iter()
+        .map(|t| t.verdict.release.name.as_str())
+        .collect();
+    Node::Plot {
+        kind: PlotKind::Line,
+        x: "release".into(),
+        y: "tickets".into(),
+        series: Category::ALL
+            .into_iter()
+            .map(|category| Series {
+                label: category.label().into(),
+                tone: category.tone(),
+                points: releases
+                    .iter()
+                    .filter_map(|release| {
+                        let count = tickets
+                            .iter()
+                            .filter(|t| t.verdict.release.name == *release)
+                            .filter(|t| t.category == category)
+                            .count();
+                        Some([release.parse().ok()?, count as f64])
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
+/// Each scored ticket's days open against its CVSS score.
+fn age_by_score(tickets: &[Ticket]) -> Node {
+    Node::Plot {
+        kind: PlotKind::Scatter,
+        x: "CVSS score".into(),
+        y: "days open".into(),
+        series: Category::ALL
+            .into_iter()
+            .map(|category| Series {
+                label: category.label().into(),
+                tone: category.tone(),
+                points: tickets
+                    .iter()
+                    .filter(|t| t.category == category)
+                    .filter_map(|t| {
+                        let cvss = t.verdict.proposed_actions.cvss.as_ref()?;
+                        Some([cvss.score, t.age_days])
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
+/// A heat map of tickets by category and release beside the closable share as a ring, drawn
+/// with canvas commands.
+fn drawing(tickets: &[Ticket]) -> Node {
+    use std::f32::consts::{FRAC_PI_2, TAU};
+
+    let releases: Vec<&str> = tickets
+        .iter()
+        .map(|t| t.verdict.release.name.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let count = |category: Category, release: &str| {
+        tickets
+            .iter()
+            .filter(|t| t.category == category && t.verdict.release.name == release)
+            .count()
+    };
+    let most = Category::ALL
+        .into_iter()
+        .flat_map(|category| releases.iter().map(move |release| (category, *release)))
+        .map(|(category, release)| count(category, release))
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let (left, top, wide, tall) = (130.0, 28.0, 64.0, 26.0);
+    let grid = left + wide * releases.len() as f32;
+    let mut ctx = Context2d::new(grid + 190.0, top + tall * Category::ALL.len() as f32 + 12.0);
+
+    ctx.set_font("11px monospace");
+    ctx.set_text_align(TextAlign::Center);
+    ctx.set_fill_style(Tone::Muted);
+    for (column, release) in releases.iter().enumerate() {
+        ctx.fill_text(release, left + wide * (column as f32 + 0.5), 16.0);
+    }
+    for (row, category) in Category::ALL.into_iter().enumerate() {
+        let y = top + tall * row as f32;
+        ctx.set_text_align(TextAlign::Right);
+        ctx.set_fill_style(category.tone());
+        ctx.fill_text(category.label(), left - 10.0, y + 17.0);
+        ctx.set_text_align(TextAlign::Center);
+        for (column, release) in releases.iter().enumerate() {
+            let n = count(category, release);
+            let x = left + wide * column as f32;
+            ctx.set_fill_style(category.tone());
+            ctx.set_global_alpha(0.12 + 0.88 * n as f32 / most as f32);
+            ctx.fill_rect(x + 1.0, y + 1.0, wide - 2.0, tall - 2.0);
+            ctx.set_global_alpha(1.0);
+            ctx.set_fill_style(Tone::Neutral);
+            ctx.fill_text(&n.to_string(), x + wide / 2.0, y + 17.0);
+        }
+    }
+
+    let open = tickets
+        .iter()
+        .filter(|t| matches!(t.category, Category::Affected | Category::NeedsReview))
+        .count();
+    let share = if tickets.is_empty() {
+        0.0
+    } else {
+        (tickets.len() - open) as f32 / tickets.len() as f32
+    };
+    let (cx, cy, radius) = (grid + 100.0, top + tall * 3.0, 56.0);
+    ctx.set_line_width(12.0);
+    ctx.set_stroke_style(Tone::Muted);
+    ctx.set_global_alpha(0.3);
+    ctx.begin_path();
+    ctx.arc(cx, cy, radius, 0.0, TAU);
+    ctx.stroke();
+    ctx.set_global_alpha(1.0);
+    ctx.set_stroke_style(Tone::Good);
+    ctx.set_line_cap(LineCap::Round);
+    ctx.begin_path();
+    ctx.arc(cx, cy, radius, -FRAC_PI_2, -FRAC_PI_2 + TAU * share);
+    ctx.stroke();
+    ctx.set_fill_style(Tone::Neutral);
+    ctx.set_font("bold 20px monospace");
+    ctx.fill_text(&format!("{:.0}%", share * 100.0), cx, cy + 4.0);
+    ctx.set_fill_style(Tone::Muted);
+    ctx.set_font("11px sans-serif");
+    ctx.fill_text("closable", cx, cy + 22.0);
+    ctx.finish()
+}
+
+fn pivot(tickets: &[Ticket]) -> Node {
+    let statuses: BTreeSet<&str> = tickets.iter().map(|t| t.status.as_str()).collect();
+    let tally = |category: Option<Category>, status: Option<&str>| {
+        tickets
+            .iter()
+            .filter(|t| category.is_none_or(|c| t.category == c))
+            .filter(|t| status.is_none_or(|s| t.status == s))
+            .count()
+            .to_string()
+    };
+    let line = |label: &str, tone: Tone, category: Option<Category>| {
+        let mut cells = vec![
+            Cell::text(label).tone(tone),
+            Cell::text(tally(category, None)),
+        ];
+        cells.extend(
+            statuses
+                .iter()
+                .map(|status| Cell::text(tally(category, Some(status)))),
+        );
+        cells
+    };
+    let mut columns = vec!["category".to_string(), "total".to_string()];
+    columns.extend(statuses.iter().map(|status| status.to_string()));
+    let mut rows: Vec<Vec<Cell>> = Category::ALL
+        .into_iter()
+        .map(|category| line(category.label(), category.tone(), Some(category)))
+        .collect();
+    rows.push(line("total", Tone::Neutral, None));
+    Node::Grid { columns, rows }
+}
+
+fn table<'a>(id: &str, tickets: impl Iterator<Item = &'a Ticket>) -> Node {
+    let column = |id: &str, title: &str, kind: ColumnKind, width: Width| Column {
+        id: id.into(),
+        title: title.into(),
+        kind,
+        width,
+    };
+    Node::Table {
+        id: id.into(),
+        columns: vec![
+            column("ticket", "Ticket", ColumnKind::Mono, Width::Narrow),
+            column("status", "Status", ColumnKind::Text, Width::Narrow),
+            column("category", "Category", ColumnKind::Badge, Width::Medium),
+            column("confidence", "Confidence", ColumnKind::Text, Width::Narrow),
+            column("release", "Release", ColumnKind::Mono, Width::Narrow),
+            column("cve", "CVE", ColumnKind::Mono, Width::Medium),
+            column("package", "Package", ColumnKind::Text, Width::Wide),
+            column("version", "Version", ColumnKind::Mono, Width::Narrow),
+            column("image", "Image", ColumnKind::Mono, Width::Wide),
+            column("lane", "Lane", ColumnKind::Text, Width::Narrow),
+            column("why", "Why", ColumnKind::Text, Width::Fill),
+        ],
+        rows: tickets
+            .map(|ticket| {
+                let v = &ticket.verdict;
+                let why = match noted(&v.rationale, "Why review:") {
+                    "" => v.rationale.lines().next().unwrap_or_default(),
+                    why => why,
+                };
+                Row {
+                    id: ticket.key.clone(),
+                    cells: vec![
+                        Cell::text(&ticket.key).link(format!("{TICKETS}{}", ticket.key)),
+                        Cell::text(&ticket.status),
+                        Cell::text(ticket.category.label()).tone(ticket.category.tone()),
+                        Cell::text(&v.confidence),
+                        Cell::text(&v.release.name),
+                        Cell::text(v.cve_ids.join(", ")),
+                        Cell::text(&v.package.name),
+                        Cell::text(&v.package.version),
+                        Cell::text(&v.artifact.locator),
+                        Cell::text(&ticket.source).tone(Tone::Muted),
+                        Cell::text(why),
+                    ],
+                }
+            })
+            .collect(),
+    }
+}

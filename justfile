@@ -287,6 +287,34 @@ route-serving-forward namespace="weaton-dev" context="coreweave-waldorf":
 route-serving-down namespace="weaton-dev" context="coreweave-waldorf":
     kubectl --context {{context}} -n {{namespace}} delete deploy/dgemma-systemone svc/dgemma-systemone --ignore-not-found
 
+# Build the report example's view plugin into examples/report/ui/report.wasm, with the paths
+# the compiler embeds rewritten so the module carries none from this machine.
+example-report-view:
+    RUSTFLAGS="--remap-path-prefix=$HOME=/home --remap-path-prefix={{ justfile_directory() }}=." cargo build --release --target wasm32-unknown-unknown --manifest-path examples/report/ui/report/Cargo.toml --target-dir target/view-plugins
+    cp target/view-plugins/wasm32-unknown-unknown/release/report_view.wasm examples/report/ui/report.wasm
+
+# Build the report example's scatter plot as a view plugin written in Go.
+example-report-view-go:
+    cd examples/report/ui/report-go && GOOS=wasip1 GOARCH=wasm go build -buildmode=c-shared -o report-go.wasm .
+
+# Build what the self-report example's agent needs: a kit in the pack holding the view plugin
+# skill and a copy of crucible-view that builds outside this workspace, then its image.
+example-self-report-kit:
+    rm -rf examples/self-report/kit
+    mkdir -p examples/self-report/kit/crucible-view examples/self-report/kit/skill
+    cp -R crucible-view/src crucible-view/js examples/self-report/kit/crucible-view/
+    cp skills/write-a-view-plugin/*.md examples/self-report/kit/skill/
+    printf '[package]\nname = "crucible-view"\nversion = "0.0.0"\nedition = "2024"\n\n[dependencies]\nserde = { version = "1", features = ["derive"] }\nserde_json = "1"\nthiserror = "2"\n\n[[bin]]\nname = "crucible-view-check"\npath = "src/bin/check.rs"\n' > examples/self-report/kit/crucible-view/Cargo.toml
+    podman build -t localhost/crucible-view-agent -f examples/self-report/agent/Containerfile examples/self-report
+
+# Fetch the engine JavaScript view plugins run in: Javy's QuickJS module, checked against the
+# release's digest.
+desktop-js-engine:
+    mkdir -p crucible-desktop/assets/js-engine
+    gh release download v9.1.0 --repo bytecodealliance/javy --pattern plugin.wasm.gz --dir crucible-desktop/assets/js-engine --clobber
+    echo "dc237a6fb9c7e58423456a12fc3c4e7a97d9d1eeb91b89ca73db76b78ae95e83  crucible-desktop/assets/js-engine/plugin.wasm.gz" | shasum -a 256 -c -
+    gunzip -f crucible-desktop/assets/js-engine/plugin.wasm.gz
+
 # Open the desktop app (Crucible Playbooks), its own Cargo workspace on Rune.
 desktop-run:
     sh crucible-desktop/rune-patches.sh
