@@ -1030,6 +1030,28 @@ impl Client {
             .await
     }
 
+    /// Make schedule `id` due now; the controller fires it as it does a cron window.
+    pub async fn fire_schedule<T: DeserializeOwned>(&self, id: &str) -> Result<T> {
+        self.post(
+            &format!("/api/schedules/{}/fire", encode(id)),
+            None::<&serde_json::Value>,
+        )
+        .await
+    }
+
+    /// Launch schedule `id` once with `cursor`, leaving the schedule and its cursor as they are.
+    pub async fn test_fire_schedule(
+        &self,
+        id: &str,
+        cursor: &dto::TestCursor,
+    ) -> Result<dto::TestFire> {
+        self.post(
+            &format!("/api/schedules/{}/test-fire", encode(id)),
+            Some(&serde_json::json!({ "cursor": cursor })),
+        )
+        .await
+    }
+
     pub async fn watches<T: DeserializeOwned>(&self) -> Result<T> {
         self.get("/api/watches").await
     }

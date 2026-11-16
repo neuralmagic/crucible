@@ -1090,6 +1090,61 @@
     "name": "crucible_runs"
   },
   {
+    "description": "Fire a schedule now instead of at its next window. A real firing: the run gets the stored cursor and advances it. Refused while the schedule is disabled or a launch that may still advance its cursor is in flight.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "id": {
+          "description": "The schedule's id, as schedules lists it.",
+          "type": "string"
+        },
+        "json": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_schedule_fire"
+  },
+  {
+    "description": "Launch a schedule once without moving it: the run gets the stored cursor, the cursor given here, or none, and never writes it back. Works on a disabled schedule. Costs money against the schedule's max_cost. Returns the issue key to watch it by with crucible_playbook_run.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "cursor": {
+          "default": null,
+          "description": "A cursor value to give the firing in place of the stored one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "The schedule's id, as schedules lists it.",
+          "type": "string"
+        },
+        "json": {
+          "default": false,
+          "type": "boolean"
+        },
+        "no_cursor": {
+          "default": false,
+          "description": "Give the firing no cursor, as on the schedule's first firing.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_schedule_test_fire"
+  },
+  {
     "description": "Recurrences: ID PLAYBOOK CRON STATE NEXT LAST FAILS OWNER.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",

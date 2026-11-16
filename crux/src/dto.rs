@@ -1681,6 +1681,27 @@ pub struct RunRow {
     pub cluster: Option<String>,
 }
 
+/// What a schedule's test firing receives as its cursor.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "from", rename_all = "snake_case")]
+pub enum TestCursor {
+    /// The value the schedule holds now.
+    #[default]
+    Stored,
+    /// Nothing, as on the schedule's first firing.
+    None,
+    /// This value in place of the stored one.
+    Value { value: String },
+}
+
+/// `POST /api/schedules/{id}/test-fire`: the launch it minted and the cursor that launch got.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TestFire {
+    pub key: String,
+    pub schedule: String,
+    pub cursor: TestCursor,
+}
+
 /// A recurrence: what it launches, when it next fires, and whether it can still fire at all.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Schedule {

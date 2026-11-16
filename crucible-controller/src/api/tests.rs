@@ -3499,6 +3499,8 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/schedules",
         "/api/schedules/preview",
         "/api/schedules/{id}",
+        "/api/schedules/{id}/fire",
+        "/api/schedules/{id}/test-fire",
         "/api/watches",
         "/api/watches/trackers",
         "/api/watches/preview",
@@ -8695,6 +8697,165 @@ async fn a_schedule_round_trips_through_its_crud_surface(pool: PgPool) -> Result
         .await?;
     assert_eq!(res.status(), StatusCode::NO_CONTENT);
     let (status, _) = get_json_value(&app, &format!("/api/schedules/{id}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+/// Firing a schedule now makes it due at once, and the sweep launches it as the schedule's own
+/// firing. A disabled schedule and an id naming nothing are refused.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn firing_a_schedule_now_makes_it_due_for_the_sweep(pool: PgPool) -> Result<()> {
+    let (db, dir) = db_with(pool.clone());
+    let app = app_with_admins(db.clone(), vec!["wren".to_string()]);
+    register_survey(&app, dir.path(), LAUNCH_WORKFLOW).await;
+    let (status, created) = send_json(
+        &app,
+        HttpRequest::post("/api/schedules"),
+        schedule_body("0 0 1 1 *", "UTC"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().expect("id").to_string();
+    let window = created["next_due_at"].as_str().expect("due").to_string();
+    let fire = format!("/api/schedules/{id}/fire");
+
+    assert!(
+        crate::launches::schedules::fire_due(&db, jiff::Timestamp::now(), 8, 5)
+            .await?
+            .is_empty(),
+        "its window is months out"
+    );
+    let (status, fired) = send_json(&app, HttpRequest::post(&fire), serde_json::Value::Null).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{fired}");
+    let due: jiff::Timestamp = fired["next_due_at"].as_str().expect("due").parse()?;
+    assert!(due <= jiff::Timestamp::now(), "{due} is due");
+    let events: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT from_status, to_status, actor FROM events WHERE key = $1 ORDER BY id",
+    )
+    .bind(format!("schedule:{id}"))
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        events.last(),
+        Some(&(
+            "waiting".to_string(),
+            "due".to_string(),
+            Some("wren".to_string())
+        ))
+    );
+
+    let launched = crate::launches::schedules::fire_due(&db, jiff::Timestamp::now(), 8, 5).await?;
+    assert_eq!(launched.len(), 1, "{launched:?}");
+    let (status, rows) = get_json_value(&app, "/api/playbook-runs").await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert_eq!(rows[0]["key"], launched[0].as_str());
+    assert_eq!(rows[0]["origin"], "schedule");
+    assert_eq!(rows[0]["schedule"], id.as_str());
+    assert_eq!(rows[0]["advance_dedupe"], true);
+    let (_, after) = get_json_value(&app, &format!("/api/schedules/{id}")).await;
+    assert_eq!(
+        after["next_due_at"],
+        window.as_str(),
+        "the window it was waiting on still stands"
+    );
+
+    let (status, refused) =
+        send_json(&app, HttpRequest::post(&fire), serde_json::Value::Null).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .expect("error")
+            .contains(launched[0].as_str()),
+        "the refusal names the launch in flight: {refused}"
+    );
+    let (_, held) = get_json_value(&app, &format!("/api/schedules/{id}")).await;
+    assert_eq!(held["next_due_at"], window.as_str());
+
+    let mut off = schedule_body("0 0 1 1 *", "UTC");
+    off["enabled"] = serde_json::Value::Bool(false);
+    let (status, _) = send_json(&app, HttpRequest::put(format!("/api/schedules/{id}")), off).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, refused) =
+        send_json(&app, HttpRequest::post(&fire), serde_json::Value::Null).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    let (_, still) = get_json_value(&app, &format!("/api/schedules/{id}")).await;
+    assert_eq!(still["next_due_at"], serde_json::Value::Null);
+
+    let (status, _) = send_json(
+        &app,
+        HttpRequest::post("/api/schedules/no-such-schedule/fire"),
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+/// A test firing launches the schedule's own authorization at once, listed as its firing and
+/// marked as one that cannot advance, and the schedule reads back exactly as it did. A cursor the
+/// schedule has no place for is a field refusal; an id naming nothing is a 404.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn test_firing_a_schedule_launches_without_moving_it(pool: PgPool) -> Result<()> {
+    let (db, dir) = db_with(pool.clone());
+    let app = app_with_admins(db.clone(), vec!["wren".to_string()]);
+    register_survey(&app, dir.path(), LAUNCH_WORKFLOW).await;
+    let mut body = schedule_body("0 0 1 1 *", "UTC");
+    body["enabled"] = serde_json::Value::Bool(false);
+    let (status, created) = send_json(&app, HttpRequest::post("/api/schedules"), body).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().expect("id").to_string();
+    let test_fire = format!("/api/schedules/{id}/test-fire");
+
+    let (status, ack) = send_json(&app, HttpRequest::post(&test_fire), serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{ack}");
+    assert_eq!(ack["schedule"], id.as_str());
+    assert_eq!(ack["cursor"], serde_json::json!({"from": "stored"}));
+    let key = ack["key"].as_str().expect("key");
+
+    let (status, rows) = get_json_value(&app, "/api/playbook-runs").await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert_eq!(rows[0]["key"], key);
+    assert_eq!(rows[0]["origin"], "schedule");
+    assert_eq!(rows[0]["schedule"], id.as_str());
+    assert_eq!(rows[0]["advance_dedupe"], false);
+    assert_eq!(rows[0]["params"]["topic"], "attention sinks");
+    let given: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT test_cursor FROM playbook_launches WHERE key = $1")
+            .bind(key)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(given, Some(serde_json::json!({"from": "stored"})));
+    let actor: Option<String> =
+        sqlx::query_scalar("SELECT actor FROM events WHERE key = $1 ORDER BY id LIMIT 1")
+            .bind(key)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(actor.as_deref(), Some("wren"));
+
+    let (_, after) = get_json_value(&app, &format!("/api/schedules/{id}")).await;
+    assert_eq!(after, created, "the schedule is exactly as it was saved");
+
+    for cursor in [
+        serde_json::json!({"from": "value", "value": "2026-01-01T00:00:00Z"}),
+        serde_json::json!({"from": "none"}),
+    ] {
+        let (status, refused) = send_json(
+            &app,
+            HttpRequest::post(&test_fire),
+            serde_json::json!({"cursor": cursor}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+        assert_eq!(refused["fields"][0]["field"], "cursor");
+    }
+
+    let (status, _) = send_json(
+        &app,
+        HttpRequest::post("/api/schedules/no-such-schedule/test-fire"),
+        serde_json::json!({}),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     Ok(())
 }
