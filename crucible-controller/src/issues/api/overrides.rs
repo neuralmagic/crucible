@@ -7,7 +7,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-// --- POST handlers (overrides; never write the DB) ---------------------------
+// --- POST handlers (overrides; write only the pending-override table) --------
 
 /// Accepts either a JSON or a form-urlencoded body for the same route, so the zero-JS debug UI's
 /// plain `<form>` posts and JSON API/CLI clients share one handler. `origin` records which
@@ -79,13 +79,13 @@ pub(crate) struct ParkBody {
     reason: String,
 }
 
-fn submit_override(
+async fn submit_override(
     state: &ApiState,
     ov: Override,
     action: &'static str,
     redirect_to: &str,
     origin: BodyOrigin,
-) -> Response {
+) -> ApiResult<Response> {
     let ack = OverrideAck {
         key: ov.key.0.clone(),
         action,
@@ -93,8 +93,8 @@ fn submit_override(
         priority: ov.priority,
         actor: ov.actor.clone(),
     };
-    state.sink.submit(ov);
-    override_response(origin, ack, redirect_to)
+    state.sink.submit(ov).await?;
+    Ok(override_response(origin, ack, redirect_to))
 }
 
 #[utoipa::path(
@@ -116,7 +116,7 @@ pub(crate) async fn park_issue(
     identity: crate::identity::session::Identity,
     _operator: crate::authz::guard::OperatorGuard,
     body: AnyBody<ParkBody>,
-) -> Response {
+) -> ApiResult<Response> {
     submit_override(
         &state,
         Override {
@@ -130,6 +130,7 @@ pub(crate) async fn park_issue(
         "/inbox",
         body.origin,
     )
+    .await
 }
 
 #[derive(Debug, Deserialize, Default, ToSchema)]
@@ -157,7 +158,7 @@ pub(crate) async fn unpark_issue(
     identity: crate::identity::session::Identity,
     _operator: crate::authz::guard::OperatorGuard,
     body: AnyBody<UnparkBody>,
-) -> Response {
+) -> ApiResult<Response> {
     submit_override(
         &state,
         Override {
@@ -171,6 +172,7 @@ pub(crate) async fn unpark_issue(
         "/inbox",
         body.origin,
     )
+    .await
 }
 
 #[cfg(feature = "autoresearch")]
@@ -201,7 +203,7 @@ pub(crate) async fn scope_now(
     identity: crate::identity::session::Identity,
     _admin: crate::authz::guard::AdminGuard,
     body: AnyBody<ScopeNowBody>,
-) -> Response {
+) -> ApiResult<Response> {
     let justification = body.value.justification;
     submit_override(
         &state,
@@ -219,6 +221,7 @@ pub(crate) async fn scope_now(
         "/",
         body.origin,
     )
+    .await
 }
 
 #[cfg(feature = "autoresearch")]
@@ -247,7 +250,7 @@ pub(crate) async fn redispatch_issue(
     identity: crate::identity::session::Identity,
     _admin: crate::authz::guard::AdminGuard,
     body: AnyBody<RedispatchBody>,
-) -> Response {
+) -> ApiResult<Response> {
     let justification = body.value.justification;
     submit_override(
         &state,
@@ -264,6 +267,7 @@ pub(crate) async fn redispatch_issue(
         "/",
         body.origin,
     )
+    .await
 }
 
 #[cfg(feature = "autoresearch")]
@@ -294,7 +298,7 @@ pub(crate) async fn bump_issue(
     identity: crate::identity::session::Identity,
     _operator: crate::authz::guard::OperatorGuard,
     body: AnyBody<BumpBody>,
-) -> Response {
+) -> ApiResult<Response> {
     submit_override(
         &state,
         Override {
@@ -308,4 +312,5 @@ pub(crate) async fn bump_issue(
         "/",
         body.origin,
     )
+    .await
 }
