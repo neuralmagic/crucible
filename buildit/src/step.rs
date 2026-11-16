@@ -35,13 +35,13 @@ pub const BUILDKIT_STAMPS: &str = r"^(#[0-9]+ \[|#[0-9]+ exporting to image|CACH
 /// [`RESTORE`], [`SAVE`], then the build stage's argv.
 pub(crate) const RUNNER: &str = r#"log=$1; shift; t=
 stage() {
-  secs=$1; shift
+  lim=$1; shift
   printf '$ %s\n' "$*" >> "$log"
   s=$(date +%s)
-  timeout "$secs" "$@" >> "$log" 2>&1 < /dev/null
-  c=$?; t=
-  [ "$c" -ne 0 ] && [ $(($(date +%s) - s)) -ge "$secs" ] && t=" timeout"
-  return "$c"
+  timeout "$lim" "$@" >> "$log" 2>&1 < /dev/null
+  rc=$?; t=
+  [ "$rc" -ne 0 ] && [ $(($(date +%s) - s)) -ge "$lim" ] && t=" timeout"
+  return "$rc"
 }
 secs=$1; term=$2; stamps=$3; steps=$4; plan=$5; url=$6; auth=$7; restore=$8; save=$9; shift 9
 sleep 2147483647 & hold=$!
@@ -383,11 +383,24 @@ mod tests {
     /// The runner as a build pod runs it, to its end.
     #[cfg(target_os = "linux")]
     fn build(log: &std::path::Path, secs: &str, stamps: &str, cmd: &[&str]) {
+        build_with_caches(log, secs, stamps, ["", "", ""], cmd);
+    }
+
+    /// The runner as a build pod with cluster caches runs it: `snapshots` is the plan, the
+    /// shared cache's URL and the save header file.
+    #[cfg(target_os = "linux")]
+    fn build_with_caches(
+        log: &std::path::Path,
+        secs: &str,
+        stamps: &str,
+        snapshots: [&str; 3],
+        cmd: &[&str],
+    ) {
         use std::path::Path;
         std::fs::create_dir_all(log.parent().unwrap()).unwrap();
         let (term, steps) = (ext(log, "term"), ext(log, "steps"));
         let mut args = vec![log, Path::new(secs), &term, Path::new(stamps), &steps];
-        args.extend(["", "", ""].map(Path::new));
+        args.extend(snapshots.map(Path::new));
         args.extend([crate::step::RESTORE, crate::step::SAVE].map(Path::new));
         args.extend(cmd.iter().map(Path::new));
         let out = std::process::Command::new("sh")
@@ -439,6 +452,57 @@ mod tests {
                 timed_out: true
             }
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_build_with_caches_keeps_its_own_timeout_and_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |name: &str, secs: &str, cmd: &str| {
+            let log = dir.path().join(name).join("build.log");
+            let (plan, auth) = (dir.path().join(name).join("plan"), dir.path().join("auth"));
+            std::fs::create_dir_all(plan.parent().unwrap()).unwrap();
+            std::fs::write(&plan, "").unwrap();
+            std::fs::write(&auth, "Authorization: Bearer t\n").unwrap();
+            let cmd = cmd.replace("$plan", plan.to_str().unwrap());
+            build_with_caches(
+                &log,
+                secs,
+                crate::step::BUILDAH_STAMPS,
+                [
+                    plan.to_str().unwrap(),
+                    "http://127.0.0.1:9",
+                    auth.to_str().unwrap(),
+                ],
+                &["sh", "-c", &cmd],
+            );
+            (
+                State::record(read(&ext(&log, "exit")).trim()).unwrap(),
+                read(&log),
+            )
+        };
+
+        let (state, log) = run("slow", "1", "sleep 5");
+        assert_eq!(
+            state,
+            State::Exited {
+                code: 124,
+                timed_out: true
+            },
+            "{log}"
+        );
+        assert!(!log.contains(".save "), "{log}");
+
+        let (state, log) = run("failed-save", "30", "rm $plan");
+        assert_eq!(
+            state,
+            State::Exited {
+                code: 0,
+                timed_out: false
+            },
+            "{log}"
+        );
+        assert!(log.contains(".save "), "{log}");
     }
 
     /// The steps file of a build, once it holds `lines` lines.
