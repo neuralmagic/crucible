@@ -1823,6 +1823,7 @@ clusters            = ["pirate", "waldorf"]
 workload_namespaces = ["crucible-kueue-e2e"]
 people              = true
 people_urls         = { pirate = "https://kueue.pirate.example.com/mcp" }
+storage_classes     = { pirate = ["gpu-local"] }
 
 [buildit]
 clusters  = ["pirate", "waldorf"]
@@ -1832,6 +1833,11 @@ push_repo = "quay.io/example/crucible-smoke"
 `people_urls` is needed once `people` covers more than one cluster: every cluster's server has the
 same Service URL, and a person's token names its cluster by URL, so all but one cluster need a URL
 of their own. `deploy render --kueue` also needs `[kueue] image`.
+
+`storage_classes` lists, for each cluster, the StorageClasses a workload's volume claims may name.
+A cluster left out offers none: a claim there names no class and takes the cluster's default. List
+them where the default class cannot serve the nodes workloads run on, as with node-local classes
+that each exist on one node pool.
 
 ### 9.2 Derived values
 
