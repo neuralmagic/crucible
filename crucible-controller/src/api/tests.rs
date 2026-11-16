@@ -9141,6 +9141,50 @@ fn draft_files() -> serde_json::Value {
     })
 }
 
+/// Deleting a draft is decided against its owner, not the caller's platform role: a viewer
+/// deletes their own draft, and another viewer's draft does not exist for them.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_viewer_deletes_their_own_draft_and_no_one_elses(pool: PgPool) -> Result<()> {
+    let (db, _dir) = db_with(pool);
+    let app = app_with_roles(db, vec!["wren".to_string()], vec![]);
+    for (user, id) in [("alice", "alices"), ("bob", "bobs")] {
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/playbook-drafts",
+            user,
+            Some(serde_json::json!({"id": id, "description": "a drafted pack"})),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    let (status, _) = send(&app, "DELETE", "/api/playbook-drafts/bobs", "alice", None).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a viewer may not delete another's draft, nor learn it is there"
+    );
+    let (status, _) = send(&app, "GET", "/api/playbook-drafts/bobs", "bob", None).await;
+    assert_eq!(status, StatusCode::OK, "the refused delete dropped nothing");
+
+    let (status, body) = send(&app, "DELETE", "/api/playbook-drafts/alices", "alice", None).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "a viewer deletes their own draft: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let (status, _) = send(&app, "GET", "/api/playbook-drafts/alices", "alice", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    Ok(())
+}
+
 /// A draft is not a registered pack: it lists on its own rail, with its version history, and never
 /// shows up where the registry says what can be launched from a pin.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
