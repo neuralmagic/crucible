@@ -324,4 +324,24 @@ mod tests {
                 .is_empty()
         );
     }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_failed_query_answers_a_fixed_500_that_names_nothing_internal(pool: PgPool) {
+        let app = app(&pool, AuthPath::Session).await;
+        sqlx::query("DROP TABLE api_keys CASCADE")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for req in [
+            Request::get("/api/keys").body(Body::empty()).unwrap(),
+            Request::post("/api/keys")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"name": "ci"}).to_string()))
+                .unwrap(),
+        ] {
+            let (status, bytes) = crate::testing::oneshot_bytes(&app, req).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(&bytes[..], br#"{"error":"internal error"}"#);
+        }
+    }
 }

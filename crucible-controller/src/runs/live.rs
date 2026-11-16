@@ -23,7 +23,7 @@
 //! is thread-per-accept); when the SSE client disconnects, the relay task observes the dropped
 //! receiver and drops the TCP connection promptly, so no dial leaks to a pod.
 
-use crate::api::state::{ApiState, ErrorBody};
+use crate::api::state::{ApiError, ApiState, ErrorBody};
 use anyhow::{Context, Result};
 use axum::Json;
 use axum::http::StatusCode;
@@ -738,11 +738,7 @@ pub(crate) async fn live_response(
                 .into_response();
         }
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("reading run {run_id}: {e:#}"),
-            )
-                .into_response();
+            return ApiError::Internal(e.context(format!("reading run {run_id}"))).into_response();
         }
     };
 
