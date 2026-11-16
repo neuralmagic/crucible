@@ -160,9 +160,12 @@ pub struct RunLogDto {
     pub run_id: String,
     /// `local` (a supervised subprocess on this machine) or `pod` (a work pod).
     pub dispatch: String,
-    /// One window of the engine output, on line boundaries and capped: the tail, or the window
-    /// starting at `from`. Null when this machine holds none.
+    /// One window of the engine output, capped: the tail, or the window starting at `from`. Null
+    /// when this machine holds none.
     pub text: Option<String>,
+    /// Which copy of the output `text` came from; null when there is none. Offsets belong to one
+    /// source, so a reader paging by `next` starts over from 0 when this changes.
+    pub source: Option<RunLogSource>,
     /// True when `text` is not the whole log.
     pub truncated: bool,
     /// Byte offset of `text` in the whole log.
@@ -176,12 +179,26 @@ pub struct RunLogDto {
     pub location: Option<String>,
 }
 
+/// The copy of a run's output a log response was cut from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RunLogSource {
+    /// A local run's log file.
+    Local,
+    /// The running work pod, read live.
+    LivePod,
+    /// The pod log kept at completion, which holds only the end of a very long log.
+    Stored,
+    /// The ingested session, for a run that finished before pod logs were kept.
+    Session,
+}
+
 /// Which window of a run's log to serve.
 #[derive(Debug, Default, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct RunLogQuery {
-    /// Byte offset to start at, as a previous response's `start` or `next` gave it. Omit for the
-    /// tail.
+    /// Byte offset to start at, as a previous response's `next` gave it, or 0 for the first
+    /// window. Omit for the tail.
     pub from: Option<u64>,
 }
 
@@ -213,10 +230,10 @@ pub(crate) async fn get_run_log(
         return Ok(not_found(format!("run not found: {run_id}")));
     };
     let dispatch = run.dispatch.as_str().to_string();
-    let (bytes, location) = match run.dispatch {
+    let (log, location) = match run.dispatch {
         crate::runs::model::RunDispatch::Local => {
             match task_evidence::engine_log_bytes(&state.scratch_dir, &run_id).await {
-                Some(bytes) => (Some(bytes), None),
+                Some(bytes) => (Some((bytes, RunLogSource::Local)), None),
                 None => (
                     None,
                     Some(format!(
@@ -228,7 +245,8 @@ pub(crate) async fn get_run_log(
         }
         crate::runs::model::RunDispatch::Pod => pod_run_log(&state, &run, &run_id).await,
     };
-    let window = bytes.map(|b| task_evidence::log_window(&b, query.from));
+    let source = log.as_ref().map(|(_, source)| *source);
+    let window = log.map(|(bytes, _)| task_evidence::log_window(&bytes, query.from));
     Ok(Json(RunLogDto {
         run_id,
         dispatch,
@@ -239,6 +257,7 @@ pub(crate) async fn get_run_log(
         next: window.as_ref().and_then(|w| w.next),
         total_bytes: window.as_ref().map_or(0, |w| w.total_bytes),
         text: window.map(|w| w.text),
+        source,
         location,
     })
     .into_response())
@@ -251,21 +270,21 @@ async fn pod_run_log(
     state: &ApiState,
     run: &crate::runs::model::Run,
     run_id: &str,
-) -> (Option<Vec<u8>>, Option<String>) {
+) -> (Option<(Vec<u8>, RunLogSource)>, Option<String>) {
     if run.status == "running"
         && let Some(text) = live_pod_log(state, run).await
     {
-        return (Some(text.into_bytes()), None);
+        return (Some((text.into_bytes(), RunLogSource::LivePod)), None);
     }
     match crate::runs::blob_store::get_run_engine_log(state.db.pool(), run_id).await {
-        Ok(Some(log)) => return (Some(log.into_bytes()), None),
+        Ok(Some(log)) => return (Some((log.into_bytes(), RunLogSource::Stored)), None),
         Ok(None) => {}
         Err(e) => {
             tracing::warn!(run_id, error = %e, "reading the stored engine log failed");
         }
     }
     match crate::runs::blob_store::get_run_session(state.db.pool(), run_id).await {
-        Ok(Some(session)) => (Some(session.into_bytes()), None),
+        Ok(Some(session)) => (Some((session.into_bytes(), RunLogSource::Session)), None),
         Ok(None) => (None, Some(pod_location(run, &state.pod_namespace))),
         Err(e) => {
             tracing::warn!(run_id, error = %e, "reading the stored run session failed");
