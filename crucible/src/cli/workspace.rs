@@ -5,6 +5,8 @@ use crate::errors::FileError;
 use crate::manifest::{self, GitRef};
 use crucible_vcs::cli::{GitError, git};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::RecvTimeoutError;
+use std::time::{Duration, Instant};
 
 /// What preparing a workspace can fail on: the setup command, the clone, the toolbox copy.
 #[derive(Debug, thiserror::Error)]
@@ -129,13 +131,18 @@ pub(crate) fn clone_repo(
     let mut args: Vec<&std::ffi::OsStr> = vec!["clone".as_ref(), "--quiet".as_ref()];
     args.extend(filter_arg.as_deref().map(std::ffi::OsStr::new));
     args.extend([src.as_ref(), dest.as_os_str()]);
-    git(None, args)
-        .run()
-        .map_err(|source| WorkspaceError::GitCloneFailed {
-            src: src.to_owned(),
-            dest: dest.to_path_buf(),
-            source,
-        })?;
+    let shown = crate::turn_trace::redact(src);
+    eprintln!("[crucible] cloning {shown}");
+    with_heartbeat(
+        CLONE_HEARTBEAT,
+        |elapsed| eprintln!("{}", clone_progress(&shown, dest, elapsed)),
+        || git(None, args).run(),
+    )
+    .map_err(|source| WorkspaceError::GitCloneFailed {
+        src: src.to_owned(),
+        dest: dest.to_path_buf(),
+        source,
+    })?;
     let Some(r) = git_ref else {
         return Ok(());
     };
@@ -146,6 +153,49 @@ pub(crate) fn clone_repo(
         tracing::warn!(dest = %dest.display(), error = %e, "removing a clone whose ref failed");
     }
     checked_out
+}
+
+/// How often a clone still running says how far it has got.
+const CLONE_HEARTBEAT: Duration = Duration::from_secs(30);
+
+/// Run `work`, calling `beat` with the time elapsed every `every` until it returns.
+fn with_heartbeat<T>(
+    every: Duration,
+    beat: impl Fn(Duration) + Send,
+    work: impl FnOnce() -> T,
+) -> T {
+    let started = Instant::now();
+    std::thread::scope(|scope| {
+        let (done, running) = std::sync::mpsc::channel::<()>();
+        scope.spawn(move || {
+            while running.recv_timeout(every) == Err(RecvTimeoutError::Timeout) {
+                beat(started.elapsed());
+            }
+        });
+        let out = work();
+        drop(done);
+        out
+    })
+}
+
+/// One heartbeat line of a clone of `src` into `dest`.
+fn clone_progress(src: &str, dest: &Path, elapsed: Duration) -> String {
+    format!(
+        "[crucible] cloning {src}: {} MiB received after {}",
+        pack_bytes(dest) / (1024 * 1024),
+        crate::duration::Shown(Duration::from_secs(elapsed.as_secs())),
+    )
+}
+
+/// The bytes in the packs `dest` holds, the one a clone is still receiving included.
+fn pack_bytes(dest: &Path) -> u64 {
+    let Ok(packs) = std::fs::read_dir(dest.join(".git/objects/pack")) else {
+        return 0;
+    };
+    packs
+        .filter_map(|entry| entry.ok()?.metadata().ok())
+        .map(|meta| meta.len())
+        .sum()
 }
 
 /// Fetch `r` from origin and check it out detached. A commit the clone already holds is checked
@@ -702,6 +752,74 @@ mod tests {
         let err =
             install_toolbox(&p, &["rig-cofnig-typo".to_string()], ".claude/skills").unwrap_err();
         assert!(err.to_string().contains("rig-cofnig-typo"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_heartbeat_beats_while_the_work_runs_and_not_after() {
+        let beats = std::sync::Mutex::new(Vec::new());
+        let out = with_heartbeat(
+            Duration::from_millis(20),
+            |elapsed| beats.lock().unwrap().push(elapsed),
+            || {
+                std::thread::sleep(Duration::from_millis(300));
+                7
+            },
+        );
+        assert_eq!(out, 7);
+        let seen = beats.lock().unwrap().clone();
+        assert!(seen.len() >= 3, "{seen:?}");
+        assert!(seen.is_sorted(), "{seen:?}");
+        assert!(seen[0] >= Duration::from_millis(20), "{seen:?}");
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(beats.lock().unwrap().len(), seen.len());
+    }
+
+    #[test]
+    fn work_that_ends_before_the_first_beat_returns_at_once_with_none() {
+        let beats = std::sync::atomic::AtomicU32::new(0);
+        let started = Instant::now();
+        with_heartbeat(
+            Duration::from_secs(60),
+            |_| {
+                beats.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            },
+            || (),
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(beats.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn clone_progress_counts_the_pack_being_received() {
+        let dir = tempdir("clone-progress");
+        let dest = dir.join("workspace");
+        let line = |secs| {
+            clone_progress(
+                "https://example.com/r.git",
+                &dest,
+                Duration::from_secs(secs),
+            )
+        };
+        assert_eq!(
+            line(30),
+            "[crucible] cloning https://example.com/r.git: 0 MiB received after 30s"
+        );
+
+        let packs = dest.join(".git/objects/pack");
+        fs::create_dir_all(&packs).unwrap();
+        fs::write(packs.join("tmp_pack_a1b2c3"), vec![0u8; 3 * 1024 * 1024]).unwrap();
+        fs::write(packs.join("pack-1.pack"), vec![0u8; 2 * 1024 * 1024 + 5]).unwrap();
+        assert_eq!(pack_bytes(&dest), 5 * 1024 * 1024 + 5);
+        assert_eq!(
+            clone_progress(
+                "https://example.com/r.git",
+                &dest,
+                Duration::from_millis(90_400)
+            ),
+            "[crucible] cloning https://example.com/r.git: 5 MiB received after 90s"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

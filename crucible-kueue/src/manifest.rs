@@ -171,6 +171,12 @@ pub enum ManifestError {
         name: String,
         allowed: Vec<String>,
     },
+    #[error("{path}: storage class {name:?} is not one this server offers; it offers {}. Without the field a claim takes the cluster's default class", allowed.join(", "))]
+    StorageClass {
+        path: String,
+        name: String,
+        allowed: Vec<String>,
+    },
     #[error("{path}: expected {expected}")]
     Shape {
         path: String,
@@ -1055,6 +1061,7 @@ const RUN_POLICY: &[&str] = &[
 const REPLICA_SPEC: &[&str] = &["replicas", "restartPolicy", "template"];
 const PVC_TEMPLATE: &[&str] = &["metadata", "spec"];
 const PVC_SPEC: &[&str] = &["accessModes", "resources", "volumeMode"];
+const PVC_SPEC_CLASSED: &[&str] = &["accessModes", "resources", "storageClassName", "volumeMode"];
 
 /// Object-level fields outside the pod templates. Each kind's spec is allowlisted, so fields that
 /// hand the object to another controller (`managedBy`, `clusterSelector`), adopt foreign pods,
@@ -1189,8 +1196,8 @@ fn check_claim_templates(
     Ok(())
 }
 
-/// A claim the workload provisions: default storage class only, empty, never cloned from or
-/// bound to an existing volume.
+/// A claim the workload provisions: empty, never cloned from or bound to an existing volume, on
+/// the default storage class or one the server offers.
 fn check_claim_template(t: &Value, path: &str, cfg: &Config) -> Result<(), ManifestError> {
     let t = object_at(t, path)?;
     only_fields(t, PVC_TEMPLATE, path)?;
@@ -1202,11 +1209,32 @@ fn check_claim_template(t: &Value, path: &str, cfg: &Config) -> Result<(), Manif
             cfg,
         )?;
     }
-    if let Some(spec) = t.get("spec") {
-        let s_path = format!("{path}/spec");
-        only_fields(object_at(spec, &s_path)?, PVC_SPEC, &s_path)?;
+    let Some(spec) = t.get("spec") else {
+        return Ok(());
+    };
+    let s_path = format!("{path}/spec");
+    let spec = object_at(spec, &s_path)?;
+    let offered = &cfg.storage_classes;
+    if offered.is_empty() {
+        return only_fields(spec, PVC_SPEC, &s_path);
     }
-    Ok(())
+    only_fields(spec, PVC_SPEC_CLASSED, &s_path)?;
+    let Some(class) = spec.get("storageClassName") else {
+        return Ok(());
+    };
+    let c_path = format!("{s_path}/storageClassName");
+    let name = class.as_str().ok_or(ManifestError::Shape {
+        path: c_path.clone(),
+        expected: "a string",
+    })?;
+    if offered.contains(name) {
+        return Ok(());
+    }
+    Err(ManifestError::StorageClass {
+        path: c_path,
+        name: name.to_string(),
+        allowed: offered.iter().cloned().collect(),
+    })
 }
 
 /// Pins a Deployment or StatefulSet selector to the server-set template labels, so its
@@ -2907,6 +2935,76 @@ mod tests {
             "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "1Gi"}}}
         }}}]);
         assert!(normalize(m, &caller(), &queue(), &Config::default()).is_ok());
+    }
+
+    #[test]
+    fn a_claim_may_name_only_a_storage_class_the_server_offers() {
+        let cfg = Config {
+            storage_classes: ["gpu-local", "shared"].map(String::from).into(),
+            ..Config::default()
+        };
+        let classed = |class: Value| {
+            let mut m = statefulset();
+            m["spec"]["volumeClaimTemplates"][0]["spec"]["storageClassName"] = class;
+            m
+        };
+        let ephemeral = |class: &str| {
+            let mut m = job();
+            m["spec"]["template"]["spec"]["volumes"] = json!([{"name": "v", "ephemeral": {"volumeClaimTemplate": {
+                "spec": {"accessModes": ["ReadWriteOnce"], "storageClassName": class, "resources": {"requests": {"storage": "1Gi"}}}
+            }}}]);
+            m
+        };
+
+        let n = normalize(classed(json!("gpu-local")), &caller(), &queue(), &cfg).unwrap();
+        assert_eq!(
+            n.object
+                .pointer("/spec/volumeClaimTemplates/0/spec/storageClassName"),
+            Some(&json!("gpu-local"))
+        );
+        assert!(normalize(ephemeral("shared"), &caller(), &queue(), &cfg).is_ok());
+        assert!(normalize(statefulset(), &caller(), &queue(), &cfg).is_ok());
+
+        let err =
+            normalize(classed(json!("control-plane")), &caller(), &queue(), &cfg).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "/spec/volumeClaimTemplates/0/spec/storageClassName: storage class \"control-plane\" is not one this server offers; it offers gpu-local, shared. Without the field a claim takes the cluster's default class"
+        );
+        for refused in [
+            ephemeral("control-plane"),
+            ephemeral(""),
+            classed(json!(null)),
+            classed(json!(["gpu-local"])),
+        ] {
+            let err = normalize(refused, &caller(), &queue(), &cfg).unwrap_err();
+            assert!(err.to_string().contains("storageClassName"), "{err}");
+        }
+        for (needle, field, value) in [
+            ("volumeName", "volumeName", json!("pv-victim")),
+            (
+                "dataSource",
+                "dataSource",
+                json!({"kind": "PersistentVolumeClaim", "name": "victim"}),
+            ),
+        ] {
+            let mut m = classed(json!("gpu-local"));
+            m["spec"]["volumeClaimTemplates"][0]["spec"][field] = value;
+            let err = normalize(m, &caller(), &queue(), &cfg).unwrap_err();
+            assert!(err.to_string().contains(needle), "{needle}: {err}");
+        }
+
+        let err = normalize(
+            classed(json!("gpu-local")),
+            &caller(),
+            &queue(),
+            &Config::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ManifestError::NotAllowed { .. }),
+            "with no classes offered the field itself is refused: {err}"
+        );
     }
 
     #[test]
