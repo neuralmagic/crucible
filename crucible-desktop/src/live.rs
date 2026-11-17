@@ -94,14 +94,23 @@ impl LiveView {
             .collect()
     }
 
-    /// Each playbook's newest launch the filter keeps: running ones first, then newest first.
+    /// One launch per playbook the filter keeps, its newest running one, else its newest:
+    /// running playbooks first, then by newest launch.
     pub fn playbooks(&self, filter: &LaunchFilter) -> Vec<&LivePlaybook> {
-        let mut seen = HashSet::new();
-        let mut rows: Vec<&LivePlaybook> = self
-            .kept(filter)
-            .into_iter()
-            .filter(|launch| seen.insert(launch.id.as_str()))
-            .collect();
+        let mut at: HashMap<&str, usize> = HashMap::new();
+        let mut rows: Vec<&LivePlaybook> = Vec::new();
+        for launch in self.kept(filter) {
+            match at.get(launch.id.as_str()).and_then(|&i| rows.get_mut(i)) {
+                Some(row) if launch.status.is_running() && !row.status.is_running() => {
+                    *row = launch;
+                }
+                Some(_) => {}
+                None => {
+                    at.insert(launch.id.as_str(), rows.len());
+                    rows.push(launch);
+                }
+            }
+        }
         rows.sort_by_key(|row| !row.status.is_running());
         rows
     }
@@ -2378,13 +2387,36 @@ mod tests {
         assert_eq!(
             keys(&view.playbooks(&everything())),
             [
+                "playbook:nightly:1",
                 "playbook:hourly:0",
                 "playbook:weekly:4",
                 "playbook:adhoc:3",
-                "playbook:nightly:2",
             ]
         );
         assert_eq!(view.playbook_count(), 4);
+    }
+
+    #[test]
+    fn a_playbook_reads_as_running_while_an_older_launch_outlives_a_newer_one() {
+        let view = ready(vec![
+            firing("fanout", 1, "manual", "cancelled"),
+            firing("fanout", 2, "manual", "running"),
+            firing("fanout", 3, "manual", "running"),
+            firing("fanout", 4, "manual", "done"),
+        ]);
+        assert_eq!(
+            keys(&view.playbooks(&everything())),
+            ["playbook:fanout:3"],
+            "the newest of the launches still running"
+        );
+        let settled = ready(vec![
+            firing("fanout", 2, "manual", "done"),
+            firing("fanout", 4, "manual", "done"),
+        ]);
+        assert_eq!(
+            keys(&settled.playbooks(&everything())),
+            ["playbook:fanout:4"]
+        );
     }
 
     #[test]
