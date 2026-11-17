@@ -159,13 +159,15 @@ jobs:
       - name: Rune
         run: sh crucible-desktop/rune-patches.sh
 
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
       - name: Build the RPM
         env:
           SQLX_OFFLINE: "true"
         run: |
           set -euo pipefail
           tag="${{ inputs.tag || github.ref_name }}"
-          cargo build --release --locked -p crucible-lsp
+          sh crucible-desktop/build-runtime.sh
           ( cd crucible-desktop && cargo build --release --locked )
           VERSION="${tag#v}" sh crucible-desktop/linux-bundle.sh
           mkdir -p dist
@@ -206,13 +208,15 @@ jobs:
       - name: Rune
         run: sh crucible-desktop/rune-patches.sh
 
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
       - name: Build Crucible Playbooks.app
         env:
           SQLX_OFFLINE: "true"
         run: |
           set -euo pipefail
           tag="${{ inputs.tag || github.ref_name }}"
-          cargo build --release --locked -p crucible-lsp
+          sh crucible-desktop/build-runtime.sh
           ( cd crucible-desktop && cargo build --release --locked )
           VERSION="${tag#v}" sh crucible-desktop/macos-bundle.sh
 

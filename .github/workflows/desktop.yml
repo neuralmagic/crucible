@@ -107,12 +107,14 @@ jobs:
       - name: Rune
         run: sh crucible-desktop/rune-patches.sh
 
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
       - name: Build
         env:
           SQLX_OFFLINE: "true"
         run: |
           set -euo pipefail
-          cargo build --release --locked -p crucible-lsp
+          sh crucible-desktop/build-runtime.sh
           ( cd crucible-desktop && cargo build --release --locked )
           sh crucible-desktop/macos-bundle.sh
 
@@ -122,8 +124,11 @@ jobs:
           app="crucible-desktop/target/release/Crucible Playbooks.app"
           plutil -lint "$app/Contents/Info.plist"
           test -x "$app/Contents/MacOS/crucible-playbooks"
-          test -x "$app/Contents/MacOS/crucible-lsp"
+          for binary in crucible-lsp crucible-controller crucible crux; do
+            test -x "$app/Contents/MacOS/$binary"
+          done
           codesign --verify --deep "$app"
+          python3 crucible-desktop/check-runtime.py "$app/Contents/MacOS/crucible-controller"
           # The binary starts: as a tunnel supervisor with no command it refuses with code 2.
           code=0
           "$app/Contents/MacOS/crucible-playbooks" --keep </dev/null || code=$?
@@ -190,19 +195,24 @@ jobs:
           cargo run --locked -- --scene local --snap /tmp/local.png --size 1120x720
           test -s /tmp/local.png
 
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
       - name: RPM
         env:
           SQLX_OFFLINE: "true"
         run: |
           set -euo pipefail
-          cargo build --release --locked -p crucible-lsp
+          sh crucible-desktop/build-runtime.sh
           ( cd crucible-desktop && cargo build --release --locked )
           sh crucible-desktop/linux-bundle.sh
           dnf -y install crucible-desktop/target/linux/*.rpm
           code=0
           crucible-playbooks --keep </dev/null || code=$?
           test "$code" -eq 2
-          test -x /usr/bin/crucible-lsp
+          for binary in crucible-lsp crucible-controller crucible crux; do
+            test -x "/usr/bin/$binary"
+          done
+          runuser -u nobody -- env HOME=/tmp python3 crucible-desktop/check-runtime.py /usr/bin/crucible-controller
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:

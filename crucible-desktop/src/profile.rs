@@ -18,14 +18,15 @@
 //! shell = "/bin/bash"                    # what runs it, `-l -c`; `$SHELL` when unset
 //!
 //! [profiles.local]
-//! url = "http://127.0.0.1:8870"         # starts `just controller-local 8870` in the repo
+//! url = "http://127.0.0.1:8870"         # starts `crucible-controller local --port 8870`
 //! ```
 //!
-//! macOS cannot tie a child's life to its parent's, so a tunnel runs under the app's own binary
-//! as a supervisor ([`keep`]), which ends the tunnel when the app's end of a pipe closes, however
-//! the app ends.
+//! macOS cannot tie a child's life to its parent's, so a tunnel or a local controller runs under
+//! the app's own binary as a supervisor ([`keep`]), which ends it when the app's end of a pipe
+//! closes, however the app ends.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader};
 #[cfg(not(target_arch = "wasm32"))]
 use std::net::{IpAddr, SocketAddr};
@@ -43,7 +44,7 @@ use crate::keys::Store;
 
 /// How long a tunnel has to start answering.
 const TUNNEL_WAIT: Duration = Duration::from_secs(60);
-/// How long the local controller has to build and bind.
+/// How long the local controller has to bind. Its first start installs Postgres.
 const LOCAL_WAIT: Duration = Duration::from_mins(15);
 const PROBE: Duration = Duration::from_millis(800);
 /// How often a kept command is looked at.
@@ -54,11 +55,19 @@ const RESTART_MAX: Duration = Duration::from_secs(60);
 /// Lines of a tunnel's output kept to say why it stopped.
 const TAIL: usize = 6;
 
-/// The flag that runs the app as a tunnel's supervisor, and where the command goes.
+/// The flag that runs the app as a supervisor. What it keeps is a program and its arguments
+/// after `--`, else the shell command in [`KEEP`].
 pub const KEEP_FLAG: &str = "--keep";
 const KEEP: &str = "CRUCIBLE_PLAYBOOKS_KEEP";
-/// The shell the supervisor runs the command under, when the profile names one.
+/// The shell the supervisor runs a command under, or logs in with for a program's environment,
+/// when the profile names one.
 const KEEP_SHELL: &str = "CRUCIBLE_PLAYBOOKS_KEEP_SHELL";
+/// How long a login shell has to print its environment.
+#[cfg(not(target_arch = "wasm32"))]
+const LOGIN_ENV_WAIT: Duration = Duration::from_secs(10);
+/// The line a login shell prints before its environment, after whatever its startup files print.
+#[cfg(not(target_arch = "wasm32"))]
+const LOGIN_ENV_MARK: &str = "@@crucible-playbooks-env@@";
 /// How long a tunnel has to stop on TERM before it is killed.
 #[cfg(not(target_arch = "wasm32"))]
 const KILL_AFTER: Duration = Duration::from_secs(3);
@@ -91,8 +100,8 @@ pub struct Profile {
     /// port forward. The profile waits for its proxy, or its URL, to answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel: Option<String>,
-    /// The shell the tunnel or local controller runs under, as `<shell> -l -c <command>`;
-    /// `$SHELL` when unset.
+    /// The shell the tunnel runs under, as `<shell> -l -c <command>`, and the one whose login
+    /// environment the local controller gets; `$SHELL` when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell: Option<String>,
 }
@@ -343,15 +352,15 @@ impl Target {
         }
     }
 
-    /// The command this profile keeps running, and how long it has to answer: its tunnel, or for
-    /// a profile on this machine with none, the local controller from `repo`.
-    fn kept(&self) -> Option<(String, Duration, &'static str)> {
+    /// What this profile keeps running, and how long it has to answer: its tunnel, or for a
+    /// profile on this machine with none, the local controller.
+    fn kept(&self) -> Option<(Run, Duration, &'static str)> {
         if cfg!(target_arch = "wasm32") {
             return None;
         }
         if let Some(tunnel) = &self.profile.tunnel {
             return Some((
-                tunnel.trim().to_string(),
+                Run::Tunnel(tunnel.trim().to_string()),
                 TUNNEL_WAIT,
                 "Starting the tunnel",
             ));
@@ -361,9 +370,9 @@ impl Target {
             .filter(|_| self.profile.loopback())?
             .port_or_known_default()?;
         Some((
-            format!("just controller-local {port}"),
+            Run::Controller(port),
             LOCAL_WAIT,
-            "Building and starting the local controller",
+            "Starting the local controller",
         ))
     }
 
@@ -385,14 +394,15 @@ impl Target {
     /// started again. The keeper stops it when dropped. Returns at once: the probe and the
     /// command run on the watch thread.
     pub fn start(&self, repo: &Path, supervisor: Supervisor) -> Option<Keeper> {
-        let (command, wait, what) = self.kept()?;
+        let (run, wait, what) = self.kept()?;
         let addr = self.probe_addr()?;
         self.set(Readiness::Starting(what.to_string()));
         let watch = Watch {
             target: self.clone(),
-            command,
+            command: run.to_string(),
+            run,
             shell: self.profile.shell.as_deref().map(|s| s.trim().to_string()),
-            dir: repo.to_path_buf(),
+            repo: repo.to_path_buf(),
             addr,
             wait,
             what,
@@ -420,6 +430,24 @@ impl Target {
 /// Builds the command that supervises a kept one: [`supervisor`], outside tests.
 pub type Supervisor = fn() -> std::io::Result<Command>;
 
+/// What a profile keeps running.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Run {
+    /// The profile's `tunnel`: a command line for the login shell.
+    Tunnel(String),
+    /// `crucible-controller local` on the port of the profile's URL.
+    Controller(u16),
+}
+
+impl std::fmt::Display for Run {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Run::Tunnel(command) => f.write_str(command),
+            Run::Controller(port) => write!(f, "crucible-controller local --port {port}"),
+        }
+    }
+}
+
 /// One profile's kept command, watched on a thread of its own for as long as its keeper lives.
 ///
 /// ```text
@@ -433,9 +461,11 @@ pub type Supervisor = fn() -> std::io::Result<Command>;
 /// ```
 struct Watch {
     target: Target,
+    run: Run,
+    /// `run` as messages name it.
     command: String,
     shell: Option<String>,
-    dir: PathBuf,
+    repo: PathBuf,
     addr: String,
     wait: Duration,
     what: &'static str,
@@ -450,9 +480,30 @@ impl Watch {
     }
 
     fn spawn(&self) -> Result<(), String> {
-        let kept = (self.supervisor)()
-            .and_then(|s| Kept::spawn(s, &self.command, self.shell.as_deref(), &self.dir))
-            .map_err(|why| format!("starting `{}`: {why}", self.command))?;
+        let shell = self.shell.as_deref();
+        let kept = match &self.run {
+            Run::Tunnel(command) => {
+                (self.supervisor)().and_then(|s| Kept::shell(s, command, shell, &self.repo))
+            }
+            Run::Controller(port) => {
+                let controller = crate::model::controller_binary(&self.repo).ok_or_else(|| {
+                    format!(
+                        "no crucible-controller beside the app or built in {}; \
+                             `just controller-local {port}` builds and runs one",
+                        self.repo.display()
+                    )
+                })?;
+                let argv = [
+                    controller.into_os_string(),
+                    "local".into(),
+                    "--port".into(),
+                    port.to_string().into(),
+                ];
+                (self.supervisor)()
+                    .and_then(|s| Kept::program(s, &argv, shell, &std::env::temp_dir()))
+            }
+        }
+        .map_err(|why| format!("starting `{}`: {why}", self.command))?;
         match self.kept.lock() {
             Ok(mut slot) if !self.stopped() => *slot = Some(kept),
             _ => kept.end(),
@@ -629,19 +680,35 @@ struct Kept {
 }
 
 impl Kept {
-    /// Run `command` under `supervisor`, which [`keep`]s it in `shell`, else `$SHELL`.
-    fn spawn(
+    /// Run the shell `command` under `supervisor`, which [`keep`]s it in `shell`, else `$SHELL`.
+    fn shell(
         mut supervisor: Command,
         command: &str,
         shell: Option<&str>,
         dir: &Path,
     ) -> std::io::Result<Kept> {
+        supervisor.env(KEEP, command);
+        Kept::spawn(supervisor, shell, dir)
+    }
+
+    /// Run the program `argv` under `supervisor`, which [`keep`]s it in the environment `shell`,
+    /// else `$SHELL`, logs in with.
+    fn program(
+        mut supervisor: Command,
+        argv: &[OsString],
+        shell: Option<&str>,
+        dir: &Path,
+    ) -> std::io::Result<Kept> {
+        supervisor.env_remove(KEEP).arg("--").args(argv);
+        Kept::spawn(supervisor, shell, dir)
+    }
+
+    fn spawn(mut supervisor: Command, shell: Option<&str>, dir: &Path) -> std::io::Result<Kept> {
         match shell {
             Some(shell) => supervisor.env(KEEP_SHELL, shell),
             None => supervisor.env_remove(KEEP_SHELL),
         };
         let mut child = supervisor
-            .env(KEEP, command)
             .current_dir(dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -678,34 +745,109 @@ impl Kept {
     }
 }
 
-/// The app itself as a supervisor: `crucible-playbooks --keep`, the command in [`KEEP`].
+/// The app itself as a supervisor: `crucible-playbooks --keep`, for the command in [`KEEP`] or
+/// the program after `--`.
 pub fn supervisor() -> std::io::Result<Command> {
     let mut command = Command::new(std::env::current_exe()?);
     command.arg(KEEP_FLAG);
     Ok(command)
 }
 
-/// Supervise the command in [`KEEP`], as `--keep`: run it under the login shell in a process group
-/// of its own, kill that group once stdin closes, and return the command's exit code.
+/// The variables in what a login shell printed for [`login_env`], past whatever its startup
+/// files printed first.
+#[cfg(not(target_arch = "wasm32"))]
+fn printed_env(out: &[u8]) -> Option<Vec<(OsString, OsString)>> {
+    use std::os::unix::ffi::OsStringExt;
+    let mark = format!("\n{LOGIN_ENV_MARK}\n").into_bytes();
+    let start = out.windows(mark.len()).position(|at| at == mark)? + mark.len();
+    let env: Vec<(OsString, OsString)> = out[start..]
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| {
+            let eq = entry.iter().position(|byte| *byte == b'=')?;
+            (eq > 0).then(|| {
+                (
+                    OsString::from_vec(entry[..eq].to_vec()),
+                    OsString::from_vec(entry[eq + 1..].to_vec()),
+                )
+            })
+        })
+        .collect();
+    (!env.is_empty()).then_some(env)
+}
+
+/// The environment `shell` logs in with: the `PATH` and exports of the person's startup files,
+/// which an app started from the desktop was never given. `None` when the shell does not print
+/// one in time.
+#[cfg(not(target_arch = "wasm32"))]
+fn login_env(shell: &str) -> Option<Vec<(OsString, OsString)>> {
+    let mut child = Command::new(shell)
+        .args([
+            "-l",
+            "-c",
+            &format!("printf '\\n{LOGIN_ENV_MARK}\\n'; exec env -0"),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (send, receive) = std::sync::mpsc::channel();
+    let reading = std::thread::Builder::new()
+        .name("keep-login-env".into())
+        .spawn(move || {
+            let mut out = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut stdout, &mut out);
+            let _ = send.send(out);
+        });
+    let out = reading
+        .ok()
+        .and_then(|_| receive.recv_timeout(LOGIN_ENV_WAIT).ok());
+    let _ = child.kill();
+    let _ = child.wait();
+    printed_env(&out?)
+}
+
+/// Supervise a command, as `--keep`: run it in a process group of its own, kill that group once
+/// stdin closes, and return the command's exit code. The command is the program and arguments
+/// after `--`, run in the login shell's environment, else the shell command in [`KEEP`], run by
+/// the login shell.
 ///
 /// ```text
 /// app ──stdin pipe──▶ supervisor ──spawns, own pgid──▶ $SHELL -l -c <command> ──▶ ssh …
+///                                                 or ▶ <program> <arguments>
 ///      app exits, crashes or is killed: the pipe closes ──▶ killpg(TERM), then KILL
 ///      the command exits first: the supervisor exits with its code
 /// ```
 #[cfg(not(target_arch = "wasm32"))]
 pub fn keep() -> i32 {
     use std::os::unix::process::{CommandExt, ExitStatusExt};
-    let Ok(command) = std::env::var(KEEP) else {
-        eprintln!("{KEEP_FLAG} needs the command in {KEEP}");
-        return 2;
-    };
     let shell = std::env::var(KEEP_SHELL)
         .ok()
         .filter(|shell| !shell.is_empty())
         .unwrap_or_else(|| crate::editor::Os::HOST.login_shell());
-    let mut child = match Command::new(&shell)
-        .args(["-l", "-c", &command])
+    let mut argv = std::env::args_os().skip_while(|arg| arg != "--").skip(1);
+    let (mut command, name) = match argv.next() {
+        Some(program) => {
+            let name = program.to_string_lossy().into_owned();
+            let mut command = Command::new(program);
+            command.args(argv);
+            if let Some(env) = login_env(&shell) {
+                command.env_clear().envs(env);
+            }
+            (command, name)
+        }
+        None => {
+            let Ok(line) = std::env::var(KEEP) else {
+                eprintln!("{KEEP_FLAG} needs a program after `--` or a command in {KEEP}");
+                return 2;
+            };
+            let mut command = Command::new(&shell);
+            command.args(["-l", "-c", &line]);
+            (command, shell)
+        }
+    };
+    let mut child = match command
         .env_remove(KEEP)
         .env_remove(KEEP_SHELL)
         .stdin(Stdio::null())
@@ -714,7 +856,7 @@ pub fn keep() -> i32 {
     {
         Ok(child) => child,
         Err(e) => {
-            eprintln!("starting {shell}: {e}");
+            eprintln!("starting {name}: {e}");
             return 127;
         }
     };
@@ -1098,7 +1240,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::keys::Store;
-    use crate::profile::{Auth, Profile, Readiness, Target, addresses, answers, keep};
+    use crate::profile::{
+        Auth, LOGIN_ENV_MARK, Profile, Readiness, Run, Target, addresses, answers, keep, login_env,
+        printed_env,
+    };
 
     const AS_SUPERVISOR: &str = "CRUCIBLE_PLAYBOOKS_TEST_SUPERVISOR";
 
@@ -1262,9 +1407,10 @@ url = "https://crucible.ext.wdc.example.com"
             profile("http://127.0.0.1:8870"),
             &Store::Dir("/k".into()),
         );
+        assert_eq!(local.kept().map(|k| k.0), Some(Run::Controller(8870)));
         assert_eq!(
-            local.kept().map(|k| k.0),
-            Some("just controller-local 8870".to_string())
+            Run::Controller(8870).to_string(),
+            "crucible-controller local --port 8870"
         );
         assert!(profile("http://localhost:9000").loopback());
         assert!(profile("http://[::1]:9000").loopback());
@@ -1274,6 +1420,13 @@ url = "https://crucible.ext.wdc.example.com"
             &Store::Dir("/k".into()),
         );
         assert_eq!(remote.kept(), None);
+        let mut tunneled = profile("http://127.0.0.1:8870");
+        tunneled.tunnel = Some(" ssh -N -L 8870:c:8870 j ".into());
+        let tunneled = Target::new("t", tunneled, &Store::Dir("/k".into()));
+        assert_eq!(
+            tunneled.kept().map(|k| k.0),
+            Some(Run::Tunnel("ssh -N -L 8870:c:8870 j".into()))
+        );
     }
 
     #[test]
@@ -1616,5 +1769,143 @@ url = "https://crucible.ext.wdc.example.com"
         std::thread::sleep(Duration::from_secs(1));
         assert!(!starts.exists(), "the command never ran");
         assert_eq!(target.readiness(), Readiness::Ready);
+    }
+
+    #[test]
+    fn a_printed_environment_is_read_past_what_the_startup_files_print() {
+        let os = |text: &str| std::ffi::OsString::from(text);
+        let out = format!(
+            "Last login: today\nnoise=1\n\n{LOGIN_ENV_MARK}\n\
+             PATH=/opt/bin:/usr/bin\0LINES=a\nb=c\0EMPTY=\0=nameless\0novalue\0"
+        );
+        assert_eq!(
+            printed_env(out.as_bytes()),
+            Some(vec![
+                (os("PATH"), os("/opt/bin:/usr/bin")),
+                (os("LINES"), os("a\nb=c")),
+                (os("EMPTY"), os("")),
+            ])
+        );
+        assert_eq!(printed_env(b"PATH=/usr/bin\0"), None, "no mark");
+        assert_eq!(
+            printed_env(format!("\n{LOGIN_ENV_MARK}\n").as_bytes()),
+            None,
+            "a mark and nothing after it"
+        );
+    }
+
+    /// A login shell whose startup prints a banner and exports `FROM_LOGIN`.
+    fn login_shell(dir: &std::path::Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let shell = dir.join("login-shell");
+        std::fs::write(
+            &shell,
+            "#!/bin/sh\necho 'Welcome back'\nexport FROM_LOGIN=yes\nshift\nexec /bin/sh \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        shell.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn the_login_environment_is_what_the_shell_exports_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = login_env(&login_shell(dir.path())).expect("an environment");
+        let get = |name: &str| {
+            env.iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(get("FROM_LOGIN"), Some("yes".into()));
+        assert_eq!(get("PATH"), std::env::var_os("PATH"));
+        assert_eq!(login_env("/nonexistent/shell"), None);
+        assert_eq!(
+            login_env("/usr/bin/false"),
+            None,
+            "a shell that prints nothing"
+        );
+    }
+
+    /// A checkout whose built `crucible-controller` listens on the port it is given and records
+    /// its arguments and `FROM_LOGIN` beside itself.
+    fn checkout_with_a_controller(repo: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let built = repo.join("target/debug");
+        std::fs::create_dir_all(&built).unwrap();
+        let controller = built.join("crucible-controller");
+        std::fs::write(
+            &controller,
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" \"${FROM_LOGIN:-unset}\" > \"$(dirname \"$0\")/started\"\n\
+             test \"$1\" = local && test \"$2\" = --port || exit 64\n\
+             exec python3 -c 'import socket,sys,time; s=socket.socket(); \
+             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); \
+             s.bind((\"127.0.0.1\", int(sys.argv[1]))); s.listen(); time.sleep(60)' \"$3\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&controller, std::fs::Permissions::from_mode(0o755)).unwrap();
+        built.join("started")
+    }
+
+    #[test]
+    fn a_local_profile_runs_the_controller_by_argv_in_the_login_environment() {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let addr = format!("127.0.0.1:{port}");
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("a checkout; with $spaces");
+        let started = checkout_with_a_controller(&repo);
+        let mut p = profile(&format!("http://{addr}"));
+        p.shell = Some(login_shell(dir.path()));
+        let target = Target::new("local", p, &Store::Dir(dir.path().into()));
+        let keeper = target.start(&repo, test_supervisor).expect("a keeper");
+        assert_eq!(
+            target.readiness(),
+            Readiness::Starting("Starting the local controller".into())
+        );
+        assert_eq!(
+            wait_for(&target, |r| !matches!(r, Readiness::Starting(_))),
+            Readiness::Ready
+        );
+        assert_eq!(
+            std::fs::read_to_string(&started).unwrap(),
+            format!("local --port {port}\nyes\n")
+        );
+        drop(keeper);
+        let until = Instant::now() + Duration::from_secs(10);
+        while answers(&addr) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!answers(&addr), "dropping the keeper ends the controller");
+    }
+
+    #[test]
+    fn a_local_profile_with_no_controller_to_run_says_how_to_get_one() {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let dir = tempfile::tempdir().unwrap();
+        let target = Target::new(
+            "local",
+            profile(&format!("http://127.0.0.1:{port}")),
+            &Store::Dir(dir.path().into()),
+        );
+        let _keeper = target.start(dir.path(), test_supervisor);
+        let failed = wait_for(&target, |r| matches!(r, Readiness::Failed(_)));
+        let Readiness::Failed(why) = failed else {
+            panic!("{failed:?}");
+        };
+        assert!(
+            why.contains(&format!(
+                "`just controller-local {port}` builds and runs one"
+            )),
+            "{why}"
+        );
+        assert!(why.contains(&dir.path().display().to_string()), "{why}");
     }
 }
