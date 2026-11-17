@@ -177,8 +177,8 @@ pub enum RunsTab {
 /// What the Report pane asks a worker to build.
 #[derive(Clone, Debug, PartialEq)]
 enum ReportAsk {
-    /// A local pack's report, with the reader's params.
-    Local(String, model::Params),
+    /// A local pack's report, with what it is asked with.
+    Local(String, report::Asked),
     Live(report::Wanted),
 }
 
@@ -1406,13 +1406,13 @@ impl App {
             return;
         }
         match &wanted {
-            Some(ReportAsk::Local(pack, params)) => {
-                self.local.report(Some((pack.clone(), params.clone())));
+            Some(ReportAsk::Local(pack, asked)) => {
+                self.local.report(Some((pack.clone(), asked.clone())));
             }
-            Some(ReportAsk::Live(asked)) => {
+            Some(ReportAsk::Live(wanted)) => {
                 if let Some((_, (_, text), listed)) = self.live_report_source() {
                     self.remote.live_client.report(
-                        asked.clone(),
+                        wanted.clone(),
                         text.to_string(),
                         listed.to_vec(),
                     );
@@ -1433,9 +1433,9 @@ impl App {
         if !self.workspace().showing(PaneKind::Report) || self.runs_page().is_some() {
             return None;
         }
-        let params = self.report_shown.shown.params().clone();
+        let asked = self.report_shown.shown.asked();
         if let Some(pack) = self.selected_pack() {
-            return Some(ReportAsk::Local(pack.name.clone(), params));
+            return Some(ReportAsk::Local(pack.name.clone(), asked));
         }
         let (run, (plugin, _), files) = self.live_report_source()?;
         Some(ReportAsk::Live(report::Wanted {
@@ -1443,7 +1443,7 @@ impl App {
             plugin: plugin.to_string(),
             listed: files.iter().map(|f| (f.key.clone(), f.size)).collect(),
             settled: self.selected_settled(),
-            params,
+            asked,
         }))
     }
 
@@ -1552,7 +1552,7 @@ impl App {
                 .take(report::RUNS)
                 .map(|launch| report::Launched::of(launch))
                 .collect(),
-            params: self.runs_shown.shown.params().clone(),
+            asked: self.runs_shown.shown.asked(),
         })
     }
 
@@ -1575,6 +1575,18 @@ impl App {
             .as_deref()
             .filter(|built| built.wanted.playbook == playbook)
             .and_then(|built| built.report.as_ref())
+    }
+
+    /// Fires the tick of each live view on screen that is due at `clock`, and says how many
+    /// seconds until the next is due.
+    fn tick_reports(&mut self, clock: f64) -> Option<f64> {
+        let report = self.workspace().showing(PaneKind::Report) && self.runs_page().is_none();
+        let runs = self.runs_tab == RunsTab::Report && self.runs_view().is_some();
+        let waits = [
+            report.then(|| self.report_shown.shown.play.tick(clock)),
+            runs.then(|| self.runs_shown.shown.play.tick(clock)),
+        ];
+        waits.into_iter().flatten().flatten().reduce(f64::min)
     }
 
     /// Whether a worker has been asked for a report it has not built yet.
@@ -2186,6 +2198,9 @@ fn poll(app: &mut App, clock: f64, tx: &mut Tx) -> bool {
         app.fleet = statuses;
         changed = true;
     }
+    if let Some(wait) = app.tick_reports(clock) {
+        tx.wake_after(std::time::Duration::try_from_secs_f64(wait).unwrap_or_default());
+    }
     app.sync_live();
     app.sync_report();
     app.sync_admin();
@@ -2422,7 +2437,7 @@ mod tests {
             pack: pack.into(),
             report: None,
         };
-        let local = ReportAsk::Local("demo".into(), model::Params::new());
+        let local = ReportAsk::Local("demo".into(), report::Asked::default());
         assert!(local.awaited(None, false));
         assert!(local.awaited(Some(&built("other")), false), "another's");
         assert!(
@@ -2436,7 +2451,7 @@ mod tests {
             plugin: "ui/report.js".into(),
             listed: Vec::new(),
             settled: true,
-            params: model::Params::new(),
+            asked: report::Asked::default(),
         });
         assert!(live.awaited(Some(&built("demo")), false));
         assert!(!live.awaited(None, true));

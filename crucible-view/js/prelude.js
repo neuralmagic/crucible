@@ -95,6 +95,10 @@ class CanvasContext2D {
   hint(x, y, width, height, text) {
     this.#commands.push({ hint: { x, y, width, height, text: String(text) } });
   }
+  /** Not the browser's: a rectangle the reader clicks, which runs `view` again with `{ hit: id }`. */
+  hit(x, y, width, height, id) {
+    this.#commands.push({ hit: { id: String(id), x, y, width, height } });
+  }
 }
 
 class Canvas {

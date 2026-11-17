@@ -450,6 +450,7 @@ mod tests {
             let (_, commands) = drawing(&nodes, &links, &style).unwrap();
             let view = crucible_view::View {
                 controls: vec![],
+                live: Default::default(),
                 title: "T".into(),
                 body: crucible_view::Node::Canvas {
                     width: WIDTH,

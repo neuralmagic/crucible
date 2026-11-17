@@ -9,6 +9,7 @@
 //! A plugin may also draw the launches of its playbook on the runs page, from what each launch's
 //! newest run captured.
 
+pub mod play;
 pub mod shown;
 
 use std::collections::BTreeMap;
@@ -17,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use crucible_view::{File, Param, Request, Run, RunsRequest, Status, View};
+use crucible_view::{Event, File, Param, Request, Run, RunsRequest, Status, View};
 
 use base64::Engine;
 
@@ -43,21 +44,61 @@ pub const FILE_BYTES: u64 = 8 * 1024 * 1024;
 /// The most launches one runs view reads.
 pub const RUNS: usize = 50;
 
+/// What a plugin is asked with besides its files: the reader's params and, for a live view,
+/// the state its newest view returned and the event that asks. Two are the same ask when their
+/// params and turn are.
+#[derive(Clone, Debug, Default)]
+pub struct Asked {
+    pub params: BTreeMap<String, Param>,
+    /// How many events have asked; each one is a new ask.
+    pub turn: u64,
+    pub state: Option<String>,
+    pub event: Option<Event>,
+}
+
+impl PartialEq for Asked {
+    fn eq(&self, other: &Asked) -> bool {
+        self.params == other.params && self.turn == other.turn
+    }
+}
+
+impl Asked {
+    /// The request for one run's `files`.
+    pub fn request(&self, files: Vec<File>) -> Request {
+        Request {
+            files,
+            params: self.params.clone(),
+            state: self.state.clone(),
+            event: self.event.clone(),
+        }
+    }
+
+    /// The request for `runs`, of `total` launches the filters keep.
+    pub fn runs_request(&self, runs: Vec<Run>, total: usize) -> RunsRequest {
+        RunsRequest {
+            runs,
+            total,
+            params: self.params.clone(),
+            state: self.state.clone(),
+            event: self.event.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Report {
     /// The task that wrote the plugin during the run; `None` for the pack's own.
     pub author: Option<String>,
-    /// What the plugin was asked with.
-    pub params: BTreeMap<String, Param>,
+    pub asked: Asked,
     pub view: Result<View, String>,
 }
 
 impl Report {
-    /// The pack's own plugin's view, asked with `params`.
-    pub fn pack(params: BTreeMap<String, Param>, view: Result<View, String>) -> Report {
+    /// The pack's own plugin's view, built for `asked`.
+    pub fn pack(asked: Asked, view: Result<View, String>) -> Report {
         Report {
             author: None,
-            params,
+            asked,
             view,
         }
     }
@@ -74,7 +115,16 @@ pub struct Wanted {
     pub listed: Vec<(String, u64)>,
     /// The run has stopped, so a captured file's copy on disk can stand in for it.
     pub settled: bool,
-    pub params: BTreeMap<String, Param>,
+    pub asked: Asked,
+}
+
+impl Wanted {
+    /// Whether a report for `other` reads the same files: all but what it is asked with is
+    /// the same.
+    pub fn reads_as(&self, other: &Wanted) -> bool {
+        (&self.run, &self.plugin, &self.listed, self.settled)
+            == (&other.run, &other.plugin, &other.listed, other.settled)
+    }
 }
 
 /// A playbook's runs view, as the runs page asks the live worker for it. Asked again when any
@@ -88,7 +138,7 @@ pub struct WantedRuns {
     pub launches: Vec<Launched>,
     /// How many launches the reader's filters keep.
     pub total: usize,
-    pub params: BTreeMap<String, Param>,
+    pub asked: Asked,
 }
 
 /// One launch a runs view is asked with, as the launch list has it.
@@ -132,15 +182,23 @@ impl Launched {
 }
 
 /// What each launch of the last runs view was read as, kept so a launch that has stopped and
-/// not changed is not read again.
+/// not changed is not read again, and none is for an event.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Gathered {
     /// The paths each launch was read for.
     pub inputs: Vec<String>,
+    /// The launches the view was asked to read.
+    pub launches: Vec<Launched>,
+    /// Those read, which leaves out the ones past the bytes a view reads.
     pub runs: Vec<(Launched, Run)>,
 }
 
 impl Gathered {
+    /// Whether this is what reading `launches` for `inputs` gave, as they were then.
+    pub fn read(&self, inputs: &[String], launches: &[Launched]) -> bool {
+        self.inputs == inputs && self.launches == launches
+    }
+
     /// What `launch` was read as for `inputs`, when it has stopped and is as it was then.
     pub fn kept(&self, inputs: &[String], launch: &Launched) -> Option<&Run> {
         if self.inputs != inputs || !launch.settled() {
@@ -333,20 +391,19 @@ fn readable(sizes: impl Iterator<Item = u64>) -> Result<(), String> {
     Ok(())
 }
 
-/// The view `plugin` builds from `files`, the captured copies of its `inputs`, with the
-/// reader's `params`.
+/// The view `plugin` builds from `files`, the captured copies of its `inputs`, for `asked`.
 pub fn run(
     plugin: &Loaded,
     inputs: &[String],
     files: Vec<File>,
-    params: BTreeMap<String, Param>,
+    asked: &Asked,
 ) -> Result<View, String> {
     if files.is_empty() && !inputs.is_empty() {
         return Err(format!("No task has captured {} yet.", inputs.join(" or ")));
     }
     readable(files.iter().map(|file| file.text.len() as u64))?;
     plugin
-        .view(&Request { files, params })
+        .view(&asked.request(files))
         .map_err(|fault| fault.to_string())
 }
 
@@ -461,7 +518,7 @@ fn build(
     plugin: &Loaded,
     inputs: &[String],
     files: &[(String, String, Mark)],
-    params: &BTreeMap<String, Param>,
+    asked: &Asked,
 ) -> Result<View, String> {
     let sized: Vec<(String, u64)> = files
         .iter()
@@ -477,16 +534,18 @@ fn build(
             text,
         });
     }
-    run(plugin, inputs, read, params.clone())
+    run(plugin, inputs, read, asked)
 }
 
-/// A local pack's report, built again when its plugin, the files it reads or the reader's
-/// params change.
+/// A local pack's report, built again when its plugin, the files it reads or the ask change.
 #[derive(Default)]
 pub struct Reporter {
     plugin: Option<Mark>,
     loaded: Option<Arc<Plugin>>,
     read: Vec<Mark>,
+    /// What the next build asks with: the last ask, with the state its newest view returned
+    /// and no event, so a build for a changed file does not answer the event again.
+    asked: Option<Asked>,
     report: Option<Arc<Report>>,
 }
 
@@ -496,14 +555,9 @@ impl Reporter {
         self.report.as_ref()
     }
 
-    /// Builds `pack`'s report with `params`, loading its plugin through `plugins`; whether the
+    /// Builds `pack`'s report for `asked`, loading its plugin through `plugins`; whether the
     /// report changed.
-    pub fn refresh(
-        &mut self,
-        pack: &Path,
-        params: &BTreeMap<String, Param>,
-        plugins: &mut Plugins,
-    ) -> bool {
+    pub fn refresh(&mut self, pack: &Path, asked: &Asked, plugins: &mut Plugins) -> bool {
         let (file, author) = match written_plugin(pack) {
             Some((path, task)) => (Some(path), Some(task)),
             None => (plugin_file(pack), None),
@@ -517,13 +571,18 @@ impl Reporter {
             });
             self.plugin = plugin;
         }
+        let fresh = self.asked.as_ref() != Some(asked);
+        let held = match &mut self.asked {
+            Some(held) if !fresh => held,
+            held => held.insert(asked.clone()),
+        };
         let Some(loaded) = &self.loaded else {
             self.read.clear();
             return self.report.take().is_some();
         };
         let view = match &**loaded {
             Err(error) => {
-                if !reloaded {
+                if !reloaded && !fresh {
                     return false;
                 }
                 Err(error.clone())
@@ -535,19 +594,22 @@ impl Reporter {
             }) => {
                 let files = captured(pack, inputs);
                 let read: Vec<Mark> = files.iter().map(|(.., mark)| mark.clone()).collect();
-                let asked = self.report.as_ref().map(|report| &report.params);
-                if !reloaded && read == self.read && asked == Some(params) {
+                if !reloaded && !fresh && read == self.read {
                     return false;
                 }
                 self.read = read;
-                build(plugin, inputs, &files, params)
+                build(plugin, inputs, &files, held)
             }
         };
         let report = Report {
             author,
-            params: params.clone(),
+            asked: held.clone(),
             view,
         };
+        held.event = None;
+        if let Ok(view) = &report.view {
+            held.state.clone_from(&view.live.state);
+        }
         let changed = self.report.as_deref() != Some(&report);
         if changed {
             self.report = Some(Arc::new(report));
@@ -569,11 +631,10 @@ mod tests {
 
     use crate::captured::Captured;
     use crate::live::{LaunchStatus, LivePlaybook};
-    use crate::model::Params;
     use crate::report::shown::{Scoped, Shown};
     use crate::report::{
-        FILE_BYTES, Gathered, Launched, Plugins, READ_BYTES, Reporter, admit, file_named, readable,
-        run_runs, stand_in, task_named, with_run,
+        Asked, FILE_BYTES, Gathered, Launched, Plugins, READ_BYTES, Reporter, Wanted, admit,
+        file_named, readable, run_runs, stand_in, task_named, with_run,
     };
 
     fn example() -> std::path::PathBuf {
@@ -604,7 +665,7 @@ mod tests {
 
     /// Builds `pack`'s report with no params and nothing loaded before.
     fn refresh(reporter: &mut Reporter, pack: &Path) -> bool {
-        reporter.refresh(pack, &Params::new(), &mut Plugins::default())
+        reporter.refresh(pack, &Asked::default(), &mut Plugins::default())
     }
 
     fn triaged(reporter: &Reporter) -> String {
@@ -1048,12 +1109,12 @@ mod tests {
         let selection = crate::Selection::Local("report-ts".into());
         shown.follow(Some(&selection), Some(&report));
         shown.shown.set("lane", Param::Select(first_lane.clone()));
-        let params = shown.shown.params().clone();
-        assert_eq!(params["cvss"], Param::Range(0.0));
+        let asked = shown.shown.asked();
+        assert_eq!(asked.params["cvss"], Param::Range(0.0));
         let mut plugins = Plugins::default();
-        assert!(reporter.refresh(dir.path(), &params, &mut plugins));
+        assert!(reporter.refresh(dir.path(), &asked, &mut plugins));
         let laned = reporter.report().unwrap();
-        assert_eq!(laned.params, params);
+        assert_eq!(laned.asked, asked);
         let view = laned.view.as_ref().unwrap();
         let triaged = |view: &View| {
             let Node::Stack { children } = &view.body else {
@@ -1074,9 +1135,13 @@ mod tests {
         shown.follow(Some(&selection), Some(laned));
         shown.shown.set("lane", Param::Select("all".into()));
         shown.shown.set("cvss", Param::Range(9.2));
-        let params = shown.shown.params();
-        assert_eq!(params["cvss"], Param::Range(9.0), "on the range's step");
-        assert!(reporter.refresh(dir.path(), params, &mut plugins));
+        let asked = shown.shown.asked();
+        assert_eq!(
+            asked.params["cvss"],
+            Param::Range(9.0),
+            "on the range's step"
+        );
+        assert!(reporter.refresh(dir.path(), &asked, &mut plugins));
         let view = reporter.report().unwrap().view.as_ref().unwrap();
         let severe = triaged(view);
         assert!(severe > 0 && severe < 64, "{severe}");
@@ -1097,7 +1162,7 @@ mod tests {
 
         shown.shown.set("cvss", Param::Range(10.0));
         shown.shown.set("lane", Param::Select(first_lane));
-        assert!(reporter.refresh(dir.path(), shown.shown.params(), &mut plugins));
+        assert!(reporter.refresh(dir.path(), &shown.shown.asked(), &mut plugins));
         let view = reporter.report().unwrap().view.as_ref().unwrap();
         assert_eq!(
             view.body,
@@ -1143,7 +1208,7 @@ mod tests {
                 launch("triage:1", Status::Done, vec![lane("go")]),
             ],
             total: 4,
-            params: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -1395,8 +1460,11 @@ mod tests {
         let inputs = vec!["verdicts.json".to_string()];
         let done = Launched::of(&launch("PB-1", LaunchStatus::Done));
         let running = Launched::of(&launch("PB-2", LaunchStatus::Running));
+        let cut = Launched::of(&launch("PB-0", LaunchStatus::Done));
+        let asked = [done.clone(), running.clone(), cut.clone()];
         let gathered = Gathered {
             inputs: inputs.clone(),
+            launches: asked.to_vec(),
             runs: vec![
                 (done.clone(), run("PB-1", 3)),
                 (running.clone(), run("PB-2", 3)),
@@ -1421,7 +1489,62 @@ mod tests {
         );
         let unknown = Launched::of(&launch("PB-9", LaunchStatus::Done));
         assert_eq!(gathered.kept(&inputs, &unknown), None);
+        assert_eq!(gathered.kept(&inputs, &cut), None, "asked for, not read");
         assert_eq!(Gathered::default().kept(&[], &done), None);
+
+        assert!(gathered.read(&inputs, &asked), "running and cut ones too");
+        assert!(!gathered.read(&other, &asked));
+        assert!(!gathered.read(&inputs, &asked[..2]));
+        assert!(!gathered.read(&inputs, &[done.clone(), running, rerun]));
+        assert!(!gathered.read(&inputs, &[]));
+        assert!(Gathered::default().read(&[], &[]), "nothing to read");
+        assert!(!Gathered::default().read(&[], &[done]));
+    }
+
+    #[test]
+    fn a_report_reads_the_same_files_whatever_it_is_asked_with() {
+        let wanted = Wanted {
+            run: "r1".into(),
+            plugin: "ui/report.js".into(),
+            listed: vec![("triage/verdicts.json".into(), 8)],
+            settled: false,
+            asked: Asked::default(),
+        };
+        let asked = Wanted {
+            asked: Asked {
+                params: [("lane".to_string(), Param::Select("go".into()))].into(),
+                turn: 3,
+                state: Some("s".into()),
+                event: Some(crucible_view::Event::Tick),
+            },
+            ..wanted.clone()
+        };
+        assert_ne!(wanted, asked);
+        assert!(wanted.reads_as(&asked) && asked.reads_as(&wanted));
+        for other in [
+            Wanted {
+                run: "r2".into(),
+                ..wanted.clone()
+            },
+            Wanted {
+                plugin: "ui/other.js".into(),
+                ..wanted.clone()
+            },
+            Wanted {
+                listed: vec![("triage/verdicts.json".into(), 9)],
+                ..wanted.clone()
+            },
+            Wanted {
+                listed: vec![],
+                ..wanted.clone()
+            },
+            Wanted {
+                settled: true,
+                ..wanted.clone()
+            },
+        ] {
+            assert!(!wanted.reads_as(&other), "{other:?}");
+        }
     }
 
     #[test]
@@ -1534,22 +1657,25 @@ mod tests {
         capture(dir.path(), "triage-python", "python");
         let mut reporter = Reporter::default();
         let mut plugins = Plugins::default();
-        let none = Params::new();
+        let none = Asked::default();
         assert!(reporter.refresh(dir.path(), &none, &mut plugins));
         assert_eq!(triaged(&reporter), "64");
-        assert!(reporter.report().unwrap().params.is_empty());
+        assert!(reporter.report().unwrap().asked.params.is_empty());
         assert!(
             !reporter.refresh(dir.path(), &none, &mut plugins),
             "no params is no change"
         );
 
-        let go: Params = [("task".to_string(), Param::Select("triage-go".into()))].into();
+        let go = Asked {
+            params: [("task".to_string(), Param::Select("triage-go".into()))].into(),
+            ..Asked::default()
+        };
         let before = Arc::clone(reporter.report().unwrap());
         assert!(reporter.refresh(dir.path(), &go, &mut plugins));
         assert_eq!(triaged(&reporter), "34");
-        assert_eq!(reporter.report().unwrap().params, go);
+        assert_eq!(reporter.report().unwrap().asked, go);
         assert_eq!(
-            before.params.len(),
+            before.asked.params.len(),
             0,
             "the last report stands until the next is built"
         );
@@ -1566,7 +1692,7 @@ mod tests {
         reporter.refresh(dir.path(), &go, &mut plugins);
         assert_eq!(triaged(&reporter), "34");
         assert_eq!(
-            reporter.report().unwrap().params,
+            reporter.report().unwrap().asked,
             go,
             "a refresh keeps the params"
         );
@@ -1577,6 +1703,133 @@ mod tests {
             "34",
             "go alone has no python verdicts now"
         );
-        assert!(reporter.report().unwrap().params.is_empty());
+        assert!(reporter.report().unwrap().asked.params.is_empty());
+    }
+
+    /// A pack directory holding the stack example's plugin.
+    fn stack_pack() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("ui")).unwrap();
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/stack/ui/stack.wasm"),
+            dir.path().join("ui/stack.wasm"),
+        )
+        .expect("build it with `just example-stack-view`");
+        dir
+    }
+
+    #[test]
+    fn the_stack_example_plays_through_the_reporter() {
+        use crucible_view::{Draw, Event, Key};
+        let dir = stack_pack();
+        let mut reporter = Reporter::default();
+        let mut plugins = Plugins::default();
+        let a = crate::Selection::Local("stack".into());
+        let mut shown = Scoped::default();
+        assert!(reporter.refresh(dir.path(), &shown.shown.asked(), &mut plugins));
+        shown.follow(Some(&a), reporter.report());
+        let view = |reporter: &Reporter| reporter.report().unwrap().view.clone().unwrap();
+        let first = view(&reporter);
+        assert_eq!(first.title, "Stack");
+        assert_eq!(first.live.tick_ms, Some(600));
+        assert_eq!(first.live.keys.len(), 6);
+        let state = first.live.state.clone().unwrap();
+        assert!(state.starts_with(&"0".repeat(180)), "an empty board");
+        let Node::Stack { children } = &first.body else {
+            panic!("the view is a stack");
+        };
+        let Node::Canvas { commands, .. } = &children[1] else {
+            panic!("the board is a canvas");
+        };
+        let hits: Vec<&str> = commands
+            .iter()
+            .filter_map(|command| match command {
+                Draw::Hit { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(hits, ["left", "right", "turn", "down", "drop", "new"]);
+
+        let mut play = |shown: &mut Scoped<crate::Selection>, event: Event| {
+            shown.shown.play.fire(event);
+            assert!(reporter.refresh(dir.path(), &shown.shown.asked(), &mut plugins));
+            shown.follow(Some(&a), reporter.report());
+            assert_eq!(shown.shown.asked().event, None, "answered");
+            view(&reporter)
+        };
+        let fell = play(&mut shown, Event::Tick);
+        assert_ne!(fell.live.state, first.live.state, "the piece fell a row");
+        let moved = play(&mut shown, Event::Key(Key::Left));
+        assert_ne!(moved.live.state, fell.live.state, "and moved left");
+        let dropped = play(&mut shown, Event::Key(Key::Space));
+        let board = dropped.live.state.clone().unwrap();
+        let filled = board[..180].bytes().filter(|cell| *cell != b'0').count();
+        assert_eq!(filled, 4, "the piece set down: {board}");
+        assert!(
+            board[..140].bytes().all(|cell| cell == b'0'),
+            "on the floor: {board}"
+        );
+        for _ in 0..40 {
+            play(&mut shown, Event::Hit("drop".into()));
+        }
+        let over = play(&mut shown, Event::Tick);
+        assert_eq!(over.live.tick_ms, None, "a full board stops the clock");
+        let again = play(&mut shown, Event::Key(Key::Enter));
+        assert_eq!(again.live.tick_ms, Some(600));
+        assert!(again.live.state.unwrap().starts_with(&"0".repeat(180)));
+    }
+
+    #[test]
+    fn a_build_for_a_changed_plugin_continues_from_the_newest_state_without_the_event() {
+        use crucible_view::Event;
+        let dir = stack_pack();
+        let mut reporter = Reporter::default();
+        let mut plugins = Plugins::default();
+        let state = |reporter: &Reporter| {
+            reporter
+                .report()
+                .unwrap()
+                .view
+                .as_ref()
+                .unwrap()
+                .live
+                .state
+                .clone()
+        };
+        assert!(reporter.refresh(dir.path(), &Asked::default(), &mut plugins));
+        let ticked = Asked {
+            turn: 1,
+            state: state(&reporter),
+            event: Some(Event::Tick),
+            ..Asked::default()
+        };
+        assert!(reporter.refresh(dir.path(), &ticked, &mut plugins));
+        let fell = state(&reporter);
+        assert_ne!(fell, ticked.state, "the tick moved the piece");
+        assert_eq!(reporter.report().unwrap().asked.event, Some(Event::Tick));
+        assert!(
+            !reporter.refresh(dir.path(), &ticked, &mut plugins),
+            "the same ask builds nothing"
+        );
+
+        let wasm = fs::read(dir.path().join("ui/stack.wasm")).unwrap();
+        fs::remove_file(dir.path().join("ui/stack.wasm")).unwrap();
+        fs::write(dir.path().join("ui/stack.wasm"), wasm).unwrap();
+        assert!(
+            !reporter.refresh(dir.path(), &ticked, &mut plugins),
+            "built again from the newest state, the view is the same"
+        );
+        assert_eq!(state(&reporter), fell, "the tick is not answered twice");
+
+        let other = Asked {
+            turn: 2,
+            state: fell.clone(),
+            event: Some(Event::Hit("nothing".into())),
+            ..Asked::default()
+        };
+        reporter.refresh(dir.path(), &other, &mut plugins);
+        assert_eq!(state(&reporter), fell, "a hit the game has no button for");
+        let built = &reporter.report().unwrap().asked;
+        assert_eq!((built.turn, &built.event), (2, &other.event));
     }
 }

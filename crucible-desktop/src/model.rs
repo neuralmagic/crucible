@@ -22,6 +22,7 @@ use rune::Waker;
 use crate::logline::LogLine;
 use crate::pack::PackFiles;
 use crate::preview::Preview;
+use crate::report::Asked;
 use crate::session::{RunFold, TaskView};
 
 const LOG: &str = "state/session.jsonl";
@@ -129,13 +130,10 @@ pub enum Request {
         pack: String,
         max_time: String,
     },
-    /// The pack whose report the Report pane shows and the params it is asked with; `None`
-    /// while it shows none.
-    Report(Option<(String, Params)>),
+    /// The pack whose report the Report pane shows and what it is asked with; `None` while it
+    /// shows none.
+    Report(Option<(String, Asked)>),
 }
-
-/// A report's params, by control id.
-pub type Params = std::collections::BTreeMap<String, crucible_view::Param>;
 
 /// The UI-side handle. Dropping it stops the client thread.
 pub struct Client {
@@ -188,8 +186,9 @@ impl Client {
         });
     }
 
-    /// Builds the report of the pack `asked` names with its params, and keeps it current.
-    pub fn report(&self, asked: Option<(String, Params)>) {
+    /// Builds the report of the pack `asked` names for what it is asked with, and keeps it
+    /// current.
+    pub fn report(&self, asked: Option<(String, Asked)>) {
         let _ = self.tx.send(Request::Report(asked));
     }
 
@@ -219,17 +218,17 @@ fn publish(shared: &Mutex<Shared>, snapshot: Snapshot) -> Vec<Option<String>> {
 }
 
 /// The report the Report pane asked for, kept current on each tick.
-struct Asked {
+struct Reporting {
     pack: String,
-    params: Params,
+    asked: Asked,
     reporter: crate::report::Reporter,
 }
 
-impl Asked {
+impl Reporting {
     /// Builds the report again from `packs`; whether it changed.
     fn refresh(&mut self, packs: &[Pack], plugins: &mut crate::report::Plugins) -> bool {
         match packs.iter().find(|pack| pack.name == self.pack) {
-            Some(pack) => self.reporter.refresh(&pack.dir, &self.params, plugins),
+            Some(pack) => self.reporter.refresh(&pack.dir, &self.asked, plugins),
             None => false,
         }
     }
@@ -250,7 +249,7 @@ fn run_client(repo: PathBuf, rx: Receiver<Request>, shared: Arc<Mutex<Shared>>) 
         Vec::new()
     });
     let mut plugins = crate::report::Plugins::default();
-    let mut asked: Option<Asked> = None;
+    let mut reporting: Option<Reporting> = None;
     let mut built: Option<PackReport> = None;
     let mut next_local = Instant::now();
     let mut shown = publish(&shared, snapshot(&packs, error.clone(), built.clone()));
@@ -275,21 +274,21 @@ fn run_client(repo: PathBuf, rx: Receiver<Request>, shared: Arc<Mutex<Shared>>) 
                 shown = publish(&shared, snapshot(&packs, error.clone(), built.clone()));
                 next_local = Instant::now() + LIVE_TICK;
             }
-            Ok(Request::Report(None)) => asked = None,
-            Ok(Request::Report(Some((pack, params)))) => {
-                let reporter = asked
+            Ok(Request::Report(None)) => reporting = None,
+            Ok(Request::Report(Some((pack, asked)))) => {
+                let reporter = reporting
                     .take()
                     .filter(|held| held.pack == pack)
                     .map(|held| held.reporter)
                     .unwrap_or_default();
-                let mut held = Asked {
+                let mut held = Reporting {
                     pack,
-                    params,
+                    asked,
                     reporter,
                 };
                 held.refresh(&packs, &mut plugins);
                 built = Some(held.built());
-                asked = Some(held);
+                reporting = Some(held);
                 shown = publish(&shared, snapshot(&packs, error.clone(), built.clone()));
             }
             Err(RecvTimeoutError::Disconnected) => return,
@@ -302,7 +301,7 @@ fn run_client(repo: PathBuf, rx: Receiver<Request>, shared: Arc<Mutex<Shared>>) 
             for pack in &mut packs {
                 changed |= pack.tick();
             }
-            if let Some(held) = &mut asked
+            if let Some(held) = &mut reporting
                 && held.refresh(&packs, &mut plugins)
             {
                 built = Some(held.built());
@@ -1079,7 +1078,7 @@ printf '%s\n' '{SHUTDOWN}' >> "$d/state/session.jsonl"
             found.report.is_none(),
             "nothing is built before it is asked"
         );
-        client.report(Some(("demo".into(), Params::new())));
+        client.report(Some(("demo".into(), Asked::default())));
         wait_for(&client, &mut seen, "the report", |snapshot| {
             triaged(snapshot) == Some(("demo".into(), "34".into()))
         });
@@ -1089,19 +1088,22 @@ printf '%s\n' '{SHUTDOWN}' >> "$d/state/session.jsonl"
             triaged(snapshot) == Some(("demo".into(), "64".into()))
         });
 
-        let go: Params = [(
-            "task".to_string(),
-            crucible_view::Param::Select("triage-go".into()),
-        )]
-        .into();
+        let go = Asked {
+            params: [(
+                "task".to_string(),
+                crucible_view::Param::Select("triage-go".into()),
+            )]
+            .into(),
+            ..Asked::default()
+        };
         client.report(Some(("demo".into(), go.clone())));
         let laned = wait_for(&client, &mut seen, "the params", |snapshot| {
             triaged(snapshot) == Some(("demo".into(), "34".into()))
         });
         let built = laned.report.unwrap().report.unwrap();
-        assert_eq!(built.params, go);
+        assert_eq!(built.asked, go);
 
-        client.report(Some(("elsewhere".into(), Params::new())));
+        client.report(Some(("elsewhere".into(), Asked::default())));
         wait_for(&client, &mut seen, "a pack with no plugin", |snapshot| {
             snapshot
                 .report
@@ -1110,7 +1112,7 @@ printf '%s\n' '{SHUTDOWN}' >> "$d/state/session.jsonl"
         });
 
         client.report(None);
-        client.report(Some(("demo".into(), Params::new())));
+        client.report(Some(("demo".into(), Asked::default())));
         wait_for(&client, &mut seen, "the pack asked again", |snapshot| {
             triaged(snapshot) == Some(("demo".into(), "64".into()))
         });

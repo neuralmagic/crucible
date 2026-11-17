@@ -23,7 +23,8 @@ smaller, faster plugin and is worth it for a view that shapes a lot of data.
 - It sees only the captured files it names, as text. A file over 8 MiB or not UTF-8 is refused,
   and so are files that together hold more than 32 MiB.
 - It has no network, filesystem, arguments or environment. Its clock counts its own readings
-  and its random bytes never change, so the view must depend on the files alone.
+  and its random bytes never change, so the view must depend on the files alone, and for a
+  live view on the state and event the app hands it.
 - It runs under limits: about two seconds of work, 256 MiB of memory, a 64 MiB reply, 16 input
   paths. Past one, the pane shows the error instead of the view.
 - A view the app cannot check is refused whole: an unknown component or field, a row whose
@@ -148,6 +149,7 @@ fn report(request: Request) -> Result<View, String> {
             }],
         },
         controls: vec![],
+        live: Default::default(),
     })
 }
 ```
@@ -227,6 +229,43 @@ a launch runs. `pack_version` is the draft save a draft's launch ran.
   the view with `crucible-view-check --runs`. Against a controller, `CRUCIBLE_VIEW_PLUGIN=<file>`
   draws a live run and its runs page with a local plugin file in place of the pack's.
 
+## Live views
+
+A view can change without a new run: a stepper through a long result, a page of a big table at a
+time, a game. Return `live` with the view, and the app runs the plugin again on a tick, on a key
+the view asked for, or on a click on a canvas rectangle marked with `ctx.hit`. The plugin keeps
+nothing between runs and has no clock, so it returns all it needs in `live.state` and reads it
+back from the request's `state`, with what happened in `event`. `components.md` has the fields,
+the limits and the order events are answered in; `examples/stack` is a game built this way.
+
+```ts
+export const inputs = [];
+
+export function view({ state, event }: ViewRequest): View {
+  let count = Number(state ?? "0");
+  if (event !== null && event !== "tick" && "hit" in event && event.hit === "add") count += 1;
+  if (event !== null && event !== "tick" && "key" in event && event.key === "up") count += 1;
+  const canvas = new Canvas(200, 40);
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "muted";
+  ctx.fillRect(0, 0, 60, 40);
+  ctx.fillStyle = "neutral";
+  ctx.fillText("+1", 20, 25);
+  ctx.hit(0, 0, 60, 40, "add");
+  ctx.fillText(String(count), 80, 25);
+  return {
+    title: "Counter",
+    body: canvas.node(),
+    live: { state: String(count), keys: ["up"] },
+  };
+}
+```
+
+In Rust the same fields are `request.state`, `request.event` (`Event::Hit`, `Event::Key`,
+`Event::Tick`), `View::live` (`crucible_view::Live`) and `Context2d::hit`. The runs view is live
+the same way. Check it by playing it in the app: a test can build the request with a `state` and
+an `event` and call the view function as many times as a reader would.
+
 ## What a compiled plugin exports
 
 `crucible-view`'s `plugin!` writes these for a Rust plugin. A module built another way exports
@@ -243,11 +282,23 @@ a launch runs. `pack_version` is the draft save a draft's launch ran.
 A module draws a runs view only when it exports both optional functions.
 
 A JSON result is returned as one `i64`: the address in the high 32 bits, the length in the low
-32. The request and reply; `params` is left out until the reader changes a control:
+32. The request and reply; `params` is left out until the reader changes a control, and
+`state` and `event` until a live view has them:
 
 ```json request
 {"files": [{"path": "verdicts.json", "task": "triage-go", "text": "[]"}],
  "params": {"lane": {"select": "go"}}}
+```
+
+A live view's request after a click on its `add` rectangle, and its reply:
+
+```json live-request
+{"files": [], "state": "3", "event": {"hit": "add"}}
+```
+
+```json reply
+{"view": {"title": "Counter", "body": {"text": {"text": "4"}},
+ "live": {"state": "4", "keys": ["up"]}}}
 ```
 
 ```json reply

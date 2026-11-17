@@ -6,6 +6,9 @@
 //!
 //! A plugin may also export `crucible_runs_inputs` and `crucible_runs_view`, which answer the
 //! same way for a [`RunsRequest`]: the launches of its playbook instead of one run.
+//!
+//! A view may be [`Live`]: the host hands back the state it returned and runs the plugin again
+//! on a tick, a key or a click on a canvas [`Draw::Hit`], naming the [`Event`].
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -50,6 +53,7 @@ pub const RUNS_VIEW: &str = "crucible_runs_view";
 ///         title: format!("Lane {lane}"),
 ///         body: crucible_view::Node::Stats { items: vec![] },
 ///         controls: vec![],
+///         live: Default::default(),
 ///     })
 /// }
 ///
@@ -58,6 +62,7 @@ pub const RUNS_VIEW: &str = "crucible_runs_view";
 ///         title: format!("{} of {} launches", request.runs.len(), request.total),
 ///         body: crucible_view::Node::Stats { items: vec![] },
 ///         controls: vec![],
+///         live: Default::default(),
 ///     })
 /// }
 /// ```
@@ -130,6 +135,12 @@ pub struct Request {
     /// changes one.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, Param>,
+    /// The state the newest view returned in [`Live::state`]; none before a view returns one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// What asked for this run, when the reader or the clock did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<Event>,
 }
 
 impl Request {
@@ -158,6 +169,12 @@ pub struct RunsRequest {
     /// As [`Request::params`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, Param>,
+    /// As [`Request::state`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// As [`Request::event`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<Event>,
 }
 
 impl RunsRequest {
@@ -209,6 +226,58 @@ pub enum Status {
     /// Not started, or stopped without an outcome.
     Unfinished,
 }
+
+/// What runs a live view's plugin again.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Event {
+    /// A click on the canvas [`Draw::Hit`] with this id.
+    Hit(String),
+    /// A key the view asked for in [`Live::keys`], pressed while the view has focus.
+    Key(Key),
+    /// [`Live::tick_ms`] passed.
+    Tick,
+}
+
+/// A key a live view may ask for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Key {
+    Left,
+    Right,
+    Up,
+    Down,
+    Space,
+    Enter,
+}
+
+/// What makes a view live: a state handed back on the next run, a tick and keys.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Live {
+    /// Handed back as [`Request::state`], at most [`Limits::state`] bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// Runs the plugin again with [`Event::Tick`] this many milliseconds on, within
+    /// [`TICK_MS`], while the view is on screen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tick_ms: Option<u32>,
+    /// Run the plugin again with [`Event::Key`] while the view has focus; at most [`KEYS`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<Key>,
+}
+
+impl Live {
+    /// Whether the view is not live.
+    pub fn is_still(&self) -> bool {
+        *self == Live::default()
+    }
+}
+
+/// The shortest and longest tick a view may ask for, in milliseconds.
+pub const TICK_MS: [u32; 2] = [50, 3_600_000];
+/// The most keys a view may ask for: one of each.
+pub const KEYS: usize = 6;
 
 fn select<'a>(params: &'a BTreeMap<String, Param>, id: &str) -> Option<&'a str> {
     match params.get(id)? {
@@ -381,6 +450,8 @@ pub struct View {
     /// Drawn in a row above the body.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub controls: Vec<Control>,
+    #[serde(default, skip_serializing_if = "Live::is_still")]
+    pub live: Live,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -968,7 +1039,7 @@ pub struct Limits {
     /// Cells in one grid, its header among them.
     pub grid_cells: usize,
     /// Stats, meters, bars, segments, series, plot categories, grid cells, heatmap cells and
-    /// labels, table columns, flow stages and ribbons, and canvas hints across the view.
+    /// labels, table columns, flow stages and ribbons, and canvas hints and hits across the view.
     pub items: usize,
     /// Plot points, histogram values, and the points of every canvas path filled or stroked,
     /// across the view.
@@ -992,6 +1063,8 @@ pub struct Limits {
     pub options: usize,
     /// Steps from one end of a range to the other.
     pub steps: u32,
+    /// Bytes of [`Live::state`].
+    pub state: usize,
 }
 
 impl Limits {
@@ -1012,6 +1085,7 @@ impl Limits {
         controls: 12,
         options: 100,
         steps: 1_000,
+        state: 65_536,
     };
 }
 
@@ -1027,7 +1101,7 @@ pub enum Problem {
     GridCells(usize),
     #[error(
         "the view holds more than {0} stats, meters, bars, segments, series, categories, grid \
-         and heatmap cells, heatmap labels, columns, stages, ribbons and canvas hints"
+         and heatmap cells, heatmap labels, columns, stages, ribbons and canvas hints and hits"
     )]
     Items(usize),
     #[error("a title, label, cell or address is longer than {0} bytes")]
@@ -1118,6 +1192,12 @@ pub enum Problem {
     Range(String),
     #[error("the range {0} has more than {1} steps")]
     Steps(String, u32),
+    #[error("the view's state is more than {0} bytes")]
+    State(usize),
+    #[error("the view's tick is not from 50 milliseconds to an hour")]
+    Tick,
+    #[error("the view asks for more than {0} keys")]
+    Keys(usize),
 }
 
 /// What a view is drawn for, which decides where its links may lead.
@@ -1142,8 +1222,29 @@ impl View {
         if shown > 1 {
             return Err(Problem::Tables);
         }
-        controls_fit(&self.controls, limits)
+        controls_fit(&self.controls, limits)?;
+        live_fits(&self.live, limits)
     }
+}
+
+fn live_fits(live: &Live, limits: &Limits) -> Result<(), Problem> {
+    if live
+        .state
+        .as_ref()
+        .is_some_and(|state| state.len() > limits.state)
+    {
+        return Err(Problem::State(limits.state));
+    }
+    if live
+        .tick_ms
+        .is_some_and(|tick| !(TICK_MS[0]..=TICK_MS[1]).contains(&tick))
+    {
+        return Err(Problem::Tick);
+    }
+    if live.keys.len() > KEYS {
+        return Err(Problem::Keys(KEYS));
+    }
+    Ok(())
 }
 
 fn controls_fit(controls: &[Control], limits: &Limits) -> Result<(), Problem> {
@@ -1387,7 +1488,7 @@ impl Node {
                         Draw::Fill | Draw::Stroke => seen.points(path, limits)?,
                         Draw::FillRect(_) | Draw::StrokeRect(_) => seen.points(4, limits)?,
                         Draw::Font(text) | Draw::FillText { text, .. } => fits(text, limits)?,
-                        Draw::Hint { text, .. } => {
+                        Draw::Hint { text, .. } | Draw::Hit { id: text, .. } => {
                             fits(text, limits)?;
                             seen.items(1, limits)?;
                         }
@@ -1597,9 +1698,10 @@ fn cells_fit(cells: &[Cell], kind: ViewKind, limits: &Limits) -> Result<(), Prob
 #[cfg(test)]
 mod tests {
     use crate::{
-        Bar, Cell, Column, File, Limits, Link, MAX_BINS, Node, PlotKind, Problem, Reply, Row, Run,
-        RunsRequest, Scale, Segment, Series, Stat, Status, TIME_SPAN, Tab, Tone, View, ViewKind,
-        file_link, launch_link, launch_task_link, task_link,
+        Bar, Cell, Column, Event, File, KEYS, Key, Limits, Link, Live, MAX_BINS, Node, PlotKind,
+        Problem, Reply, Request, Row, Run, RunsRequest, Scale, Segment, Series, Stat, Status,
+        TICK_MS, TIME_SPAN, Tab, Tone, View, ViewKind, file_link, launch_link, launch_task_link,
+        task_link,
     };
 
     fn table(id: &str, rows: Vec<Row>) -> Node {
@@ -1636,6 +1738,178 @@ mod tests {
             title: "Report".into(),
             body,
             controls: vec![],
+            live: Default::default(),
+        }
+    }
+
+    fn live(live: Live) -> View {
+        View {
+            live,
+            ..view(Node::Stats { items: vec![] })
+        }
+    }
+
+    #[test]
+    fn a_view_that_is_not_live_says_nothing_of_it() {
+        let still = live(Live::default());
+        assert!(still.live.is_still());
+        assert_eq!(still.check(ViewKind::Run, &Limits::DEFAULT), Ok(()));
+        assert_eq!(
+            serde_json::to_string(&still).unwrap(),
+            r#"{"title":"Report","body":{"stats":{"items":[]}}}"#
+        );
+        let empty: View =
+            serde_json::from_str(r#"{"title":"T","body":{"text":{"text":"a"}},"live":{}}"#)
+                .unwrap();
+        assert!(empty.live.is_still());
+        for one in [
+            Live {
+                state: Some(String::new()),
+                ..Live::default()
+            },
+            Live {
+                tick_ms: Some(TICK_MS[0]),
+                ..Live::default()
+            },
+            Live {
+                keys: vec![Key::Enter],
+                ..Live::default()
+            },
+        ] {
+            assert!(!one.is_still(), "{one:?}");
+        }
+    }
+
+    #[test]
+    fn a_live_view_reads_back_as_written() {
+        let json = serde_json::to_string(&live(Live {
+            state: Some("a|b".into()),
+            tick_ms: Some(400),
+            keys: vec![
+                Key::Left,
+                Key::Right,
+                Key::Up,
+                Key::Down,
+                Key::Space,
+                Key::Enter,
+            ],
+        }))
+        .unwrap();
+        assert!(
+            json.ends_with(
+                r#""live":{"state":"a|b","tick_ms":400,"keys":["left","right","up","down","space","enter"]}}"#
+            ),
+            "{json}"
+        );
+        let read: View = serde_json::from_str(&json).unwrap();
+        assert_eq!(read.live.tick_ms, Some(400));
+        assert_eq!(read.live.keys.len(), 6);
+        for off in [
+            r#"{"keys":["escape"]}"#,
+            r#"{"keys":["Left"]}"#,
+            r#"{"fps":60}"#,
+            r#"{"tick_ms":-1}"#,
+            r#"{"tick_ms":1.5}"#,
+            r#"{"tick_ms":4294967296}"#,
+            r#"{"state":7}"#,
+        ] {
+            assert!(serde_json::from_str::<Live>(off).is_err(), "{off}");
+        }
+    }
+
+    #[test]
+    fn a_live_view_s_state_tick_and_keys_are_bounded() {
+        let at = |state: usize| {
+            live(Live {
+                state: Some("s".repeat(state)),
+                ..Live::default()
+            })
+        };
+        assert_eq!(at(65_536).check(ViewKind::Run, &Limits::DEFAULT), Ok(()));
+        assert_eq!(
+            at(65_537).check(ViewKind::Run, &Limits::DEFAULT),
+            Err(Problem::State(65_536))
+        );
+        assert_eq!(at(8).check(ViewKind::Runs, &TIGHT), Ok(()));
+        assert_eq!(at(9).check(ViewKind::Runs, &TIGHT), Err(Problem::State(8)));
+        let ticking = |tick: u32| {
+            live(Live {
+                tick_ms: Some(tick),
+                ..Live::default()
+            })
+            .check(ViewKind::Run, &Limits::DEFAULT)
+        };
+        assert_eq!(TICK_MS, [50, 3_600_000]);
+        for fine in [TICK_MS[0], 600, TICK_MS[1]] {
+            assert_eq!(ticking(fine), Ok(()), "{fine}");
+        }
+        for off in [0, 1, TICK_MS[0] - 1, TICK_MS[1] + 1, u32::MAX] {
+            assert_eq!(ticking(off), Err(Problem::Tick), "{off}");
+        }
+        let keyed = |count: usize| {
+            live(Live {
+                keys: vec![Key::Up; count],
+                ..Live::default()
+            })
+            .check(ViewKind::Run, &Limits::DEFAULT)
+        };
+        assert_eq!(KEYS, 6);
+        assert_eq!(keyed(0), Ok(()));
+        assert_eq!(keyed(KEYS), Ok(()));
+        assert_eq!(keyed(KEYS + 1), Err(Problem::Keys(KEYS)));
+        assert_eq!(keyed(10_000), Err(Problem::Keys(KEYS)));
+    }
+
+    #[test]
+    fn a_request_carries_state_and_the_event_that_asks() {
+        assert_eq!(
+            serde_json::to_string(&Request::default()).unwrap(),
+            r#"{"files":[]}"#
+        );
+        for (event, json) in [
+            (Event::Tick, r#""tick""#),
+            (Event::Key(Key::Down), r#"{"key":"down"}"#),
+            (Event::Key(Key::Space), r#"{"key":"space"}"#),
+            (Event::Hit("left".into()), r#"{"hit":"left"}"#),
+            (Event::Hit(String::new()), r#"{"hit":""}"#),
+        ] {
+            let asked = Request {
+                state: Some("s".into()),
+                event: Some(event),
+                ..Request::default()
+            };
+            let written = serde_json::to_string(&asked).unwrap();
+            assert_eq!(
+                written,
+                format!(r#"{{"files":[],"state":"s","event":{json}}}"#)
+            );
+            assert_eq!(serde_json::from_str::<Request>(&written).unwrap(), asked);
+        }
+        let stateless = Request {
+            event: Some(Event::Tick),
+            ..Request::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&stateless).unwrap(),
+            r#"{"files":[],"event":"tick"}"#
+        );
+        let runs = RunsRequest {
+            state: Some("s".into()),
+            event: Some(Event::Hit("next".into())),
+            ..RunsRequest::default()
+        };
+        let written = serde_json::to_string(&runs).unwrap();
+        assert_eq!(
+            written,
+            r#"{"runs":[],"total":0,"state":"s","event":{"hit":"next"}}"#
+        );
+        assert_eq!(serde_json::from_str::<RunsRequest>(&written).unwrap(), runs);
+        assert_eq!(
+            serde_json::to_string(&RunsRequest::default()).unwrap(),
+            r#"{"runs":[],"total":0}"#
+        );
+        for off in [r#""tock""#, r#"{"key":"escape"}"#, r#"{"hit":3}"#] {
+            assert!(serde_json::from_str::<Event>(off).is_err(), "{off}");
         }
     }
 
@@ -1896,6 +2170,7 @@ mod tests {
             ],
             total: 3,
             params: [("lane".to_string(), crate::Param::Select("go".into()))].into(),
+            ..RunsRequest::default()
         };
         let json = serde_json::to_string(&request).unwrap();
         assert_eq!(
@@ -2534,6 +2809,7 @@ mod tests {
         controls: 2,
         options: 3,
         steps: 10,
+        state: 8,
     };
 
     #[test]
@@ -2905,6 +3181,7 @@ mod tests {
                 title: long.clone(),
                 body: Node::Stats { items: vec![] },
                 controls: vec![],
+                live: Default::default(),
             }
             .check(ViewKind::Run, &TIGHT),
             Err(Problem::Text(8))
@@ -3415,7 +3692,7 @@ mod tests {
         use crate::{Param, Request};
         let bare = Request {
             files: vec![],
-            params: Default::default(),
+            ..Request::default()
         };
         assert_eq!(serde_json::to_string(&bare).unwrap(), r#"{"files":[]}"#);
         assert_eq!(
@@ -3430,6 +3707,7 @@ mod tests {
                 ("cvss".to_string(), Param::Range(7.5)),
             ]
             .into(),
+            ..Request::default()
         };
         let json = serde_json::to_string(&asked).unwrap();
         assert_eq!(
@@ -3456,7 +3734,7 @@ mod tests {
                     task: "t".into(),
                     text: "x".into(),
                 }],
-                params: Default::default(),
+                ..Request::default()
             },
             "a field the host adds later is passed over"
         );
@@ -3561,7 +3839,29 @@ mod tests {
         let limits = Limits::DEFAULT;
         let mut names = std::collections::BTreeSet::new();
         let mut kinds = std::collections::BTreeSet::new();
+        let mut events = std::collections::BTreeSet::new();
+        let mut live = 0;
         for (word, json) in skill_examples("components.md") {
+            if word == "live" {
+                let view: View =
+                    serde_json::from_str(&json).unwrap_or_else(|e| panic!("{e}: {json}"));
+                assert!(!view.live.is_still(), "{json}");
+                component_names(&view.body, &mut names);
+                view.check(ViewKind::Run, &limits)
+                    .unwrap_or_else(|e| panic!("{e}: {json}"));
+                live += 1;
+                continue;
+            }
+            if word == "events" {
+                let asked: Vec<crate::Event> =
+                    serde_json::from_str(&json).unwrap_or_else(|e| panic!("{e}: {json}"));
+                events.extend(asked.iter().map(|event| match event {
+                    crate::Event::Hit(_) => "hit",
+                    crate::Event::Key(_) => "key",
+                    crate::Event::Tick => "tick",
+                }));
+                continue;
+            }
             if word == "controls" {
                 let controls: Vec<Control> =
                     serde_json::from_str(&json).unwrap_or_else(|e| panic!("{e}: {json}"));
@@ -3573,6 +3873,7 @@ mod tests {
                     title: "T".into(),
                     body: Node::Stats { items: vec![] },
                     controls,
+                    live: Default::default(),
                 };
                 view.check(ViewKind::Run, &limits)
                     .unwrap_or_else(|e| panic!("{e}: {json}"));
@@ -3589,6 +3890,7 @@ mod tests {
                 controls: vec![],
                 title: "T".into(),
                 body,
+                live: Default::default(),
             };
             view.check(kind, &limits)
                 .unwrap_or_else(|e| panic!("{e}: {json}"));
@@ -3629,6 +3931,20 @@ mod tests {
             ["range", "select", "toggle"],
             "every control has an example"
         );
+        assert_eq!(live, 1, "a live view has an example");
+        assert_eq!(
+            events.into_iter().collect::<Vec<_>>(),
+            ["hit", "key", "tick"],
+            "every event has an example"
+        );
+        for typed_name in [
+            "state?: string",
+            "tick_ms?: number",
+            "keys?: ViewKey[]",
+            "hit(",
+        ] {
+            assert!(typed.contains(typed_name), "the types name {typed_name}");
+        }
 
         let mut kinds = Vec::new();
         for (kind, json) in skill_examples("SKILL.md") {
@@ -3637,6 +3953,11 @@ mod tests {
                     let request: crate::Request = serde_json::from_str(&json).unwrap();
                     assert_eq!(request.files.len(), 1);
                     assert_eq!(request.select("lane"), Some("go"));
+                }
+                "live-request" => {
+                    let request: crate::Request = serde_json::from_str(&json).unwrap();
+                    assert_eq!(request.state.as_deref(), Some("3"));
+                    assert_eq!(request.event, Some(crate::Event::Hit("add".into())));
                 }
                 "reply" => match serde_json::from_str(&json).unwrap() {
                     Reply::View(view) => view.check(ViewKind::Run, &limits).unwrap(),
@@ -3652,7 +3973,17 @@ mod tests {
             }
             kinds.push(kind);
         }
-        assert_eq!(kinds, ["runs-request", "request", "reply", "reply"]);
+        assert_eq!(
+            kinds,
+            [
+                "runs-request",
+                "request",
+                "live-request",
+                "reply",
+                "reply",
+                "reply"
+            ]
+        );
     }
 
     #[test]

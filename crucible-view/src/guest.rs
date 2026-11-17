@@ -5,6 +5,10 @@
 //! [`crate::RunsRequest`] for the launches of the playbook. `inputs` answers `crucible_inputs`
 //! and `crucible_runs_inputs`.
 //!
+//! A module keeps nothing between calls the host can rely on, and has no clock: a live view
+//! keeps what it needs in [`crate::Live::state`], gets it back as the request's `state`, and is
+//! told what happened in its `event`.
+//!
 //! A result is returned as one `u64`: its address in the high half, its length in the low half.
 
 use serde::de::DeserializeOwned;

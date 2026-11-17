@@ -1,6 +1,7 @@
 //! Draws a view's canvas: its commands, read as the HTML canvas's 2D context reads them, become
 //! vector shapes and lines of text painted in command order, shrunk to fit the pane.
 
+use std::collections::HashSet;
 use std::f32::consts::TAU;
 
 use crucible_view::{
@@ -8,7 +9,9 @@ use crucible_view::{
 };
 use rune::{Color, El, Shape, canvas, col, el, row, text};
 
+use crate::App;
 use crate::ui::Paint;
+use crate::ui::report::Slot;
 use crate::ui::report::hue::{dot, from_rgba, ink};
 
 /// The widest box a line of canvas text with no max width is laid out in.
@@ -382,11 +385,13 @@ enum Piece {
     Label(Label),
 }
 
-/// A canvas's pieces and its hints, `[x, y, width, height]` and a text, in the canvas's points.
+/// A canvas's pieces, its hints and its hits: each an area `[x, y, width, height]` in the
+/// canvas's points, and its text or id.
 #[derive(Debug, Default, PartialEq)]
 struct Drawing {
     pieces: Vec<Piece>,
     hints: Vec<([f32; 4], String)>,
+    hits: Vec<([f32; 4], String)>,
 }
 
 /// `commands` read as the 2D context reads them on a canvas `size` points wide and high, scaled
@@ -489,6 +494,17 @@ fn drawing(commands: &[Draw], size: [f32; 2], fit: f32, ink: &dyn Fn(Style) -> C
                     drawn.hints.push((area, body.clone()));
                 }
             }
+            Draw::Hit {
+                id,
+                x,
+                y,
+                width,
+                height,
+            } => {
+                if let Some(area) = hinted(corners([*x, *y, *width, *height], m), size, fit) {
+                    drawn.hits.push((area, id.clone()));
+                }
+            }
             path => {
                 pen.take(path, m);
             }
@@ -514,10 +530,36 @@ fn hinted(corners: [[f32; 2]; 4], [w, h]: [f32; 2], fit: f32) -> Option<[f32; 4]
     (right > left && bottom > top).then_some([left, top, right - left, bottom - top])
 }
 
-/// A canvas `width` by `height` points, scaled by `fit`.
-fn canvas_view(width: f32, height: f32, commands: &[Draw], fit: f32, p: &Paint) -> El {
+/// The key of a canvas's hit `id`: `report-hit-<id>` for the first of `seen` with that id, none
+/// for the rest.
+fn hit_key<'a>(id: &'a str, seen: &mut HashSet<&'a str>) -> Option<String> {
+    seen.insert(id).then(|| format!("report-hit-{id}"))
+}
+
+/// A canvas `width` by `height` points, scaled by `fit`, its hits asking the plugin of `S`.
+fn canvas_view<S: Slot>(width: f32, height: f32, commands: &[Draw], fit: f32, p: &Paint) -> El {
     let size = [width * fit, height * fit];
     let drawn = drawing(commands, [width, height], fit, &|style| colour(style, p));
+    let mut seen = HashSet::new();
+    let hits: Vec<El> = drawn
+        .hits
+        .iter()
+        .map(|([x, y, w, h], id)| {
+            let fired = id.clone();
+            let hit = el()
+                .absolute(*x, *y)
+                .size(*w, *h)
+                .role("button")
+                .label(id.clone())
+                .on_press(move |app: &mut App| {
+                    S::fire(app, crucible_view::Event::Hit(fired.clone()));
+                });
+            match hit_key(id, &mut seen) {
+                Some(key) => hit.key(key),
+                None => hit,
+            }
+        })
+        .collect();
     el().key("report-canvas")
         .size(size[0], size[1])
         .children(drawn.pieces.into_iter().map(|piece| match piece {
@@ -530,23 +572,31 @@ fn canvas_view(width: f32, height: f32, commands: &[Draw], fit: f32, p: &Paint) 
                 .into_iter()
                 .map(|([x, y, w, h], body)| el().absolute(x, y).size(w, h).help(body)),
         )
+        .children(hits)
 }
 
 /// A canvas in a box as wide as its parent, shrunk to that width when it is wider. `key` names
 /// the box; no other canvas may share it.
-pub(crate) fn fitted(key: String, width: f32, height: f32, commands: &[Draw], p: &Paint) -> El {
+pub(crate) fn fitted<S: Slot>(
+    key: String,
+    width: f32,
+    height: f32,
+    commands: &[Draw],
+    p: &Paint,
+) -> El {
     let scale = rune::memo::layout_with(&key, move |rect| fit(rect[2], width)).unwrap_or(1.0);
     col().w_full().min_w(0.0).child(
         col()
             .key(key)
             .w_full()
             .min_w(0.0)
-            .child(canvas_view(width, height, commands, scale, p)),
+            .child(canvas_view::<S>(width, height, commands, scale, p)),
     )
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::f32::consts::{PI, TAU};
 
     use crucible_view::{CANVAS_REACH, Draw, Style, TextBaseline};
@@ -554,7 +604,7 @@ mod tests {
 
     use crate::ui::report::canvas::{
         Drawing, FAR, Font, LEAST_FIT, Label, Matrix, Pen, Piece, Subpath, TEXT_BOX, TEXT_SIZE,
-        WIDEST, arc_points, drawing, fit,
+        WIDEST, arc_points, drawing, fit, hit_key,
     };
 
     const IDENTITY: Matrix = Matrix([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
@@ -1078,5 +1128,127 @@ mod tests {
         }
         assert!(hints(&[Draw::Scale([0.0, 0.0]), hint(1.0, 1.0, 5.0, 5.0)]).is_empty());
         assert_eq!(hints(&vec![hint(0.0, 0.0, 5.0, 5.0); 3]).len(), 3);
+    }
+
+    fn hit(id: &str, x: f32, y: f32, width: f32, height: f32) -> Draw {
+        Draw::Hit {
+            id: id.into(),
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn a_hit_covers_its_transformed_rectangle_inside_the_canvas() {
+        let hits = |commands: &[Draw], fit: f32| drawing(commands, [100.0, 50.0], fit, &white).hits;
+        assert_eq!(
+            hits(&[hit("a", 10.0, 10.0, 20.0, 5.0)], 1.0),
+            [([10.0, 10.0, 20.0, 5.0], "a".to_string())]
+        );
+        assert_eq!(
+            hits(&[hit("a", 10.0, 10.0, 20.0, 5.0)], 0.5)[0].0,
+            [5.0, 5.0, 10.0, 2.5],
+            "shrunk with the canvas"
+        );
+        assert_eq!(
+            hits(&[hit("a", 30.0, 15.0, -20.0, -5.0)], 1.0)[0].0,
+            [10.0, 10.0, 20.0, 5.0]
+        );
+        let moved = hits(
+            &[
+                Draw::Save,
+                Draw::Translate([40.0, 20.0]),
+                Draw::Scale([2.0, 2.0]),
+                hit("in", 0.0, 0.0, 5.0, 5.0),
+                Draw::Restore,
+                hit("out", 0.0, 0.0, 5.0, 5.0),
+            ],
+            1.0,
+        );
+        assert_eq!(
+            moved,
+            [
+                ([40.0, 20.0, 10.0, 10.0], "in".to_string()),
+                ([0.0, 0.0, 5.0, 5.0], "out".to_string())
+            ]
+        );
+        let turned = hits(
+            &[
+                Draw::Translate([50.0, 25.0]),
+                Draw::Rotate(PI / 2.0),
+                hit("a", 0.0, 0.0, 10.0, 4.0),
+            ],
+            1.0,
+        );
+        let [x, y, w, h] = turned[0].0;
+        assert!(
+            near([x, y], [46.0, 25.0]) && near([w, h], [4.0, 10.0]),
+            "{turned:?}"
+        );
+        assert_eq!(
+            hits(
+                &[
+                    hit("a", -50.0, -50.0, 1e6, 1e6),
+                    hit("b", 99.0, 49.0, 1e6, 1e6)
+                ],
+                1.0
+            ),
+            [
+                ([0.0, 0.0, 100.0, 50.0], "a".to_string()),
+                ([99.0, 49.0, 1.0, 1.0], "b".to_string())
+            ],
+            "cut to the canvas"
+        );
+        for off in [
+            hit("a", 200.0, 0.0, 10.0, 10.0),
+            hit("a", -20.0, 0.0, 10.0, 10.0),
+            hit("a", 10.0, 10.0, 0.0, 10.0),
+            hit("a", 10.0, 60.0, 10.0, 10.0),
+        ] {
+            assert!(hits(std::slice::from_ref(&off), 1.0).is_empty(), "{off:?}");
+        }
+        assert!(
+            hits(
+                &[Draw::Scale([0.0, 0.0]), hit("a", 1.0, 1.0, 5.0, 5.0)],
+                1.0
+            )
+            .is_empty()
+        );
+        let drawn = drawing(
+            &[
+                Draw::FillRect([0.0, 0.0, 10.0, 10.0]),
+                hit("a", 0.0, 0.0, 5.0, 5.0),
+                Draw::FillRect([0.0, 0.0, 10.0, 10.0]),
+            ],
+            [100.0, 50.0],
+            1.0,
+            &white,
+        );
+        assert_eq!(drawn.pieces.len(), 1, "a hit draws nothing");
+        assert!(drawn.hints.is_empty());
+        assert_eq!(drawn.hits.len(), 1);
+    }
+
+    #[test]
+    fn the_first_hit_of_an_id_is_keyed_by_it_and_the_rest_have_no_key() {
+        let mut seen = HashSet::new();
+        let keys: Vec<Option<String>> = ["left", "left-1", "left", "", "", "left"]
+            .into_iter()
+            .map(|id| hit_key(id, &mut seen))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                Some("report-hit-left".to_string()),
+                Some("report-hit-left-1".to_string()),
+                None,
+                Some("report-hit-".to_string()),
+                None,
+                None
+            ],
+            "no two hits share a key, whatever their ids"
+        );
     }
 }

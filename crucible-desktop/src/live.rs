@@ -387,12 +387,21 @@ enum Reply {
     RunsReport(Built<WantedRuns>),
 }
 
-/// What the worker keeps between report builds: the plugin it last loaded, and what the last
-/// runs view read of each launch.
+/// What the worker keeps between report builds: the plugin it last loaded, what the last run
+/// report read, and what the last runs view read of each launch.
 #[derive(Default)]
 struct Reporting {
     plugins: Mutex<Plugins>,
+    read: Mutex<Option<Read>>,
     gathered: Mutex<Arc<Gathered>>,
+}
+
+/// The files a run report read for the `inputs` its plugin names, kept so an event reads none
+/// again.
+struct Read {
+    wanted: crate::report::Wanted,
+    inputs: Vec<String>,
+    files: Vec<crucible_view::File>,
 }
 
 impl Action {
@@ -455,14 +464,14 @@ impl Action {
             } => {
                 let files = dirs.files.as_deref();
                 let view = build_report(&c, files, reporting, &wanted, plugin, listed).await;
-                let report = crate::report::Report::pack(wanted.params.clone(), view);
+                let report = crate::report::Report::pack(wanted.asked.clone(), view);
                 Reply::Report(Built::new(wanted, Some(report)))
             }
             Action::RunsReport { wanted, plugin } => {
                 let files = dirs.files.as_deref();
                 let view = build_runs_report(&c, files, reporting, &wanted, plugin).await;
                 let report =
-                    view.map(|view| crate::report::Report::pack(wanted.params.clone(), view));
+                    view.map(|view| crate::report::Report::pack(wanted.asked.clone(), view));
                 Reply::RunsReport(Built::new(wanted, report))
             }
         }
@@ -513,11 +522,11 @@ impl Action {
                 result: Err(why),
             }),
             Action::Report { wanted, .. } => {
-                let report = crate::report::Report::pack(wanted.params.clone(), Err(why));
+                let report = crate::report::Report::pack(wanted.asked.clone(), Err(why));
                 Reply::Report(Built::new(wanted, Some(report)))
             }
             Action::RunsReport { wanted, .. } => {
-                let report = crate::report::Report::pack(wanted.params.clone(), Err(why));
+                let report = crate::report::Report::pack(wanted.asked.clone(), Err(why));
                 Reply::RunsReport(Built::new(wanted, Some(report)))
             }
         }
@@ -780,7 +789,8 @@ async fn load_plugin(
     .ok_or_else(stopped)
 }
 
-/// A run's report: load the plugin, fetch the captured files it asks for, and run it.
+/// A run's report: load the plugin, fetch the captured files it asks for, and run it. An event
+/// is answered from the files the last report read, when it would read the same.
 async fn build_report(
     c: &Connection,
     files: Option<&Path>,
@@ -791,6 +801,47 @@ async fn build_report(
 ) -> Result<crucible_view::View, String> {
     let loaded = load_plugin(reporting, wanted.plugin.clone(), plugin).await?;
     let Ready { inputs, .. } = (*loaded).as_ref().map_err(String::clone)?;
+    let kept = wanted.asked.event.as_ref().and_then(|_| {
+        let read = reporting
+            .read
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        read.as_ref()
+            .filter(|read| read.wanted.reads_as(wanted) && read.inputs == *inputs)
+            .map(|read| read.files.clone())
+    });
+    let read = match kept {
+        Some(read) => read,
+        None => {
+            let read = read_run(c, files, wanted, inputs, &listed).await?;
+            *reporting
+                .read
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(Read {
+                wanted: wanted.clone(),
+                inputs: inputs.clone(),
+                files: read.clone(),
+            });
+            read
+        }
+    };
+    let asked = wanted.asked.clone();
+    crate::net::blocking(move || {
+        let Ready { loaded, inputs, .. } = (*loaded).as_ref().map_err(String::clone)?;
+        crate::report::run(loaded, inputs, read, &asked)
+    })
+    .await
+    .ok_or_else(stopped)?
+}
+
+/// The files of `listed` at the paths `inputs` names, as `wanted`'s run captured them.
+async fn read_run(
+    c: &Connection,
+    files: Option<&Path>,
+    wanted: &crate::report::Wanted,
+    inputs: &[String],
+    listed: &[Captured],
+) -> Result<Vec<crucible_view::File>, String> {
     let asked: Vec<&Captured> = listed
         .iter()
         .filter(|file| inputs.contains(&file.path))
@@ -818,13 +869,7 @@ async fn build_report(
             text,
         });
     }
-    let params = wanted.params.clone();
-    crate::net::blocking(move || {
-        let Ready { loaded, inputs, .. } = (*loaded).as_ref().map_err(String::clone)?;
-        crate::report::run(loaded, inputs, read, params)
-    })
-    .await
-    .ok_or_else(stopped)?
+    Ok(read)
 }
 
 /// How many launches a runs view reads at once.
@@ -832,7 +877,8 @@ const RUNS_AT_ONCE: usize = 6;
 
 /// A playbook's runs view: load the plugin, read each launch `wanted` names, newest first, and
 /// run it. `None` when the plugin draws no runs view. A launch the last build read and that has
-/// stopped unchanged is not read again; the launches past the bytes a view reads are left out.
+/// stopped unchanged is not read again, and none is for an event that asks about the same
+/// launches; the launches past the bytes a view reads are left out.
 async fn build_runs_report(
     c: &Connection,
     files: Option<&Path>,
@@ -860,12 +906,44 @@ async fn build_runs_report(
             .lock()
             .unwrap_or_else(PoisonError::into_inner),
     );
-    let mut gathered = Gathered {
-        inputs: inputs.clone(),
-        runs: Vec::new(),
+    let gathered = if wanted.asked.event.is_some() && earlier.read(&inputs, &wanted.launches) {
+        earlier
+    } else {
+        let gathered = match gather(c, files, &earlier, inputs, &wanted.launches).await {
+            Ok(gathered) => Arc::new(gathered),
+            Err(error) => return Some(Err(error)),
+        };
+        *reporting
+            .gathered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Arc::clone(&gathered);
+        gathered
     };
+    let request = wanted.asked.runs_request(
+        gathered.runs.iter().map(|(_, run)| run.clone()).collect(),
+        wanted.total,
+    );
+    let view = crate::net::blocking(move || {
+        let Ready { loaded, .. } = (*loaded).as_ref().map_err(String::clone)?;
+        crate::report::run_runs(loaded, &request)
+    })
+    .await
+    .unwrap_or_else(|| Err(stopped()));
+    Some(view)
+}
+
+/// `launches` read for `inputs`, newest first, up to the bytes a view reads. A launch `earlier`
+/// kept is not read again.
+async fn gather(
+    c: &Connection,
+    files: Option<&Path>,
+    earlier: &Gathered,
+    inputs: Vec<String>,
+    launches: &[crate::report::Launched],
+) -> Result<Gathered, String> {
+    let mut runs = Vec::new();
     let mut held = 0_u64;
-    'read: for batch in wanted.launches.chunks(RUNS_AT_ONCE) {
+    'read: for batch in launches.chunks(RUNS_AT_ONCE) {
         let reading = batch.iter().map(|launch| async {
             match earlier.kept(&inputs, launch) {
                 Some(run) => Ok(Some(run.clone())),
@@ -874,34 +952,21 @@ async fn build_runs_report(
         });
         let read = futures_util::future::join_all(reading).await;
         for (launch, run) in batch.iter().zip(read) {
-            let run = match run {
-                Ok(Some(run)) => run,
-                Ok(None) => break 'read,
-                Err(error) => return Some(Err(error)),
+            let Some(run) = run? else {
+                break 'read;
             };
             let Some(more) = crate::report::with_run(held, &run) else {
                 break 'read;
             };
             held = more;
-            gathered.runs.push((launch.clone(), run));
+            runs.push((launch.clone(), run));
         }
     }
-    let request = crucible_view::RunsRequest {
-        runs: gathered.runs.iter().map(|(_, run)| run.clone()).collect(),
-        total: wanted.total,
-        params: wanted.params.clone(),
-    };
-    *reporting
-        .gathered
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner) = Arc::new(gathered);
-    let view = crate::net::blocking(move || {
-        let Ready { loaded, .. } = (*loaded).as_ref().map_err(String::clone)?;
-        crate::report::run_runs(loaded, &request)
+    Ok(Gathered {
+        inputs,
+        launches: launches.to_vec(),
+        runs,
     })
-    .await
-    .unwrap_or_else(|| Err(stopped()));
-    Some(view)
 }
 
 /// One launch as a runs view is handed it: what it was launched with, and the files of
@@ -3109,7 +3174,7 @@ mod tests {
             captured("triage-python", "verdicts.json", size("python")),
         ];
         let wanted = |run: &str, settled: bool| crate::report::Wanted {
-            params: Default::default(),
+            asked: Default::default(),
             run: run.into(),
             plugin: "ui/report.wasm.b64".into(),
             listed: listed.iter().map(|f| (f.key.clone(), f.size)).collect(),
@@ -3162,11 +3227,14 @@ mod tests {
         );
 
         let laned = crate::report::Wanted {
-            params: [(
-                "task".to_string(),
-                crucible_view::Param::Select("triage-go".into()),
-            )]
-            .into(),
+            asked: crate::report::Asked {
+                params: [(
+                    "task".to_string(),
+                    crucible_view::Param::Select("triage-go".into()),
+                )]
+                .into(),
+                ..Default::default()
+            },
             ..wanted("r1", true)
         };
         assert_ne!(
@@ -3177,11 +3245,44 @@ mod tests {
         client.report(laned.clone(), plugin.clone(), listed.clone());
         let built_laned = built(&laned);
         assert_eq!(triaged(&built_laned), "34");
-        assert_eq!(built_laned.report.as_ref().unwrap().params, laned.params);
+        assert_eq!(built_laned.report.as_ref().unwrap().asked, laned.asked);
         assert!(
             held(&client).is_some_and(|held| Arc::ptr_eq(&loaded, &held)),
             "the plugin is loaded once while its text stays the same"
         );
+
+        let fetches = || asked.lock().unwrap().len();
+        client.report(wanted("r1", false), plugin.clone(), listed.clone());
+        built(&wanted("r1", false));
+        assert_eq!(fetches(), 4, "a running run's files are fetched again");
+        let event = |turn: u64, wanted: crate::report::Wanted| crate::report::Wanted {
+            asked: crate::report::Asked {
+                turn,
+                state: Some("s".into()),
+                event: Some(crucible_view::Event::Tick),
+                ..Default::default()
+            },
+            ..wanted
+        };
+        let ticked = event(1, wanted("r1", false));
+        client.report(ticked.clone(), plugin.clone(), listed.clone());
+        let answered = built(&ticked);
+        assert_eq!(triaged(&answered), "64");
+        assert_eq!(
+            answered.report.as_ref().unwrap().asked.event,
+            Some(crucible_view::Event::Tick)
+        );
+        assert_eq!(fetches(), 4, "an event reads nothing again");
+
+        let mut grown = listed.clone();
+        grown[1].size = 4;
+        let moved = crate::report::Wanted {
+            listed: grown.iter().map(|f| (f.key.clone(), f.size)).collect(),
+            ..event(2, wanted("r1", false))
+        };
+        client.report(moved.clone(), plugin.clone(), grown);
+        assert_eq!(triaged(&built(&moved)), "64");
+        assert_eq!(fetches(), 6, "but an event for other files reads them");
     }
 
     #[test]
@@ -3269,15 +3370,18 @@ mod tests {
                 launched("PB-1", crucible_view::Status::Done),
             ],
             total: 9,
-            params: lane
-                .map(|lane| {
-                    (
-                        "lane".to_string(),
-                        crucible_view::Param::Select(lane.into()),
-                    )
-                })
-                .into_iter()
-                .collect(),
+            asked: crate::report::Asked {
+                params: lane
+                    .map(|lane| {
+                        (
+                            "lane".to_string(),
+                            crucible_view::Param::Select(lane.into()),
+                        )
+                    })
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
         };
         let built = |wanted: &WantedRuns| {
             let snapshot = snapshot_when(&client, Duration::from_secs(60), |s| {
@@ -3314,7 +3418,7 @@ mod tests {
                 pair("total", "9 all"),
             ]
         );
-        assert_eq!(first.report.as_ref().unwrap().params, wanted(None).params);
+        assert_eq!(first.report.as_ref().unwrap().asked, wanted(None).asked);
         let fetched = |from: usize| {
             let lines = asked.lock().unwrap();
             lines[from..]
@@ -3347,6 +3451,36 @@ mod tests {
         assert!(
             more.iter().all(|line| line.contains("PB-2")),
             "only the running launch is read again: {more:?}"
+        );
+
+        let event = |turn: u64, wanted: WantedRuns| WantedRuns {
+            asked: crate::report::Asked {
+                turn,
+                state: Some("s".into()),
+                event: Some(crucible_view::Event::Tick),
+                ..wanted.asked.clone()
+            },
+            ..wanted
+        };
+        let so_far = asked.lock().unwrap().len();
+        let ticked = event(1, wanted(Some("go")));
+        client.runs_report(ticked.clone(), PLUGIN.into());
+        assert_eq!(stats(&built(&ticked)), stats(&again));
+        assert!(
+            fetched(so_far).is_empty(),
+            "an event reads no launch again, running or not"
+        );
+        let fewer = WantedRuns {
+            launches: wanted(None).launches[1..].to_vec(),
+            ..event(2, wanted(Some("go")))
+        };
+        client.runs_report(fewer.clone(), PLUGIN.into());
+        assert_eq!(stats(&built(&fewer)), stats(&again)[1..]);
+        let more = fetched(so_far);
+        assert!(!more.is_empty());
+        assert!(
+            more.iter().all(|line| line.contains("PB-2")),
+            "an event for other launches reads the running one: {more:?}"
         );
 
         let other = WantedRuns {

@@ -1,0 +1,20 @@
+[package]
+name = "stack-view"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+crucible-view = { path = "../../../../crucible-view" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"

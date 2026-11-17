@@ -300,6 +300,7 @@ fn report(request: Request) -> Result<View, String> {
             ],
         },
         controls: vec![Control::select("task", "Lane", &options, task)],
+        live: Default::default(),
     })
 }
 
@@ -812,6 +813,7 @@ fn history(request: RunsRequest) -> Result<View, String> {
                 tone: Tone::Muted,
             },
             controls: vec![],
+            live: Default::default(),
         });
     }
     let mut by_key: BTreeMap<&str, Moves> = BTreeMap::new();
@@ -886,6 +888,7 @@ fn history(request: RunsRequest) -> Result<View, String> {
             ],
         },
         controls: vec![],
+        live: Default::default(),
     })
 }
 
@@ -1020,6 +1023,7 @@ mod tests {
                 .iter()
                 .map(|(id, value)| (id.to_string(), value.clone()))
                 .collect(),
+            ..Request::default()
         })
         .unwrap();
         view.check(ViewKind::Run, &Limits::DEFAULT).unwrap();
@@ -1345,12 +1349,12 @@ mod tests {
     #[test]
     fn a_torn_file_is_the_report_s_error() {
         let why = report(Request {
-            params: Default::default(),
             files: vec![File {
                 path: "verdicts.json".into(),
                 task: "triage-go".into(),
                 text: "{".into(),
             }],
+            ..Request::default()
         })
         .unwrap_err();
         assert!(why.starts_with("verdicts.json from triage-go:"), "{why}");
@@ -1400,7 +1404,7 @@ mod tests {
                 launch("triage:1", Status::Error, 1_793_491_200.0, vec![file("go")]),
             ],
             total: 5,
-            params: Default::default(),
+            ..RunsRequest::default()
         }
     }
 
@@ -1527,7 +1531,7 @@ mod tests {
             let view = history(RunsRequest {
                 runs,
                 total: 1,
-                params: Default::default(),
+                ..RunsRequest::default()
             })
             .unwrap();
             view.check(ViewKind::Runs, &Limits::DEFAULT).unwrap();

@@ -275,6 +275,7 @@ mod tests {
                 ],
                 total: 7,
                 params: [("lane".to_string(), Param::Select("go".into()))].into(),
+                ..RunsRequest::default()
             })
             .unwrap();
         assert_eq!(view.title, "2 of 7, lane go");
@@ -348,14 +349,118 @@ mod tests {
         );
     }
 
+    const COUNTER: &str = r#"
+        export const inputs = [];
+        const read = (state, event) => {
+            let count = Number(state ?? "0");
+            if (event === "tick") count += 10;
+            else if (event?.hit === "add") count += 1;
+            else if (event?.key === "down") count -= 1;
+            return count;
+        };
+        export function view({ state, event }) {
+            const count = read(state, event);
+            const canvas = new Canvas(100, 40);
+            const ctx = canvas.getContext("2d");
+            ctx.translate(10, 5);
+            ctx.hit(0, 0, 30, 20, "add");
+            return {
+                title: `${count} after ${JSON.stringify(event)} from ${JSON.stringify(state)}`,
+                body: canvas.node(),
+                live: { state: String(count), tick_ms: 250, keys: ["down", "space"] },
+            };
+        }
+        export const runsInputs = [];
+        export function runs({ state, event }) {
+            const count = read(state, event);
+            return {
+                title: `runs ${count}`,
+                body: { stats: { items: [] } },
+                live: { state: String(count) },
+            };
+        }
+    "#;
+
+    #[test]
+    #[ignore = "needs assets/js-engine/plugin.wasm from `just desktop-js-engine`"]
+    fn a_script_reads_the_state_and_the_event_and_returns_live() {
+        use crucible_view::{Event, Key, RunsRequest};
+        let script = loaded(engine(), COUNTER);
+        let first = script.view(&Request::default()).unwrap();
+        assert_eq!(first.title, "0 after null from null");
+        assert_eq!(first.live.state.as_deref(), Some("0"));
+        assert_eq!(first.live.tick_ms, Some(250));
+        assert_eq!(first.live.keys, [Key::Down, Key::Space]);
+        let Node::Canvas { commands, .. } = &first.body else {
+            panic!("a canvas");
+        };
+        assert_eq!(
+            commands[1],
+            Draw::Hit {
+                id: "add".into(),
+                x: 0.0,
+                y: 0.0,
+                width: 30.0,
+                height: 20.0,
+            }
+        );
+        let asked = |state: &str, event: Event| Request {
+            state: Some(state.into()),
+            event: Some(event),
+            ..Request::default()
+        };
+        let title = |request: Request| script.view(&request).unwrap().title;
+        assert_eq!(
+            title(asked("4", Event::Hit("add".into()))),
+            r#"5 after {"hit":"add"} from "4""#
+        );
+        assert_eq!(
+            title(asked("4", Event::Key(Key::Down))),
+            r#"3 after {"key":"down"} from "4""#
+        );
+        assert_eq!(
+            title(asked("4", Event::Tick)),
+            r#"14 after "tick" from "4""#
+        );
+        let runs = script
+            .runs_view(&RunsRequest {
+                state: Some("7".into()),
+                event: Some(Event::Hit("add".into())),
+                ..RunsRequest::default()
+            })
+            .unwrap();
+        assert_eq!(runs.title, "runs 8");
+        assert_eq!(runs.live.state.as_deref(), Some("8"));
+
+        let over = loaded(
+            engine(),
+            r#"export const inputs = [];
+               export function view() {
+                   return { title: "T", body: { stats: { items: [] } }, live: { tick_ms: 10 } };
+               }"#,
+        );
+        assert_eq!(
+            over.view(&Request::default()),
+            Err(Fault::View(crucible_view::Problem::Tick))
+        );
+        let unknown = loaded(
+            engine(),
+            r#"export const inputs = [];
+               export function view() {
+                   return { title: "T", body: { stats: { items: [] } }, live: { keys: ["tab"] } };
+               }"#,
+        );
+        assert!(unknown.view(&Request::default()).is_err());
+    }
+
     fn request(text: &str) -> Request {
         Request {
-            params: Default::default(),
             files: vec![File {
                 path: "verdicts.json".into(),
                 task: "triage".into(),
                 text: text.into(),
             }],
+            ..Request::default()
         }
     }
 

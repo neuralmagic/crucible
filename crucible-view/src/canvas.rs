@@ -17,7 +17,8 @@
 //! What differs from a browser's canvas: styles are a theme tone or a hex colour, with no
 //! gradients or patterns; there are no clips or images; text is drawn upright at its
 //! transformed anchor; and a font is read only for its `px` size and the words `bold` and
-//! `monospace`. [`Draw::Hint`] is not the 2D context's: a text shown on hover over a rectangle.
+//! `monospace`. [`Draw::Hint`] and [`Draw::Hit`] are not the 2D context's: a text shown on hover
+//! over a rectangle, and a rectangle the reader clicks.
 
 use std::fmt;
 use std::str::FromStr;
@@ -193,6 +194,15 @@ pub enum Draw {
         height: f32,
         text: String,
     },
+    /// A rectangle the reader clicks, under the current transform, which runs the plugin again
+    /// with [`crate::Event::Hit`] and this id.
+    Hit {
+        id: String,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    },
 }
 
 /// The furthest from zero a canvas number may be.
@@ -229,6 +239,13 @@ impl Draw {
                 x, y, max_width, ..
             } => near(x) && near(y) && max_width.as_ref().is_none_or(near),
             Draw::Hint {
+                x,
+                y,
+                width,
+                height,
+                ..
+            }
+            | Draw::Hit {
                 x,
                 y,
                 width,
@@ -452,6 +469,18 @@ impl Context2d {
             text: text.to_string(),
         });
     }
+
+    /// Marks the rectangle, under the current transform, as one the reader clicks; see
+    /// [`Draw::Hit`].
+    pub fn hit(&mut self, x: f32, y: f32, width: f32, height: f32, id: &str) {
+        self.commands.push(Draw::Hit {
+            id: id.to_string(),
+            x,
+            y,
+            width,
+            height,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -466,6 +495,7 @@ mod tests {
             title: "T".into(),
             body,
             controls: vec![],
+            live: Default::default(),
         }
     }
 
@@ -864,6 +894,132 @@ mod tests {
         assert_eq!(
             canvas(100.0, vec![long_text]).check(ViewKind::Run, &limits),
             Err(Problem::Text(8))
+        );
+    }
+
+    fn hit(id: &str, x: f32, width: f32) -> Draw {
+        Draw::Hit {
+            id: id.into(),
+            x,
+            y: 0.0,
+            width,
+            height: 4.0,
+        }
+    }
+
+    #[test]
+    fn a_hit_goes_under_its_own_name_and_reads_back() {
+        let mut ctx = Context2d::new(10.0, 10.0);
+        ctx.translate(2.0, 3.0);
+        ctx.hit(0.0, 0.0, 4.0, 4.0, "left");
+        let node = ctx.finish();
+        let json = serde_json::to_string(&node).unwrap();
+        assert_eq!(
+            json,
+            r#"{"canvas":{"width":10.0,"height":10.0,"commands":[{"translate":[2.0,3.0]},{"hit":{"id":"left","x":0.0,"y":0.0,"width":4.0,"height":4.0}}]}}"#
+        );
+        assert_eq!(serde_json::from_str::<Node>(&json).unwrap(), node);
+        assert_eq!(view(node).check(ViewKind::Run, &Limits::DEFAULT), Ok(()));
+        assert_eq!(hit("a", 0.0, 1.0).path_points(), 0);
+        for off in [
+            r#"{"hit":{"x":0,"y":0,"width":1,"height":1}}"#,
+            r#"{"hit":{"id":"a","x":0,"y":0,"width":1}}"#,
+            r#"{"hit":{"id":1,"x":0,"y":0,"width":1,"height":1}}"#,
+            r#"{"hit":{"id":"a","x":0,"y":0,"width":1,"height":1,"tone":"bad"}}"#,
+        ] {
+            assert!(serde_json::from_str::<Draw>(off).is_err(), "{off}");
+        }
+    }
+
+    #[test]
+    fn a_hit_s_numbers_are_within_reach() {
+        for fine in [0.0, -1e6, 1e6] {
+            assert_eq!(
+                canvas(100.0, vec![hit("a", fine, fine)]).check(ViewKind::Run, &Limits::DEFAULT),
+                Ok(()),
+                "{fine}"
+            );
+        }
+        for off in [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            1.000_001e6,
+            f32::MAX,
+        ] {
+            for command in [hit("a", off, 1.0), hit("a", 0.0, off)] {
+                assert_eq!(
+                    canvas(100.0, vec![Draw::Save, command.clone()])
+                        .check(ViewKind::Run, &Limits::DEFAULT),
+                    Err(Problem::CanvasNumber(1)),
+                    "{command:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hits_are_items_across_the_view_and_their_ids_are_bounded() {
+        let limits = Limits {
+            items: 3,
+            text: 8,
+            ..Limits::DEFAULT
+        };
+        assert_eq!(
+            canvas(100.0, vec![hit("a", 0.0, 1.0); 3]).check(ViewKind::Run, &limits),
+            Ok(())
+        );
+        assert_eq!(
+            canvas(100.0, vec![hit("a", 0.0, 1.0); 4]).check(ViewKind::Run, &limits),
+            Err(Problem::Items(3)),
+            "the same id counts again"
+        );
+        let hinted = Draw::Hint {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+            text: "h".into(),
+        };
+        assert_eq!(
+            canvas(
+                100.0,
+                vec![
+                    hinted.clone(),
+                    hinted,
+                    hit("a", 0.0, 1.0),
+                    hit("b", 0.0, 1.0)
+                ]
+            )
+            .check(ViewKind::Run, &limits),
+            Err(Problem::Items(3)),
+            "hints and hits count together"
+        );
+        let two = Node::Stack {
+            children: vec![
+                Node::Canvas {
+                    width: 1.0,
+                    height: 1.0,
+                    commands: vec![hit("a", 0.0, 1.0); 2],
+                };
+                2
+            ],
+        };
+        assert_eq!(
+            view(two).check(ViewKind::Runs, &limits),
+            Err(Problem::Items(3))
+        );
+        assert_eq!(
+            canvas(100.0, vec![hit("12345678", 0.0, 1.0)]).check(ViewKind::Run, &limits),
+            Ok(())
+        );
+        assert_eq!(
+            canvas(100.0, vec![hit("123456789", 0.0, 1.0)]).check(ViewKind::Run, &limits),
+            Err(Problem::Text(8))
+        );
+        assert_eq!(
+            canvas(100.0, vec![hit("", 0.0, 1.0)]).check(ViewKind::Run, &limits),
+            Ok(())
         );
     }
 }

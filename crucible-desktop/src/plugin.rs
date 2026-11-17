@@ -529,12 +529,12 @@ mod tests {
                         (i64.extend_i32_u (local.get 1)))))"#;
         let plugin = Loaded::Wasm(Module::load(echo.as_bytes(), SMALL).unwrap());
         let request = Request {
-            params: Default::default(),
             files: vec![File {
                 path: "verdicts.json".into(),
                 task: "triage".into(),
                 text: "[]".into(),
             }],
+            ..Request::default()
         };
         let Err(Fault::Reply(why)) = plugin.view(&request) else {
             panic!("a request is not a reply");
@@ -895,6 +895,7 @@ mod tests {
                         .iter()
                         .map(|(id, value)| (id.to_string(), value.clone()))
                         .collect(),
+                    ..Request::default()
                 })
                 .unwrap();
             let Node::Stack { children } = &view.body else {
@@ -931,12 +932,12 @@ mod tests {
         let select = crucible_view::Param::Select("triage-go".into());
         assert_eq!(triaged(&[("task", select)]).1, "34");
         let bad = plugin.view(&Request {
-            params: Default::default(),
             files: vec![File {
                 path: "verdicts.json".into(),
                 task: "triage-go".into(),
                 text: "{".into(),
             }],
+            ..Request::default()
         });
         let Err(Fault::Refused(why)) = bad else {
             panic!("a torn file is the plugin's error");

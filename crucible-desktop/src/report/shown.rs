@@ -9,7 +9,8 @@ use crucible_view::{Cell, Column, ColumnKind, Control, Node, Param, Row, View};
 use rune::TextEdit;
 use rune_kit::{SortDir, TableState};
 
-use crate::report::Report;
+use crate::report::play::Play;
+use crate::report::{Asked, Report};
 
 /// The table a view is showing.
 #[derive(Clone, Copy)]
@@ -36,6 +37,8 @@ pub struct Shown {
     sliding: Option<(String, f64)>,
     /// The select whose options are open.
     pub choosing: Option<String>,
+    /// The live view's state and events.
+    pub play: Play,
     tabs: HashMap<String, usize>,
     sections: HashMap<String, bool>,
     pub table: TableState,
@@ -143,6 +146,7 @@ impl Default for Shown {
             asked: BTreeMap::new(),
             sliding: None,
             choosing: None,
+            play: Play::default(),
             tabs: HashMap::new(),
             sections: HashMap::new(),
             table: fresh_table(),
@@ -165,6 +169,10 @@ impl Shown {
             return;
         }
         self.report = report.cloned();
+        match report {
+            Some(report) => self.play.answer(report),
+            None => self.play.rest(),
+        }
         self.declare();
         self.arrange();
     }
@@ -261,17 +269,17 @@ impl Shown {
         }
     }
 
-    /// What the plugin is asked with: every control's value once the reader has set one,
-    /// nothing before.
-    pub fn params(&self) -> &BTreeMap<String, Param> {
-        &self.asked
+    /// What the plugin is asked with next: every control's value once the reader has set one,
+    /// nothing before, and the live view's turn, state and event.
+    pub fn asked(&self) -> Asked {
+        self.play.asked(&self.asked)
     }
 
     /// Whether the report was built with other params than its controls now hold.
     pub fn pending(&self) -> bool {
         self.report
             .as_ref()
-            .is_some_and(|report| report.view.is_ok() && report.params != self.asked)
+            .is_some_and(|report| report.view.is_ok() && report.asked.params != self.asked)
     }
 
     /// The picked tab of the `len` tabs named `id`.
@@ -474,7 +482,7 @@ mod tests {
 
     fn report_of(view: View) -> Arc<Report> {
         Arc::new(Report {
-            params: Default::default(),
+            asked: Default::default(),
             author: None,
             view: Ok(view),
         })
@@ -491,6 +499,7 @@ mod tests {
     fn holding_node(node: Node) -> Shown {
         holding(View {
             controls: vec![],
+            live: Default::default(),
             title: "T".into(),
             body: node,
         })
@@ -509,6 +518,7 @@ mod tests {
     fn tabbed() -> View {
         View {
             controls: vec![],
+            live: Default::default(),
             title: "T".into(),
             body: Node::Stack {
                 children: vec![
@@ -565,6 +575,7 @@ mod tests {
         for open in [true, false] {
             let view = View {
                 controls: vec![],
+                live: Default::default(),
                 title: "T".into(),
                 body: Node::Stack {
                     children: vec![
@@ -631,6 +642,7 @@ mod tests {
         let report = |names: &[&str]| {
             report_of(View {
                 controls: vec![],
+                live: Default::default(),
                 title: "T".into(),
                 body: section("more", true, table("t", names)),
             })
@@ -764,7 +776,7 @@ mod tests {
         assert_eq!(ids(&shown), ["a1", "b9", "b10"]);
 
         let failed = Arc::new(Report {
-            params: Default::default(),
+            asked: Default::default(),
             author: None,
             view: Err("torn".into()),
         });
@@ -974,6 +986,7 @@ mod tests {
             title: "T".into(),
             body: Node::Stats { items: vec![] },
             controls,
+            live: Default::default(),
         })
     }
 
@@ -990,7 +1003,7 @@ mod tests {
         shown.follow(Some(&a), Some(&first));
         assert_eq!(shown.shown.controls().len(), 3);
         assert!(
-            shown.shown.params().is_empty(),
+            shown.shown.asked().params.is_empty(),
             "nothing set, nothing asked"
         );
         assert_eq!(shown.shown.value(&lane()), Param::Select("all".into()));
@@ -998,7 +1011,7 @@ mod tests {
 
         shown.shown.set("lane", Param::Select("go".into()));
         assert!(shown.shown.pending(), "built before the lane was set");
-        let every = shown.shown.params();
+        let every = shown.shown.asked().params;
         assert_eq!(
             every.clone().into_iter().collect::<Vec<_>>(),
             [
@@ -1011,24 +1024,24 @@ mod tests {
 
         shown.shown.set("lane", Param::Select("rust".into()));
         assert_eq!(
-            shown.shown.params()["lane"],
+            shown.shown.asked().params["lane"],
             Param::Select("all".into()),
             "a value the select does not offer falls back to its own"
         );
         shown.shown.set("open", Param::Range(3.0));
-        assert_eq!(shown.shown.params()["open"], Param::Toggle(false));
+        assert_eq!(shown.shown.asked().params["open"], Param::Toggle(false));
         shown.shown.set("lane", Param::Select("go".into()));
         shown.shown.set("open", Param::Toggle(true));
         shown.shown.set("ghost", Param::Toggle(true));
         assert!(
-            !shown.shown.params().contains_key("ghost"),
+            !shown.shown.asked().params.contains_key("ghost"),
             "only declared controls go"
         );
 
         shown.shown.slide("cvss", 7.3);
         assert_eq!(shown.shown.value(&cvss()), Param::Range(7.5));
         assert_eq!(
-            shown.shown.params()["cvss"],
+            shown.shown.asked().params["cvss"],
             Param::Range(0.0),
             "not while dragged"
         );
@@ -1039,7 +1052,7 @@ mod tests {
             "another range's release"
         );
         shown.shown.release("cvss");
-        assert_eq!(shown.shown.params()["cvss"], Param::Range(7.5));
+        assert_eq!(shown.shown.asked().params["cvss"], Param::Range(7.5));
         shown.shown.slide("cvss", 2.0);
         shown.shown.cancel_slide();
         assert_eq!(
@@ -1050,21 +1063,21 @@ mod tests {
         shown.shown.slide("cvss", f64::NAN);
         assert_eq!(shown.shown.value(&cvss()), Param::Range(0.0));
         shown.shown.release("cvss");
-        assert_eq!(shown.shown.params()["cvss"], Param::Range(0.0));
+        assert_eq!(shown.shown.asked().params["cvss"], Param::Range(0.0));
         shown.shown.set("cvss", Param::Range(1e300));
-        assert_eq!(shown.shown.params()["cvss"], Param::Range(10.0));
+        assert_eq!(shown.shown.asked().params["cvss"], Param::Range(10.0));
 
         let refreshed = controlled(vec![lane(), open(), cvss()]);
         shown.follow(Some(&a), Some(&refreshed));
         assert_eq!(
-            shown.shown.params()["lane"],
+            shown.shown.asked().params["lane"],
             Param::Select("go".into()),
             "kept"
         );
 
         let failed = Arc::new(Report {
             author: None,
-            params: Default::default(),
+            asked: Default::default(),
             view: Err("torn".into()),
         });
         shown.follow(Some(&a), Some(&failed));
@@ -1074,14 +1087,17 @@ mod tests {
             "a failed view keeps the last controls"
         );
         assert!(!shown.shown.pending(), "a failed view waits on nothing");
-        assert_eq!(shown.shown.params()["lane"], Param::Select("go".into()));
+        assert_eq!(
+            shown.shown.asked().params["lane"],
+            Param::Select("go".into())
+        );
 
         shown.shown.choosing = Some("lane".into());
         shown.shown.slide("cvss", 4.0);
         let fewer = controlled(vec![open()]);
         shown.follow(Some(&a), Some(&fewer));
         assert_eq!(
-            shown.shown.params().clone().into_iter().collect::<Vec<_>>(),
+            shown.shown.asked().params.into_iter().collect::<Vec<_>>(),
             [("open".to_string(), Param::Toggle(true))],
             "a control the view no longer has is dropped"
         );
@@ -1097,13 +1113,13 @@ mod tests {
         let none = controlled(vec![]);
         shown.follow(Some(&a), Some(&none));
         assert!(shown.shown.controls().is_empty());
-        assert!(shown.shown.params().is_empty());
+        assert!(shown.shown.asked().params.is_empty());
 
         shown.follow(Some(&a), Some(&first));
         shown.shown.set("open", Param::Toggle(true));
         shown.follow(Some(&local("b")), Some(&first));
         assert!(
-            shown.shown.params().is_empty(),
+            shown.shown.asked().params.is_empty(),
             "another selection starts over"
         );
         assert_eq!(
@@ -1115,7 +1131,10 @@ mod tests {
         shown.shown.set("open", Param::Toggle(true));
         shown.follow(None, None);
         assert!(shown.shown.controls().is_empty());
-        assert!(shown.shown.params().is_empty(), "and so does no selection");
+        assert!(
+            shown.shown.asked().params.is_empty(),
+            "and so does no selection"
+        );
     }
 
     #[test]
@@ -1133,29 +1152,32 @@ mod tests {
         let mut shown = Scoped::default();
         shown.follow(Some(&a), Some(&low()));
         shown.shown.set("cvss", Param::Range(2.0));
-        let asked = shown.shown.params();
+        let asked = shown.shown.asked().params;
         assert_eq!(asked["cvss"], Param::Range(2.0));
         for _ in 0..3 {
             shown.follow(Some(&a), Some(&high()));
             assert!(
-                shown.shown.params().is_empty(),
+                shown.shown.asked().params.is_empty(),
                 "a value the view no longer offers is not asked for"
             );
             shown.follow(Some(&a), Some(&low()));
-            assert!(shown.shown.params().is_empty(), "and is not asked again");
+            assert!(
+                shown.shown.asked().params.is_empty(),
+                "and is not asked again"
+            );
         }
 
         shown.follow(Some(&a), Some(&lanes(&[("all", "All"), ("go", "Go")])));
         shown.shown.set("lane", Param::Select("go".into()));
-        assert_eq!(shown.shown.params().len(), 2);
+        assert_eq!(shown.shown.asked().params.len(), 2);
         shown.follow(Some(&a), Some(&lanes(&[("all", "All")])));
         assert_eq!(
-            shown.shown.params().clone().into_iter().collect::<Vec<_>>(),
+            shown.shown.asked().params.into_iter().collect::<Vec<_>>(),
             [("open".to_string(), Param::Toggle(false))]
         );
         shown.follow(Some(&a), Some(&lanes(&[("all", "All"), ("go", "Go")])));
         assert_eq!(
-            shown.shown.params().len(),
+            shown.shown.asked().params.len(),
             1,
             "a view arriving never adds to what is asked"
         );
@@ -1171,13 +1193,16 @@ mod tests {
         );
 
         shown.shown.set("ghost", Param::Toggle(true));
-        assert!(!shown.shown.params().contains_key("ghost"));
+        assert!(!shown.shown.asked().params.contains_key("ghost"));
         shown.follow(
             Some(&a),
             Some(&lanes(&[("all", "All"), ("ghost", "Ghost")])),
         );
         shown.shown.set("open", Param::Toggle(true));
-        assert_eq!(shown.shown.params()["lane"], Param::Select("all".into()));
+        assert_eq!(
+            shown.shown.asked().params["lane"],
+            Param::Select("all".into())
+        );
     }
 
     fn csv_of(columns: &[&str], rows: &[&[&str]], cells: usize) -> String {

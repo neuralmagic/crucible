@@ -34,6 +34,12 @@ pub(crate) trait Slot: 'static {
     fn follow(app: &mut App, href: &str, tx: &mut Tx);
     /// Builds the report again with what its controls now hold.
     fn ask(app: &mut App);
+
+    /// Asks the report's plugin again with `event`, once the events before it are answered.
+    fn fire(app: &mut App, event: crucible_view::Event) {
+        Self::shown_mut(app).play.fire(event);
+        Self::ask(app);
+    }
 }
 
 /// The Report pane's report: the selected local pack's, or the one built for the selected
@@ -135,12 +141,25 @@ fn view<S: Slot>(report: &Report, app: &App, p: &Paint, layer: &mut Vec<El>) -> 
             };
         }
     };
-    col()
-        .key("report")
+    let mut drawn = col().key("report");
+    if S::shown(app).play.keyed() {
+        drawn = drawn.focusable(true);
+    }
+    drawn
         .w_full()
         .grow(1.0)
         .min_h(0.0)
         .gap(12.0)
+        .on_key(|app: &mut App, pressed: &rune::KeyEvent, _: &mut Tx| {
+            let Some(key) = live_key(pressed) else {
+                return false;
+            };
+            if !S::shown(app).play.wants(key) {
+                return false;
+            }
+            S::fire(app, crucible_view::Event::Key(key));
+            true
+        })
         .child(
             row()
                 .w_full()
@@ -168,6 +187,24 @@ fn view<S: Slot>(report: &Report, app: &App, p: &Paint, layer: &mut Vec<El>) -> 
                 p,
             )
         })
+}
+
+/// The key a live view may ask for that `pressed` is, with no modifier held.
+fn live_key(pressed: &rune::KeyEvent) -> Option<crucible_view::Key> {
+    use crucible_view::Key;
+    let mods = pressed.mods;
+    if mods.cmd || mods.ctrl || mods.alt {
+        return None;
+    }
+    match &pressed.key {
+        rune::Key::Left => Some(Key::Left),
+        rune::Key::Right => Some(Key::Right),
+        rune::Key::Up => Some(Key::Up),
+        rune::Key::Down => Some(Key::Down),
+        rune::Key::Enter => Some(Key::Enter),
+        rune::Key::Text(typed) if typed == " " => Some(Key::Space),
+        _ => None,
+    }
 }
 
 /// The narrowest a child of `columns` is drawn before the next one wraps under it.
@@ -272,7 +309,7 @@ fn node<S: Slot>(node_: &Node, fills: bool, at: &str, app: &App, p: &Paint) -> E
         } => plot::heatmap(columns, rows, values, *tone, p),
         Node::Flow { nodes, links } => {
             match flow::drawing(nodes, links, &|hue| hue::style(hue, p.k)) {
-                Some((height, commands)) => card(p).child(canvas::fitted(
+                Some((height, commands)) => card(p).child(canvas::fitted::<S>(
                     format!("report-canvas-{at}"),
                     flow::WIDTH,
                     height,
@@ -286,7 +323,7 @@ fn node<S: Slot>(node_: &Node, fills: bool, at: &str, app: &App, p: &Paint) -> E
             width,
             height,
             commands,
-        } => canvas::fitted(format!("report-canvas-{at}"), *width, *height, commands, p),
+        } => canvas::fitted::<S>(format!("report-canvas-{at}"), *width, *height, commands, p),
         Node::Grid { columns, rows } => grid(columns, rows, p),
         Node::Table { columns, .. } => table::<S>(columns, app, p),
         Node::Text { text: body, tone } => text(body.clone())

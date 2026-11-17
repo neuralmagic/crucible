@@ -1,0 +1,16 @@
+# stack: a pack whose view is live. `ui/stack.wasm` (built from `ui/stack/` by
+# `just example-stack-view`) is a falling-block game: the plugin keeps the board in the state the
+# app hands back to it, and the app runs it again on a tick, a key or a click. Open the pack in
+# the desktop app and play it in the Report pane; there is nothing to run.
+
+[workspace]
+inject = []
+
+[agent]
+backend   = "command"
+agent_cmd = "true"
+goal      = "Nothing to run: play the Report pane."
+
+[workflow]
+type = "playbook"
+file = "workflow.star"

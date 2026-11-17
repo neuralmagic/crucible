@@ -10,6 +10,10 @@
 //
 //   export const runsInputs = ["verdicts.json"];
 //   export function runs({ runs, total, params }: RunsRequest): View { ... }
+//
+// A view may be live: it returns `live` with a `state` the next request hands back, a tick and
+// keys, and marks canvas rectangles with `ctx.hit`. The plugin has no clock and no memory of its
+// own, so it keeps what it needs in `state` and reads what happened in `event`.
 
 /** A colour role from the app's theme. */
 type Tone = "neutral" | "muted" | "good" | "warn" | "bad" | "info";
@@ -33,6 +37,26 @@ interface ViewRequest {
    * toggle's `on`, a range's number. Empty until the reader changes one.
    */
   params: Record<string, string | boolean | number>;
+  /** The `live.state` the newest view returned; `null` until one does. */
+  state: string | null;
+  /** What ran the plugin again; `null` for a run the files or the controls asked for. */
+  event: ViewEvent | null;
+}
+
+/** A key a live view asks for. */
+type ViewKey = "left" | "right" | "up" | "down" | "space" | "enter";
+
+/** What runs a live view again: a click on a `ctx.hit` rectangle, a key it asked for, or its tick. */
+type ViewEvent = { hit: string } | { key: ViewKey } | "tick";
+
+/** What makes a view live. */
+interface ViewLive {
+  /** Handed back as the next request's `state`; at most 65,536 bytes. */
+  state?: string;
+  /** Runs the plugin again with `"tick"` this many milliseconds on, from 50 to 3,600,000, while the view is on screen. */
+  tick_ms?: number;
+  /** Run the plugin again with `{ key }` while the view has focus; at most 6. */
+  keys?: ViewKey[];
 }
 
 /** One launch of the playbook and the files its newest run captured. */
@@ -61,6 +85,10 @@ interface RunsRequest {
   total: number;
   /** As `ViewRequest.params`. */
   params: Record<string, string | boolean | number>;
+  /** As `ViewRequest.state`. */
+  state: string | null;
+  /** As `ViewRequest.event`. */
+  event: ViewEvent | null;
 }
 
 interface View {
@@ -68,6 +96,8 @@ interface View {
   body: ViewNode;
   /** Drawn in a row above the body; at most 12, ids unique among them. */
   controls?: ViewControl[];
+  /** Left out for a view that is not live. */
+  live?: ViewLive;
 }
 
 /**
@@ -250,6 +280,8 @@ declare class CanvasContext2D {
   fillText(text: string, x: number, y: number, maxWidth?: number): void;
   /** Not the browser's: shows `text` on hover over the rectangle, under the current transform. */
   hint(x: number, y: number, width: number, height: number, text: string): void;
+  /** Not the browser's: a rectangle the reader clicks, under the current transform, which runs the plugin again with `{ hit: id }`. */
+  hit(x: number, y: number, width: number, height: number, id: string): void;
 }
 
 /** A drawing surface in points, 1 to 4,000 on each side. Use it inside `view`. */

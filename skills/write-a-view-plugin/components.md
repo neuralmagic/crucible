@@ -414,9 +414,10 @@ the points of the path it draws, so call `begin_path` before each new shape.
 | `rect`, `fill_rect`, `stroke_rect` | `[x, y, width, height]` |
 | `fill_text` | `text`, `x`, `y`, optional `max_width` |
 | `hint` | `x`, `y`, `width`, `height`, `text`: shown on hover over the rectangle |
+| `hit` | `id`, `x`, `y`, `width`, `height`: a rectangle the reader clicks; see "Live views" |
 
-A transform applies to every point as it is added to the path, to `fill_rect`, `stroke_rect`
-and `hint` rectangles, to line widths, and to where text is drawn. Text is never rotated or
+A transform applies to every point as it is added to the path, to `fill_rect`, `stroke_rect`,
+`hint` and `hit` rectangles, to line widths, and to where text is drawn. Text is never rotated or
 skewed: it is drawn upright at its transformed point, its size scaled by the transform. Text
 longer than `max_width` ends in an ellipsis; a `max_width` of 0 or less draws nothing. A `hint`
 is not the 2D context's: its text shows on hover over its rectangle, and each counts as an item.
@@ -425,7 +426,8 @@ Shapes and text are painted in the order of their commands.
 In Rust, `crucible_view::Context2d` records the same commands with the method names `web-sys`
 uses (`set_fill_style`, `begin_path`, `fill_rect`, `arc`, `arc_with_anticlockwise`, `fill_text`,
 `fill_text_with_max_width`, `set_transform`), and `finish()` returns the component. In a
-script, `ctx.hint(x, y, width, height, text)` adds a hint.
+script, `ctx.hint(x, y, width, height, text)` adds a hint and `ctx.hit(x, y, width, height, id)`
+a hit, as `hint` and `hit` do in Rust.
 
 What a browser's canvas has and this does not: clipping, holes in a fill (the `evenodd` rule;
 each subpath fills on its own), images, gradients, patterns, shadows, `stroke_text`,
@@ -468,13 +470,59 @@ request carries each under its kind (`{"lane": {"select": "go"}}`), which a Rust
 with `request.select("lane")`, `request.toggle("open")` and `request.range("cvss")`. At most 12
 controls, their ids unique among themselves.
 
+## Live views
+
+A view is live when it returns `live` beside `title` and `body`. The app then runs the plugin
+again on an event and draws each new view in place of the last: a game, a stepper, a view that
+pages through its data. The plugin has no clock and no memory of its own; everything it needs
+from one run to the next goes in `state`, and the next request hands it back.
+
+- `state`: text, at most 65,536 bytes, handed back as the request's `state`. Until a view
+  returns one, `state` is `null` (`None` in Rust).
+- `tick_ms`: run again with the event `tick` this many milliseconds on, from 50 to 3,600,000,
+  while the view is on screen. Leave it out to stop the clock.
+- `keys`: the keys that run it again while the view has focus, at most 6 of `left`, `right`,
+  `up`, `down`, `space` and `enter`. Other keys stay the app's.
+
+```json live
+{"title": "Counter",
+ "body": {"canvas": {"width": 200, "height": 40, "commands": [
+   {"fill_style": "muted"},
+   {"fill_rect": [0, 0, 60, 40]},
+   {"fill_style": "neutral"},
+   {"text_align": "center"},
+   {"fill_text": {"text": "+1", "x": 30, "y": 25}},
+   {"hit": {"id": "add", "x": 0, "y": 0, "width": 60, "height": 40}},
+   {"text_align": "left"},
+   {"fill_text": {"text": "3", "x": 80, "y": 25}}
+ ]}},
+ "live": {"state": "3", "tick_ms": 1000, "keys": ["up", "down"]}}
+```
+
+The request's `event` says what ran it: a click on a canvas `hit` rectangle by its `id`, a key
+the view asked for, or the tick. It is `null` (`None`) when the files or the controls ran it.
+
+```json events
+[{"hit": "add"}, {"key": "up"}, "tick"]
+```
+
+A `hit` is a canvas command that draws nothing: its rectangle, under the current transform,
+takes clicks above whatever the canvas draws there. Each counts as an item, like a `hint`, and
+its `id` is at most as long as a label.
+
+The app answers events in order. While one is unanswered, later clicks and keys wait, at most 8
+of them, and a tick that comes due is dropped, so a slow plugin is never asked faster than it
+answers. Each request carries the state the newest view returned. Picking another pack, run or
+playbook starts over with no state. Controls and live views mix: a control change runs the
+plugin with the current state and no event.
+
 ## Whole-view limits
 
 Across the whole view, at most:
 
 - 2,000 components, nested at most 8 deep;
 - 20,000 stats, meters, bars, segments, series, plot categories, grid cells, heatmap cells and
-  labels, table columns, flow stages and links, and canvas hints;
+  labels, table columns, flow stages and links, and canvas hints and hits;
 - 50,000 points, counting plot points, histogram values, the points of each canvas path filled
   or stroked, and 4 for each `fill_rect` or `stroke_rect`;
 - 20,000 canvas commands;

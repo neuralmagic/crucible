@@ -293,9 +293,18 @@ example-report-view:
     RUSTFLAGS="--remap-path-prefix=$HOME=/home --remap-path-prefix={{ justfile_directory() }}=." cargo build --release --target wasm32-unknown-unknown --manifest-path examples/report/ui/report/Cargo.toml --target-dir target/view-plugins
     cp target/view-plugins/wasm32-unknown-unknown/release/report_view.wasm examples/report/ui/report.wasm
 
+# Build the stack example's live view plugin, a falling-block game, into its pack.
+example-stack-view:
+    RUSTFLAGS="--remap-path-prefix=$HOME=/home --remap-path-prefix={{ justfile_directory() }}=." cargo build --release --target wasm32-unknown-unknown --manifest-path examples/stack/ui/stack/Cargo.toml --target-dir target/view-plugins
+    cp target/view-plugins/wasm32-unknown-unknown/release/stack_view.wasm examples/stack/ui/stack.wasm
+
 # Run the report example's view plugin tests natively.
 example-report-test:
     cargo test --locked --manifest-path examples/report/ui/report/Cargo.toml --target-dir target/view-plugins
+
+# Run the stack example's view plugin tests natively.
+example-stack-test:
+    cargo test --locked --manifest-path examples/stack/ui/stack/Cargo.toml --target-dir target/view-plugins
 
 # Type-check the report-ts example's view plugin and write the JavaScript the app runs.
 example-report-ts-view:
