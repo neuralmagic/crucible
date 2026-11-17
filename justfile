@@ -112,36 +112,8 @@ controller-local port="8870" user=env_var("USER"):
     SQLX_OFFLINE=true cargo build -p crucible -p crucible-controller -p crux --bins \
         --features crucible-controller/embedded-db
     bin="${CARGO_TARGET_DIR:-$PWD/target}/debug"
-    state="${XDG_STATE_HOME:-$HOME/.local/state}/crucible-controller"
-    mkdir -p "$state"
-    hooks="${HOOKS_PORT:-8871}"
-    if [ ! -s "$state/webhook.key" ]; then
-        (umask 077 && head -c 32 /dev/urandom | base64 > "$state/webhook.key")
-    fi
-    if [ -z "${OPENSHELL_PODMAN_SOCKET:-}" ] && command -v podman >/dev/null \
-        && podman machine inspect >/dev/null 2>&1; then
-        export OPENSHELL_PODMAN_SOCKET=$(podman machine inspect --format '{{"{{"}}.ConnectionInfo.PodmanSocket.Path{{"}}"}}')
-    fi
-    echo "UI  http://127.0.0.1:{{port}} as {{user}}"
-    echo "Webhook deliveries http://127.0.0.1:$hooks/hooks/<id>"
     echo "CLI {{ if port != "8870" { "CONTROLLER_URL=http://127.0.0.1:" + port + " " } else { "" } }}$bin/crux whoami"
-    exec env -u CONTROLLER_API_TOKEN -u CONTROLLER_OIDC_ISSUER -u VAULT_ADDR \
-        KUBECONFIG=/dev/null \
-        DATABASE_URL=embedded \
-        CONTROLLER_API_ADDR=127.0.0.1:{{port}} \
-        CONTROLLER_PUBLIC_URL=http://127.0.0.1:{{port}} \
-        CONTROLLER_HOOKS_ADDR=127.0.0.1:$hooks \
-        CONTROLLER_HOOKS_PUBLIC_URL=http://127.0.0.1:$hooks \
-        CONTROLLER_WEBHOOK_KEY_FILE="$state/webhook.key" \
-        CONTROLLER_DEV_IDENTITY={{user}} \
-        CONTROLLER_ADMINS={{user}} \
-        CONTROLLER_SESSION_SECURE=false \
-        CONTROLLER_PLAYBOOK_EXECUTOR=local \
-        CONTROLLER_SCOPE_EXECUTOR=disabled \
-        CONTROLLER_STATE_DIR="$state" \
-        CRUCIBLE_BIN="$bin/crucible" \
-        RUST_LOG="${RUST_LOG:-info}" \
-        "$bin/crucible-controller" autopilot
+    exec "$bin/crucible-controller" local --port {{port}} --identity {{user}}
 
 # Regenerate the controller UI's OpenAPI spec + typed client (build artifacts, not committed):
 # `cargo run -p crucible-controller --bin openapi-spec` -> openapi.json -> openapi-typescript.
