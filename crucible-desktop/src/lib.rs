@@ -529,11 +529,26 @@ impl App {
         self.report_shown.row(&self.report_table()?, i)
     }
 
+    /// How many rows of the shown report table are drawn.
+    pub fn report_rows(&self) -> usize {
+        self.report_table()
+            .map_or(0, |table| self.report_shown.len(&table))
+    }
+
     pub fn sort_report(&mut self, column: &str, dir: rune_kit::SortDir) {
-        let order = self
-            .report_table()
-            .and_then(|table| report::Order::of(&table, column, dir));
-        self.report_shown.sort(order);
+        let report = self.shown_report().cloned();
+        let view = report.as_ref().and_then(|report| report.view.as_ref().ok());
+        if let Some(table) = view.and_then(|view| self.report_shown.table(view)) {
+            self.report_shown.sort(&table, column, dir);
+        }
+    }
+
+    /// Filters the shown report table by what its filter box now holds.
+    pub fn filter_report(&mut self) {
+        let report = self.shown_report().cloned();
+        let view = report.as_ref().and_then(|report| report.view.as_ref().ok());
+        let table = view.and_then(|view| self.report_shown.table(view));
+        self.report_shown.arrange(table.as_ref());
     }
 
     /// The first address the shown report table's row `id` links to.

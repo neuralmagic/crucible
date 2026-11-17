@@ -46,10 +46,19 @@ are right-aligned. At most 600 cells, header included.
 
 ## Table
 
-`table` holds any number of rows and sorts by a click on a column header, in natural order of
-the cell text. A cell with `href` is a link (see Links), and a double click on a row opens its
-first link. A column's `kind` is `text`, `mono` or `badge` (a dot in the cell's tone before the
-text); its `width` is `narrow`, `medium`, `wide` or `fill`. Both are optional.
+`table` holds any number of rows. The reader sorts it by a click on a column header and
+filters it with the box above it, which keeps the rows holding every word typed, in any cell.
+A cell with `href` is a link (see Links), and a double click on a row opens its first link.
+
+A column's `kind` is `text`, `mono`, `badge` (a dot in the cell's tone before the text) or
+`number` (right-aligned); its `width` is `narrow`, `medium`, `wide` or `fill`. Both are
+optional.
+
+Sorting is by the cell text in natural order, so `item2` comes before `item10`. A `number`
+column sorts text that is a number, such as `6.1` or `1,200`, as that number. For anything
+shown with a unit, give the cell a `value`: `{"text": "3 min", "value": 180}` sorts by 180 in
+any kind of column. Use it for durations, sizes, dates (as a timestamp) and percentages. Cells
+with no number sort after those with one.
 
 A row's optional `detail` is Markdown shown in a panel under the table while that row is
 selected. Put there what does not fit a cell: the whole rationale, the evidence, links to the
@@ -61,12 +70,14 @@ task and file it came from. Keep the cells to what a reader scans and sorts by.
   "columns": [
     {"id": "ticket", "title": "Ticket", "kind": "mono", "width": "narrow"},
     {"id": "category", "title": "Category", "kind": "badge"},
+    {"id": "open", "title": "Open", "kind": "number", "width": "narrow"},
     {"id": "why", "title": "Why", "width": "fill"}
   ],
   "rows": [
     {"id": "DEMO-101", "cells": [
       {"text": "DEMO-101", "href": "https://issues.example.com/browse/DEMO-101"},
       {"text": "affected", "tone": "bad"},
+      {"text": "57 d", "value": 57},
       {"text": "The handler is reachable from the public listener."}
     ], "detail": "### DEMO-101\n\nThe handler is reachable from the public listener.\n\nTriaged by [triage-go](run:task/triage-go), from [its verdicts](run:file/triage-go/verdicts.json)."}
   ]

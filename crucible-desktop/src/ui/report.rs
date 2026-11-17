@@ -10,7 +10,7 @@ use crucible_view::{
     Bar, Cell, Column, ColumnKind, Node, PlotKind, Row, Series, Stat, Tab, Tone, Width,
 };
 use rune::{Align, Color, El, LineCap, Shape, Tx, canvas, col, el, row, text};
-use rune_kit::{IconButton, IconButtonVariant, Kit, Markdown, Table, TableColumn};
+use rune_kit::{IconButton, IconButtonVariant, Kit, Markdown, Table, TableColumn, TextInput};
 use rune_theme_opencode::icons as oc;
 
 use crate::App;
@@ -451,7 +451,7 @@ fn table(columns: &[Column], app: &App, p: &Paint) -> El {
     let mut table = Table::new(
         |app: &App| &app.report_shown.table,
         |app: &mut App| &mut app.report_shown.table,
-        |app: &App| app.report_table().map_or(0, |table| table.rows.len()),
+        |app: &App| app.report_rows(),
         |app: &App, i| {
             app.report_row(i)
                 .map_or(Cow::Borrowed(""), |row| Cow::Borrowed(row.id.as_str()))
@@ -459,6 +459,11 @@ fn table(columns: &[Column], app: &App, p: &Paint) -> El {
     );
     for column in columns {
         let sized = TableColumn::new(column.id.clone(), column.title.clone()).sortable();
+        let sized = if column.kind == ColumnKind::Number {
+            sized.align(Align::End)
+        } else {
+            sized
+        };
         table = table.column(match column.width {
             Width::Narrow => sized.width(96.0).min(64.0),
             Width::Medium => sized.width(150.0).min(80.0),
@@ -499,16 +504,39 @@ fn table(columns: &[Column], app: &App, p: &Paint) -> El {
         .key("report-table")
         .grow(1.0)
         .min_h(0.0);
-    let Some(shown) = app.report_detail() else {
-        return table;
-    };
     col()
         .w_full()
         .grow(1.0)
         .min_h(0.0)
         .gap(10.0)
+        .child(filter(app, p))
         .child(table)
-        .child(detail(shown, p))
+        .children(app.report_detail().map(|shown| detail(shown, p)))
+}
+
+/// The box that filters the shown table, and how many rows pass while it holds something.
+fn filter(app: &App, p: &Paint) -> El {
+    let edit = &app.report_shown.filter;
+    let mut input = TextInput::new(edit)
+        .placeholder("Filter rows")
+        .leading_icon(&oc::MAGNIFYING_GLASS)
+        .on_edit(|app: &mut App| &mut app.report_shown.filter)
+        .on_change(|app: &mut App, _: &mut Tx| app.filter_report());
+    if !edit.text.is_empty() {
+        input = input.clear_button();
+    }
+    let total = app.report_table().map_or(0, |table| table.rows.len());
+    row()
+        .w_full()
+        .gap(10.0)
+        .center_y()
+        .child(input.build(p.k).key("report-filter").w(280.0).min_w(0.0))
+        .children((!edit.text.trim().is_empty()).then(|| {
+            text(format!("{} of {total}", app.report_rows()))
+                .key("report-filter-count")
+                .font(p.mono(11.0, 440.0))
+                .color(p.c.text_muted)
+        }))
 }
 
 /// The selected row's detail, under the table.
@@ -586,12 +614,12 @@ fn drawn(cell: &Cell, kind: ColumnKind, link: Option<Color>, k: &Kit) -> rune_ki
                         .color(k.c.text_base),
                 ),
         ),
-        ColumnKind::Text | ColumnKind::Mono => {
+        ColumnKind::Text | ColumnKind::Mono | ColumnKind::Number => {
             let body = rune_kit::Cell::text(cell.text.clone());
-            let body = if kind == ColumnKind::Mono {
-                body.mono()
-            } else {
+            let body = if kind == ColumnKind::Text {
                 body
+            } else {
+                body.mono()
             };
             match ink(cell.tone, k) {
                 Some(color) => body.color(color),

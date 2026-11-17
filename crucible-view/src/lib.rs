@@ -217,6 +217,9 @@ pub enum ColumnKind {
     Mono,
     /// A label coloured by the cell's tone.
     Badge,
+    /// Right-aligned figures, sorted as numbers: a cell's `value`, else its text when that is
+    /// a number.
+    Number,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,7 +233,7 @@ pub enum Width {
     Fill,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Row {
     /// Unique within its table.
@@ -241,10 +244,14 @@ pub struct Row {
     pub detail: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Cell {
     pub text: String,
+    /// What a table sorts the cell by in place of its text, within [`MAGNITUDE`] of zero: the
+    /// seconds behind "3 min", the bytes behind "1.2 MB", a date as a timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<f64>,
     /// The [`Link`] the cell opens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub href: Option<String>,
@@ -267,6 +274,11 @@ impl Cell {
 
     pub fn tone(mut self, tone: Tone) -> Cell {
         self.tone = tone;
+        self
+    }
+
+    pub fn value(mut self, value: f64) -> Cell {
+        self.value = Some(value);
         self
     }
 }
@@ -392,6 +404,8 @@ pub enum Problem {
     Tables,
     #[error("{0} is not an http(s) address or a run link")]
     Href(String),
+    #[error("the cell {0} has a value that is not a number within 1e15 of zero")]
+    CellValue(String),
     #[error("the view's Markdown and diagrams hold more than {0} bytes")]
     Prose(usize),
     #[error("a row's detail is longer than {0} bytes")]
@@ -657,6 +671,12 @@ impl Node {
 fn cells_fit(cells: &[Cell], limits: &Limits) -> Result<(), Problem> {
     for cell in cells {
         fits(&cell.text, limits)?;
+        if cell
+            .value
+            .is_some_and(|value| !(-MAGNITUDE..=MAGNITUDE).contains(&value))
+        {
+            return Err(Problem::CellValue(cell.text.clone()));
+        }
         if let Some(href) = &cell.href {
             fits(href, limits)?;
             if Link::parse(href).is_none() {
@@ -810,6 +830,39 @@ mod tests {
             view(bad).check(&Limits::DEFAULT),
             Err(Problem::Href("file:///etc/passwd".into()))
         );
+    }
+
+    #[test]
+    fn a_cell_s_value_is_a_bounded_number_and_is_left_out_when_absent() {
+        let valued = |value: f64| {
+            table(
+                "t",
+                vec![Row {
+                    id: "1".into(),
+                    cells: vec![Cell::text("3 min").value(value), Cell::text("y")],
+                    detail: None,
+                }],
+            )
+        };
+        assert_eq!(view(valued(180.0)).check(&Limits::DEFAULT), Ok(()));
+        assert_eq!(view(valued(-1e15)).check(&Limits::DEFAULT), Ok(()));
+        for off in [f64::NAN, f64::INFINITY, 1.1e15] {
+            assert_eq!(
+                view(valued(off)).check(&Limits::DEFAULT),
+                Err(Problem::CellValue("3 min".into()))
+            );
+        }
+        assert_eq!(
+            serde_json::to_string(&Cell::text("3 min").value(180.0)).unwrap(),
+            r#"{"text":"3 min","value":180.0,"tone":"neutral"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Cell::text("x")).unwrap(),
+            r#"{"text":"x","tone":"neutral"}"#
+        );
+        let column: Column =
+            serde_json::from_str(r#"{"id":"n","title":"N","kind":"number"}"#).unwrap();
+        assert_eq!(column.kind, crate::ColumnKind::Number);
     }
 
     #[test]

@@ -28,6 +28,8 @@ interface View {
 
 interface ViewCell {
   text: string;
+  /** What a table sorts the cell by in place of its text: the seconds behind "3 min". */
+  value?: number;
   /**
    * The address the cell opens: `http(s)://...`, `run:task/<task>` for a task of the run, or
    * `run:file/<task>/<path>` for a file it captured, with the task as a `CapturedFile` names it.
@@ -65,7 +67,8 @@ type ViewNode =
         columns: {
           id: string;
           title: string;
-          kind?: "text" | "mono" | "badge";
+          /** `number` is right-aligned and sorts by `value`, or by the text when it is a number. */
+          kind?: "text" | "mono" | "badge" | "number";
           width?: "narrow" | "medium" | "wide" | "fill";
         }[];
         /** `detail` is Markdown shown under the table while the row is selected. */

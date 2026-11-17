@@ -6,13 +6,15 @@
 //! `<name>.view.wasm` or `<name>.view.js`; a local run's newest one is drawn instead of the
 //! pack's.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::SystemTime;
 
-use crucible_view::{Column, File, Node, Request, Row, View};
+use crucible_view::{Cell, Column, ColumnKind, File, Node, Request, Row, View};
+use rune::TextEdit;
 use rune_kit::{SortDir, TableState};
 
 use base64::Engine;
@@ -357,41 +359,88 @@ pub struct Table<'a> {
 }
 
 /// What the Report pane keeps between frames: the tab picked in each set of tabs, and the shown
-/// table's sort and selection.
+/// table's filter, sort and selection.
 pub struct Shown {
     /// The selection and the report all of this was kept for.
     selection: Option<Selection>,
     report: Weak<Report>,
     tabs: HashMap<String, usize>,
     pub table: TableState,
+    /// What the box over the shown table holds: a row is drawn when it holds every word.
+    pub filter: TextEdit,
+    sorted: Option<(String, SortDir)>,
     order: Option<Order>,
 }
 
-/// A table's rows' indices in sorted order, and the sort that gave it.
-pub struct Order {
+/// The rows of a table that pass a filter, as sorted.
+struct Order {
     table: String,
-    column: String,
-    dir: SortDir,
+    /// How many rows the table had.
+    of: usize,
     rows: Vec<usize>,
 }
 
+/// What a cell sorts by before its text: its value, or its text as a number in a number
+/// column.
+fn figure(cell: &Cell, kind: ColumnKind) -> Option<f64> {
+    cell.value.or_else(|| {
+        (kind == ColumnKind::Number)
+            .then(|| cell.text.trim().replace(',', "").parse::<f64>().ok())
+            .flatten()
+            .filter(|figure| figure.is_finite())
+    })
+}
+
+/// Whether `text` holds `word`, which is in lower case, in any case.
+fn holds(text: &str, word: &str) -> bool {
+    if text.is_ascii() && word.is_ascii() {
+        text.as_bytes()
+            .windows(word.len().max(1))
+            .any(|window| window.eq_ignore_ascii_case(word.as_bytes()))
+    } else {
+        text.to_lowercase().contains(word)
+    }
+}
+
 impl Order {
-    /// `table` sorted by `column`; `None` when it has no such column.
-    pub fn of(table: &Table<'_>, column: &str, dir: SortDir) -> Option<Order> {
-        let at = table.columns.iter().position(|c| c.id == column)?;
-        let cell = |row: usize| {
-            table
-                .rows
-                .get(row)
-                .and_then(|row| row.cells.get(at))
-                .map_or("", |cell| cell.text.as_str())
-        };
-        let mut rows: Vec<usize> = (0..table.rows.len()).collect();
-        rows.sort_by(|&a, &b| dir.apply(rune_kit::natural_cmp(cell(a), cell(b))));
+    /// The rows of `table` holding every word of `query`, sorted by `sort` when the table has
+    /// that column: figures first and in order, then text in natural order. `None` when that
+    /// is every row as written.
+    fn of(table: &Table<'_>, sort: Option<(&str, SortDir)>, query: &str) -> Option<Order> {
+        let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+        let sort = sort.and_then(|(column, dir)| {
+            let at = table.columns.iter().position(|c| c.id == column)?;
+            Some((at, table.columns[at].kind, dir))
+        });
+        if words.is_empty() && sort.is_none() {
+            return None;
+        }
+        let mut rows: Vec<usize> = (0..table.rows.len())
+            .filter(|row| {
+                let row = &table.rows[*row];
+                words.iter().all(|word| {
+                    holds(&row.id, word) || row.cells.iter().any(|cell| holds(&cell.text, word))
+                })
+            })
+            .collect();
+        if let Some((at, kind, dir)) = sort {
+            let key = |row: usize| {
+                table.rows[row]
+                    .cells
+                    .get(at)
+                    .map_or((None, ""), |cell| (figure(cell, kind), cell.text.as_str()))
+            };
+            let keys: Vec<(Option<f64>, &str)> = (0..table.rows.len()).map(key).collect();
+            rows.sort_by(|&a, &b| match (keys[a], keys[b]) {
+                ((Some(x), _), (Some(y), _)) => dir.apply(x.total_cmp(&y)),
+                ((Some(_), _), (None, _)) => Ordering::Less,
+                ((None, _), (Some(_), _)) => Ordering::Greater,
+                ((None, x), (None, y)) => dir.apply(rune_kit::natural_cmp(x, y)),
+            });
+        }
         Some(Order {
             table: table.id.to_string(),
-            column: column.to_string(),
-            dir,
+            of: table.rows.len(),
             rows,
         })
     }
@@ -404,6 +453,8 @@ impl Default for Shown {
             report: Weak::new(),
             tabs: HashMap::new(),
             table: fresh_table(),
+            filter: TextEdit::new(""),
+            sorted: None,
             order: None,
         }
     }
@@ -415,7 +466,7 @@ fn fresh_table() -> TableState {
 
 impl Shown {
     /// Follows the pane to `report` under `selection`: another selection starts over, and
-    /// another report for the same one keeps its tabs and sorts its table again.
+    /// another report for the same one keeps its tabs and filters and sorts its table again.
     pub fn follow(&mut self, selection: Option<&Selection>, report: Option<&Arc<Report>>) {
         let held = report.map_or_else(Weak::new, Arc::downgrade);
         if self.selection.as_ref() != selection {
@@ -430,13 +481,10 @@ impl Shown {
             return;
         }
         self.report = held;
-        let again = self.order.take().and_then(|order| {
-            let table = self.table_in(&report?.view.as_ref().ok()?.body)?;
-            (table.id == order.table)
-                .then(|| Order::of(&table, &order.column, order.dir))
-                .flatten()
-        });
-        self.order = again;
+        let table = report
+            .and_then(|report| report.view.as_ref().ok())
+            .and_then(|view| self.table(view));
+        self.arrange(table.as_ref());
     }
 
     /// The picked tab of the `len` tabs named `id`.
@@ -451,6 +499,8 @@ impl Shown {
     pub fn pick(&mut self, id: &str, tab: usize) {
         self.tabs.insert(id.to_string(), tab);
         self.table = fresh_table();
+        self.filter = TextEdit::new("");
+        self.sorted = None;
         self.order = None;
     }
 
@@ -481,22 +531,40 @@ impl Shown {
         }
     }
 
-    /// Row `i` of `table` as sorted.
+    fn order(&self, table: &Table<'_>) -> Option<&Order> {
+        self.order
+            .as_ref()
+            .filter(|order| order.table == table.id && order.of == table.rows.len())
+    }
+
+    /// How many rows of `table` are drawn.
+    pub fn len(&self, table: &Table<'_>) -> usize {
+        self.order(table)
+            .map_or(table.rows.len(), |order| order.rows.len())
+    }
+
+    /// Row `i` of `table` as filtered and sorted.
     pub fn row<'a>(&self, table: &Table<'a>, i: usize) -> Option<&'a Row> {
-        let i = match &self.order {
-            Some(order) if order.table == table.id && order.rows.len() == table.rows.len() => {
-                *order.rows.get(i)?
-            }
-            _ => i,
+        let i = match self.order(table) {
+            Some(order) => *order.rows.get(i)?,
+            None => i,
         };
         table.rows.get(i)
     }
 
-    /// Keep `order` for the shown table; `None` leaves the rows as they are.
-    pub fn sort(&mut self, order: Option<Order>) {
-        if order.is_some() {
-            self.order = order;
-        }
+    /// Sorts `table`, the one shown, by `column`.
+    pub fn sort(&mut self, table: &Table<'_>, column: &str, dir: SortDir) {
+        self.sorted = Some((column.to_string(), dir));
+        self.arrange(Some(table));
+    }
+
+    /// Filters and sorts `table`, the one shown, by what the filter box and the sort now say.
+    pub fn arrange(&mut self, table: Option<&Table<'_>>) {
+        let sort = self
+            .sorted
+            .as_ref()
+            .map(|(column, dir)| (column.as_str(), *dir));
+        self.order = table.and_then(|table| Order::of(table, sort, &self.filter.text));
     }
 }
 
@@ -505,7 +573,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use crucible_view::{Cell, Column, Node, Row, Tab, View};
+    use crucible_view::{Cell, Column, ColumnKind, Node, Row, Tab, View};
     use rune_kit::SortDir;
 
     use std::sync::Arc;
@@ -513,7 +581,7 @@ mod tests {
     use crate::Selection;
     use crate::captured::Captured;
     use crate::report::{
-        Order, READ_BYTES, Report, Reporter, Shown, file_named, readable, task_named,
+        READ_BYTES, Report, Reporter, Shown, Table, file_named, readable, task_named,
     };
 
     fn example() -> std::path::PathBuf {
@@ -969,14 +1037,14 @@ mod tests {
                 .collect()
         };
         assert_eq!(ids(&shown), ["item10", "item2", "item1"]);
-        shown.sort(Order::of(&table, "name", SortDir::Ascending));
+        shown.sort(&table, "name", SortDir::Ascending);
         assert_eq!(ids(&shown), ["item1", "item2", "item10"]);
-        shown.sort(Order::of(&table, "name", SortDir::Descending));
+        shown.sort(&table, "name", SortDir::Descending);
         assert_eq!(ids(&shown), ["item10", "item2", "item1"]);
-        shown.sort(Order::of(&table, "missing", SortDir::Ascending));
+        shown.sort(&table, "missing", SortDir::Ascending);
         assert_eq!(ids(&shown), ["item10", "item2", "item1"]);
         assert!(shown.row(&table, 3).is_none());
-        shown.sort(Order::of(&table, "name", SortDir::Ascending));
+        shown.sort(&table, "name", SortDir::Ascending);
         shown.pick("by", 1);
         assert_eq!(ids(&shown), ["item10", "item2", "item1"]);
     }
@@ -1000,7 +1068,7 @@ mod tests {
         };
         let ids = |shown: &Shown, report: &Report| -> Vec<String> {
             let table = shown.table(report.view.as_ref().unwrap()).unwrap();
-            (0..table.rows.len())
+            (0..shown.len(&table))
                 .map(|i| shown.row(&table, i).unwrap().id.clone())
                 .collect()
         };
@@ -1010,7 +1078,7 @@ mod tests {
         shown.follow(Some(&local("a")), Some(&first));
         shown.pick("by", 1);
         let table = shown.table(first.view.as_ref().unwrap()).unwrap();
-        shown.sort(Order::of(&table, "name", SortDir::Ascending));
+        shown.sort(&table, "name", SortDir::Ascending);
         assert_eq!(ids(&shown, &first), ["item1", "item2", "item10"]);
         shown.follow(Some(&local("a")), Some(&first));
         assert_eq!(ids(&shown, &first), ["item1", "item2", "item10"]);
@@ -1027,13 +1095,22 @@ mod tests {
         });
         shown.follow(Some(&local("a")), Some(&failed));
         shown.follow(Some(&local("a")), Some(&second));
-        assert_eq!(ids(&shown, &second), ["b9", "b10", "a1"]);
+        assert_eq!(
+            ids(&shown, &second),
+            ["a1", "b9", "b10"],
+            "the sort outlasts a report that failed"
+        );
 
-        shown.sort(Order::of(
-            &shown.table(second.view.as_ref().unwrap()).unwrap(),
-            "name",
-            SortDir::Ascending,
-        ));
+        shown.filter = rune::TextEdit::new("B");
+        shown.follow(Some(&local("a")), Some(&first));
+        assert_eq!(ids(&shown, &first), Vec::<String>::new());
+        shown.follow(Some(&local("a")), Some(&second));
+        assert_eq!(
+            ids(&shown, &second),
+            ["b9", "b10"],
+            "and so does the filter"
+        );
+
         shown.follow(Some(&local("b")), Some(&second));
         assert_eq!(
             shown.tab("by", 2),
@@ -1126,5 +1203,142 @@ mod tests {
         ] {
             assert_eq!(key(off), None, "{off}");
         }
+    }
+
+    #[test]
+    fn a_number_column_sorts_by_figure_and_a_value_sorts_any_column() {
+        let cells = |texts: &[(&str, Option<f64>)]| -> Vec<Row> {
+            texts
+                .iter()
+                .enumerate()
+                .map(|(i, (text, value))| Row {
+                    id: format!("r{i}"),
+                    cells: vec![Cell {
+                        value: *value,
+                        ..Cell::text(*text)
+                    }],
+                    detail: None,
+                })
+                .collect()
+        };
+        let column = |kind: ColumnKind| {
+            vec![Column {
+                id: "n".into(),
+                title: "N".into(),
+                kind,
+                width: Default::default(),
+            }]
+        };
+        let texts = |shown: &Shown, table: &Table<'_>| -> Vec<String> {
+            (0..shown.len(table))
+                .map(|i| shown.row(table, i).unwrap().cells[0].text.clone())
+                .collect()
+        };
+
+        let rows = cells(&[
+            ("1.25", None),
+            ("-3", None),
+            ("n/a", None),
+            ("1,200", None),
+            ("1.5", None),
+            ("", None),
+        ]);
+        let numbers = column(ColumnKind::Number);
+        let table = Table {
+            id: "t",
+            columns: &numbers,
+            rows: &rows,
+        };
+        let mut shown = Shown::default();
+        shown.sort(&table, "n", SortDir::Ascending);
+        assert_eq!(
+            texts(&shown, &table),
+            ["-3", "1.25", "1.5", "1,200", "", "n/a"]
+        );
+        shown.sort(&table, "n", SortDir::Descending);
+        assert_eq!(
+            texts(&shown, &table),
+            ["1,200", "1.5", "1.25", "-3", "n/a", ""],
+            "what is not a number stays last"
+        );
+        let as_text = column(ColumnKind::Text);
+        let table = Table {
+            id: "t",
+            columns: &as_text,
+            rows: &rows,
+        };
+        shown.sort(&table, "n", SortDir::Ascending);
+        assert_eq!(texts(&shown, &table)[..2], ["", "-3"]);
+
+        let rows = cells(&[
+            ("3 min", Some(180.0)),
+            ("45 s", Some(45.0)),
+            ("2 h", Some(7200.0)),
+            ("unknown", None),
+        ]);
+        let table = Table {
+            id: "t",
+            columns: &as_text,
+            rows: &rows,
+        };
+        shown.sort(&table, "n", SortDir::Ascending);
+        assert_eq!(texts(&shown, &table), ["45 s", "3 min", "2 h", "unknown"]);
+    }
+
+    #[test]
+    fn the_filter_keeps_rows_holding_every_word_in_any_case() {
+        let rows: Vec<Row> = [
+            ("DEMO-1", "affected", "grpc handler reachable"),
+            ("DEMO-2", "not_affected", "gRPC absent from image"),
+            ("DEMO-3", "affected", "Jinja2 sandbox escape"),
+            ("DEMO-4", "needs_review", "caf\u{e9} \u{c9}clair"),
+        ]
+        .into_iter()
+        .map(|(id, verdict, why)| Row {
+            id: id.into(),
+            cells: vec![Cell::text(verdict), Cell::text(why)],
+            detail: None,
+        })
+        .collect();
+        let columns: Vec<Column> = ["verdict", "why"]
+            .into_iter()
+            .map(|id| Column {
+                id: id.into(),
+                title: id.into(),
+                kind: Default::default(),
+                width: Default::default(),
+            })
+            .collect();
+        let table = Table {
+            id: "t",
+            columns: &columns,
+            rows: &rows,
+        };
+        let mut shown = Shown::default();
+        let kept = |query: &str, shown: &mut Shown| -> Vec<String> {
+            shown.filter = rune::TextEdit::new(query);
+            shown.arrange(Some(&table));
+            (0..shown.len(&table))
+                .map(|i| shown.row(&table, i).unwrap().id.clone())
+                .collect()
+        };
+        assert_eq!(kept("", &mut shown).len(), 4);
+        assert_eq!(kept("GRPC", &mut shown), ["DEMO-1", "DEMO-2"]);
+        assert_eq!(kept("grpc  affected", &mut shown), ["DEMO-1", "DEMO-2"]);
+        assert_eq!(kept("grpc reachable", &mut shown), ["DEMO-1"]);
+        assert_eq!(
+            kept("demo-3", &mut shown),
+            ["DEMO-3"],
+            "the row's id counts"
+        );
+        assert_eq!(kept("\u{c9}CLAIR", &mut shown), ["DEMO-4"]);
+        assert_eq!(kept("nothing", &mut shown), Vec::<String>::new());
+        assert!(shown.row(&table, 0).is_none());
+
+        shown.sort(&table, "why", SortDir::Descending);
+        assert_eq!(kept("affected", &mut shown), ["DEMO-3", "DEMO-1", "DEMO-2"]);
+        shown.pick("tabs", 1);
+        assert_eq!(shown.filter.text, "");
+        assert_eq!(shown.len(&table), 4);
     }
 }

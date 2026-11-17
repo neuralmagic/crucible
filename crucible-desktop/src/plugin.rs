@@ -824,8 +824,24 @@ mod tests {
             Some("https://issues.example.com/browse/DEMO-101")
         );
         assert_eq!(
-            (row.cells[9].text.as_str(), row.cells[9].href.as_deref()),
+            (row.cells[11].text.as_str(), row.cells[11].href.as_deref()),
             ("triage-go", Some("run:task/triage-go"))
+        );
+        assert_eq!(
+            (columns[4].id.as_str(), columns[4].kind, columns[5].kind),
+            (
+                "cvss",
+                crucible_view::ColumnKind::Number,
+                crucible_view::ColumnKind::Number
+            )
+        );
+        assert_eq!(
+            (row.cells[4].text.as_str(), row.cells[4].value),
+            ("6.1", None)
+        );
+        assert_eq!(
+            (row.cells[5].text.as_str(), row.cells[5].value),
+            ("57 d", Some(57.0))
         );
         let detail = row.detail.as_deref().unwrap();
         assert!(
