@@ -260,3 +260,55 @@ test.describe('playbook launch form', () => {
     }
   });
 });
+
+const FAN_OUT_SCHEMA = {
+  type: 'object',
+  required: ['topic', 'release'],
+  additionalProperties: false,
+  properties: {
+    topic: { type: 'string', description: 'What the survey covers.' },
+    release: { type: 'string', enum: ['r6', 'r5', 'r4', 'r3', 'r2', 'r1'], 'x-fan-out': true },
+    branch: {
+      type: 'string',
+      description: 'Branch to build.',
+      'x-placeholder-from': { task: 'opts', field: 'branches', keyed_by: 'release' },
+      'x-placeholder-snapshot': { value: { r6: 'rhai/6', r5: 'rhai/5' }, captured_at: null },
+    },
+  },
+};
+
+test.describe('a fan-out param', () => {
+  test.beforeEach(async ({ page }) => {
+    await stubApi(page);
+    await page.route('**/api/playbooks/survey/schema', (route: Route) => route.fulfill({ json: FAN_OUT_SCHEMA }));
+    await ready(page, LAUNCH);
+  });
+
+  test('names each checkbox by its value', async ({ page }) => {
+    await expect(page.getByRole('group', { name: /^release/ }).getByRole('checkbox')).toHaveCount(5);
+    await expect(page.getByRole('checkbox', { name: 'r6', exact: true })).not.toBeChecked();
+  });
+
+  test("shows a value's own fields under its checkbox only while it is checked", async ({ page }) => {
+    const branches = page.getByTitle('Branch to build.');
+    await expect(branches).toHaveCount(0);
+    await page.getByText('r6', { exact: true }).click();
+    await page.getByText('r5', { exact: true }).click();
+    await expect(branches).toHaveCount(2);
+    await expect(page.getByPlaceholder('rhai/6')).toBeVisible();
+    const r6 = await page.getByRole('checkbox', { name: 'r6', exact: true }).boundingBox();
+    const r5 = await page.getByRole('checkbox', { name: 'r5', exact: true }).boundingBox();
+    const r6Branch = await page.getByPlaceholder('rhai/6').boundingBox();
+    expect(r6Branch!.y).toBeGreaterThan(r6!.y);
+    expect(r6Branch!.y).toBeLessThan(r5!.y);
+    await page.getByText('r6', { exact: true }).click();
+    await expect(page.getByPlaceholder('rhai/6')).toHaveCount(0);
+    await expect(branches).toHaveCount(1);
+  });
+
+  test('takes the first click after leaving an empty required field', async ({ page }) => {
+    await page.locator('#launch-param-topic').focus();
+    await page.getByText('r6', { exact: true }).click();
+    await expect(page.getByRole('checkbox', { name: 'r6', exact: true })).toBeChecked();
+  });
+});

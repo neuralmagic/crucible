@@ -5,6 +5,7 @@ import { Select } from '@base-ui-components/react/select';
 import { useState, type ReactNode } from 'react';
 import { Button, cn, Mono } from '../ui';
 import { arrangeOptions, type PickOption } from './pickList';
+import { foldedChoices } from './playbookLaunchForm';
 
 const LABEL = 'font-mono text-label font-semibold uppercase tracking-group text-ink-3';
 const CONTROL =
@@ -539,6 +540,85 @@ export function CheckField({ id, label, checked, onChange, description, required
       ) : null}
       {description !== undefined && <p className={cn('m-0 pl-5.5', HINT)}>{description}</p>}
     </div>
+  );
+}
+
+export interface CheckGroupFieldProps {
+  id: string;
+  label: ReactNode;
+  options: readonly string[];
+  checked: readonly string[];
+  onToggle: (value: string, on: boolean) => void;
+  required?: boolean;
+  hint?: ReactNode;
+  error?: string | null;
+  fold?: number;
+  detail?: (value: string) => ReactNode;
+}
+
+/// A checkbox per option, the first `fold` shown and the rest behind an expander; a checked option
+/// past the fold stays shown, with its `detail` beneath it.
+export function CheckGroupField({
+  id,
+  label,
+  options,
+  checked,
+  onToggle,
+  required = false,
+  hint,
+  error,
+  fold = 5,
+  detail,
+}: CheckGroupFieldProps) {
+  const [expanded, setExpanded] = useState(false);
+  const { shown, hidden } = foldedChoices(options, checked, expanded ? options.length : fold);
+  const stale = checked.filter((value) => !options.includes(value));
+  return (
+    <fieldset className="m-0 grid gap-1.5 border-0 p-0">
+      <legend className={cn(LABEL, 'mb-1.5 p-0')}>
+        {label}
+        {required && <span className="ml-1 text-red">*</span>}
+      </legend>
+      {hint !== undefined && <p className={cn(HINT, 'm-0')}>{hint}</p>}
+      <div className="grid gap-1.5">
+        {[...shown, ...stale].map((value, index) => (
+          <div key={value} className="grid gap-2">
+            <div className="flex items-center gap-2">
+              <Check
+                id={`${id}-${String(index)}`}
+                label={value}
+                checked={checked.includes(value)}
+                onChange={(on) => {
+                  onToggle(value, on);
+                }}
+              />
+              <label htmlFor={`${id}-${String(index)}`} className="cursor-pointer font-mono text-data-lg text-ink">
+                {stale.includes(value) ? `${value} (not offered)` : value}
+              </label>
+            </div>
+            {detail !== undefined && checked.includes(value) ? (
+              <div className="mb-1.5 ml-1.5 grid gap-2.5 border-l border-rule-hard py-1 pl-4">{detail(value)}</div>
+            ) : null}
+          </div>
+        ))}
+        {hidden > 0 || expanded ? (
+          <Button
+            className="w-fit border border-rule-hard px-2.5 uppercase"
+            aria-expanded={expanded}
+            onClick={() => {
+              setExpanded(!expanded);
+            }}
+          >
+            {expanded ? 'Show fewer' : `Show ${String(hidden)} more`}
+          </Button>
+        ) : null}
+      </div>
+      {error ? (
+        <p role="alert" className="m-0 max-w-[66ch] text-data-lg text-red">
+          {error}
+        </p>
+      ) : null}
+    </fieldset>
   );
 }
 

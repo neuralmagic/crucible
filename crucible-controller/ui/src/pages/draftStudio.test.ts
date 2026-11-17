@@ -329,8 +329,8 @@ describe('cloneDraftBody', () => {
 
 describe('draftLaunchBody', () => {
   const specs: ParamFieldSpec[] = [
-    { name: 'topic', valueType: 'string', required: true, defaultValue: null, pattern: null, description: null, multiline: false, choices: null, enabledBy: null, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null },
-    { name: 'depth', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null, multiline: false, choices: null, enabledBy: null, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null },
+    { name: 'topic', valueType: 'string', required: true, defaultValue: null, pattern: null, description: null, multiline: false, choices: null, enabledBy: null, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null, fanOut: false },
+    { name: 'depth', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null, multiline: false, choices: null, enabledBy: null, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null, fanOut: false },
   ];
   const ceilings = { maxCost: 2.5, maxTime: ' 30m ', schemaDigest: 'sha256:bb' };
 

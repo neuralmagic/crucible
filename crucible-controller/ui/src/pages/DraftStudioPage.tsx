@@ -46,10 +46,12 @@ import { NO_AGENT_PICK, type AgentPick } from './agentPick';
 import { WorkflowGraph } from './WorkflowGraph';
 import { projectionLabel, reasonLabel } from './blueprints';
 import {
+  ceilingHint,
   clampCeiling,
   initialValues,
   mapServerRejection,
   parseParamsSchema,
+  runCount,
   type ParamFieldSpec,
 } from './playbookLaunchForm';
 import {
@@ -298,7 +300,7 @@ function DraftStudio({ id }: { id: string }) {
         params: { path: { id } },
         body: draftLaunchBody(specs, values, { maxCost, maxTime, schemaDigest }, agent),
       });
-      void navigate(`/playbook-runs/${encodeURIComponent(ack.key)}`);
+      void navigate(ack.keys.length > 1 ? '/playbook-runs' : `/playbook-runs/${encodeURIComponent(ack.key)}`);
     } catch (err: unknown) {
       const rejection = mapServerRejection(
         err,
@@ -722,9 +724,10 @@ function DraftStudio({ id }: { id: string }) {
                   onChange={(next) => {
                     setMaxCost(clampCeiling(next, caps.data?.max_cost ?? null));
                   }}
-                  hint={
-                    caps.data === undefined ? undefined : `This controller caps it at ${caps.data.max_cost}.`
-                  }
+                  hint={ceilingHint(
+                    caps.data === undefined ? null : `This controller caps it at ${caps.data.max_cost}.`,
+                    runCount(specs, values)
+                  )}
                 />
                 <TextField
                   id="studio-max-time"
@@ -732,9 +735,10 @@ function DraftStudio({ id }: { id: string }) {
                   mono
                   value={maxTime}
                   onChange={setMaxTime}
-                  hint={
-                    caps.data === undefined ? undefined : `This controller caps it at ${caps.data.max_time}.`
-                  }
+                  hint={ceilingHint(
+                    caps.data === undefined ? null : `This controller caps it at ${caps.data.max_time}.`,
+                    runCount(specs, values)
+                  )}
                 />
                 <ProviderModelField
                   idPrefix="studio"

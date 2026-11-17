@@ -569,6 +569,9 @@ pub(crate) async fn create_one_shot(
         Ok(a) => a,
         Err(refusal) => return refusal,
     };
+    if let Err(refusal) = authorized.single("a scheduled one-shot") {
+        return refusal;
+    }
 
     let dedupe_schedule = match crate::playbooks::api::registry::dedupe_target(
         &state,

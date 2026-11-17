@@ -1301,6 +1301,7 @@ mod tests {
     fn playbook_launch_ack_is_the_wire_contract() {
         let ack = crate::playbooks::api::registry::PlaybookLaunchAck {
             key: "playbook:survey:0199c0de-7c2c-71a5-8000-1".to_string(),
+            keys: vec!["playbook:survey:0199c0de-7c2c-71a5-8000-1".to_string()],
             playbook: "survey".to_string(),
             params: std::collections::BTreeMap::from([
                 ("depth".to_string(), "deep".to_string()),

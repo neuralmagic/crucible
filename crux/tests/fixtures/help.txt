@@ -487,7 +487,8 @@ Options:
           [env: CONTROLLER_CONFIG=]
 
       --params <PARAMS>
-          The params object its schema accepts, as JSON
+          The params object its schema accepts, as JSON. A fan-out param takes an array of values,
+          one run each; a param keyed by it takes an object from those values to each run's value
           
           [default: {}]
 
@@ -545,7 +546,9 @@ Options:
           `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var
           wins over the file [env: CONTROLLER_CONFIG=]
       --params <PARAMS>
-          The params object its schema accepts, as JSON [default: {}]
+          The params object its schema accepts, as JSON. A fan-out param takes an array of values,
+          one run each; a param keyed by it takes an object from those values to each run's value
+          [default: {}]
       --max-cost <MAX_COST>
           Dollar ceiling for this launch
       --url <URL>
@@ -3907,7 +3910,9 @@ Options:
           [env: CONTROLLER_CONFIG=]
 
       --params <PARAMS>
-          The form values its schema accepts, as a JSON object of string to string
+          The form values its schema accepts, as a JSON object. A fan-out param takes an array of
+          values, one run each; a param keyed by it takes an object from those values to each run's
+          value
           
           [default: {}]
 
@@ -3969,7 +3974,9 @@ Options:
           `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var
           wins over the file [env: CONTROLLER_CONFIG=]
       --params <PARAMS>
-          The form values its schema accepts, as a JSON object of string to string [default: {}]
+          The form values its schema accepts, as a JSON object. A fan-out param takes an array of
+          values, one run each; a param keyed by it takes an object from those values to each run's
+          value [default: {}]
       --max-cost <MAX_COST>
           Dollar ceiling for this launch
       --url <URL>

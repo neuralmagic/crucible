@@ -147,6 +147,9 @@ pub struct ParamSpec {
     /// The boolean parameter that must be true for this one to be supplied.
     #[serde(default)]
     pub enabled_by: Option<String>,
+    /// A controller launch may pick several of the offered values, and starts one run per value.
+    #[serde(default)]
+    pub fan_out: bool,
 }
 
 /// A task in the same workflow and the field it emits for a parameter's form: a list of strings,
@@ -227,6 +230,7 @@ pub const FIELDS: &[&str] = &[
     "placeholder_from",
     "confirm_from",
     "enabled_by",
+    "fan_out",
 ];
 
 /// Every parameter a source declares, in source order. Serializes as the bare list, so a launcher
@@ -276,6 +280,13 @@ impl Params {
                 return Err(CompileError::ParamNameHasDot { param: name });
             }
             specs.push(spec(&name, &value.node)?);
+        }
+        let mut fanned = specs.iter().filter(|s| s.fan_out);
+        if let (Some(first), Some(second)) = (fanned.next(), fanned.next()) {
+            return Err(CompileError::ParamFanOutTwice {
+                first: first.name.clone(),
+                second: second.name.clone(),
+            });
         }
         for spec in &specs {
             for from in spec.sources() {
@@ -435,6 +446,9 @@ impl Params {
             }
             if let Some(gate) = &spec.enabled_by {
                 property.insert("x-enabled-by".into(), serde_json::json!(gate));
+            }
+            if spec.fan_out {
+                property.insert("x-fan-out".into(), serde_json::json!(true));
             }
             if spec.required {
                 required.push(spec.name.clone());
@@ -617,6 +631,20 @@ fn spec(name: &str, expression: &Expr) -> Result<ParamSpec> {
             });
         }
     }
+    let fan_out =
+        field(&declared, name, "fan_out", "True or False", literal_bool)?.unwrap_or(false);
+    if fan_out && ty != ParamType::String {
+        return Err(CompileError::ParamConstraintMismatch {
+            param: name.to_owned(),
+            constraint: "fan_out",
+            ty: ty.as_str(),
+        });
+    }
+    if fan_out && choices.is_empty() && choices_from.is_none() {
+        return Err(CompileError::ParamFanOutWithoutChoices {
+            param: name.to_owned(),
+        });
+    }
     let multiline =
         field(&declared, name, "multiline", "True or False", literal_bool)?.unwrap_or(false);
     if multiline && ty != ParamType::String {
@@ -649,6 +677,7 @@ fn spec(name: &str, expression: &Expr) -> Result<ParamSpec> {
             "a string literal",
             literal_string,
         )?,
+        fan_out,
     })
 }
 

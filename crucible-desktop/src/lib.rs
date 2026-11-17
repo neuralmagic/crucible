@@ -73,7 +73,7 @@ mod version;
 mod webhook;
 mod workspace;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -182,15 +182,18 @@ pub struct Launcher {
     pub stage: Stage,
     pub fields: Vec<form::Field>,
     pub answers: Vec<TextEdit>,
-    /// Fields that take a typed value in place of their offered choices.
-    pub typing: std::collections::BTreeSet<usize>,
+    /// Each picked value's answers to the fan-out field's dependents, indexed like the fields.
+    pub per_value: BTreeMap<String, Vec<TextEdit>>,
+    /// Fields, and the picked value for one set per value, that take a typed value in place of
+    /// their offered choices.
+    pub typing: std::collections::BTreeSet<(usize, Option<String>)>,
     pub cost: TextEdit,
     pub time: TextEdit,
     /// Where it runs: the dispatch target, and the agent's provider and model.
     pub runs_on: runs_on::RunsOnForm,
     /// The admin caps: dollars and a duration.
     pub caps: (f64, String),
-    pub problems: form::Problems,
+    pub problems: Vec<form::Problem>,
     /// Why the controller refused the launch, or a ceiling over its cap.
     pub refusal: Option<String>,
     /// A draft's schema digest, sent so a save that lands meanwhile refuses the launch.
@@ -203,6 +206,16 @@ pub struct Launcher {
     after: u64,
     /// The newest schema reply this form took, so a repeated snapshot does not refill it.
     filled: u64,
+}
+
+impl Launcher {
+    /// The text of each picked value's answers.
+    pub fn per_value_texts(&self) -> form::PerValue {
+        self.per_value
+            .iter()
+            .map(|(value, own)| (value.clone(), own.iter().map(|a| a.text.clone()).collect()))
+            .collect()
+    }
 }
 
 /// What the detail area shows: the selected run, or one of the controller's management pages.
@@ -921,6 +934,7 @@ impl App {
             stage: Stage::Reading,
             fields: Vec::new(),
             answers: Vec::new(),
+            per_value: BTreeMap::new(),
             typing: Default::default(),
             cost: TextEdit::new(""),
             time: TextEdit::new(""),
@@ -958,7 +972,7 @@ impl App {
         let answers: Vec<String> = launcher.answers.iter().map(|a| a.text.clone()).collect();
         let params = match &launcher.rerun {
             Some(rerun) => Ok(rerun.params.clone()),
-            None => form::params(&launcher.fields, &answers),
+            None => form::params(&launcher.fields, &answers, &launcher.per_value_texts()),
         };
         let ceilings = form::ceilings(
             &launcher.cost.text,
@@ -1096,7 +1110,7 @@ impl App {
                 launcher.runs_on = runs_on::RunsOnForm::new(&targets, &providers, before);
                 launcher.digest = digest;
                 launcher.fields = form::fields(&schema);
-                launcher.answers = launcher
+                let mut answers: Vec<String> = launcher
                     .fields
                     .iter()
                     .map(|field| {
@@ -1107,9 +1121,14 @@ impl App {
                                 serde_json::Value::String(text) => text.clone(),
                                 other => other.to_string(),
                             });
-                        TextEdit::new(before.unwrap_or_else(|| field.default.clone()))
+                        before.unwrap_or_else(|| field.default.clone())
                     })
                     .collect();
+                launcher.per_value = form::spread(&launcher.fields, &mut answers)
+                    .into_iter()
+                    .map(|(value, own)| (value, own.iter().map(TextEdit::new).collect()))
+                    .collect();
+                launcher.answers = answers.iter().map(TextEdit::new).collect();
                 let cost = stored
                     .as_ref()
                     .map(|s| s.max_cost)

@@ -36,6 +36,8 @@ export interface ParamFieldSpec {
   /// The task output whose message for the key param's value this bool must confirm.
   confirmFrom: ChoicesSource | null;
   confirmSnapshot: Snapshot<Record<string, string>> | null;
+  /// Several of the offered values may be picked; the launch starts one run per picked value.
+  fanOut: boolean;
 }
 
 export interface ChoicesSource {
@@ -284,6 +286,13 @@ export function parseParamsSchema(schema: unknown): ParsedParamsSchema {
     if (!allowOther.ok) {
       return { kind: 'unrenderable', reason: `param ${name} has a non-boolean x-allow-other` };
     }
+    const fanOut = boolField(raw, 'x-fan-out');
+    if (!fanOut.ok) {
+      return { kind: 'unrenderable', reason: `param ${name} has a non-boolean x-fan-out` };
+    }
+    if (fanOut.value && (valueType !== 'string' || (choices === null && choicesFrom === null))) {
+      return { kind: 'unrenderable', reason: `param ${name} fans out but is not a string with offered values` };
+    }
     const keyedChoices = choicesFrom?.keyedBy !== undefined && choicesFrom.keyedBy !== null;
     const description = stringField(raw, 'description');
     specs.push({
@@ -304,6 +313,7 @@ export function parseParamsSchema(schema: unknown): ParsedParamsSchema {
       placeholderSnapshot: placeholderFrom === null ? null : snapshot(raw['x-placeholder-snapshot'], isKeyedText),
       confirmFrom,
       confirmSnapshot: confirmFrom === null ? null : snapshot(raw['x-confirm-snapshot'], isKeyedText),
+      fanOut: fanOut.value,
     });
   }
   if (orderRaw !== undefined) {
@@ -325,7 +335,130 @@ export function initialValues(
     const prefilled = prefill?.[spec.name];
     values[spec.name] = prefilled ?? spec.defaultValue ?? '';
   }
+  const fan = fanOutOf(specs);
+  const [only] = fan === null ? [] : picked(fan, values);
+  if (fan !== null && only !== undefined) {
+    for (const name of fanOutDependents(specs, fan.name)) {
+      const prefilled = prefill?.[name];
+      if (prefilled !== undefined) values[perValueKey(name, only)] = prefilled;
+    }
+  }
   return values;
+}
+
+/// The form key of a param keyed by a fan-out param, for one picked value of it.
+export function perValueKey(name: string, value: string): string {
+  return `${name}\u001f${value}`;
+}
+
+/// The param whose picked values each start a run, if the pack declares one.
+export function fanOutOf(specs: readonly ParamFieldSpec[]): ParamFieldSpec | null {
+  return specs.find((spec) => spec.fanOut) ?? null;
+}
+
+/// The values picked for a fan-out param: its form value is a JSON array, or one plain value.
+export function picked(spec: ParamFieldSpec, values: Readonly<Record<string, string>>): string[] {
+  const text = (values[spec.name] ?? '').trim();
+  if (text === '') return [];
+  if (!text.startsWith('[')) return [text];
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+/// A fan-out param's form value with `value` picked or unpicked, keeping the order picked.
+export function withPick(spec: ParamFieldSpec, values: Readonly<Record<string, string>>, value: string, on: boolean): string {
+  const current = picked(spec, values).filter((item) => item !== value);
+  return JSON.stringify(on ? [...current, value] : current);
+}
+
+/// The offered values a collapsed checkbox group shows, in offered order: the first `fold`, and any
+/// picked one past them, which stays in view. `hidden` is how many the expander reveals.
+export function foldedChoices(
+  offered: readonly string[],
+  picks: readonly string[],
+  fold: number
+): { shown: string[]; hidden: number } {
+  const shown = offered.filter((value, index) => index < fold || picks.includes(value));
+  return { shown, hidden: offered.length - shown.length };
+}
+
+/// A ceiling input's hint, saying the ceiling binds each run when the values launch several.
+export function ceilingHint(hint: string | null, runs: number): string | undefined {
+  const each = runs > 1 ? `Applies to each of the ${String(runs)} runs.` : null;
+  const text = [hint, each].filter((part) => part !== null).join(' ');
+  return text === '' ? undefined : text;
+}
+
+/// How many runs the form's values launch: one per picked value of a fan-out param, else one.
+export function runCount(specs: readonly ParamFieldSpec[], values: Readonly<Record<string, string>>): number {
+  const fan = fanOutOf(specs);
+  return fan === null ? 1 : Math.max(1, picked(fan, values).length);
+}
+
+/// The params set per picked value of `fan`: those whose options, placeholder, or confirmation are
+/// keyed by it, and the gates that enable them.
+export function fanOutDependents(specs: readonly ParamFieldSpec[], fan: string): Set<string> {
+  const keyed = specs.filter((spec) =>
+    [spec.choicesFrom, spec.placeholderFrom, spec.confirmFrom].some((source) => source?.keyedBy === fan)
+  );
+  const names = new Set(keyed.map((spec) => spec.name));
+  for (const spec of keyed) {
+    if (spec.enabledBy !== null) names.add(spec.enabledBy);
+  }
+  return names;
+}
+
+/// The form values one run of a fan-out launch sees: the picked value, and that value's settings
+/// of the params keyed by it.
+export function valuesFor(
+  specs: readonly ParamFieldSpec[],
+  values: Readonly<Record<string, string>>,
+  fan: ParamFieldSpec,
+  value: string
+): Record<string, string> {
+  const run: Record<string, string> = { ...values, [fan.name]: value };
+  for (const name of fanOutDependents(specs, fan.name)) {
+    const spec = specs.find((candidate) => candidate.name === name);
+    run[name] = values[perValueKey(name, value)] ?? spec?.defaultValue ?? '';
+  }
+  return run;
+}
+
+/// Every refusal the form can find before posting, keyed by the form key it belongs on: a param's
+/// name, or [`perValueKey`] for a param set per picked value of a fan-out param.
+export function validateParams(
+  specs: readonly ParamFieldSpec[],
+  values: Readonly<Record<string, string>>
+): Map<string, string> {
+  const errors = new Map<string, string>();
+  const fan = fanOutOf(specs);
+  const picks = fan === null ? [] : picked(fan, values);
+  const dependents = fan === null ? new Set<string>() : fanOutDependents(specs, fan.name);
+  for (const spec of specs) {
+    if (fan !== null && spec.name === fan.name) {
+      const message =
+        picks.length === 0
+          ? spec.required
+            ? `pick at least one ${spec.name}`
+            : null
+          : picks.map((value) => validateParam(spec, value, values)).find((m) => m !== null) ?? null;
+      if (message !== null) errors.set(spec.name, message);
+    } else if (fan !== null && dependents.has(spec.name) && picks.length > 0) {
+      for (const value of picks) {
+        const run = valuesFor(specs, values, fan, value);
+        const message = validateParam(spec, run[spec.name] ?? '', run);
+        if (message !== null) errors.set(perValueKey(spec.name, value), message);
+      }
+    } else {
+      const message = validateParam(spec, values[spec.name] ?? '', values);
+      if (message !== null) errors.set(spec.name, message);
+    }
+  }
+  return errors;
 }
 
 /// One block of the rendered form: a lone field, or a boolean gate with the fields it enables.
@@ -481,13 +614,36 @@ export function trimmedParams(
   values: Readonly<Record<string, string>>
 ): Record<string, string> {
   const params: Record<string, string> = {};
+  const fan = fanOutOf(specs);
+  const picks = fan === null ? [] : picked(fan, values);
+  const dependents = fan === null ? new Set<string>() : fanOutDependents(specs, fan.name);
   for (const spec of specs) {
-    const value = (values[spec.name] ?? '').trim();
-    const hidden = confirmation(spec, values)?.kind === 'hidden';
-    if (!isEnabled(spec, values) || hidden || (value.length === 0 && !spec.required)) continue;
-    params[spec.name] = value;
+    if (fan !== null && spec.name === fan.name) {
+      if (picks.length > 0) params[spec.name] = picks.length === 1 ? (picks[0] ?? '') : JSON.stringify(picks);
+      continue;
+    }
+    if (fan !== null && dependents.has(spec.name) && picks.length > 0) {
+      const byValue: Record<string, string> = {};
+      for (const value of picks) {
+        const sent = trimmedOne(spec, valuesFor(specs, values, fan, value));
+        if (sent !== null) byValue[value] = sent;
+      }
+      const only = picks.length === 1 ? byValue[picks[0] ?? ''] : undefined;
+      if (only !== undefined) params[spec.name] = only;
+      else if (picks.length > 1 && Object.keys(byValue).length > 0) params[spec.name] = JSON.stringify(byValue);
+      continue;
+    }
+    const sent = trimmedOne(spec, values);
+    if (sent !== null) params[spec.name] = sent;
   }
   return params;
+}
+
+function trimmedOne(spec: ParamFieldSpec, values: Readonly<Record<string, string>>): string | null {
+  const value = (values[spec.name] ?? '').trim();
+  const hidden = confirmation(spec, values)?.kind === 'hidden';
+  if (!isEnabled(spec, values) || hidden || (value.length === 0 && !spec.required)) return null;
+  return value;
 }
 
 /// Build the launch POST body.

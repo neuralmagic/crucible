@@ -2000,6 +2000,9 @@ pub struct WebhookCheck {
 #[derive(Debug, Clone, Deserialize)]
 pub struct LaunchAck {
     pub key: String,
+    /// Every launch's key, `key` first: several when a fan-out param picked several values.
+    #[serde(default)]
+    pub keys: Vec<String>,
     #[serde(default)]
     pub playbook: String,
     #[serde(default)]

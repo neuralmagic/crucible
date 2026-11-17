@@ -1288,6 +1288,12 @@ pub(crate) async fn launch_playbook_draft(
         Ok(a) => a,
         Err(refusal) => return refusal,
     };
+    if body.rerun.is_some()
+        && let Err(refusal) = authorized.single("a rerun")
+    {
+        return refusal;
+    }
+    let fanned: Vec<serde_json::Value> = authorized.all_params().cloned().collect();
     let head = authorized.pack;
     let max_time = authorized.max_time;
     let saver = match crate::playbooks::api::saver::resolve_saver(
@@ -1326,7 +1332,15 @@ pub(crate) async fn launch_playbook_draft(
     let actor = saver.actor.as_deref();
     let owner = caller.subject_principal().map(|p| p.to_string());
     let dispatch_target = saver.dispatch_target.clone();
-    let key = format!("playbook:{id}:{}", uuid::Uuid::now_v7());
+    let keys: Vec<String> = fanned
+        .iter()
+        .map(|_| format!("playbook:{id}:{}", uuid::Uuid::now_v7()))
+        .collect();
+    let runs: Vec<crate::launches::store::LaunchRun<'_>> = keys
+        .iter()
+        .zip(&fanned)
+        .map(|(key, params)| crate::launches::store::LaunchRun { key, params })
+        .collect();
     let title = format!("draft {id}: {}", head.draft.description);
     let launch = crate::launches::model::NewPlaybookLaunch {
         choice_snapshots: Some(&authorized.choice_snapshots),
@@ -1367,7 +1381,7 @@ pub(crate) async fn launch_playbook_draft(
     };
 
     use crate::launches::store::AdoptDraftOutcome;
-    match crate::launches::store::adopt_draft_launch(state.db.pool(), &key, &launch, &exposure)
+    match crate::launches::store::adopt_draft_launches(state.db.pool(), &runs, &launch, &exposure)
         .await
     {
         Ok(AdoptDraftOutcome::Adopted) => {}
@@ -1385,30 +1399,35 @@ pub(crate) async fn launch_playbook_draft(
         Err(e) => return ApiError::from(e).into_response(),
     }
 
-    state
-        .audit(
-            crate::event_log::Event::now(
-                &key,
-                "new",
-                "new",
-                Some(&format!(
-                    "draft {id} launched at version {} ({} params, max_cost {}, max_time {max_time})",
-                    head.version,
-                    body.params.len(),
-                    body.max_cost
-                )),
-                None,
+    for key in &keys {
+        state
+            .audit(
+                crate::event_log::Event::now(
+                    key,
+                    "new",
+                    "new",
+                    Some(&format!(
+                        "draft {id} launched at version {} ({} params, max_cost {}, max_time \
+                         {max_time}, 1 of {} launches)",
+                        head.version,
+                        body.params.len(),
+                        body.max_cost,
+                        keys.len()
+                    )),
+                    None,
+                )
+                .by(actor),
+                "launch_playbook_draft",
             )
-            .by(actor),
-            "launch_playbook_draft",
-        )
-        .await;
-    state.queue.enqueue_urgent(IssueKey(key.clone()));
+            .await;
+        state.queue.enqueue_urgent(IssueKey(key.clone()));
+    }
 
     (
         StatusCode::CREATED,
         Json(PlaybookLaunchAck {
-            key,
+            key: keys.first().cloned().unwrap_or_default(),
+            keys,
             playbook: id,
             params: body.params,
             schema_digest: head.schema_digest,

@@ -274,6 +274,7 @@ async fn authorize_watch(
             choice_snapshots: serde_json::json!({}),
             pack,
             params,
+            more: Vec::new(),
             max_cost: body.max_cost,
             max_time,
         },

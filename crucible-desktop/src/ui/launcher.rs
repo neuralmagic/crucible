@@ -5,7 +5,7 @@ use rune::{El, TextEdit, Tx, col, el, icon, row, text};
 use rune_kit::{Button, ButtonVariant, Dialog, SegmentedControl, Spinner, Switch, TextInput};
 use rune_theme_opencode::icons as oc;
 
-use crate::form::{Kind, Scale, duration, minutes};
+use crate::form::{self, Kind, Scale, duration, minutes};
 use crate::live::Target;
 use crate::ui::desk::{field, pills};
 use crate::ui::slider::Slider;
@@ -22,9 +22,11 @@ const BODY: f32 = 520.0;
 const REFUSAL: f32 = 72.0;
 
 /// Which of the form's text fields an edit goes to.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Slot {
     Answer(usize),
+    /// One picked value's answer to a field set per picked value.
+    PerValue(usize, String),
     Cost,
     Time,
     Model,
@@ -35,6 +37,10 @@ fn edit(app: &mut App, slot: Slot) -> &mut TextEdit {
     if let Some(launcher) = app.remote.launcher.as_mut() {
         let found = match slot {
             Slot::Answer(i) => launcher.answers.get_mut(i),
+            Slot::PerValue(i, value) => launcher
+                .per_value
+                .get_mut(&value)
+                .and_then(|own| own.get_mut(i)),
             Slot::Cost => Some(&mut launcher.cost),
             Slot::Time => Some(&mut launcher.time),
             Slot::Model => Some(&mut launcher.runs_on.model),
@@ -116,12 +122,15 @@ pub(crate) fn sheet(app: &App, p: &Paint, layer: &mut Vec<El>) {
         Stage::Ready | Stage::Sending => form(app, p, layer),
     };
     let blocked = launcher.rerun.as_ref().and_then(|r| r.blocked()).is_some();
+    let runs = runs(launcher);
     let (verb, going) = if launcher.rerun.is_some() {
-        ("Rerun", "Rerunning\u{2026}")
+        ("Rerun".to_string(), "Rerunning\u{2026}")
     } else if launcher.schedule.is_some() {
-        ("Save schedule", "Saving\u{2026}")
+        ("Save schedule".to_string(), "Saving\u{2026}")
+    } else if runs > 1 {
+        (format!("Launch {runs} runs"), "Launching\u{2026}")
     } else {
-        ("Launch", "Launching\u{2026}")
+        ("Launch".to_string(), "Launching\u{2026}")
     };
     let sending = launcher.stage == Stage::Sending;
     let ready = matches!(launcher.stage, Stage::Ready | Stage::Sending);
@@ -328,6 +337,235 @@ fn fact(name: &str, value: String, p: &Paint) -> El {
 /// The choice that switches an open list to a typed value; never sent.
 const OTHER: &str = "Other\u{2026}";
 
+/// The problem the last submit found with field `i`, for `value` when it is set per value.
+fn issue_at(launcher: &crate::Launcher, i: usize, value: Option<&str>) -> Option<String> {
+    launcher
+        .problems
+        .iter()
+        .find(|problem| problem.field == i && problem.value.as_deref() == value)
+        .map(|problem| problem.why.clone())
+}
+
+/// One answer's input: which answer it edits, the answers its field sees, and how wide it is.
+struct Input<'a> {
+    slot: Slot,
+    run: &'a [String],
+    invalid: bool,
+    width: f32,
+}
+
+fn control(app: &App, input: Input, p: &Paint) -> El {
+    let Some(launcher) = &app.remote.launcher else {
+        return el();
+    };
+    let (i, per) = match &input.slot {
+        Slot::Answer(i) => (*i, None),
+        Slot::PerValue(i, value) => (*i, Some(value.clone())),
+        _ => return el(),
+    };
+    let Some(field) = launcher.fields.get(i) else {
+        return el();
+    };
+    let current_edit = match &per {
+        None => launcher.answers.get(i),
+        Some(value) => launcher.per_value.get(value).and_then(|own| own.get(i)),
+    };
+    let answer = input.run.get(i).map(String::as_str).unwrap_or_default();
+    let off = !field.enabled(&launcher.fields, input.run);
+    let key = |what: &str| match &per {
+        None => format!("launch-{what}-{}", field.name),
+        Some(value) => format!("launch-{what}-{}-{value}", field.name),
+    };
+    let slot = input.slot.clone();
+    let typed = |id: String| {
+        let slot = slot.clone();
+        TextInput::new(current_edit.unwrap_or(&app.scratch))
+            .placeholder(field.placeholder(&launcher.fields, input.run))
+            .width(Some(input.width))
+            .invalid(input.invalid)
+            .disabled(off)
+            .on_edit(move |app: &mut App| edit(app, slot.clone()))
+            .build(p.k)
+            .key(id)
+    };
+    let offered = field.offered(&launcher.fields, input.run);
+    match (&field.kind, offered) {
+        (Kind::Bool, _) => {
+            let slot = slot.clone();
+            Switch::new(answer == "true")
+                .label(field.name.clone())
+                .hide_label()
+                .disabled(off)
+                .on_toggle(move |app: &mut App| {
+                    let on = edit(app, slot.clone()).text == "true";
+                    *edit(app, slot.clone()) = TextEdit::new(if on { "false" } else { "true" });
+                })
+                .build(p.k)
+        }
+        (Kind::Choice(values), _) if values.len() <= 4 && !field.offer.allow_other && !off => {
+            let picks = values.clone();
+            let slot = slot.clone();
+            SegmentedControl::new(values, values.iter().position(|v| v == answer))
+                .label(field.name.clone())
+                .width(Some(110.0 * values.len() as f32))
+                .on_pick(move |app: &mut App, pick: usize, _: &mut Tx| {
+                    if let Some(value) = picks.get(pick) {
+                        *edit(app, slot.clone()) = TextEdit::new(value);
+                    }
+                })
+                .build(p.k)
+        }
+        (_, Some(mut values)) => {
+            let typing_key = (i, per.clone());
+            let listed = values.iter().any(|v| v == answer);
+            let other = field.offer.allow_other
+                && (launcher.typing.contains(&typing_key) || (!answer.is_empty() && !listed));
+            if field.offer.allow_other {
+                values.push(OTHER.to_string());
+            }
+            let current = if other {
+                Some(OTHER)
+            } else {
+                listed.then_some(answer)
+            };
+            let mut pick = row().key(key("choices")).w_full().gap(6.0).flex_wrap();
+            for (n, value) in values.into_iter().enumerate() {
+                let chosen = current == Some(value.as_str());
+                let slot = slot.clone();
+                let typing_key = typing_key.clone();
+                pick = pick.child(
+                    Button::new(value.clone())
+                        .variant(if chosen {
+                            ButtonVariant::Submit
+                        } else {
+                            ButtonVariant::Outline
+                        })
+                        .disabled(off)
+                        .on_press(move |app: &mut App| {
+                            let typing = value == OTHER;
+                            if let Some(launcher) = app.remote.launcher.as_mut() {
+                                if typing {
+                                    launcher.typing.insert(typing_key.clone());
+                                } else {
+                                    launcher.typing.remove(&typing_key);
+                                }
+                            }
+                            *edit(app, slot.clone()) =
+                                TextEdit::new(if typing { "" } else { value.as_str() });
+                        })
+                        .build(p.k)
+                        .key(format!("{}-{n}", key("choice"))),
+                );
+            }
+            col()
+                .w_full()
+                .gap(6.0)
+                .child(pick)
+                .children(other.then(|| typed(key("other"))))
+        }
+        _ => typed(key("param")),
+    }
+}
+
+/// A fan-out field's values, several of which may be picked, each picked value followed by its
+/// own answers to the fields set per value.
+fn fan_out(app: &App, fan: usize, texts: &[String], p: &Paint) -> El {
+    let Some(launcher) = &app.remote.launcher else {
+        return el();
+    };
+    let Some(field) = launcher.fields.get(fan) else {
+        return el();
+    };
+    let picks = form::picked(texts.get(fan).map(String::as_str).unwrap_or_default());
+    let values = field.offered(&launcher.fields, texts).unwrap_or_default();
+    let mut pick = row()
+        .key(format!("launch-choices-{}", field.name))
+        .w_full()
+        .gap(6.0)
+        .flex_wrap();
+    for (n, value) in values.into_iter().enumerate() {
+        let chosen = picks.contains(&value);
+        pick = pick.child(
+            Button::new(value.clone())
+                .variant(if chosen {
+                    ButtonVariant::Submit
+                } else {
+                    ButtonVariant::Outline
+                })
+                .on_press(move |app: &mut App| {
+                    let Some(launcher) = app.remote.launcher.as_mut() else {
+                        return;
+                    };
+                    let Some(answer) = launcher.answers.get_mut(fan) else {
+                        return;
+                    };
+                    *answer = TextEdit::new(form::with_pick(&answer.text, &value, !chosen));
+                    if !chosen && !launcher.per_value.contains_key(&value) {
+                        let start = launcher.answers.clone();
+                        launcher.per_value.insert(value.clone(), start);
+                    }
+                })
+                .build(p.k)
+                .key(format!("launch-choice-{}-{n}", field.name)),
+        );
+    }
+    let per_value = launcher.per_value_texts();
+    let dependents = form::dependents(&launcher.fields, fan);
+    let mut out = col().w_full().gap(8.0).child(pick);
+    for value in &picks {
+        let run = form::run_answers(&launcher.fields, texts, &per_value, fan, value);
+        let mut group = col()
+            .key(format!("launch-per-value-{value}"))
+            .w_full()
+            .gap(8.0)
+            .px(10.0)
+            .py(8.0)
+            .radius(p.k.radius.md)
+            .border(p.hair, p.c.border_muted)
+            .child(text(value.clone()).font(p.k.ty.small).color(p.c.text_muted));
+        for &d in &dependents {
+            let Some(dep) = launcher.fields.get(d) else {
+                continue;
+            };
+            if !dep.enabled(&launcher.fields, &run) {
+                continue;
+            }
+            let issue = issue_at(launcher, d, Some(value));
+            let input = control(
+                app,
+                Input {
+                    slot: Slot::PerValue(d, value.clone()),
+                    run: &run,
+                    invalid: issue.is_some(),
+                    width: INNER - 22.0,
+                },
+                p,
+            );
+            let labelled = if dep.kind == Kind::Bool {
+                row()
+                    .gap(8.0)
+                    .center_y()
+                    .child(input)
+                    .child(label(&dep.name, "", false, p))
+            } else {
+                col()
+                    .w_full()
+                    .gap(4.0)
+                    .child(label(&dep.name, "", dep.required, p))
+                    .child(input)
+            };
+            group =
+                group.child(
+                    col().w_full().gap(4.0).child(labelled).children(
+                        issue.map(|why| text(why).font(p.k.ty.small).color(p.c.danger.fg)),
+                    ),
+                );
+        }
+        out = out.child(group);
+    }
+    out
+}
+
 fn form(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
     let Some(launcher) = &app.remote.launcher else {
         return el();
@@ -343,100 +581,29 @@ fn form(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
             .child(ceilings(app, p));
     }
     let texts: Vec<String> = launcher.answers.iter().map(|a| a.text.clone()).collect();
+    let fan = form::fan_out(&launcher.fields);
+    let dependents = fan.map_or_else(Default::default, |fan| {
+        form::dependents(&launcher.fields, fan)
+    });
     let mut fields = col().w_full().gap(14.0);
     for (i, field) in launcher.fields.iter().enumerate() {
-        let answer = texts.get(i).map(String::as_str).unwrap_or_default();
-        let issue = launcher
-            .problems
-            .iter()
-            .find(|(at, _)| *at == i)
-            .map(|(_, why)| why.clone());
-        let off = !field.enabled(&launcher.fields, &texts);
-        let typed = |id: String| {
-            TextInput::new(launcher.answers.get(i).unwrap_or(&app.scratch))
-                .placeholder(field.placeholder(&launcher.fields, &texts))
-                .width(Some(INNER))
-                .invalid(issue.is_some())
-                .disabled(off)
-                .on_edit(move |app: &mut App| edit(app, Slot::Answer(i)))
-                .build(p.k)
-                .key(id)
-        };
-        let offered = field.offered(&launcher.fields, &texts);
-        let control = match (&field.kind, offered) {
-            (Kind::Bool, _) => Switch::new(answer == "true")
-                .label(field.name.clone())
-                .hide_label()
-                .disabled(off)
-                .on_toggle(move |app: &mut App| {
-                    let on = edit(app, Slot::Answer(i)).text == "true";
-                    *edit(app, Slot::Answer(i)) = TextEdit::new(if on { "false" } else { "true" });
-                })
-                .build(p.k),
-            (Kind::Choice(values), _) if values.len() <= 4 && !field.offer.allow_other && !off => {
-                let picks = values.clone();
-                SegmentedControl::new(values, values.iter().position(|v| v == answer))
-                    .label(field.name.clone())
-                    .width(Some(110.0 * values.len() as f32))
-                    .on_pick(move |app: &mut App, pick: usize, _: &mut Tx| {
-                        if let Some(value) = picks.get(pick) {
-                            *edit(app, Slot::Answer(i)) = TextEdit::new(value);
-                        }
-                    })
-                    .build(p.k)
-            }
-            (_, Some(mut values)) => {
-                let listed = values.iter().any(|v| v == answer);
-                let other = field.offer.allow_other
-                    && (launcher.typing.contains(&i) || (!answer.is_empty() && !listed));
-                if field.offer.allow_other {
-                    values.push(OTHER.to_string());
-                }
-                let current = if other {
-                    Some(OTHER)
-                } else {
-                    listed.then_some(answer)
-                };
-                let mut pick = row()
-                    .key(format!("launch-choices-{}", field.name))
-                    .w_full()
-                    .gap(6.0)
-                    .flex_wrap();
-                for (n, value) in values.into_iter().enumerate() {
-                    let chosen = current == Some(value.as_str());
-                    pick = pick.child(
-                        Button::new(value.clone())
-                            .variant(if chosen {
-                                ButtonVariant::Submit
-                            } else {
-                                ButtonVariant::Outline
-                            })
-                            .disabled(off)
-                            .on_press(move |app: &mut App| {
-                                let Some(launcher) = app.remote.launcher.as_mut() else {
-                                    return;
-                                };
-                                let typing = value == OTHER;
-                                if typing {
-                                    launcher.typing.insert(i);
-                                } else {
-                                    launcher.typing.remove(&i);
-                                }
-                                if let Some(slot) = launcher.answers.get_mut(i) {
-                                    *slot = TextEdit::new(if typing { "" } else { value.as_str() });
-                                }
-                            })
-                            .build(p.k)
-                            .key(format!("launch-choice-{}-{n}", field.name)),
-                    );
-                }
-                col()
-                    .w_full()
-                    .gap(6.0)
-                    .child(pick)
-                    .children(other.then(|| typed(format!("launch-other-{}", field.name))))
-            }
-            _ => typed(format!("launch-param-{}", field.name)),
+        if dependents.contains(&i) {
+            continue;
+        }
+        let issue = issue_at(launcher, i, None);
+        let control = if fan == Some(i) {
+            fan_out(app, i, &texts, p)
+        } else {
+            control(
+                app,
+                Input {
+                    slot: Slot::Answer(i),
+                    run: &texts,
+                    invalid: issue.is_some(),
+                    width: INNER,
+                },
+                p,
+            )
         };
         fields = fields.child(
             col()
@@ -681,12 +848,25 @@ fn runs_on(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
     ))
 }
 
+/// How many runs the form's answers launch.
+fn runs(launcher: &crate::Launcher) -> usize {
+    let texts: Vec<String> = launcher.answers.iter().map(|a| a.text.clone()).collect();
+    form::runs(&launcher.fields, &texts)
+}
+
 fn ceilings(app: &App, p: &Paint) -> El {
     let Some(launcher) = &app.remote.launcher else {
         return el();
     };
+    let runs = runs(launcher);
+    let each = (runs > 1).then(|| {
+        text(format!("The ceilings apply to each of the {runs} runs."))
+            .font(p.k.ty.small)
+            .color(p.c.text_muted)
+            .key("launch-each-run")
+    });
     let (cap_cost, cap_time) = &launcher.caps;
-    row()
+    let both = row()
         .w_full()
         .gap(12.0)
         .child(
@@ -757,7 +937,8 @@ fn ceilings(app: &App, p: &Paint) -> El {
                         p,
                     )
                 })),
-        )
+        );
+    col().w_full().gap(6.0).child(both).children(each)
 }
 
 /// A slider with the cap it stops at beside its end.
