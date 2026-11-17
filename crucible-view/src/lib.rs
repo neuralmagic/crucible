@@ -169,6 +169,15 @@ impl Control {
         }
     }
 
+    /// The name a view gives this kind of control.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Control::Select { .. } => "select",
+            Control::Toggle { .. } => "toggle",
+            Control::Range { .. } => "range",
+        }
+    }
+
     /// `asked` when it is a value of this control's kind, a select's among its options and a
     /// range's moved onto its nearest step or its `max`; otherwise the control's own value.
     pub fn coerce(&self, asked: Option<&Param>) -> Param {
@@ -327,6 +336,47 @@ pub enum Node {
     Markdown { text: String },
     /// A Mermaid diagram from its source.
     Mermaid { source: String },
+}
+
+impl Node {
+    /// The name a view gives this kind of component.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Node::Stack { .. } => "stack",
+            Node::Columns { .. } => "columns",
+            Node::Section { .. } => "section",
+            Node::Tabs { .. } => "tabs",
+            Node::Stats { .. } => "stats",
+            Node::Meter { .. } => "meter",
+            Node::Bars { .. } => "bars",
+            Node::Plot { .. } => "plot",
+            Node::Histogram { .. } => "histogram",
+            Node::Heatmap { .. } => "heatmap",
+            Node::Flow { .. } => "flow",
+            Node::Canvas { .. } => "canvas",
+            Node::Grid { .. } => "grid",
+            Node::Table { .. } => "table",
+            Node::Text { .. } => "text",
+            Node::Note { .. } => "note",
+            Node::Markdown { .. } => "markdown",
+            Node::Mermaid { .. } => "mermaid",
+        }
+    }
+
+    /// The components this one holds: a stack's or columns' children, a section's body, or
+    /// each tab's body.
+    pub fn children(&self) -> impl Iterator<Item = &Node> {
+        let (nodes, body, tabs): (&[Node], Option<&Node>, &[Tab]) = match self {
+            Node::Stack { children } | Node::Columns { children } => (children, None, &[]),
+            Node::Section { body, .. } => (&[], Some(body), &[]),
+            Node::Tabs { tabs, .. } => (&[], None, tabs),
+            _ => (&[], None, &[]),
+        };
+        nodes
+            .iter()
+            .chain(body)
+            .chain(tabs.iter().map(|tab| &tab.body))
+    }
 }
 
 fn unfolded() -> bool {
@@ -957,7 +1007,6 @@ struct Seen {
     points: usize,
     commands: usize,
     prose: usize,
-    tables: usize,
     ids: HashSet<String>,
 }
 
@@ -971,20 +1020,26 @@ impl Seen {
     }
 
     fn items(&mut self, more: usize, limits: &Limits) -> Result<(), Problem> {
-        self.items = self.items.saturating_add(more);
-        if self.items > limits.items {
-            return Err(Problem::Items(limits.items));
-        }
-        Ok(())
+        spend(&mut self.items, more, limits.items, Problem::Items)
     }
 
     fn points(&mut self, more: usize, limits: &Limits) -> Result<(), Problem> {
-        self.points = self.points.saturating_add(more);
-        if self.points > limits.points {
-            return Err(Problem::Points(limits.points));
-        }
-        Ok(())
+        spend(&mut self.points, more, limits.points, Problem::Points)
     }
+}
+
+/// Adds `more` to `held`, refusing a total over `limit` with `over(limit)`.
+fn spend(
+    held: &mut usize,
+    more: usize,
+    limit: usize,
+    over: fn(usize) -> Problem,
+) -> Result<(), Problem> {
+    *held = held.saturating_add(more);
+    if *held > limit {
+        return Err(over(limit));
+    }
+    Ok(())
 }
 
 fn fits(text: &str, limits: &Limits) -> Result<(), Problem> {
@@ -1000,10 +1055,7 @@ impl Node {
         if depth > limits.depth {
             return Err(Problem::Depth(limits.depth));
         }
-        seen.nodes += 1;
-        if seen.nodes > limits.nodes {
-            return Err(Problem::Nodes(limits.nodes));
-        }
+        spend(&mut seen.nodes, 1, limits.nodes, Problem::Nodes)?;
         match self {
             Node::Stack { children } => {
                 let mut shown = 0;
@@ -1013,11 +1065,11 @@ impl Node {
                 Ok(shown)
             }
             Node::Columns { children } => {
-                let tables = seen.tables;
+                let mut tables = 0;
                 for child in children {
-                    child.check(limits, depth + 1, seen)?;
+                    tables += child.check(limits, depth + 1, seen)?;
                 }
-                if seen.tables > tables {
+                if tables > 0 {
                     return Err(Problem::ColumnsTable);
                 }
                 Ok(0)
@@ -1069,10 +1121,7 @@ impl Node {
                 fits(detail, limits).map(|()| 0)
             }
             Node::Markdown { text: source } | Node::Mermaid { source } => {
-                seen.prose = seen.prose.saturating_add(source.len());
-                if seen.prose > limits.prose {
-                    return Err(Problem::Prose(limits.prose));
-                }
+                spend(&mut seen.prose, source.len(), limits.prose, Problem::Prose)?;
                 Ok(0)
             }
             Node::Bars { bars } => {
@@ -1112,10 +1161,12 @@ impl Node {
                 if ![width, height].iter().all(|n| (1.0..=side).contains(*n)) {
                     return Err(Problem::CanvasSize(limits.canvas_side));
                 }
-                seen.commands = seen.commands.saturating_add(commands.len());
-                if seen.commands > limits.commands {
-                    return Err(Problem::Commands(limits.commands));
-                }
+                spend(
+                    &mut seen.commands,
+                    commands.len(),
+                    limits.commands,
+                    Problem::Commands,
+                )?;
                 let (mut path, mut stretch) = (0_usize, 0_usize);
                 for (at, command) in commands.iter().enumerate() {
                     if !command.in_reach() {
@@ -1245,7 +1296,6 @@ impl Node {
             Node::Table { id, columns, rows } => {
                 fits(id, limits)?;
                 seen.name(id)?;
-                seen.tables += 1;
                 seen.items(columns.len(), limits)?;
                 let mut names = HashSet::new();
                 for column in columns {
@@ -1255,12 +1305,12 @@ impl Node {
                         return Err(Problem::DuplicateColumn(id.clone(), column.id.clone()));
                     }
                 }
-                seen.cells = seen
-                    .cells
-                    .saturating_add(columns.len().max(1).saturating_mul(rows.len()));
-                if seen.cells > limits.cells {
-                    return Err(Problem::Cells(limits.cells));
-                }
+                spend(
+                    &mut seen.cells,
+                    columns.len().max(1).saturating_mul(rows.len()),
+                    limits.cells,
+                    Problem::Cells,
+                )?;
                 let mut ids = HashSet::new();
                 for row in rows {
                     if row.cells.len() != columns.len() {

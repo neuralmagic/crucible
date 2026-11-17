@@ -5,15 +5,15 @@
 mod js;
 mod wasi;
 
-pub use crate::plugin::js::{JsEngine, Script};
+pub use crate::plugin::js::Script;
 
 use std::path::{Component, Path};
 
 use crucible_view::{ALLOC, INPUTS, Reply, Request, VIEW, View};
-use wasmi::{
-    Config, Engine, Instance, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder,
-    TrapCode,
-};
+use serde::Serialize;
+use wasmi::{Config, Engine, Instance, Linker, Memory, Store, StoreLimitsBuilder, TrapCode};
+
+use crate::plugin::wasi::Held;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
@@ -25,7 +25,6 @@ pub struct Limits {
     pub table_elements: usize,
     pub reply_bytes: usize,
     pub inputs: usize,
-    pub view: crucible_view::Limits,
 }
 
 impl Limits {
@@ -35,7 +34,6 @@ impl Limits {
         table_elements: 1 << 20,
         reply_bytes: 64 << 20,
         inputs: 16,
-        view: crucible_view::Limits::DEFAULT,
     };
 }
 
@@ -67,90 +65,91 @@ pub enum Fault {
     View(#[from] crucible_view::Problem),
 }
 
+/// A function a plugin offers that builds a view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Entry {
+    /// The view of a run.
+    View,
+}
+
+impl Entry {
+    /// The module's export for it.
+    fn export(self) -> &'static str {
+        match self {
+            Entry::View => VIEW,
+        }
+    }
+
+    /// The key a script is asked under.
+    fn key(self) -> &'static str {
+        match self {
+            Entry::View => "view",
+        }
+    }
+}
+
 /// A view plugin of either kind: a compiled module, or JavaScript source.
 pub enum Loaded {
-    Wasm(Plugin),
+    Wasm(Module),
     Js(Script),
 }
 
 impl Loaded {
     /// The captured file paths the plugin reads.
     pub fn inputs(&self) -> Result<Vec<String>, Fault> {
-        match self {
-            Loaded::Wasm(plugin) => plugin.inputs(),
-            Loaded::Js(script) => script.inputs(),
+        let paths = match self {
+            Loaded::Wasm(module) => module.inputs()?,
+            Loaded::Js(script) => script.inputs()?,
+        };
+        let limits = self.limits();
+        if paths.len() > limits.inputs {
+            return Err(Fault::Inputs(limits.inputs));
+        }
+        match paths.iter().find(|path| !captured(path)) {
+            Some(path) => Err(Fault::Input(path.clone())),
+            None => Ok(paths),
         }
     }
 
     /// The plugin's view of `request`, checked against the view limits.
     pub fn view(&self, request: &Request) -> Result<View, Fault> {
+        self.ask(Entry::View, request)
+    }
+
+    /// What `entry` builds from `request`, checked against the view limits.
+    fn ask(&self, entry: Entry, request: &impl Serialize) -> Result<View, Fault> {
+        let reply = match self {
+            Loaded::Wasm(module) => {
+                let body = serde_json::to_vec(request).map_err(|e| Fault::Reply(e.to_string()))?;
+                module.answer(entry.export(), &body)?
+            }
+            Loaded::Js(script) => script.answer(entry.key(), request)?,
+        };
+        match reply {
+            Reply::View(view) => {
+                view.check(&crucible_view::Limits::DEFAULT)?;
+                Ok(view)
+            }
+            Reply::Error(error) => Err(Fault::Refused(error)),
+        }
+    }
+
+    fn limits(&self) -> &Limits {
         match self {
-            Loaded::Wasm(plugin) => plugin.view(request),
-            Loaded::Js(script) => script.view(request),
+            Loaded::Wasm(module) => &module.limits,
+            Loaded::Js(script) => script.limits(),
         }
     }
 }
 
-pub struct Plugin {
+/// A module whose only imports are WASI calls the host answers, and the limits each of its
+/// calls runs under: a plugin, or the engine a script runs in.
+pub struct Module {
     engine: Engine,
-    module: Module,
+    module: wasmi::Module,
     limits: Limits,
 }
 
-/// One call's limits, what the plugin reads and has written, and its clock.
-struct Held {
-    limits: StoreLimits,
-    /// The plugin's standard input, and how much of it has been read.
-    input: Vec<u8>,
-    taken: usize,
-    /// The plugin's standard output, up to `output_limit` bytes; `overflowed` past that.
-    output: Vec<u8>,
-    output_limit: usize,
-    overflowed: bool,
-    /// The start of the plugin's standard error.
-    said: Vec<u8>,
-    clock: u64,
-}
-
-impl wasi::Guest for Held {
-    fn tick(&mut self) -> u64 {
-        self.clock += 1_000_000;
-        self.clock
-    }
-
-    fn room(&self, fd: i32) -> usize {
-        if fd == 1 {
-            self.output_limit.saturating_sub(self.output.len())
-        } else {
-            SAID.saturating_sub(self.said.len())
-        }
-    }
-
-    fn write(&mut self, fd: i32, bytes: &[u8], whole: usize) {
-        let kept = &bytes[..bytes.len().min(self.room(fd))];
-        if fd == 1 {
-            self.overflowed |= whole > kept.len();
-            self.output.extend_from_slice(kept);
-        } else {
-            self.said.extend_from_slice(kept);
-        }
-    }
-
-    fn unread(&self) -> usize {
-        self.input.len().saturating_sub(self.taken)
-    }
-
-    fn read(&mut self, buffer: &mut [u8]) -> usize {
-        let rest = &self.input[self.taken.min(self.input.len())..];
-        let filled = rest.len().min(buffer.len());
-        buffer[..filled].copy_from_slice(&rest[..filled]);
-        self.taken += filled;
-        filled
-    }
-}
-
-/// The most of a plugin's output a fault quotes.
-const SAID: usize = 2048;
 /// The most tables one plugin may have.
 const TABLES: usize = 8;
 
@@ -160,19 +159,32 @@ struct Call {
     memory: Memory,
 }
 
-impl Plugin {
-    pub fn load(wasm: &[u8], limits: Limits) -> Result<Plugin, Fault> {
-        let (engine, module) = module(wasm)?;
-        Ok(Plugin {
-            engine,
-            module,
-            limits,
-        })
+impl Module {
+    pub fn load(wasm: &[u8], limits: Limits) -> Result<Module, Fault> {
+        let mut config = Config::default();
+        config.consume_fuel(true).wasm_simd(true);
+        let engine = Engine::new(&config);
+        let module = wasmi::Module::new(&engine, wasm).map_err(|e| Fault::Module(e.to_string()))?;
+        let foreign = module
+            .imports()
+            .find(|import| import.module() != wasi::MODULE || !wasi::offers(import.name()));
+        match foreign {
+            Some(import) => Err(Fault::Import(format!(
+                "{}.{}",
+                import.module(),
+                import.name()
+            ))),
+            None => Ok(Module {
+                engine,
+                module,
+                limits,
+            }),
+        }
     }
 
-    /// The captured file paths the plugin reads.
-    pub fn inputs(&self) -> Result<Vec<String>, Fault> {
-        let mut call = self.call()?;
+    /// The paths the plugin's inputs export names.
+    fn inputs(&self) -> Result<Vec<String>, Fault> {
+        let mut call = self.start()?;
         let ask = call
             .instance
             .get_typed_func::<(), u64>(&call.store, INPUTS)
@@ -180,15 +192,13 @@ impl Plugin {
         let packed = ask
             .call(&mut call.store, ())
             .map_err(|e| said(fault(e), &call.store))?;
-        let paths: Vec<String> = serde_json::from_slice(&call.read(packed, &self.limits)?)
-            .map_err(|e| Fault::Reply(e.to_string()))?;
-        asked_for(paths, &self.limits)
+        serde_json::from_slice(&call.read(packed, &self.limits)?)
+            .map_err(|e| Fault::Reply(e.to_string()))
     }
 
-    /// The plugin's view of `request`, checked against the view limits.
-    pub fn view(&self, request: &Request) -> Result<View, Fault> {
-        let mut call = self.call()?;
-        let body = serde_json::to_vec(request).map_err(|e| Fault::Reply(e.to_string()))?;
+    /// What the plugin's `export` answers to `body`, written into its memory.
+    fn answer(&self, export: &'static str, body: &[u8]) -> Result<Reply, Fault> {
+        let mut call = self.start()?;
         let len = u32::try_from(body.len()).map_err(|_| Fault::Memory)?;
         let alloc = call
             .instance
@@ -196,103 +206,50 @@ impl Plugin {
             .map_err(|_| Fault::Export(ALLOC))?;
         let build = call
             .instance
-            .get_typed_func::<(u32, u32), u64>(&call.store, VIEW)
-            .map_err(|_| Fault::Export(VIEW))?;
+            .get_typed_func::<(u32, u32), u64>(&call.store, export)
+            .map_err(|_| Fault::Export(export))?;
         let at = alloc
             .call(&mut call.store, len)
             .map_err(|e| said(fault(e), &call.store))?;
         call.memory
-            .write(&mut call.store, at as usize, &body)
+            .write(&mut call.store, at as usize, body)
             .map_err(|e| Fault::Trap(e.to_string()))?;
         let packed = build
             .call(&mut call.store, (at, len))
             .map_err(|e| said(fault(e), &call.store))?;
-        let reply: Reply = serde_json::from_slice(&call.read(packed, &self.limits)?)
-            .map_err(|e| Fault::Reply(e.to_string()))?;
-        match reply {
-            Reply::View(view) => {
-                view.check(&self.limits.view)?;
-                Ok(view)
-            }
-            Reply::Error(error) => Err(Fault::Refused(error)),
-        }
+        serde_json::from_slice(&call.read(packed, &self.limits)?)
+            .map_err(|e| Fault::Reply(e.to_string()))
     }
 
-    fn call(&self) -> Result<Call, Fault> {
-        start(&self.engine, &self.module, &self.limits)
-    }
-}
-
-/// `wasm` as a module whose only imports are WASI calls the host answers.
-fn module(wasm: &[u8]) -> Result<(Engine, Module), Fault> {
-    let mut config = Config::default();
-    config.consume_fuel(true).wasm_simd(true);
-    let engine = Engine::new(&config);
-    let module = Module::new(&engine, wasm).map_err(|e| Fault::Module(e.to_string()))?;
-    let foreign = module
-        .imports()
-        .find(|import| import.module() != wasi::MODULE || !wasi::offers(import.name()));
-    match foreign {
-        Some(import) => Err(Fault::Import(format!(
-            "{}.{}",
-            import.module(),
-            import.name()
-        ))),
-        None => Ok((engine, module)),
-    }
-}
-
-/// A fresh instance of `module` under `limits`, with nothing on its standard input.
-fn start(engine: &Engine, module: &Module, limits: &Limits) -> Result<Call, Fault> {
-    let store_limits = StoreLimitsBuilder::new()
-        .memory_size(limits.memory_bytes)
-        .memories(1)
-        .table_elements(limits.table_elements)
-        .tables(TABLES)
-        .instances(1)
-        .trap_on_grow_failure(true)
-        .build();
-    let mut store = Store::new(
-        engine,
-        Held {
-            limits: store_limits,
-            input: Vec::new(),
-            taken: 0,
-            output: Vec::new(),
-            output_limit: limits.reply_bytes,
-            overflowed: false,
-            said: Vec::new(),
-            clock: 1_000_000_000,
-        },
-    );
-    store.limiter(|held| &mut held.limits);
-    store
-        .set_fuel(limits.fuel)
-        .map_err(|e| Fault::Module(e.to_string()))?;
-    let mut linker = Linker::new(engine);
-    wasi::link(&mut linker).map_err(|e| Fault::Module(e.to_string()))?;
-    let instance = linker
-        .instantiate_and_start(&mut store, module)
-        .map_err(|e| said(fault(e), &store))?;
-    let memory = instance
-        .get_memory(&store, "memory")
-        .ok_or(Fault::Export("memory"))?;
-    Ok(Call {
-        store,
-        instance,
-        memory,
-    })
-}
-
-/// The paths a plugin asked for, when each is inside a task's captured files and there are not
-/// too many.
-fn asked_for(paths: Vec<String>, limits: &Limits) -> Result<Vec<String>, Fault> {
-    if paths.len() > limits.inputs {
-        return Err(Fault::Inputs(limits.inputs));
-    }
-    match paths.iter().find(|path| !captured(path)) {
-        Some(path) => Err(Fault::Input(path.clone())),
-        None => Ok(paths),
+    /// A fresh instance under the module's limits, with nothing on its standard input.
+    fn start(&self) -> Result<Call, Fault> {
+        let limits = &self.limits;
+        let store_limits = StoreLimitsBuilder::new()
+            .memory_size(limits.memory_bytes)
+            .memories(1)
+            .table_elements(limits.table_elements)
+            .tables(TABLES)
+            .instances(1)
+            .trap_on_grow_failure(true)
+            .build();
+        let mut store = Store::new(&self.engine, Held::new(store_limits, limits.reply_bytes));
+        store.limiter(|held| &mut held.limits);
+        store
+            .set_fuel(limits.fuel)
+            .map_err(|e| Fault::Module(e.to_string()))?;
+        let mut linker = Linker::new(&self.engine);
+        wasi::link(&mut linker).map_err(|e| Fault::Module(e.to_string()))?;
+        let instance = linker
+            .instantiate_and_start(&mut store, &self.module)
+            .map_err(|e| said(fault(e), &store))?;
+        let memory = instance
+            .get_memory(&store, "memory")
+            .ok_or(Fault::Export("memory"))?;
+        Ok(Call {
+            store,
+            instance,
+            memory,
+        })
     }
 }
 
@@ -346,7 +303,7 @@ fn captured(path: &str) -> bool {
 mod tests {
     use crucible_view::{File, Node, PlotKind, Request};
 
-    use crate::plugin::{Fault, Limits, Plugin};
+    use crate::plugin::{Fault, Limits, Loaded, Module};
 
     const SMALL: Limits = Limits {
         fuel: 5_000_000,
@@ -354,7 +311,6 @@ mod tests {
         table_elements: 1024,
         reply_bytes: 4096,
         inputs: 2,
-        view: crucible_view::Limits::DEFAULT,
     };
 
     /// A plugin whose `crucible_inputs` and `crucible_view` both return the string at address 8,
@@ -375,8 +331,8 @@ mod tests {
         )
     }
 
-    fn load(reply: &str, body: &str) -> Plugin {
-        Plugin::load(module(reply, body).as_bytes(), SMALL).unwrap()
+    fn load(reply: &str, body: &str) -> Loaded {
+        Loaded::Wasm(Module::load(module(reply, body).as_bytes(), SMALL).unwrap())
     }
 
     #[test]
@@ -403,7 +359,7 @@ mod tests {
             (func (export "crucible_view") (param i32 i32) (result i64)
                 (i64.or (i64.shl (i64.extend_i32_u (local.get 0)) (i64.const 32))
                         (i64.extend_i32_u (local.get 1)))))"#;
-        let plugin = Plugin::load(echo.as_bytes(), SMALL).unwrap();
+        let plugin = Loaded::Wasm(Module::load(echo.as_bytes(), SMALL).unwrap());
         let request = Request {
             params: Default::default(),
             files: vec![File {
@@ -427,7 +383,7 @@ mod tests {
                     (import "{module}" "{name}" (func (param i32 i32) (result i32)))
                     (memory (export "memory") 1))"#
             );
-            Plugin::load(wat.as_bytes(), SMALL).err()
+            Module::load(wat.as_bytes(), SMALL).err()
         };
         for (module, name) in [
             ("wasi_snapshot_preview1", "path_open"),
@@ -444,7 +400,7 @@ mod tests {
         }
         assert_eq!(importing("wasi_snapshot_preview1", "random_get"), None);
         assert!(matches!(
-            Plugin::load(b"not wasm", SMALL),
+            Module::load(b"not wasm", SMALL),
             Err(Fault::Module(_))
         ));
     }
@@ -516,7 +472,7 @@ mod tests {
             (func (export "crucible_view") (param i32 i32) (result i64)
                 (call $exit (i32.const 3))
                 (i64.const 0)))"#;
-        let plugin = Plugin::load(probe.as_bytes(), SMALL).unwrap();
+        let plugin = Loaded::Wasm(Module::load(probe.as_bytes(), SMALL).unwrap());
         assert_eq!(plugin.inputs().unwrap(), ["nothing"]);
         let Err(Fault::Trap(why)) = plugin.view(&Request::default()) else {
             panic!("an exit stops the plugin");
@@ -535,7 +491,7 @@ mod tests {
         let plugin = load("[]", "(drop (memory.grow (i32.const 64)))");
         assert_eq!(plugin.view(&Request::default()), Err(Fault::Memory));
         let big = r#"(module (memory (export "memory") 64))"#;
-        let plugin = Plugin::load(big.as_bytes(), SMALL).unwrap();
+        let plugin = Loaded::Wasm(Module::load(big.as_bytes(), SMALL).unwrap());
         let Err(Fault::Trap(why)) = plugin.inputs() else {
             panic!("64 pages is over the limit");
         };
@@ -554,19 +510,19 @@ mod tests {
                         (drop (table.grow (ref.null func) (i32.const {by})))
                         (i64.or (i64.shl (i64.const 8) (i64.const 32)) (i64.const 2))))"#
             );
-            Plugin::load(wat.as_bytes(), SMALL).unwrap().inputs()
+            Loaded::Wasm(Module::load(wat.as_bytes(), SMALL).unwrap()).inputs()
         };
         assert_eq!(grows(1023), Ok(vec![]));
         assert_eq!(grows(1024), Err(Fault::Memory));
         let big = r#"(module (memory (export "memory") 1) (table 2000 funcref))"#;
-        let plugin = Plugin::load(big.as_bytes(), SMALL).unwrap();
+        let plugin = Loaded::Wasm(Module::load(big.as_bytes(), SMALL).unwrap());
         let Err(Fault::Trap(why)) = plugin.inputs() else {
             panic!("2000 entries is over the limit");
         };
         assert!(why.contains("table"), "{why}");
         let many: String = (0..9).map(|_| "(table 1 funcref)").collect();
         let wat = format!(r#"(module (memory (export "memory") 1) {many})"#);
-        let plugin = Plugin::load(wat.as_bytes(), SMALL).unwrap();
+        let plugin = Loaded::Wasm(Module::load(wat.as_bytes(), SMALL).unwrap());
         assert!(matches!(plugin.inputs(), Err(Fault::Trap(_))));
     }
 
@@ -590,7 +546,7 @@ mod tests {
                             (then (i64.or (i64.shl (i64.const 16) (i64.const 32)) (i64.const 11)))
                             (else (i64.or (i64.shl (i64.const 8) (i64.const 32)) (i64.const 2))))))"#
             );
-            Plugin::load(wat.as_bytes(), SMALL).unwrap().inputs()
+            Loaded::Wasm(Module::load(wat.as_bytes(), SMALL).unwrap()).inputs()
         };
         assert_eq!(
             calling("(call $random (i32.const 1024) (i32.const 0x7fffffff))"),
@@ -627,8 +583,10 @@ mod tests {
                 reply_bytes,
                 ..SMALL
             };
-            let (engine, module) = crate::plugin::module(writes.as_bytes()).unwrap();
-            let mut call = crate::plugin::start(&engine, &module, &limits).unwrap();
+            let mut call = Module::load(writes.as_bytes(), limits)
+                .unwrap()
+                .start()
+                .unwrap();
             let run = call
                 .instance
                 .get_typed_func::<(), u32>(&call.store, "run")
@@ -662,12 +620,12 @@ mod tests {
             (memory (export "memory") 1)
             (func (export "crucible_inputs") (result i64)
                 (i64.or (i64.shl (i64.const 65530) (i64.const 32)) (i64.const 64))))"#;
-        let plugin = Plugin::load(far.as_bytes(), SMALL).unwrap();
+        let plugin = Loaded::Wasm(Module::load(far.as_bytes(), SMALL).unwrap());
         assert!(matches!(plugin.inputs(), Err(Fault::Reply(_))));
         let long = r#"(module
             (memory (export "memory") 1)
             (func (export "crucible_inputs") (result i64) (i64.const 5000)))"#;
-        let plugin = Plugin::load(long.as_bytes(), SMALL).unwrap();
+        let plugin = Loaded::Wasm(Module::load(long.as_bytes(), SMALL).unwrap());
         let Err(Fault::Reply(why)) = plugin.inputs() else {
             panic!("5000 bytes is over the limit");
         };
@@ -703,7 +661,7 @@ mod tests {
         let pack = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/report");
         let wasm = std::fs::read(pack.join("ui/report.wasm"))
             .expect("build it with `just example-report-view`");
-        let plugin = Plugin::load(&wasm, Limits::DEFAULT).unwrap();
+        let plugin = Loaded::Wasm(Module::load(&wasm, Limits::DEFAULT).unwrap());
         assert_eq!(plugin.inputs().unwrap(), ["verdicts.json"]);
         let file = |lane: &str| File {
             path: "verdicts.json".into(),

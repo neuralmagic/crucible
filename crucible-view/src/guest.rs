@@ -11,7 +11,9 @@
 //!
 //! A result is returned as one `u64`: its address in the high half, its length in the low half.
 
-use crate::{Reply, Request, View};
+use serde::de::DeserializeOwned;
+
+use crate::{Reply, View};
 
 #[macro_export]
 macro_rules! plugin {
@@ -28,7 +30,7 @@ macro_rules! plugin {
 
         #[unsafe(no_mangle)]
         pub extern "C" fn crucible_view(ptr: u32, len: u32) -> u64 {
-            $crate::guest::view(ptr, len, $view)
+            $crate::guest::view::<$crate::Request>(ptr, len, $view)
         }
     };
 }
@@ -44,10 +46,10 @@ pub fn inputs(paths: &[&str]) -> u64 {
     hand_back(serde_json::to_vec(paths).unwrap_or_default())
 }
 
-pub fn view(ptr: u32, len: u32, build: fn(Request) -> Result<View, String>) -> u64 {
+pub fn view<R: DeserializeOwned>(ptr: u32, len: u32, build: fn(R) -> Result<View, String>) -> u64 {
     // SAFETY: the host wrote `len` bytes at the address `alloc(len)` returned.
     let bytes = unsafe { Vec::from_raw_parts(ptr as *mut u8, len as usize, len as usize) };
-    let reply = match serde_json::from_slice::<Request>(&bytes) {
+    let reply = match serde_json::from_slice::<R>(&bytes) {
         Ok(request) => match build(request) {
             Ok(view) => Reply::View(view),
             Err(error) => Reply::Error(error),

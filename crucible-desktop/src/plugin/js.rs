@@ -2,13 +2,13 @@
 //! engine, a WebAssembly module the host instantiates under the same limits as any plugin, so
 //! the script gets nothing the engine module does not: no files, network or real clock.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use crucible_view::{Request, View};
-use serde::Deserialize;
-use wasmi::{Engine, Module};
+use crucible_view::{Reply, View};
+use serde::{Deserialize, Serialize};
 
-use crate::plugin::{Fault, Limits, asked_for, fault, module, said, start};
+use crate::plugin::{Fault, Limits, Module, fault, said};
 
 /// What the host puts after a script: the canvas it can draw with and the `Cell` helpers.
 const PRELUDE: &str = include_str!("../../../crucible-view/js/prelude.js");
@@ -18,27 +18,10 @@ const EPILOGUE: &str = include_str!("../../../crucible-view/js/epilogue.js");
 /// The byte the epilogue writes before the script's answer, after anything the script printed.
 const ANSWER: u8 = 0x1e;
 
-/// Javy's QuickJS engine module, ready to instantiate.
-pub struct JsEngine {
-    engine: Engine,
-    module: Module,
-    limits: Limits,
-}
-
-impl JsEngine {
-    pub fn load(wasm: &[u8], limits: Limits) -> Result<JsEngine, Fault> {
-        let (engine, module) = module(wasm)?;
-        Ok(JsEngine {
-            engine,
-            module,
-            limits,
-        })
-    }
-}
-
-/// A JavaScript view plugin: a module that defines `inputs` and `view`.
+/// A JavaScript view plugin: a module that defines `inputs` and `view`, run in Javy's QuickJS
+/// engine module.
 pub struct Script {
-    engine: Arc<JsEngine>,
+    engine: Arc<Module>,
     source: String,
 }
 
@@ -51,45 +34,45 @@ enum Answer {
 }
 
 impl Script {
-    pub fn new(engine: Arc<JsEngine>, source: &str) -> Script {
+    pub fn new(engine: Arc<Module>, source: &str) -> Script {
         Script {
             engine,
             source: format!("{source}\n{PRELUDE}\n{EPILOGUE}"),
         }
     }
 
-    /// The captured file paths the script reads.
-    pub fn inputs(&self) -> Result<Vec<String>, Fault> {
+    pub(in crate::plugin) fn limits(&self) -> &Limits {
+        &self.engine.limits
+    }
+
+    /// The paths the script's `inputs` names.
+    pub(in crate::plugin) fn inputs(&self) -> Result<Vec<String>, Fault> {
         match self.ask(b"{}".to_vec())? {
-            Answer::Inputs(paths) => asked_for(paths, &self.engine.limits),
+            Answer::Inputs(paths) => Ok(paths),
             Answer::View(_) => Err(Fault::Reply("a view, when asked for inputs".into())),
             Answer::Error(error) => Err(Fault::Refused(error)),
         }
     }
 
-    /// The script's view of `request`, checked against the view limits.
-    pub fn view(&self, request: &Request) -> Result<View, Fault> {
-        let asked = serde_json::to_vec(&serde_json::json!({ "view": request }))
+    /// What the script answers to `request`, asked under `key`.
+    pub(in crate::plugin) fn answer(
+        &self,
+        key: &str,
+        request: &impl Serialize,
+    ) -> Result<Reply, Fault> {
+        let asked = serde_json::to_vec(&HashMap::from([(key, request)]))
             .map_err(|e| Fault::Reply(e.to_string()))?;
         match self.ask(asked)? {
-            Answer::View(view) => {
-                view.check(&self.engine.limits.view)?;
-                Ok(view)
-            }
+            Answer::View(view) => Ok(Reply::View(view)),
             Answer::Inputs(_) => Err(Fault::Reply("inputs, when asked for a view".into())),
-            Answer::Error(error) => Err(Fault::Refused(error)),
+            Answer::Error(error) => Ok(Reply::Error(error)),
         }
     }
 
     /// Compiles the script in a fresh engine, runs it with `asked` on its standard input, and
     /// reads its answer from its standard output.
     fn ask(&self, asked: Vec<u8>) -> Result<Answer, Fault> {
-        let JsEngine {
-            engine,
-            module,
-            limits,
-        } = &*self.engine;
-        let mut call = start(engine, module, limits)?;
+        let mut call = self.engine.start()?;
         let export = |call: &crate::plugin::Call, name: &'static str| {
             call.instance
                 .get_func(&call.store, name)
@@ -139,9 +122,7 @@ impl Script {
             ));
         }
 
-        let held = call.store.data_mut();
-        held.input = asked;
-        held.taken = 0;
+        call.store.data_mut().hand(asked);
         invoke
             .call(&mut call.store, (code, code_len, 0, 0, 0))
             .map_err(|e| said(fault(e), &call.store))?;
@@ -149,7 +130,7 @@ impl Script {
         if held.overflowed {
             return Err(Fault::Reply(format!(
                 "over the {} bytes allowed",
-                limits.reply_bytes
+                self.engine.limits.reply_bytes
             )));
         }
         let Some(at) = held.output.iter().rposition(|byte| *byte == ANSWER) else {
@@ -165,13 +146,17 @@ mod tests {
 
     use crucible_view::{Draw, File, Node, Request};
 
-    use crate::plugin::{Fault, JsEngine, Limits, Script};
+    use crate::plugin::{Fault, Limits, Loaded, Module, Script};
 
-    fn engine() -> Arc<JsEngine> {
+    fn engine() -> Arc<Module> {
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/js-engine/plugin.wasm");
         let wasm = std::fs::read(path).expect("fetch it with `just desktop-js-engine`");
-        Arc::new(JsEngine::load(&wasm, Limits::DEFAULT).unwrap())
+        Arc::new(Module::load(&wasm, Limits::DEFAULT).unwrap())
+    }
+
+    fn loaded(engine: Arc<Module>, source: &str) -> Loaded {
+        Loaded::Js(Script::new(engine, source))
     }
 
     const COUNTS: &str = r#"
@@ -209,7 +194,7 @@ mod tests {
     #[test]
     #[ignore = "needs assets/js-engine/plugin.wasm from `just desktop-js-engine`"]
     fn a_script_names_its_inputs_and_draws_a_view_with_the_canvas() {
-        let script = Script::new(engine(), COUNTS);
+        let script = loaded(engine(), COUNTS);
         let started = std::time::Instant::now();
         assert_eq!(script.inputs().unwrap(), ["verdicts.json"]);
         let view = script.view(&request("[1, 2, 3]")).unwrap();
@@ -237,7 +222,7 @@ mod tests {
     #[test]
     #[ignore = "needs assets/js-engine/plugin.wasm from `just desktop-js-engine`"]
     fn the_canvas_records_transforms_baselines_widths_and_hints_under_the_browser_s_names() {
-        let script = Script::new(
+        let script = loaded(
             engine(),
             r#"
             export const inputs = [];
@@ -307,7 +292,7 @@ mod tests {
     #[test]
     #[ignore = "needs assets/js-engine/plugin.wasm from `just desktop-js-engine`"]
     fn a_script_that_does_not_compile_or_throws_says_why() {
-        let broken = Script::new(engine(), "export const inputs = [;");
+        let broken = loaded(engine(), "export const inputs = [;");
         let Err(Fault::Script(why)) = broken.inputs() else {
             panic!("a syntax error is a compile failure");
         };
@@ -316,14 +301,14 @@ mod tests {
             "{why}"
         );
 
-        let throws = Script::new(engine(), COUNTS);
+        let throws = loaded(engine(), COUNTS);
         let Err(Fault::Refused(why)) = throws.view(&request("not json")) else {
             panic!("a thrown error is the script's answer");
         };
         assert!(why.starts_with("SyntaxError"), "{why}");
         assert!(why.contains("at view (function.mjs:4:"), "{why}");
 
-        let missing = Script::new(engine(), "export const inputs = [];");
+        let missing = loaded(engine(), "export const inputs = [];");
         let Err(Fault::Refused(why)) = missing.view(&Request::default()) else {
             panic!("a script with no view function cannot answer");
         };
@@ -341,19 +326,19 @@ mod tests {
             fuel: 400_000_000,
             ..Limits::DEFAULT
         };
-        let spins = Script::new(
-            Arc::new(JsEngine::load(&wasm, tight).unwrap()),
+        let spins = loaded(
+            Arc::new(Module::load(&wasm, tight).unwrap()),
             "export const inputs = []; export function view() { for (;;) {} }",
         );
         assert_eq!(spins.view(&Request::default()), Err(Fault::Fuel));
 
-        let outside = Script::new(engine(), r#"export const inputs = ["../session.jsonl"];"#);
+        let outside = loaded(engine(), r#"export const inputs = ["../session.jsonl"];"#);
         assert_eq!(
             outside.inputs(),
             Err(Fault::Input("../session.jsonl".into()))
         );
 
-        let unknown = Script::new(
+        let unknown = loaded(
             engine(),
             r#"export const inputs = [];
                export function view() { return { title: "T", body: { script: { src: "x.js" } } }; }"#,
@@ -363,7 +348,7 @@ mod tests {
             Err(Fault::Reply(_))
         ));
 
-        let chatty = Script::new(
+        let chatty = loaded(
             engine(),
             r#"console.log("starting");
                export const inputs = ["a.json"];
@@ -375,7 +360,7 @@ mod tests {
         assert_eq!(chatty.inputs().unwrap(), ["a.json"]);
         assert_eq!(chatty.view(&Request::default()).unwrap().title, "T");
 
-        let reaches = Script::new(
+        let reaches = loaded(
             engine(),
             r#"export const inputs = [];
                export function view() {
@@ -399,7 +384,7 @@ mod tests {
                 return { title: "T", body: { table: {
                     id: "t", columns: [{ id: "c", title: "C" }], rows } } };
             }"#;
-        let script = Script::new(engine(), source);
+        let script = loaded(engine(), source);
         let view = script.view(&Request::default()).unwrap();
         let Node::Table { rows, .. } = &view.body else {
             panic!("the view is a table");
@@ -415,7 +400,7 @@ mod tests {
             reply_bytes: 1 << 20,
             ..Limits::DEFAULT
         };
-        let capped = Script::new(Arc::new(JsEngine::load(&wasm, small).unwrap()), source);
+        let capped = loaded(Arc::new(Module::load(&wasm, small).unwrap()), source);
         assert_eq!(
             capped.view(&Request::default()),
             Err(Fault::Reply("over the 1048576 bytes allowed".into()))
@@ -427,7 +412,7 @@ mod tests {
     fn a_script_s_formatted_cells_match_the_rust_constructors() {
         use crucible_view::Cell;
         let cases = include_str!("../../../crucible-view/js/formatted.json");
-        let script = Script::new(
+        let script = loaded(
             engine(),
             &format!(
                 r#"export const inputs = [];
@@ -478,7 +463,7 @@ mod tests {
     #[ignore = "needs assets/js-engine/plugin.wasm from `just desktop-js-engine`"]
     fn a_script_reads_params_as_plain_values_and_declares_controls() {
         use crucible_view::{Control, Param};
-        let script = Script::new(
+        let script = loaded(
             engine(),
             r#"export const inputs = [];
                export function view({ files, params }) {
@@ -525,7 +510,7 @@ mod tests {
             Control::range("min", "Min", [0.0, 10.0], 0.5, 7.5)
         );
 
-        let twice = Script::new(
+        let twice = loaded(
             engine(),
             r#"export const inputs = [];
                export function view() {

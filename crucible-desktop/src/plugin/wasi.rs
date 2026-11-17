@@ -6,7 +6,7 @@
 //! Each call charges fuel for the bytes it moves and refuses a list of more than [`BUFFERS`]
 //! buffers.
 
-use wasmi::{Caller, Error, Extern, Linker, Memory, TrapCode, errors::LinkerError};
+use wasmi::{Caller, Error, Extern, Linker, Memory, StoreLimits, TrapCode, errors::LinkerError};
 
 pub const MODULE: &str = "wasi_snapshot_preview1";
 
@@ -35,24 +35,86 @@ const BUFFERS: u32 = 1024;
 const CALL: u64 = 100;
 const BUFFER: u64 = 16;
 
-/// What one call keeps for its plugin.
-pub trait Guest {
+/// The most of a plugin's output a fault quotes.
+const SAID: usize = 2048;
+
+/// One call's limits, what the plugin reads and has written, and its clock.
+pub struct Held {
+    pub limits: StoreLimits,
+    /// The plugin's standard input, and how much of it has been read.
+    input: Vec<u8>,
+    taken: usize,
+    /// The plugin's standard output, up to `output_limit` bytes; `overflowed` past that.
+    pub output: Vec<u8>,
+    output_limit: usize,
+    pub overflowed: bool,
+    /// The start of the plugin's standard error.
+    pub said: Vec<u8>,
+    clock: u64,
+}
+
+impl Held {
+    /// Nothing on standard input, and room for `output_limit` bytes on standard output.
+    pub fn new(limits: StoreLimits, output_limit: usize) -> Held {
+        Held {
+            limits,
+            input: Vec::new(),
+            taken: 0,
+            output: Vec::new(),
+            output_limit,
+            overflowed: false,
+            said: Vec::new(),
+            clock: 1_000_000_000,
+        }
+    }
+
+    /// Puts `input` on the plugin's standard input, to be read from its start.
+    pub fn hand(&mut self, input: Vec<u8>) {
+        self.input = input;
+        self.taken = 0;
+    }
+
     /// How many more bytes descriptor `fd` keeps: 1 is the plugin's standard output, anything
     /// else its standard error.
-    fn room(&self, fd: i32) -> usize;
+    fn room(&self, fd: i32) -> usize {
+        if fd == 1 {
+            self.output_limit.saturating_sub(self.output.len())
+        } else {
+            SAID.saturating_sub(self.said.len())
+        }
+    }
 
     /// Takes `bytes`, as much as there was room for of a write of `whole` bytes to `fd`.
-    fn write(&mut self, fd: i32, bytes: &[u8], whole: usize);
+    fn write(&mut self, fd: i32, bytes: &[u8], whole: usize) {
+        let kept = &bytes[..bytes.len().min(self.room(fd))];
+        if fd == 1 {
+            self.overflowed |= whole > kept.len();
+            self.output.extend_from_slice(kept);
+        } else {
+            self.said.extend_from_slice(kept);
+        }
+    }
 
     /// How much of the plugin's standard input is left to read.
-    fn unread(&self) -> usize;
+    fn unread(&self) -> usize {
+        self.input.len().saturating_sub(self.taken)
+    }
 
     /// Fills `buffer` from the plugin's standard input and returns how much it filled; zero at
     /// the end.
-    fn read(&mut self, buffer: &mut [u8]) -> usize;
+    fn read(&mut self, buffer: &mut [u8]) -> usize {
+        let rest = &self.input[self.taken.min(self.input.len())..];
+        let filled = rest.len().min(buffer.len());
+        buffer[..filled].copy_from_slice(&rest[..filled]);
+        self.taken += filled;
+        filled
+    }
 
     /// The clock's next reading in nanoseconds: later than the last, and never zero.
-    fn tick(&mut self) -> u64;
+    fn tick(&mut self) -> u64 {
+        self.clock += 1_000_000;
+        self.clock
+    }
 }
 
 /// Whether the host answers the WASI call `name`.
@@ -61,7 +123,7 @@ pub fn offers(name: &str) -> bool {
 }
 
 /// Takes `fuel` from the call, trapping as the interpreter does when there is not enough.
-fn charge<T>(caller: &mut Caller<'_, T>, fuel: u64) -> Result<(), Error> {
+fn charge(caller: &mut Caller<'_, Held>, fuel: u64) -> Result<(), Error> {
     match caller.get_fuel()?.checked_sub(fuel) {
         Some(left) => caller.set_fuel(left),
         None => {
@@ -71,14 +133,14 @@ fn charge<T>(caller: &mut Caller<'_, T>, fuel: u64) -> Result<(), Error> {
     }
 }
 
-fn memory<T>(caller: &Caller<'_, T>) -> Option<Memory> {
+fn memory(caller: &Caller<'_, Held>) -> Option<Memory> {
     match caller.get_export("memory")? {
         Extern::Memory(memory) => Some(memory),
         _ => None,
     }
 }
 
-fn write<T>(caller: &mut Caller<'_, T>, at: u32, bytes: &[u8]) -> i32 {
+fn write(caller: &mut Caller<'_, Held>, at: u32, bytes: &[u8]) -> i32 {
     let Some(memory) = memory(caller) else {
         return FAULT;
     };
@@ -89,7 +151,7 @@ fn write<T>(caller: &mut Caller<'_, T>, at: u32, bytes: &[u8]) -> i32 {
 }
 
 /// The address and length of buffer `i` of the list at `list`.
-fn buffer<T>(caller: &Caller<'_, T>, list: u32, i: u32) -> Option<(u32, u32)> {
+fn buffer(caller: &Caller<'_, Held>, list: u32, i: u32) -> Option<(u32, u32)> {
     let mut pair = [0; 8];
     let entry = list.wrapping_add(i.wrapping_mul(8));
     memory(caller)?
@@ -102,7 +164,7 @@ fn buffer<T>(caller: &Caller<'_, T>, list: u32, i: u32) -> Option<(u32, u32)> {
 }
 
 /// Zero for each of two counts.
-fn none<T>(mut caller: Caller<'_, T>, count: i32, size: i32) -> Result<i32, Error> {
+fn none(mut caller: Caller<'_, Held>, count: i32, size: i32) -> Result<i32, Error> {
     charge(&mut caller, CALL)?;
     Ok(match write(&mut caller, count as u32, &[0; 4]) {
         OK => write(&mut caller, size as u32, &[0; 4]),
@@ -110,10 +172,10 @@ fn none<T>(mut caller: Caller<'_, T>, count: i32, size: i32) -> Result<i32, Erro
     })
 }
 
-/// Hands the `count` buffers listed at `list` to the plugin's [`Guest`], as far as it has
+/// Hands the `count` buffers listed at `list` to the plugin's [`Held`], as far as it has
 /// room, and reports them all written.
-fn fd_write<T: Guest>(
-    mut caller: Caller<'_, T>,
+fn fd_write(
+    mut caller: Caller<'_, Held>,
     fd: i32,
     list: i32,
     count: i32,
@@ -146,8 +208,8 @@ fn fd_write<T: Guest>(
 
 /// Fills the `count` buffers listed at `list` from the plugin's standard input, stopping at the
 /// first it cannot fill.
-fn fd_read<T: Guest>(
-    mut caller: Caller<'_, T>,
+fn fd_read(
+    mut caller: Caller<'_, Held>,
     fd: i32,
     list: i32,
     count: i32,
@@ -181,7 +243,7 @@ fn fd_read<T: Guest>(
     Ok(write(&mut caller, got as u32, &total.to_le_bytes()))
 }
 
-fn random_get<T>(mut caller: Caller<'_, T>, at: i32, len: i32) -> Result<i32, Error> {
+fn random_get(mut caller: Caller<'_, Held>, at: i32, len: i32) -> Result<i32, Error> {
     const CHUNK: [u8; 4096] = [0x5a; 4096];
     let (at, len) = (at as u32, len as u32);
     charge(&mut caller, CALL + u64::from(len))?;
@@ -197,17 +259,17 @@ fn random_get<T>(mut caller: Caller<'_, T>, at: i32, len: i32) -> Result<i32, Er
 }
 
 /// A call that does nothing but answer `answer`.
-fn fixed<T>(caller: &mut Caller<'_, T>, answer: i32) -> Result<i32, Error> {
+fn fixed(caller: &mut Caller<'_, Held>, answer: i32) -> Result<i32, Error> {
     charge(caller, CALL)?;
     Ok(answer)
 }
 
-pub fn link<T: Guest + 'static>(linker: &mut Linker<T>) -> Result<(), LinkerError> {
+pub fn link(linker: &mut Linker<Held>) -> Result<(), LinkerError> {
     linker
         .func_wrap(
             MODULE,
             "clock_time_get",
-            |mut caller: Caller<'_, T>, _clock: i32, _precision: i64, time: i32| {
+            |mut caller: Caller<'_, Held>, _clock: i32, _precision: i64, time: i32| {
                 charge(&mut caller, CALL)?;
                 let now = caller.data_mut().tick();
                 Ok::<i32, Error>(write(&mut caller, time as u32, &now.to_le_bytes()))
@@ -216,29 +278,31 @@ pub fn link<T: Guest + 'static>(linker: &mut Linker<T>) -> Result<(), LinkerErro
         .func_wrap(
             MODULE,
             "environ_get",
-            |mut caller: Caller<'_, T>, _: i32, _: i32| fixed(&mut caller, OK),
+            |mut caller: Caller<'_, Held>, _: i32, _: i32| fixed(&mut caller, OK),
         )?
-        .func_wrap(MODULE, "environ_sizes_get", none::<T>)?
-        .func_wrap(MODULE, "fd_close", |mut caller: Caller<'_, T>, _: i32| {
-            fixed(&mut caller, BAD_DESCRIPTOR)
-        })?
+        .func_wrap(MODULE, "environ_sizes_get", none)?
+        .func_wrap(
+            MODULE,
+            "fd_close",
+            |mut caller: Caller<'_, Held>, _: i32| fixed(&mut caller, BAD_DESCRIPTOR),
+        )?
         .func_wrap(
             MODULE,
             "fd_fdstat_get",
-            |mut caller: Caller<'_, T>, _: i32, _: i32| fixed(&mut caller, BAD_DESCRIPTOR),
+            |mut caller: Caller<'_, Held>, _: i32, _: i32| fixed(&mut caller, BAD_DESCRIPTOR),
         )?
-        .func_wrap(MODULE, "fd_read", fd_read::<T>)?
+        .func_wrap(MODULE, "fd_read", fd_read)?
         .func_wrap(
             MODULE,
             "fd_seek",
-            |mut caller: Caller<'_, T>, _: i32, _: i64, _: i32, _: i32| {
+            |mut caller: Caller<'_, Held>, _: i32, _: i64, _: i32, _: i32| {
                 fixed(&mut caller, NOT_SEEKABLE)
             },
         )?
-        .func_wrap(MODULE, "fd_write", fd_write::<T>)?
+        .func_wrap(MODULE, "fd_write", fd_write)?
         .func_wrap(MODULE, "proc_exit", |code: i32| -> Result<(), Error> {
             Err(Error::i32_exit(code))
         })?
-        .func_wrap(MODULE, "random_get", random_get::<T>)?;
+        .func_wrap(MODULE, "random_get", random_get)?;
     Ok(())
 }

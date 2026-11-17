@@ -22,7 +22,7 @@ use base64::Engine;
 use crate::Selection;
 use crate::captured::{Captured, SHOWN_BYTES};
 use crate::pack::PackFiles;
-use crate::plugin::{JsEngine, Limits, Loaded, Plugin, Script};
+use crate::plugin::{Limits, Loaded, Module, Script};
 
 /// Where a pack keeps its view plugins.
 const PLUGINS: &str = "ui";
@@ -39,8 +39,6 @@ pub const READ_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Report {
-    /// The plugin's file name without `.wasm`, `.wasm.b64` or `.view.wasm`.
-    pub name: String,
     /// The task that wrote the plugin during the run; `None` for the pack's own.
     pub author: Option<String>,
     /// What the plugin was asked with.
@@ -69,37 +67,49 @@ pub struct Built {
     pub report: Arc<Report>,
 }
 
+/// How a plugin's file holds it, from the file's name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Form {
+    Wasm,
+    Encoded,
+    Script,
+}
+
+impl Form {
+    fn of(name: &str) -> Option<Form> {
+        if name.ends_with(ENCODED) {
+            Some(Form::Encoded)
+        } else if name.ends_with(".wasm") {
+            Some(Form::Wasm)
+        } else if name.ends_with(SCRIPT) {
+            Some(Form::Script)
+        } else {
+            None
+        }
+    }
+}
+
+/// The form of the plugin a pack keeps at `path`, a path inside the pack.
+fn pack_plugin(path: &str) -> Option<Form> {
+    path.strip_prefix(PLUGINS)?
+        .strip_prefix('/')
+        .filter(|name| !name.contains('/'))
+        .and_then(Form::of)
+}
+
 /// The plugin a controller's pack carries as text, base64 or JavaScript: its path and that
 /// text. The first by path.
 pub fn text_plugin(pack: &PackFiles) -> Option<(&str, &str)> {
     pack.files
         .iter()
-        .filter(|file| {
-            file.path
-                .strip_prefix(PLUGINS)
-                .and_then(|rest| rest.strip_prefix('/'))
-                .is_some_and(|name| {
-                    !name.contains('/') && (name.ends_with(ENCODED) || name.ends_with(SCRIPT))
-                })
-        })
+        .filter(|file| pack_plugin(&file.path).is_some_and(|form| form != Form::Wasm))
         .filter_map(|file| Some((file.path.as_str(), file.text.as_deref()?)))
         .min_by_key(|(path, _)| *path)
 }
 
-/// A plugin's name from its path.
-pub fn name_of(path: &str) -> String {
-    let file = path.rsplit('/').next().unwrap_or(path);
-    WRITTEN
-        .iter()
-        .chain(&[ENCODED, ".wasm", SCRIPT])
-        .find_map(|suffix| file.strip_suffix(suffix))
-        .unwrap_or(file)
-        .to_string()
-}
-
 /// The engine JavaScript plugins run in: the module `CRUCIBLE_JS_ENGINE` names, else the one
 /// `just desktop-js-engine` fetches into this crate's assets.
-pub fn js_engine() -> Result<Arc<JsEngine>, String> {
+pub fn js_engine() -> Result<Arc<Module>, String> {
     let path = std::env::var_os("CRUCIBLE_JS_ENGINE")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -107,30 +117,39 @@ pub fn js_engine() -> Result<Arc<JsEngine>, String> {
         });
     let wasm = fs::read(&path)
         .map_err(|e| format!("reading the JavaScript engine {}: {e}", path.display()))?;
-    JsEngine::load(&wasm, Limits::DEFAULT)
+    Module::load(&wasm, Limits::DEFAULT)
         .map(Arc::new)
         .map_err(|fault| fault.to_string())
 }
 
 /// The plugin `bytes` hold, in the form `path` names, and the captured file paths it reads.
 pub fn load(path: &str, bytes: &[u8]) -> Result<(Loaded, Vec<String>), String> {
-    let plugin = if path.ends_with(SCRIPT) {
-        Loaded::Js(Script::new(js_engine()?, &String::from_utf8_lossy(bytes)))
-    } else {
-        let decoded;
-        let wasm = if path.ends_with(ENCODED) {
+    let plugin = match Form::of(path) {
+        Some(Form::Script) => {
+            Loaded::Js(Script::new(js_engine()?, &String::from_utf8_lossy(bytes)))
+        }
+        Some(Form::Encoded) => {
             let packed: String = String::from_utf8_lossy(bytes).split_whitespace().collect();
-            decoded = base64::engine::general_purpose::STANDARD
+            let wasm = base64::engine::general_purpose::STANDARD
                 .decode(packed)
                 .map_err(|e| format!("the plugin is not base64: {e}"))?;
-            decoded.as_slice()
-        } else {
-            bytes
-        };
-        Loaded::Wasm(Plugin::load(wasm, Limits::DEFAULT).map_err(|f| f.to_string())?)
+            Loaded::Wasm(Module::load(&wasm, Limits::DEFAULT).map_err(|f| f.to_string())?)
+        }
+        Some(Form::Wasm) | None => {
+            Loaded::Wasm(Module::load(bytes, Limits::DEFAULT).map_err(|f| f.to_string())?)
+        }
     };
     let inputs = plugin.inputs().map_err(|f| f.to_string())?;
     Ok((plugin, inputs))
+}
+
+/// Refuses `files`, each named with its size, when one holds more than [`SHOWN_BYTES`] or all
+/// together more than [`READ_BYTES`].
+pub fn admit(files: &[(String, u64)]) -> Result<(), String> {
+    if let Some((name, size)) = files.iter().find(|(_, size)| *size > SHOWN_BYTES) {
+        return Err(format!("{name} is {size} bytes, more than a view reads."));
+    }
+    readable(files.iter().map(|(_, size)| *size))
 }
 
 /// Refuses files of `sizes` that together hold more than [`READ_BYTES`].
@@ -199,9 +218,7 @@ fn plugin_file(pack: &Path) -> Option<PathBuf> {
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    name.ends_with(".wasm") || name.ends_with(ENCODED) || name.ends_with(SCRIPT)
-                })
+                .is_some_and(|name| Form::of(name).is_some())
         })
         .collect();
     found.sort();
@@ -272,14 +289,14 @@ fn build(
     files: &[(String, String, PathBuf)],
     params: &BTreeMap<String, Param>,
 ) -> Result<View, String> {
-    let size = |path: &PathBuf| fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
-    if let Some((task, input, path)) = files.iter().find(|(.., path)| size(path) > SHOWN_BYTES) {
-        return Err(format!(
-            "{task}/{input} is {} bytes, more than a view reads.",
-            size(path)
-        ));
-    }
-    readable(files.iter().map(|(.., path)| size(path)))?;
+    let sized: Vec<(String, u64)> = files
+        .iter()
+        .map(|(task, input, path)| {
+            let size = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+            (format!("{task}/{input}"), size)
+        })
+        .collect();
+    admit(&sized)?;
     let mut read = Vec::new();
     for (task, input, path) in files {
         let text = fs::read_to_string(path).map_err(|e| format!("reading {task}/{input}: {e}"))?;
@@ -297,7 +314,6 @@ fn build(
 #[derive(Default)]
 pub struct Reporter {
     plugin: Option<Mark>,
-    author: Option<String>,
     loaded: Option<Result<(Loaded, Vec<String>), String>>,
     read: Vec<Mark>,
     params: BTreeMap<String, Param>,
@@ -325,7 +341,6 @@ impl Reporter {
         };
         let plugin = file.and_then(|path| mark(&path));
         let reloaded = plugin != self.plugin;
-        self.author = author;
         if reloaded {
             self.loaded = plugin.as_ref().map(|(path, ..)| {
                 let bytes =
@@ -334,11 +349,10 @@ impl Reporter {
             });
             self.plugin = plugin;
         }
-        let (Some((path, ..)), Some(loaded)) = (&self.plugin, &self.loaded) else {
+        let Some(loaded) = &self.loaded else {
             self.read.clear();
             return self.report.take().is_some();
         };
-        let name = name_of(&path.to_string_lossy());
         let view = match loaded {
             Err(error) => {
                 if !reloaded {
@@ -358,8 +372,7 @@ impl Reporter {
             }
         };
         let report = Report {
-            name,
-            author: self.author.clone(),
+            author,
             params: self.params.clone(),
             view,
         };
@@ -657,20 +670,7 @@ impl Shown {
             Node::Stack { children } => children.iter().any(|child| self.fills(child)),
             Node::Section { id, open, body, .. } => self.open(id, *open) && self.fills(body),
             Node::Tabs { .. } | Node::Table { .. } => true,
-            Node::Columns { .. }
-            | Node::Stats { .. }
-            | Node::Meter { .. }
-            | Node::Bars { .. }
-            | Node::Plot { .. }
-            | Node::Histogram { .. }
-            | Node::Heatmap { .. }
-            | Node::Flow { .. }
-            | Node::Canvas { .. }
-            | Node::Grid { .. }
-            | Node::Text { .. }
-            | Node::Note { .. }
-            | Node::Markdown { .. }
-            | Node::Mermaid { .. } => false,
+            _ => false,
         }
     }
 
@@ -682,20 +682,7 @@ impl Shown {
                 self.open(id, *open).then(|| self.table_in(body)).flatten()
             }
             Node::Table { id, columns, rows } => Some(Table { id, columns, rows }),
-            Node::Columns { .. }
-            | Node::Stats { .. }
-            | Node::Meter { .. }
-            | Node::Bars { .. }
-            | Node::Plot { .. }
-            | Node::Histogram { .. }
-            | Node::Heatmap { .. }
-            | Node::Flow { .. }
-            | Node::Canvas { .. }
-            | Node::Grid { .. }
-            | Node::Text { .. }
-            | Node::Note { .. }
-            | Node::Markdown { .. }
-            | Node::Mermaid { .. } => None,
+            _ => None,
         }
     }
 
@@ -794,9 +781,9 @@ mod tests {
     use std::sync::Arc;
 
     use crate::Selection;
-    use crate::captured::Captured;
+    use crate::captured::{Captured, SHOWN_BYTES};
     use crate::report::{
-        READ_BYTES, Report, Reporter, Shown, Table, file_named, readable, task_named,
+        READ_BYTES, Report, Reporter, Shown, Table, admit, file_named, readable, task_named,
     };
 
     fn example() -> std::path::PathBuf {
@@ -857,9 +844,6 @@ mod tests {
         );
         let none = crate::pack::PackFiles::new("x".into(), [("ui/a.wasm".to_string(), None)]);
         assert_eq!(crate::report::text_plugin(&none), None);
-        assert_eq!(crate::report::name_of("ui/report.wasm.b64"), "report");
-        assert_eq!(crate::report::name_of("ui/report.wasm"), "report");
-        assert_eq!(crate::report::name_of("report"), "report");
     }
 
     #[test]
@@ -877,7 +861,6 @@ mod tests {
         capture(dir.path(), "triage-go", "go");
         let mut reporter = Reporter::default();
         assert!(reporter.refresh(dir.path()));
-        assert_eq!(reporter.report().unwrap().name, "report");
         assert_eq!(triaged(&reporter), "34");
     }
 
@@ -907,46 +890,21 @@ mod tests {
         found
     }
 
+    /// The name `value` is written under.
+    fn tag(value: &impl serde::Serialize) -> String {
+        let written = serde_json::to_value(value).unwrap();
+        let mut keys = written.as_object().unwrap().keys();
+        let name = keys.next().unwrap().clone();
+        assert_eq!(keys.next(), None);
+        name
+    }
+
     fn component_names(node: &Node, names: &mut std::collections::BTreeSet<&'static str>) {
-        let name = match node {
-            Node::Stack { children } => {
-                for child in children {
-                    component_names(child, names);
-                }
-                "stack"
-            }
-            Node::Columns { children } => {
-                for child in children {
-                    component_names(child, names);
-                }
-                "columns"
-            }
-            Node::Section { body, .. } => {
-                component_names(body, names);
-                "section"
-            }
-            Node::Tabs { tabs, .. } => {
-                for tab in tabs {
-                    component_names(&tab.body, names);
-                }
-                "tabs"
-            }
-            Node::Stats { .. } => "stats",
-            Node::Meter { .. } => "meter",
-            Node::Bars { .. } => "bars",
-            Node::Plot { .. } => "plot",
-            Node::Histogram { .. } => "histogram",
-            Node::Heatmap { .. } => "heatmap",
-            Node::Flow { .. } => "flow",
-            Node::Canvas { .. } => "canvas",
-            Node::Grid { .. } => "grid",
-            Node::Table { .. } => "table",
-            Node::Text { .. } => "text",
-            Node::Note { .. } => "note",
-            Node::Markdown { .. } => "markdown",
-            Node::Mermaid { .. } => "mermaid",
-        };
-        names.insert(name);
+        assert_eq!(tag(node), node.name());
+        names.insert(node.name());
+        for child in node.children() {
+            component_names(child, names);
+        }
     }
 
     #[test]
@@ -958,11 +916,10 @@ mod tests {
             if word == "controls" {
                 let controls: Vec<crucible_view::Control> =
                     serde_json::from_str(&json).unwrap_or_else(|e| panic!("{e}: {json}"));
-                kinds.extend(controls.iter().map(|control| match control {
-                    crucible_view::Control::Select { .. } => "select",
-                    crucible_view::Control::Toggle { .. } => "toggle",
-                    crucible_view::Control::Range { .. } => "range",
-                }));
+                for control in &controls {
+                    assert_eq!(tag(control), control.kind(), "{json}");
+                }
+                kinds.extend(controls.iter().map(crucible_view::Control::kind));
                 let view = View {
                     title: "T".into(),
                     body: Node::Stats { items: vec![] },
@@ -981,6 +938,13 @@ mod tests {
             };
             view.check(&limits)
                 .unwrap_or_else(|e| panic!("{e}: {json}"));
+        }
+        let typed = include_str!("../../crucible-view/js/crucible-view.d.ts");
+        for name in names.iter().chain(&kinds) {
+            assert!(
+                typed.contains(&format!("{name}: {{")),
+                "the types name {name}"
+            );
         }
         assert_eq!(
             names.into_iter().collect::<Vec<_>>(),
@@ -1045,7 +1009,6 @@ mod tests {
         let mut reporter = Reporter::default();
         assert!(reporter.refresh(dir.path()));
         let report = reporter.report().unwrap();
-        assert_eq!(report.name, "report");
         assert_eq!(
             report.view,
             Err("No task has captured verdicts.json yet.".into())
@@ -1092,10 +1055,7 @@ mod tests {
         .unwrap();
         assert!(reporter.refresh(dir.path()));
         let report = reporter.report().unwrap();
-        assert_eq!(
-            (report.name.as_str(), report.author.as_deref()),
-            ("mine", Some("explain"))
-        );
+        assert_eq!(report.author.as_deref(), Some("explain"));
         assert_eq!(triaged(&reporter), "34");
         assert!(!reporter.refresh(dir.path()), "nothing changed");
 
@@ -1137,16 +1097,12 @@ mod tests {
                 panic!("the view is its stats");
             };
             (
-                report.name.clone(),
                 report.author.clone(),
                 view.title.clone(),
                 items[0].value.clone(),
             )
         };
-        assert_eq!(
-            rows(&reporter),
-            ("summary".into(), None, "From the pack".into(), "34".into())
-        );
+        assert_eq!(rows(&reporter), (None, "From the pack".into(), "34".into()));
 
         let written = dir.path().join("state/files/explain");
         fs::create_dir_all(&written).unwrap();
@@ -1154,12 +1110,7 @@ mod tests {
         assert!(reporter.refresh(dir.path()));
         assert_eq!(
             rows(&reporter),
-            (
-                "report".into(),
-                Some("explain".into()),
-                "From the task".into(),
-                "34".into()
-            )
+            (Some("explain".into()), "From the task".into(), "34".into())
         );
 
         fs::write(written.join("report.view.js"), "export const inputs = [;").unwrap();
@@ -1614,7 +1565,6 @@ mod tests {
         let report = |names: &[&str]| {
             Arc::new(Report {
                 params: Default::default(),
-                name: "report".into(),
                 author: None,
                 view: Ok(View {
                     controls: vec![],
@@ -1744,7 +1694,6 @@ mod tests {
             tabs[1].body = table("all", names);
             Arc::new(Report {
                 params: Default::default(),
-                name: "report".into(),
                 author: None,
                 view: Ok(view),
             })
@@ -1773,7 +1722,6 @@ mod tests {
 
         let failed = Arc::new(Report {
             params: Default::default(),
-            name: "report".into(),
             author: None,
             view: Err("torn".into()),
         });
@@ -1826,6 +1774,23 @@ mod tests {
         let over = readable([READ_BYTES, 1].into_iter()).unwrap_err();
         assert!(over.contains("33554433 bytes"), "{over}");
         assert!(readable([u64::MAX, u64::MAX].into_iter()).is_err());
+        let sized = |sizes: &[u64]| -> Vec<(String, u64)> {
+            sizes
+                .iter()
+                .enumerate()
+                .map(|(i, size)| (format!("t/{i}.json"), *size))
+                .collect()
+        };
+        assert_eq!(admit(&sized(&[SHOWN_BYTES, SHOWN_BYTES])), Ok(()));
+        assert_eq!(
+            admit(&sized(&[1, SHOWN_BYTES + 1])),
+            Err(format!(
+                "t/1.json is {} bytes, more than a view reads.",
+                SHOWN_BYTES + 1
+            ))
+        );
+        let over = admit(&sized(&[SHOWN_BYTES; 5])).unwrap_err();
+        assert!(over.starts_with("The files this view reads hold"), "{over}");
 
         let dir = pack();
         for task in ["a", "b", "c", "d", "e"] {
@@ -2088,7 +2053,6 @@ mod tests {
 
     fn controlled(controls: Vec<crucible_view::Control>) -> Arc<Report> {
         Arc::new(Report {
-            name: "report".into(),
             author: None,
             params: Default::default(),
             view: Ok(View {
@@ -2188,7 +2152,6 @@ mod tests {
         );
 
         let failed = Arc::new(Report {
-            name: "report".into(),
             author: None,
             params: Default::default(),
             view: Err("torn".into()),

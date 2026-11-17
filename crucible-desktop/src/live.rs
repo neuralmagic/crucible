@@ -446,7 +446,6 @@ impl Action {
                 let view = build_report(&c, dirs.files.as_deref(), &wanted, plugin, listed).await;
                 Reply::Report(crate::report::Built {
                     report: Arc::new(crate::report::Report {
-                        name: crate::report::name_of(&wanted.plugin.0),
                         author: None,
                         params: wanted.params.clone(),
                         view,
@@ -503,7 +502,6 @@ impl Action {
             }),
             Action::Report { wanted, .. } => Reply::Report(crate::report::Built {
                 report: Arc::new(crate::report::Report {
-                    name: crate::report::name_of(&wanted.plugin.0),
                     author: None,
                     params: wanted.params.clone(),
                     view: Err(why),
@@ -766,13 +764,11 @@ async fn build_report(
         .iter()
         .filter(|file| inputs.contains(&file.path))
         .collect();
-    if let Some(file) = asked.iter().find(|file| !file.shown()) {
-        return Err(format!(
-            "{} is {} bytes, more than a view reads.",
-            file.key, file.size
-        ));
-    }
-    crate::report::readable(asked.iter().map(|file| file.size))?;
+    let sized: Vec<(String, u64)> = asked
+        .iter()
+        .map(|file| (file.key.clone(), file.size))
+        .collect();
+    crate::report::admit(&sized)?;
     let mut read = Vec::new();
     for file in asked {
         let kept = file_on_disk(files, &wanted.run, &file.key)
@@ -2942,7 +2938,6 @@ mod tests {
 
         client.report(wanted("r1", false), plugin.clone(), listed.clone());
         let first = built(&wanted("r1", false));
-        assert_eq!(first.report.name, "report");
         assert_eq!(triaged(&first), "64");
         let fetched = asked.lock().unwrap().clone();
         assert_eq!(fetched.len(), 2, "{fetched:?}");

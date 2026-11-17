@@ -6,48 +6,13 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::process::ExitCode;
 
-use crucible_view::{Control, Limits, Node, Reply, View};
+use crucible_view::{Limits, Node, Reply, View};
 
 fn count(node: &Node, counts: &mut BTreeMap<&'static str, usize>) {
-    let name = match node {
-        Node::Stack { children } => {
-            for child in children {
-                count(child, counts);
-            }
-            "stack"
-        }
-        Node::Columns { children } => {
-            for child in children {
-                count(child, counts);
-            }
-            "columns"
-        }
-        Node::Section { body, .. } => {
-            count(body, counts);
-            "section"
-        }
-        Node::Tabs { tabs, .. } => {
-            for tab in tabs {
-                count(&tab.body, counts);
-            }
-            "tabs"
-        }
-        Node::Stats { .. } => "stats",
-        Node::Meter { .. } => "meter",
-        Node::Bars { .. } => "bars",
-        Node::Plot { .. } => "plot",
-        Node::Histogram { .. } => "histogram",
-        Node::Heatmap { .. } => "heatmap",
-        Node::Flow { .. } => "flow",
-        Node::Canvas { .. } => "canvas",
-        Node::Grid { .. } => "grid",
-        Node::Table { .. } => "table",
-        Node::Text { .. } => "text",
-        Node::Note { .. } => "note",
-        Node::Markdown { .. } => "markdown",
-        Node::Mermaid { .. } => "mermaid",
-    };
-    *counts.entry(name).or_default() += 1;
+    *counts.entry(node.name()).or_default() += 1;
+    for child in node.children() {
+        count(child, counts);
+    }
 }
 
 fn checked(input: &str) -> Result<String, String> {
@@ -63,12 +28,7 @@ fn checked(input: &str) -> Result<String, String> {
     let mut counts = BTreeMap::new();
     count(&view.body, &mut counts);
     for control in &view.controls {
-        let kind = match control {
-            Control::Select { .. } => "select",
-            Control::Toggle { .. } => "toggle",
-            Control::Range { .. } => "range",
-        };
-        *counts.entry(kind).or_default() += 1;
+        *counts.entry(control.kind()).or_default() += 1;
     }
     let parts: Vec<String> = counts
         .into_iter()

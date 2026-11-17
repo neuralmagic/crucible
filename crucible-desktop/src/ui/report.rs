@@ -81,26 +81,10 @@ const CARD: f32 = 24.0;
 
 /// The width `node` draws at when it has the room: its widest canvas or flow.
 fn least_width(node: &Node) -> f32 {
-    let widest =
-        |nodes: &mut dyn Iterator<Item = &Node>| nodes.map(least_width).fold(0.0, f32::max);
     match node {
-        Node::Stack { children } | Node::Columns { children } => widest(&mut children.iter()),
-        Node::Section { body, .. } => least_width(body),
-        Node::Tabs { tabs, .. } => widest(&mut tabs.iter().map(|tab| &tab.body)),
         Node::Canvas { width, .. } => *width,
         Node::Flow { .. } => flow::WIDTH + CARD,
-        Node::Stats { .. }
-        | Node::Meter { .. }
-        | Node::Bars { .. }
-        | Node::Plot { .. }
-        | Node::Histogram { .. }
-        | Node::Heatmap { .. }
-        | Node::Grid { .. }
-        | Node::Table { .. }
-        | Node::Text { .. }
-        | Node::Note { .. }
-        | Node::Markdown { .. }
-        | Node::Mermaid { .. } => 0.0,
+        _ => node.children().map(least_width).fold(0.0, f32::max),
     }
 }
 
