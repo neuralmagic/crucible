@@ -5,7 +5,7 @@
 //! side catches what it can say before a round trip: a missing required field, a number that
 //! is not one, a ceiling over the admin cap.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Map, Value};
 
@@ -41,6 +41,10 @@ pub struct Offer {
     pub allow_other: bool,
     /// What the empty field shows for each value of a key field (`x-placeholder-snapshot`).
     pub placeholder: Option<Keyed<String>>,
+    /// Several of the values may be picked, each launching its own run (`x-fan-out`).
+    pub fan_out: bool,
+    /// The fields whose answer keys this one's choices, placeholder or confirmation.
+    pub keys: Vec<String>,
 }
 
 /// Choices a task output computed: one list, or one per value of a key field.
@@ -101,6 +105,7 @@ pub fn fields(schema: &Value) -> Vec<Field> {
                 (None, Some("number")) => Kind::Number,
                 _ => Kind::Text,
             };
+            let offer = offer(prop, props);
             Some(Field {
                 name: name.to_string(),
                 required: required.contains(&name),
@@ -114,11 +119,13 @@ pub fn fields(schema: &Value) -> Vec<Field> {
                     .map(text_of)
                     .unwrap_or_else(|| match kind {
                         Kind::Bool => "false".to_string(),
-                        Kind::Choice(ref values) => values.first().cloned().unwrap_or_default(),
+                        Kind::Choice(ref values) if !offer.fan_out => {
+                            values.first().cloned().unwrap_or_default()
+                        }
                         _ => String::new(),
                     }),
                 kind,
-                offer: offer(prop, props),
+                offer,
             })
         })
         .collect()
@@ -154,6 +161,10 @@ fn offer(prop: &Value, props: &Map<String, Value>) -> Offer {
             })?,
         })
     });
+    let keys = ["x-choices-from", "x-placeholder-from", "x-confirm-from"]
+        .iter()
+        .filter_map(|source| keyed_by(prop.get(*source)?, props)?)
+        .collect();
     Offer {
         enabled_by,
         snapshot,
@@ -162,6 +173,8 @@ fn offer(prop: &Value, props: &Map<String, Value>) -> Offer {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         placeholder,
+        fan_out: prop.get("x-fan-out").and_then(Value::as_bool) == Some(true),
+        keys,
     }
 }
 
@@ -259,22 +272,245 @@ fn text_of(value: &Value) -> String {
     }
 }
 
-/// What is wrong with one field's answer, by field index.
-pub type Problems = Vec<(usize, String)>;
+/// What is wrong with one field's answer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Problem {
+    pub field: usize,
+    /// The picked value whose answer it is, for a field set per picked value.
+    pub value: Option<String>,
+    pub why: String,
+}
+
+/// The fan-out field, by index.
+pub fn fan_out(fields: &[Field]) -> Option<usize> {
+    fields.iter().position(|f| f.offer.fan_out)
+}
+
+/// The values picked for a fan-out field: its answer is a JSON array of them, or one plain value.
+pub fn picked(answer: &str) -> Vec<String> {
+    let text = answer.trim();
+    if text.is_empty() {
+        return Vec::new();
+    }
+    if !text.starts_with('[') {
+        return vec![text.to_string()];
+    }
+    serde_json::from_str::<Vec<Value>>(text)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A fan-out answer with `value` picked or unpicked, keeping the order picked.
+pub fn with_pick(answer: &str, value: &str, on: bool) -> String {
+    let mut picks: Vec<String> = picked(answer).into_iter().filter(|v| v != value).collect();
+    if on {
+        picks.push(value.to_string());
+    }
+    Value::from(picks).to_string()
+}
+
+/// How many runs the answers launch: one per picked value of a fan-out field, else one.
+pub fn runs(fields: &[Field], answers: &[String]) -> usize {
+    fan_out(fields)
+        .and_then(|fan| answers.get(fan))
+        .map_or(1, |answer| picked(answer).len().max(1))
+}
+
+/// The fields set per picked value of the fan-out field `fan`: those keyed by it, and their gates.
+pub fn dependents(fields: &[Field], fan: usize) -> BTreeSet<usize> {
+    let Some(name) = fields.get(fan).map(|f| f.name.as_str()) else {
+        return BTreeSet::new();
+    };
+    let keyed: Vec<&Field> = fields
+        .iter()
+        .filter(|f| f.offer.keys.iter().any(|k| k == name))
+        .collect();
+    fields
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| {
+            keyed
+                .iter()
+                .any(|k| k.name == f.name || k.offer.enabled_by.as_deref() == Some(&f.name))
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Each picked value's answers to the fan-out field's dependents, indexed like the fields.
+pub type PerValue = BTreeMap<String, Vec<String>>;
+
+/// The answers one run of a fan-out launch sees: `value` picked, and that value's answers to the
+/// dependents.
+pub fn run_answers(
+    fields: &[Field],
+    answers: &[String],
+    per_value: &PerValue,
+    fan: usize,
+    value: &str,
+) -> Vec<String> {
+    let dependents = dependents(fields, fan);
+    let own = per_value.get(value);
+    answers
+        .iter()
+        .zip(fields)
+        .enumerate()
+        .map(|(i, (answer, field))| {
+            if i == fan {
+                value.to_string()
+            } else if dependents.contains(&i) {
+                own.and_then(|own| own.get(i))
+                    .cloned()
+                    .unwrap_or_else(|| field.default.clone())
+            } else {
+                answer.clone()
+            }
+        })
+        .collect()
+}
+
+/// Splits prefilled answers into per-value ones: a dependent's JSON object from picked value to
+/// answer goes to each value, and every picked value starts from the other prefilled answers.
+pub fn spread(fields: &[Field], answers: &mut [String]) -> PerValue {
+    let Some(fan) = fan_out(fields) else {
+        return PerValue::new();
+    };
+    let picks = answers.get(fan).map(|a| picked(a)).unwrap_or_default();
+    let mut per_value: PerValue = picks
+        .iter()
+        .map(|value| (value.clone(), answers.to_vec()))
+        .collect();
+    for i in dependents(fields, fan) {
+        let (Some(answer), Some(field)) = (answers.get_mut(i), fields.get(i)) else {
+            continue;
+        };
+        let Ok(Value::Object(by_value)) = serde_json::from_str(answer.trim()) else {
+            continue;
+        };
+        for (value, own) in &mut per_value {
+            if let Some(slot) = own.get_mut(i) {
+                *slot = by_value
+                    .get(value)
+                    .map_or_else(|| field.default.clone(), text_of);
+            }
+        }
+        *answer = field.default.clone();
+    }
+    per_value
+}
 
 /// The params object the answers make. An empty optional field is left out, so the schema's
-/// own default applies.
-pub fn params(fields: &[Field], answers: &[String]) -> Result<Value, Problems> {
+/// own default applies. Picking several values of a fan-out field sends it as a JSON array and
+/// each dependent as a JSON object from picked value to that run's answer.
+pub fn params(
+    fields: &[Field],
+    answers: &[String],
+    per_value: &PerValue,
+) -> Result<Value, Vec<Problem>> {
+    let Some(fan) = fan_out(fields) else {
+        return one_run(fields, answers, &BTreeSet::new());
+    };
+    let dependents = dependents(fields, fan);
+    let picks = answers.get(fan).map(|a| picked(a)).unwrap_or_default();
+    if picks.is_empty() {
+        return one_run(fields, answers, &dependents);
+    }
+    let mut out = Map::new();
+    let mut by_value: BTreeMap<&str, Map<String, Value>> = BTreeMap::new();
+    let mut problems: Vec<Problem> = Vec::new();
+    for value in &picks {
+        let run = run_answers(fields, answers, per_value, fan, value);
+        let sent = match one_run(fields, &run, &BTreeSet::new()) {
+            Ok(Value::Object(sent)) => sent,
+            Ok(_) => Map::new(),
+            Err(found) => {
+                for mut problem in found {
+                    if dependents.contains(&problem.field) {
+                        problem.value = Some(value.clone());
+                    }
+                    if !problems.contains(&problem) {
+                        problems.push(problem);
+                    }
+                }
+                continue;
+            }
+        };
+        for (i, field) in fields.iter().enumerate() {
+            let Some(sent) = sent.get(&field.name) else {
+                continue;
+            };
+            if dependents.contains(&i) {
+                by_value
+                    .entry(field.name.as_str())
+                    .or_default()
+                    .insert(value.clone(), sent.clone());
+            } else if i != fan {
+                out.insert(field.name.clone(), sent.clone());
+            }
+        }
+    }
+    if !problems.is_empty() {
+        return Err(problems);
+    }
+    let several = picks.len() > 1;
+    for (name, sent) in by_value {
+        let value = if several {
+            let texts: Map<String, Value> = sent
+                .into_iter()
+                .map(|(k, v)| (k, Value::String(text_of(&v))))
+                .collect();
+            Value::String(Value::Object(texts).to_string())
+        } else {
+            sent.into_iter().next().map_or(Value::Null, |(_, v)| v)
+        };
+        out.insert(name.to_string(), value);
+    }
+    let fanned = match picks.as_slice() {
+        [only] => only.clone(),
+        _ => Value::from(picks.clone()).to_string(),
+    };
+    if let Some(field) = fields.get(fan) {
+        out.insert(field.name.clone(), Value::String(fanned));
+    }
+    Ok(Value::Object(out))
+}
+
+/// The params one run's answers make, leaving out the fields in `skip`.
+fn one_run(
+    fields: &[Field],
+    answers: &[String],
+    skip: &BTreeSet<usize>,
+) -> Result<Value, Vec<Problem>> {
     let mut out = Map::new();
     let mut problems = Vec::new();
+    let mut refuse = |field: usize, why: String| {
+        problems.push(Problem {
+            field,
+            value: None,
+            why,
+        })
+    };
     for (i, field) in fields.iter().enumerate() {
-        if !field.enabled(fields, answers) {
+        if skip.contains(&i) || !field.enabled(fields, answers) {
             continue;
         }
         let answer = answers.get(i).map(|a| a.trim()).unwrap_or_default();
         if answer.is_empty() {
             if field.required {
-                problems.push((i, "Required".to_string()));
+                refuse(
+                    i,
+                    if field.offer.fan_out {
+                        "Pick at least one"
+                    } else {
+                        "Required"
+                    }
+                    .to_string(),
+                );
             }
             continue;
         }
@@ -282,14 +518,14 @@ pub fn params(fields: &[Field], answers: &[String]) -> Result<Value, Problems> {
             && let Some(values) = field.offered(fields, answers)
             && !values.iter().any(|v| v == answer)
         {
-            problems.push((
+            refuse(
                 i,
                 match (values.is_empty(), field.keyed_by()) {
                     (true, Some(key)) => format!("No options for this {key}"),
                     (true, None) => "No options".to_string(),
                     (false, _) => format!("One of {}", values.join(", ")),
                 },
-            ));
+            );
             continue;
         }
         let value = match &field.kind {
@@ -297,14 +533,14 @@ pub fn params(fields: &[Field], answers: &[String]) -> Result<Value, Problems> {
             Kind::Integer => match answer.parse::<i64>() {
                 Ok(n) => Value::from(n),
                 Err(_) => {
-                    problems.push((i, "A whole number".to_string()));
+                    refuse(i, "A whole number".to_string());
                     continue;
                 }
             },
             Kind::Number => match answer.parse::<f64>().ok().filter(|n| n.is_finite()) {
                 Some(n) => Value::from(n),
                 None => {
-                    problems.push((i, "A number".to_string()));
+                    refuse(i, "A number".to_string());
                     continue;
                 }
             },
@@ -462,7 +698,10 @@ impl From<&str> for Refusal {
 mod tests {
     use serde_json::json;
 
-    use crate::form::{Field, Kind, Refusal, Scale, ceilings, duration, fields, minutes, params};
+    use crate::form::{
+        Field, Kind, PerValue, Problem, Refusal, Scale, ceilings, dependents, duration, fan_out,
+        fields, minutes, params, picked, runs, spread, with_pick,
+    };
 
     #[test]
     fn a_refusal_says_what_the_controller_said_about_each_field() {
@@ -528,7 +767,7 @@ mod tests {
             .map(String::from)
             .to_vec();
         assert_eq!(
-            params(&f, &answers).unwrap(),
+            params(&f, &answers, &PerValue::new()).unwrap(),
             json!({"repo": "vllm-project/speculators", "limit": "2", "deep": true, "mode": "thorough", "tries": 3})
         );
     }
@@ -539,7 +778,11 @@ mod tests {
         let answers: Vec<String> = ["  ", "", "", "false", "slow", "three"]
             .map(String::from)
             .to_vec();
-        let problems = params(&f, &answers).unwrap_err();
+        let problems: Vec<(usize, String)> = params(&f, &answers, &PerValue::new())
+            .unwrap_err()
+            .into_iter()
+            .map(|p| (p.field, p.why))
+            .collect();
         assert_eq!(
             problems,
             vec![
@@ -704,13 +947,16 @@ mod tests {
         ];
         let off = answer(&f, &[base.as_slice(), &[("override", "false")]].concat());
         assert!(!f[3].enabled(&f, &off));
-        let sent = params(&f, &off).unwrap();
+        let sent = params(&f, &off, &PerValue::new()).unwrap();
         assert_eq!(sent.get("branch"), None);
         assert_eq!(sent["override"], json!(false));
 
         let on = answer(&f, &[base.as_slice(), &[("override", "true")]].concat());
         assert!(f[3].enabled(&f, &on));
-        assert_eq!(params(&f, &on).unwrap()["branch"], json!("main"));
+        assert_eq!(
+            params(&f, &on, &PerValue::new()).unwrap()["branch"],
+            json!("main")
+        );
         assert!(f[0].enabled(&f, &on), "an ungated field is always sent");
     }
 
@@ -728,8 +974,14 @@ mod tests {
     #[test]
     fn offered_choices_refuse_other_values_unless_other_is_allowed() {
         let f = fields(&release());
-        let problems =
-            |pairs: &[(&str, &str)]| params(&f, &answer(&f, pairs)).err().unwrap_or_default();
+        let problems = |pairs: &[(&str, &str)]| -> Vec<(usize, String)> {
+            params(&f, &answer(&f, pairs), &PerValue::new())
+                .err()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| (p.field, p.why))
+                .collect()
+        };
         assert_eq!(
             problems(&[("release", "2.9"), ("stage", "qa")]),
             vec![
@@ -755,6 +1007,7 @@ mod tests {
                     ("unread", "anything"),
                 ],
             ),
+            &PerValue::new(),
         )
         .unwrap();
         assert_eq!(sent["image"], json!("alpine"));
@@ -785,5 +1038,196 @@ mod tests {
             }
         }));
         assert!(f.iter().all(|field| field.offer.snapshot.is_none()));
+    }
+
+    fn backport() -> serde_json::Value {
+        json!({
+            "properties": {
+                "release": {
+                    "type": "string",
+                    "x-fan-out": true,
+                    "x-choices-from": {"task": "sheet", "field": "releases"},
+                    "x-choices-snapshot": {"value": ["3.7 Fast-1", "3.6", "3.5"]}
+                },
+                "component": {
+                    "type": "string",
+                    "x-choices-from": {"task": "sheet", "field": "components", "keyed_by": "release"},
+                    "x-choices-snapshot": {"value": {
+                        "3.7 Fast-1": ["vLLM", "vLLM [TPU]"], "3.6": ["vLLM"], "3.5": ["vLLM"]
+                    }}
+                },
+                "override": {"type": "boolean"},
+                "branch": {
+                    "type": "string",
+                    "x-enabled-by": "override",
+                    "x-placeholder-from": {"task": "sheet", "field": "branches", "keyed_by": "release"},
+                    "x-placeholder-snapshot": {"value": {"3.6": "rhai-3.6"}}
+                },
+                "tentative": {
+                    "type": "boolean",
+                    "x-confirm-from": {"task": "sheet", "field": "tentative", "keyed_by": "release"}
+                },
+                "context": {"type": "string"}
+            },
+            "required": ["release", "component"],
+            "x-order": ["release", "component", "override", "branch", "tentative", "context"]
+        })
+    }
+
+    fn per(f: &[Field], picks: &[(&str, &[(&str, &str)])]) -> PerValue {
+        picks
+            .iter()
+            .map(|(value, pairs)| ((*value).to_string(), answer(f, pairs)))
+            .collect()
+    }
+
+    #[test]
+    fn a_fan_out_field_sets_the_fields_keyed_by_it_and_their_gates_per_value() {
+        let f = fields(&backport());
+        assert_eq!(fan_out(&f), Some(0));
+        assert!(f[0].offer.fan_out && !f[1].offer.fan_out);
+        assert_eq!(
+            dependents(&f, 0).into_iter().collect::<Vec<_>>(),
+            [1, 2, 3, 4],
+            "component, override (the gate of branch), branch and tentative; not context"
+        );
+        assert_eq!(fan_out(&fields(&release())), None);
+        let listed = fields(&json!({"properties": {
+            "fan": {"type": "string", "x-fan-out": true, "x-choices": ["a", "b"]},
+            "one": {"type": "string", "x-choices": ["a", "b"]}
+        }}));
+        assert_eq!(
+            (listed[0].default.as_str(), listed[1].default.as_str()),
+            ("", "a"),
+            "a fan-out field starts with nothing picked"
+        );
+    }
+
+    #[test]
+    fn picks_toggle_in_the_order_picked() {
+        assert_eq!(picked(""), Vec::<String>::new());
+        assert_eq!(picked(" 3.6 "), ["3.6"]);
+        assert_eq!(picked(r#"["3.6","3.5"]"#), ["3.6", "3.5"]);
+        let two = with_pick(&with_pick("", "3.6", true), "3.5", true);
+        assert_eq!(two, r#"["3.6","3.5"]"#);
+        assert_eq!(picked(&with_pick(&two, "3.6", false)), ["3.5"]);
+        assert_eq!(picked(&with_pick(&two, "3.5", true)), ["3.6", "3.5"]);
+        let f = fields(&backport());
+        assert_eq!(runs(&f, &answer(&f, &[])), 1);
+        assert_eq!(runs(&f, &answer(&f, &[("release", &two)])), 2);
+    }
+
+    #[test]
+    fn a_required_fan_out_field_with_nothing_picked_asks_for_one_pick() {
+        let f = fields(&backport());
+        assert_eq!(
+            params(&f, &answer(&f, &[("context", "x")]), &PerValue::new()).unwrap_err(),
+            vec![Problem {
+                field: 0,
+                value: None,
+                why: "Pick at least one".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn one_pick_sends_plain_values() {
+        let f = fields(&backport());
+        let answers = answer(&f, &[("release", r#"["3.6"]"#), ("context", "why")]);
+        let per_value = per(
+            &f,
+            &[(
+                "3.6",
+                &[("component", "vLLM"), ("override", "true"), ("branch", "b")],
+            )],
+        );
+        assert_eq!(
+            params(&f, &answers, &per_value).unwrap(),
+            json!({"release": "3.6", "component": "vLLM", "override": true, "branch": "b",
+                   "context": "why"})
+        );
+    }
+
+    #[test]
+    fn several_picks_send_an_array_and_each_dependent_by_picked_value() {
+        let f = fields(&backport());
+        let answers = answer(
+            &f,
+            &[("release", r#"["3.7 Fast-1","3.6"]"#), ("context", "why")],
+        );
+        let per_value = per(
+            &f,
+            &[
+                (
+                    "3.7 Fast-1",
+                    &[
+                        ("component", "vLLM [TPU]"),
+                        ("override", "false"),
+                        ("branch", "ignored while off"),
+                    ],
+                ),
+                (
+                    "3.6",
+                    &[("component", "vLLM"), ("override", "true"), ("branch", "b")],
+                ),
+            ],
+        );
+        let sent = params(&f, &answers, &per_value).unwrap();
+        let object = |name: &str| -> serde_json::Value {
+            serde_json::from_str(sent[name].as_str().unwrap()).unwrap()
+        };
+        assert_eq!(sent["release"], json!(r#"["3.7 Fast-1","3.6"]"#));
+        assert_eq!(
+            object("component"),
+            json!({"3.7 Fast-1": "vLLM [TPU]", "3.6": "vLLM"})
+        );
+        assert_eq!(
+            object("override"),
+            json!({"3.7 Fast-1": "false", "3.6": "true"})
+        );
+        assert_eq!(object("branch"), json!({"3.6": "b"}));
+        assert_eq!(sent["context"], json!("why"));
+    }
+
+    #[test]
+    fn a_dependents_problem_names_the_picked_value_it_belongs_to() {
+        let f = fields(&backport());
+        let answers = answer(&f, &[("release", r#"["3.7 Fast-1","3.6"]"#)]);
+        let per_value = per(
+            &f,
+            &[
+                ("3.7 Fast-1", &[("component", "vLLM [TPU]")]),
+                ("3.6", &[("component", "vLLM [TPU]")]),
+            ],
+        );
+        assert_eq!(
+            params(&f, &answers, &per_value).unwrap_err(),
+            vec![Problem {
+                field: 1,
+                value: Some("3.6".to_string()),
+                why: "One of vLLM".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn prefilled_objects_spread_to_each_picked_value() {
+        let f = fields(&backport());
+        let mut answers = answer(
+            &f,
+            &[
+                ("release", r#"["3.7 Fast-1","3.6"]"#),
+                ("component", r#"{"3.6":"vLLM"}"#),
+                ("override", "true"),
+            ],
+        );
+        let per_value = spread(&f, &mut answers);
+        assert_eq!(answers[1], "", "the object is not left as a typed answer");
+        assert_eq!(per_value["3.6"][1], "vLLM");
+        assert_eq!(per_value["3.7 Fast-1"][1], "", "an absent value is unset");
+        assert_eq!(
+            per_value["3.6"][2], "true",
+            "a plain answer applies to each"
+        );
     }
 }
