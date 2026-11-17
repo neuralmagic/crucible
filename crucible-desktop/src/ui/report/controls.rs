@@ -5,7 +5,9 @@ use rune::{Drag, El, Phase, Tx, col, el, row, text};
 use rune_kit::{Select, Switch};
 
 use crate::App;
+use crate::report::shown::Shown;
 use crate::ui::Paint;
+use crate::ui::report::Slot;
 
 /// How wide a range's track is drawn.
 const TRACK: f32 = 160.0;
@@ -13,8 +15,8 @@ const TRACK: f32 = 160.0;
 const FIELD: f32 = 180.0;
 
 /// The shown report's controls, or `None` when its last view declared none.
-pub(crate) fn controls(app: &App, p: &Paint, layer: &mut Vec<El>) -> Option<El> {
-    let declared = app.report_shown.controls();
+pub(crate) fn controls<S: Slot>(shown: &Shown, p: &Paint, layer: &mut Vec<El>) -> Option<El> {
+    let declared = shown.controls();
     if declared.is_empty() {
         return None;
     }
@@ -26,13 +28,13 @@ pub(crate) fn controls(app: &App, p: &Paint, layer: &mut Vec<El>) -> Option<El> 
         .center_y();
     for control in declared {
         let id = control.id();
-        let widget = match (control, app.report_shown.value(control)) {
+        let widget = match (control, shown.value(control)) {
             (Control::Select { options, .. }, Param::Select(value)) => {
-                select(id, control.label(), options, &value, app, p, layer)
+                select::<S>(id, control.label(), options, &value, shown, p, layer)
             }
-            (Control::Toggle { .. }, Param::Toggle(on)) => toggle(id, control.label(), on, p),
+            (Control::Toggle { .. }, Param::Toggle(on)) => toggle::<S>(id, control.label(), on, p),
             (Control::Range { min, max, step, .. }, Param::Range(value)) => {
-                range(id, control.label(), [*min, *max], *step, value, p)
+                range::<S>(id, control.label(), [*min, *max], *step, value, p)
             }
             _ => continue,
         };
@@ -49,7 +51,7 @@ pub(crate) fn controls(app: &App, p: &Paint, layer: &mut Vec<El>) -> Option<El> 
                 .child(widget),
         );
     }
-    if app.report_pending() {
+    if shown.pending() {
         bar = bar.child(
             text("Updating\u{2026}")
                 .key("report-pending")
@@ -60,12 +62,18 @@ pub(crate) fn controls(app: &App, p: &Paint, layer: &mut Vec<El>) -> Option<El> 
     Some(bar)
 }
 
-fn select(
+/// Sets the control `id` and builds the report again.
+fn set_control<S: Slot>(app: &mut App, id: &str, value: Param) {
+    S::shown_mut(app).set(id, value);
+    S::ask(app);
+}
+
+fn select<S: Slot>(
     id: &str,
     label: &str,
     options: &[Choice],
     value: &str,
-    app: &App,
+    shown: &Shown,
     p: &Paint,
     layer: &mut Vec<El>,
 ) -> El {
@@ -80,39 +88,47 @@ fn select(
         .label(label.to_string())
         .current(current)
         .width(FIELD)
-        .open(app.report_shown.choosing.as_deref() == Some(id))
+        .open(shown.choosing.as_deref() == Some(id))
         .on_toggle(move |app: &mut App| {
-            let shown = &mut app.report_shown;
+            let shown = S::shown_mut(app);
             shown.choosing = match shown.choosing.take() {
                 Some(open) if open == opened => None,
                 _ => Some(opened.clone()),
             };
         })
         .on_close(move |app: &mut App| {
-            if app.report_shown.choosing.as_deref() == Some(closed.as_str()) {
-                app.report_shown.choosing = None;
+            let shown = S::shown_mut(app);
+            if shown.choosing.as_deref() == Some(closed.as_str()) {
+                shown.choosing = None;
             }
         })
         .on_choose(move |app: &mut App, picked: &str, _: &mut Tx| {
             if let Some(choice) = choices.iter().find(|choice| choice.label == picked) {
-                app.set_report_control(&chosen, Param::Select(choice.value.clone()));
+                set_control::<S>(app, &chosen, Param::Select(choice.value.clone()));
             }
         })
         .build(p.k, layer)
 }
 
-fn toggle(id: &str, label: &str, on: bool, p: &Paint) -> El {
+fn toggle<S: Slot>(id: &str, label: &str, on: bool, p: &Paint) -> El {
     let set = id.to_string();
     Switch::new(on)
         .label(label.to_string())
         .hide_label()
-        .on_toggle(move |app: &mut App| app.set_report_control(&set, Param::Toggle(!on)))
+        .on_toggle(move |app: &mut App| set_control::<S>(app, &set, Param::Toggle(!on)))
         .build(p.k)
         .key(format!("report-switch-{id}"))
 }
 
 /// A track the reader drags along; the plugin runs again when the drag ends.
-fn range(id: &str, label: &str, [min, max]: [f64; 2], step: f64, value: f64, p: &Paint) -> El {
+fn range<S: Slot>(
+    id: &str,
+    label: &str,
+    [min, max]: [f64; 2],
+    step: f64,
+    value: f64,
+    p: &Paint,
+) -> El {
     let span = max - min;
     let frac = ((value - min) / span).clamp(0.0, 1.0) as f32;
     let set = id.to_string();
@@ -130,14 +146,16 @@ fn range(id: &str, label: &str, [min, max]: [f64; 2], step: f64, value: f64, p: 
             match drag.phase {
                 Phase::Down => {
                     drag.data = drag.x;
-                    app.report_shown.slide(&set, min + along(drag.x) * span);
+                    S::shown_mut(app).slide(&set, min + along(drag.x) * span);
                 }
                 Phase::Move => {
-                    app.report_shown
-                        .slide(&set, min + along(drag.data + drag.dx) * span);
+                    S::shown_mut(app).slide(&set, min + along(drag.data + drag.dx) * span);
                 }
-                Phase::Up if drag.cancelled() => app.report_shown.cancel_slide(),
-                Phase::Up => app.release_report_range(&set),
+                Phase::Up if drag.cancelled() => S::shown_mut(app).cancel_slide(),
+                Phase::Up => {
+                    S::shown_mut(app).release(&set);
+                    S::ask(app);
+                }
             }
         })
         .child(

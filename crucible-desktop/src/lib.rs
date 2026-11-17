@@ -434,8 +434,9 @@ pub struct App {
     /// The captured file the Files tab shows, by key; the first listed when none is picked.
     pub run_file: Option<String>,
     pub files_md_source: bool,
-    /// The Report pane's controls, picked tabs and its table's sort.
-    pub report_shown: report::Shown,
+    /// The Report pane's report, controls, picked tabs and its table's sort, kept for the
+    /// selection.
+    pub report_shown: report::shown::Scoped<Selection>,
     /// The local pack and params its report was last asked for.
     report_asked: Option<(String, model::Params)>,
     /// The workspace the user arranged; `None` lays each run out by its graph's depth.
@@ -518,77 +519,6 @@ impl App {
             }
             _ => None,
         }
-    }
-
-    /// The table the shown report shows.
-    pub fn report_table(&self) -> Option<report::Table<'_>> {
-        let view = self.shown_report()?.view.as_ref().ok()?;
-        self.report_shown.table(view)
-    }
-
-    /// Row `i` of the shown report table, as sorted.
-    pub fn report_row(&self, i: usize) -> Option<&crucible_view::Row> {
-        self.report_shown.row(&self.report_table()?, i)
-    }
-
-    /// How many rows of the shown report table are drawn.
-    pub fn report_rows(&self) -> usize {
-        self.report_table()
-            .map_or(0, |table| self.report_shown.len(&table))
-    }
-
-    /// The shown report table as filtered and sorted, as CSV.
-    pub fn report_csv(&self) -> Option<String> {
-        let table = self.report_table()?;
-        let rows =
-            (0..self.report_shown.len(&table)).filter_map(|i| self.report_shown.row(&table, i));
-        Some(report::csv(
-            table.columns,
-            rows,
-            crucible_view::Limits::DEFAULT.cells,
-        ))
-    }
-
-    pub fn sort_report(&mut self, column: &str, dir: rune_kit::SortDir) {
-        let report = self.shown_report().cloned();
-        let view = report.as_ref().and_then(|report| report.view.as_ref().ok());
-        if let Some(table) = view.and_then(|view| self.report_shown.table(view)) {
-            self.report_shown.sort(&table, column, dir);
-        }
-    }
-
-    /// Filters the shown report table by what its filter box now holds.
-    pub fn filter_report(&mut self) {
-        let report = self.shown_report().cloned();
-        let view = report.as_ref().and_then(|report| report.view.as_ref().ok());
-        let table = view.and_then(|view| self.report_shown.table(view));
-        self.report_shown.arrange(table.as_ref());
-    }
-
-    /// Folds or unfolds the shown report's section `id`, which starts `open` or not.
-    pub fn toggle_report_section(&mut self, id: &str, open: bool) {
-        let report = self.shown_report().cloned();
-        if let Some(view) = report.as_ref().and_then(|report| report.view.as_ref().ok()) {
-            self.report_shown.toggle(view, id, open);
-        }
-    }
-
-    /// The first address the shown report table's row `id` links to.
-    pub fn report_link(&self, id: &str) -> Option<String> {
-        let table = self.report_table()?;
-        let row = table.rows.iter().find(|row| row.id == id)?;
-        row.cells.iter().find_map(|cell| cell.href.clone())
-    }
-
-    /// The shown report table's one selected row, when it has a detail.
-    pub fn report_detail(&self) -> Option<&crucible_view::Row> {
-        let state = &self.report_shown.table;
-        let id = state
-            .selected()
-            .next()
-            .filter(|_| state.selected_len() == 1)?;
-        let row = self.report_table()?.rows.iter().find(|row| row.id == id)?;
-        row.detail.is_some().then_some(row)
     }
 
     /// The task a report names, or the fan-out and instance key for `task[key]`.
@@ -1427,26 +1357,6 @@ impl App {
         (!params.is_empty()).then(|| (pack.name.clone(), params))
     }
 
-    /// Sets the shown report's control `id`, which builds the report again.
-    pub fn set_report_control(&mut self, id: &str, value: crucible_view::Param) {
-        self.report_shown.set(id, value);
-        self.sync_live();
-    }
-
-    /// Ends a drag of the shown report's range `id`, which builds the report again.
-    pub fn release_report_range(&mut self, id: &str) {
-        self.report_shown.release(id);
-        self.sync_live();
-    }
-
-    /// Whether the shown report was built with other params than its controls now hold.
-    pub fn report_pending(&self) -> bool {
-        let Some(report) = self.shown_report() else {
-            return false;
-        };
-        report.view.is_ok() && report.params != self.report_shown.params(self.selection.as_ref())
-    }
-
     fn answer_report(&mut self, built: Option<std::sync::Arc<report::Built>>) {
         if let Some(built) = built
             && Some(&built.wanted) == self.remote.report_sent.as_ref()
@@ -1846,6 +1756,7 @@ impl App {
         self.forget_run_view();
         self.reconcile();
         self.sync_live();
+        self.follow_report();
     }
 
     pub fn launch(&mut self) {
@@ -1982,7 +1893,7 @@ fn init() -> App {
         pack_md_source: false,
         run_file: None,
         files_md_source: false,
-        report_shown: report::Shown::default(),
+        report_shown: report::shown::Scoped::default(),
         report_asked: None,
         knobs: rune_knobs::Knobs::default(),
         page: Page::Runs,

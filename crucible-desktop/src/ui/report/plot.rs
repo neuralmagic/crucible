@@ -117,7 +117,7 @@ pub(crate) fn bars(all: &[Bar], p: &Paint) -> El {
         p,
     );
     let mut chart = card("report-bars".into(), p).child(key);
-    for (bar, colours) in all.iter().zip(&coloured) {
+    for (i, (bar, colours)) in all.iter().zip(&coloured).enumerate() {
         let mut track = row().grow(1.0).min_w(0.0).h(12.0).gap(1.0);
         for (segment, color) in bar.segments.iter().zip(colours) {
             if segment.value > 0.0 {
@@ -140,7 +140,7 @@ pub(crate) fn bars(all: &[Bar], p: &Paint) -> El {
         }
         chart = chart.child(
             row()
-                .key(format!("report-bar-{}", bar.label))
+                .key(format!("report-bar-{i}"))
                 .w_full()
                 .h(20.0)
                 .gap(10.0)

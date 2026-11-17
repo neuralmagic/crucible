@@ -8,6 +8,7 @@ mod hue;
 mod plot;
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use crucible_view::{Cell, Column, ColumnKind, Node, Row, Stat, Tab, Tone, Width};
 use rune::{Align, Color, El, Tx, col, el, icon, row, text};
@@ -15,11 +16,52 @@ use rune_kit::{IconButton, IconButtonVariant, Kit, Markdown, Table, TableColumn,
 use rune_theme_opencode::icons as oc;
 
 use crate::App;
+use crate::report::Report;
+use crate::report::shown::Shown;
 use crate::ui::report::hue::dot;
 use crate::ui::{Paint, desk};
 
+/// Where a drawn report and its reader state live on the app, and what its links lead to.
+pub(crate) trait Slot: 'static {
+    fn shown(app: &App) -> &Shown;
+    fn shown_mut(app: &mut App) -> &mut Shown;
+    /// Whether an address the report holds leads somewhere.
+    fn leads(app: &App, href: &str) -> bool;
+    /// Opens an address the report holds.
+    fn follow(app: &mut App, href: &str, tx: &mut Tx);
+    /// Builds the report again with what its controls now hold.
+    fn ask(app: &mut App);
+}
+
+/// The Report pane's report: the selected local pack's, or the one built for the selected
+/// live run.
+struct RunReport;
+
+impl Slot for RunReport {
+    fn shown(app: &App) -> &Shown {
+        &app.report_shown.shown
+    }
+
+    fn shown_mut(app: &mut App) -> &mut Shown {
+        &mut app.report_shown.shown
+    }
+
+    fn leads(app: &App, href: &str) -> bool {
+        app.report_leads(href)
+    }
+
+    fn follow(app: &mut App, href: &str, tx: &mut Tx) {
+        app.follow_report_link(href, tx);
+    }
+
+    fn ask(app: &mut App) {
+        app.sync_live();
+    }
+}
+
 pub(crate) fn report_view(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
-    let Some(report) = app.shown_report() else {
+    let followed = |report: &&Arc<Report>| RunReport::shown(app).holds(Some(report));
+    let Some(report) = app.shown_report().filter(followed) else {
         let why = if app.awaits_report() {
             "Drawing the view\u{2026}"
         } else {
@@ -27,7 +69,12 @@ pub(crate) fn report_view(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
         };
         return desk::note("report-note", why, "", p);
     };
-    let controls = controls::controls(app, p, layer);
+    view::<RunReport>(report, app, p, layer)
+}
+
+/// `report`'s title, controls and body.
+fn view<S: Slot>(report: &Report, app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
+    let controls = controls::controls::<S>(S::shown(app), p, layer);
     let view = match &report.view {
         Ok(view) => view,
         Err(error) => {
@@ -67,10 +114,14 @@ pub(crate) fn report_view(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
                 })),
         )
         .children(controls)
-        .child(if app.report_shown.fills(&view.body) {
-            node(&view.body, true, "0", app, p)
+        .child(if S::shown(app).fills(&view.body) {
+            node::<S>(&view.body, true, "0", app, p)
         } else {
-            desk::scrolled("report-scroll", node(&view.body, false, "0", app, p), p)
+            desk::scrolled(
+                "report-scroll",
+                node::<S>(&view.body, false, "0", app, p),
+                p,
+            )
         })
 }
 
@@ -91,7 +142,7 @@ fn least_width(node: &Node) -> f32 {
 /// `fills` when the node takes the height its parent has left, as a table's ancestors do;
 /// otherwise it is as tall as its content, inside a scroll area. `at` is the node's place in
 /// the view, unique among the nodes drawn.
-fn node(node_: &Node, fills: bool, at: &str, app: &App, p: &Paint) -> El {
+fn node<S: Slot>(node_: &Node, fills: bool, at: &str, app: &App, p: &Paint) -> El {
     match node_ {
         Node::Stack { children } => {
             let mut stack = col().w_full().gap(12.0);
@@ -100,13 +151,7 @@ fn node(node_: &Node, fills: bool, at: &str, app: &App, p: &Paint) -> El {
             }
             for (i, child) in children.iter().enumerate() {
                 let place = format!("{at}-{i}");
-                let drawn = node(
-                    child,
-                    fills && app.report_shown.fills(child),
-                    &place,
-                    app,
-                    p,
-                );
+                let drawn = node::<S>(child, fills && S::shown(app).fills(child), &place, app, p);
                 stack = stack.child(match child {
                     Node::Tabs { .. } | Node::Table { .. } | Node::Section { .. } => drawn,
                     _ => drawn.key(format!("report-part-{i}")),
@@ -126,7 +171,7 @@ fn node(node_: &Node, fills: bool, at: &str, app: &App, p: &Paint) -> El {
                         .key(format!("report-column-{i}"))
                         .grow(1.0)
                         .min_w(COLUMN.max(least_width(child)).min(room))
-                        .child(node(child, false, &format!("{at}-{i}"), app, p)),
+                        .child(node::<S>(child, false, &format!("{at}-{i}"), app, p)),
                 );
             }
             col().w_full().child(line)
@@ -136,8 +181,8 @@ fn node(node_: &Node, fills: bool, at: &str, app: &App, p: &Paint) -> El {
             title,
             open,
             body,
-        } => section(id, title, *open, body, fills, app, p),
-        Node::Tabs { id, tabs } => tabs_view(id, tabs, fills, app, p),
+        } => section::<S>(id, title, *open, body, fills, app, p),
+        Node::Tabs { id, tabs } => tabs_view::<S>(id, tabs, fills, app, p),
         Node::Stats { items } => stats(items, p),
         Node::Meter {
             label,
@@ -196,7 +241,7 @@ fn node(node_: &Node, fills: bool, at: &str, app: &App, p: &Paint) -> El {
             commands,
         } => canvas::fitted(format!("report-canvas-{at}"), *width, *height, commands, p),
         Node::Grid { columns, rows } => grid(columns, rows, p),
-        Node::Table { columns, .. } => table(columns, app, p),
+        Node::Table { columns, .. } => table::<S>(columns, app, p),
         Node::Text { text: body, tone } => text(body.clone())
             .font(p.k.ty.ui)
             .color(ink(*tone, p.k).unwrap_or(p.c.text_base))
@@ -214,8 +259,8 @@ fn node(node_: &Node, fills: bool, at: &str, app: &App, p: &Paint) -> El {
             ink(*tone, p.k).unwrap_or(p.c.text_base),
             p,
         ),
-        Node::Markdown { text: body } => markdown(body.clone(), "report-markdown", p),
-        Node::Mermaid { source } => markdown(fenced(source), "report-mermaid", p),
+        Node::Markdown { text: body } => markdown::<S>(body.clone(), "report-markdown", p),
+        Node::Mermaid { source } => markdown::<S>(fenced(source), "report-mermaid", p),
     }
 }
 
@@ -227,10 +272,10 @@ fn flow_palette(p: &Paint) -> Vec<crucible_view::Style> {
 }
 
 /// Markdown whose links lead to the web or into the run.
-fn markdown(body: String, key: &str, p: &Paint) -> El {
+fn markdown<S: Slot>(body: String, key: &str, p: &Paint) -> El {
     Markdown::new(body)
         .selectable(true)
-        .on_link_tx(|app: &mut App, href: &str, tx: &mut Tx| app.follow_report_link(href, tx))
+        .on_link_tx(|app: &mut App, href: &str, tx: &mut Tx| S::follow(app, href, tx))
         .build(p.k)
         .key(key.to_string())
         .w_full()
@@ -256,7 +301,7 @@ fn ink(tone: Tone, k: &Kit) -> Option<Color> {
 }
 
 /// A title the reader clicks to fold or unfold `body` under it.
-fn section(
+fn section<S: Slot>(
     id: &str,
     title: &str,
     open: bool,
@@ -265,7 +310,7 @@ fn section(
     app: &App,
     p: &Paint,
 ) -> El {
-    let unfolded = app.report_shown.open(id, open);
+    let unfolded = S::shown(app).open(id, open);
     let glyph = if unfolded {
         p.k.glyph.triangle_down
     } else {
@@ -283,7 +328,7 @@ fn section(
         .h(28.0)
         .gap(6.0)
         .center_y()
-        .on_press(move |app: &mut App| app.toggle_report_section(&set, open))
+        .on_press(move |app: &mut App| S::shown_mut(app).toggle(&set, open))
         .child(icon(glyph, 14.0).color(p.c.icon_weaker))
         .child(
             text(title.to_string())
@@ -300,13 +345,19 @@ fn section(
         shown = shown.grow(1.0).min_h(0.0);
     }
     if unfolded {
-        shown = shown.child(node(body, fills, &format!("s{}:{id}", id.len()), app, p));
+        shown = shown.child(node::<S>(
+            body,
+            fills,
+            &format!("s{}:{id}", id.len()),
+            app,
+            p,
+        ));
     }
     shown
 }
 
-fn tabs_view(id: &str, tabs: &[Tab], fills: bool, app: &App, p: &Paint) -> El {
-    let picked = app.report_shown.tab(id, tabs.len());
+fn tabs_view<S: Slot>(id: &str, tabs: &[Tab], fills: bool, app: &App, p: &Paint) -> El {
+    let picked = S::shown(app).tab(id, tabs.len());
     let options: Vec<(String, String)> = tabs
         .iter()
         .enumerate()
@@ -325,7 +376,7 @@ fn tabs_view(id: &str, tabs: &[Tab], fills: bool, app: &App, p: &Paint) -> El {
         Some(picked.to_string().as_str()),
         move |app: &mut App, value: &str| {
             if let Ok(tab) = value.parse() {
-                app.report_shown.pick(&set, tab);
+                S::shown_mut(app).pick(&set, tab);
             }
         },
         p,
@@ -339,8 +390,8 @@ fn tabs_view(id: &str, tabs: &[Tab], fills: bool, app: &App, p: &Paint) -> El {
         shown = shown.grow(1.0).min_h(0.0);
     }
     if let Some(tab) = tabs.get(picked) {
-        let filled = app.report_shown.fills(&tab.body);
-        let body = node(
+        let filled = S::shown(app).fills(&tab.body);
+        let body = node::<S>(
             &tab.body,
             fills && filled,
             &format!("t{}:{id}", id.len()),
@@ -358,10 +409,10 @@ fn tabs_view(id: &str, tabs: &[Tab], fills: bool, app: &App, p: &Paint) -> El {
 
 fn stats(items: &[Stat], p: &Paint) -> El {
     let mut tiles = row().key("report-stats").w_full().gap(10.0).flex_wrap();
-    for item in items {
+    for (i, item) in items.iter().enumerate() {
         tiles = tiles.child(
             col()
-                .key(format!("report-stat-{}", item.label))
+                .key(format!("report-stat-{i}"))
                 .min_w(120.0)
                 .padding(12.0)
                 .gap(2.0)
@@ -502,13 +553,14 @@ fn grid(columns: &[String], rows: &[Vec<Cell>], p: &Paint) -> El {
         .child(desk::stacked("report-grid-rows", lines, p))
 }
 
-fn table(columns: &[Column], app: &App, p: &Paint) -> El {
+fn table<S: Slot>(columns: &[Column], app: &App, p: &Paint) -> El {
     let mut table = Table::new(
-        |app: &App| &app.report_shown.table,
-        |app: &mut App| &mut app.report_shown.table,
-        |app: &App| app.report_rows(),
+        |app: &App| &S::shown(app).table,
+        |app: &mut App| &mut S::shown_mut(app).table,
+        |app: &App| S::shown(app).rows(),
         |app: &App, i| {
-            app.report_row(i)
+            S::shown(app)
+                .row(i)
                 .map_or(Cow::Borrowed(""), |row| Cow::Borrowed(row.id.as_str()))
         },
     );
@@ -538,20 +590,17 @@ fn table(columns: &[Column], app: &App, p: &Paint) -> El {
             let Some(at) = kinds.iter().position(|(id, _)| id == column) else {
                 return rune_kit::Cell::text("");
             };
-            let Some(cell) = app.report_row(i).and_then(|row| row.cells.get(at)) else {
+            let Some(cell) = S::shown(app).row(i).and_then(|row| row.cells.get(at)) else {
                 return rune_kit::Cell::text("");
             };
             let kind = kinds.get(at).map_or(ColumnKind::Text, |(_, kind)| *kind);
-            let leads = cell
-                .href
-                .as_deref()
-                .is_some_and(|href| app.report_leads(href));
-            drawn(cell, kind, leads.then_some(link), k)
+            let leads = cell.href.as_deref().is_some_and(|href| S::leads(app, href));
+            drawn::<S>(cell, kind, leads.then_some(link), k)
         })
-        .on_sort(|app: &mut App, column, dir, _| app.sort_report(column, dir))
+        .on_sort(|app: &mut App, column, dir, _| S::shown_mut(app).sort(column, dir))
         .on_open(|app: &mut App, id, tx: &mut Tx| {
-            if let Some(href) = app.report_link(id) {
-                app.follow_report_link(&href, tx);
+            if let Some(href) = S::shown(app).link(id) {
+                S::follow(app, &href, tx);
             }
         })
         .zebra(true)
@@ -564,24 +613,25 @@ fn table(columns: &[Column], app: &App, p: &Paint) -> El {
         .grow(1.0)
         .min_h(0.0)
         .gap(10.0)
-        .child(filter(app, p))
+        .child(filter::<S>(app, p))
         .child(table)
-        .children(app.report_detail().map(|shown| detail(shown, p)))
+        .children(S::shown(app).detail().map(|shown| detail::<S>(shown, p)))
 }
 
 /// The box that filters the shown table, a button that copies the rows it shows, and how many
 /// rows pass while it holds something.
-fn filter(app: &App, p: &Paint) -> El {
-    let edit = &app.report_shown.filter;
+fn filter<S: Slot>(app: &App, p: &Paint) -> El {
+    let shown = S::shown(app);
+    let edit = &shown.filter;
     let mut input = TextInput::new(edit)
         .placeholder("Filter rows")
         .leading_icon(&oc::MAGNIFYING_GLASS)
-        .on_edit(|app: &mut App| &mut app.report_shown.filter)
-        .on_change(|app: &mut App, _: &mut Tx| app.filter_report());
+        .on_edit(|app: &mut App| &mut S::shown_mut(app).filter)
+        .on_change(|app: &mut App, _: &mut Tx| S::shown_mut(app).arrange());
     if !edit.text.is_empty() {
         input = input.clear_button();
     }
-    let total = app.report_table().map_or(0, |table| table.rows.len());
+    let total = shown.table().map_or(0, |table| table.rows.len());
     row()
         .w_full()
         .gap(10.0)
@@ -593,7 +643,7 @@ fn filter(app: &App, p: &Paint) -> El {
                 .label("Copy as CSV")
                 .help("Copy as CSV".to_string())
                 .on_press_tx(|app: &mut App, tx: &mut Tx| {
-                    if let Some(csv) = app.report_csv() {
+                    if let Some(csv) = S::shown(app).csv() {
                         tx.copy(csv);
                     }
                 })
@@ -601,7 +651,7 @@ fn filter(app: &App, p: &Paint) -> El {
                 .key("report-copy-csv"),
         )
         .children((!edit.text.trim().is_empty()).then(|| {
-            text(format!("{} of {total}", app.report_rows()))
+            text(format!("{} of {total}", shown.rows()))
                 .key("report-filter-count")
                 .font(p.mono(11.0, 440.0))
                 .color(p.c.text_muted)
@@ -609,7 +659,7 @@ fn filter(app: &App, p: &Paint) -> El {
 }
 
 /// The selected row's detail, under the table.
-fn detail(shown: &Row, p: &Paint) -> El {
+fn detail<S: Slot>(shown: &Row, p: &Paint) -> El {
     let body = shown.detail.clone().unwrap_or_default();
     col()
         .key("report-detail")
@@ -636,7 +686,7 @@ fn detail(shown: &Row, p: &Paint) -> El {
                     IconButton::new(&oc::XMARK_SMALL)
                         .variant(IconButtonVariant::GhostMuted)
                         .label("Close")
-                        .on_press(|app: &mut App| app.report_shown.table.clear_selection())
+                        .on_press(|app: &mut App| S::shown_mut(app).table.clear_selection())
                         .build(p.k)
                         .key("report-detail-close"),
                 ),
@@ -644,7 +694,7 @@ fn detail(shown: &Row, p: &Paint) -> El {
         .child(el().h(p.hair).w_full().fill(p.c.border_muted))
         .child(desk::scrolled(
             "report-detail-scroll",
-            col().w_full().padding(12.0).child(markdown(
+            col().w_full().padding(12.0).child(markdown::<S>(
                 body,
                 &format!("report-detail-{}", shown.id),
                 p,
@@ -654,7 +704,7 @@ fn detail(shown: &Row, p: &Paint) -> El {
 }
 
 /// `link` is the colour of a cell whose address leads somewhere.
-fn drawn(cell: &Cell, kind: ColumnKind, link: Option<Color>, k: &Kit) -> rune_kit::Cell {
+fn drawn<S: Slot>(cell: &Cell, kind: ColumnKind, link: Option<Color>, k: &Kit) -> rune_kit::Cell {
     if let (Some(url), Some(link)) = (cell.href.clone(), link) {
         let style = if kind == ColumnKind::Mono {
             k.ty.mono
@@ -668,7 +718,7 @@ fn drawn(cell: &Cell, kind: ColumnKind, link: Option<Color>, k: &Kit) -> rune_ki
                 .role("link")
                 .label(format!("Open {url}"))
                 .help(url.clone())
-                .on_press_tx(move |app: &mut App, tx| app.follow_report_link(&url, tx)),
+                .on_press_tx(move |app: &mut App, tx| S::follow(app, &url, tx)),
             cell,
             k,
         ));
