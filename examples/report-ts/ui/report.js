@@ -424,3 +424,146 @@ export function view({ files, params }) {
         controls,
     };
 }
+export const runsInputs = ["verdicts.json"];
+const STATUS_TONE = {
+    done: "good",
+    error: "bad",
+    running: "info",
+    cancelled: "muted",
+    unfinished: "muted",
+};
+/** How each ticket's action moved across the launches of the playbook. */
+export function runs({ runs: launches, total }) {
+    const triaged = [...launches].reverse().map((run) => {
+        let tickets;
+        try {
+            tickets = read(run.files);
+        }
+        catch (error) {
+            throw new Error(`${error instanceof Error ? error.message : error}, in ${run.id}`);
+        }
+        return { run, actions: new Map(tickets.map((t) => [t.key, t.action])) };
+    });
+    const withVerdicts = triaged.filter((one) => one.actions.size > 0);
+    if (withVerdicts.length === 0) {
+        return { title: "Triage history", body: { note: { headline: "No launch has captured verdicts.json yet.", tone: "muted" } } };
+    }
+    const paths = new Map();
+    for (const { run, actions } of withVerdicts) {
+        for (const [key, action] of actions) {
+            paths.set(key, [...(paths.get(key) ?? []), { run, action }]);
+        }
+    }
+    const changes = (path) => path.slice(1).filter((step, i) => step.action !== path[i].action).length;
+    const moved = [...paths.entries()].filter(([, path]) => changes(path) > 0).sort(([a], [b]) => a.localeCompare(b));
+    const newest = withVerdicts[withVerdicts.length - 1];
+    const count = (actions, action) => [...actions.values()].filter((a) => a === action).length;
+    const movedRows = moved.map(([key, path]) => {
+        let last = 1;
+        for (let i = 1; i < path.length; i++)
+            if (path[i].action !== path[i - 1].action)
+                last = i;
+        const [was, now] = [path[last - 1].action, path[last].action];
+        const steps = path.map((step) => labelOf(step.action)).filter((label, i, all) => i === 0 || label !== all[i - 1]);
+        return {
+            id: key,
+            cells: [
+                { text: key },
+                { text: labelOf(now), tone: toneOf(now) },
+                { text: labelOf(was), tone: toneOf(was) },
+                { text: path[last].run.id, href: `launch:${path[last].run.id}` },
+                Cell.count(changes(path)),
+                { text: steps.join(" → ") },
+            ],
+        };
+    });
+    const launchRows = triaged
+        .map((one, at) => {
+        const before = one.actions.size === 0 ? undefined : triaged.slice(0, at).reverse().find((earlier) => earlier.actions.size > 0);
+        const shifted = before
+            ? Cell.count([...one.actions].filter(([key, action]) => before.actions.has(key) && before.actions.get(key) !== action).length)
+            : { text: "" };
+        return {
+            id: one.run.id,
+            cells: [
+                { text: one.run.id, href: `launch:${one.run.id}` },
+                { text: one.run.status, tone: STATUS_TONE[one.run.status] },
+                Cell.date(one.run.started),
+                Cell.count(one.actions.size),
+                Cell.count(count(one.actions, "fix")),
+                shifted,
+            ],
+        };
+    })
+        .reverse();
+    return {
+        title: "Triage history",
+        body: {
+            stack: {
+                children: [
+                    {
+                        stats: {
+                            items: [
+                                { label: "Launches", value: `${launches.length} of ${total}` },
+                                { label: "Tickets", value: String(paths.size) },
+                                { label: "Moved", value: String(moved.length), tone: "warn" },
+                                { label: "Fix now", value: String(count(newest.actions, "fix")), tone: "bad" },
+                            ],
+                        },
+                    },
+                    {
+                        bars: {
+                            bars: withVerdicts.map((one) => ({
+                                label: one.run.id,
+                                segments: ACTIONS.map((a) => ({ label: a.label, value: count(one.actions, a.id), tone: a.tone })),
+                            })),
+                        },
+                    },
+                    {
+                        tabs: {
+                            id: "history",
+                            tabs: [
+                                {
+                                    label: "Moved",
+                                    count: moved.length,
+                                    body: {
+                                        table: {
+                                            id: "moved",
+                                            columns: [
+                                                { id: "ticket", title: "Ticket", kind: "mono", width: "narrow" },
+                                                { id: "now", title: "Now", kind: "badge" },
+                                                { id: "was", title: "Was", kind: "badge" },
+                                                { id: "since", title: "Since", kind: "mono" },
+                                                { id: "moves", title: "Moves", kind: "number", width: "narrow" },
+                                                { id: "path", title: "Path", width: "fill" },
+                                            ],
+                                            rows: movedRows,
+                                        },
+                                    },
+                                },
+                                {
+                                    label: "Launches",
+                                    count: launches.length,
+                                    body: {
+                                        table: {
+                                            id: "launches",
+                                            columns: [
+                                                { id: "launch", title: "Launch", kind: "mono" },
+                                                { id: "status", title: "Status", kind: "badge", width: "narrow" },
+                                                { id: "started", title: "Started", kind: "mono", width: "narrow" },
+                                                { id: "tickets", title: "Tickets", kind: "number", width: "narrow" },
+                                                { id: "fix", title: "Fix", kind: "number", width: "narrow" },
+                                                { id: "moved", title: "Moved", kind: "number", width: "fill" },
+                                            ],
+                                            rows: launchRows,
+                                        },
+                                    },
+                                },
+                            ],
+                        },
+                    },
+                ],
+            },
+        },
+    };
+}

@@ -1,6 +1,6 @@
 ---
 name: write-a-view-plugin
-description: Give a crucible playbook pack its own view of a run (a report, dashboard, table, pivot, chart or drawing in the desktop app's Report pane) by writing a view plugin in the pack's ui/ folder, in TypeScript or JavaScript, or in Rust compiled to WebAssembly. Use when asked to add or change a pack's report, custom view, chart, table or dashboard, or to turn a run's captured files into something a person reads.
+description: Give a crucible playbook pack its own view of a run (a report, dashboard, table, pivot, chart or drawing in the desktop app's Report pane), and optionally of all its launches on the playbook's runs page, by writing a view plugin in the pack's ui/ folder, in TypeScript or JavaScript, or in Rust compiled to WebAssembly. Use when asked to add or change a pack's report, custom view, chart, table or dashboard, to show how results changed across launches, or to turn a run's captured files into something a person reads.
 ---
 
 # Writing a view plugin
@@ -163,6 +163,70 @@ cp <target dir>/wasm32-unknown-unknown/release/report_view.wasm ui/report.wasm
 Keep the target directory out of the pack: the pack is saved whole. Build for
 `wasm32-unknown-unknown`, not a WASI target: a module that imports anything is refused.
 
+## Runs view
+
+A plugin may also draw the launches of its playbook: how a result moved from one launch to the
+next, which launches regressed, a trend over a week of scheduled runs. It is a second entry
+beside `view`. A plugin without it has no runs view and nothing else changes.
+
+```ts
+export const runsInputs = ["verdicts.json"];
+
+export function runs({ runs, total, params }: RunsRequest): View {
+  return {
+    title: `${runs.length} of ${total} launches`,
+    body: { table: { id: "launches", columns: [{ id: "launch", title: "Launch" }],
+      rows: runs.map((run) => ({ id: run.id, cells: [{ text: run.id, href: `launch:${run.id}` }] })) } },
+  };
+}
+```
+
+```rust
+crucible_view::plugin!(
+    inputs = ["verdicts.json"],
+    view = report,
+    runs_inputs = ["verdicts.json"],
+    runs_view = history,
+);
+
+fn history(request: crucible_view::RunsRequest) -> Result<crucible_view::View, String> { .. }
+```
+
+The request holds the launches newest first, each with what its newest run captured of
+`runsInputs`, and `total`, how many launches the reader's filters keep. A launch with no run yet
+has no files. `params` works as it does for `view`. A request may gain fields; ignore the ones
+you do not read.
+
+```json runs-request
+{"runs": [
+  {"id": "triage:12", "status": "done", "started": 1793491200, "cost_usd": 0.42,
+   "origin": "schedule", "params": {"lane": "go"},
+   "files": [{"path": "verdicts.json", "task": "triage-go", "text": "[]"}]},
+  {"id": "triage:11", "status": "running", "started": 1793404800, "origin": "manual",
+   "pack_version": 7, "files": []}
+ ],
+ "total": 30}
+```
+
+`status` is `running`, `done`, `error`, `cancelled` or `unfinished`. `cost_usd` is left out while
+a launch runs. `pack_version` is the draft save a draft's launch ran.
+
+- **Where it shows.** On a playbook's runs page in the desktop app, when no launch is picked
+  and the filters keep more than one, as a Report tab beside Runs. The tabs show only when the
+  plugin draws a runs view. The plugin is the one in the newest launch's pack.
+- **Links.** `launch:<id>` opens that launch and `launch:<id>/task/<task>` opens it on a
+  task; `crucible_view::launch_link` and `launch_task_link` build them. A runs view has no one
+  run, so a `run:task` or `run:file` address in a cell is refused there. A view of one run may
+  hold launch links too.
+- **Limits.** The newest 50 launches the filters keep. Of each, only text files of the paths
+  named, each at most 8 MiB. The launches together hold at most 32 MiB; past that the oldest are
+  left out, so `runs` may be shorter than `total`. A launch that has stopped and not changed is
+  not read again.
+- **Checking.** A local pack has one run, so the app shows no runs page for it. Build a
+  `RunsRequest` by hand from real captured files in a test, as `examples/report` does, and check
+  the view with `crucible-view-check --runs`. Against a controller, `CRUCIBLE_VIEW_PLUGIN=<file>`
+  draws a live run and its runs page with a local plugin file in place of the pack's.
+
 ## What a compiled plugin exports
 
 `crucible-view`'s `plugin!` writes these for a Rust plugin. A module built another way exports
@@ -173,6 +237,10 @@ Keep the target directory out of the pack: the pack is saved whole. Build for
 | `crucible_alloc` | a length (`i32`) | the address of that many writable bytes (`i32`) |
 | `crucible_inputs` | nothing | a JSON list of captured file paths |
 | `crucible_view` | the address and length of the request JSON | the reply JSON |
+| `crucible_runs_inputs` | nothing | a JSON list of the paths read from each launch; optional |
+| `crucible_runs_view` | the address and length of a runs request's JSON | the reply JSON; optional |
+
+A module draws a runs view only when it exports both optional functions.
 
 A JSON result is returned as one `i64`: the address in the high 32 bits, the length in the low
 32. The request and reply; `params` is left out until the reader changes a control:
@@ -232,9 +300,11 @@ pack selected, move the clicks and `--at` later. Read the image. Do not report a
 working from a clean build alone.
 
 Without the app, check the view itself. `crucible-view-check` reads a view, or a plugin's
-answer, on standard input and applies every rule in `components.md`; it does not show how the
-view looks. For Rust, a native test in the plugin's crate can call the view function on real
-captured files and assert `view.check(&crucible_view::Limits::DEFAULT)`.
+answer, on standard input and applies every rule in `components.md`, and `--runs` checks a runs
+view; it does not show how the view looks. For Rust, a native test in the plugin's crate can call
+the view function on real captured files and assert
+`view.check(crucible_view::ViewKind::Run, &crucible_view::Limits::DEFAULT)`, or `ViewKind::Runs`
+for a runs view.
 
 When the pane shows an error:
 

@@ -4,6 +4,12 @@
 //
 //   export const inputs = ["verdicts.json"];
 //   export function view({ files, params }: ViewRequest): View { ... }
+//
+// It may also export `runsInputs`, the paths it reads from each launch of its playbook, and
+// `runs`, which turns those launches into a view drawn on the playbook's runs page.
+//
+//   export const runsInputs = ["verdicts.json"];
+//   export function runs({ runs, total, params }: RunsRequest): View { ... }
 
 /** A colour role from the app's theme. */
 type Tone = "neutral" | "muted" | "good" | "warn" | "bad" | "info";
@@ -26,6 +32,34 @@ interface ViewRequest {
    * Each control of the last view by id, with the reader's value: a select's option value, a
    * toggle's `on`, a range's number. Empty until the reader changes one.
    */
+  params: Record<string, string | boolean | number>;
+}
+
+/** One launch of the playbook and the files its newest run captured. */
+interface LaunchedRun {
+  /** What a launch link names: `launch:<id>`, or `launch:<id>/task/<task>` for one of its tasks. */
+  id: string;
+  status: "running" | "done" | "error" | "cancelled" | "unfinished";
+  /** When it was launched, in Unix seconds. */
+  started: number;
+  /** What it cost; left out while it runs. */
+  cost_usd?: number;
+  /** What started it: `manual`, `schedule`, `webhook` and so on. */
+  origin: string;
+  /** The draft save it ran, for a draft's launch. */
+  pack_version?: number;
+  /** The params it was launched with. */
+  params?: Record<string, unknown>;
+  /** The text files of `runsInputs` its newest run captured; empty for a launch with no run yet. */
+  files: CapturedFile[];
+}
+
+interface RunsRequest {
+  /** Newest first: at most the newest 50 the reader's filters keep, fewer when their files are large. */
+  runs: LaunchedRun[];
+  /** How many launches the filters keep, `runs` and those left out. */
+  total: number;
+  /** As `ViewRequest.params`. */
   params: Record<string, string | boolean | number>;
 }
 
@@ -56,8 +90,10 @@ interface ViewCell {
   /** What a table sorts the cell by in place of its text: the seconds behind "3 min". */
   value?: number;
   /**
-   * The address the cell opens: `http(s)://...`, `run:task/<task>` for a task of the run, or
-   * `run:file/<task>/<path>` for a file it captured, with the task as a `CapturedFile` names it.
+   * The address the cell opens: `http(s)://...`, `run:task/<task>` for a task of the run,
+   * `run:file/<task>/<path>` for a file it captured, with the task as a `CapturedFile` names it,
+   * or `launch:<id>` and `launch:<id>/task/<task>` for a launch of the playbook. A runs view
+   * may not hold a `run:` address.
    */
   href?: string;
   tone?: Tone;

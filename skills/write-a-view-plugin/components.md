@@ -186,13 +186,40 @@ An address, in a cell's `href` or a Markdown link, is one of:
 | `https://...` or `http://...` | the web page, in the browser |
 | `run:task/<task>` | that task of the run, in the Tasks pane; `task[key]` is one instance of a fan-out, in the Data pane |
 | `run:file/<task>/<path>` | that captured file, in the Files pane |
+| `launch:<id>` | that launch of the playbook, by a launch's `id` in a runs request |
+| `launch:<id>/task/<task>` | that launch, on that task |
 
 `<task>` and `<path>` are a file's `task` and `path` exactly as the request gives them, so the
 address of a file the plugin read is `run:file/` + `task` + `/` + `path`. In Rust,
-`crucible_view::task_link` and `file_link` build them. Any other address in a cell is refused;
-in Markdown it is drawn and leads nowhere. A cell whose task or file this run does not have is
-drawn as plain text. A local run shows tasks but lists no captured files, so `run:file` links
-lead somewhere only for a run on a controller.
+`crucible_view::task_link`, `file_link`, `launch_link` and `launch_task_link` build them. Any
+other address in a cell is refused; in Markdown it is drawn and leads nowhere. A cell whose task,
+file or launch the app does not have is drawn as plain text. A local run shows tasks but lists no
+captured files, so `run:file` links lead somewhere only for a run on a controller, and `launch:`
+links only on a controller.
+
+## Runs view
+
+A runs view is built from the launches of the playbook rather than one run (see `SKILL.md`), and
+drawn on the playbook's runs page with every component on this page. It has no one run, so a
+cell's `run:task` or `run:file` address is refused there, and one in Markdown leads nowhere;
+link each launch with `launch:` instead. A row per launch, linked, beside a chart of how a count
+moved:
+
+```json runs
+{"stack": {"children": [
+  {"bars": {"bars": [
+    {"label": "triage:11", "segments": [{"label": "affected", "value": 8, "tone": "bad"}]},
+    {"label": "triage:12", "segments": [{"label": "affected", "value": 9, "tone": "bad"}]}
+  ]}},
+  {"table": {"id": "launches", "columns": [
+    {"id": "launch", "title": "Launch", "kind": "mono"},
+    {"id": "affected", "title": "Affected", "kind": "number"}
+  ], "rows": [
+    {"id": "triage:12", "cells": [{"text": "triage:12", "href": "launch:triage:12"}, {"text": "9"}]},
+    {"id": "triage:11", "cells": [{"text": "triage:11", "href": "launch:triage:11/task/triage-go"}, {"text": "8"}]}
+  ]}}
+]}}
+```
 
 ## Charts
 

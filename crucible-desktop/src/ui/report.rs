@@ -62,11 +62,36 @@ impl Slot for RunReport {
     }
 }
 
+/// The runs page's view of the launches of the playbook it shows.
+struct RunsReport;
+
+impl Slot for RunsReport {
+    fn shown(app: &App) -> &Shown {
+        &app.runs_shown.shown
+    }
+
+    fn shown_mut(app: &mut App) -> &mut Shown {
+        &mut app.runs_shown.shown
+    }
+
+    fn leads(app: &App, href: &str) -> bool {
+        app.runs_leads(href)
+    }
+
+    fn follow(app: &mut App, href: &str, tx: &mut Tx) {
+        app.follow_runs_link(href, tx);
+    }
+
+    fn ask(app: &mut App) {
+        app.sync_report();
+    }
+}
+
 pub(crate) fn report_view(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
     let followed = |report: &&Arc<Report>| RunReport::shown(app).holds(Some(report));
     let Some(report) = app.shown_report().filter(followed) else {
         let why = if app.awaits_report() {
-            "Drawing the view\u{2026}"
+            DRAWING
         } else {
             "This pack has no view."
         };
@@ -74,6 +99,23 @@ pub(crate) fn report_view(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
     };
     view::<RunReport>(report, app, p, layer)
 }
+
+/// The runs page's Report tab, drawing `report`.
+pub(crate) fn runs_report_view(
+    report: &Arc<Report>,
+    app: &App,
+    p: &Paint,
+    layer: &mut Vec<El>,
+) -> El {
+    if RunsReport::shown(app).holds(Some(report)) {
+        view::<RunsReport>(report, app, p, layer)
+    } else {
+        desk::note("report-note", DRAWING, "", p)
+    }
+}
+
+/// What a report says while its view is being built.
+const DRAWING: &str = "Drawing the view\u{2026}";
 
 /// `report`'s title, controls and body.
 fn view<S: Slot>(report: &Report, app: &App, p: &Paint, layer: &mut Vec<El>) -> El {

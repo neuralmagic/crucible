@@ -5,6 +5,9 @@
 //! and runs itself. A task may also write a plugin during the run and capture it as
 //! `<name>.view.wasm` or `<name>.view.js`; a local run's newest one is drawn instead of the
 //! pack's.
+//!
+//! A plugin may also draw the launches of its playbook on the runs page, from what each launch's
+//! newest run captured.
 
 pub mod shown;
 
@@ -14,11 +17,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use crucible_view::{File, Param, Request, View};
+use crucible_view::{File, Param, Request, Run, RunsRequest, Status, View};
 
 use base64::Engine;
 
 use crate::captured::Captured;
+use crate::live::{LaunchStatus, LivePlaybook};
 use crate::pack::PackFiles;
 use crate::plugin::{Limits, Loaded, Module, Script};
 
@@ -36,6 +40,8 @@ const CAPTURED: &str = "state/files";
 pub const READ_BYTES: u64 = 32 * 1024 * 1024;
 /// The most bytes one captured file a view reads may hold.
 pub const FILE_BYTES: u64 = 8 * 1024 * 1024;
+/// The most launches one runs view reads.
+pub const RUNS: usize = 50;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Report {
@@ -44,6 +50,17 @@ pub struct Report {
     /// What the plugin was asked with.
     pub params: BTreeMap<String, Param>,
     pub view: Result<View, String>,
+}
+
+impl Report {
+    /// The pack's own plugin's view, asked with `params`.
+    pub fn pack(params: BTreeMap<String, Param>, view: Result<View, String>) -> Report {
+        Report {
+            author: None,
+            params,
+            view,
+        }
+    }
 }
 
 /// A live run's report, as the Report pane asks the live worker for it. Asked again when any of
@@ -60,23 +77,104 @@ pub struct Wanted {
     pub params: BTreeMap<String, Param>,
 }
 
-/// What the live worker built for a [`Wanted`].
+/// A playbook's runs view, as the runs page asks the live worker for it. Asked again when any
+/// of it changes.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Built {
-    pub wanted: Wanted,
-    pub report: Arc<Report>,
+pub struct WantedRuns {
+    pub playbook: String,
+    /// The plugin's path in the newest launch's pack.
+    pub plugin: String,
+    /// The launches to read, newest first, at most [`RUNS`].
+    pub launches: Vec<Launched>,
+    /// How many launches the reader's filters keep.
+    pub total: usize,
+    pub params: BTreeMap<String, Param>,
 }
 
-impl Built {
-    /// The pack's own plugin's `view` for `wanted`.
-    pub fn new(wanted: Wanted, view: Result<View, String>) -> Built {
+/// One launch a runs view is asked with, as the launch list has it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Launched {
+    pub key: String,
+    pub status: Status,
+    /// How many runs it has dispatched.
+    pub runs: i64,
+    /// When it was launched, in Unix seconds.
+    pub started: i64,
+    /// What it cost, once it has stopped. Left out while it runs, so that a rising cost does
+    /// not make every poll a new ask and read every running launch again.
+    pub cost: Option<f64>,
+    pub origin: String,
+}
+
+impl Launched {
+    pub fn of(launch: &LivePlaybook) -> Launched {
+        let status = match launch.status {
+            LaunchStatus::Running => Status::Running,
+            LaunchStatus::Done => Status::Done,
+            LaunchStatus::Error => Status::Error,
+            LaunchStatus::Cancelled => Status::Cancelled,
+            LaunchStatus::New | LaunchStatus::Other(_) => Status::Unfinished,
+        };
+        Launched {
+            key: launch.key.clone(),
+            status,
+            runs: launch.runs,
+            started: launch.landed,
+            cost: launch.cost.filter(|_| status != Status::Running),
+            origin: launch.origin.clone(),
+        }
+    }
+
+    /// Whether it has stopped, so what its runs captured no longer changes.
+    pub fn settled(&self) -> bool {
+        self.status != Status::Running
+    }
+}
+
+/// What each launch of the last runs view was read as, kept so a launch that has stopped and
+/// not changed is not read again.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Gathered {
+    /// The paths each launch was read for.
+    pub inputs: Vec<String>,
+    pub runs: Vec<(Launched, Run)>,
+}
+
+impl Gathered {
+    /// What `launch` was read as for `inputs`, when it has stopped and is as it was then.
+    pub fn kept(&self, inputs: &[String], launch: &Launched) -> Option<&Run> {
+        if self.inputs != inputs || !launch.settled() {
+            return None;
+        }
+        self.runs
+            .iter()
+            .find_map(|(read, run)| (read == launch).then_some(run))
+    }
+}
+
+/// `held` bytes of launches' files with `run`'s added, when that is at most [`READ_BYTES`].
+pub fn with_run(held: u64, run: &Run) -> Option<u64> {
+    let total = run
+        .files
+        .iter()
+        .map(|file| file.text.len() as u64)
+        .fold(held, u64::saturating_add);
+    (total <= READ_BYTES).then_some(total)
+}
+
+/// What the live worker built for a [`Wanted`] or a [`WantedRuns`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct Built<W> {
+    pub wanted: W,
+    /// `None` when the plugin draws no view of that kind.
+    pub report: Option<Arc<Report>>,
+}
+
+impl<W> Built<W> {
+    pub fn new(wanted: W, report: Option<Report>) -> Built<W> {
         Built {
-            report: Arc::new(Report {
-                author: None,
-                params: wanted.params.clone(),
-                view,
-            }),
             wanted,
+            report: report.map(Arc::new),
         }
     }
 }
@@ -121,8 +219,30 @@ pub fn text_plugin(pack: &PackFiles) -> Option<(&str, &str)> {
         .min_by_key(|(path, _)| *path)
 }
 
-/// A loaded plugin and the captured file paths it reads, or why it did not load.
-pub type Plugin = Result<(Loaded, Vec<String>), String>;
+/// The plugin file at `path` holding `bytes`, as the path and text a controller's pack would
+/// carry it under: a `.wasm` module as base64 text, anything else as UTF-8. `None` for a file
+/// that is no plugin or not text.
+pub fn stand_in(path: &str, bytes: Vec<u8>) -> Option<(String, String)> {
+    match Form::of(path)? {
+        Form::Wasm => Some((
+            format!("{path}.b64"),
+            base64::engine::general_purpose::STANDARD.encode(bytes),
+        )),
+        Form::Encoded | Form::Script => Some((path.to_string(), String::from_utf8(bytes).ok()?)),
+    }
+}
+
+/// A plugin that loaded, and the captured file paths each of its views reads.
+pub struct Ready {
+    pub loaded: Loaded,
+    /// What its view of one run reads.
+    pub inputs: Vec<String>,
+    /// What its view of the playbook's launches reads from each; `None` when it draws none.
+    pub runs_inputs: Option<Vec<String>>,
+}
+
+/// A loaded plugin, or why it did not load.
+pub type Plugin = Result<Ready, String>;
 
 /// The plugins a worker has loaded: the JavaScript engine once a script needs it, and the last
 /// plugin that loaded, kept while its path and bytes stay the same.
@@ -180,7 +300,12 @@ impl Plugins {
             }
         };
         let inputs = plugin.inputs().map_err(|f| f.to_string())?;
-        Ok((plugin, inputs))
+        let runs_inputs = plugin.runs_inputs().map_err(|f| f.to_string())?;
+        Ok(Ready {
+            loaded: plugin,
+            inputs,
+            runs_inputs,
+        })
     }
 }
 
@@ -223,6 +348,11 @@ pub fn run(
     plugin
         .view(&Request { files, params })
         .map_err(|fault| fault.to_string())
+}
+
+/// The view `plugin` builds from the launches in `request`.
+pub fn run_runs(plugin: &Loaded, request: &RunsRequest) -> Result<View, String> {
+    plugin.runs_view(request).map_err(|fault| fault.to_string())
 }
 
 /// The task a run link names, or the fan-out and instance key for `task[key]`; `runs` says
@@ -398,7 +528,11 @@ impl Reporter {
                 }
                 Err(error.clone())
             }
-            Ok((plugin, inputs)) => {
+            Ok(Ready {
+                loaded: plugin,
+                inputs,
+                ..
+            }) => {
                 let files = captured(pack, inputs);
                 let read: Vec<Mark> = files.iter().map(|(.., mark)| mark.clone()).collect();
                 let asked = self.report.as_ref().map(|report| &report.params);
@@ -431,11 +565,15 @@ mod tests {
 
     use std::sync::Arc;
 
+    use crucible_view::{Run, Status};
+
     use crate::captured::Captured;
+    use crate::live::{LaunchStatus, LivePlaybook};
     use crate::model::Params;
     use crate::report::shown::{Scoped, Shown};
     use crate::report::{
-        FILE_BYTES, Plugins, READ_BYTES, Reporter, admit, file_named, readable, task_named,
+        FILE_BYTES, Gathered, Launched, Plugins, READ_BYTES, Reporter, admit, file_named, readable,
+        run_runs, stand_in, task_named, with_run,
     };
 
     fn example() -> std::path::PathBuf {
@@ -972,6 +1110,152 @@ mod tests {
         assert_eq!(view.controls.len(), 2, "the controls stay to undo it");
     }
 
+    /// Three launches of `example`, newest first, built from its inbox: one with no run yet,
+    /// one of both lanes with DEMO-101 found affected, and one of the go lane alone.
+    fn example_launches(example: &Path) -> crucible_view::RunsRequest {
+        let lane = |lane: &str| crucible_view::File {
+            path: "verdicts.json".into(),
+            task: format!("triage-{lane}"),
+            text: fs::read_to_string(example.join(format!("inbox/{lane}.json"))).unwrap(),
+        };
+        let mut records: Vec<serde_json::Value> = serde_json::from_str(&lane("go").text).unwrap();
+        let ticket = records
+            .iter_mut()
+            .find(|record| record["ticket_key"] == "DEMO-101")
+            .unwrap();
+        ticket["verdict_property"]["verdict"] = "affected".into();
+        ticket["verdict_property"]["proposed_actions"]["lane"] = "present".into();
+        ticket["verdict_property"]["rationale"] = "Reachable.".into();
+        let regressed = crucible_view::File {
+            text: serde_json::to_string(&records).unwrap(),
+            ..lane("go")
+        };
+        let launch = |id: &str, status: Status, files: Vec<crucible_view::File>| Run {
+            files,
+            id: id.into(),
+            status,
+            ..run(id, 0)
+        };
+        crucible_view::RunsRequest {
+            runs: vec![
+                launch("triage:3", Status::Running, vec![]),
+                launch("triage:2", Status::Done, vec![regressed, lane("python")]),
+                launch("triage:1", Status::Done, vec![lane("go")]),
+            ],
+            total: 4,
+            params: Default::default(),
+        }
+    }
+
+    /// The stats, the moved tickets' cells and the launch links of an example's runs view.
+    fn history(view: &View) -> (Vec<String>, Vec<Vec<String>>, Vec<String>) {
+        let Node::Stack { children } = &view.body else {
+            panic!("the runs view is a stack");
+        };
+        let [
+            Node::Stats { items },
+            Node::Bars { .. },
+            Node::Tabs { tabs, .. },
+        ] = children.as_slice()
+        else {
+            panic!("the runs view is its stats over its bars over its tabs");
+        };
+        let rows = |at: usize| {
+            let Node::Table { rows, .. } = &tabs[at].body else {
+                panic!("a table");
+            };
+            rows.clone()
+        };
+        let moved = rows(0)
+            .iter()
+            .map(|row| row.cells.iter().map(|cell| cell.text.clone()).collect())
+            .collect();
+        let links = rows(1)
+            .iter()
+            .filter_map(|row| row.cells[0].href.clone())
+            .collect();
+        (
+            items.iter().map(|item| item.value.clone()).collect(),
+            moved,
+            links,
+        )
+    }
+
+    #[test]
+    fn the_report_example_s_runs_view_follows_each_ticket_across_launches() {
+        let wasm = fs::read(example().join("ui/report.wasm"))
+            .expect("build it with `just example-report-view`");
+        let plugin = Plugins::default().load("ui/report.wasm", &wasm);
+        let ready = (*plugin).as_ref().unwrap();
+        assert_eq!(
+            ready.runs_inputs.as_deref(),
+            Some(&["verdicts.json".to_string()][..])
+        );
+        let view = run_runs(&ready.loaded, &example_launches(&example())).unwrap();
+        assert_eq!(view.title, "Triage history");
+        let (stats, moved, links) = history(&view);
+        assert_eq!(stats[..3], ["3 of 4", "64", "1"]);
+        assert_eq!(
+            moved,
+            [[
+                "DEMO-101",
+                "affected",
+                "sbom_inaccurate",
+                "triage:2",
+                "1",
+                "sbom_inaccurate \u{2192} affected"
+            ]]
+        );
+        assert_eq!(
+            links,
+            ["launch:triage:3", "launch:triage:2", "launch:triage:1"]
+        );
+    }
+
+    #[test]
+    #[ignore = "needs assets/js-engine/plugin.wasm from `just desktop-js-engine`"]
+    fn the_typescript_example_s_runs_view_follows_each_ticket_across_launches() {
+        let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/report-ts");
+        let script = fs::read(example.join("ui/report.js")).unwrap();
+        let plugin = Plugins::default().load("ui/report.js", &script);
+        let ready = (*plugin).as_ref().unwrap();
+        assert_eq!(
+            ready.runs_inputs.as_deref(),
+            Some(&["verdicts.json".to_string()][..])
+        );
+        let view = run_runs(&ready.loaded, &example_launches(&example)).unwrap();
+        assert_eq!(view.title, "Triage history");
+        let (stats, moved, links) = history(&view);
+        assert_eq!(stats[..3], ["3 of 4", "64", "1"]);
+        assert_eq!(
+            moved,
+            [[
+                "DEMO-101",
+                "Fix",
+                "Close",
+                "triage:2",
+                "1",
+                "Close \u{2192} Fix"
+            ]]
+        );
+        assert_eq!(
+            links,
+            ["launch:triage:3", "launch:triage:2", "launch:triage:1"]
+        );
+        let empty = crucible_view::RunsRequest {
+            total: 1,
+            ..Default::default()
+        };
+        assert!(matches!(
+            run_runs(&ready.loaded, &empty).unwrap().body,
+            Node::Note { .. }
+        ));
+        let mut torn = example_launches(&example);
+        torn.runs[2].files[0].text = "[{".into();
+        let error = run_runs(&ready.loaded, &torn).unwrap_err();
+        assert!(error.contains(", in triage:1"), "{error}");
+    }
+
     #[test]
     fn a_torn_file_is_the_report_s_error() {
         let dir = pack();
@@ -1031,6 +1315,160 @@ mod tests {
             error.starts_with("The files this view reads hold 36700160 bytes"),
             "{error}"
         );
+    }
+
+    fn launch(key: &str, status: LaunchStatus) -> LivePlaybook {
+        LivePlaybook {
+            id: "triage".into(),
+            key: key.into(),
+            status,
+            cost: Some(1.25),
+            runs: 1,
+            landed: 1_790_000_000,
+            origin: "schedule".into(),
+            ..LivePlaybook::default()
+        }
+    }
+
+    #[test]
+    fn a_launch_is_asked_with_its_status_and_its_cost_once_it_has_stopped() {
+        for (status, read) in [
+            (LaunchStatus::Running, Status::Running),
+            (LaunchStatus::Done, Status::Done),
+            (LaunchStatus::Error, Status::Error),
+            (LaunchStatus::Cancelled, Status::Cancelled),
+            (LaunchStatus::New, Status::Unfinished),
+            (LaunchStatus::Other("parked".into()), Status::Unfinished),
+        ] {
+            let asked = Launched::of(&launch("PB-1", status));
+            assert_eq!(asked.status, read);
+            assert_eq!(asked.settled(), read != Status::Running);
+            let cost = (read != Status::Running).then_some(1.25);
+            assert_eq!(asked.cost, cost, "{read:?}");
+            assert_eq!(
+                (
+                    asked.key.as_str(),
+                    asked.runs,
+                    asked.started,
+                    asked.origin.as_str()
+                ),
+                ("PB-1", 1, 1_790_000_000, "schedule")
+            );
+        }
+        let running = |cost: f64| {
+            Launched::of(&LivePlaybook {
+                cost: Some(cost),
+                ..launch("PB-1", LaunchStatus::Running)
+            })
+        };
+        assert_eq!(running(0.5), running(3.0), "a rising cost is the same ask");
+        let more = LivePlaybook {
+            runs: 2,
+            ..launch("PB-1", LaunchStatus::Running)
+        };
+        assert_ne!(
+            Launched::of(&more),
+            running(0.5),
+            "another run is a new ask"
+        );
+    }
+
+    fn run(id: &str, bytes: usize) -> Run {
+        Run {
+            id: id.into(),
+            status: Status::Done,
+            started: 0.0,
+            cost_usd: None,
+            origin: "manual".into(),
+            pack_version: None,
+            params: Default::default(),
+            files: vec![crucible_view::File {
+                path: "verdicts.json".into(),
+                task: "triage".into(),
+                text: "x".repeat(bytes),
+            }],
+        }
+    }
+
+    #[test]
+    fn a_stopped_unchanged_launch_is_kept_for_the_same_inputs_only() {
+        let inputs = vec!["verdicts.json".to_string()];
+        let done = Launched::of(&launch("PB-1", LaunchStatus::Done));
+        let running = Launched::of(&launch("PB-2", LaunchStatus::Running));
+        let gathered = Gathered {
+            inputs: inputs.clone(),
+            runs: vec![
+                (done.clone(), run("PB-1", 3)),
+                (running.clone(), run("PB-2", 3)),
+            ],
+        };
+        assert_eq!(gathered.kept(&inputs, &done), Some(&run("PB-1", 3)));
+        assert_eq!(
+            gathered.kept(&inputs, &running),
+            None,
+            "a running launch is read again"
+        );
+        let rerun = Launched {
+            runs: 2,
+            ..done.clone()
+        };
+        assert_eq!(gathered.kept(&inputs, &rerun), None, "it changed since");
+        let other = ["verdicts.json".to_string(), "notes.json".to_string()];
+        assert_eq!(
+            gathered.kept(&other, &done),
+            None,
+            "the plugin reads other files now"
+        );
+        let unknown = Launched::of(&launch("PB-9", LaunchStatus::Done));
+        assert_eq!(gathered.kept(&inputs, &unknown), None);
+        assert_eq!(Gathered::default().kept(&[], &done), None);
+    }
+
+    #[test]
+    fn launches_are_read_while_their_files_fit_the_bytes_a_view_reads() {
+        let whole = READ_BYTES as usize;
+        assert_eq!(with_run(0, &run("a", 0)), Some(0));
+        assert_eq!(with_run(0, &run("a", whole)), Some(READ_BYTES));
+        assert_eq!(with_run(0, &run("a", whole + 1)), None);
+        assert_eq!(with_run(READ_BYTES - 3, &run("a", 3)), Some(READ_BYTES));
+        assert_eq!(with_run(READ_BYTES - 3, &run("a", 4)), None);
+        assert_eq!(with_run(u64::MAX, &run("a", 1)), None);
+        let two = Run {
+            files: [run("a", 5).files, run("a", 7).files].concat(),
+            ..run("a", 0)
+        };
+        assert_eq!(with_run(1, &two), Some(13));
+    }
+
+    #[test]
+    fn a_stand_in_plugin_is_carried_as_text() {
+        use base64::Engine;
+        assert_eq!(
+            stand_in("/tmp/view.js", b"export const inputs = [];".to_vec()),
+            Some(("/tmp/view.js".into(), "export const inputs = [];".into()))
+        );
+        let (path, text) = stand_in("/tmp/report.wasm", vec![0, 97, 115, 109]).unwrap();
+        assert_eq!(path, "/tmp/report.wasm.b64");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(text)
+                .unwrap(),
+            [0, 97, 115, 109]
+        );
+        assert_eq!(
+            stand_in("ui/report.wasm.b64", b"AA==".to_vec()),
+            Some(("ui/report.wasm.b64".into(), "AA==".into()))
+        );
+        assert_eq!(stand_in("/tmp/view.js", vec![0xff, 0xfe]), None, "not text");
+        assert_eq!(
+            stand_in("/tmp/notes.md", b"# hi".to_vec()),
+            None,
+            "no plugin"
+        );
+        let wasm = fs::read(example().join("ui/report.wasm"))
+            .expect("build it with `just example-report-view`");
+        let (path, text) = stand_in("report.wasm", wasm).unwrap();
+        assert!(Plugins::default().load(&path, text.as_bytes()).is_ok());
     }
 
     #[test]

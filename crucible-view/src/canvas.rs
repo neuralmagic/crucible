@@ -458,6 +458,7 @@ impl Context2d {
 mod tests {
     use crate::{
         Context2d, Draw, Limits, Node, Problem, Style, TextAlign, TextBaseline, Tone, View,
+        ViewKind,
     };
 
     fn view(body: Node) -> View {
@@ -528,7 +529,7 @@ mod tests {
             assert!(json.contains(part), "{part} in {json}");
         }
         assert_eq!(serde_json::from_str::<Node>(&json).unwrap(), node);
-        assert_eq!(view(node).check(&Limits::DEFAULT), Ok(()));
+        assert_eq!(view(node).check(ViewKind::Run, &Limits::DEFAULT), Ok(()));
         let unknown = r#"{"canvas":{"width":1,"height":1,"commands":[{"draw_image":"x.png"}]}}"#;
         assert!(serde_json::from_str::<Node>(unknown).is_err());
     }
@@ -543,15 +544,18 @@ mod tests {
 
     #[test]
     fn a_canvas_is_bounded_and_its_numbers_within_reach() {
-        assert_eq!(canvas(100.0, vec![]).check(&Limits::DEFAULT), Ok(()));
+        assert_eq!(
+            canvas(100.0, vec![]).check(ViewKind::Run, &Limits::DEFAULT),
+            Ok(())
+        );
         for width in [0.0, -5.0, 4_001.0, f32::NAN] {
             assert_eq!(
-                canvas(width, vec![]).check(&Limits::DEFAULT),
+                canvas(width, vec![]).check(ViewKind::Run, &Limits::DEFAULT),
                 Err(Problem::CanvasSize(4_000))
             );
         }
         assert_eq!(
-            canvas(100.0, vec![Draw::LineTo([1.0, -1e6])]).check(&Limits::DEFAULT),
+            canvas(100.0, vec![Draw::LineTo([1.0, -1e6])]).check(ViewKind::Run, &Limits::DEFAULT),
             Ok(())
         );
         for off in [f32::INFINITY, f32::NAN, 1.1e6, f32::MIN] {
@@ -570,13 +574,13 @@ mod tests {
                 Draw::LineWidth(off),
             ] {
                 assert_eq!(
-                    canvas(100.0, vec![Draw::Save, command]).check(&Limits::DEFAULT),
+                    canvas(100.0, vec![Draw::Save, command]).check(ViewKind::Run, &Limits::DEFAULT),
                     Err(Problem::CanvasNumber(1))
                 );
             }
         }
         assert_eq!(
-            canvas(100.0, vec![Draw::Save; 20_001]).check(&Limits::DEFAULT),
+            canvas(100.0, vec![Draw::Save; 20_001]).check(ViewKind::Run, &Limits::DEFAULT),
             Err(Problem::Commands(20_000))
         );
         let two = Node::Stack {
@@ -590,11 +594,12 @@ mod tests {
             ],
         };
         assert_eq!(
-            view(two).check(&Limits::DEFAULT),
+            view(two).check(ViewKind::Run, &Limits::DEFAULT),
             Err(Problem::Commands(20_000))
         );
         assert_eq!(
-            canvas(100.0, vec![Draw::Font("x".repeat(20_001))]).check(&Limits::DEFAULT),
+            canvas(100.0, vec![Draw::Font("x".repeat(20_001))])
+                .check(ViewKind::Run, &Limits::DEFAULT),
             Err(Problem::Text(20_000))
         );
     }
@@ -608,14 +613,20 @@ mod tests {
         };
         let mut drawn_once = vec![Draw::LineTo([0.0, 0.0]); 20];
         drawn_once.push(Draw::Stroke);
-        assert_eq!(canvas(100.0, drawn_once.clone()).check(&limits), Ok(()));
+        assert_eq!(
+            canvas(100.0, drawn_once.clone()).check(ViewKind::Run, &limits),
+            Ok(())
+        );
 
         let mut drawn_often = drawn_once.clone();
         drawn_often.extend(vec![Draw::Fill; 4]);
-        assert_eq!(canvas(100.0, drawn_often.clone()).check(&limits), Ok(()));
+        assert_eq!(
+            canvas(100.0, drawn_often.clone()).check(ViewKind::Run, &limits),
+            Ok(())
+        );
         drawn_often.push(Draw::Stroke);
         assert_eq!(
-            canvas(100.0, drawn_often).check(&limits),
+            canvas(100.0, drawn_often).check(ViewKind::Run, &limits),
             Err(Problem::Points(100))
         );
 
@@ -624,15 +635,18 @@ mod tests {
             fresh.push(Draw::BeginPath);
             fresh.extend(drawn_once.clone());
         }
-        assert_eq!(canvas(100.0, fresh).check(&limits), Ok(()));
+        assert_eq!(canvas(100.0, fresh).check(ViewKind::Run, &limits), Ok(()));
 
         let rects = |count: usize| {
             let mut commands = vec![Draw::FillRect([0.0, 0.0, 1.0, 1.0]); count];
             commands.insert(0, Draw::BeginPath);
             canvas(100.0, commands)
         };
-        assert_eq!(rects(25).check(&limits), Ok(()));
-        assert_eq!(rects(26).check(&limits), Err(Problem::Points(100)));
+        assert_eq!(rects(25).check(ViewKind::Run, &limits), Ok(()));
+        assert_eq!(
+            rects(26).check(ViewKind::Run, &limits),
+            Err(Problem::Points(100))
+        );
     }
 
     #[test]
@@ -643,7 +657,7 @@ mod tests {
         };
         let line = Draw::LineTo([0.0, 0.0]);
         assert_eq!(
-            canvas(100.0, vec![line.clone(); 21]).check(&limits),
+            canvas(100.0, vec![line.clone(); 21]).check(ViewKind::Run, &limits),
             Err(Problem::PathPoints(20))
         );
         for restart in [
@@ -654,12 +668,15 @@ mod tests {
             let mut commands = vec![line.clone(); 19];
             commands.push(restart);
             commands.extend(vec![line.clone(); 19]);
-            assert_eq!(canvas(100.0, commands).check(&limits), Ok(()));
+            assert_eq!(
+                canvas(100.0, commands).check(ViewKind::Run, &limits),
+                Ok(())
+            );
         }
         let curve = Draw::QuadraticCurveTo([0.0; 4]);
         assert_eq!(curve.path_points(), 65);
         assert_eq!(
-            canvas(100.0, vec![curve]).check(&limits),
+            canvas(100.0, vec![curve]).check(ViewKind::Run, &limits),
             Err(Problem::PathPoints(20))
         );
         let arc = Draw::Arc {
@@ -707,7 +724,7 @@ mod tests {
             assert!(json.contains(part), "{part} in {json}");
         }
         assert_eq!(serde_json::from_str::<Node>(&json).unwrap(), node);
-        assert_eq!(view(node).check(&Limits::DEFAULT), Ok(()));
+        assert_eq!(view(node).check(ViewKind::Run, &Limits::DEFAULT), Ok(()));
         for baseline in ["top", "middle", "alphabetic", "bottom"] {
             let json = format!(r#"{{"text_baseline":"{baseline}"}}"#);
             assert!(serde_json::from_str::<Draw>(&json).is_ok(), "{json}");
@@ -740,7 +757,7 @@ mod tests {
                     },
                 ]
             )
-            .check(&Limits::DEFAULT),
+            .check(ViewKind::Run, &Limits::DEFAULT),
             Ok(())
         );
         for off in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN, 1.1e6, f32::MAX] {
@@ -766,7 +783,7 @@ mod tests {
             ] {
                 assert_eq!(
                     canvas(100.0, vec![Draw::ResetTransform, command.clone()])
-                        .check(&Limits::DEFAULT),
+                        .check(ViewKind::Run, &Limits::DEFAULT),
                     Err(Problem::CanvasNumber(1)),
                     "{command:?}"
                 );
@@ -806,10 +823,13 @@ mod tests {
             height: 1.0,
             text: text.into(),
         };
-        assert_eq!(canvas(100.0, vec![]).check(&limits), Ok(()));
-        assert_eq!(canvas(100.0, vec![hint(""); 3]).check(&limits), Ok(()));
+        assert_eq!(canvas(100.0, vec![]).check(ViewKind::Run, &limits), Ok(()));
         assert_eq!(
-            canvas(100.0, vec![hint("same"); 4]).check(&limits),
+            canvas(100.0, vec![hint(""); 3]).check(ViewKind::Run, &limits),
+            Ok(())
+        );
+        assert_eq!(
+            canvas(100.0, vec![hint("same"); 4]).check(ViewKind::Run, &limits),
             Err(Problem::Items(3)),
             "duplicates count"
         );
@@ -823,10 +843,16 @@ mod tests {
                 2
             ],
         };
-        assert_eq!(view(two).check(&limits), Err(Problem::Items(3)));
-        assert_eq!(canvas(100.0, vec![hint("12345678")]).check(&limits), Ok(()));
         assert_eq!(
-            canvas(100.0, vec![hint("123456789")]).check(&limits),
+            view(two).check(ViewKind::Run, &limits),
+            Err(Problem::Items(3))
+        );
+        assert_eq!(
+            canvas(100.0, vec![hint("12345678")]).check(ViewKind::Run, &limits),
+            Ok(())
+        );
+        assert_eq!(
+            canvas(100.0, vec![hint("123456789")]).check(ViewKind::Run, &limits),
             Err(Problem::Text(8))
         );
         let long_text = Draw::FillText {
@@ -836,7 +862,7 @@ mod tests {
             max_width: Some(5.0),
         };
         assert_eq!(
-            canvas(100.0, vec![long_text]).check(&limits),
+            canvas(100.0, vec![long_text]).check(ViewKind::Run, &limits),
             Err(Problem::Text(8))
         );
     }

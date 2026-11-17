@@ -165,6 +165,15 @@ impl Selection {
     }
 }
 
+/// What the runs page shows of a playbook's launches.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RunsTab {
+    #[default]
+    Runs,
+    /// The pack's view of the launches.
+    Report,
+}
+
 /// What the Report pane asks a worker to build.
 #[derive(Clone, Debug, PartialEq)]
 enum ReportAsk {
@@ -460,6 +469,13 @@ pub struct App {
     report_sent: Option<ReportAsk>,
     /// The report the local worker last built for the Report pane.
     local_report: Option<model::PackReport>,
+    /// The runs page's view of the launches, its controls, tabs and table, kept for the
+    /// playbook.
+    pub runs_shown: report::shown::Scoped<String>,
+    pub runs_tab: RunsTab,
+    /// The plugin that stands in for a live pack's, as its path and text: what
+    /// `CRUCIBLE_VIEW_PLUGIN` named at start.
+    view_plugin: Option<(String, String)>,
     /// The workspace the user arranged; `None` lays each run out by its graph's depth.
     pub layout: Option<Workspace>,
     /// Panes picked from a tab bar while the layout follows the run, oldest first.
@@ -554,22 +570,28 @@ impl App {
         report::file_named(files, named).map(|file| file.key.clone())
     }
 
-    /// Whether an address a report holds leads to the web or to something this run has.
+    /// Whether an address a report holds leads to the web, to something this run has, or to a
+    /// launch the controller listed.
     pub fn report_leads(&self, href: &str) -> bool {
         match crucible_view::Link::parse(href) {
             Some(crucible_view::Link::Web(_)) => true,
             Some(crucible_view::Link::Task(task)) => self.report_task(task).is_some(),
             Some(crucible_view::Link::File(file)) => self.report_file(file).is_some(),
+            Some(crucible_view::Link::Launch { launch, .. }) => {
+                self.listed_launch(launch).is_some()
+            }
             None => false,
         }
     }
 
-    /// Opens a web address a report holds, or shows the task or captured file it names.
+    /// Opens a web address a report holds, shows the task or captured file it names, or opens
+    /// the launch it names.
     pub fn follow_report_link(&mut self, href: &str, tx: &mut Tx) {
         match crucible_view::Link::parse(href) {
             Some(crucible_view::Link::Web(url)) => {
                 let _ = tx.open_url(url);
             }
+            Some(crucible_view::Link::Launch { launch, task }) => self.open_launch(launch, task),
             Some(crucible_view::Link::Task(named)) => match self.report_task(named) {
                 Some((task, Some(key))) => self.pick_instance(task, key),
                 Some((task, None)) => {
@@ -586,6 +608,40 @@ impl App {
             }
             None => {}
         }
+    }
+
+    /// Whether an address the runs view holds leads to the web or to a launch the controller
+    /// listed. One into a run leads nowhere: the view is of no one run.
+    pub fn runs_leads(&self, href: &str) -> bool {
+        crucible_view::Link::parse(href).is_some_and(|link| !link.in_run())
+            && self.report_leads(href)
+    }
+
+    /// Opens a web address or a launch the runs view holds.
+    pub fn follow_runs_link(&mut self, href: &str, tx: &mut Tx) {
+        if self.runs_leads(href) {
+            self.follow_report_link(href, tx);
+        }
+    }
+
+    /// The launch `key` names, when the controller's list has it.
+    fn listed_launch(&self, key: &str) -> Option<&LivePlaybook> {
+        (self.backend == Backend::Controller)
+            .then(|| self.remote.live.launch(key))
+            .flatten()
+    }
+
+    /// Opens the launch `key` names, with `task` open when one is named.
+    fn open_launch(&mut self, key: &str, task: Option<&str>) {
+        let Some(launch) = self.listed_launch(key) else {
+            return;
+        };
+        let link = Link::Launch {
+            playbook: launch.id.clone(),
+            key: launch.key.clone(),
+            task: task.map(ToString::to_string),
+        };
+        self.follow(&link);
     }
 
     /// The local packs matching the sidebar's search field.
@@ -1202,6 +1258,7 @@ impl App {
         self.answer_drop(snapshot.dropped);
         self.answer_file(snapshot.file);
         self.answer_report(snapshot.report);
+        self.answer_runs_report(snapshot.runs_report);
         self.answer_revisions(snapshot.revisions);
         self.announce(&snapshot.finished);
         self.reconcile();
@@ -1339,8 +1396,10 @@ impl App {
             .is_some_and(|launch| !launch.status.is_running())
     }
 
-    /// Asks the worker behind the selection for the report the Report pane shows.
+    /// Asks the worker behind the selection for the report the Report pane shows, and the live
+    /// worker for the runs view the runs page shows.
     fn sync_report(&mut self) {
+        self.sync_runs_report();
         self.follow_report();
         let wanted = self.wanted_report();
         if wanted == self.report_sent {
@@ -1371,7 +1430,7 @@ impl App {
     /// The report the Report pane shows while it is open: the selected local pack's, or the
     /// selected live run's when its pack carries a plugin and its captured files are listed.
     fn wanted_report(&self) -> Option<ReportAsk> {
-        if !self.workspace().showing(PaneKind::Report) {
+        if !self.workspace().showing(PaneKind::Report) || self.runs_page().is_some() {
             return None;
         }
         let params = self.report_shown.shown.params().clone();
@@ -1388,15 +1447,24 @@ impl App {
         }))
     }
 
-    /// The selected live run, its pack's plugin as path and text, and the files it captured.
+    /// The selected live run, its plugin as path and text, and the files it captured.
     fn live_report_source(&self) -> Option<(&str, (&str, &str), &[captured::Captured])> {
         let detail = self.selected_detail()?;
-        let plugin = report::text_plugin(detail.pack.as_ref().ok()?)?;
+        let plugin = self.live_plugin()?;
         let files = detail.files.as_ref()?.as_ref().ok()?;
         Some((detail.run_id.as_deref()?, plugin, files))
     }
 
-    fn answer_report(&mut self, built: Option<std::sync::Arc<report::Built>>) {
+    /// The plugin a live run and its playbook's runs page draw with, as its path and text: the
+    /// file `CRUCIBLE_VIEW_PLUGIN` named, else the one the selected launch's pack carries.
+    fn live_plugin(&self) -> Option<(&str, &str)> {
+        if let Some((path, text)) = &self.view_plugin {
+            return Some((path, text));
+        }
+        report::text_plugin(self.selected_detail()?.pack.as_ref().ok()?)
+    }
+
+    fn answer_report(&mut self, built: Option<std::sync::Arc<report::Built<report::Wanted>>>) {
         if let Some(built) = built
             && matches!(&self.report_sent, Some(ReportAsk::Live(sent)) if *sent == built.wanted)
         {
@@ -1419,7 +1487,7 @@ impl App {
             .report
             .as_deref()
             .filter(|built| built.wanted.run == run)
-            .map(|built| &built.report)
+            .and_then(|built| built.report.as_ref())
     }
 
     /// Drops what the Report pane kept for a selection or a report it no longer shows.
@@ -1427,6 +1495,86 @@ impl App {
         let report = self.shown_report().cloned();
         self.report_shown
             .follow(self.selection.as_ref(), report.as_ref());
+    }
+
+    /// The selected playbook and the launches the filters keep, newest first, when there is
+    /// more than one.
+    pub fn playbook_launches(&self) -> Option<(&str, Vec<&LivePlaybook>)> {
+        let playbook = self.selected_playbook()?;
+        let launches: Vec<&LivePlaybook> = self
+            .remote
+            .live
+            .kept(&self.launch_filter())
+            .into_iter()
+            .filter(|launch| launch.id == playbook)
+            .collect();
+        (launches.len() > 1).then_some((playbook, launches))
+    }
+
+    /// The playbook and launches the runs page shows, while it is on screen in place of one
+    /// run.
+    pub fn runs_page(&self) -> Option<(&str, Vec<&LivePlaybook>)> {
+        let following = matches!(self.selection, Some(Selection::Live { launch: None, .. }));
+        let listed = matches!(&*self.remote.live, LiveView::Ready { .. });
+        (self.page == Page::Runs && following && listed)
+            .then(|| self.playbook_launches())
+            .flatten()
+    }
+
+    /// Asks the live worker for the runs view of the playbook the runs page shows.
+    fn sync_runs_report(&mut self) {
+        let playbook = self.selected_playbook().map(str::to_string);
+        let view = self.runs_view().cloned();
+        self.runs_shown.follow(playbook.as_ref(), view.as_ref());
+        let wanted = self.wanted_runs_report();
+        if wanted == self.remote.runs_report_sent {
+            return;
+        }
+        if let (Some(wanted), Some((_, text))) = (&wanted, self.live_plugin()) {
+            self.remote
+                .live_client
+                .runs_report(wanted.clone(), text.to_string());
+        }
+        self.remote.runs_report_sent = wanted;
+    }
+
+    /// The runs view of the playbook the runs page shows, while its newest launch's pack carries
+    /// a plugin: the newest [`report::RUNS`] launches the filters keep.
+    fn wanted_runs_report(&self) -> Option<report::WantedRuns> {
+        let (playbook, launches) = self.runs_page()?;
+        let (plugin, _) = self.live_plugin()?;
+        Some(report::WantedRuns {
+            playbook: playbook.to_string(),
+            plugin: plugin.to_string(),
+            total: launches.len(),
+            launches: launches
+                .iter()
+                .take(report::RUNS)
+                .map(|launch| report::Launched::of(launch))
+                .collect(),
+            params: self.runs_shown.shown.params().clone(),
+        })
+    }
+
+    fn answer_runs_report(
+        &mut self,
+        built: Option<std::sync::Arc<report::Built<report::WantedRuns>>>,
+    ) {
+        if let Some(built) = built
+            && Some(&built.wanted) == self.remote.runs_report_sent.as_ref()
+        {
+            self.remote.runs_report = Some(built);
+        }
+    }
+
+    /// The runs view built for the playbook the runs page shows, when its plugin draws one.
+    pub fn runs_view(&self) -> Option<&std::sync::Arc<report::Report>> {
+        let (playbook, _) = self.runs_page()?;
+        self.remote
+            .runs_report
+            .as_deref()
+            .filter(|built| built.wanted.playbook == playbook)
+            .and_then(|built| built.report.as_ref())
     }
 
     /// Whether a worker has been asked for a report it has not built yet.
@@ -1941,6 +2089,11 @@ fn init() -> App {
         report_shown: report::shown::Scoped::default(),
         report_sent: None,
         local_report: None,
+        runs_shown: report::shown::Scoped::default(),
+        runs_tab: RunsTab::default(),
+        view_plugin: std::env::var("CRUCIBLE_VIEW_PLUGIN")
+            .ok()
+            .and_then(|path| report::stand_in(&path, std::fs::read(&path).ok()?)),
         knobs: rune_knobs::Knobs::default(),
         page: Page::Runs,
         flight: None,
@@ -2179,9 +2332,15 @@ pub fn run() {
             // `CRUCIBLE_LINK=<crucible-playbooks:// link>` follows a link as the system would.
             // `CRUCIBLE_RANGE=<from>..<to>` picks the saves the History pane compares, and
             // `CRUCIBLE_DIFF=split` draws them side by side.
+            // `CRUCIBLE_RUNS_TAB=report` shows the runs page's Report tab, and
+            // `CRUCIBLE_VIEW_PLUGIN=<file>`, in any scene, draws live runs and runs pages with
+            // that plugin file in place of the pack's.
             ("live", |app: &mut App| {
                 app.backend = Backend::Controller;
                 scene_tab(app);
+                if std::env::var("CRUCIBLE_RUNS_TAB").is_ok_and(|tab| tab == "report") {
+                    app.runs_tab = RunsTab::Report;
+                }
                 if let Ok(id) = std::env::var("CRUCIBLE_LIVE_SCENE") {
                     app.select(Selection::playbook(&id));
                 }

@@ -71,7 +71,7 @@ pub fn flow_columns(nodes: &[FlowNode], links: &[FlowLink]) -> Result<Vec<usize>
 
 #[cfg(test)]
 mod tests {
-    use crate::{FlowLink, FlowNode, Limits, Node, Problem, Tone, View, flow_columns};
+    use crate::{FlowLink, FlowNode, Limits, Node, Problem, Tone, View, ViewKind, flow_columns};
 
     fn node(id: &str) -> FlowNode {
         FlowNode {
@@ -96,7 +96,7 @@ mod tests {
             body: Node::Flow { nodes, links },
             controls: vec![],
         }
-        .check(&Limits::DEFAULT)
+        .check(ViewKind::Run, &Limits::DEFAULT)
     }
 
     #[test]

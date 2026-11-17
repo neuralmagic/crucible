@@ -457,7 +457,13 @@ mod tests {
                     commands,
                 },
             };
-            assert_eq!(view.check(&crucible_view::Limits::DEFAULT), Ok(()));
+            assert_eq!(
+                view.check(
+                    crucible_view::ViewKind::Run,
+                    &crucible_view::Limits::DEFAULT
+                ),
+                Ok(())
+            );
         }
     }
 }

@@ -10,10 +10,11 @@ use crate::runs::{
     weeks_shown,
 };
 use crate::ui::Flight;
+use crate::ui::desk;
 use crate::ui::{
     Paint, SECTION, TITLE, age, meter, pulsing, runs_note, stat, verdict_color, verdict_icon,
 };
-use crate::{App, Selection};
+use crate::{App, RunsTab, Selection};
 use jiff::tz::TimeZone;
 use rune_kit::Spinner;
 
@@ -31,6 +32,7 @@ pub(crate) fn runs_page(
     playbook: &str,
     launches: &[&LivePlaybook],
     now: i64,
+    view: Option<(RunsTab, Option<El>)>,
     p: &Paint,
 ) -> El {
     let summary = Summary::of(
@@ -85,29 +87,62 @@ pub(crate) fn runs_page(
                         .wrap()
                 })),
         )
-        .child(stats(&summary, newest, now, p))
-        .child(card("Timeline", timeline(launches, now, &zone, p), p))
-        .child(
-            row()
-                .w_full()
-                .grow(1.0)
-                .min_h(0.0)
-                .gap(16.0)
-                .child(
-                    col()
-                        .gap(16.0)
-                        .h_full()
-                        .min_h(0.0)
-                        .child(card("Calendar", heatmap(launches, now, &zone, p), p))
-                        .children(shares.map(|shares| card("Shares", shares, p))),
-                )
-                .child(
-                    card("All runs", list(launches, now, p), p)
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .min_h(0.0),
-                ),
-        )
+        .children(view.as_ref().map(|(tab, _)| tabs(*tab, p)))
+        .children(match view {
+            Some((RunsTab::Report, Some(drawn))) => vec![
+                col()
+                    .key("runs-report")
+                    .w_full()
+                    .grow(1.0)
+                    .min_h(0.0)
+                    .child(drawn),
+            ],
+            _ => vec![
+                stats(&summary, newest, now, p),
+                card("Timeline", timeline(launches, now, &zone, p), p),
+                row()
+                    .w_full()
+                    .grow(1.0)
+                    .min_h(0.0)
+                    .gap(16.0)
+                    .child(
+                        col()
+                            .gap(16.0)
+                            .h_full()
+                            .min_h(0.0)
+                            .child(card("Calendar", heatmap(launches, now, &zone, p), p))
+                            .children(shares.map(|shares| card("Shares", shares, p))),
+                    )
+                    .child(
+                        card("All runs", list(launches, now, p), p)
+                            .grow(1.0)
+                            .min_w(0.0)
+                            .min_h(0.0),
+                    ),
+            ],
+        })
+}
+
+/// The runs page's tabs: the launches, and the pack's view of them.
+fn tabs(shown: RunsTab, p: &Paint) -> El {
+    let options = [("runs", "Runs"), ("report", "Report")]
+        .map(|(value, label)| (value.to_string(), label.to_string()));
+    let picked = match shown {
+        RunsTab::Runs => "runs",
+        RunsTab::Report => "report",
+    };
+    desk::pills(
+        "runs-tabs",
+        &options,
+        Some(picked),
+        |app: &mut App, value: &str| {
+            app.runs_tab = match value {
+                "report" => RunsTab::Report,
+                _ => RunsTab::Runs,
+            };
+        },
+        p,
+    )
 }
 
 fn stats(summary: &Summary, newest: i64, now: i64, p: &Paint) -> El {

@@ -1,15 +1,21 @@
-//! The report view: every lane's `verdicts.json` as one row per ticket, by disposition.
+//! The report view: every lane's `verdicts.json` as one row per ticket, by disposition. Its runs
+//! view follows each ticket's category across the playbook's launches.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crucible_view::{
-    Bar, Cell, Column, ColumnKind, Context2d, Control, FlowLink, FlowNode, LineCap, Node, PlotKind,
-    Request, Row, Scale, Segment, Series, Stat, Tab, TextAlign, TextBaseline, Tone, View, Width,
-    file_link, task_link,
+    Bar, Cell, Column, ColumnKind, Context2d, Control, File, FlowLink, FlowNode, LineCap, Node,
+    PlotKind, Request, Row, Run, RunsRequest, Scale, Segment, Series, Stat, Status, Tab, TextAlign,
+    TextBaseline, Tone, View, Width, file_link, launch_link, task_link,
 };
 use serde::Deserialize;
 
-crucible_view::plugin!(inputs = ["verdicts.json"], view = report);
+crucible_view::plugin!(
+    inputs = ["verdicts.json"],
+    view = report,
+    runs_inputs = ["verdicts.json"],
+    runs_view = history,
+);
 
 const TICKETS: &str = "https://issues.example.com/browse/";
 
@@ -153,20 +159,10 @@ fn noted<'a>(text: &'a str, label: &str) -> &'a str {
         .map_or("", str::trim)
 }
 
-fn report(request: Request) -> Result<View, String> {
-    let tasks: BTreeSet<&str> = request.files.iter().map(|f| f.task.as_str()).collect();
-    let task = request
-        .select("task")
-        .filter(|task| tasks.contains(task))
-        .unwrap_or("all");
-    let mut options = vec![("all", "All")];
-    options.extend(tasks.iter().map(|task| (*task, *task)));
-    let mut tickets: BTreeMap<String, Ticket> = BTreeMap::new();
-    for file in request
-        .files
-        .iter()
-        .filter(|file| task == "all" || file.task == task)
-    {
+/// Each ticket in `files`, by key; a ticket in more than one is the last file's.
+fn read<'a>(files: impl Iterator<Item = &'a File>) -> Result<BTreeMap<String, Ticket>, String> {
+    let mut tickets = BTreeMap::new();
+    for file in files {
         let records: Vec<Record> = serde_json::from_str(&file.text)
             .map_err(|e| format!("{} from {}: {e}", file.path, file.task))?;
         for record in records {
@@ -191,6 +187,23 @@ fn report(request: Request) -> Result<View, String> {
             );
         }
     }
+    Ok(tickets)
+}
+
+fn report(request: Request) -> Result<View, String> {
+    let tasks: BTreeSet<&str> = request.files.iter().map(|f| f.task.as_str()).collect();
+    let task = request
+        .select("task")
+        .filter(|task| tasks.contains(task))
+        .unwrap_or("all");
+    let mut options = vec![("all", "All")];
+    options.extend(tasks.iter().map(|task| (*task, *task)));
+    let tickets = read(
+        request
+            .files
+            .iter()
+            .filter(|file| task == "all" || file.task == task),
+    )?;
     let mut tickets: Vec<Ticket> = tickets.into_values().collect();
     tickets.sort_by(|a, b| (a.category, &a.key).cmp(&(b.category, &b.key)));
 
@@ -689,13 +702,16 @@ fn severity(score: f64) -> Tone {
     }
 }
 
-fn table<'a>(id: &str, tickets: impl Iterator<Item = &'a Ticket>) -> Node {
-    let column = |id: &str, title: &str, kind: ColumnKind, width: Width| Column {
+fn column(id: &str, title: &str, kind: ColumnKind, width: Width) -> Column {
+    Column {
         id: id.into(),
         title: title.into(),
         kind,
         width,
-    };
+    }
+}
+
+fn table<'a>(id: &str, tickets: impl Iterator<Item = &'a Ticket>) -> Node {
     Node::Table {
         id: id.into(),
         columns: vec![
@@ -751,13 +767,242 @@ fn table<'a>(id: &str, tickets: impl Iterator<Item = &'a Ticket>) -> Node {
     }
 }
 
+/// One launch's tickets, each by key with its category.
+struct Triaged<'a> {
+    run: &'a Run,
+    categories: BTreeMap<String, Category>,
+}
+
+/// A ticket's category in each launch that triaged it, oldest first.
+struct Moves<'a> {
+    key: &'a str,
+    path: Vec<(&'a Run, Category)>,
+}
+
+impl Moves<'_> {
+    /// How many times its category changed from one launch to the next.
+    fn moves(&self) -> usize {
+        self.path.windows(2).filter(|w| w[0].1 != w[1].1).count()
+    }
+}
+
+/// How each ticket's category moved across the launches in `request`.
+fn history(request: RunsRequest) -> Result<View, String> {
+    let mut triaged = Vec::new();
+    for run in request.runs.iter().rev() {
+        let tickets = read(run.files.iter()).map_err(|e| format!("{e}, in {}", run.id))?;
+        triaged.push(Triaged {
+            run,
+            categories: tickets
+                .into_iter()
+                .map(|(key, ticket)| (key, ticket.category))
+                .collect(),
+        });
+    }
+    let read: Vec<&Triaged> = triaged
+        .iter()
+        .filter(|one| !one.categories.is_empty())
+        .collect();
+    if read.is_empty() {
+        return Ok(View {
+            title: "Triage history".into(),
+            body: Node::Note {
+                headline: "No launch has captured verdicts.json yet.".into(),
+                detail: String::new(),
+                tone: Tone::Muted,
+            },
+            controls: vec![],
+        });
+    }
+    let mut by_key: BTreeMap<&str, Moves> = BTreeMap::new();
+    for one in &read {
+        for (key, category) in &one.categories {
+            by_key
+                .entry(key)
+                .or_insert_with(|| Moves { key, path: vec![] })
+                .path
+                .push((one.run, *category));
+        }
+    }
+    let moved: Vec<&Moves> = by_key
+        .values()
+        .filter(|ticket| ticket.moves() > 0)
+        .collect();
+    let newest = read.last().map_or(0, |one| {
+        one.categories
+            .values()
+            .filter(|category| **category == Category::Affected)
+            .count()
+    });
+    let stats = Node::Stats {
+        items: vec![
+            Stat {
+                label: "Launches".into(),
+                value: format!("{} of {}", request.runs.len(), request.total),
+                tone: Tone::Neutral,
+            },
+            stat("Tickets", by_key.len(), Tone::Neutral),
+            stat("Moved", moved.len(), Tone::Warn),
+            stat("Affected now", newest, Tone::Bad),
+        ],
+    };
+    let bars = Node::Bars {
+        bars: read
+            .iter()
+            .map(|one| Bar {
+                label: one.run.id.clone(),
+                segments: Category::ALL
+                    .into_iter()
+                    .map(|category| Segment {
+                        label: category.label().into(),
+                        value: one.categories.values().filter(|c| **c == category).count() as f64,
+                        tone: category.tone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    };
+    Ok(View {
+        title: "Triage history".into(),
+        body: Node::Stack {
+            children: vec![
+                stats,
+                bars,
+                Node::Tabs {
+                    id: "history".into(),
+                    tabs: vec![
+                        Tab {
+                            label: "Moved".into(),
+                            count: Some(moved.len() as u64),
+                            body: moved_table(&moved),
+                        },
+                        Tab {
+                            label: "Launches".into(),
+                            count: Some(request.runs.len() as u64),
+                            body: launches_table(&triaged),
+                        },
+                    ],
+                },
+            ],
+        },
+        controls: vec![],
+    })
+}
+
+/// A row per ticket whose category changed: where it is now, where it was, and the launch that
+/// moved it last.
+fn moved_table(moved: &[&Moves]) -> Node {
+    let badge = |category: Category| Cell::text(category.label()).tone(category.tone());
+    Node::Table {
+        id: "moved".into(),
+        columns: vec![
+            column("ticket", "Ticket", ColumnKind::Mono, Width::Narrow),
+            column("now", "Now", ColumnKind::Badge, Width::Medium),
+            column("was", "Was", ColumnKind::Badge, Width::Medium),
+            column("since", "Since", ColumnKind::Mono, Width::Medium),
+            column("moves", "Moves", ColumnKind::Number, Width::Narrow),
+            column("path", "Path", ColumnKind::Text, Width::Fill),
+        ],
+        rows: moved
+            .iter()
+            .filter_map(|ticket| {
+                let last = ticket.path.windows(2).rfind(|w| w[0].1 != w[1].1)?;
+                let (was, (since, now)) = (last[0].1, (last[1].0, last[1].1));
+                let mut path: Vec<&str> = Vec::new();
+                for (_, category) in &ticket.path {
+                    if path.last() != Some(&category.label()) {
+                        path.push(category.label());
+                    }
+                }
+                Some(Row {
+                    id: ticket.key.to_string(),
+                    cells: vec![
+                        Cell::text(ticket.key).link(format!("{TICKETS}{}", ticket.key)),
+                        badge(now),
+                        badge(was),
+                        Cell::text(&since.id).link(launch_link(since)),
+                        Cell::count(ticket.moves() as f64),
+                        Cell::text(path.join(" \u{2192} ")),
+                    ],
+                    detail: None,
+                })
+            })
+            .collect(),
+    }
+}
+
+/// A row per launch, newest first, each linked to its launch.
+fn launches_table(triaged: &[Triaged]) -> Node {
+    let status = |status: Status| match status {
+        Status::Done => Cell::text("done").tone(Tone::Good),
+        Status::Error => Cell::text("error").tone(Tone::Bad),
+        Status::Running => Cell::text("running").tone(Tone::Info),
+        Status::Cancelled => Cell::text("cancelled").tone(Tone::Muted),
+        Status::Unfinished => Cell::text("unfinished").tone(Tone::Muted),
+    };
+    let rows = triaged
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(at, one)| {
+            let before = triaged[..at]
+                .iter()
+                .rev()
+                .find(|earlier| !earlier.categories.is_empty())
+                .filter(|_| !one.categories.is_empty());
+            let moved = before.map(|before| {
+                one.categories
+                    .iter()
+                    .filter(|(key, category)| {
+                        before
+                            .categories
+                            .get(*key)
+                            .is_some_and(|was| was != *category)
+                    })
+                    .count()
+            });
+            let affected = one
+                .categories
+                .values()
+                .filter(|category| **category == Category::Affected)
+                .count();
+            Row {
+                id: one.run.id.clone(),
+                cells: vec![
+                    Cell::text(&one.run.id).link(launch_link(one.run)),
+                    status(one.run.status),
+                    Cell::date(one.run.started),
+                    Cell::count(one.categories.len() as f64),
+                    Cell::count(affected as f64),
+                    moved.map_or_else(Cell::default, |moved| Cell::count(moved as f64)),
+                ],
+                detail: None,
+            }
+        })
+        .collect();
+    Node::Table {
+        id: "launches".into(),
+        columns: vec![
+            column("launch", "Launch", ColumnKind::Mono, Width::Medium),
+            column("status", "Status", ColumnKind::Badge, Width::Narrow),
+            column("started", "Started", ColumnKind::Mono, Width::Narrow),
+            column("tickets", "Tickets", ColumnKind::Number, Width::Narrow),
+            column("affected", "Affected", ColumnKind::Number, Width::Narrow),
+            column("moved", "Moved", ColumnKind::Number, Width::Fill),
+        ],
+        rows,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
-    use crucible_view::{File, Limits, Node, Param, PlotKind, Request, View};
+    use crucible_view::{
+        File, Limits, Node, Param, PlotKind, Request, Run, RunsRequest, Status, View, ViewKind,
+    };
 
-    use crate::report;
+    use crate::{history, report};
 
     fn file(lane: &str) -> File {
         let inbox = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../inbox");
@@ -777,7 +1022,7 @@ mod tests {
                 .collect(),
         })
         .unwrap();
-        view.check(&Limits::DEFAULT).unwrap();
+        view.check(ViewKind::Run, &Limits::DEFAULT).unwrap();
         view
     }
 
@@ -1109,5 +1354,201 @@ mod tests {
         })
         .unwrap_err();
         assert!(why.starts_with("verdicts.json from triage-go:"), "{why}");
+    }
+
+    /// The go lane's verdicts with DEMO-101 found affected.
+    fn regressed() -> File {
+        let mut records: Vec<serde_json::Value> = serde_json::from_str(&file("go").text).unwrap();
+        let ticket = records
+            .iter_mut()
+            .find(|record| record["ticket_key"] == "DEMO-101")
+            .unwrap();
+        ticket["verdict_property"]["verdict"] = "affected".into();
+        ticket["verdict_property"]["proposed_actions"]["lane"] = "present".into();
+        ticket["verdict_property"]["rationale"] = "Reachable.".into();
+        File {
+            text: serde_json::to_string(&records).unwrap(),
+            ..file("go")
+        }
+    }
+
+    fn launch(id: &str, status: Status, started: f64, files: Vec<File>) -> Run {
+        Run {
+            id: id.into(),
+            status,
+            started,
+            cost_usd: None,
+            origin: "schedule".into(),
+            pack_version: None,
+            params: Default::default(),
+            files,
+        }
+    }
+
+    /// Three launches, newest first: one with no run yet, one that found DEMO-101 affected in
+    /// both lanes, and one of the go lane alone.
+    fn launches() -> RunsRequest {
+        RunsRequest {
+            runs: vec![
+                launch("triage:3", Status::Running, 1_793_664_000.0, vec![]),
+                launch(
+                    "triage:2",
+                    Status::Done,
+                    1_793_577_600.0,
+                    vec![regressed(), file("python")],
+                ),
+                launch("triage:1", Status::Error, 1_793_491_200.0, vec![file("go")]),
+            ],
+            total: 5,
+            params: Default::default(),
+        }
+    }
+
+    #[test]
+    fn the_runs_view_follows_each_ticket_across_the_launches() {
+        let view = history(launches()).unwrap();
+        view.check(ViewKind::Runs, &Limits::DEFAULT).unwrap();
+        assert_eq!(view.title, "Triage history");
+        let Node::Stack { children } = &view.body else {
+            panic!("the runs view is a stack");
+        };
+        let [
+            Node::Stats { items },
+            Node::Bars { bars },
+            Node::Tabs { tabs, .. },
+        ] = children.as_slice()
+        else {
+            panic!("the runs view is its stats over its bars over its tabs");
+        };
+        let stats: Vec<(&str, &str)> = items
+            .iter()
+            .map(|item| (item.label.as_str(), item.value.as_str()))
+            .collect();
+        let affected = |files: &[File]| {
+            crate::read(files.iter())
+                .unwrap()
+                .values()
+                .filter(|ticket| ticket.category == crate::Category::Affected)
+                .count()
+                .to_string()
+        };
+        let now = affected(&[regressed(), file("python")]);
+        assert_eq!(
+            now.parse::<usize>().unwrap(),
+            affected(&[file("go"), file("python")])
+                .parse::<usize>()
+                .unwrap()
+                + 1
+        );
+        assert_eq!(
+            stats,
+            [
+                ("Launches", "3 of 5"),
+                ("Tickets", "64"),
+                ("Moved", "1"),
+                ("Affected now", now.as_str())
+            ]
+        );
+        let labels: Vec<&str> = bars.iter().map(|bar| bar.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["triage:1", "triage:2"],
+            "launches with verdicts, oldest first"
+        );
+        let total =
+            |bar: &crucible_view::Bar| -> f64 { bar.segments.iter().map(|s| s.value).sum() };
+        assert_eq!((total(&bars[0]), total(&bars[1])), (34.0, 64.0));
+
+        let [moved, launched] = tabs.as_slice() else {
+            panic!("Moved and Launches");
+        };
+        assert_eq!((moved.label.as_str(), moved.count), ("Moved", Some(1)));
+        let Node::Table { rows, .. } = &moved.body else {
+            panic!("Moved is a table");
+        };
+        let [row] = rows.as_slice() else {
+            panic!("one ticket moved");
+        };
+        let texts: Vec<&str> = row.cells.iter().map(|cell| cell.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "DEMO-101",
+                "affected",
+                "sbom_inaccurate",
+                "triage:2",
+                "1",
+                "sbom_inaccurate \u{2192} affected"
+            ]
+        );
+        assert_eq!(row.cells[3].href.as_deref(), Some("launch:triage:2"));
+
+        assert_eq!(
+            (launched.label.as_str(), launched.count),
+            ("Launches", Some(3))
+        );
+        let Node::Table { rows, .. } = &launched.body else {
+            panic!("Launches is a table");
+        };
+        let texts: Vec<Vec<&str>> = rows
+            .iter()
+            .map(|row| row.cells.iter().map(|cell| cell.text.as_str()).collect())
+            .collect();
+        let then = affected(&[file("go")]);
+        assert_eq!(
+            texts,
+            [
+                ["triage:3", "running", "2026-11-03", "0", "0", ""],
+                ["triage:2", "done", "2026-11-02", "64", now.as_str(), "1"],
+                ["triage:1", "error", "2026-11-01", "34", then.as_str(), ""],
+            ],
+            "nothing moves into a launch with no verdicts or out of the first"
+        );
+        let links: Vec<Option<&str>> = rows
+            .iter()
+            .map(|row| row.cells[0].href.as_deref())
+            .collect();
+        assert_eq!(
+            links,
+            [
+                Some("launch:triage:3"),
+                Some("launch:triage:2"),
+                Some("launch:triage:1")
+            ]
+        );
+    }
+
+    #[test]
+    fn the_runs_view_says_when_no_launch_has_verdicts() {
+        for runs in [
+            vec![],
+            vec![launch("triage:1", Status::Unfinished, 0.0, vec![])],
+        ] {
+            let view = history(RunsRequest {
+                runs,
+                total: 1,
+                params: Default::default(),
+            })
+            .unwrap();
+            view.check(ViewKind::Runs, &Limits::DEFAULT).unwrap();
+            assert!(
+                matches!(&view.body, Node::Note { headline, .. }
+                    if headline == "No launch has captured verdicts.json yet."),
+                "{:?}",
+                view.body
+            );
+        }
+    }
+
+    #[test]
+    fn a_torn_file_names_its_launch() {
+        let mut request = launches();
+        request.runs[2].files[0].text = "[{".into();
+        let error = history(request).unwrap_err();
+        assert!(
+            error.starts_with("verdicts.json from triage-go:"),
+            "{error}"
+        );
+        assert!(error.ends_with(", in triage:1"), "{error}");
     }
 }

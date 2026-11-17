@@ -19,8 +19,8 @@ const EPILOGUE: &str = include_str!("../../../crucible-view/js/epilogue.js");
 /// The byte the epilogue writes before the script's answer, after anything the script printed.
 const ANSWER: u8 = 0x1e;
 
-/// A JavaScript view plugin: a module that defines `inputs` and `view`, run in Javy's QuickJS
-/// engine module.
+/// A JavaScript view plugin: a module that defines `inputs` and `view`, and may define
+/// `runsInputs` and `runs`, run in Javy's QuickJS engine module.
 pub struct Script {
     engine: Arc<Module>,
     source: String,
@@ -30,6 +30,8 @@ pub struct Script {
 #[serde(rename_all = "snake_case")]
 enum Answer {
     Inputs(Vec<String>),
+    /// `None` when the script defines no `runs` and `runsInputs`.
+    RunsInputs(Option<Vec<String>>),
     View(View),
     Error(String),
 }
@@ -65,8 +67,21 @@ impl Script {
     pub(in crate::plugin) fn inputs(&self) -> Result<Vec<String>, Fault> {
         match self.ask(b"{}".to_vec())? {
             Answer::Inputs(paths) => Ok(paths),
-            Answer::View(_) => Err(Fault::Reply("a view, when asked for inputs".into())),
             Answer::Error(error) => Err(Fault::Refused(error)),
+            Answer::View(_) | Answer::RunsInputs(_) => {
+                Err(Fault::Reply("not inputs, when asked for inputs".into()))
+            }
+        }
+    }
+
+    /// The paths the script's `runsInputs` names; `None` when it defines no `runs`.
+    pub(in crate::plugin) fn runs_inputs(&self) -> Result<Option<Vec<String>>, Fault> {
+        match self.ask(br#"{"runs_inputs":null}"#.to_vec())? {
+            Answer::RunsInputs(paths) => Ok(paths),
+            Answer::Error(error) => Err(Fault::Refused(error)),
+            Answer::View(_) | Answer::Inputs(_) => {
+                Err(Fault::Reply("not inputs, when asked for inputs".into()))
+            }
         }
     }
 
@@ -80,8 +95,10 @@ impl Script {
             .map_err(|e| Fault::Reply(e.to_string()))?;
         match self.ask(asked)? {
             Answer::View(view) => Ok(Reply::View(view)),
-            Answer::Inputs(_) => Err(Fault::Reply("inputs, when asked for a view".into())),
             Answer::Error(error) => Ok(Reply::Error(error)),
+            Answer::Inputs(_) | Answer::RunsInputs(_) => {
+                Err(Fault::Reply("inputs, when asked for a view".into()))
+            }
         }
     }
 
@@ -192,6 +209,144 @@ mod tests {
             };
         }
     "#;
+
+    const HISTORY: &str = r#"
+        export const inputs = ["verdicts.json"];
+        export function view() {
+            return { title: "One", body: { stats: { items: [] } } };
+        }
+        export const runsInputs = ["verdicts.json", "notes/summary.json"];
+        export function runs({ runs, total, params }) {
+            const rows = runs.map((run) => ({
+                id: run.id,
+                cells: [
+                    { text: run.id, href: `launch:${run.id}` },
+                    { text: run.status },
+                    { text: String(run.files.length) },
+                    { text: String(run.params?.profile ?? "") },
+                ],
+            }));
+            return {
+                title: `${runs.length} of ${total}, lane ${params.lane ?? "all"}`,
+                body: { table: { id: "runs", columns: [
+                    { id: "launch", title: "Launch" },
+                    { id: "status", title: "Status" },
+                    { id: "files", title: "Files" },
+                    { id: "profile", title: "Profile" },
+                ], rows } },
+            };
+        }
+    "#;
+
+    #[test]
+    #[ignore = "needs assets/js-engine/plugin.wasm from `just desktop-js-engine`"]
+    fn a_script_with_runs_draws_the_launches_and_one_without_draws_none() {
+        use crucible_view::{Param, Run, RunsRequest, Status};
+        let with = loaded(engine(), HISTORY);
+        assert_eq!(
+            with.runs_inputs().unwrap(),
+            Some(vec![
+                "verdicts.json".to_string(),
+                "notes/summary.json".to_string()
+            ])
+        );
+        let run = |id: &str, status: Status, files: usize| Run {
+            id: id.into(),
+            status,
+            started: 1_790_000_000.0,
+            cost_usd: None,
+            origin: "manual".into(),
+            pack_version: Some(4),
+            params: [("profile".to_string(), serde_json::json!("demo"))].into(),
+            files: vec![
+                File {
+                    path: "verdicts.json".into(),
+                    task: "triage".into(),
+                    text: "[]".into(),
+                };
+                files
+            ],
+        };
+        let view = with
+            .runs_view(&RunsRequest {
+                runs: vec![
+                    run("PB-2", Status::Running, 0),
+                    run("PB-1", Status::Done, 2),
+                ],
+                total: 7,
+                params: [("lane".to_string(), Param::Select("go".into()))].into(),
+            })
+            .unwrap();
+        assert_eq!(view.title, "2 of 7, lane go");
+        let Node::Table { rows, .. } = &view.body else {
+            panic!("a table");
+        };
+        let texts: Vec<Vec<&str>> = rows
+            .iter()
+            .map(|row| row.cells.iter().map(|cell| cell.text.as_str()).collect())
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                ["PB-2", "running", "0", "demo"],
+                ["PB-1", "done", "2", "demo"]
+            ]
+        );
+        assert_eq!(rows[0].cells[0].href.as_deref(), Some("launch:PB-2"));
+        assert_eq!(with.view(&Request::default()).unwrap().title, "One");
+
+        let without = loaded(engine(), COUNTS);
+        assert_eq!(without.runs_inputs().unwrap(), None);
+        let Err(Fault::Refused(why)) = without.runs_view(&RunsRequest::default()) else {
+            panic!("a script with no runs function cannot answer");
+        };
+        assert!(why.contains("runs"), "{why}");
+        assert_eq!(without.inputs().unwrap(), ["verdicts.json"]);
+        let half = loaded(
+            engine(),
+            "export const inputs = []; export function view() {} \
+             export function runs() {}",
+        );
+        assert_eq!(half.runs_inputs().unwrap(), None, "runs with no runsInputs");
+
+        let outside = loaded(
+            engine(),
+            "export const inputs = []; export function view() {} \
+             export const runsInputs = [\"../secrets\"]; export function runs() {}",
+        );
+        assert_eq!(
+            outside.runs_inputs(),
+            Err(Fault::Input("../secrets".into()))
+        );
+        let into_one = loaded(
+            engine(),
+            r#"export const inputs = []; export function view() {}
+               export const runsInputs = [];
+               export function runs() {
+                   return { title: "T", body: { markdown: { text: "[x](run:task/a)" } },
+                            controls: [], };
+               }"#,
+        );
+        assert_eq!(
+            into_one.runs_view(&RunsRequest::default()).unwrap().title,
+            "T"
+        );
+        let cell_into_one = loaded(
+            engine(),
+            r#"export const inputs = []; export function view() {}
+               export const runsInputs = [];
+               export function runs() {
+                   return { title: "T", body: { grid: { columns: ["a"],
+                       rows: [[{ text: "x", href: "run:task/a" }]] } } };
+               }"#,
+        );
+        assert_eq!(
+            cell_into_one.runs_view(&RunsRequest::default()),
+            Err(Fault::View(crucible_view::Problem::RunLink(
+                "run:task/a".into()
+            )))
+        );
+    }
 
     fn request(text: &str) -> Request {
         Request {

@@ -9,7 +9,9 @@ pub use crate::plugin::js::Script;
 
 use std::path::{Component, Path};
 
-use crucible_view::{ALLOC, INPUTS, Reply, Request, VIEW, View};
+use crucible_view::{
+    ALLOC, INPUTS, RUNS_INPUTS, RUNS_VIEW, Reply, Request, RunsRequest, VIEW, View, ViewKind,
+};
 use serde::Serialize;
 use wasmi::{Config, Engine, Instance, Linker, Memory, Store, StoreLimitsBuilder, TrapCode};
 
@@ -70,6 +72,8 @@ pub enum Fault {
 enum Entry {
     /// The view of a run.
     View,
+    /// The view of the launches of the playbook.
+    Runs,
 }
 
 impl Entry {
@@ -77,6 +81,7 @@ impl Entry {
     fn export(self) -> &'static str {
         match self {
             Entry::View => VIEW,
+            Entry::Runs => RUNS_VIEW,
         }
     }
 
@@ -84,6 +89,15 @@ impl Entry {
     fn key(self) -> &'static str {
         match self {
             Entry::View => "view",
+            Entry::Runs => "runs_view",
+        }
+    }
+
+    /// What the view it builds is checked as.
+    fn kind(self) -> ViewKind {
+        match self {
+            Entry::View => ViewKind::Run,
+            Entry::Runs => ViewKind::Runs,
         }
     }
 }
@@ -98,9 +112,37 @@ impl Loaded {
     /// The captured file paths the plugin reads.
     pub fn inputs(&self) -> Result<Vec<String>, Fault> {
         let paths = match self {
-            Loaded::Wasm(module) => module.inputs()?,
+            Loaded::Wasm(module) => module.inputs(INPUTS)?,
             Loaded::Js(script) => script.inputs()?,
         };
+        self.admit(paths)
+    }
+
+    /// The captured file paths the plugin reads from each launch of its playbook; `None` when
+    /// it draws no view of them.
+    pub fn runs_inputs(&self) -> Result<Option<Vec<String>>, Fault> {
+        let paths = match self {
+            Loaded::Wasm(module) if module.exports(&[RUNS_INPUTS, RUNS_VIEW]) => {
+                Some(module.inputs(RUNS_INPUTS)?)
+            }
+            Loaded::Wasm(_) => None,
+            Loaded::Js(script) => script.runs_inputs()?,
+        };
+        paths.map(|paths| self.admit(paths)).transpose()
+    }
+
+    /// The plugin's view of `request`, checked against the view limits.
+    pub fn view(&self, request: &Request) -> Result<View, Fault> {
+        self.ask(Entry::View, request)
+    }
+
+    /// The plugin's view of the launches in `request`, checked as a runs view.
+    pub fn runs_view(&self, request: &RunsRequest) -> Result<View, Fault> {
+        self.ask(Entry::Runs, request)
+    }
+
+    /// `paths` when there are few enough and each is inside a task's captured files.
+    fn admit(&self, paths: Vec<String>) -> Result<Vec<String>, Fault> {
         let limits = self.limits();
         if paths.len() > limits.inputs {
             return Err(Fault::Inputs(limits.inputs));
@@ -109,11 +151,6 @@ impl Loaded {
             Some(path) => Err(Fault::Input(path.clone())),
             None => Ok(paths),
         }
-    }
-
-    /// The plugin's view of `request`, checked against the view limits.
-    pub fn view(&self, request: &Request) -> Result<View, Fault> {
-        self.ask(Entry::View, request)
     }
 
     /// What `entry` builds from `request`, checked against the view limits.
@@ -127,7 +164,7 @@ impl Loaded {
         };
         match reply {
             Reply::View(view) => {
-                view.check(&crucible_view::Limits::DEFAULT)?;
+                view.check(entry.kind(), &crucible_view::Limits::DEFAULT)?;
                 Ok(view)
             }
             Reply::Error(error) => Err(Fault::Refused(error)),
@@ -203,13 +240,20 @@ impl Module {
         }
     }
 
-    /// The paths the plugin's inputs export names.
-    fn inputs(&self) -> Result<Vec<String>, Fault> {
+    /// Whether the module exports every one of `names`.
+    fn exports(&self, names: &[&str]) -> bool {
+        names
+            .iter()
+            .all(|name| self.module.exports().any(|export| export.name() == *name))
+    }
+
+    /// The paths the plugin's inputs export `export` names.
+    fn inputs(&self, export: &'static str) -> Result<Vec<String>, Fault> {
         let mut call = self.start()?;
         let ask = call
             .instance
-            .get_typed_func::<(), u64>(&call.store, INPUTS)
-            .map_err(|_| Fault::Export(INPUTS))?;
+            .get_typed_func::<(), u64>(&call.store, export)
+            .map_err(|_| Fault::Export(export))?;
         let packed = ask
             .call(&mut call.store, ())
             .map_err(|e| said(fault(e), &call.store))?;
@@ -324,7 +368,7 @@ fn captured(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crucible_view::{File, Node, Request};
+    use crucible_view::{File, Node, Request, RunsRequest};
 
     use crate::plugin::{Fault, Limits, Loaded, Module};
 
@@ -372,6 +416,107 @@ mod tests {
         let view = plugin.view(&Request::default()).unwrap();
         assert_eq!(view.title, "T");
         assert!(matches!(view.body, Node::Text { .. }));
+    }
+
+    /// A plugin that also exports `crucible_runs_inputs` and `crucible_runs_view`, both
+    /// returning `reply`, as `crucible_view` does.
+    fn with_runs(reply: &str) -> Loaded {
+        let wat = module(reply, "");
+        let len = reply.len();
+        let runs = format!(
+            r#"(func (export "crucible_runs_inputs") (result i64)
+                    (i64.or (i64.shl (i64.const 8) (i64.const 32)) (i64.const {len})))
+                (func (export "crucible_runs_view") (param i32 i32) (result i64)
+                    (i64.or (i64.shl (i64.const 8) (i64.const 32)) (i64.const {len}))))"#
+        );
+        let open = wat.trim_end().strip_suffix(')').unwrap();
+        let wat = format!("{open}{runs}");
+        Loaded::Wasm(Module::load(wat.as_bytes(), SMALL).unwrap())
+    }
+
+    #[test]
+    fn a_plugin_without_both_runs_exports_draws_no_runs_view() {
+        let plugin = load(r#"["verdicts.json"]"#, "");
+        assert_eq!(plugin.runs_inputs(), Ok(None));
+        assert_eq!(
+            plugin.runs_view(&RunsRequest::default()),
+            Err(Fault::Export("crucible_runs_view"))
+        );
+        let half = r#"(module
+            (memory (export "memory") 1)
+            (data (i32.const 8) "[]")
+            (func (export "crucible_runs_inputs") (result i64)
+                (i64.or (i64.shl (i64.const 8) (i64.const 32)) (i64.const 2))))"#;
+        let plugin = Loaded::Wasm(Module::load(half.as_bytes(), SMALL).unwrap());
+        assert_eq!(plugin.runs_inputs(), Ok(None), "inputs with no view");
+
+        let plugin = with_runs(r#"["verdicts.json","notes/a.json"]"#);
+        assert_eq!(
+            plugin.runs_inputs(),
+            Ok(Some(vec!["verdicts.json".into(), "notes/a.json".into()]))
+        );
+        assert_eq!(plugin.inputs().unwrap(), ["verdicts.json", "notes/a.json"]);
+    }
+
+    #[test]
+    fn runs_inputs_are_held_to_the_same_rules_as_inputs() {
+        for path in ["../session.jsonl", "/etc/passwd", "a/../../b", ""] {
+            let plugin = with_runs(&serde_json::to_string(&[path]).unwrap());
+            assert_eq!(
+                plugin.runs_inputs(),
+                Err(Fault::Input(path.into())),
+                "{path}"
+            );
+        }
+        assert_eq!(
+            with_runs(r#"["a","b","c"]"#).runs_inputs(),
+            Err(Fault::Inputs(2))
+        );
+        assert_eq!(
+            with_runs(r#"["a","b"]"#)
+                .runs_inputs()
+                .unwrap()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(matches!(
+            with_runs("not json").runs_inputs(),
+            Err(Fault::Reply(_))
+        ));
+    }
+
+    #[test]
+    fn a_runs_view_is_checked_as_one_and_a_run_s_view_as_the_other() {
+        let linked = |href: &str| {
+            format!(
+                r#"{{"view":{{"title":"T","body":{{"table":{{"id":"t","columns":[{{"id":"a","title":"A"}}],"rows":[{{"id":"1","cells":[{{"text":"x","href":"{href}"}}]}}]}}}}}}}}"#
+            )
+        };
+        let runs = RunsRequest::default();
+        for href in [
+            "launch:PB-1",
+            "launch:PB-1/task/apply",
+            "https://example.com",
+        ] {
+            let plugin = with_runs(&linked(href));
+            assert!(plugin.runs_view(&runs).is_ok(), "{href}");
+            assert!(plugin.view(&Request::default()).is_ok(), "{href}");
+        }
+        for href in ["run:task/apply", "run:file/apply/verdicts.json"] {
+            let plugin = with_runs(&linked(href));
+            assert_eq!(
+                plugin.runs_view(&runs),
+                Err(Fault::View(crucible_view::Problem::RunLink(href.into()))),
+                "{href}"
+            );
+            assert!(plugin.view(&Request::default()).is_ok(), "{href}");
+        }
+        let refused = with_runs(r#"{"error":"no launches yet"}"#);
+        assert_eq!(
+            refused.runs_view(&runs),
+            Err(Fault::Refused("no launches yet".into()))
+        );
     }
 
     #[test]

@@ -1266,19 +1266,6 @@ fn live_rows(app: &App, playbooks: &[&LivePlaybook], now: i64, p: &Paint) -> Vec
         .collect()
 }
 
-/// The launches of the selected live playbook the filters keep, when there is more than one.
-fn playbook_launches(app: &App) -> Option<(&str, Vec<&LivePlaybook>)> {
-    let playbook = app.selected_playbook()?;
-    let launches: Vec<&LivePlaybook> = app
-        .remote
-        .live
-        .kept(&app.launch_filter())
-        .into_iter()
-        .filter(|launch| launch.id == playbook)
-        .collect();
-    (launches.len() > 1).then_some((playbook, launches))
-}
-
 fn pack_row(app: &App, pack: &PackView, p: &Paint) -> El {
     let selected = app.selection == Some(Selection::Local(pack.name.clone()));
     let name = pack.name.clone();
@@ -1333,18 +1320,21 @@ fn detail(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
         crate::Page::Keys => return keys::page(app, p),
         crate::Page::Runs => {}
     }
-    if let (
-        Some(Selection::Live { launch: None, .. }),
-        Some((playbook, launches)),
-        LiveView::Ready { now, .. },
-    ) = (&app.selection, playbook_launches(app), &*app.remote.live)
+    if let (Some((playbook, launches)), LiveView::Ready { now, .. }) =
+        (app.runs_page(), &*app.remote.live)
     {
+        let view = app.runs_view().map(|built| {
+            let drawn = (app.runs_tab == crate::RunsTab::Report)
+                .then(|| report::runs_report_view(built, app, p, layer));
+            (app.runs_tab, drawn)
+        });
         return runs::runs_page(
             launcher::launch_button(app, playbook, p),
             shares::section(app, p),
             playbook,
             &launches,
             *now,
+            view,
             p,
         );
     }
@@ -1352,7 +1342,7 @@ fn detail(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
     let pane = match &app.selection {
         Some(Selection::Local(_)) => app.selected_pack().map(|pack| local_pane(pack, font)),
         Some(Selection::Live { launch, .. }) => {
-            let pinned = launch.is_some() && playbook_launches(app).is_some();
+            let pinned = launch.is_some() && app.playbook_launches().is_some();
             app.selected_live().map(|live| Pane {
                 preview: app.remote.working_preview.as_ref(),
                 ..live_pane(live, app.selected_detail(), font, pinned)
@@ -1577,7 +1567,7 @@ fn breadcrumb(app: &App, p: &Paint) -> Option<El> {
     else {
         return None;
     };
-    let (playbook, _) = playbook_launches(app)?;
+    let (playbook, _) = app.playbook_launches()?;
     let back = Selection::playbook(playbook);
     Some(
         row()

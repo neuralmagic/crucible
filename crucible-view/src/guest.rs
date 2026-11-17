@@ -1,5 +1,10 @@
 //! The functions behind the exports `plugin!` writes, built for `wasm32-unknown-unknown`.
 //!
+//! `view` answers both entries: `crucible_view` reads a [`crate::Request`] for one run, and
+//! `crucible_runs_view`, written when `plugin!` names a `runs_view`, reads a
+//! [`crate::RunsRequest`] for the launches of the playbook. `inputs` answers `crucible_inputs`
+//! and `crucible_runs_inputs`.
+//!
 //! A result is returned as one `u64`: its address in the high half, its length in the low half.
 
 use serde::de::DeserializeOwned;

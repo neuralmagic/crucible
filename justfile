@@ -322,6 +322,15 @@ desktop-release *args:
     sh crucible-desktop/macos-bundle.sh
     open "crucible-desktop/target/release/Crucible Playbooks.app" --args {{ args }}
 
+# Build the release .app of an unmerged feature and open it: "Crucible Playbooks (<name>)" with
+# the green icon and its own bundle id, beside any installed release. `just desktop-feature runs-view`.
+desktop-feature name *args:
+    cargo build --release -p crucible-lsp
+    sh crucible-desktop/rune-patches.sh
+    cd crucible-desktop && cargo build --release
+    FEATURE="{{ name }}" sh crucible-desktop/macos-bundle.sh
+    open "crucible-desktop/target/release/Crucible Playbooks ({{ name }}).app" --args {{ args }}
+
 # Build and install the release .app, crucible-lsp inside, into ~/Applications.
 desktop-install:
     cargo build --release -p crucible-lsp

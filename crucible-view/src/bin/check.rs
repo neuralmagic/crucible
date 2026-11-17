@@ -1,13 +1,23 @@
 //! Checks a view on standard input the way the app does before drawing it: a view, or the
-//! `{"view": ...}` or `{"error": ...}` a plugin answers with. Prints what it found and exits
-//! nonzero when the app would not draw it.
+//! `{"view": ...}` or `{"error": ...}` a plugin answers with. `--runs` checks it as a runs view.
+//! Prints what it found and exits nonzero when the app would not draw it.
 
 use std::io::Read;
 use std::process::ExitCode;
 
-use crucible_view::{Limits, Reply, View};
+use crucible_view::{Limits, Reply, View, ViewKind};
 
-fn checked(input: &str) -> Result<String, String> {
+/// What the arguments after the program's name ask for: a view of one run, or with `--runs` a
+/// runs view.
+fn kind(args: &[String]) -> Result<ViewKind, String> {
+    match args {
+        [] => Ok(ViewKind::Run),
+        [flag] if flag == "--runs" => Ok(ViewKind::Runs),
+        _ => Err("usage: crucible-view-check [--runs] < view.json".to_string()),
+    }
+}
+
+fn checked(input: &str, kind: ViewKind) -> Result<String, String> {
     let view = match serde_json::from_str::<Reply>(input) {
         Ok(Reply::View(view)) => view,
         Ok(Reply::Error(error)) => {
@@ -15,7 +25,7 @@ fn checked(input: &str) -> Result<String, String> {
         }
         Err(_) => serde_json::from_str::<View>(input).map_err(|e| format!("not a view: {e}"))?,
     };
-    view.check(&Limits::DEFAULT)
+    view.check(kind, &Limits::DEFAULT)
         .map_err(|problem| format!("the view was refused: {problem}"))?;
     let mut counts = view.body.counts();
     for control in &view.controls {
@@ -29,12 +39,20 @@ fn checked(input: &str) -> Result<String, String> {
 }
 
 fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let kind = match kind(&args) {
+        Ok(kind) => kind,
+        Err(usage) => {
+            eprintln!("{usage}");
+            return ExitCode::from(2);
+        }
+    };
     let mut input = String::new();
     if let Err(error) = std::io::stdin().read_to_string(&mut input) {
         eprintln!("reading standard input: {error}");
         return ExitCode::from(2);
     }
-    match checked(&input) {
+    match checked(&input, kind) {
         Ok(found) => {
             println!("{found}");
             ExitCode::SUCCESS
@@ -48,7 +66,13 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use crate::checked;
+    use crucible_view::ViewKind;
+
+    use crate::kind;
+
+    fn checked(input: &str) -> Result<String, String> {
+        crate::checked(input, ViewKind::Run)
+    }
 
     #[test]
     fn a_view_or_a_plugin_s_answer_is_checked_and_summed_up() {
@@ -112,5 +136,45 @@ mod tests {
             why.starts_with("not a view: unknown variant `script`"),
             "{why}"
         );
+    }
+
+    #[test]
+    fn a_runs_view_takes_launch_links_and_refuses_links_into_one_run() {
+        let linked = |href: &str| {
+            format!(
+                r#"{{"title":"T","body":{{"table":{{"id":"t","columns":[{{"id":"a","title":"A"}}],
+                "rows":[{{"id":"1","cells":[{{"text":"x","href":"{href}"}}]}}]}}}}}}"#
+            )
+        };
+        for href in [
+            "launch:PB-1",
+            "launch:PB-1/task/apply",
+            "https://example.com",
+        ] {
+            let ok = Ok("ok: \"T\" with 1 table".to_string());
+            assert_eq!(crate::checked(&linked(href), ViewKind::Runs), ok, "{href}");
+            assert_eq!(checked(&linked(href)), ok, "{href}");
+        }
+        for href in ["run:task/apply", "run:file/apply/verdicts.json"] {
+            assert_eq!(
+                crate::checked(&linked(href), ViewKind::Runs),
+                Err(format!(
+                    "the view was refused: {href} is a link into one run, which a runs view \
+                     has none of"
+                ))
+            );
+            assert!(checked(&linked(href)).is_ok(), "{href}");
+        }
+    }
+
+    #[test]
+    fn the_arguments_name_the_kind_of_view() {
+        let args =
+            |given: &[&str]| kind(&given.iter().map(|arg| arg.to_string()).collect::<Vec<_>>());
+        assert_eq!(args(&[]), Ok(ViewKind::Run));
+        assert_eq!(args(&["--runs"]), Ok(ViewKind::Runs));
+        for off in [&["--run"][..], &["--runs", "--runs"], &["view.json"]] {
+            assert!(args(off).unwrap_err().starts_with("usage:"), "{off:?}");
+        }
     }
 }

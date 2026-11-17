@@ -3,6 +3,9 @@
 //! A plugin is a WebAssembly module with no imports. The host calls `crucible_inputs` for the
 //! captured file paths it reads, then `crucible_view` with a [`Request`] holding those files, and
 //! gets a [`Reply`]. The host draws the [`View`]; the plugin draws nothing.
+//!
+//! A plugin may also export `crucible_runs_inputs` and `crucible_runs_view`, which answer the
+//! same way for a [`RunsRequest`]: the launches of its playbook instead of one run.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -25,11 +28,21 @@ pub const ALLOC: &str = "crucible_alloc";
 pub const INPUTS: &str = "crucible_inputs";
 /// The export that takes a [`Request`] and returns a [`Reply`].
 pub const VIEW: &str = "crucible_view";
+/// The export that returns the captured file paths the plugin reads from each launch.
+pub const RUNS_INPUTS: &str = "crucible_runs_inputs";
+/// The export that takes a [`RunsRequest`] and returns a [`Reply`].
+pub const RUNS_VIEW: &str = "crucible_runs_view";
 
-/// What a view plugin exports. Off `wasm32` it writes only a check of the view function's type.
+/// What a view plugin exports. Off `wasm32` it writes only a check of the view functions'
+/// types.
 ///
 /// ```
-/// crucible_view::plugin!(inputs = ["verdicts.json"], view = report);
+/// crucible_view::plugin!(
+///     inputs = ["verdicts.json"],
+///     view = report,
+///     runs_inputs = ["verdicts.json"],
+///     runs_view = history,
+/// );
 ///
 /// fn report(request: crucible_view::Request) -> Result<crucible_view::View, String> {
 ///     let lane = request.select("lane").unwrap_or("all");
@@ -39,9 +52,42 @@ pub const VIEW: &str = "crucible_view";
 ///         controls: vec![],
 ///     })
 /// }
+///
+/// fn history(request: crucible_view::RunsRequest) -> Result<crucible_view::View, String> {
+///     Ok(crucible_view::View {
+///         title: format!("{} of {} launches", request.runs.len(), request.total),
+///         body: crucible_view::Node::Stats { items: vec![] },
+///         controls: vec![],
+///     })
+/// }
 /// ```
 #[macro_export]
 macro_rules! plugin {
+    (
+        inputs = [$($path:literal),* $(,)?],
+        view = $view:path,
+        runs_inputs = [$($runs_path:literal),* $(,)?],
+        runs_view = $runs_view:path $(,)?
+    ) => {
+        $crate::plugin!(inputs = [$($path),*], view = $view);
+
+        #[cfg(target_arch = "wasm32")]
+        #[unsafe(no_mangle)]
+        pub extern "C" fn crucible_runs_inputs() -> u64 {
+            $crate::guest::inputs(&[$($runs_path),*])
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        #[unsafe(no_mangle)]
+        pub extern "C" fn crucible_runs_view(ptr: u32, len: u32) -> u64 {
+            $crate::guest::view::<$crate::RunsRequest>(ptr, len, $runs_view)
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        const _: fn(
+            $crate::RunsRequest,
+        ) -> ::core::result::Result<$crate::View, ::std::string::String> = $runs_view;
+    };
     (inputs = [$($path:literal),* $(,)?], view = $view:path) => {
         #[cfg(target_arch = "wasm32")]
         #[unsafe(no_mangle)]
@@ -89,26 +135,99 @@ pub struct Request {
 impl Request {
     /// The value of the select `id`.
     pub fn select(&self, id: &str) -> Option<&str> {
-        match self.params.get(id)? {
-            Param::Select(value) => Some(value),
-            Param::Toggle(_) | Param::Range(_) => None,
-        }
+        select(&self.params, id)
     }
 
     /// Whether the toggle `id` is on.
     pub fn toggle(&self, id: &str) -> Option<bool> {
-        match self.params.get(id)? {
-            Param::Toggle(on) => Some(*on),
-            Param::Select(_) | Param::Range(_) => None,
-        }
+        toggle(&self.params, id)
     }
 
     /// The value of the range `id`.
     pub fn range(&self, id: &str) -> Option<f64> {
-        match self.params.get(id)? {
-            Param::Range(value) => Some(*value),
-            Param::Select(_) | Param::Toggle(_) => None,
-        }
+        range(&self.params, id)
+    }
+}
+
+/// The launches of a playbook the reader's filters keep, newest first, up to the host's cap.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RunsRequest {
+    pub runs: Vec<Run>,
+    /// How many launches the filters keep: `runs` and those past the cap.
+    pub total: usize,
+    /// As [`Request::params`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, Param>,
+}
+
+impl RunsRequest {
+    /// The value of the select `id`.
+    pub fn select(&self, id: &str) -> Option<&str> {
+        select(&self.params, id)
+    }
+
+    /// Whether the toggle `id` is on.
+    pub fn toggle(&self, id: &str) -> Option<bool> {
+        toggle(&self.params, id)
+    }
+
+    /// The value of the range `id`.
+    pub fn range(&self, id: &str) -> Option<f64> {
+        range(&self.params, id)
+    }
+}
+
+/// One launch of the playbook and the files its newest run captured.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Run {
+    /// What a launch link names.
+    pub id: String,
+    pub status: Status,
+    /// When it was launched, in Unix seconds.
+    pub started: f64,
+    /// What it cost; left out while it runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    /// What started it: `manual`, `schedule`, `webhook` and so on.
+    pub origin: String,
+    /// The draft save it ran, for a draft's launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack_version: Option<i64>,
+    /// The params it was launched with.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, serde_json::Value>,
+    pub files: Vec<File>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Status {
+    Running,
+    Done,
+    Error,
+    Cancelled,
+    /// Not started, or stopped without an outcome.
+    Unfinished,
+}
+
+fn select<'a>(params: &'a BTreeMap<String, Param>, id: &str) -> Option<&'a str> {
+    match params.get(id)? {
+        Param::Select(value) => Some(value),
+        Param::Toggle(_) | Param::Range(_) => None,
+    }
+}
+
+fn toggle(params: &BTreeMap<String, Param>, id: &str) -> Option<bool> {
+    match params.get(id)? {
+        Param::Toggle(on) => Some(*on),
+        Param::Select(_) | Param::Range(_) => None,
+    }
+}
+
+fn range(params: &BTreeMap<String, Param>, id: &str) -> Option<f64> {
+    match params.get(id)? {
+        Param::Range(value) => Some(*value),
+        Param::Select(_) | Param::Toggle(_) => None,
     }
 }
 
@@ -438,7 +557,8 @@ fn is_unfolded(open: &bool) -> bool {
     *open
 }
 
-/// Where an address leads: the web, or a place in the run the view is drawn for.
+/// Where an address leads: the web, a place in the run the view is drawn for, or a launch of
+/// the playbook.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Link<'a> {
     /// `http://` or `https://` and the rest.
@@ -447,12 +567,26 @@ pub enum Link<'a> {
     Task(&'a str),
     /// `run:file/<task>/<path>`, held as `<task>/<path>`.
     File(&'a str),
+    /// `launch:<launch>`, the launch as a [`Run`] names it, or `launch:<launch>/task/<task>`
+    /// for one of its tasks.
+    Launch {
+        launch: &'a str,
+        task: Option<&'a str>,
+    },
 }
 
 impl<'a> Link<'a> {
     pub fn parse(href: &'a str) -> Option<Link<'a>> {
         if href.starts_with("https://") || href.starts_with("http://") {
             return Some(Link::Web(href));
+        }
+        if let Some(place) = href.strip_prefix("launch:") {
+            let (launch, task) = match place.split_once("/task/") {
+                Some((launch, task)) => (launch, Some(task)),
+                None => (place, None),
+            };
+            let named = !launch.is_empty() && !launch.contains('/') && task != Some("");
+            return named.then_some(Link::Launch { launch, task });
         }
         let place = href.strip_prefix("run:")?;
         if let Some(task) = place.strip_prefix("task/") {
@@ -461,6 +595,11 @@ impl<'a> Link<'a> {
         let file = place.strip_prefix("file/")?;
         let (task, path) = file.split_once('/')?;
         (!task.is_empty() && !path.is_empty()).then_some(Link::File(file))
+    }
+
+    /// Whether it leads into the run a view is drawn for, which a runs view has none of.
+    pub fn in_run(self) -> bool {
+        matches!(self, Link::Task(_) | Link::File(_))
     }
 }
 
@@ -472,6 +611,16 @@ pub fn task_link(task: &str) -> String {
 /// The address of the captured file `file` in the run.
 pub fn file_link(file: &File) -> String {
     format!("run:file/{}/{}", file.task, file.path)
+}
+
+/// The address of the launch `run`.
+pub fn launch_link(run: &Run) -> String {
+    format!("launch:{}", run.id)
+}
+
+/// The address of `task` in the launch `run`.
+pub fn launch_task_link(run: &Run, task: &str) -> String {
+    format!("launch:{}/task/{task}", run.id)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -921,8 +1070,10 @@ pub enum Problem {
     NoTabs(String),
     #[error("more than one table is shown at once")]
     Tables,
-    #[error("{0} is not an http(s) address or a run link")]
+    #[error("{0} is not an http(s) address, a run link or a launch link")]
     Href(String),
+    #[error("{0} is a link into one run, which a runs view has none of")]
+    RunLink(String),
     #[error("the cell {0} has a bar that is not a number from 0 to 1")]
     CellBar(String),
     #[error(
@@ -969,10 +1120,23 @@ pub enum Problem {
     Steps(String, u32),
 }
 
+/// What a view is drawn for, which decides where its links may lead.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ViewKind {
+    /// One run, from a [`Request`]: every [`Link`].
+    #[default]
+    Run,
+    /// The launches of a playbook, from a [`RunsRequest`]: web and launch links.
+    Runs,
+}
+
 impl View {
-    /// Whether the host can draw this view within `limits`.
-    pub fn check(&self, limits: &Limits) -> Result<(), Problem> {
-        let mut seen = Seen::default();
+    /// Whether the host can draw this view, built as a `kind` view, within `limits`.
+    pub fn check(&self, kind: ViewKind, limits: &Limits) -> Result<(), Problem> {
+        let mut seen = Seen {
+            kind,
+            ..Seen::default()
+        };
         fits(&self.title, limits)?;
         let shown = self.body.check(limits, 1, &mut seen)?;
         if shown > 1 {
@@ -1046,6 +1210,7 @@ fn controls_fit(controls: &[Control], limits: &Limits) -> Result<(), Problem> {
 /// What the view holds so far.
 #[derive(Default)]
 struct Seen {
+    kind: ViewKind,
     nodes: usize,
     cells: usize,
     items: usize,
@@ -1341,7 +1506,7 @@ impl Node {
                             columns.len(),
                         ));
                     }
-                    cells_fit(row, limits)?;
+                    cells_fit(row, seen.kind, limits)?;
                 }
                 Ok(0)
             }
@@ -1383,7 +1548,7 @@ impl Node {
                     if !ids.insert(row.id.as_str()) {
                         return Err(Problem::DuplicateRow(id.clone(), row.id.clone()));
                     }
-                    cells_fit(&row.cells, limits)?;
+                    cells_fit(&row.cells, seen.kind, limits)?;
                 }
                 Ok(1)
             }
@@ -1406,7 +1571,7 @@ fn on_scale(scale: Scale, value: f64, series: &str) -> Result<(), Problem> {
     }
 }
 
-fn cells_fit(cells: &[Cell], limits: &Limits) -> Result<(), Problem> {
+fn cells_fit(cells: &[Cell], kind: ViewKind, limits: &Limits) -> Result<(), Problem> {
     for cell in cells {
         fits(&cell.text, limits)?;
         if cell.value.is_some_and(|value| !within(&value)) {
@@ -1417,8 +1582,12 @@ fn cells_fit(cells: &[Cell], limits: &Limits) -> Result<(), Problem> {
         }
         if let Some(href) = &cell.href {
             fits(href, limits)?;
-            if Link::parse(href).is_none() {
-                return Err(Problem::Href(href.clone()));
+            match Link::parse(href) {
+                None => return Err(Problem::Href(href.clone())),
+                Some(link) if kind == ViewKind::Runs && link.in_run() => {
+                    return Err(Problem::RunLink(href.clone()));
+                }
+                Some(_) => {}
             }
         }
     }
@@ -1428,8 +1597,9 @@ fn cells_fit(cells: &[Cell], limits: &Limits) -> Result<(), Problem> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        Bar, Cell, Column, File, Limits, Link, MAX_BINS, Node, PlotKind, Problem, Reply, Row,
-        Scale, Segment, Series, Stat, TIME_SPAN, Tab, Tone, View, file_link, task_link,
+        Bar, Cell, Column, File, Limits, Link, MAX_BINS, Node, PlotKind, Problem, Reply, Row, Run,
+        RunsRequest, Scale, Segment, Series, Stat, Status, TIME_SPAN, Tab, Tone, View, ViewKind,
+        file_link, launch_link, launch_task_link, task_link,
     };
 
     fn table(id: &str, rows: Vec<Row>) -> Node {
@@ -1515,11 +1685,17 @@ mod tests {
                 },
             ],
         };
-        assert_eq!(view(tabs.clone()).check(&Limits::DEFAULT), Ok(()));
+        assert_eq!(
+            view(tabs.clone()).check(ViewKind::Run, &Limits::DEFAULT),
+            Ok(())
+        );
         let two = Node::Stack {
             children: vec![tabs, table("c", vec![])],
         };
-        assert_eq!(view(two).check(&Limits::DEFAULT), Err(Problem::Tables));
+        assert_eq!(
+            view(two).check(ViewKind::Run, &Limits::DEFAULT),
+            Err(Problem::Tables)
+        );
     }
 
     #[test]
@@ -1533,12 +1709,12 @@ mod tests {
             }],
         );
         assert_eq!(
-            view(short).check(&Limits::DEFAULT),
+            view(short).check(ViewKind::Run, &Limits::DEFAULT),
             Err(Problem::RowWidth("table t".into(), 1, 2))
         );
         let twice = table("t", vec![row("1"), row("1")]);
         assert_eq!(
-            view(twice).check(&Limits::DEFAULT),
+            view(twice).check(ViewKind::Run, &Limits::DEFAULT),
             Err(Problem::DuplicateRow("t".into(), "1".into()))
         );
         let same = Node::Tabs {
@@ -1550,7 +1726,7 @@ mod tests {
             }],
         };
         assert_eq!(
-            view(same).check(&Limits::DEFAULT),
+            view(same).check(ViewKind::Run, &Limits::DEFAULT),
             Err(Problem::DuplicateId("t".into()))
         );
     }
@@ -1566,8 +1742,190 @@ mod tests {
             }],
         );
         assert_eq!(
-            view(bad).check(&Limits::DEFAULT),
+            view(bad).check(ViewKind::Run, &Limits::DEFAULT),
             Err(Problem::Href("file:///etc/passwd".into()))
+        );
+    }
+
+    fn launched(id: &str) -> Run {
+        Run {
+            id: id.into(),
+            status: Status::Done,
+            started: 1_790_000_000.0,
+            cost_usd: Some(1.5),
+            origin: "manual".into(),
+            pack_version: None,
+            params: [("profile".to_string(), serde_json::json!("demo"))].into(),
+            files: vec![],
+        }
+    }
+
+    #[test]
+    fn a_launch_link_names_a_launch_and_maybe_a_task_of_it() {
+        assert_eq!(
+            Link::parse("launch:PB-12"),
+            Some(Link::Launch {
+                launch: "PB-12",
+                task: None
+            })
+        );
+        assert_eq!(
+            Link::parse("launch:PB-12/task/triage[go]"),
+            Some(Link::Launch {
+                launch: "PB-12",
+                task: Some("triage[go]")
+            })
+        );
+        assert_eq!(
+            Link::parse("launch:PB-12/task/a/task/b"),
+            Some(Link::Launch {
+                launch: "PB-12",
+                task: Some("a/task/b")
+            }),
+            "the first /task/ ends the launch"
+        );
+        for off in [
+            "launch:",
+            "launch:/task/a",
+            "launch:PB-12/task/",
+            "launch:a/b",
+            "launch:a/b/task/c",
+            "launch",
+            "launches:PB-12",
+        ] {
+            assert_eq!(Link::parse(off), None, "{off}");
+        }
+        let run = launched("PB-12");
+        assert_eq!(launch_link(&run), "launch:PB-12");
+        assert_eq!(launch_task_link(&run, "apply"), "launch:PB-12/task/apply");
+        assert_eq!(
+            Link::parse(&launch_task_link(&run, "apply")),
+            Some(Link::Launch {
+                launch: "PB-12",
+                task: Some("apply")
+            })
+        );
+    }
+
+    #[test]
+    fn a_runs_view_may_link_to_launches_and_the_web_but_not_into_one_run() {
+        let linked = |href: &str| {
+            table(
+                "t",
+                vec![Row {
+                    id: "1".into(),
+                    cells: vec![Cell::text("x").link(href), Cell::text("y")],
+                    detail: None,
+                }],
+            )
+        };
+        let gridded = |href: &str| Node::Grid {
+            columns: vec!["a".into()],
+            rows: vec![vec![Cell::text("x").link(href)]],
+        };
+        for body in [linked as fn(&str) -> Node, gridded] {
+            for href in [
+                "launch:PB-1",
+                "launch:PB-1/task/apply",
+                "https://example.com/a",
+            ] {
+                let view = view(body(href));
+                assert_eq!(
+                    view.check(ViewKind::Runs, &Limits::DEFAULT),
+                    Ok(()),
+                    "{href}"
+                );
+                assert_eq!(
+                    view.check(ViewKind::Run, &Limits::DEFAULT),
+                    Ok(()),
+                    "{href}"
+                );
+            }
+            for href in ["run:task/apply", "run:file/apply/verdicts.json"] {
+                let view = view(body(href));
+                assert_eq!(
+                    view.check(ViewKind::Runs, &Limits::DEFAULT),
+                    Err(Problem::RunLink(href.into())),
+                    "{href}"
+                );
+                assert_eq!(
+                    view.check(ViewKind::Run, &Limits::DEFAULT),
+                    Ok(()),
+                    "{href}"
+                );
+            }
+            for href in ["launch:", "launch:a/b", "file:///etc/passwd"] {
+                for kind in [ViewKind::Run, ViewKind::Runs] {
+                    assert_eq!(
+                        view(body(href)).check(kind, &Limits::DEFAULT),
+                        Err(Problem::Href(href.into())),
+                        "{href}"
+                    );
+                }
+            }
+        }
+        assert_eq!(ViewKind::default(), ViewKind::Run);
+        for (href, in_run) in [
+            ("run:task/apply", true),
+            ("run:file/apply/verdicts.json", true),
+            ("launch:PB-1", false),
+            ("launch:PB-1/task/apply", false),
+            ("https://example.com/a", false),
+        ] {
+            assert_eq!(Link::parse(href).unwrap().in_run(), in_run, "{href}");
+        }
+    }
+
+    #[test]
+    fn a_runs_request_reads_back_as_written_and_reads_past_unknown_fields() {
+        let request = RunsRequest {
+            runs: vec![
+                Run {
+                    status: Status::Running,
+                    cost_usd: None,
+                    pack_version: Some(4),
+                    params: Default::default(),
+                    files: vec![File {
+                        path: "verdicts.json".into(),
+                        task: "triage[go]".into(),
+                        text: "[]".into(),
+                    }],
+                    ..launched("PB-13")
+                },
+                launched("PB-12"),
+            ],
+            total: 3,
+            params: [("lane".to_string(), crate::Param::Select("go".into()))].into(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            json,
+            r#"{"runs":[{"id":"PB-13","status":"running","started":1790000000.0,"origin":"manual","pack_version":4,"files":[{"path":"verdicts.json","task":"triage[go]","text":"[]"}]},{"id":"PB-12","status":"done","started":1790000000.0,"cost_usd":1.5,"origin":"manual","params":{"profile":"demo"},"files":[]}],"total":3,"params":{"lane":{"select":"go"}}}"#
+        );
+        assert_eq!(serde_json::from_str::<RunsRequest>(&json).unwrap(), request);
+        assert_eq!(request.select("lane"), Some("go"));
+        assert_eq!(request.toggle("lane"), None);
+        assert_eq!(request.range("lane"), None);
+        assert_eq!(request.select("other"), None);
+        assert_eq!(
+            serde_json::to_string(&RunsRequest::default()).unwrap(),
+            r#"{"runs":[],"total":0}"#
+        );
+        let later = r#"{"runs":[{"id":"a","status":"cancelled","started":0,"origin":"webhook",
+            "files":[],"by":"someone"}],"total":1,"page":2}"#;
+        let read: RunsRequest = serde_json::from_str(later).unwrap();
+        assert_eq!(read.runs[0].status, Status::Cancelled);
+        assert_eq!(read.runs[0].origin, "webhook");
+        for status in ["running", "done", "error", "cancelled", "unfinished"] {
+            let run =
+                format!(r#"{{"id":"a","status":"{status}","started":0,"origin":"o","files":[]}}"#);
+            assert!(serde_json::from_str::<Run>(&run).is_ok(), "{status}");
+        }
+        assert!(
+            serde_json::from_str::<Run>(
+                r#"{"id":"a","status":"queued","started":0,"origin":"o","files":[]}"#
+            )
+            .is_err()
         );
     }
 
@@ -1583,11 +1941,17 @@ mod tests {
                 }],
             )
         };
-        assert_eq!(view(valued(180.0)).check(&Limits::DEFAULT), Ok(()));
-        assert_eq!(view(valued(-1e15)).check(&Limits::DEFAULT), Ok(()));
+        assert_eq!(
+            view(valued(180.0)).check(ViewKind::Run, &Limits::DEFAULT),
+            Ok(())
+        );
+        assert_eq!(
+            view(valued(-1e15)).check(ViewKind::Run, &Limits::DEFAULT),
+            Ok(())
+        );
         for off in [f64::NAN, f64::INFINITY, 1.1e15] {
             assert_eq!(
-                view(valued(off)).check(&Limits::DEFAULT),
+                view(valued(off)).check(ViewKind::Run, &Limits::DEFAULT),
                 Err(Problem::Magnitude("the cell 3 min".into()))
             );
         }
@@ -1658,7 +2022,7 @@ mod tests {
                 detail: None,
             }],
         );
-        assert_eq!(view(linked).check(&Limits::DEFAULT), Ok(()));
+        assert_eq!(view(linked).check(ViewKind::Run, &Limits::DEFAULT), Ok(()));
     }
 
     #[test]
@@ -1674,9 +2038,12 @@ mod tests {
                 children: vec![a, b],
             })
         };
-        assert_eq!(pair(markdown(6), mermaid(6)).check(&TIGHT), Ok(()));
         assert_eq!(
-            pair(markdown(6), mermaid(7)).check(&TIGHT),
+            pair(markdown(6), mermaid(6)).check(ViewKind::Run, &TIGHT),
+            Ok(())
+        );
+        assert_eq!(
+            pair(markdown(6), mermaid(7)).check(ViewKind::Run, &TIGHT),
             Err(Problem::Prose(12))
         );
         let detailed = |bytes: usize| {
@@ -1702,8 +2069,11 @@ mod tests {
                 ],
             })
         };
-        assert_eq!(detailed(12).check(&TIGHT), Ok(()));
-        assert_eq!(detailed(13).check(&TIGHT), Err(Problem::Detail(12)));
+        assert_eq!(detailed(12).check(ViewKind::Run, &TIGHT), Ok(()));
+        assert_eq!(
+            detailed(13).check(ViewKind::Run, &TIGHT),
+            Err(Problem::Detail(12))
+        );
 
         let json = r##"{"markdown":{"text":"# Hi"}}"##;
         assert_eq!(
@@ -1742,12 +2112,12 @@ mod tests {
                 }],
             })
         };
-        assert_eq!(bars(3.0, 2).check(&Limits::DEFAULT), Ok(()));
-        assert_eq!(bars(0.0, 1).check(&Limits::DEFAULT), Ok(()));
-        assert_eq!(bars(1e15, 1).check(&Limits::DEFAULT), Ok(()));
+        assert_eq!(bars(3.0, 2).check(ViewKind::Run, &Limits::DEFAULT), Ok(()));
+        assert_eq!(bars(0.0, 1).check(ViewKind::Run, &Limits::DEFAULT), Ok(()));
+        assert_eq!(bars(1e15, 1).check(ViewKind::Run, &Limits::DEFAULT), Ok(()));
         for value in [-1.0, f64::INFINITY, f64::NAN, 1.1e15, f64::MAX] {
             assert_eq!(
-                bars(value, 1).check(&Limits::DEFAULT),
+                bars(value, 1).check(ViewKind::Run, &Limits::DEFAULT),
                 Err(Problem::Value("affected".into()))
             );
         }
@@ -1757,9 +2127,12 @@ mod tests {
             )
             .is_err()
         );
-        assert_eq!(bars(1.0, 19_999).check(&Limits::DEFAULT), Ok(()));
         assert_eq!(
-            bars(1.0, 20_000).check(&Limits::DEFAULT),
+            bars(1.0, 19_999).check(ViewKind::Run, &Limits::DEFAULT),
+            Ok(())
+        );
+        assert_eq!(
+            bars(1.0, 20_000).check(ViewKind::Run, &Limits::DEFAULT),
             Err(Problem::Items(20_000))
         );
     }
@@ -1782,13 +2155,16 @@ mod tests {
             })
         };
         assert_eq!(
-            plot(vec![[7.5, 12.0], [-1.0, 0.0]]).check(&Limits::DEFAULT),
+            plot(vec![[7.5, 12.0], [-1.0, 0.0]]).check(ViewKind::Run, &Limits::DEFAULT),
             Ok(())
         );
-        assert_eq!(plot(vec![[-1e15, 1e15]]).check(&Limits::DEFAULT), Ok(()));
+        assert_eq!(
+            plot(vec![[-1e15, 1e15]]).check(ViewKind::Run, &Limits::DEFAULT),
+            Ok(())
+        );
         for off in [f64::NAN, f64::INFINITY, -1.1e15, f64::MAX] {
             assert_eq!(
-                plot(vec![[1.0, off]]).check(&Limits::DEFAULT),
+                plot(vec![[1.0, off]]).check(ViewKind::Run, &Limits::DEFAULT),
                 Err(Problem::Magnitude("the series affected".into()))
             );
         }
@@ -1797,7 +2173,7 @@ mod tests {
             "the series affected has a value that is not a number within 1e15 of zero"
         );
         assert_eq!(
-            plot(vec![[0.0, 0.0]; 50_001]).check(&Limits::DEFAULT),
+            plot(vec![[0.0, 0.0]; 50_001]).check(ViewKind::Run, &Limits::DEFAULT),
             Err(Problem::Points(50_000))
         );
         let json = serde_json::to_string(&plot(vec![[1.0, 2.0]])).unwrap();
@@ -1872,22 +2248,22 @@ mod tests {
         let on_x = |x: f64| scaled(Scale::Log, Scale::Linear, &[], vec![[x, -5.0]]);
         let on_y = |y: f64| scaled(Scale::Linear, Scale::Log, &[], vec![[-5.0, y]]);
         for fine in [5e-324, 1e-300, 1.0, 1e15] {
-            assert_eq!(on_x(fine).check(&Limits::DEFAULT), Ok(()));
-            assert_eq!(on_y(fine).check(&Limits::DEFAULT), Ok(()));
+            assert_eq!(on_x(fine).check(ViewKind::Run, &Limits::DEFAULT), Ok(()));
+            assert_eq!(on_y(fine).check(ViewKind::Run, &Limits::DEFAULT), Ok(()));
         }
         for off in [0.0, -0.0, -1.0, -1e15] {
             assert_eq!(
-                on_x(off).check(&Limits::DEFAULT),
+                on_x(off).check(ViewKind::Run, &Limits::DEFAULT),
                 Err(Problem::Log("s".into()))
             );
             assert_eq!(
-                on_y(off).check(&Limits::DEFAULT),
+                on_y(off).check(ViewKind::Run, &Limits::DEFAULT),
                 Err(Problem::Log("s".into()))
             );
         }
         for off in [f64::NAN, f64::INFINITY, 1.1e15] {
             assert_eq!(
-                on_y(off).check(&Limits::DEFAULT),
+                on_y(off).check(ViewKind::Run, &Limits::DEFAULT),
                 Err(Problem::Magnitude("the series s".into()))
             );
         }
@@ -1897,17 +2273,24 @@ mod tests {
     fn a_time_axis_holds_the_years_1_to_9998() {
         let at = |t: f64| scaled(Scale::Time, Scale::Linear, &[], vec![[t, 1.0]]);
         for fine in [TIME_SPAN[0], 0.0, 1_763_251_200.5, TIME_SPAN[1]] {
-            assert_eq!(at(fine).check(&Limits::DEFAULT), Ok(()), "{fine}");
+            assert_eq!(
+                at(fine).check(ViewKind::Run, &Limits::DEFAULT),
+                Ok(()),
+                "{fine}"
+            );
         }
         for off in [TIME_SPAN[0] - 1.0, TIME_SPAN[1] + 1.0, -1e15, 1e15] {
             assert_eq!(
-                at(off).check(&Limits::DEFAULT),
+                at(off).check(ViewKind::Run, &Limits::DEFAULT),
                 Err(Problem::Time("s".into())),
                 "{off}"
             );
         }
         let on_y = scaled(Scale::Linear, Scale::Time, &[], vec![[1e15, 1e15]]);
-        assert_eq!(on_y.check(&Limits::DEFAULT), Err(Problem::Time("s".into())));
+        assert_eq!(
+            on_y.check(ViewKind::Run, &Limits::DEFAULT),
+            Err(Problem::Time("s".into()))
+        );
     }
 
     #[test]
@@ -1915,23 +2298,28 @@ mod tests {
         let names = ["3.3", "3.4", "3.5"];
         let at = |x: f64| scaled(Scale::Linear, Scale::Linear, &names, vec![[x, 1.0]]);
         for fine in [0.0, 1.0, 2.0, -0.0] {
-            assert_eq!(at(fine).check(&Limits::DEFAULT), Ok(()), "{fine}");
+            assert_eq!(
+                at(fine).check(ViewKind::Run, &Limits::DEFAULT),
+                Ok(()),
+                "{fine}"
+            );
         }
         for off in [3.0, -1.0, 0.5, 2.0000001, 1e15] {
             assert_eq!(
-                at(off).check(&Limits::DEFAULT),
+                at(off).check(ViewKind::Run, &Limits::DEFAULT),
                 Err(Problem::Category("s".into())),
                 "{off}"
             );
         }
         assert_eq!(
-            scaled(Scale::Linear, Scale::Linear, &[], vec![[0.5, 1.0]]).check(&Limits::DEFAULT),
+            scaled(Scale::Linear, Scale::Linear, &[], vec![[0.5, 1.0]])
+                .check(ViewKind::Run, &Limits::DEFAULT),
             Ok(()),
             "no categories, any x"
         );
         for scale in [Scale::Log, Scale::Time] {
             assert_eq!(
-                scaled(scale, Scale::Linear, &names, vec![]).check(&Limits::DEFAULT),
+                scaled(scale, Scale::Linear, &names, vec![]).check(ViewKind::Run, &Limits::DEFAULT),
                 Err(Problem::CategoryScale)
             );
         }
@@ -1940,21 +2328,23 @@ mod tests {
             "a plot with categories has a log or time x axis"
         );
         assert_eq!(
-            scaled(Scale::Linear, Scale::Log, &names, vec![[1.0, 2.0]]).check(&Limits::DEFAULT),
+            scaled(Scale::Linear, Scale::Log, &names, vec![[1.0, 2.0]])
+                .check(ViewKind::Run, &Limits::DEFAULT),
             Ok(())
         );
         let many: Vec<&str> = vec!["c"; 6];
         assert_eq!(
-            scaled(Scale::Linear, Scale::Linear, &many, vec![]).check(&TIGHT),
+            scaled(Scale::Linear, Scale::Linear, &many, vec![]).check(ViewKind::Run, &TIGHT),
             Err(Problem::Items(6)),
             "the series and its categories are items"
         );
         assert_eq!(
-            scaled(Scale::Linear, Scale::Linear, &many[..5], vec![]).check(&TIGHT),
+            scaled(Scale::Linear, Scale::Linear, &many[..5], vec![]).check(ViewKind::Run, &TIGHT),
             Ok(())
         );
         assert_eq!(
-            scaled(Scale::Linear, Scale::Linear, &["123456789"], vec![]).check(&TIGHT),
+            scaled(Scale::Linear, Scale::Linear, &["123456789"], vec![])
+                .check(ViewKind::Run, &TIGHT),
             Err(Problem::Text(8))
         );
     }
@@ -1970,30 +2360,36 @@ mod tests {
 
     #[test]
     fn a_histogram_s_values_are_bounded_and_counted_as_points() {
-        assert_eq!(histogram(vec![], None).check(&Limits::DEFAULT), Ok(()));
         assert_eq!(
-            histogram(vec![-1e15, 0.0, 1e15], Some(1)).check(&Limits::DEFAULT),
+            histogram(vec![], None).check(ViewKind::Run, &Limits::DEFAULT),
             Ok(())
         );
         assert_eq!(
-            histogram(vec![1.0], Some(MAX_BINS)).check(&Limits::DEFAULT),
+            histogram(vec![-1e15, 0.0, 1e15], Some(1)).check(ViewKind::Run, &Limits::DEFAULT),
+            Ok(())
+        );
+        assert_eq!(
+            histogram(vec![1.0], Some(MAX_BINS)).check(ViewKind::Run, &Limits::DEFAULT),
             Ok(())
         );
         for bins in [0, MAX_BINS + 1, u32::MAX] {
             assert_eq!(
-                histogram(vec![1.0], Some(bins)).check(&Limits::DEFAULT),
+                histogram(vec![1.0], Some(bins)).check(ViewKind::Run, &Limits::DEFAULT),
                 Err(Problem::Bins(100))
             );
         }
         for off in [f64::NAN, f64::NEG_INFINITY, 1.1e15] {
             assert_eq!(
-                histogram(vec![1.0, off], None).check(&Limits::DEFAULT),
+                histogram(vec![1.0, off], None).check(ViewKind::Run, &Limits::DEFAULT),
                 Err(Problem::Magnitude("the histogram days".into()))
             );
         }
-        assert_eq!(histogram(vec![0.0; 6], None).check(&TIGHT), Ok(()));
         assert_eq!(
-            histogram(vec![0.0; 7], None).check(&TIGHT),
+            histogram(vec![0.0; 6], None).check(ViewKind::Run, &TIGHT),
+            Ok(())
+        );
+        assert_eq!(
+            histogram(vec![0.0; 7], None).check(ViewKind::Run, &TIGHT),
             Err(Problem::Points(6))
         );
         let shared = view(Node::Stack {
@@ -2002,7 +2398,7 @@ mod tests {
                 scaled(Scale::Linear, Scale::Linear, &[], vec![[0.0, 0.0]; 4]).body,
             ],
         });
-        assert_eq!(shared.check(&TIGHT), Err(Problem::Points(6)));
+        assert_eq!(shared.check(ViewKind::Run, &TIGHT), Err(Problem::Points(6)));
         let json = serde_json::to_string(&histogram(vec![2.0], None)).unwrap();
         assert!(
             json.contains(r#"{"histogram":{"x":"days","values":[2.0],"tone":"neutral"}}"#),
@@ -2041,53 +2437,57 @@ mod tests {
     #[test]
     fn a_heatmap_is_a_full_matrix_of_bounded_values() {
         assert_eq!(
-            heatmap(&["a", "b"], &["r"], vec![vec![1.0, -1e15]]).check(&Limits::DEFAULT),
-            Ok(())
-        );
-        assert_eq!(heatmap(&[], &[], vec![]).check(&Limits::DEFAULT), Ok(()));
-        assert_eq!(
-            heatmap(&[], &["r"], vec![vec![]]).check(&Limits::DEFAULT),
+            heatmap(&["a", "b"], &["r"], vec![vec![1.0, -1e15]])
+                .check(ViewKind::Run, &Limits::DEFAULT),
             Ok(())
         );
         assert_eq!(
-            heatmap(&["a"], &["r", "s"], vec![vec![1.0]]).check(&Limits::DEFAULT),
+            heatmap(&[], &[], vec![]).check(ViewKind::Run, &Limits::DEFAULT),
+            Ok(())
+        );
+        assert_eq!(
+            heatmap(&[], &["r"], vec![vec![]]).check(ViewKind::Run, &Limits::DEFAULT),
+            Ok(())
+        );
+        assert_eq!(
+            heatmap(&["a"], &["r", "s"], vec![vec![1.0]]).check(ViewKind::Run, &Limits::DEFAULT),
             Err(Problem::HeatmapRows(1, 2))
         );
         assert_eq!(
-            heatmap(&["a"], &[], vec![vec![1.0]]).check(&Limits::DEFAULT),
+            heatmap(&["a"], &[], vec![vec![1.0]]).check(ViewKind::Run, &Limits::DEFAULT),
             Err(Problem::HeatmapRows(1, 0))
         );
         assert_eq!(
             heatmap(&["a", "b"], &["r", "s"], vec![vec![1.0, 2.0], vec![3.0]])
-                .check(&Limits::DEFAULT),
+                .check(ViewKind::Run, &Limits::DEFAULT),
             Err(Problem::HeatmapRow("s".into(), 1, 2))
         );
         assert_eq!(
-            heatmap(&["a"], &["r"], vec![vec![1.0, 2.0]]).check(&Limits::DEFAULT),
+            heatmap(&["a"], &["r"], vec![vec![1.0, 2.0]]).check(ViewKind::Run, &Limits::DEFAULT),
             Err(Problem::HeatmapRow("r".into(), 2, 1))
         );
         for off in [f64::NAN, f64::INFINITY, -1.1e15] {
             assert_eq!(
-                heatmap(&["a"], &["r"], vec![vec![off]]).check(&Limits::DEFAULT),
+                heatmap(&["a"], &["r"], vec![vec![off]]).check(ViewKind::Run, &Limits::DEFAULT),
                 Err(Problem::Magnitude("the heatmap row r".into()))
             );
         }
         assert_eq!(
-            heatmap(&["a"], &["r", "s"], vec![vec![1.0], vec![2.0]]).check(&TIGHT),
+            heatmap(&["a"], &["r", "s"], vec![vec![1.0], vec![2.0]]).check(ViewKind::Run, &TIGHT),
             Ok(()),
             "two cells and three labels"
         );
         assert_eq!(
-            heatmap(&["a", "b"], &["r", "s"], vec![vec![1.0; 2]; 2]).check(&TIGHT),
+            heatmap(&["a", "b"], &["r", "s"], vec![vec![1.0; 2]; 2]).check(ViewKind::Run, &TIGHT),
             Err(Problem::Items(6)),
             "four cells and four labels"
         );
         assert_eq!(
-            heatmap(&["123456789"], &["r"], vec![vec![1.0]]).check(&TIGHT),
+            heatmap(&["123456789"], &["r"], vec![vec![1.0]]).check(ViewKind::Run, &TIGHT),
             Err(Problem::Text(8))
         );
         assert_eq!(
-            heatmap(&["a"], &["123456789"], vec![vec![1.0]]).check(&TIGHT),
+            heatmap(&["a"], &["123456789"], vec![vec![1.0]]).check(ViewKind::Run, &TIGHT),
             Err(Problem::Text(8))
         );
         let huge = Node::Heatmap {
@@ -2097,7 +2497,7 @@ mod tests {
             tone: Tone::Neutral,
         };
         assert_eq!(
-            view(huge).check(&Limits::DEFAULT),
+            view(huge).check(ViewKind::Run, &Limits::DEFAULT),
             Err(Problem::Items(20_000)),
             "counted before the rows are read"
         );
@@ -2144,24 +2544,36 @@ mod tests {
                 children: vec![Node::Stats { items: vec![] }],
             }],
         };
-        assert_eq!(view(deep).check(&limits), Err(Problem::Depth(2)));
+        assert_eq!(
+            view(deep).check(ViewKind::Run, &limits),
+            Err(Problem::Depth(2))
+        );
         let wide = Node::Stack {
             children: (0..3).map(|_| Node::Stats { items: vec![] }).collect(),
         };
-        assert_eq!(view(wide).check(&limits), Err(Problem::Nodes(3)));
+        assert_eq!(
+            view(wide).check(ViewKind::Run, &limits),
+            Err(Problem::Nodes(3))
+        );
         let big = table("t", vec![row("1"), row("2")]);
-        assert_eq!(view(big).check(&limits), Err(Problem::Cells(2)));
+        assert_eq!(
+            view(big).check(ViewKind::Run, &limits),
+            Err(Problem::Cells(2))
+        );
         let grid = Node::Grid {
             columns: vec!["a".into(), "b".into()],
             rows: vec![vec![Cell::text("1"), Cell::text("2")]; 2],
         };
-        assert_eq!(view(grid).check(&limits), Err(Problem::GridCells(4)));
+        assert_eq!(
+            view(grid).check(ViewKind::Run, &limits),
+            Err(Problem::GridCells(4))
+        );
         assert_eq!(
             view(Node::Tabs {
                 id: "t".into(),
                 tabs: vec![]
             })
-            .check(&limits),
+            .check(ViewKind::Run, &limits),
             Err(Problem::NoTabs("t".into()))
         );
     }
@@ -2174,9 +2586,9 @@ mod tests {
                 rows: vec![vec![]; rows],
             })
         };
-        assert_eq!(grid(599).check(&Limits::DEFAULT), Ok(()));
+        assert_eq!(grid(599).check(ViewKind::Run, &Limits::DEFAULT), Ok(()));
         assert_eq!(
-            grid(600).check(&Limits::DEFAULT),
+            grid(600).check(ViewKind::Run, &Limits::DEFAULT),
             Err(Problem::GridCells(600))
         );
         let table = |rows: usize| {
@@ -2192,9 +2604,12 @@ mod tests {
                     .collect(),
             })
         };
-        assert_eq!(table(500_000).check(&Limits::DEFAULT), Ok(()));
         assert_eq!(
-            table(500_001).check(&Limits::DEFAULT),
+            table(500_000).check(ViewKind::Run, &Limits::DEFAULT),
+            Ok(())
+        );
+        assert_eq!(
+            table(500_001).check(ViewKind::Run, &Limits::DEFAULT),
             Err(Problem::Cells(500_000))
         );
     }
@@ -2228,13 +2643,16 @@ mod tests {
                 children: vec![a, b],
             })
         };
-        assert_eq!(pair(stats(3), stats(3)).check(&TIGHT), Ok(()));
         assert_eq!(
-            pair(stats(3), stats(4)).check(&TIGHT),
+            pair(stats(3), stats(3)).check(ViewKind::Run, &TIGHT),
+            Ok(())
+        );
+        assert_eq!(
+            pair(stats(3), stats(4)).check(ViewKind::Run, &TIGHT),
             Err(Problem::Items(6))
         );
         assert_eq!(
-            view(plot(vec![series(0); 7])).check(&TIGHT),
+            view(plot(vec![series(0); 7])).check(ViewKind::Run, &TIGHT),
             Err(Problem::Items(6))
         );
         assert_eq!(
@@ -2246,15 +2664,15 @@ mod tests {
                     })
                     .collect(),
             })
-            .check(&TIGHT),
+            .check(ViewKind::Run, &TIGHT),
             Err(Problem::Items(6))
         );
         assert_eq!(
-            pair(plot(vec![series(3)]), plot(vec![series(3)])).check(&TIGHT),
+            pair(plot(vec![series(3)]), plot(vec![series(3)])).check(ViewKind::Run, &TIGHT),
             Ok(())
         );
         assert_eq!(
-            pair(plot(vec![series(3)]), plot(vec![series(4)])).check(&TIGHT),
+            pair(plot(vec![series(3)]), plot(vec![series(4)])).check(ViewKind::Run, &TIGHT),
             Err(Problem::Points(6))
         );
         let wide = Node::Table {
@@ -2269,7 +2687,10 @@ mod tests {
                 .collect(),
             rows: vec![],
         };
-        assert_eq!(view(wide).check(&TIGHT), Err(Problem::Items(6)));
+        assert_eq!(
+            view(wide).check(ViewKind::Run, &TIGHT),
+            Err(Problem::Items(6))
+        );
     }
 
     fn section(id: &str, open: bool, body: Node) -> Node {
@@ -2304,7 +2725,10 @@ mod tests {
             ])
         );
         assert_eq!(serde_json::to_string(&node).unwrap(), json);
-        assert_eq!(view(columns(vec![])).check(&Limits::DEFAULT), Ok(()));
+        assert_eq!(
+            view(columns(vec![])).check(ViewKind::Run, &Limits::DEFAULT),
+            Ok(())
+        );
         assert!(serde_json::from_str::<Node>(r#"{"columns":{"children":[],"gap":4}}"#).is_err());
         assert!(serde_json::from_str::<Node>(r#"{"columns":{}}"#).is_err());
     }
@@ -2312,7 +2736,7 @@ mod tests {
     #[test]
     fn columns_hold_no_table_however_deep() {
         assert_eq!(
-            view(columns(vec![stats(), table("t", vec![])])).check(&Limits::DEFAULT),
+            view(columns(vec![stats(), table("t", vec![])])).check(ViewKind::Run, &Limits::DEFAULT),
             Err(Problem::ColumnsTable)
         );
         let hidden = Node::Tabs {
@@ -2334,26 +2758,32 @@ mod tests {
             view(columns(vec![Node::Stack {
                 children: vec![hidden.clone()],
             }]))
-            .check(&Limits::DEFAULT),
+            .check(ViewKind::Run, &Limits::DEFAULT),
             Err(Problem::ColumnsTable)
         );
-        assert_eq!(view(hidden.clone()).check(&Limits::DEFAULT), Ok(()));
+        assert_eq!(
+            view(hidden.clone()).check(ViewKind::Run, &Limits::DEFAULT),
+            Ok(())
+        );
         let beside = Node::Stack {
             children: vec![columns(vec![stats(), stats()]), table("t", vec![row("1")])],
         };
-        assert_eq!(view(beside).check(&Limits::DEFAULT), Ok(()));
+        assert_eq!(view(beside).check(ViewKind::Run, &Limits::DEFAULT), Ok(()));
     }
 
     #[test]
     fn columns_count_toward_nodes_and_depth() {
         let limits = TIGHT;
-        assert_eq!(view(columns(vec![stats(), stats()])).check(&limits), Ok(()));
         assert_eq!(
-            view(columns(vec![stats(), stats(), stats()])).check(&limits),
+            view(columns(vec![stats(), stats()])).check(ViewKind::Run, &limits),
+            Ok(())
+        );
+        assert_eq!(
+            view(columns(vec![stats(), stats(), stats()])).check(ViewKind::Run, &limits),
             Err(Problem::Nodes(3))
         );
         assert_eq!(
-            view(columns(vec![columns(vec![stats()])])).check(&limits),
+            view(columns(vec![columns(vec![stats()])])).check(ViewKind::Run, &limits),
             Err(Problem::Depth(2))
         );
     }
@@ -2394,11 +2824,12 @@ mod tests {
             })
         };
         assert_eq!(
-            pair(section("s", true, stats()), section("s", false, stats())).check(&Limits::DEFAULT),
+            pair(section("s", true, stats()), section("s", false, stats()))
+                .check(ViewKind::Run, &Limits::DEFAULT),
             Err(Problem::DuplicateId("s".into()))
         );
         assert_eq!(
-            view(section("t", true, table("t", vec![]))).check(&Limits::DEFAULT),
+            view(section("t", true, table("t", vec![]))).check(ViewKind::Run, &Limits::DEFAULT),
             Err(Problem::DuplicateId("t".into()))
         );
         let tabbed = Node::Tabs {
@@ -2410,11 +2841,11 @@ mod tests {
             }],
         };
         assert_eq!(
-            pair(tabbed, section("s", true, stats())).check(&Limits::DEFAULT),
+            pair(tabbed, section("s", true, stats())).check(ViewKind::Run, &Limits::DEFAULT),
             Err(Problem::DuplicateId("s".into()))
         );
         assert_eq!(
-            view(section(&"x".repeat(9), true, stats())).check(&TIGHT),
+            view(section(&"x".repeat(9), true, stats())).check(ViewKind::Run, &TIGHT),
             Err(Problem::Text(8))
         );
         let titled = Node::Section {
@@ -2423,13 +2854,16 @@ mod tests {
             open: true,
             body: Box::new(stats()),
         };
-        assert_eq!(view(titled).check(&TIGHT), Err(Problem::Text(8)));
         assert_eq!(
-            view(section(&"x".repeat(8), true, stats())).check(&TIGHT),
+            view(titled).check(ViewKind::Run, &TIGHT),
+            Err(Problem::Text(8))
+        );
+        assert_eq!(
+            view(section(&"x".repeat(8), true, stats())).check(ViewKind::Run, &TIGHT),
             Ok(())
         );
         assert_eq!(
-            view(section("a", true, section("b", true, stats()))).check(&TIGHT),
+            view(section("a", true, section("b", true, stats()))).check(ViewKind::Run, &TIGHT),
             Err(Problem::Depth(2))
         );
     }
@@ -2438,13 +2872,17 @@ mod tests {
     fn a_folded_section_s_table_counts_as_shown() {
         for open in [true, false] {
             assert_eq!(
-                view(section("s", open, table("t", vec![row("1")]))).check(&Limits::DEFAULT),
+                view(section("s", open, table("t", vec![row("1")])))
+                    .check(ViewKind::Run, &Limits::DEFAULT),
                 Ok(())
             );
             let two = Node::Stack {
                 children: vec![section("s", open, table("a", vec![])), table("b", vec![])],
             };
-            assert_eq!(view(two).check(&Limits::DEFAULT), Err(Problem::Tables));
+            assert_eq!(
+                view(two).check(ViewKind::Run, &Limits::DEFAULT),
+                Err(Problem::Tables)
+            );
             let folded_pair = Node::Stack {
                 children: vec![
                     section("s", open, table("a", vec![])),
@@ -2452,7 +2890,7 @@ mod tests {
                 ],
             };
             assert_eq!(
-                view(folded_pair).check(&Limits::DEFAULT),
+                view(folded_pair).check(ViewKind::Run, &Limits::DEFAULT),
                 Err(Problem::Tables)
             );
         }
@@ -2461,14 +2899,14 @@ mod tests {
     #[test]
     fn a_long_title_label_cell_or_address_is_refused() {
         let long = "x".repeat(9);
-        let over = |body: Node| view(body).check(&TIGHT) == Err(Problem::Text(8));
+        let over = |body: Node| view(body).check(ViewKind::Run, &TIGHT) == Err(Problem::Text(8));
         assert_eq!(
             View {
                 title: long.clone(),
                 body: Node::Stats { items: vec![] },
                 controls: vec![],
             }
-            .check(&TIGHT),
+            .check(ViewKind::Run, &TIGHT),
             Err(Problem::Text(8))
         );
         assert!(over(Node::Text {
@@ -2536,7 +2974,7 @@ mod tests {
             "{json}"
         );
         assert_eq!(serde_json::from_str::<View>(&json).unwrap(), with);
-        assert_eq!(with.check(&Limits::DEFAULT), Ok(()));
+        assert_eq!(with.check(ViewKind::Run, &Limits::DEFAULT), Ok(()));
         let none = controlled(vec![]);
         let json = serde_json::to_string(&none).unwrap();
         assert!(!json.contains("controls"), "{json}");
@@ -2558,15 +2996,15 @@ mod tests {
         use crate::Control;
         let toggle = |id: &str| Control::toggle(id, "On", false);
         assert_eq!(
-            controlled(vec![toggle("a"), toggle("b")]).check(&TIGHT),
+            controlled(vec![toggle("a"), toggle("b")]).check(ViewKind::Run, &TIGHT),
             Ok(())
         );
         assert_eq!(
-            controlled(vec![toggle("a"), toggle("b"), toggle("c")]).check(&TIGHT),
+            controlled(vec![toggle("a"), toggle("b"), toggle("c")]).check(ViewKind::Run, &TIGHT),
             Err(Problem::Controls(2))
         );
         assert_eq!(
-            controlled(vec![toggle("a"), toggle("a")]).check(&TIGHT),
+            controlled(vec![toggle("a"), toggle("a")]).check(ViewKind::Run, &TIGHT),
             Err(Problem::DuplicateControl("a".into()))
         );
         let tabs = Node::Tabs {
@@ -2582,20 +3020,21 @@ mod tests {
                 controls: vec![toggle("a")],
                 ..view(tabs)
             }
-            .check(&Limits::DEFAULT),
+            .check(ViewKind::Run, &Limits::DEFAULT),
             Ok(()),
             "controls and components are named apart"
         );
         assert_eq!(
-            controlled(vec![toggle(&"x".repeat(9))]).check(&TIGHT),
+            controlled(vec![toggle(&"x".repeat(9))]).check(ViewKind::Run, &TIGHT),
             Err(Problem::Text(8))
         );
         assert_eq!(
-            controlled(vec![Control::toggle("a", &"x".repeat(9), true)]).check(&TIGHT),
+            controlled(vec![Control::toggle("a", &"x".repeat(9), true)])
+                .check(ViewKind::Run, &TIGHT),
             Err(Problem::Text(8))
         );
         assert_eq!(
-            controlled(vec![Control::toggle("", "", true)]).check(&TIGHT),
+            controlled(vec![Control::toggle("", "", true)]).check(ViewKind::Run, &TIGHT),
             Ok(())
         );
     }
@@ -2604,7 +3043,7 @@ mod tests {
     fn a_select_s_value_is_one_of_a_bounded_set_of_distinct_options() {
         use crate::Control;
         let select = |options: &[(&str, &str)], value: &str| {
-            controlled(vec![Control::select("s", "S", options, value)]).check(&TIGHT)
+            controlled(vec![Control::select("s", "S", options, value)]).check(ViewKind::Run, &TIGHT)
         };
         assert_eq!(select(&[("a", "A"), ("b", "B"), ("c", "C")], "c"), Ok(()));
         assert_eq!(
@@ -2632,7 +3071,8 @@ mod tests {
     fn a_range_is_finite_ordered_and_steps_a_bounded_number_of_times() {
         use crate::Control;
         let range = |min: f64, max: f64, step: f64, value: f64| {
-            controlled(vec![Control::range("r", "R", [min, max], step, value)]).check(&TIGHT)
+            controlled(vec![Control::range("r", "R", [min, max], step, value)])
+                .check(ViewKind::Run, &TIGHT)
         };
         let off = Err(Problem::Range("r".into()));
         assert_eq!(range(0.0, 10.0, 1.0, 0.0), Ok(()));
@@ -2726,7 +3166,7 @@ mod tests {
             (-3.0, 64.0),
         ] {
             assert_eq!(
-                meter(value, max).check(&Limits::DEFAULT),
+                meter(value, max).check(ViewKind::Run, &Limits::DEFAULT),
                 Ok(()),
                 "{value} {max}"
             );
@@ -2745,7 +3185,7 @@ mod tests {
             (-1.1e15, 1.0),
         ] {
             assert_eq!(
-                meter(value, max).check(&Limits::DEFAULT),
+                meter(value, max).check(ViewKind::Run, &Limits::DEFAULT),
                 Err(Problem::Meter("Closable".into())),
                 "{value} {max}"
             );
@@ -2764,7 +3204,7 @@ mod tests {
                 children: vec![meter(1.0, 2.0).body; count],
             })
         };
-        assert_eq!(meters(1).check(&TIGHT), Ok(()));
+        assert_eq!(meters(1).check(ViewKind::Run, &TIGHT), Ok(()));
         let six = Node::Stack {
             children: vec![
                 Node::Stats {
@@ -2780,14 +3220,14 @@ mod tests {
                 meter(1.0, 2.0).body,
             ],
         };
-        assert_eq!(view(six.clone()).check(&TIGHT), Ok(()));
+        assert_eq!(view(six.clone()).check(ViewKind::Run, &TIGHT), Ok(()));
         let Node::Stack { mut children } = six else {
             panic!("a stack");
         };
         children.push(meter(1.0, 2.0).body);
         let limits = Limits { nodes: 4, ..TIGHT };
         assert_eq!(
-            view(Node::Stack { children }).check(&limits),
+            view(Node::Stack { children }).check(ViewKind::Run, &limits),
             Err(Problem::Items(6))
         );
         let long = view(Node::Meter {
@@ -2796,7 +3236,7 @@ mod tests {
             max: 2.0,
             tone: Tone::Neutral,
         });
-        assert_eq!(long.check(&TIGHT), Err(Problem::Text(8)));
+        assert_eq!(long.check(ViewKind::Run, &TIGHT), Err(Problem::Text(8)));
     }
 
     fn note(headline: &str, detail: &str) -> Node {
@@ -2835,17 +3275,17 @@ mod tests {
         ] {
             assert!(serde_json::from_str::<Node>(off).is_err(), "{off}");
         }
-        assert_eq!(view(note("", "")).check(&TIGHT), Ok(()));
+        assert_eq!(view(note("", "")).check(ViewKind::Run, &TIGHT), Ok(()));
         assert_eq!(
-            view(note(&"x".repeat(8), &"y".repeat(8))).check(&TIGHT),
+            view(note(&"x".repeat(8), &"y".repeat(8))).check(ViewKind::Run, &TIGHT),
             Ok(())
         );
         assert_eq!(
-            view(note(&"x".repeat(9), "")).check(&TIGHT),
+            view(note(&"x".repeat(9), "")).check(ViewKind::Run, &TIGHT),
             Err(Problem::Text(8))
         );
         assert_eq!(
-            view(note("x", &"y".repeat(9))).check(&TIGHT),
+            view(note("x", &"y".repeat(9))).check(ViewKind::Run, &TIGHT),
             Err(Problem::Text(8))
         );
     }
@@ -2863,7 +3303,11 @@ mod tests {
             )
         };
         for fine in [0.0, -0.0, 0.45, 1.0, 5e-324] {
-            assert_eq!(view(barred(fine)).check(&Limits::DEFAULT), Ok(()), "{fine}");
+            assert_eq!(
+                view(barred(fine)).check(ViewKind::Run, &Limits::DEFAULT),
+                Ok(()),
+                "{fine}"
+            );
         }
         for off in [
             -5e-324,
@@ -2875,7 +3319,7 @@ mod tests {
             f64::NEG_INFINITY,
         ] {
             assert_eq!(
-                view(barred(off)).check(&Limits::DEFAULT),
+                view(barred(off)).check(ViewKind::Run, &Limits::DEFAULT),
                 Err(Problem::CellBar("45%".into())),
                 "{off}"
             );
@@ -2885,7 +3329,7 @@ mod tests {
             rows: vec![vec![Cell::text("x").bar(1.5)]],
         };
         assert_eq!(
-            view(grid).check(&Limits::DEFAULT),
+            view(grid).check(ViewKind::Run, &Limits::DEFAULT),
             Err(Problem::CellBar("x".into()))
         );
         assert_eq!(
@@ -2954,7 +3398,11 @@ mod tests {
                     columns: vec!["a".into()],
                     rows: vec![vec![cell]],
                 });
-                assert_eq!(shown.check(&Limits::DEFAULT), Ok(()), "{helper}({edge})");
+                assert_eq!(
+                    shown.check(ViewKind::Run, &Limits::DEFAULT),
+                    Ok(()),
+                    "{helper}({edge})"
+                );
             }
         }
         for off in [TIME_SPAN[0] - 1.0, TIME_SPAN[1] + 1.0] {
@@ -3126,10 +3574,15 @@ mod tests {
                     body: Node::Stats { items: vec![] },
                     controls,
                 };
-                view.check(&limits)
+                view.check(ViewKind::Run, &limits)
                     .unwrap_or_else(|e| panic!("{e}: {json}"));
                 continue;
             }
+            let kind = match word.as_str() {
+                "runs" => ViewKind::Runs,
+                "" => ViewKind::Run,
+                other => panic!("an example marked {other:?}"),
+            };
             let body: Node = serde_json::from_str(&json).unwrap_or_else(|e| panic!("{e}: {json}"));
             component_names(&body, &mut names);
             let view = View {
@@ -3137,7 +3590,7 @@ mod tests {
                 title: "T".into(),
                 body,
             };
-            view.check(&limits)
+            view.check(kind, &limits)
                 .unwrap_or_else(|e| panic!("{e}: {json}"));
         }
         let typed = include_str!("../js/crucible-view.d.ts");
@@ -3186,14 +3639,20 @@ mod tests {
                     assert_eq!(request.select("lane"), Some("go"));
                 }
                 "reply" => match serde_json::from_str(&json).unwrap() {
-                    Reply::View(view) => view.check(&limits).unwrap(),
+                    Reply::View(view) => view.check(ViewKind::Run, &limits).unwrap(),
                     Reply::Error(error) => assert!(!error.is_empty()),
                 },
+                "runs-request" => {
+                    let request: RunsRequest = serde_json::from_str(&json).unwrap();
+                    assert_eq!((request.runs.len(), request.total), (2, 30));
+                    assert_eq!(request.runs[1].status, Status::Running);
+                    assert_eq!(request.runs[0].files.len(), 1);
+                }
                 other => panic!("an example marked {other:?}"),
             }
             kinds.push(kind);
         }
-        assert_eq!(kinds, ["request", "reply", "reply"]);
+        assert_eq!(kinds, ["runs-request", "request", "reply", "reply"]);
     }
 
     #[test]

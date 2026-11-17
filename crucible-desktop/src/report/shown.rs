@@ -573,7 +573,13 @@ mod tests {
                     ],
                 },
             };
-            assert_eq!(view.check(&crucible_view::Limits::DEFAULT), Ok(()));
+            assert_eq!(
+                view.check(
+                    crucible_view::ViewKind::Run,
+                    &crucible_view::Limits::DEFAULT
+                ),
+                Ok(())
+            );
             let body = view.body.clone();
             let mut shown = holding(view);
             assert_eq!(shown.open("more", open), open);

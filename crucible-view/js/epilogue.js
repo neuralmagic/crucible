@@ -20,12 +20,21 @@
   let reply;
   try {
     const asked = JSON.parse(new TextDecoder().decode(bytes));
-    if ("view" in asked) {
+    const plain = (given) => {
       const params = {};
-      for (const [id, value] of Object.entries(asked.view.params ?? {})) {
+      for (const [id, value] of Object.entries(given ?? {})) {
         params[id] = Object.values(value)[0];
       }
-      reply = { view: view({ files: asked.view.files, params }) };
+      return params;
+    };
+    if ("view" in asked) {
+      reply = { view: view({ files: asked.view.files, params: plain(asked.view.params) }) };
+    } else if ("runs_view" in asked) {
+      const { runs: launches, total, params } = asked.runs_view;
+      reply = { view: runs({ runs: launches, total, params: plain(params) }) };
+    } else if ("runs_inputs" in asked) {
+      const drawn = typeof runs === "function" && typeof runsInputs !== "undefined";
+      reply = { runs_inputs: drawn ? runsInputs : null };
     } else {
       reply = { inputs };
     }
