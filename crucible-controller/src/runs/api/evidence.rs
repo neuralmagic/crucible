@@ -323,8 +323,13 @@ pub(crate) async fn get_run_task_log(
     let (text, truncated, location) = match session {
         Some(session) => {
             let folded = task_evidence::task_console(&session);
-            let (text, truncated) = task_evidence::tail_within_cap(folded.as_bytes());
-            (Some(text), truncated, None)
+            let window = task_evidence::log_window(
+                folded.as_bytes(),
+                None,
+                task_evidence::LogCap::default(),
+            );
+            let truncated = window.truncated();
+            (Some(window.text), truncated, None)
         }
         None => (None, false, Some(task_log_location(&run, &run_id, &state))),
     };

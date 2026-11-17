@@ -7843,7 +7843,7 @@ async fn cancelling_a_local_launch_stops_its_engine_and_stamps_the_run_cancelled
         "the engine is running"
     );
 
-    let store = std::sync::Arc::new(crucible_controller::OverrideStore::new());
+    let store = std::sync::Arc::new(crucible_controller::OverrideStore::new(db.pool().clone()));
     let sink = crate::daemon::overrides::QueueOverrideSink::new(
         store.clone(),
         crate::daemon::queue::WorkQueue::new(),
@@ -7854,7 +7854,8 @@ async fn cancelling_a_local_launch_stops_its_engine_and_stamps_the_run_cancelled
         reason: None,
         priority: None,
         actor: Some("wren".to_string()),
-    });
+    })
+    .await?;
     let applied = crate::daemon::overrides::apply_pending(&db, &store, key, false).await?;
     assert!(applied.is_some(), "the cancel override applies");
     let stopped = crate::runs::cancel::cancel_runs(&db, &cfg, key, Some("wren")).await?;

@@ -969,7 +969,7 @@ impl Diagnostic {
 }
 
 /// `GET /api/playbook-drafts`: one draft of the rail, as the studio's list reads it.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct PlaybookDraft {
     pub id: String,
     #[serde(default)]

@@ -514,6 +514,63 @@ fn live_pane<'a>(
     }
 }
 
+/// A draft the rail holds with no launch of its own: the studio's compile as its graph, its files
+/// in the Pack tab, and nothing run yet.
+fn draft_pane<'a>(row: &crux::dto::PlaybookDraft, log_font: LogFont, app: &'a App) -> Pane<'a> {
+    let studio = app
+        .remote
+        .studio
+        .as_ref()
+        .filter(|studio| studio.draft == row.id);
+    let tasks: &'a [TaskView] = studio
+        .and_then(|studio| studio.compiled.as_ref())
+        .map_or(&[], |preview| preview.fold.tasks.as_slice());
+    let meta = if row.compiles {
+        format!("v{} \u{b7} compiles", row.latest_version)
+    } else {
+        format!(
+            "v{} \u{b7} {} problems",
+            row.latest_version, row.diagnostics
+        )
+    };
+    Pane {
+        title: row.id.clone(),
+        subtitle: if row.description.is_empty() {
+            "A draft with no description yet.".to_string()
+        } else {
+            row.description.clone()
+        },
+        path: format!("draft:{}", row.id),
+        verdict: Verdict::NotRun,
+        spent: 0.0,
+        cap: 0.0,
+        passed: 0,
+        failed: 0,
+        tasks,
+        time: "\u{2014}".to_string(),
+        time_note: None,
+        meta: Some(meta),
+        streaming: false,
+        problem: None,
+        log: &[],
+        transcript: &[],
+        agent_events: &[],
+        log_font,
+        launchable: false,
+        preview: None,
+        previewing: false,
+        run_tasks: &[],
+        pack: Err("The Pack tab holds this draft's files.".to_string()),
+        launch: None,
+        run_id: None,
+        files: Some(Err("A draft captures nothing until it runs.".to_string())),
+        empty: (
+            "No tasks yet.",
+            "The compile's graph shows here once the draft holds files that build one.".to_string(),
+        ),
+    }
+}
+
 /// Why a live launch shows no tasks: still loading, unreadable, never dispatched, or no plan.
 fn live_empty(launch: &LivePlaybook, detail: Option<&LiveDetail>) -> (&'static str, String) {
     let Some(detail) = detail else {
@@ -984,7 +1041,8 @@ fn pack_list(app: &App, p: &Paint) -> El {
         Backend::Controller => match &*app.remote.live {
             LiveView::Ready { now, .. } => {
                 let playbooks = app.visible_playbooks();
-                if playbooks.is_empty() {
+                let drafts = draft_rows(app, p);
+                if playbooks.is_empty() && drafts.is_empty() {
                     list = list.child(note(
                         if app.filtering() {
                             "No playbooks match."
@@ -995,6 +1053,17 @@ fn pack_list(app: &App, p: &Paint) -> El {
                     ));
                 } else {
                     list = list.children(live_rows(app, &playbooks, *now, p));
+                    if !drafts.is_empty() {
+                        list = list
+                            .child(
+                                text("Drafts")
+                                    .font(p.k.ty.small)
+                                    .color(p.c.text_faint)
+                                    .px(8.0)
+                                    .pt(10.0),
+                            )
+                            .children(drafts);
+                    }
                 }
             }
             LiveView::Loading => {
@@ -1265,6 +1334,49 @@ fn live_rows(app: &App, playbooks: &[&LivePlaybook], now: i64, p: &Paint) -> Vec
         .collect()
 }
 
+/// The drafts the controller holds that no launch of their own shows: the rail's own rows, under
+/// the playbooks.
+fn draft_rows(app: &App, p: &Paint) -> Vec<El> {
+    let shown: Vec<&str> = app
+        .visible_playbooks()
+        .into_iter()
+        .map(|playbook| playbook.id.as_str())
+        .collect();
+    let current = app.selected_playbook();
+    app.remote
+        .drafts
+        .iter()
+        .filter(|draft| draft.retired_at.is_none())
+        .filter(|draft| !shown.contains(&draft.id.as_str()))
+        .map(|draft| {
+            let id = draft.id.clone();
+            let meta = if draft.compiles {
+                format!("v{} \u{b7} compiles", draft.latest_version)
+            } else {
+                format!(
+                    "v{} \u{b7} {} problems",
+                    draft.latest_version, draft.diagnostics
+                )
+            };
+            SidebarRow::new(draft.id.clone())
+                .subtitle(meta)
+                .height(ROW * p.text)
+                .status(verdict_status(
+                    if draft.compiles {
+                        Verdict::NotRun
+                    } else {
+                        Verdict::Invalid
+                    },
+                    p,
+                ))
+                .selected(current == Some(draft.id.as_str()))
+                .on_select(move |app: &mut App, _: &mut Tx| app.select(Selection::playbook(&id)))
+                .build(p.k)
+                .key(format!("draft-{}", draft.id))
+        })
+        .collect()
+}
+
 /// The launches of the selected live playbook the filters keep, when there is more than one.
 fn playbook_launches(app: &App) -> Option<(&str, Vec<&LivePlaybook>)> {
     let playbook = app.selected_playbook()?;
@@ -1350,10 +1462,24 @@ fn detail(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
     let font = app.settings.log_font;
     let pane = match &app.selection {
         Some(Selection::Local(_)) => app.selected_pack().map(|pack| local_pane(pack, font)),
+        Some(Selection::Live {
+            playbook,
+            launch: None,
+        }) if app.rail_draft().is_some() => app
+            .remote
+            .drafts
+            .iter()
+            .find(|draft| &draft.id == playbook)
+            .map(|row| draft_pane(row, font, app)),
         Some(Selection::Live { launch, .. }) => {
             let pinned = launch.is_some() && playbook_launches(app).is_some();
             app.selected_live().map(|live| Pane {
-                preview: app.remote.working_preview.as_ref(),
+                preview: app.remote.working_preview.as_ref().or_else(|| {
+                    app.remote
+                        .studio
+                        .as_ref()
+                        .and_then(|studio| studio.compiled.as_ref())
+                }),
                 ..live_pane(live, app.selected_detail(), font, pinned)
             })
         }

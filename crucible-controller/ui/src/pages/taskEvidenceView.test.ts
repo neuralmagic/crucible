@@ -96,10 +96,10 @@ describe('the run log', () => {
 
   it('names the output source and a dropped head in the section note', () => {
     expect(
-      logSectionNote({ run_id: 'r', dispatch: 'local', text: 'done\n', truncated: false, location: null }),
+      logSectionNote({ run_id: 'r', dispatch: 'local', text: 'done\n', truncated: false, start: 0, next: null, total_bytes: 0, location: null }),
     ).toBe('local process');
     expect(
-      logSectionNote({ run_id: 'r', dispatch: 'pod', text: 'tail\n', truncated: true, location: null }),
+      logSectionNote({ run_id: 'r', dispatch: 'pod', text: 'tail\n', truncated: true, start: 0, next: null, total_bytes: 0, location: null }),
     ).toBe('work pod · earlier output dropped');
   });
 

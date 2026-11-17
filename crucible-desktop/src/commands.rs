@@ -46,8 +46,14 @@ impl App {
             }),
             Command::Open(page) => self.toggle_page(page),
             Command::SaveDraft => {
-                if self.remote.working_edited && !self.remote.draft_busy {
-                    self.save_draft();
+                if self
+                    .remote
+                    .studio
+                    .as_ref()
+                    .is_some_and(|studio| studio.edited())
+                    && !self.remote.draft_busy
+                {
+                    self.save_studio();
                 }
             }
             Command::LaunchWorkingCopy => match self.backend {

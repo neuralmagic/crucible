@@ -248,14 +248,14 @@ mod tests {
             "workflow.star".to_string(),
             SKELETON_WORKFLOW.replace("echo hello", "echo hi"),
         );
-        save_version(&pool, "studio", files.clone(), Some("ada"), Some(1))
+        save_version(&pool, "studio", files.clone(), Some("ada"), Some(1), None)
             .await
             .expect("save 2");
-        save_version(&pool, "studio", files.clone(), Some("ada"), Some(2))
+        save_version(&pool, "studio", files.clone(), Some("ada"), Some(2), None)
             .await
             .expect("save 3");
         files.remove("skills/review.md");
-        save_version(&pool, "studio", files, Some("wren"), Some(3))
+        save_version(&pool, "studio", files, Some("wren"), Some(3), None)
             .await
             .expect("save 4");
 
@@ -308,7 +308,7 @@ mod tests {
         let mut files = skeleton();
         for n in 2..=3 {
             files.insert("notes.md".to_string(), format!("save {n}\n"));
-            save_version(&pool, "studio", files.clone(), None, None)
+            save_version(&pool, "studio", files.clone(), None, None, None)
                 .await
                 .expect("save");
         }
@@ -337,7 +337,7 @@ mod tests {
             SKELETON_WORKFLOW.replace("echo hello", "echo hi"),
         );
         files.insert("skills/review.md".to_string(), "review\n".to_string());
-        save_version(&pool, "studio", files, None, Some(1))
+        save_version(&pool, "studio", files, None, Some(1), None)
             .await
             .expect("save 2");
 
@@ -413,7 +413,7 @@ mod tests {
         let mut files = skeleton();
         for n in 2..=4 {
             files.insert("notes.md".to_string(), format!("save {n}\n"));
-            save_version(&pool, "studio", files.clone(), None, None)
+            save_version(&pool, "studio", files.clone(), None, None, None)
                 .await
                 .expect("save");
         }
