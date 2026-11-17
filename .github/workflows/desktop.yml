@@ -2,8 +2,9 @@ name: Desktop
 
 # Format, lint and test the desktop app (crucible-desktop, its own Cargo workspace on Rune, so
 # ci.yml never builds it) on macOS and Fedora, and assemble its .app bundle and RPM. Runs only when the app, the crates it
-# builds from (crux, crucible-contract, crucible-lsp, and the root Cargo.toml whose workspace
-# dependencies they inherit) or this workflow change: macOS runner minutes are billed.
+# builds from (crux, crucible-contract, crucible-lsp, crucible-view, and the root Cargo.toml whose
+# workspace dependencies they inherit), the report example packs its view tests load, or this
+# workflow change: macOS runner minutes are billed.
 on:
   push:
     branches: [main]
@@ -12,6 +13,9 @@ on:
       - 'crux/**'
       - 'crucible-contract/**'
       - 'crucible-lsp/**'
+      - 'crucible-view/**'
+      - 'examples/report/**'
+      - 'examples/report-ts/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/desktop.yml'
@@ -21,6 +25,9 @@ on:
       - 'crux/**'
       - 'crucible-contract/**'
       - 'crucible-lsp/**'
+      - 'crucible-view/**'
+      - 'examples/report/**'
+      - 'examples/report-ts/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/desktop.yml'
@@ -75,6 +82,9 @@ jobs:
       - name: test
         working-directory: crucible-desktop
         run: CRUCIBLE_LSP="$GITHUB_WORKSPACE/target/debug/crucible-lsp" cargo test --locked
+
+      - name: report example
+        run: cargo test --locked --manifest-path examples/report/ui/report/Cargo.toml --target-dir target/view-plugins
 
       # The browser build: the library, and the crux client under it, linted for wasm32.
       - name: web

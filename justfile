@@ -293,6 +293,10 @@ example-report-view:
     RUSTFLAGS="--remap-path-prefix=$HOME=/home --remap-path-prefix={{ justfile_directory() }}=." cargo build --release --target wasm32-unknown-unknown --manifest-path examples/report/ui/report/Cargo.toml --target-dir target/view-plugins
     cp target/view-plugins/wasm32-unknown-unknown/release/report_view.wasm examples/report/ui/report.wasm
 
+# Run the report example's view plugin tests natively.
+example-report-test:
+    cargo test --locked --manifest-path examples/report/ui/report/Cargo.toml --target-dir target/view-plugins
+
 # Type-check the report-ts example's view plugin and write the JavaScript the app runs.
 example-report-ts-view:
     npx --yes -p typescript@5.9.3 tsc --strict --noEmitOnError --target es2022 --module es2022 --lib es2022 --outDir examples/report-ts/ui crucible-view/js/crucible-view.d.ts examples/report-ts/ui/report.ts

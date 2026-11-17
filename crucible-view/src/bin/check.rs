@@ -2,18 +2,10 @@
 //! `{"view": ...}` or `{"error": ...}` a plugin answers with. Prints what it found and exits
 //! nonzero when the app would not draw it.
 
-use std::collections::BTreeMap;
 use std::io::Read;
 use std::process::ExitCode;
 
-use crucible_view::{Limits, Node, Reply, View};
-
-fn count(node: &Node, counts: &mut BTreeMap<&'static str, usize>) {
-    *counts.entry(node.name()).or_default() += 1;
-    for child in node.children() {
-        count(child, counts);
-    }
-}
+use crucible_view::{Limits, Reply, View};
 
 fn checked(input: &str) -> Result<String, String> {
     let view = match serde_json::from_str::<Reply>(input) {
@@ -25,8 +17,7 @@ fn checked(input: &str) -> Result<String, String> {
     };
     view.check(&Limits::DEFAULT)
         .map_err(|problem| format!("the view was refused: {problem}"))?;
-    let mut counts = BTreeMap::new();
-    count(&view.body, &mut counts);
+    let mut counts = view.body.counts();
     for control in &view.controls {
         *counts.entry(control.kind()).or_default() += 1;
     }

@@ -521,137 +521,6 @@ mod tests {
         assert_eq!(triaged(&reporter), "34");
     }
 
-    /// The fenced `json` blocks of one of the view plugin skill's files, each with the word
-    /// after `json` on its fence.
-    fn skill_examples(file: &str) -> Vec<(String, String)> {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../skills/write-a-view-plugin")
-            .join(file);
-        let text = fs::read_to_string(path).unwrap();
-        let mut found = Vec::new();
-        let mut open: Option<(String, String)> = None;
-        for line in text.lines() {
-            match (&mut open, line.strip_prefix("```")) {
-                (None, Some(info)) if info.starts_with("json") => {
-                    open = Some((info["json".len()..].trim().to_string(), String::new()));
-                }
-                (Some(_), Some(_)) => found.extend(open.take()),
-                (Some((_, body)), None) => {
-                    body.push_str(line);
-                    body.push('\n');
-                }
-                _ => {}
-            }
-        }
-        assert!(open.is_none(), "{file} ends inside an example");
-        found
-    }
-
-    /// The name `value` is written under.
-    fn tag(value: &impl serde::Serialize) -> String {
-        let written = serde_json::to_value(value).unwrap();
-        let mut keys = written.as_object().unwrap().keys();
-        let name = keys.next().unwrap().clone();
-        assert_eq!(keys.next(), None);
-        name
-    }
-
-    fn component_names(node: &Node, names: &mut std::collections::BTreeSet<&'static str>) {
-        assert_eq!(tag(node), node.name());
-        names.insert(node.name());
-        for child in node.children() {
-            component_names(child, names);
-        }
-    }
-
-    #[test]
-    fn the_skill_s_examples_are_views_the_host_draws() {
-        let limits = crucible_view::Limits::DEFAULT;
-        let mut names = std::collections::BTreeSet::new();
-        let mut kinds = std::collections::BTreeSet::new();
-        for (word, json) in skill_examples("components.md") {
-            if word == "controls" {
-                let controls: Vec<crucible_view::Control> =
-                    serde_json::from_str(&json).unwrap_or_else(|e| panic!("{e}: {json}"));
-                for control in &controls {
-                    assert_eq!(tag(control), control.kind(), "{json}");
-                }
-                kinds.extend(controls.iter().map(crucible_view::Control::kind));
-                let view = View {
-                    title: "T".into(),
-                    body: Node::Stats { items: vec![] },
-                    controls,
-                };
-                view.check(&limits)
-                    .unwrap_or_else(|e| panic!("{e}: {json}"));
-                continue;
-            }
-            let body: Node = serde_json::from_str(&json).unwrap_or_else(|e| panic!("{e}: {json}"));
-            component_names(&body, &mut names);
-            let view = View {
-                controls: vec![],
-                title: "T".into(),
-                body,
-            };
-            view.check(&limits)
-                .unwrap_or_else(|e| panic!("{e}: {json}"));
-        }
-        let typed = include_str!("../../crucible-view/js/crucible-view.d.ts");
-        for name in names.iter().chain(&kinds) {
-            assert!(
-                typed.contains(&format!("{name}: {{")),
-                "the types name {name}"
-            );
-        }
-        assert_eq!(
-            names.into_iter().collect::<Vec<_>>(),
-            [
-                "bars",
-                "canvas",
-                "columns",
-                "flow",
-                "grid",
-                "heatmap",
-                "histogram",
-                "markdown",
-                "mermaid",
-                "meter",
-                "note",
-                "plot",
-                "section",
-                "stack",
-                "stats",
-                "table",
-                "tabs",
-                "text"
-            ],
-            "every component has an example"
-        );
-        assert_eq!(
-            kinds.into_iter().collect::<Vec<_>>(),
-            ["range", "select", "toggle"],
-            "every control has an example"
-        );
-
-        let mut kinds = Vec::new();
-        for (kind, json) in skill_examples("SKILL.md") {
-            match kind.as_str() {
-                "request" => {
-                    let request: crucible_view::Request = serde_json::from_str(&json).unwrap();
-                    assert_eq!(request.files.len(), 1);
-                    assert_eq!(request.select("lane"), Some("go"));
-                }
-                "reply" => match serde_json::from_str(&json).unwrap() {
-                    crucible_view::Reply::View(view) => view.check(&limits).unwrap(),
-                    crucible_view::Reply::Error(error) => assert!(!error.is_empty()),
-                },
-                other => panic!("an example marked {other:?}"),
-            }
-            kinds.push(kind);
-        }
-        assert_eq!(kinds, ["request", "reply", "reply"]);
-    }
-
     #[test]
     fn a_plugin_is_loaded_again_only_when_its_path_or_bytes_change() {
         let wasm = fs::read(example().join("ui/report.wasm"))
@@ -848,10 +717,8 @@ mod tests {
             view.title,
             "Triage: 19 to act on, 22 to spot-check, 23 to close"
         );
-        let mut names = std::collections::BTreeSet::new();
-        component_names(&view.body, &mut names);
         assert_eq!(
-            names.into_iter().collect::<Vec<_>>(),
+            view.body.counts().into_keys().collect::<Vec<_>>(),
             [
                 "canvas",
                 "columns",

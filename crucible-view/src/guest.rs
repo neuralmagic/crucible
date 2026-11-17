@@ -1,39 +1,10 @@
-//! What a view plugin exports, built for `wasm32-unknown-unknown`.
-//!
-//! ```ignore
-//! crucible_view::plugin!(inputs = ["verdicts.json"], view = report);
-//!
-//! fn report(request: crucible_view::Request) -> Result<crucible_view::View, String> {
-//!     let lane = request.select("lane").unwrap_or("all");
-//!     ..
-//! }
-//! ```
+//! The functions behind the exports `plugin!` writes, built for `wasm32-unknown-unknown`.
 //!
 //! A result is returned as one `u64`: its address in the high half, its length in the low half.
 
 use serde::de::DeserializeOwned;
 
 use crate::{Reply, View};
-
-#[macro_export]
-macro_rules! plugin {
-    (inputs = [$($path:literal),* $(,)?], view = $view:path) => {
-        #[unsafe(no_mangle)]
-        pub extern "C" fn crucible_alloc(len: u32) -> u32 {
-            $crate::guest::alloc(len)
-        }
-
-        #[unsafe(no_mangle)]
-        pub extern "C" fn crucible_inputs() -> u64 {
-            $crate::guest::inputs(&[$($path),*])
-        }
-
-        #[unsafe(no_mangle)]
-        pub extern "C" fn crucible_view(ptr: u32, len: u32) -> u64 {
-            $crate::guest::view::<$crate::Request>(ptr, len, $view)
-        }
-    };
-}
 
 pub fn alloc(len: u32) -> u32 {
     let mut bytes = Vec::<u8>::with_capacity(len as usize);

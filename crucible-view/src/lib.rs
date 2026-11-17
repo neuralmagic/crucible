@@ -26,6 +26,47 @@ pub const INPUTS: &str = "crucible_inputs";
 /// The export that takes a [`Request`] and returns a [`Reply`].
 pub const VIEW: &str = "crucible_view";
 
+/// What a view plugin exports. Off `wasm32` it writes only a check of the view function's type.
+///
+/// ```
+/// crucible_view::plugin!(inputs = ["verdicts.json"], view = report);
+///
+/// fn report(request: crucible_view::Request) -> Result<crucible_view::View, String> {
+///     let lane = request.select("lane").unwrap_or("all");
+///     Ok(crucible_view::View {
+///         title: format!("Lane {lane}"),
+///         body: crucible_view::Node::Stats { items: vec![] },
+///         controls: vec![],
+///     })
+/// }
+/// ```
+#[macro_export]
+macro_rules! plugin {
+    (inputs = [$($path:literal),* $(,)?], view = $view:path) => {
+        #[cfg(target_arch = "wasm32")]
+        #[unsafe(no_mangle)]
+        pub extern "C" fn crucible_alloc(len: u32) -> u32 {
+            $crate::guest::alloc(len)
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        #[unsafe(no_mangle)]
+        pub extern "C" fn crucible_inputs() -> u64 {
+            $crate::guest::inputs(&[$($path),*])
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        #[unsafe(no_mangle)]
+        pub extern "C" fn crucible_view(ptr: u32, len: u32) -> u64 {
+            $crate::guest::view::<$crate::Request>(ptr, len, $view)
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        const _: fn($crate::Request) -> ::core::result::Result<$crate::View, ::std::string::String> =
+            $view;
+    };
+}
+
 /// A captured file handed to a plugin.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -376,6 +417,17 @@ impl Node {
             .iter()
             .chain(body)
             .chain(tabs.iter().map(|tab| &tab.body))
+    }
+
+    /// The number of components of each kind in this one and all it holds, by name.
+    pub fn counts(&self) -> BTreeMap<&'static str, usize> {
+        let mut counts = BTreeMap::new();
+        let mut open = vec![self];
+        while let Some(node) = open.pop() {
+            *counts.entry(node.name()).or_default() += 1;
+            open.extend(node.children());
+        }
+        counts
     }
 }
 
@@ -2987,5 +3039,159 @@ mod tests {
             picked(&backwards, Param::Range(5.0)),
             Param::Range(value) if value.is_finite()
         ));
+    }
+
+    /// The fenced `json` blocks of one of the view plugin skill's files, each with the word
+    /// after `json` on its fence.
+    fn skill_examples(file: &str) -> Vec<(String, String)> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../skills/write-a-view-plugin")
+            .join(file);
+        let text = std::fs::read_to_string(path).unwrap();
+        let mut found = Vec::new();
+        let mut open: Option<(String, String)> = None;
+        for line in text.lines() {
+            match (&mut open, line.strip_prefix("```")) {
+                (None, Some(info)) if info.starts_with("json") => {
+                    open = Some((info["json".len()..].trim().to_string(), String::new()));
+                }
+                (Some(_), Some(_)) => found.extend(open.take()),
+                (Some((_, body)), None) => {
+                    body.push_str(line);
+                    body.push('\n');
+                }
+                _ => {}
+            }
+        }
+        assert!(open.is_none(), "{file} ends inside an example");
+        found
+    }
+
+    /// The name `value` is written under.
+    fn tag(value: &impl serde::Serialize) -> String {
+        let written = serde_json::to_value(value).unwrap();
+        let mut keys = written.as_object().unwrap().keys();
+        let name = keys.next().unwrap().clone();
+        assert_eq!(keys.next(), None);
+        name
+    }
+
+    fn component_names(node: &Node, names: &mut std::collections::BTreeSet<&'static str>) {
+        assert_eq!(tag(node), node.name());
+        names.insert(node.name());
+        for child in node.children() {
+            component_names(child, names);
+        }
+    }
+
+    #[test]
+    fn the_skill_s_examples_are_views_the_host_draws() {
+        use crate::Control;
+        let limits = Limits::DEFAULT;
+        let mut names = std::collections::BTreeSet::new();
+        let mut kinds = std::collections::BTreeSet::new();
+        for (word, json) in skill_examples("components.md") {
+            if word == "controls" {
+                let controls: Vec<Control> =
+                    serde_json::from_str(&json).unwrap_or_else(|e| panic!("{e}: {json}"));
+                for control in &controls {
+                    assert_eq!(tag(control), control.kind(), "{json}");
+                }
+                kinds.extend(controls.iter().map(Control::kind));
+                let view = View {
+                    title: "T".into(),
+                    body: Node::Stats { items: vec![] },
+                    controls,
+                };
+                view.check(&limits)
+                    .unwrap_or_else(|e| panic!("{e}: {json}"));
+                continue;
+            }
+            let body: Node = serde_json::from_str(&json).unwrap_or_else(|e| panic!("{e}: {json}"));
+            component_names(&body, &mut names);
+            let view = View {
+                controls: vec![],
+                title: "T".into(),
+                body,
+            };
+            view.check(&limits)
+                .unwrap_or_else(|e| panic!("{e}: {json}"));
+        }
+        let typed = include_str!("../js/crucible-view.d.ts");
+        for name in names.iter().chain(&kinds) {
+            assert!(
+                typed.contains(&format!("{name}: {{")),
+                "the types name {name}"
+            );
+        }
+        assert_eq!(
+            names.into_iter().collect::<Vec<_>>(),
+            [
+                "bars",
+                "canvas",
+                "columns",
+                "flow",
+                "grid",
+                "heatmap",
+                "histogram",
+                "markdown",
+                "mermaid",
+                "meter",
+                "note",
+                "plot",
+                "section",
+                "stack",
+                "stats",
+                "table",
+                "tabs",
+                "text"
+            ],
+            "every component has an example"
+        );
+        assert_eq!(
+            kinds.into_iter().collect::<Vec<_>>(),
+            ["range", "select", "toggle"],
+            "every control has an example"
+        );
+
+        let mut kinds = Vec::new();
+        for (kind, json) in skill_examples("SKILL.md") {
+            match kind.as_str() {
+                "request" => {
+                    let request: crate::Request = serde_json::from_str(&json).unwrap();
+                    assert_eq!(request.files.len(), 1);
+                    assert_eq!(request.select("lane"), Some("go"));
+                }
+                "reply" => match serde_json::from_str(&json).unwrap() {
+                    Reply::View(view) => view.check(&limits).unwrap(),
+                    Reply::Error(error) => assert!(!error.is_empty()),
+                },
+                other => panic!("an example marked {other:?}"),
+            }
+            kinds.push(kind);
+        }
+        assert_eq!(kinds, ["request", "reply", "reply"]);
+    }
+
+    #[test]
+    fn counts_tally_every_component_a_view_holds() {
+        let body = Node::Stack {
+            children: vec![
+                stats(),
+                Node::Columns {
+                    children: vec![
+                        stats(),
+                        Node::Text {
+                            text: "t".into(),
+                            tone: Tone::Neutral,
+                        },
+                    ],
+                },
+            ],
+        };
+        assert_eq!(
+            body.counts().into_iter().collect::<Vec<_>>(),
+            [("columns", 1), ("stack", 1), ("stats", 2), ("text", 1)]
+        );
     }
 }
