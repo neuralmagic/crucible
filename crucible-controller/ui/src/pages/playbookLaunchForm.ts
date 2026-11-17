@@ -463,7 +463,8 @@ export function validateParam(
   } catch {
     return null;
   }
-  return re.test(trimmed) ? null : `${spec.name} must match ${spec.pattern}`;
+  if (re.test(trimmed)) return null;
+  return spec.description === null ? `${spec.name} must match ${spec.pattern}` : `${spec.name} isn't in the expected form`;
 }
 
 export interface LaunchCeilings {
