@@ -174,6 +174,27 @@ pub enum RunsTab {
     Report,
 }
 
+/// A plugin file that stands in for a live pack's.
+struct StandIn {
+    /// The file's name.
+    file: String,
+    /// The path and text a controller's pack would carry it under.
+    path: String,
+    text: String,
+}
+
+impl StandIn {
+    /// The plugin file `named`, when it can be read as one.
+    fn read(named: &str) -> Option<StandIn> {
+        let file = std::path::Path::new(named)
+            .file_name()?
+            .to_str()?
+            .to_string();
+        let (path, text) = report::stand_in(named, std::fs::read(named).ok()?)?;
+        Some(StandIn { file, path, text })
+    }
+}
+
 /// What the Report pane asks a worker to build.
 #[derive(Clone, Debug, PartialEq)]
 enum ReportAsk {
@@ -473,9 +494,9 @@ pub struct App {
     /// playbook.
     pub runs_shown: report::shown::Scoped<String>,
     pub runs_tab: RunsTab,
-    /// The plugin that stands in for a live pack's, as its path and text: what
-    /// `CRUCIBLE_VIEW_PLUGIN` named at start.
-    view_plugin: Option<(String, String)>,
+    /// The plugin file that stands in for a live pack's: what `CRUCIBLE_VIEW_PLUGIN` named at
+    /// start.
+    view_plugin: Option<StandIn>,
     /// The workspace the user arranged; `None` lays each run out by its graph's depth.
     pub layout: Option<Workspace>,
     /// Panes picked from a tab bar while the layout follows the run, oldest first.
@@ -1272,7 +1293,9 @@ impl App {
         self.answer_drop(snapshot.dropped);
         self.answer_file(snapshot.file);
         self.answer_report(snapshot.report);
-        self.answer_runs_report(snapshot.runs_report);
+        if let Some(built) = snapshot.runs_report {
+            self.remote.runs_ask.answer(built);
+        }
         self.answer_revisions(snapshot.revisions);
         self.announce(&snapshot.finished);
         self.reconcile();
@@ -1472,10 +1495,15 @@ impl App {
     /// The plugin a live run and its playbook's runs page draw with, as its path and text: the
     /// file `CRUCIBLE_VIEW_PLUGIN` named, else the one the selected launch's pack carries.
     fn live_plugin(&self) -> Option<(&str, &str)> {
-        if let Some((path, text)) = &self.view_plugin {
-            return Some((path, text));
+        if let Some(plugin) = &self.view_plugin {
+            return Some((&plugin.path, &plugin.text));
         }
         report::text_plugin(self.selected_detail()?.pack.as_ref().ok()?)
+    }
+
+    /// The name of the file that stands in for a live pack's plugin.
+    pub fn stand_in(&self) -> Option<&str> {
+        self.view_plugin.as_ref().map(|plugin| plugin.file.as_str())
     }
 
     fn answer_report(&mut self, built: Option<std::sync::Arc<report::Built<report::Wanted>>>) {
@@ -1541,15 +1569,13 @@ impl App {
         let view = self.runs_view().cloned();
         self.runs_shown.follow(playbook.as_ref(), view.as_ref());
         let wanted = self.wanted_runs_report();
-        if wanted == self.remote.runs_report_sent {
-            return;
-        }
-        if let (Some(wanted), Some((_, text))) = (&wanted, self.live_plugin()) {
+        if let Some(wanted) = self.remote.runs_ask.ask(wanted).cloned()
+            && let Some((_, text)) = self.live_plugin()
+        {
             self.remote
                 .live_client
-                .runs_report(wanted.clone(), text.to_string());
+                .runs_report(wanted, text.to_string());
         }
-        self.remote.runs_report_sent = wanted;
     }
 
     /// The runs view of the playbook the runs page shows, while its newest launch's pack carries
@@ -1557,38 +1583,18 @@ impl App {
     fn wanted_runs_report(&self) -> Option<report::WantedRuns> {
         let (playbook, launches) = self.runs_page()?;
         let (plugin, _) = self.live_plugin()?;
-        Some(report::WantedRuns {
-            playbook: playbook.to_string(),
-            plugin: plugin.to_string(),
-            total: launches.len(),
-            launches: launches
-                .iter()
-                .take(report::RUNS)
-                .map(|launch| report::Launched::of(launch))
-                .collect(),
-            asked: self.runs_shown.shown.asked(),
-        })
-    }
-
-    fn answer_runs_report(
-        &mut self,
-        built: Option<std::sync::Arc<report::Built<report::WantedRuns>>>,
-    ) {
-        if let Some(built) = built
-            && Some(&built.wanted) == self.remote.runs_report_sent.as_ref()
-        {
-            self.remote.runs_report = Some(built);
-        }
+        Some(report::WantedRuns::of(
+            playbook,
+            plugin,
+            &launches,
+            self.runs_shown.shown.asked(),
+        ))
     }
 
     /// The runs view built for the playbook the runs page shows, when its plugin draws one.
     pub fn runs_view(&self) -> Option<&std::sync::Arc<report::Report>> {
         let (playbook, _) = self.runs_page()?;
-        self.remote
-            .runs_report
-            .as_deref()
-            .filter(|built| built.wanted.playbook == playbook)
-            .and_then(|built| built.report.as_ref())
+        self.remote.runs_ask.view(playbook)
     }
 
     /// Fires the tick of each live view on screen that is due at `clock`, and says how many
@@ -2119,7 +2125,7 @@ fn init() -> App {
         runs_tab: RunsTab::default(),
         view_plugin: std::env::var("CRUCIBLE_VIEW_PLUGIN")
             .ok()
-            .and_then(|path| report::stand_in(&path, std::fs::read(&path).ok()?)),
+            .and_then(|named| StandIn::read(&named)),
         knobs: rune_knobs::Knobs::default(),
         page: Page::Runs,
         flight: None,

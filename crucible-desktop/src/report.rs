@@ -91,6 +91,8 @@ pub struct Report {
     pub author: Option<String>,
     pub asked: Asked,
     pub view: Result<View, String>,
+    /// The launches a runs view was asked to read and could not.
+    pub unread: Vec<Unread>,
 }
 
 impl Report {
@@ -100,8 +102,16 @@ impl Report {
             author: None,
             asked,
             view,
+            unread: Vec::new(),
         }
     }
+}
+
+/// A launch a runs view could not read, and why.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Unread {
+    pub launch: String,
+    pub why: String,
 }
 
 /// A live run's report, as the Report pane asks the live worker for it. Asked again when any of
@@ -139,6 +149,63 @@ pub struct WantedRuns {
     /// How many launches the reader's filters keep.
     pub total: usize,
     pub asked: Asked,
+}
+
+impl WantedRuns {
+    /// The runs view of `playbook`'s `launches`, newest first, drawn by the plugin at `plugin`:
+    /// the newest [`RUNS`] of them.
+    pub fn of(
+        playbook: &str,
+        plugin: &str,
+        launches: &[&LivePlaybook],
+        asked: Asked,
+    ) -> WantedRuns {
+        WantedRuns {
+            playbook: playbook.to_string(),
+            plugin: plugin.to_string(),
+            total: launches.len(),
+            launches: launches
+                .iter()
+                .take(RUNS)
+                .map(|launch| Launched::of(launch))
+                .collect(),
+            asked,
+        }
+    }
+}
+
+/// The runs view last asked of the live worker, and the one it last built for that ask.
+#[derive(Default)]
+pub struct RunsAsk {
+    sent: Option<WantedRuns>,
+    built: Option<Arc<Built<WantedRuns>>>,
+}
+
+impl RunsAsk {
+    /// Notes `wanted` as what is asked now, and gives it back when the worker is to be asked:
+    /// when it is not what was asked last.
+    pub fn ask(&mut self, wanted: Option<WantedRuns>) -> Option<&WantedRuns> {
+        if wanted == self.sent {
+            return None;
+        }
+        self.sent = wanted;
+        self.sent.as_ref()
+    }
+
+    /// Keeps `built` when it answers what was asked last.
+    pub fn answer(&mut self, built: Arc<Built<WantedRuns>>) {
+        if Some(&built.wanted) == self.sent.as_ref() {
+            self.built = Some(built);
+        }
+    }
+
+    /// The view built for `playbook`, when its plugin draws one.
+    pub fn view(&self, playbook: &str) -> Option<&Arc<Report>> {
+        self.built
+            .as_deref()
+            .filter(|built| built.wanted.playbook == playbook)
+            .and_then(|built| built.report.as_ref())
+    }
 }
 
 /// One launch a runs view is asked with, as the launch list has it.
@@ -191,6 +258,8 @@ pub struct Gathered {
     pub launches: Vec<Launched>,
     /// Those read, which leaves out the ones past the bytes a view reads.
     pub runs: Vec<(Launched, Run)>,
+    /// Those that could not be read.
+    pub unread: Vec<Unread>,
 }
 
 impl Gathered {
@@ -605,6 +674,7 @@ impl Reporter {
             author,
             asked: held.clone(),
             view,
+            unread: Vec::new(),
         };
         held.event = None;
         if let Ok(view) = &report.view {
@@ -633,8 +703,9 @@ mod tests {
     use crate::live::{LaunchStatus, LivePlaybook};
     use crate::report::shown::{Scoped, Shown};
     use crate::report::{
-        Asked, FILE_BYTES, Gathered, Launched, Plugins, READ_BYTES, Reporter, Wanted, admit,
-        file_named, readable, run_runs, stand_in, task_named, with_run,
+        Asked, Built, FILE_BYTES, Gathered, Launched, Plugins, READ_BYTES, RUNS, Report, Reporter,
+        RunsAsk, Wanted, WantedRuns, admit, file_named, readable, run_runs, stand_in, task_named,
+        with_run,
     };
 
     fn example() -> std::path::PathBuf {
@@ -1438,6 +1509,99 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_runs_view_is_asked_with_the_newest_launches_and_how_many_there_are() {
+        let keys: Vec<String> = (0..RUNS + 3).map(|n| format!("PB-{n}")).collect();
+        let listed: Vec<LivePlaybook> = keys
+            .iter()
+            .map(|key| launch(key, LaunchStatus::Done))
+            .collect();
+        let launches: Vec<&LivePlaybook> = listed.iter().collect();
+        let wanted = WantedRuns::of("triage", "ui/report.js", &launches, Asked::default());
+        assert_eq!(
+            (wanted.playbook.as_str(), wanted.plugin.as_str()),
+            ("triage", "ui/report.js")
+        );
+        assert_eq!(wanted.total, RUNS + 3);
+        assert_eq!(
+            wanted
+                .launches
+                .iter()
+                .map(|launch| launch.key.as_str())
+                .collect::<Vec<_>>(),
+            keys[..RUNS]
+        );
+        assert_eq!(wanted.launches[0], Launched::of(&listed[0]));
+    }
+
+    #[test]
+    fn the_runs_page_asks_once_and_keeps_only_the_answer_to_its_newest_ask() {
+        let done = launch("PB-1", LaunchStatus::Done);
+        let running = launch("PB-2", LaunchStatus::Running);
+        let wanted = |playbook: &str, launches: &[&LivePlaybook]| {
+            WantedRuns::of(playbook, "ui/report.js", launches, Asked::default())
+        };
+        let built = |wanted: &WantedRuns, title: &str| {
+            let view = View {
+                title: title.into(),
+                body: Node::Stats { items: vec![] },
+                controls: vec![],
+                live: Default::default(),
+            };
+            let report = Report::pack(wanted.asked.clone(), Ok(view));
+            Arc::new(Built::new(wanted.clone(), Some(report)))
+        };
+        let title = |ask: &RunsAsk, playbook: &str| {
+            let view = ask.view(playbook)?.view.as_ref().ok()?;
+            Some(view.title.clone())
+        };
+
+        let mut ask = RunsAsk::default();
+        assert_eq!(ask.ask(None), None, "nothing to ask for");
+        let first = wanted("triage", &[&running, &done]);
+        assert_eq!(ask.ask(Some(first.clone())), Some(&first));
+        assert_eq!(
+            ask.ask(Some(first.clone())),
+            None,
+            "the same ask is sent once"
+        );
+        assert_eq!(title(&ask, "triage"), None, "not built yet");
+
+        ask.answer(built(&first, "one"));
+        assert_eq!(title(&ask, "triage").as_deref(), Some("one"));
+        assert_eq!(
+            title(&ask, "other"),
+            None,
+            "another playbook's is not shown"
+        );
+
+        let second = wanted("triage", &[&done]);
+        assert_eq!(ask.ask(Some(second.clone())), Some(&second));
+        assert_eq!(
+            title(&ask, "triage").as_deref(),
+            Some("one"),
+            "the last view stays while the next is built"
+        );
+        ask.answer(built(&first, "late"));
+        assert_eq!(
+            title(&ask, "triage").as_deref(),
+            Some("one"),
+            "an answer to an older ask is dropped"
+        );
+        ask.answer(built(&second, "two"));
+        assert_eq!(title(&ask, "triage").as_deref(), Some("two"));
+
+        ask.answer(Arc::new(Built::new(second.clone(), None)));
+        assert_eq!(title(&ask, "triage"), None, "the plugin draws no runs view");
+
+        assert_eq!(ask.ask(None), None, "the page is left");
+        assert_eq!(
+            ask.ask(Some(second.clone())),
+            Some(&second),
+            "and asked on return"
+        );
+    }
+
     fn run(id: &str, bytes: usize) -> Run {
         Run {
             id: id.into(),
@@ -1469,6 +1633,7 @@ mod tests {
                 (done.clone(), run("PB-1", 3)),
                 (running.clone(), run("PB-2", 3)),
             ],
+            unread: Vec::new(),
         };
         assert_eq!(gathered.kept(&inputs, &done), Some(&run("PB-1", 3)));
         assert_eq!(

@@ -482,6 +482,7 @@ mod tests {
 
     fn report_of(view: View) -> Arc<Report> {
         Arc::new(Report {
+            unread: Vec::new(),
             asked: Default::default(),
             author: None,
             view: Ok(view),
@@ -776,6 +777,7 @@ mod tests {
         assert_eq!(ids(&shown), ["a1", "b9", "b10"]);
 
         let failed = Arc::new(Report {
+            unread: Vec::new(),
             asked: Default::default(),
             author: None,
             view: Err("torn".into()),
@@ -1076,6 +1078,7 @@ mod tests {
         );
 
         let failed = Arc::new(Report {
+            unread: Vec::new(),
             author: None,
             asked: Default::default(),
             view: Err("torn".into()),

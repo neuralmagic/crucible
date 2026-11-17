@@ -124,6 +124,7 @@ mod tests {
 
     fn live(turn: u64, state: &str, tick_ms: Option<u32>) -> Arc<Report> {
         Arc::new(Report {
+            unread: Vec::new(),
             author: None,
             asked: Asked {
                 turn,
@@ -144,6 +145,7 @@ mod tests {
 
     fn broken(turn: u64) -> Arc<Report> {
         Arc::new(Report {
+            unread: Vec::new(),
             author: None,
             asked: Asked {
                 turn,

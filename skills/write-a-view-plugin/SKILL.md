@@ -223,11 +223,13 @@ a launch runs. `pack_version` is the draft save a draft's launch ran.
 - **Limits.** The newest 50 launches the filters keep. Of each, only text files of the paths
   named, each at most 8 MiB. The launches together hold at most 32 MiB; past that the oldest are
   left out, so `runs` may be shorter than `total`. A launch that has stopped and not changed is
-  not read again.
+  not read again. A launch that cannot be read is left out too, and the view's title row says
+  how many were and why the first was.
 - **Checking.** A local pack has one run, so the app shows no runs page for it. Build a
   `RunsRequest` by hand from real captured files in a test, as `examples/report` does, and check
   the view with `crucible-view-check --runs`. Against a controller, `CRUCIBLE_VIEW_PLUGIN=<file>`
-  draws a live run and its runs page with a local plugin file in place of the pack's.
+  draws a live run and its runs page with a local plugin file in place of the pack's, and the
+  view's title row says `drawn by <file>`.
 
 ## Live views
 

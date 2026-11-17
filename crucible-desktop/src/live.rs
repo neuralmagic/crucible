@@ -469,9 +469,7 @@ impl Action {
             }
             Action::RunsReport { wanted, plugin } => {
                 let files = dirs.files.as_deref();
-                let view = build_runs_report(&c, files, reporting, &wanted, plugin).await;
-                let report =
-                    view.map(|view| crate::report::Report::pack(wanted.asked.clone(), view));
+                let report = build_runs_report(&c, files, reporting, &wanted, plugin).await;
                 Reply::RunsReport(Built::new(wanted, report))
             }
         }
@@ -878,17 +876,19 @@ const RUNS_AT_ONCE: usize = 6;
 /// A playbook's runs view: load the plugin, read each launch `wanted` names, newest first, and
 /// run it. `None` when the plugin draws no runs view. A launch the last build read and that has
 /// stopped unchanged is not read again, and none is for an event that asks about the same
-/// launches; the launches past the bytes a view reads are left out.
+/// launches; the launches past the bytes a view reads are left out, and so is one that could
+/// not be read.
 async fn build_runs_report(
     c: &Connection,
     files: Option<&Path>,
     reporting: &Arc<Reporting>,
     wanted: &WantedRuns,
     plugin: String,
-) -> Option<Result<crucible_view::View, String>> {
+) -> Option<crate::report::Report> {
+    let failed = |error: String| crate::report::Report::pack(wanted.asked.clone(), Err(error));
     let loaded = match load_plugin(reporting, wanted.plugin.clone(), plugin).await {
         Ok(loaded) => loaded,
-        Err(error) => return Some(Err(error)),
+        Err(error) => return Some(failed(error)),
     };
     let inputs = match &*loaded {
         Ok(Ready {
@@ -898,7 +898,7 @@ async fn build_runs_report(
         Ok(Ready {
             runs_inputs: None, ..
         }) => return None,
-        Err(error) => return Some(Err(error.clone())),
+        Err(error) => return Some(failed(error.clone())),
     };
     let earlier = Arc::clone(
         &reporting
@@ -911,7 +911,7 @@ async fn build_runs_report(
     } else {
         let gathered = match gather(c, files, &earlier, inputs, &wanted.launches).await {
             Ok(gathered) => Arc::new(gathered),
-            Err(error) => return Some(Err(error)),
+            Err(error) => return Some(failed(error)),
         };
         *reporting
             .gathered
@@ -929,11 +929,15 @@ async fn build_runs_report(
     })
     .await
     .unwrap_or_else(|| Err(stopped()));
-    Some(view)
+    Some(crate::report::Report {
+        unread: gathered.unread.clone(),
+        ..crate::report::Report::pack(wanted.asked.clone(), view)
+    })
 }
 
 /// `launches` read for `inputs`, newest first, up to the bytes a view reads. A launch `earlier`
-/// kept is not read again.
+/// kept is not read again, and one that cannot be read is left out with why. The first reason,
+/// when none can be.
 async fn gather(
     c: &Connection,
     files: Option<&Path>,
@@ -942,6 +946,7 @@ async fn gather(
     launches: &[crate::report::Launched],
 ) -> Result<Gathered, String> {
     let mut runs = Vec::new();
+    let mut unread = Vec::new();
     let mut held = 0_u64;
     'read: for batch in launches.chunks(RUNS_AT_ONCE) {
         let reading = batch.iter().map(|launch| async {
@@ -952,8 +957,16 @@ async fn gather(
         });
         let read = futures_util::future::join_all(reading).await;
         for (launch, run) in batch.iter().zip(read) {
-            let Some(run) = run? else {
-                break 'read;
+            let run = match run {
+                Ok(Some(run)) => run,
+                Ok(None) => break 'read,
+                Err(why) => {
+                    unread.push(crate::report::Unread {
+                        launch: launch.key.clone(),
+                        why,
+                    });
+                    continue;
+                }
             };
             let Some(more) = crate::report::with_run(held, &run) else {
                 break 'read;
@@ -962,10 +975,16 @@ async fn gather(
             runs.push((launch.clone(), run));
         }
     }
+    if runs.is_empty()
+        && let Some(first) = unread.first()
+    {
+        return Err(first.why.clone());
+    }
     Ok(Gathered {
         inputs,
         launches: launches.to_vec(),
         runs,
+        unread,
     })
 }
 
@@ -3535,6 +3554,150 @@ mod tests {
             more.iter()
                 .all(|line| !(line.contains("PB-0") && line.contains("/files/"))),
             "none of its files is fetched: {more:?}"
+        );
+    }
+
+    #[test]
+    fn a_launch_that_cannot_be_read_is_left_out_of_the_runs_view_with_why() {
+        use base64::Engine;
+        let pack = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/report");
+        let wasm = std::fs::read(pack.join("ui/report.wasm"))
+            .expect("build it with `just example-report-view`");
+        let plugin = base64::engine::general_purpose::STANDARD.encode(&wasm);
+        let verdicts = std::fs::read_to_string(pack.join("inbox/go.json")).unwrap();
+        let size = verdicts.len();
+        let down = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (failing, seen) = (Arc::clone(&down), Arc::clone(&asked));
+        let (url, _) = crate::testserver::serve_replies(move |request| {
+            let line = &request.line;
+            seen.lock().unwrap().push(line.clone());
+            let lost = line.contains("PB-8")
+                || (line.contains("PB-9") && failing.load(std::sync::atomic::Ordering::SeqCst));
+            if lost {
+                return crate::testserver::Reply {
+                    status: 500,
+                    headers: Vec::new(),
+                    body: r#"{"error":"the launch is gone"}"#.into(),
+                };
+            }
+            let launch = ["PB-1", "PB-2", "PB-9"]
+                .into_iter()
+                .find(|key| line.contains(key))
+                .unwrap_or("none");
+            crate::testserver::Reply::ok(if line.contains("/files/") {
+                verdicts.clone()
+            } else if line.contains("/files") {
+                serde_json::json!({ "files": [
+                    { "task": "triage-go", "path": "verdicts.json", "size_bytes": size,
+                      "key": "triage-go/verdicts.json" },
+                ] })
+                .to_string()
+            } else {
+                serde_json::json!({
+                    "launch": { "params": {}, "draft_version": 1 },
+                    "dispatch": { "state": "dispatched" },
+                    "runs": [{ "run_id": format!("run-{launch}") }],
+                })
+                .to_string()
+            })
+        });
+        let (keys, files) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let net = crate::net::Net::uncached_for_tests();
+        let client = Client::spawn_with(
+            net.connector(crate::testserver::target("t", &url, keys.path())),
+            Dirs {
+                drafts: None,
+                files: Some(files.path().to_path_buf()),
+            },
+        );
+        let launched = |key: &str| crate::report::Launched {
+            key: key.into(),
+            status: crucible_view::Status::Done,
+            runs: 1,
+            started: 1_790_000_000,
+            cost: Some(0.5),
+            origin: "manual".into(),
+        };
+        let wanted = |turn: u64, keys: &[&str]| WantedRuns {
+            playbook: "triage".into(),
+            plugin: "ui/report.wasm.b64".into(),
+            launches: keys.iter().map(|key| launched(key)).collect(),
+            total: keys.len(),
+            asked: crate::report::Asked {
+                turn,
+                event: (turn > 0).then_some(crucible_view::Event::Tick),
+                ..Default::default()
+            },
+        };
+        let built = |wanted: &WantedRuns| {
+            let snapshot = snapshot_when(&client, Duration::from_secs(60), |s| {
+                s.runs_report.as_ref().is_some_and(|b| &b.wanted == wanted)
+            });
+            snapshot.runs_report.unwrap().report.clone().unwrap()
+        };
+        let read = |report: &crate::report::Report| {
+            let view = report.view.as_ref().unwrap();
+            let crucible_view::Node::Stack { children } = &view.body else {
+                panic!("the runs view is a stack");
+            };
+            let crucible_view::Node::Stats { items } = &children[0] else {
+                panic!("the runs view starts with its stats");
+            };
+            items[0].value.clone()
+        };
+        let details = |key: &str| {
+            let lines = asked.lock().unwrap();
+            lines
+                .iter()
+                .filter(|line| line.contains(&format!("/api/playbook-runs/{key} ")))
+                .count()
+        };
+
+        let holed = wanted(0, &["PB-2", "PB-9", "PB-1"]);
+        client.runs_report(holed.clone(), plugin.clone());
+        let first = built(&holed);
+        assert_eq!(read(&first), "2 of 3");
+        let [unread] = first.unread.as_slice() else {
+            panic!("one launch is unread: {:?}", first.unread);
+        };
+        assert_eq!(unread.launch, "PB-9");
+        assert!(unread.why.contains("the launch"), "{}", unread.why);
+
+        let ticked = wanted(1, &["PB-2", "PB-9", "PB-1"]);
+        client.runs_report(ticked.clone(), plugin.clone());
+        let again = built(&ticked);
+        assert_eq!(read(&again), "2 of 3");
+        assert_eq!(again.unread, first.unread, "an event keeps what was unread");
+        assert_eq!(details("PB-9"), 1, "and reads no launch again");
+
+        down.store(false, std::sync::atomic::Ordering::SeqCst);
+        let grown = wanted(0, &["PB-2", "PB-9", "PB-1", "PB-8"]);
+        client.runs_report(grown.clone(), plugin.clone());
+        let healed = built(&grown);
+        assert_eq!(read(&healed), "3 of 4");
+        assert_eq!(
+            healed
+                .unread
+                .iter()
+                .map(|unread| unread.launch.as_str())
+                .collect::<Vec<_>>(),
+            ["PB-8"],
+            "a launch that was unread is read again"
+        );
+        assert_eq!(details("PB-9"), 2);
+        assert_eq!(details("PB-2"), 1, "a stopped launch that was read is not");
+
+        let lost = wanted(0, &["PB-8"]);
+        client.runs_report(lost.clone(), plugin.clone());
+        let none = built(&lost);
+        assert!(none.unread.is_empty());
+        assert!(
+            none.view
+                .as_ref()
+                .is_err_and(|why| why.contains("the launch")),
+            "with no launch read the view is why: {:?}",
+            none.view
         );
     }
 

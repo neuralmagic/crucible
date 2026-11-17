@@ -34,6 +34,8 @@ pub(crate) trait Slot: 'static {
     fn follow(app: &mut App, href: &str, tx: &mut Tx);
     /// Builds the report again with what its controls now hold.
     fn ask(app: &mut App);
+    /// The name of the file drawing the report in place of the pack's plugin.
+    fn stand_in(app: &App) -> Option<&str>;
 
     /// Asks the report's plugin again with `event`, once the events before it are answered.
     fn fire(app: &mut App, event: crucible_view::Event) {
@@ -66,6 +68,10 @@ impl Slot for RunReport {
     fn ask(app: &mut App) {
         app.sync_report();
     }
+
+    fn stand_in(app: &App) -> Option<&str> {
+        app.selected_pack().is_none().then(|| app.stand_in())?
+    }
 }
 
 /// The runs page's view of the launches of the playbook it shows.
@@ -90,6 +96,10 @@ impl Slot for RunsReport {
 
     fn ask(app: &mut App) {
         app.sync_report();
+    }
+
+    fn stand_in(app: &App) -> Option<&str> {
+        app.stand_in()
     }
 }
 
@@ -175,6 +185,19 @@ fn view<S: Slot>(report: &Report, app: &App, p: &Paint, layer: &mut Vec<El>) -> 
                         .key("report-author")
                         .font(p.mono(10.5, 440.0))
                         .color(p.c.text_faint)
+                }))
+                .children(S::stand_in(app).map(|file| {
+                    text(format!("drawn by {file}"))
+                        .key("report-stand-in")
+                        .font(p.mono(10.5, 440.0))
+                        .color(p.c.text_faint)
+                }))
+                .children(unread(&report.unread).map(|said| {
+                    text(said)
+                        .key("report-unread")
+                        .font(p.mono(10.5, 440.0))
+                        .color(p.c.warning.fg)
+                        .max_lines(1)
                 })),
         )
         .children(controls)
@@ -187,6 +210,16 @@ fn view<S: Slot>(report: &Report, app: &App, p: &Paint, layer: &mut Vec<El>) -> 
                 p,
             )
         })
+}
+
+/// What a runs view says of the launches it could not read: how many, and why the first.
+fn unread(unread: &[crate::report::Unread]) -> Option<String> {
+    let first = unread.first()?;
+    let launches = match unread.len() {
+        1 => "1 launch".to_string(),
+        n => format!("{n} launches"),
+    };
+    Some(format!("{launches} not read: {}", first.why))
 }
 
 /// The key a live view may ask for that `pressed` is, with no modifier held.
@@ -811,7 +844,25 @@ fn drawn<S: Slot>(cell: &Cell, kind: ColumnKind, link: Option<Color>, k: &Kit) -
 mod tests {
     use crucible_view::{Context2d, Node, Tab};
 
-    use crate::ui::report::{CARD, fenced, flow, least_width};
+    use crate::report::Unread;
+    use crate::ui::report::{CARD, fenced, flow, least_width, unread};
+
+    #[test]
+    fn unread_launches_are_counted_with_why_the_first_was() {
+        let lost = |launch: &str, why: &str| Unread {
+            launch: launch.into(),
+            why: why.into(),
+        };
+        assert_eq!(unread(&[]), None);
+        assert_eq!(
+            unread(&[lost("PB-1", "timed out")]).as_deref(),
+            Some("1 launch not read: timed out")
+        );
+        assert_eq!(
+            unread(&[lost("PB-1", "timed out"), lost("PB-2", "gone")]).as_deref(),
+            Some("2 launches not read: timed out")
+        );
+    }
 
     #[test]
     fn a_column_is_as_wide_as_its_widest_canvas_or_flow() {
