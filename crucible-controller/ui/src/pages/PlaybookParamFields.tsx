@@ -27,6 +27,7 @@ const OTHER = '\u0000other';
 interface Scope {
   values: Readonly<Record<string, string>>;
   keyOf: (name: string) => string;
+  compact?: boolean;
 }
 
 const domId = (key: string) => key.replace(/[^A-Za-z0-9_-]/g, '-');
@@ -65,9 +66,10 @@ export function PlaybookParamFields({
   const input = (spec: ParamFieldSpec, scope: Scope = top) => {
     const values = scope.values;
     const key = scope.keyOf(spec.name);
+    const label = <Mono size="label">{spec.name}</Mono>;
     const field = {
       id: `${idPrefix}-param-${domId(key)}`,
-      label: <Mono size="label">{spec.name}</Mono>,
+      label: scope.compact ? <span title={spec.description ?? undefined}>{label}</span> : label,
       required: spec.required,
       disabled: !isEnabled(spec, values),
       mono: true,
@@ -80,9 +82,10 @@ export function PlaybookParamFields({
         onBlur(key);
       },
       error: errors.get(key) ?? null,
-      hint:
-        spec.description ??
-        (spec.pattern !== null ? `Must match ${spec.pattern}` : (spellingOf(spec.valueType) ?? undefined)),
+      hint: scope.compact
+        ? undefined
+        : (spec.description ??
+          (spec.pattern !== null ? `Must match ${spec.pattern}` : (spellingOf(spec.valueType) ?? undefined))),
     };
     const confirm = confirmation(spec, values);
     if (confirm?.kind === 'hidden') return null;
@@ -97,7 +100,9 @@ export function PlaybookParamFields({
           onChange={(checked) => {
             onChange(key, checked ? 'true' : 'false');
           }}
-          description={confirm.kind === 'needed' ? confirm.message : (spec.description ?? undefined)}
+          description={
+            confirm.kind === 'needed' ? confirm.message : scope.compact ? undefined : (spec.description ?? undefined)
+          }
           error={field.error}
         />
       );
@@ -149,18 +154,23 @@ export function PlaybookParamFields({
   const render = (block: ParamBlock, scope: Scope = top) => {
     if (block.kind === 'field') return input(block.spec, scope);
     const gate = scope.keyOf(block.gate.name);
+    const on = (scope.values[block.gate.name] ?? '').trim().toLowerCase() === 'true';
+    const label = <Mono size="label">{block.gate.name}</Mono>;
     return (
-      <fieldset key={gate} className="m-0 grid gap-4 border border-rule-hard p-3">
+      <fieldset
+        key={gate}
+        className={scope.compact ? 'm-0 grid gap-2 border-0 p-0' : 'm-0 grid gap-4 border border-rule-hard p-3'}
+      >
         <CheckField
           id={`${idPrefix}-param-${domId(gate)}`}
-          label={<Mono size="label">{block.gate.name}</Mono>}
-          checked={(scope.values[block.gate.name] ?? '').trim().toLowerCase() === 'true'}
+          label={scope.compact ? <span title={block.gate.description ?? undefined}>{label}</span> : label}
+          checked={on}
           onChange={(checked) => {
             onChange(gate, checked ? 'true' : 'false');
           }}
-          description={block.gate.description ?? undefined}
+          description={scope.compact ? undefined : (block.gate.description ?? undefined)}
         />
-        {block.fields.map((spec) => input(spec, scope))}
+        {scope.compact && !on ? null : block.fields.map((spec) => input(spec, scope))}
       </fieldset>
     );
   };
@@ -168,33 +178,29 @@ export function PlaybookParamFields({
   const fan = fanOutOf(specs);
   const picks = fan === null ? [] : picked(fan, values);
   const dependents = fan === null ? new Set<string>() : fanOutDependents(specs, fan.name);
-  const perValue = picks.length > 0 && dependents.size > 0;
   const dependentBlocks = paramBlocks(specs.filter((spec) => dependents.has(spec.name)));
   const blockNames = (block: ParamBlock) =>
     block.kind === 'field' ? [block.spec.name] : [block.gate.name, ...block.fields.map((spec) => spec.name)];
-  const sections = (fanned: ParamFieldSpec) =>
-    picks.map((value) => {
-      const scope: Scope = {
-        values: valuesFor(specs, values, fanned, value),
-        keyOf: (name) => (dependents.has(name) ? perValueKey(name, value) : name),
-      };
-      const fields = dependentBlocks.map((block) => render(block, scope));
-      return picks.length === 1 ? (
-        fields
-      ) : (
-        <fieldset key={value} className="m-0 grid gap-4 border border-rule-hard p-3">
-          <legend className="px-1">
-            <Mono size="label">{`${fanned.name}: ${value}`}</Mono>
-          </legend>
-          {fields}
-        </fieldset>
-      );
-    });
+  const detail = (fanned: ParamFieldSpec, value: string) => {
+    const scope: Scope = {
+      values: valuesFor(specs, values, fanned, value),
+      keyOf: (name) => (dependents.has(name) ? perValueKey(name, value) : name),
+      compact: true,
+    };
+    return dependentBlocks.map((block) => render(block, scope));
+  };
+  const fanHint = (fanned: ParamFieldSpec) => {
+    const description = fanned.description?.trim() ?? '';
+    const sentence = description === '' || /[.!?]$/.test(description) ? description : `${description}.`;
+    const runs = picks.length > 1 ? `One run per picked value: ${String(picks.length)} runs.` : '';
+    const text = [sentence, runs].filter((part) => part !== '').join(' ');
+    return text === '' ? undefined : text;
+  };
   return (
     <FormGrid>
       {paramBlocks(specs).map((block) => {
         if (fan !== null && block.kind === 'field' && block.spec.name === fan.name) {
-          return [
+          return (
             <CheckGroupField
               key={fan.name}
               id={`${idPrefix}-param-${domId(fan.name)}`}
@@ -205,17 +211,13 @@ export function PlaybookParamFields({
                 onChange(fan.name, withPick(fan, values, value, on));
               }}
               required={fan.required}
-              hint={
-                picks.length > 1
-                  ? `${fan.description ?? ''} One run per picked value: ${String(picks.length)} runs.`.trim()
-                  : (fan.description ?? undefined)
-              }
+              hint={fanHint(fan)}
               error={errors.get(fan.name) ?? null}
-            />,
-            ...(perValue ? sections(fan) : []),
-          ];
+              detail={dependents.size > 0 ? (value) => detail(fan, value) : undefined}
+            />
+          );
         }
-        if (perValue && blockNames(block).every((name) => dependents.has(name))) return null;
+        if (fan !== null && blockNames(block).every((name) => dependents.has(name))) return null;
         return render(block);
       })}
     </FormGrid>

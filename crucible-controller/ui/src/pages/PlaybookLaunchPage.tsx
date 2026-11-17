@@ -193,7 +193,9 @@ export function PlaybookLaunchPage() {
 
   const checkField = (name: string) => {
     const message = validateParams(specs, values).get(name) ?? null;
+    const untouched = (values[name] ?? '').trim() === '';
     setFieldErrors((previous) => {
+      if (message !== null && untouched && !previous.has(name)) return previous;
       const next = new Map(previous);
       if (message === null) next.delete(name);
       else next.set(name, message);
