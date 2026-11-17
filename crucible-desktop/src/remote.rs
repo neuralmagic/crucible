@@ -28,6 +28,7 @@ pub struct Remote {
     pub live_base: Option<live::Base>,
     /// Playbooks the controller has registered: the ones a launch form can start.
     pub registered: Vec<String>,
+    pub shareable: Vec<crux::client::Shared>,
     /// The open launch form, when there is one.
     pub launcher: Option<Launcher>,
     /// The newest worker reply a launch form has taken.
@@ -112,6 +113,7 @@ impl Remote {
             compare_sent: None,
             live_base: None,
             registered: Vec::new(),
+            shareable: Vec::new(),
             launcher: None,
             replies: 0,
             notified: 0,

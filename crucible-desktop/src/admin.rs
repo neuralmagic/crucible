@@ -1737,11 +1737,14 @@ impl crate::App {
         else {
             return None;
         };
-        Some(if self.remote.registered.contains(playbook) {
-            Shared::Playbook(playbook.clone())
-        } else {
-            Shared::Draft(playbook.clone())
-        })
+        self.remote
+            .shareable
+            .iter()
+            .find(|of| match of {
+                Shared::Playbook(id) | Shared::Draft(id) => id == playbook,
+                Shared::Provider(_) => false,
+            })
+            .cloned()
     }
 
     pub fn act(&mut self, action: Action) {
