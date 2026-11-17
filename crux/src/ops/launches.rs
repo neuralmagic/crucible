@@ -33,6 +33,97 @@ impl Operation for Schedules {
     }
 }
 
+/// Fire a schedule now instead of at its next window. A real firing: its run advances the
+/// cursor.
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args, Deserialize, schemars::JsonSchema)]
+pub struct ScheduleFire {
+    /// The schedule's id, as `schedules` lists it.
+    #[schemars(description = "The schedule's id, as schedules lists it.")]
+    pub id: String,
+    #[arg(long)]
+    #[serde(default)]
+    pub json: bool,
+}
+
+impl Operation for ScheduleFire {
+    type Output = dto::Schedule;
+
+    async fn call(&self, c: &Client) -> Result<Value> {
+        c.fire_schedule(&self.id).await
+    }
+
+    fn render(&self, _c: &Client, schedule: Self::Output) -> Result<String> {
+        Ok(format!(
+            "fire {}: due now\nplaybook: {}\n",
+            schedule.id, schedule.playbook
+        ))
+    }
+
+    fn json(&self) -> bool {
+        self.json
+    }
+}
+
+/// Launch a schedule once without moving it: the run gets the stored cursor, or the one given
+/// here, and never writes it back.
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args, Deserialize, schemars::JsonSchema)]
+pub struct ScheduleTestFire {
+    /// The schedule's id, as `schedules` lists it.
+    #[schemars(description = "The schedule's id, as schedules lists it.")]
+    pub id: String,
+    /// Give the firing this cursor value in place of the stored one.
+    #[arg(long, conflicts_with = "no_cursor")]
+    #[serde(default)]
+    #[schemars(description = "A cursor value to give the firing in place of the stored one.")]
+    pub cursor: Option<String>,
+    /// Give the firing no cursor, as on the schedule's first firing.
+    #[arg(long)]
+    #[serde(default)]
+    #[schemars(description = "Give the firing no cursor, as on the schedule's first firing.")]
+    pub no_cursor: bool,
+    #[arg(long)]
+    #[serde(default)]
+    pub json: bool,
+}
+
+impl ScheduleTestFire {
+    fn test_cursor(&self) -> Result<dto::TestCursor> {
+        match (&self.cursor, self.no_cursor) {
+            (Some(_), true) => bail!("give a cursor or no_cursor, not both"),
+            (Some(value), false) => Ok(dto::TestCursor::Value {
+                value: value.clone(),
+            }),
+            (None, true) => Ok(dto::TestCursor::None),
+            (None, false) => Ok(dto::TestCursor::Stored),
+        }
+    }
+}
+
+impl Operation for ScheduleTestFire {
+    type Output = dto::TestFire;
+
+    async fn call(&self, c: &Client) -> Result<Value> {
+        let fired = c.test_fire_schedule(&self.id, &self.test_cursor()?).await?;
+        Ok(serde_json::to_value(fired)?)
+    }
+
+    fn render(&self, _c: &Client, fired: Self::Output) -> Result<String> {
+        let cursor = match &fired.cursor {
+            dto::TestCursor::Stored => "stored",
+            dto::TestCursor::None => "none",
+            dto::TestCursor::Value { .. } => "given",
+        };
+        Ok(format!(
+            "test-fire {}: launched {}\ncursor: {cursor}\n",
+            fired.schedule, fired.key
+        ))
+    }
+
+    fn json(&self) -> bool {
+        self.json
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, clap::Args, Deserialize, schemars::JsonSchema)]
 pub struct Watches {
     #[arg(long)]
@@ -367,5 +458,47 @@ impl Operation for WebhookPreview {
 
     fn json(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::dto::TestCursor;
+    use crate::ops::launches::ScheduleTestFire;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Argv {
+        #[command(flatten)]
+        op: ScheduleTestFire,
+    }
+
+    fn parse(argv: &[&str]) -> Result<ScheduleTestFire, clap::Error> {
+        Argv::try_parse_from(std::iter::once("crux").chain(argv.iter().copied())).map(|a| a.op)
+    }
+
+    #[test]
+    fn a_test_firing_takes_the_stored_cursor_unless_told_otherwise() {
+        let cursor = |argv: &[&str]| parse(argv).expect("argv").test_cursor().expect("cursor");
+        assert_eq!(cursor(&["s1"]), TestCursor::Stored);
+        assert_eq!(cursor(&["s1", "--no-cursor"]), TestCursor::None);
+        assert_eq!(
+            cursor(&["s1", "--cursor", "2026-01-01T00:00:00Z"]),
+            TestCursor::Value {
+                value: "2026-01-01T00:00:00Z".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_given_cursor_and_no_cursor_are_refused_together() {
+        assert!(parse(&["s1", "--cursor", "x", "--no-cursor"]).is_err());
+        let both = ScheduleTestFire {
+            id: "s1".to_string(),
+            cursor: Some("x".to_string()),
+            no_cursor: true,
+            json: false,
+        };
+        assert!(both.test_cursor().is_err());
     }
 }

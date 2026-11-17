@@ -20,6 +20,7 @@ use crucible_contract::session::TaskStatus;
 /// Where a playbook run keeps its git memory: one patch per task commit, in commit order.
 pub const GIT_MEMORY_DIR: &str = "git-memory";
 const GIT_MEMORY_INDEX: &str = "tasks.json";
+const FETCHED_BLOBS: &str = "fetched-blobs";
 
 /// Where a rerun reads its parent from: a finished run's state directory, or that run's evidence
 /// on the controller (`https://controller/api/evidence/runs/<id>`), fetched into a directory laid out the
@@ -96,6 +97,8 @@ pub enum RerunError {
         path: PathBuf,
         source: serde_json::Error,
     },
+    #[error("{} lists {id:?}, which is not an object id", .path.display())]
+    BadObjectId { path: PathBuf, id: String },
 }
 
 /// A finished run, read from its session log.
@@ -333,12 +336,13 @@ pub fn plan(plan: &ValidPlan, parent: &Parent, from: &[TaskName]) -> Result<Reru
     })
 }
 
-/// Write a run's git memory under `state`, with the record of where the run started, replacing
-/// any earlier copy whole.
+/// Write a run's git memory under `state`, with the record of where the run started and the
+/// blobs its partial clone fetched, replacing any earlier copy whole.
 pub fn write_git_memory(
     state: &Path,
     start: &RunStart,
     commits: &[TaskCommit],
+    fetched: &[String],
 ) -> Result<(), RerunError> {
     let dir = state.join(GIT_MEMORY_DIR);
     let staging = state.join(format!("{GIT_MEMORY_DIR}.tmp"));
@@ -355,6 +359,8 @@ pub fn write_git_memory(
     let tasks: Vec<&str> = commits.iter().map(|c| c.task.as_str()).collect();
     let index = staging.join(GIT_MEMORY_INDEX);
     std::fs::write(&index, serde_json::json!(tasks).to_string()).map_err(io(&index))?;
+    let blobs = staging.join(FETCHED_BLOBS);
+    std::fs::write(&blobs, fetched.join("\n")).map_err(io(&blobs))?;
     start.write(&staging)?;
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::rename(&staging, &dir).map_err(io(&dir))
@@ -387,12 +393,37 @@ pub fn read_git_memory(state: &Path) -> Result<Vec<TaskCommit>, RerunError> {
         .collect()
 }
 
+/// The blobs the partial clone of the run under `state` fetched, by id. None for a full clone,
+/// and for a run that finished before these were recorded.
+pub fn read_fetched_blobs(state: &Path) -> Result<Vec<String>, RerunError> {
+    let path = state.join(GIT_MEMORY_DIR).join(FETCHED_BLOBS);
+    let listed = match std::fs::read_to_string(&path) {
+        Ok(listed) => listed,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => return Err(RerunError::Read { path, source }),
+    };
+    listed
+        .lines()
+        .map(|id| {
+            let hex = matches!(id.len(), 40 | 64) && id.bytes().all(|b| b.is_ascii_hexdigit());
+            if hex {
+                Ok(id.to_owned())
+            } else {
+                Err(RerunError::BadObjectId {
+                    path: path.clone(),
+                    id: id.to_owned(),
+                })
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::plan::ir::{Plan, TaskName, ValidPlan};
     use crate::plan::rerun::{
-        ParentDir, ParentRef, RerunError, definition_digests, plan, read_git_memory,
-        write_git_memory,
+        GIT_MEMORY_DIR, ParentDir, ParentRef, RerunError, definition_digests, plan,
+        read_fetched_blobs, read_git_memory, write_git_memory,
     };
     use crate::plan::resume::RunStart;
     use crucible_contract::session::TaskStatus;
@@ -515,7 +546,7 @@ mod tests {
                 patch: patch.as_bytes().to_vec(),
             })
             .collect();
-        write_git_memory(&dir.0, &start(plan), &commits).unwrap();
+        write_git_memory(&dir.0, &start(plan), &commits, &[]).unwrap();
         dir
     }
 
@@ -769,7 +800,7 @@ mod tests {
         assert!(
             matches!(ParentDir::read(&dir.0), Err(RerunError::MissingEvidence(what)) if what == "session log")
         );
-        std::fs::remove_dir_all(dir.0.join(super::GIT_MEMORY_DIR)).unwrap();
+        std::fs::remove_dir_all(dir.0.join(GIT_MEMORY_DIR)).unwrap();
         assert!(
             matches!(ParentDir::read(&dir.0), Err(RerunError::MissingEvidence(what)) if what == "git memory")
         );
@@ -826,7 +857,7 @@ mod tests {
             task: "old".into(),
             patch: b"x".to_vec(),
         }];
-        write_git_memory(&dir.0, &start(&plan), &first).unwrap();
+        write_git_memory(&dir.0, &start(&plan), &first, &[]).unwrap();
         let second = vec![
             TaskCommit {
                 task: "audit[a b]".into(),
@@ -837,14 +868,37 @@ mod tests {
                 patch: b"diff".to_vec(),
             },
         ];
-        write_git_memory(&dir.0, &start(&plan), &second).unwrap();
+        let fetched = vec!["a".repeat(40), "0f".repeat(32)];
+        write_git_memory(&dir.0, &start(&plan), &second, &fetched).unwrap();
         assert_eq!(read_git_memory(&dir.0).unwrap(), second);
+        assert_eq!(read_fetched_blobs(&dir.0).unwrap(), fetched);
         assert_eq!(
             ParentDir::read(&dir.0).err().map(|e| e.to_string()),
             Some("the parent run's session log is missing".to_string())
         );
-        write_git_memory(&dir.0, &start(&plan), &[]).unwrap();
+        write_git_memory(&dir.0, &start(&plan), &[], &[]).unwrap();
         assert_eq!(read_git_memory(&dir.0).unwrap(), Vec::new());
+        assert_eq!(read_fetched_blobs(&dir.0).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn fetched_blobs_are_object_ids_or_refused_and_absent_for_an_older_parent() {
+        let dir = tempdir();
+        let plan = compile(GRAPH);
+        write_git_memory(&dir.0, &start(&plan), &[], &[]).unwrap();
+        let listed = dir.0.join(GIT_MEMORY_DIR).join("fetched-blobs");
+        for bad in ["+refs/heads/*:refs/heads/*", "--upload-pack=x", "abc"] {
+            std::fs::write(&listed, format!("{}\n{bad}\n", "a".repeat(40))).unwrap();
+            assert!(
+                matches!(
+                    read_fetched_blobs(&dir.0),
+                    Err(RerunError::BadObjectId { ref id, .. }) if id == bad
+                ),
+                "{bad}"
+            );
+        }
+        std::fs::remove_file(&listed).unwrap();
+        assert_eq!(read_fetched_blobs(&dir.0).unwrap(), Vec::<String>::new());
     }
 
     #[test]

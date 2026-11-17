@@ -114,8 +114,8 @@ crucible plan run --manifest crucible.toml --max-cost 1 --max-time 5m
 ```
 
 ```text
-  poem                 pass       attempts=1 cost=$0.0000  out={"lines":3}
-  check                pass       attempts=1 cost=$0.0000  out={"lines":3}
+  poem                 pass       attempts=1 cost=$0.0000 elapsed=0.1s  out={"lines":3}
+  check                pass       attempts=1 cost=$0.0000 elapsed=0.1s  out={"lines":3}
 plan v1: completed — spent $0.0000 of $1
 verdict: valid
 ```

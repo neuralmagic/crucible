@@ -7,7 +7,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-// --- POST handlers (overrides; never write the DB) ---------------------------
+// --- POST handlers (overrides; write only the pending-override table) --------
 
 /// Accepts either a JSON or a form-urlencoded body for the same route, so the zero-JS debug UI's
 /// plain `<form>` posts and JSON API/CLI clients share one handler. `origin` records which
@@ -79,13 +79,13 @@ pub(crate) struct ParkBody {
     reason: String,
 }
 
-fn submit_override(
+async fn submit_override(
     state: &ApiState,
     ov: Override,
     action: &'static str,
     redirect_to: &str,
     origin: BodyOrigin,
-) -> Response {
+) -> ApiResult<Response> {
     let ack = OverrideAck {
         key: ov.key.0.clone(),
         action,
@@ -93,8 +93,8 @@ fn submit_override(
         priority: ov.priority,
         actor: ov.actor.clone(),
     };
-    state.sink.submit(ov);
-    override_response(origin, ack, redirect_to)
+    state.sink.submit(ov).await?;
+    Ok(override_response(origin, ack, redirect_to))
 }
 
 #[utoipa::path(
@@ -107,16 +107,21 @@ fn submit_override(
     responses(
         (status = 202, description = "Park override enqueued", body = OverrideAck),
         (status = 303, description = "Park override enqueued (form POST, redirects to /inbox)"),
-        (status = 403, description = "Caller is not an operator", body = ErrorBody)
+        (status = 403, description = "Caller is neither an operator nor allowed to update the launch", body = ErrorBody),
+        (status = 404, description = "A playbook launch the caller may not read", body = ErrorBody)
     )
 )]
 pub(crate) async fn park_issue(
     State(state): State<ApiState>,
     Path(key): Path<String>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     identity: crate::identity::session::Identity,
-    _operator: crate::authz::guard::OperatorGuard,
+    caller: crate::authz::Caller,
     body: AnyBody<ParkBody>,
-) -> Response {
+) -> ApiResult<Response> {
+    if let Some(refusal) = refuse_park(&state, &caller, &key, uri.path()).await? {
+        return Ok(refusal);
+    }
     submit_override(
         &state,
         Override {
@@ -129,6 +134,44 @@ pub(crate) async fn park_issue(
         "park",
         "/inbox",
         body.origin,
+    )
+    .await
+}
+
+/// The refusal for a caller who may not park `key`, `None` for one who may: a platform operator
+/// parks any issue, and whoever may update a playbook launch parks that launch.
+async fn refuse_park(
+    state: &ApiState,
+    caller: &crate::authz::Caller,
+    key: &str,
+    path: &str,
+) -> ApiResult<Option<Response>> {
+    use crate::authz::action::{Action, ResourceType, Verb};
+    use crate::launches::api::playbook_runs::LaunchUpdate;
+
+    let platform = crate::authz::decision::Resource::platform(ResourceType::Issue, path);
+    if crate::authz::guard::is_operator(caller)
+        && crate::authz::owner::may(state, caller, Verb::Update, &platform)
+    {
+        return Ok(None);
+    }
+    Ok(
+        match crate::launches::api::playbook_runs::decide_launch_update(state, caller, key).await? {
+            LaunchUpdate::Allowed => None,
+            LaunchUpdate::Refused(refusal) => Some(refusal.into_response()),
+            LaunchUpdate::NoLaunch => {
+                let curate = Action {
+                    resource: ResourceType::Issue,
+                    verb: Verb::Update,
+                };
+                Some(
+                    match crate::authz::owner::decide(state, caller, curate, &platform).await {
+                        Err(denied) => denied.into_response(),
+                        Ok(_) => crate::authz::guard::not_operator(caller),
+                    },
+                )
+            }
+        },
     )
 }
 
@@ -157,7 +200,7 @@ pub(crate) async fn unpark_issue(
     identity: crate::identity::session::Identity,
     _operator: crate::authz::guard::OperatorGuard,
     body: AnyBody<UnparkBody>,
-) -> Response {
+) -> ApiResult<Response> {
     submit_override(
         &state,
         Override {
@@ -171,6 +214,7 @@ pub(crate) async fn unpark_issue(
         "/inbox",
         body.origin,
     )
+    .await
 }
 
 #[cfg(feature = "autoresearch")]
@@ -201,7 +245,7 @@ pub(crate) async fn scope_now(
     identity: crate::identity::session::Identity,
     _admin: crate::authz::guard::AdminGuard,
     body: AnyBody<ScopeNowBody>,
-) -> Response {
+) -> ApiResult<Response> {
     let justification = body.value.justification;
     submit_override(
         &state,
@@ -219,6 +263,7 @@ pub(crate) async fn scope_now(
         "/",
         body.origin,
     )
+    .await
 }
 
 #[cfg(feature = "autoresearch")]
@@ -247,7 +292,7 @@ pub(crate) async fn redispatch_issue(
     identity: crate::identity::session::Identity,
     _admin: crate::authz::guard::AdminGuard,
     body: AnyBody<RedispatchBody>,
-) -> Response {
+) -> ApiResult<Response> {
     let justification = body.value.justification;
     submit_override(
         &state,
@@ -264,6 +309,7 @@ pub(crate) async fn redispatch_issue(
         "/",
         body.origin,
     )
+    .await
 }
 
 #[cfg(feature = "autoresearch")]
@@ -294,7 +340,7 @@ pub(crate) async fn bump_issue(
     identity: crate::identity::session::Identity,
     _operator: crate::authz::guard::OperatorGuard,
     body: AnyBody<BumpBody>,
-) -> Response {
+) -> ApiResult<Response> {
     submit_override(
         &state,
         Override {
@@ -308,4 +354,5 @@ pub(crate) async fn bump_issue(
         "/",
         body.origin,
     )
+    .await
 }

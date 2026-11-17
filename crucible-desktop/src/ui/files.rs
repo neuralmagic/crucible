@@ -9,11 +9,11 @@ use rune_theme_opencode::icons as oc;
 use crate::App;
 use crate::captured::{self, Body, Captured, Kind};
 use crate::syntax;
-use crate::ui::{Paint, Pane};
+use crate::ui::{Paint, Pane, rail};
+use crate::workspace::PaneKind;
 
 /// Lines drawn per file; a longer file says how much it left out.
 const LINES: usize = 4000;
-const FILE_LIST: f32 = 210.0;
 
 pub(crate) fn files_view(pane: &Pane, app: &App, p: &Paint) -> El {
     let files = match &pane.files {
@@ -27,7 +27,7 @@ pub(crate) fn files_view(pane: &Pane, app: &App, p: &Paint) -> El {
     let open = captured::pick(files, app.run_file.as_deref());
     let mut list = col()
         .key("files-list")
-        .w(FILE_LIST)
+        .w(rail::width(PaneKind::Files, app))
         .h_full()
         .min_h(0.0)
         .gap(1.0)
@@ -60,8 +60,8 @@ pub(crate) fn files_view(pane: &Pane, app: &App, p: &Paint) -> El {
         .w_full()
         .grow(1.0)
         .min_h(0.0)
-        .gap(10.0)
         .child(list)
+        .child(rail::handle(PaneKind::Files, app, p))
         .child(match open {
             Some(file) => viewer(file, pane.run_id.as_deref(), app, p),
             None => el().grow(1.0),

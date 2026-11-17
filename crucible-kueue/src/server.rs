@@ -2516,6 +2516,17 @@ pub fn instructions(cfg: &Config, kinds: &[WorkloadKind]) -> String {
         true => "scheduler and runtime class fields",
         false => "priority, scheduler and runtime class fields",
     });
+    let classes: Vec<&str> = cfg.storage_classes.iter().map(String::as_str).collect();
+    let storage = match classes.is_empty() {
+        true => {
+            "A volume claim takes the cluster's default storage class; storageClassName is refused."
+                .to_string()
+        }
+        false => format!(
+            "A volume claim may set storageClassName to one of {}; without it the claim takes the cluster's default class.",
+            classes.join(", ")
+        ),
+    };
     let mut domains: Vec<&str> = vec![cfg.labels.domain.as_str()];
     domains.extend(lists.reserved_domains.iter().map(String::as_str));
     format!(
@@ -2524,7 +2535,7 @@ Flow: whoami (the namespaces you can use and their queues) -> queues_list -> har
 Every tool answers JSON text with a status: ok; refused (the request is not allowed or not valid: fix it, do not retry it as is); rejected (the API server or an admission webhook refused it); not_found; error (the server could not complete it); failed (a finished task whose workload failed). Anything but ok comes back with isError and a retryable flag: retry a retryable call a few times with a pause, change a non-retryable one. \
 workload_status answers a summary by default with next_action, the pods with problems and their exit messages; detail=full adds every Workload's conditions and every pod. Logs come within a 16 KiB budget, failed pods first; narrow them with grep and since_seconds. \
 {lifetime} {control} \
-Manifests are allowlisted (profile {}): {}, and labels or annotations reserved for {} are refused. \
+Manifests are allowlisted (profile {}): {}, and labels or annotations reserved for {} are refused. {storage} \
 Kueue chooses the node; pin hardware with a nodeSelector only when hardware_describe shows the flavor spans several GPU products.",
         names.join(", "),
         cfg.profile.name,
@@ -3325,6 +3336,7 @@ mod tests {
             "profile strict",
             "crucible.dev, kueue.x-k8s.io",
             "PyTorchJob",
+            "storageClassName is refused",
         ] {
             assert!(
                 crucible.contains(want),
@@ -3339,6 +3351,7 @@ mod tests {
             labels: Labels::new("kueue-mcp.example.com"),
             ownership: Ownership::Rbac,
             profile: crate::profile::Profile::tenant(),
+            storage_classes: ["gpu-local", "shared"].map(String::from).into(),
             lifetimes: crate::config::Lifetimes {
                 active_deadline_seconds: None,
                 ttl_seconds_after_finished: Some(600),
@@ -3357,6 +3370,10 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("profile tenant"), "{text}");
+        assert!(
+            text.contains("may set storageClassName to one of gpu-local, shared;"),
+            "{text}"
+        );
         assert!(
             text.contains("reserved for kueue-mcp.example.com are refused"),
             "{text}"

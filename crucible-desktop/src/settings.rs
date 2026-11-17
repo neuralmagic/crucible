@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::editor::Editor;
 use crate::profile::Profile;
-use crate::workspace::Workspace;
+use crate::workspace::{Rails, Workspace};
 
 /// The colours the app paints with.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,6 +170,7 @@ pub struct Settings {
     pub tx02: Option<PathBuf>,
     /// The run workspace as the user last arranged it; `None` lays each run out by its graph.
     pub layout: Option<Workspace>,
+    pub rails: Rails,
     pub theme: Theme,
     pub appearance: Appearance,
     pub text_size: TextSize,
@@ -203,6 +204,8 @@ pub struct Settings {
     pub profile: Option<String>,
     /// The team each profile acts as (`team:<slug>`), by profile name.
     act_as: BTreeMap<String, String>,
+    /// Where draft working copies are kept; `None` keeps them in the app's data directory.
+    pub drafts_dir: Option<PathBuf>,
     /// The cost and time ceilings a pack folder dropped on the app is test-fired under.
     pub drop_max_cost: f64,
     pub drop_max_time: String,
@@ -222,6 +225,8 @@ struct Config {
     tx02_path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     layout: Option<Workspace>,
+    #[serde(skip_serializing_if = "Rails::is_fitted")]
+    rails: Rails,
     theme: Theme,
     appearance: Appearance,
     text_size: TextSize,
@@ -242,6 +247,8 @@ struct Config {
     checks: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    drafts_dir: Option<PathBuf>,
     drop_max_cost: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     drop_max_time: Option<String>,
@@ -289,6 +296,7 @@ impl Settings {
             log_font,
             tx02,
             layout: config.layout.and_then(Workspace::repaired),
+            rails: config.rails,
             theme: config.theme,
             appearance: config.appearance,
             text_size: config.text_size,
@@ -310,6 +318,7 @@ impl Settings {
             profiles: config.profiles,
             profile: config.profile,
             act_as: config.act_as,
+            drafts_dir: config.drafts_dir.filter(|dir| dir.is_absolute()),
             drop_max_cost: config
                 .drop_max_cost
                 .filter(|c| c.is_finite() && *c > 0.0)
@@ -355,6 +364,31 @@ impl Settings {
             }
             self.save();
         }
+    }
+
+    /// Where draft working copies are kept now.
+    pub fn drafts_root(&self) -> Option<PathBuf> {
+        crate::draft::root(self.drafts_dir.as_deref())
+    }
+
+    /// Keep draft working copies under `dir`, an absolute path or one under `~/`. An empty `dir`
+    /// goes back to the app's data directory.
+    pub fn set_drafts_dir(&mut self, dir: &str) -> Result<(), String> {
+        let dir = dir.trim();
+        let chosen = if dir.is_empty() {
+            None
+        } else if let Some(rest) = dir.strip_prefix("~/") {
+            let home = std::env::var_os("HOME").ok_or("There is no home directory for ~")?;
+            Some(PathBuf::from(home).join(rest))
+        } else {
+            Some(PathBuf::from(dir))
+        };
+        if chosen.as_deref().is_some_and(Path::is_relative) {
+            return Err("The drafts folder is an absolute path".into());
+        }
+        self.drafts_dir = chosen;
+        self.save();
+        Ok(())
     }
 
     /// Set the drop ceilings, when both read.
@@ -434,6 +468,13 @@ impl Settings {
     pub fn set_layout(&mut self, layout: Option<Workspace>) {
         if self.layout != layout {
             self.layout = layout;
+            self.save();
+        }
+    }
+
+    pub fn set_rails(&mut self, rails: Rails) {
+        if self.rails != rails {
+            self.rails = rails;
             self.save();
         }
     }
@@ -522,6 +563,7 @@ impl Settings {
             log_font: Some(self.log_font),
             tx02_path: None,
             layout: self.layout.clone(),
+            rails: self.rails,
             theme: self.theme,
             appearance: self.appearance,
             text_size: self.text_size,
@@ -540,6 +582,7 @@ impl Settings {
             profile: self.profile.clone(),
             act_as: self.act_as.clone(),
             profiles: self.profiles.clone(),
+            drafts_dir: self.drafts_dir.clone(),
             drop_max_cost: Some(self.drop_max_cost),
             drop_max_time: Some(self.drop_max_time.clone()),
             agent: (self.agent != crate::agent::Config::default()).then(|| self.agent.clone()),
@@ -949,5 +992,55 @@ proxxy = "socks5://127.0.0.1:1080"
             scan(dir.path(), 0).unwrap().file_name().unwrap(),
             "TX-02-Regular.otf"
         );
+    }
+
+    #[test]
+    fn the_drafts_folder_is_kept_when_absolute_and_dropped_when_emptied() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crucible-playbooks").join("config.toml");
+        let mut settings = Settings::load_from(path.clone());
+        assert_eq!(settings.drafts_dir, None);
+
+        assert_eq!(
+            settings.set_drafts_dir("packs/drafts"),
+            Err("The drafts folder is an absolute path".to_string())
+        );
+        assert!(settings.set_drafts_dir("~").is_err());
+        assert_eq!(settings.drafts_dir, None);
+        assert!(!path.exists(), "a refused folder saves nothing");
+
+        settings.set_drafts_dir(" /work/drafts ").unwrap();
+        assert_eq!(settings.drafts_dir, Some(PathBuf::from("/work/drafts")));
+        assert_eq!(
+            Settings::load_from(path.clone()).drafts_dir,
+            Some(PathBuf::from("/work/drafts"))
+        );
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("drafts_dir = \"/work/drafts\"")
+        );
+
+        settings.set_drafts_dir("~/packs").unwrap();
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert_eq!(
+            Settings::load_from(path.clone()).drafts_dir,
+            Some(home.join("packs"))
+        );
+
+        settings.set_drafts_dir("").unwrap();
+        assert_eq!(Settings::load_from(path.clone()).drafts_dir, None);
+        assert!(!fs::read_to_string(&path).unwrap().contains("drafts_dir"));
+    }
+
+    #[test]
+    fn a_relative_drafts_folder_in_the_file_is_not_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crucible-playbooks").join("config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "drafts_dir = \"drafts\"\n").unwrap();
+        let settings = Settings::load_from(path);
+        assert_eq!(settings.unreadable, None);
+        assert_eq!(settings.drafts_dir, None);
     }
 }

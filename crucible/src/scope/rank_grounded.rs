@@ -24,6 +24,7 @@ use crate::manifest::AgentBackend;
 use anyhow::{Context, Result};
 use crucible_contract::verdict::{Failed, Ruled};
 use crucible_contract::{Disposition, GroundedErrorKind, GroundedVerdict};
+use crucible_vcs::cli::git;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -196,30 +197,6 @@ fn worktree_path() -> PathBuf {
             .map(|d| d.as_nanos())
             .unwrap_or_default()
     ))
-}
-
-fn git(workspace: &Path, args: &[&str]) -> Result<()> {
-    let status = std::process::Command::new("git")
-        .arg("-C")
-        .arg(workspace)
-        .args(args)
-        .status()
-        .context("running git")?;
-    if !status.success() {
-        return Err(GitFailed {
-            subcommand: args.first().unwrap_or(&"").to_string(),
-            status,
-        }
-        .into());
-    }
-    Ok(())
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("git {subcommand:?} failed ({status})")]
-struct GitFailed {
-    subcommand: String,
-    status: std::process::ExitStatus,
 }
 
 /// Accumulate the agent's textual output so the verdict can be scraped from its last line: streamed
@@ -409,14 +386,15 @@ fn run_grounded_turn(
     let scratch = worktree_path();
     git(
         workspace,
-        &[
-            "worktree",
-            "add",
-            "--detach",
-            &scratch.to_string_lossy(),
-            "HEAD",
+        [
+            "worktree".as_ref(),
+            "add".as_ref(),
+            "--detach".as_ref(),
+            scratch.as_os_str(),
+            "HEAD".as_ref(),
         ],
     )
+    .run()
     .context("creating the read-only worktree for the grounded turn")?;
 
     let mut args = turn_args(a)?;
@@ -441,8 +419,14 @@ fn run_grounded_turn(
     // pristine. Best-effort: a leaked worktree is pruned by the next `worktree add`/`prune`.
     let _ = git(
         workspace,
-        &["worktree", "remove", "--force", &scratch.to_string_lossy()],
-    );
+        [
+            "worktree".as_ref(),
+            "remove".as_ref(),
+            "--force".as_ref(),
+            scratch.as_os_str(),
+        ],
+    )
+    .run();
     let _ = std::fs::remove_dir_all(&scratch);
     Ok((outcome, buf))
 }

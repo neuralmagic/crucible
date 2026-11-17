@@ -53,7 +53,7 @@ fn relay_endpoint(port: u16) -> String {
 /// Where the names of sandboxes this app created are kept until each is deleted, so one that
 /// outlived the app is deleted by the next session.
 fn ledger() -> Option<PathBuf> {
-    Some(crate::draft::root()?.parent()?.join("agent-sandboxes"))
+    Some(crate::draft::root(None)?.parent()?.join("agent-sandboxes"))
 }
 
 fn listed(ledger: &Path) -> Vec<String> {

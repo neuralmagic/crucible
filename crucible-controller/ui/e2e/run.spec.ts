@@ -289,6 +289,36 @@ test.describe('the run task graph', () => {
     await expect(view.locator('[class*="index-module_red__"]')).toHaveCSS('color', 'rgb(229, 107, 105)');
   });
 
+  test('copies a whole log, past the rows the viewer has drawn', async ({ page, context }) => {
+    await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+    await stubApi(page);
+    const lines = Array.from({ length: 2000 }, (_, i) => `[${i + 1}/2000] \x1b[32mBuilding\x1b[0m object ${i + 1}`);
+    const body = `${lines.join('\n')}\n`;
+    await page.route('**/api/runs/RUN-0412/files', (route) =>
+      route.fulfill({
+        json: {
+          run_id: 'RUN-0412',
+          files: [{ task: 'build', instance: null, path: 'edit1.log', size_bytes: body.length, key: 'build/edit1.log' }],
+        },
+      }),
+    );
+    await page.route('**/api/runs/RUN-0412/files/build/edit1.log', (route) =>
+      route.fulfill({ contentType: 'application/octet-stream', body }),
+    );
+    await ready(page, '/runs/RUN-0412');
+
+    await page.locator('[id="crucible.run-files"]').getByRole('button', { name: 'build/edit1.log' }).click();
+    const view = page.getByTestId('run-file-log');
+    await expect(view).toContainText('[1/2000] Building object 1');
+    await expect(view).not.toContainText('[2000/2000] Building object 2000');
+
+    const copy = view.getByRole('button', { name: 'Copy log' });
+    await copy.click();
+    await expect(copy).toHaveAttribute('title', 'Copied');
+    const copied = await page.evaluate(() => navigator.clipboard.readText());
+    expect(copied).toBe(Array.from({ length: 2000 }, (_, i) => `[${i + 1}/2000] Building object ${i + 1}\n`).join(''));
+  });
+
   /// A task the run has not finished says so, instead of reading as a finished one with nothing to
   /// show.
   test('says a task is still running rather than showing empty evidence', async ({ page }) => {

@@ -16,12 +16,13 @@ const SHOWN: usize = 12;
 
 fn status(app: &App, p: &Paint) -> El {
     let desk = &app.remote.agent;
-    let (label, ink) = match &desk.state {
-        None => ("No session".to_string(), p.c.text_faint),
-        Some(State::Starting(what)) => (what.clone(), p.live),
-        Some(State::Running) => ("Working".to_string(), p.live),
-        Some(State::Idle) => ("Ready".to_string(), p.pass),
-        Some(State::NotSetUp(why) | State::Failed(why)) => (why.clone(), p.fail),
+    let (label, ink) = match (&desk.state, app.agent_held()) {
+        (None | Some(State::Idle), Some(why)) => (why.to_string(), p.c.warning.fg),
+        (None, None) => ("No session".to_string(), p.c.text_faint),
+        (Some(State::Starting(what)), _) => (what.clone(), p.live),
+        (Some(State::Running), _) => ("Working".to_string(), p.live),
+        (Some(State::Idle), None) => ("Ready".to_string(), p.pass),
+        (Some(State::NotSetUp(why) | State::Failed(why)), _) => (why.clone(), p.fail),
     };
     let mut bar = row().w_full().h(24.0).gap(8.0).center_y();
     if desk.busy() {

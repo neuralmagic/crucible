@@ -94,12 +94,12 @@ workflow(type = "playbook", tasks = [read, gate, oncall, finance, backlog, filed
 
 ```text
 $ crucible plan run --manifest crucible.toml --max-cost 1 --max-time 5m
-  read                 pass       attempts=1 cost=$0.0000  out={"bucket":"billing"}
-  gate                 pass       attempts=1 cost=$0.0000  out={"bucket":{"confidence":1.0,"label":"billing",...}}
+  read                 pass       attempts=1 cost=$0.0000 elapsed=0.1s  out={"bucket":"billing"}
+  gate                 pass       attempts=1 cost=$0.0000 elapsed=0.1s  out={"bucket":{"confidence":1.0,"label":"billing",...}}
   oncall               not_taken  attempts=0 cost=$0.0000  (gate.bucket resolved to billing)
-  finance              pass       attempts=1 cost=$0.0000  out={}
+  finance              pass       attempts=1 cost=$0.0000 elapsed=0.1s  out={}
   backlog              not_taken  attempts=0 cost=$0.0000  (gate.bucket resolved to billing)
-  filed                pass       attempts=1 cost=$0.0000  out={}
+  filed                pass       attempts=1 cost=$0.0000 elapsed=0.1s  out={}
 plan v1: completed — spent $0.0000 of $1
 verdict: valid
 ```

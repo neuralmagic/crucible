@@ -319,11 +319,34 @@ pub struct RunLog {
     pub dispatch: String,
     #[serde(default)]
     pub text: Option<String>,
-    /// True when the head was dropped to fit the controller's cap.
+    /// True when `text` is not the whole log.
     #[serde(default)]
     pub truncated: bool,
+    /// Byte offset of `text` in the whole log.
+    #[serde(default)]
+    pub start: u64,
+    /// Where the next window starts, when the log already holds more.
+    #[serde(default)]
+    pub next: Option<u64>,
+    #[serde(default)]
+    pub total_bytes: u64,
+    /// Which copy of the output `text` came from. Absent from a controller that only serves the
+    /// tail.
+    #[serde(default)]
+    pub source: Option<String>,
     #[serde(default)]
     pub location: Option<String>,
+}
+
+impl RunLog {
+    /// Where a read after this window picks up.
+    pub fn resume(&self) -> anyhow::Result<u64> {
+        anyhow::ensure!(
+            self.source.is_some() || self.text.is_none(),
+            "this controller serves only a log's tail and cannot resume one; it needs upgrading"
+        );
+        Ok(self.next.unwrap_or(self.total_bytes))
+    }
 }
 
 /// `GET /api/runs/{run_id}/files`: what the run's tasks captured.
@@ -960,6 +983,63 @@ pub struct DraftFiles {
     pub files: std::collections::BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileChange {
+    Added,
+    Removed,
+    Modified,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DraftChangedFile {
+    pub path: String,
+    pub change: FileChange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DraftHistoryEntry {
+    pub version: i64,
+    #[serde(default)]
+    pub created_by: Option<String>,
+    #[serde(default)]
+    pub created_at: String,
+    /// Absent when the save did not compile.
+    #[serde(default)]
+    pub schema_digest: Option<String>,
+    #[serde(default)]
+    pub diagnostics: i64,
+    /// The save this one is compared against; absent for the first.
+    #[serde(default)]
+    pub previous_version: Option<i64>,
+    /// Absent when the controller has no stored tree to compare.
+    #[serde(default)]
+    pub changes: Option<Vec<DraftChangedFile>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DraftFileDiff {
+    pub path: String,
+    pub change: FileChange,
+    #[serde(default)]
+    pub additions: u64,
+    #[serde(default)]
+    pub deletions: u64,
+    /// Absent when either side is not text.
+    #[serde(default)]
+    pub unified: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DraftDiff {
+    /// Absent when `to` is the first save, diffed against an empty pack.
+    #[serde(default)]
+    pub from: Option<i64>,
+    pub to: i64,
+    #[serde(default)]
+    pub files: Vec<DraftFileDiff>,
+}
+
 /// `POST /api/playbook-drafts/{id}/versions`: the version stored, and what the engine made of it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DraftCompile {
@@ -1504,6 +1584,9 @@ pub struct PlaybookRun {
     /// What authorized it: `manual`, `schedule`, `draft`, `watch`, `webhook`, `deferred`.
     #[serde(default)]
     pub origin: String,
+    /// The draft save a test-fire froze; absent for a registered playbook's launch.
+    #[serde(default)]
+    pub draft_version: Option<i64>,
     #[serde(default)]
     pub max_time: String,
     #[serde(default)]
@@ -1619,6 +1702,27 @@ pub struct RunRow {
     /// Where the run was dispatched. Absent on a controller that predates recorded location.
     #[serde(default)]
     pub cluster: Option<String>,
+}
+
+/// What a schedule's test firing receives as its cursor.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "from", rename_all = "snake_case")]
+pub enum TestCursor {
+    /// The value the schedule holds now.
+    #[default]
+    Stored,
+    /// Nothing, as on the schedule's first firing.
+    None,
+    /// This value in place of the stored one.
+    Value { value: String },
+}
+
+/// `POST /api/schedules/{id}/test-fire`: the launch it minted and the cursor that launch got.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TestFire {
+    pub key: String,
+    pub schedule: String,
+    pub cursor: TestCursor,
 }
 
 /// A recurrence: what it launches, when it next fires, and whether it can still fire at all.

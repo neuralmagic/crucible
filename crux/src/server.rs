@@ -8,14 +8,16 @@
 use crate::client::Client;
 use crate::ops::blueprints::{BlueprintUse, Blueprints};
 use crate::ops::drafts::{
-    DraftCreate, DraftDelete, DraftFiles, DraftGraduate, DraftLaunch, DraftPreview, DraftPublish,
-    DraftPull, DraftPush, DraftSaveFiles,
+    DraftCreate, DraftDelete, DraftDiff, DraftFiles, DraftGraduate, DraftLaunch, DraftLog,
+    DraftPreview, DraftPublish, DraftPull, DraftPush, DraftSaveFiles,
 };
 use crate::ops::issues::{
     Adopt, ApprovalDetail, Approvals, Approve, Bump, Contracts, Issue, Issues, Park, Reconcile,
     Redispatch, Turn, Turns, Unpark,
 };
-use crate::ops::launches::{Schedules, Watch, Watches, Webhook, WebhookDeliveries, Webhooks};
+use crate::ops::launches::{
+    ScheduleFire, ScheduleTestFire, Schedules, Watch, Watches, Webhook, WebhookDeliveries, Webhooks,
+};
 use crate::ops::playbooks::{
     Launch, PlaybookCaps, PlaybookImport, PlaybookRun, PlaybookRuns, PlaybookSchema, Playbooks,
 };
@@ -126,8 +128,9 @@ impl CrucibleMcp {
     #[tool(
         description = "One window of a run's engine output, resumable by cursor. A running pod is \
         read live; once it finishes its ingested session is served, which is the only copy that \
-        outlives the pod. Returns at most 200 lines and reports the cursor to resume from, so \
-        read it in windows rather than expecting the whole log."
+        outlives the pod. Returns at most 200 lines and always reports the cursor to resume from, \
+        so read it in windows rather than expecting the whole log, and poll a running run with \
+        the cursor the last window gave."
     )]
     async fn crucible_run_log(&self, Parameters(a): Parameters<RunLog>) -> String {
         self.run(&a).await
@@ -235,6 +238,25 @@ impl CrucibleMcp {
         returns is the base_version a save needs."
     )]
     async fn crucible_draft_files(&self, Parameters(a): Parameters<DraftFiles>) -> String {
+        self.run(&a).await
+    }
+
+    #[tool(
+        description = "A draft pack's saves as a changelog, newest first: who saved each, whether \
+        it compiled, and which files it added, removed or modified from the save before it. Read \
+        the text of a change with crucible_draft_diff."
+    )]
+    async fn crucible_draft_log(&self, Parameters(a): Parameters<DraftLog>) -> String {
+        self.run(&a).await
+    }
+
+    #[tool(
+        description = "The unified diff between two saves of a draft pack. With no versions, the \
+        newest save against the one before it. Any two versions from crucible_draft_log compare, \
+        so a save that broke the pack is found by halving the range between a good one and a bad \
+        one."
+    )]
+    async fn crucible_draft_diff(&self, Parameters(a): Parameters<DraftDiff>) -> String {
         self.run(&a).await
     }
 
@@ -391,6 +413,28 @@ impl CrucibleMcp {
     }
 
     #[tool(
+        description = "Fire a schedule now instead of at its next window. A real firing: the run \
+        gets the stored cursor and advances it. Refused while the schedule is disabled or a \
+        launch that may still advance its cursor is in flight."
+    )]
+    async fn crucible_schedule_fire(&self, Parameters(a): Parameters<ScheduleFire>) -> String {
+        self.run(&a).await
+    }
+
+    #[tool(
+        description = "Launch a schedule once without moving it: the run gets the stored cursor, \
+        the cursor given here, or none, and never writes it back. Works on a disabled schedule. \
+        Costs money against the schedule's max_cost. Returns the issue key to watch it by with \
+        crucible_playbook_run."
+    )]
+    async fn crucible_schedule_test_fire(
+        &self,
+        Parameters(a): Parameters<ScheduleTestFire>,
+    ) -> String {
+        self.run(&a).await
+    }
+
+    #[tool(
         description = "Tracker watches: ID PLAYBOOK TRACKER QUERY STATE SWEPT LAUNCHED FAILS OWNER. \
         A watch launches its playbook once per item its query matches, never again for the same \
         item."
@@ -482,7 +526,7 @@ mod tests {
             .into_iter()
             .map(|t| t.name.to_string())
             .collect();
-        assert_eq!(names.len(), 46, "tools: {names:?}");
+        assert_eq!(names.len(), 50, "tools: {names:?}");
         for required in [
             "crucible_issues",
             "crucible_draft_delete",
@@ -512,6 +556,8 @@ mod tests {
             "crucible_draft_pull",
             "crucible_draft_push",
             "crucible_draft_files",
+            "crucible_draft_log",
+            "crucible_draft_diff",
             "crucible_draft_save",
             "crucible_draft_preview",
             "crucible_draft_launch",
@@ -527,6 +573,8 @@ mod tests {
             "crucible_runs",
             "crucible_run",
             "crucible_schedules",
+            "crucible_schedule_fire",
+            "crucible_schedule_test_fire",
             "crucible_whoami",
         ] {
             assert!(

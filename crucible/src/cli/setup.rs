@@ -409,18 +409,22 @@ struct RerunBaseUnavailable {
     base: String,
 }
 
-/// Rebuild a rerun's workspace: the commit its parent started from, or this checkout's `HEAD`
-/// when that holds the same tree or the workspace has no repository of its own, then the reused
-/// tasks' commits, then the manifest's injects. Returns the commit the rerun starts from.
+/// Rebuild a rerun's workspace: the blobs `fetched` names that a partial clone lacks, the commit
+/// its parent started from, or this checkout's `HEAD` when that holds the same tree or the
+/// workspace has no repository of its own, then the reused tasks' commits, then the manifest's
+/// injects. Returns the commit the rerun starts from.
 pub(crate) fn restore_for_rerun(
     manifest_path: &Path,
     m: &manifest::Manifest,
     parent: &crate::plan::resume::RunStart,
     commits: &[crucible_vcs::git_memory::TaskCommit],
+    fetched: &[String],
 ) -> Result<String> {
     use crucible_vcs::git_memory;
     let manifest_dir = manifest::manifest_dir(manifest_path);
     let workspace = manifest_dir.join(&m.workspace.dir);
+    crate::cli::workspace::fetch_blobs(&workspace, fetched)
+        .context("fetching the file contents the parent run's workspace held")?;
     let base = if git_memory::tree_of(&workspace, &parent.base)?.is_some() {
         parent.base.clone()
     } else {

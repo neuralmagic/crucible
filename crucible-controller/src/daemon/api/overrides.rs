@@ -1,7 +1,6 @@
 use crate::api::dto::{bad_request, unavailable};
 use crate::api::state::*;
 use axum::extract::State;
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -93,11 +92,7 @@ pub(crate) async fn put_config_overrides(
     let changed = next.changed_keys(&prev);
 
     if let Err(e) = store.write_overrides(&next).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorBody::new(format!("writing overrides failed: {e:#}"))),
-        )
-            .into_response();
+        return ApiError::Internal(e.context("writing overrides")).into_response();
     }
     let allowed_after = store.effective().allow_draft_head_schedules;
     let disabled = if allowed_before && !allowed_after {

@@ -249,6 +249,9 @@ fn args(cfg: &KueueCfg, cluster: &str, issuer: &str, authz: KubeAuthz) -> Result
     for secret in &cfg.pull_secrets {
         args.extend(["--pull-secret".to_string(), secret.clone()]);
     }
+    for class in cfg.storage_classes.get(cluster).into_iter().flatten() {
+        args.extend(["--storage-class".to_string(), class.clone()]);
+    }
     args.extend(["--cluster-domain".to_string(), cfg.cluster_domain.clone()]);
     if cfg.allowlist_profile != crate::deploy::profile::KueueAllowlist::Strict {
         args.extend([
@@ -1023,6 +1026,39 @@ mod tests {
             err,
             crate::deploy::profile::NotSharedNamespace {
                 namespace: "elsewhere".into()
+            }
+        );
+    }
+
+    /// Each cluster's server offers the storage classes the profile lists for that cluster.
+    #[test]
+    fn a_clusters_server_offers_the_storage_classes_listed_for_it() {
+        let with = |tables: &str| PROFILE.replace("[kueue]", &format!("[kueue]\n{tables}"));
+        let offered = |rendered: &[serde_json::Value]| -> Vec<String> {
+            args(rendered)
+                .windows(2)
+                .filter(|w| w[0] == "--storage-class")
+                .map(|w| w[1].clone())
+                .collect()
+        };
+        assert!(offered(&docs(PROFILE)).is_empty());
+
+        let listed = with("storage_classes = { ocp = [\"gpu-local\", \"shared\"] }");
+        assert_eq!(offered(&docs(&listed)), ["gpu-local", "shared"]);
+        toml::from_str::<DeployProfile>(&listed)
+            .unwrap()
+            .check_storage_classes()
+            .unwrap();
+
+        let stray = with("storage_classes = { elsewhere = [\"gpu-local\"] }");
+        assert!(offered(&docs(&stray)).is_empty());
+        assert_eq!(
+            toml::from_str::<DeployProfile>(&stray)
+                .unwrap()
+                .check_storage_classes()
+                .unwrap_err(),
+            crate::deploy::profile::NotStorageClassCluster {
+                cluster: "elsewhere".into()
             }
         );
     }

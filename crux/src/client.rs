@@ -526,6 +526,27 @@ impl Client {
         self.get(&format!("/api/runs/{}/log", encode(run_id))).await
     }
 
+    /// The window of a run's log starting at byte `from`, within `lines` lines and `bytes` bytes
+    /// where given.
+    pub async fn run_log_from<T: DeserializeOwned>(
+        &self,
+        run_id: &str,
+        from: u64,
+        lines: Option<usize>,
+        bytes: Option<usize>,
+    ) -> Result<T> {
+        let mut query = Query::new();
+        query.push("from", Some(&from.to_string()));
+        query.push("lines", lines.map(|n| n.to_string()).as_deref());
+        query.push("bytes", bytes.map(|n| n.to_string()).as_deref());
+        self.get(&format!(
+            "/api/runs/{}/log{}",
+            encode(run_id),
+            query.finish()
+        ))
+        .await
+    }
+
     pub async fn run_files<T: DeserializeOwned>(&self, run_id: &str) -> Result<T> {
         self.get(&format!("/api/runs/{}/files", encode(run_id)))
             .await
@@ -1030,6 +1051,28 @@ impl Client {
             .await
     }
 
+    /// Make schedule `id` due now; the controller fires it as it does a cron window.
+    pub async fn fire_schedule<T: DeserializeOwned>(&self, id: &str) -> Result<T> {
+        self.post(
+            &format!("/api/schedules/{}/fire", encode(id)),
+            None::<&serde_json::Value>,
+        )
+        .await
+    }
+
+    /// Launch schedule `id` once with `cursor`, leaving the schedule and its cursor as they are.
+    pub async fn test_fire_schedule(
+        &self,
+        id: &str,
+        cursor: &dto::TestCursor,
+    ) -> Result<dto::TestFire> {
+        self.post(
+            &format!("/api/schedules/{}/test-fire", encode(id)),
+            Some(&serde_json::json!({ "cursor": cursor })),
+        )
+        .await
+    }
+
     pub async fn watches<T: DeserializeOwned>(&self) -> Result<T> {
         self.get("/api/watches").await
     }
@@ -1225,6 +1268,29 @@ impl Client {
         q.push("version", version.map(|v| v.to_string()).as_deref());
         self.get(&format!(
             "/api/playbook-drafts/{}/files{}",
+            encode(id),
+            q.finish()
+        ))
+        .await
+    }
+
+    pub async fn draft_history<T: DeserializeOwned>(&self, id: &str) -> Result<T> {
+        self.get(&format!("/api/playbook-drafts/{}/history", encode(id)))
+            .await
+    }
+
+    /// `to` defaults to the newest save and `from` to the one before `to`.
+    pub async fn draft_diff<T: DeserializeOwned>(
+        &self,
+        id: &str,
+        from: Option<i64>,
+        to: Option<i64>,
+    ) -> Result<T> {
+        let mut q = Query::new();
+        q.push("from", from.map(|v| v.to_string()).as_deref());
+        q.push("to", to.map(|v| v.to_string()).as_deref());
+        self.get(&format!(
+            "/api/playbook-drafts/{}/diff{}",
             encode(id),
             q.finish()
         ))

@@ -155,11 +155,26 @@ pub enum LayerCache {
 }
 
 /// How a BuildKit build compresses the layers it makes; a base image's layers keep theirs.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum Compression {
+    /// What every registry and runtime takes.
     Gzip,
+    /// An OCI image with zstd layers, for registries and runtimes that take them.
     #[default]
     Zstd,
+    /// An OCI image whose new layers are plain tar.
     Uncompressed,
 }
 

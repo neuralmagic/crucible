@@ -6,6 +6,7 @@ pub mod blueprints;
 pub mod choices;
 pub mod co_draft;
 pub mod dispatch;
+pub mod draft_history;
 pub mod drafts;
 pub mod exposure;
 pub mod imports;

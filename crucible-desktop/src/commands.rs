@@ -64,6 +64,7 @@ impl App {
             Command::Reload => {
                 self.remote.live_client.reconnect();
                 self.remote.admin_client.reconnect();
+                self.reread_history();
             }
             Command::Profile(n) => {
                 self.switch(Backend::Controller);

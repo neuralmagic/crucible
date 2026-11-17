@@ -17,6 +17,7 @@ strum.workspace = true
 # source of truth, no cross-crate "keep in sync" drift.
 crucible-contract = { path = "../crucible-contract", features = ["openapi"] }
 crucible = { path = "../crucible", default-features = false }
+crucible-vcs = { path = "../crucible-vcs" }
 # The cluster-boundary traits (PodDispatcher, ConfigMapApi) are async + used as `dyn`, which
 # native async-fn-in-trait can't do; async-trait boxes the futures.
 async-trait = "0.1"
@@ -122,6 +123,8 @@ tower-sessions-sqlx-store = { git = "https://github.com/wseaton/tower-sessions-s
 # The tier-ranking cache key (stage 2, lane J): sha256 of an issue's title+body+labels, and the
 # digest an api key's secret half is stored as.
 sha2 = "0.10"
+# Line diffs between two saves of a draft.
+similar = "2"
 # The CSPRNG an api key's secret half comes out of. Already in the tree; named here because the
 # secret's unpredictability is the whole security property.
 rand = "0.10"

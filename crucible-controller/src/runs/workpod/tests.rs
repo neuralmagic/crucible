@@ -6618,6 +6618,91 @@ async fn collecting_an_isolated_run_deletes_its_gateway(pool: sqlx::PgPool) -> R
 }
 
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn cancelling_an_isolated_run_deletes_its_gateway(pool: sqlx::PgPool) -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let db = Db::new(pool);
+    seed_running_issue(&db, "owner/repo#7").await?;
+    insert_run_pod(&db, "crucible-run-iso", WorkPodState::Running).await?;
+    crate::runs::store::insert_run(
+        db.pool(),
+        &crate::NewRun {
+            run_id: "run-iso".into(),
+            scope: None,
+            issue: Some("owner/repo#7".into()),
+            identity_digest: None,
+            status: "running".into(),
+            pod: Some("crucible-run-iso".into()),
+            session_uri: None,
+            best_score: None,
+            cost_usd: None,
+        },
+    )
+    .await?;
+    let dispatcher = Arc::new(GatewayDispatcher::default());
+    let mut cfg = crate::testing::cfg_from_args(["ctl", "--pod-namespace", "autoresearch"]);
+    cfg.deploy_profile = Some(isolated_profile(tmp.path()));
+    cfg.runtime.dispatcher = dispatcher.clone();
+
+    let cancelled =
+        crate::runs::cancel::cancel_runs(&db, &cfg, "owner/repo#7", Some("wren")).await?;
+
+    assert_eq!(cancelled, 1);
+    let deleted: Vec<(String, String)> = dispatcher
+        .events()
+        .into_iter()
+        .filter_map(|e| match e {
+            GatewayEvent::DeleteSelected {
+                namespace,
+                selector,
+            }
+            | GatewayEvent::DeleteServices {
+                namespace,
+                selector,
+            } => Some((namespace, selector)),
+            _ => None,
+        })
+        .collect();
+    let own = crucible::deploy::render::gateway::run_gateway_selector("crucible-run-iso");
+    let created = crucible::deploy::render::gateway::gateway_created_selector(
+        &crucible::deploy::render::gateway::GatewayNames::for_run_pod("crucible-run-iso"),
+    );
+    assert_eq!(
+        deleted,
+        [
+            ("sandboxes".to_string(), created),
+            ("autoresearch".to_string(), own.clone()),
+            ("sandboxes".to_string(), own),
+        ]
+    );
+    assert!(
+        dispatcher.events().iter().any(
+            |e| matches!(e, GatewayEvent::DeleteSandboxes { namespace, .. } if namespace == "sandboxes")
+        ),
+        "the cancelled run's Sandboxes go with it"
+    );
+
+    let shared = Arc::new(GatewayDispatcher::default());
+    insert_run_pod(&db, "crucible-run-shared", WorkPodState::Running).await?;
+    sqlx::query(
+        "UPDATE runs SET status = 'running', pod = 'crucible-run-shared' WHERE run_id = 'run-iso'",
+    )
+    .execute(db.pool())
+    .await?;
+    let mut cfg = crate::testing::cfg_from_args(["ctl", "--pod-namespace", "autoresearch"]);
+    cfg.deploy_profile = Some(shared_profile(tmp.path()));
+    cfg.runtime.dispatcher = shared.clone();
+    assert_eq!(
+        crate::runs::cancel::cancel_runs(&db, &cfg, "owner/repo#7", Some("wren")).await?,
+        1
+    );
+    assert!(
+        shared.events().is_empty(),
+        "a profile without isolation has no gateway to delete"
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn the_gateway_sweep_removes_gateways_whose_run_pod_is_not_running(
     pool: sqlx::PgPool,
 ) -> Result<()> {

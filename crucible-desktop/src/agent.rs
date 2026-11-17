@@ -348,6 +348,17 @@ impl Desk {
     }
 }
 
+/// Why a working copy that is `pulled` or not, `edited` or not, cannot take a prompt.
+fn held(pulled: bool, edited: bool) -> Option<&'static str> {
+    if !pulled {
+        Some("Pull the draft first")
+    } else if edited {
+        Some("Save your edits first")
+    } else {
+        None
+    }
+}
+
 impl App {
     /// Whether this build can run an agent at all.
     pub fn agent_available(&self) -> bool {
@@ -364,17 +375,22 @@ impl App {
         }
     }
 
+    /// Why the working copy cannot take a prompt now, whatever the prompt says.
+    pub fn agent_held(&self) -> Option<&'static str> {
+        held(self.remote.working.is_some(), self.remote.working_edited)
+    }
+
     /// Why a prompt cannot be sent now.
     pub fn agent_blocked(&self) -> Option<&'static str> {
-        if self.remote.working.is_none() {
-            Some("Pull the draft first")
-        } else if self.remote.working_edited {
-            Some("Save your edits first")
-        } else if self.remote.agent.prompt.text.trim().is_empty() {
-            Some("Say what to change")
-        } else {
-            None
-        }
+        self.agent_held().or_else(|| {
+            self.remote
+                .agent
+                .prompt
+                .text
+                .trim()
+                .is_empty()
+                .then_some("Say what to change")
+        })
     }
 
     /// Send the prompt to the draft's session, starting one when there is none. While the agent
@@ -705,5 +721,14 @@ mod tests {
         assert_eq!(desk.queued, None);
         assert_eq!(desk.due(), None);
         assert_eq!(desk.submit("fourth".into()), Some("fourth".into()));
+    }
+
+    #[test]
+    fn a_prompt_waits_for_a_pulled_copy_with_its_edits_saved() {
+        use crate::agent::held;
+        assert_eq!(held(false, false), Some("Pull the draft first"));
+        assert_eq!(held(false, true), Some("Pull the draft first"));
+        assert_eq!(held(true, true), Some("Save your edits first"));
+        assert_eq!(held(true, false), None);
     }
 }

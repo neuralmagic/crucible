@@ -102,6 +102,8 @@ const CCACHE_STATS: &str = "ccache-stats.log";
 const CCACHE_USER: &str = "buildit";
 const MAX_FACTS: u64 = 64 * 1024;
 const MAX_STEPS: u64 = 1024 * 1024;
+/// How much of `ccache-stats.log` a summary reads: about a line per compiled object.
+const MAX_CCACHE_STATS: u64 = 64 * 1024 * 1024;
 const DEFAULT_LOG_BYTES: u64 = 16 * 1024;
 const MAX_LOG_BYTES: u64 = 64 * 1024;
 
@@ -912,6 +914,23 @@ impl SharedCache {
     }
 }
 
+type Facts = serde_json::Map<String, serde_json::Value>;
+type CcacheSummary = std::collections::BTreeMap<String, u64>;
+
+/// Each result's count in a ccache `stats_log`, which holds a `# <input file>` line per
+/// compilation followed by one line per result it recorded. `None` when it recorded none.
+fn ccache_summary(log: impl std::io::BufRead) -> Option<CcacheSummary> {
+    let mut counts = CcacheSummary::new();
+    for line in log.lines() {
+        let Ok(line) = line else { break };
+        let result = line.trim();
+        if !result.is_empty() && !result.starts_with('#') {
+            *counts.entry(result.to_string()).or_default() += 1;
+        }
+    }
+    (!counts.is_empty()).then_some(counts)
+}
+
 /// The /etc/ccache.conf of a build that asks for ccache.
 fn ccache_conf(cache: Option<&SharedCache>, starter: Starter) -> String {
     let mut conf = format!("stats_log = {FACTS_MOUNT}/{CCACHE_STATS}\n");
@@ -1006,6 +1025,10 @@ pub struct BuildParams {
     /// buildah a COPY whose wildcard matches nothing fails the build, under buildkit it copies
     /// nothing. buildkit is experimental
     pub builder: Option<jobs::Builder>,
+    /// How the layers the build adds are compressed: "gzip" (default) or "zstd". zstd exports a
+    /// large image several times faster and makes it an OCI image, which the registries and
+    /// runtimes it reaches must take. Only buildkit builds zstd layers
+    pub compression: Option<jobs::Compression>,
 }
 
 /// A cache a build declares.
@@ -1118,6 +1141,10 @@ pub struct StatusReply {
     /// The JSON object the build wrote to `/buildit/facts.json`, once it has ended
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub facts: Option<serde_json::Map<String, serde_json::Value>>,
+    /// How many times each ccache result occurred, from `ccache-stats.log`, once a build with
+    /// `ccache` has ended: `direct_cache_hit`, `remote_storage_hit`, `cache_miss` and so on
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ccache: Option<std::collections::BTreeMap<String, u64>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1260,13 +1287,27 @@ fn fact(tar: &[u8], name: &str, limit: u64) -> Option<Vec<u8>> {
 }
 
 /// The object the build wrote to `facts.json`.
-fn facts(id: &BuildId, tar: &[u8]) -> Option<serde_json::Map<String, serde_json::Value>> {
+fn facts(id: &BuildId, tar: &[u8]) -> Option<Facts> {
     match serde_json::from_slice(&fact(tar, "facts.json", MAX_FACTS)?) {
         Ok(serde_json::Value::Object(facts)) => Some(facts),
         _ => {
             tracing::warn!("build {} left a facts.json that is not a JSON object", id.0);
             None
         }
+    }
+}
+
+/// How a build that asks for `asked` compresses its layers when `builder` builds it, on a server
+/// whose BuildKit builds use `default` unless they ask.
+fn compression(
+    asked: Option<jobs::Compression>,
+    builder: Option<jobs::Builder>,
+    default: jobs::Compression,
+) -> Result<jobs::Compression> {
+    match (asked, builder) {
+        (asked, Some(jobs::Builder::Buildkit)) => Ok(asked.unwrap_or(default)),
+        (Some(jobs::Compression::Gzip) | None, _) => Ok(jobs::Compression::Gzip),
+        (Some(other), _) => bail!("only a buildkit build makes {} layers", other.as_str()),
     }
 }
 
@@ -1858,6 +1899,7 @@ impl Broker {
         let context = caller.workspace.context(&p.context)?;
         let recipe = Recipe::of(&p)?;
         let builder = recipe.builder(p.builder, self.site.builder)?;
+        let compression = compression(p.compression, builder, self.site.compression)?;
         let dockerfile = RelPath::parse(p.dockerfile.as_deref().unwrap_or("Dockerfile"))?;
         let limit = timeout(p.timeout_s, DEFAULT_BUILD_TIMEOUT_S);
         let mounts = run_mounts(cache_mounts(&p.caches)?, p.ccache);
@@ -1912,7 +1954,7 @@ impl Broker {
                     p.target.as_deref(),
                     &p.build_args,
                     &jobs::build_dest(&self.site, caller.sandbox.as_str(), id.as_str()),
-                    self.site.compression,
+                    compression,
                     jobs::layer_cache_refs(
                         &self.site,
                         caller.sandbox.as_str(),
@@ -2229,6 +2271,10 @@ impl Broker {
             .and_then(|tar| fact(tar, jobs::STEPS_LOG, MAX_STEPS))
             .map(|steps| String::from_utf8_lossy(&steps).into_owned())
             .unwrap_or_default();
+        let ccache = archived
+            .as_deref()
+            .and_then(|tar| fact(tar, CCACHE_STATS, MAX_CCACHE_STATS))
+            .and_then(|stats| ccache_summary(stats.as_slice()));
         Ok(StatusReply {
             build_id: id.0.clone(),
             status: seen.snap.state.status(),
@@ -2240,6 +2286,7 @@ impl Broker {
             snapshotter: step::snapshotter(&steps),
             layer_cache: step::layer_cache_use(&steps),
             facts,
+            ccache,
         })
     }
 
@@ -3185,8 +3232,8 @@ mod tests {
         CacheWriters, Caller, Launcher, LogsParams, MCP_PATH, PushParams, PushTarget,
         ResourceServer, ResourceServerConfig, Response, SCOPE_BUILD, SCOPE_READ, SharedCache,
         Snapshots, Starter, StatusCode, TokenLine, ToolPolicy, TrustedIssuer, bind_socket,
-        bud_argv, buildctl_argv, cache_mounts, ccache_conf, layer_cache_scope, parse_tokens,
-        router, run_mounts, run_sandbox, socket_router, unpack,
+        bud_argv, buildctl_argv, cache_mounts, ccache_conf, ccache_summary, layer_cache_scope,
+        parse_tokens, router, run_mounts, run_sandbox, socket_router, unpack,
     };
     use crate::sandbox::{RelPath, SandboxDir, SandboxName, Workspace};
     use crucible_mcp_auth::access::{AccessRules, Call};
@@ -4015,6 +4062,52 @@ mod tests {
     }
 
     #[test]
+    fn a_build_may_ask_for_zstd_layers_which_only_buildkit_builds() {
+        use crate::jobs::Builder::{Buildah, Buildkit};
+        use crate::jobs::Compression::{Gzip, Uncompressed, Zstd};
+        use crate::mcp::compression;
+        let parse = |v: serde_json::Value| serde_json::from_value::<BuildParams>(v);
+        let asked = |v: &str| {
+            parse(serde_json::json!({ "context": "svc", "compression": v })).map(|p| p.compression)
+        };
+        assert_eq!(asked("zstd").unwrap(), Some(Zstd));
+        assert_eq!(asked("gzip").unwrap(), Some(Gzip));
+        assert!(asked("estargz").is_err());
+        assert_eq!(
+            parse(serde_json::json!({ "context": "svc" }))
+                .unwrap()
+                .compression,
+            None
+        );
+        let schema = serde_json::to_value(rmcp::schemars::schema_for!(BuildParams)).unwrap();
+        assert!(schema.to_string().contains("\"zstd\""), "{schema}");
+
+        for default in [Gzip, Zstd, Uncompressed] {
+            assert_eq!(compression(None, Some(Buildkit), default).unwrap(), default);
+            for asked in [Gzip, Zstd, Uncompressed] {
+                assert_eq!(
+                    compression(Some(asked), Some(Buildkit), default).unwrap(),
+                    asked
+                );
+            }
+            for builder in [Some(Buildah), None] {
+                assert_eq!(compression(None, builder, default).unwrap(), Gzip);
+                assert_eq!(compression(Some(Gzip), builder, default).unwrap(), Gzip);
+                for asked in [Zstd, Uncompressed] {
+                    let refused = compression(Some(asked), builder, default)
+                        .unwrap_err()
+                        .to_string();
+                    assert!(
+                        refused.contains("only a buildkit build")
+                            && refused.contains(asked.as_str()),
+                        "{builder:?}: {refused}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_build_may_name_its_builder_and_a_layer_build_has_none() {
         use crate::context::ContextDigest;
         use crate::jobs::Builder::{Buildah, Buildkit};
@@ -4797,6 +4890,22 @@ mod tests {
     }
 
     #[test]
+    fn a_ccache_stats_log_counts_each_result_across_compilations() {
+        let log = "# /src/a.c\ndirect_cache_hit\n# /src/b.c\ncache_miss\nremote_storage_miss\n\
+                   # /src/c.c\ndirect_cache_hit\n";
+        let summary = ccache_summary(log.as_bytes()).unwrap();
+        assert_eq!(
+            summary.into_iter().collect::<Vec<_>>(),
+            [
+                ("cache_miss".to_string(), 1),
+                ("direct_cache_hit".to_string(), 2),
+                ("remote_storage_miss".to_string(), 1),
+            ]
+        );
+        assert_eq!(ccache_summary("# /src/a.c\n".as_bytes()), None);
+    }
+
+    #[test]
     fn a_build_that_asks_for_ccache_gets_a_conf_for_the_cache_it_may_use() {
         let dir = tempfile::tempdir().unwrap();
         let token = dir.path().join("token");
@@ -4863,6 +4972,7 @@ mod tests {
 
     #[test]
     fn a_buildkit_build_is_one_buildctl_that_builds_and_pushes() {
+        use crate::jobs::Compression::Zstd;
         let df = RelPath::parse("docker/Dockerfile.gpu").unwrap();
         let args = BTreeMap::from([
             ("A".to_string(), "1".to_string()),
@@ -4903,6 +5013,18 @@ mod tests {
                 .any(|a| a.starts_with("target=") || a.starts_with("build-arg:")),
             "{plain:?}"
         );
+        let zstd = buildctl_argv(&df, None, &BTreeMap::new(), dest, Zstd, None).unwrap();
+        assert_eq!(
+            zstd.iter()
+                .zip(&plain)
+                .filter(|(z, p)| z != p)
+                .collect::<Vec<_>>(),
+            [(
+                &format!("type=image,name={dest},push=true,compression=zstd,oci-mediatypes=true"),
+                &format!("type=image,name={dest},push=true")
+            )]
+        );
+        assert_eq!(zstd.len(), plain.len());
         for bad in ["", "A=B"] {
             let args = BTreeMap::from([(bad.to_string(), "1".to_string())]);
             assert!(
@@ -5563,6 +5685,7 @@ mod tests {
                     caches: caches(),
                     ccache: true,
                     builder: None,
+                    compression: None,
                     base: None,
                     script: None,
                     path: None,
@@ -6147,6 +6270,7 @@ mod tests {
                             }],
                             ccache: false,
                             builder: None,
+                            compression: None,
                             base: None,
                             script: None,
                             path: None,
@@ -6835,6 +6959,7 @@ mod tests {
                 caches: Vec::new(),
                 ccache: false,
                 builder: None,
+                compression: None,
                 base: None,
                 script: None,
                 path: None,

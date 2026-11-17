@@ -70,5 +70,6 @@ changed = [
     "C-PLAYBOOK-LANE: only a command or evaluate task may declare early completion; any other task's declaration is refused on its session row and the run continues",
     '''C-TASK-FILES: a mapped instance's key may hold a separator or a dot; its captured and staged directory escapes %, /, \, NUL, and a leading . as %25, %2F, %5C, %00, and %2E, and the key stays raw in names, rows, inputs, and resume''',
     "C-SETTLED-JOIN: an instance is staged under its own name with its key escaped",
+    "C-PLAYBOOK-RERUN: a run on a partial clone keeps the identities of the file contents it fetched, and a rerun fetches those its clone lacks before restoring its workspace",
 ]
 fixed = ["C-PLAYBOOK-LANE no longer claims git memory survives a resume; C-PLAYBOOK-RESUME governs the rebuilt workspace"]

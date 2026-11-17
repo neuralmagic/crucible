@@ -989,7 +989,7 @@ export const ROUTES: Record<string, Json> = {
       max_cost: 5,
       max_time: '1h',
       advance_dedupe: false,
-      cursor: null,
+      cursor: { from: '$.scan.newest', param: 'since', path: null },
       cursor_value: null,
       cursor_updated_at: null,
       cron_expr: '*/30 * * * *',

@@ -911,6 +911,13 @@ function DraftStudio({ id }: { id: string }) {
             <span data-testid="draft-origin">
               <Mono size="data" tone="ink-3">{`from ${originLabel(origin)}`}</Mono>
             </span>
+            <Link
+              to={`/playbooks/drafts/${encodeURIComponent(id)}/history`}
+              className="font-mono text-micro text-ink-2 uppercase underline"
+              data-testid="draft-history"
+            >
+              History
+            </Link>
             <a
               href={`/api/playbook-drafts/${encodeURIComponent(id)}/tarball`}
               className="font-mono text-micro text-ink-2 uppercase underline"

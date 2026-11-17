@@ -924,16 +924,19 @@ mod tests {
         )
         .await
         .unwrap();
-        let store = Arc::new(crate::daemon::overrides::OverrideStore::new());
-        crate::daemon::overrides::QueueOverrideSink::new(store.clone(), WorkQueue::new()).submit(
-            Override {
+        let store = Arc::new(crate::daemon::overrides::OverrideStore::new(
+            db.pool().clone(),
+        ));
+        crate::daemon::overrides::QueueOverrideSink::new(store.clone(), WorkQueue::new())
+            .submit(Override {
                 key: IssueKey(key.into()),
                 kind: OverrideKind::Unpark,
                 reason: None,
                 priority: None,
                 actor: Some("Bob".into()),
-            },
-        );
+            })
+            .await
+            .unwrap();
         crate::daemon::overrides::apply_pending(&db, &store, key, true)
             .await
             .unwrap();

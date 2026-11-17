@@ -34,3 +34,29 @@ export function scheduleView(row: ScheduleRow): ScheduleView {
     detail: row.next_due_at ? `Next firing ${row.next_due_at}.` : 'No further occurrence ahead.',
   };
 }
+
+export type TestCursor = components['schemas']['TestCursor'];
+
+export type CursorFrom = TestCursor['from'];
+
+export const CURSOR_FROM: readonly { value: CursorFrom; label: string }[] = [
+  { value: 'stored', label: 'Stored' },
+  { value: 'none', label: 'None' },
+  { value: 'value', label: 'Value' },
+];
+
+export function isCursorFrom(raw: string): raw is CursorFrom {
+  return CURSOR_FROM.some((option) => option.value === raw);
+}
+
+/// The cursor a test firing sends, or null while a value is asked for and none is typed.
+export function testCursor(from: CursorFrom, value: string): TestCursor | null {
+  switch (from) {
+    case 'stored':
+      return { from: 'stored' };
+    case 'none':
+      return { from: 'none' };
+    case 'value':
+      return value.length === 0 ? null : { from: 'value', value };
+  }
+}

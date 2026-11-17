@@ -40,12 +40,23 @@ struct Sidecar {
     tree_digest: String,
 }
 
-/// Where working copies live: `$CRUCIBLE_DRAFTS_DIR`, else the app's data directory:
-/// `~/Library/Application Support` on macOS, else `$XDG_DATA_HOME` or `~/.local/share`.
-pub fn root() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("CRUCIBLE_DRAFTS_DIR") {
-        return Some(PathBuf::from(dir));
-    }
+/// Where working copies live: `$CRUCIBLE_DRAFTS_DIR`, else `configured`, else [`default_root`].
+pub fn root(configured: Option<&Path>) -> Option<PathBuf> {
+    chosen(
+        std::env::var_os("CRUCIBLE_DRAFTS_DIR").map(PathBuf::from),
+        configured,
+    )
+    .or_else(default_root)
+}
+
+/// The folder named for working copies: the environment's before the settings'.
+fn chosen(env: Option<PathBuf>, configured: Option<&Path>) -> Option<PathBuf> {
+    env.or_else(|| configured.map(Path::to_path_buf))
+}
+
+/// `crucible-playbooks/drafts` in the app's data directory: `~/Library/Application Support` on
+/// macOS, else `$XDG_DATA_HOME` or `~/.local/share`.
+pub fn default_root() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let base = if cfg!(target_os = "macos") {
         home?.join("Library/Application Support")
@@ -475,5 +486,18 @@ mod tests {
         }
         assert!(!root.path().join("escape").exists());
         assert!(Working::open(root.path(), "nothing").is_none());
+    }
+
+    #[test]
+    fn the_environment_names_the_drafts_folder_before_the_settings_do() {
+        use std::path::{Path, PathBuf};
+
+        use crate::draft::chosen;
+
+        let (env, set) = (PathBuf::from("/env/drafts"), Path::new("/set/drafts"));
+        assert_eq!(chosen(Some(env.clone()), Some(set)), Some(env.clone()));
+        assert_eq!(chosen(Some(env.clone()), None), Some(env));
+        assert_eq!(chosen(None, Some(set)), Some(set.to_path_buf()));
+        assert_eq!(chosen(None, None), None);
     }
 }

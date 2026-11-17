@@ -195,6 +195,8 @@ A build with `ccache: true` (`--ccache` on the CLI) gets a generated `/etc/ccach
 shared cache as remote storage (writing to it when the build may write) and logs each object's
 result to `/buildit/ccache-stats.log`. The file overrides any `/etc/ccache.conf` the image has and
 is not part of the image. It needs ccache 4.4 or later, which reads the `secondary_storage` key.
+Once the build ends, `status.ccache` counts each result in that log (`direct_cache_hit`,
+`remote_storage_hit`, `cache_miss`, ...), so a caller can see how much the cache saved.
 
 #### Building with BuildKit (experimental)
 
@@ -240,7 +242,9 @@ The layers a BuildKit build makes are zstd-compressed in an OCI manifest, in the
 cache, which containerd from 1.5, Docker from 23 and CRI-O pull. A base image's layers keep
 their compression. `--layer-compression` (`MCP_LAYER_COMPRESSION`) changes it: `gzip`, which is
 several times slower to export, or `uncompressed`, which exports about as fast as zstd and takes
-the layers' full size in the registry. With `mode=max` the cache holds every stage's layers, so
+the layers' full size in the registry. One build asks for another with
+`compression` (`--compression` on the CLI); a buildah or `base` build makes gzip layers and is
+refused anything else. With `mode=max` the cache holds every stage's layers, so
 that is large: one cold build of a 25 GB uncompressed image left about 69 GB there, in a
 repository nothing prunes.
 
