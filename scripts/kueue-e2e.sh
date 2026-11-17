@@ -70,6 +70,11 @@
 # LocalQueue crucible-e2e-b200 points at CLUSTER_QUEUE_B200 (default crucible-b200), and the
 # script checks that the task token was issued to the run with that SVID and to no sandbox, that
 # RESULT_TASK (default gpu) passed, and that its Jobs carry the run.
+# SUPERVISOR_IMAGE replaces the sandbox supervisor image, by default the published build of the
+# pinned OpenShell rev. AVOID_NODES replaces the nodes no run pod or sandbox lands on, by default
+# every node that is not amd64, as the contents of a TOML list ('"cpu-07", "gpu-01"'). It does
+# not reach the sandbox and supervisor pods the gateway creates; on OpenShift,
+# SANDBOX_NODE_SELECTOR sets SANDBOX_NS's project node selector for those.
 # KEEP=1 leaves everything behind.
 set -euo pipefail
 TASKS=${TASKS:-0}
@@ -215,13 +220,13 @@ kc get clusterqueue "$CLUSTER_QUEUE" >/dev/null 2>&1 || fail "no ClusterQueue $C
 
 LAUNCHER=$(kc auth whoami -o jsonpath='{.status.userInfo.username}')
 GATEWAY_PREFIX="spiffe://$TRUST_DOMAIN/openshell/gateway/"
-AVOID_NODES=$(kc get nodes -l 'kubernetes.io/arch!=amd64' -o json | jq -r '[.items[].metadata.name | "\"\(.)\""] | join(", ")')
+AVOID_NODES=${AVOID_NODES:-$(kc get nodes -l 'kubernetes.io/arch!=amd64' -o json | jq -r '[.items[].metadata.name | "\"\(.)\""] | join(", ")')}
 ISSUER="http://crucible-controller.$CTL_NS.svc.cluster.local:8080"
 KUEUE_URL="http://crucible-kueue.$KUEUE_NS.svc.cluster.local:8850/mcp"
 log "on $PLATFORM, launching as $LAUNCHER; SVIDs from $SVID_ISSUER under $GATEWAY_PREFIX (class $SPIRE_CLASS)"
 
 # The sandbox supervisor must come from the OpenShell rev the engine's gateway client links.
-SUPERVISOR_IMAGE=ghcr.io/neuralmagic/openshell-supervisor:sha-$(cd "$ROOT" && cargo xtask openshell-rev)
+SUPERVISOR_IMAGE=${SUPERVISOR_IMAGE:-ghcr.io/neuralmagic/openshell-supervisor:sha-$(cd "$ROOT" && cargo xtask openshell-rev)}
 fill() {
     sed -e "s|@LOOP_IMAGE@|$LOOP_IMAGE|g" -e "s|@KUEUE_IMAGE@|$KUEUE_IMAGE|g" \
         -e "s|@CONTROLLER_IMAGE@|$CONTROLLER_IMAGE|g" -e "s|@SUPERVISOR_IMAGE@|$SUPERVISOR_IMAGE|g" \
@@ -264,6 +269,10 @@ if [ "$PLATFORM" = kubernetes ]; then
         "$SANDBOX_NS=$SANDBOX_PSA" "$BUILD_NS=privileged"; do
         kc label namespace "${pair%%=*}" pod-security.kubernetes.io/enforce="${pair#*=}" --overwrite >/dev/null
     done
+fi
+if [ -n "${SANDBOX_NODE_SELECTOR:-}" ]; then
+    [ "$PLATFORM" = openshift ] || fail "SANDBOX_NODE_SELECTOR needs OpenShift's project node selector"
+    kc annotate namespace "$SANDBOX_NS" openshift.io/node-selector="$SANDBOX_NODE_SELECTOR" --overwrite >/dev/null
 fi
 
 log "deploying the controller, the namespaces and their RBAC"
