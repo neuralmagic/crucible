@@ -20,6 +20,7 @@ mod form;
 mod gfx;
 mod handoff;
 mod history;
+mod html_preview;
 #[cfg(not(target_arch = "wasm32"))]
 mod httpcache;
 #[cfg(target_arch = "wasm32")]
@@ -429,6 +430,8 @@ pub struct App {
     /// The captured file the Files tab shows, by key; the first listed when none is picked.
     pub run_file: Option<String>,
     pub files_md_source: bool,
+    pub files_html_source: bool,
+    pub html_preview_error: Option<String>,
     /// The workspace the user arranged; `None` lays each run out by its graph's depth.
     pub layout: Option<Workspace>,
     /// Panes picked from a tab bar while the layout follows the run, oldest first.
@@ -1819,6 +1822,8 @@ fn init() -> App {
         pack_md_source: false,
         run_file: None,
         files_md_source: false,
+        files_html_source: false,
+        html_preview_error: None,
         knobs: rune_knobs::Knobs::default(),
         page: Page::Runs,
         flight: None,
@@ -2086,7 +2091,7 @@ pub fn run() {
     #[cfg(target_arch = "wasm32")]
     rune::App::new(spec).on_open_url(open_link).run();
     #[cfg(not(any(feature = "hot", target_arch = "wasm32")))]
-    rune::App::new(spec)
+    html_preview::install(rune::App::new(spec))
         .on_open_url(open_link)
         .chrome(rune::Chrome {
             traffic_lights: Some(ui::TRAFFIC_LIGHTS),
