@@ -22,7 +22,6 @@ import {
   SectionHeader,
   Spinner,
   Status,
-  statusTone,
   useDataTable,
 } from '../ui';
 import type { StatusTone } from '../ui';
@@ -46,7 +45,7 @@ import {
   TextAreaField,
   TextField,
 } from './formControls';
-import { issueStatusColor } from './issueStatus';
+import { EventTransition } from './eventView';
 
 type KnobView = components['schemas']['KnobView'];
 type ConfigOverridesBody = components['schemas']['ConfigOverridesBody'];
@@ -730,13 +729,7 @@ const activityColumns = activityHelper.columns([
     id: 'transition',
     header: 'Transition',
     meta: { shrink: true },
-    cell: ({ row }) => (
-      <span className="flex items-center gap-2">
-        <Status status={row.original.from} tone={statusTone(issueStatusColor(row.original.from))} />
-        <Mono tone="ink-3">→</Mono>
-        <Status status={row.original.to} tone={statusTone(issueStatusColor(row.original.to))} />
-      </span>
-    ),
+    cell: ({ row }) => <EventTransition from={row.original.from} to={row.original.to} />,
   }),
   activityHelper.display({
     id: 'reason',

@@ -2,16 +2,18 @@
 
 use std::ops::Range;
 
-use rune::{Color, El, ScrollSpec, Span, TextStyle, Tx, col, el, icon, row, text};
+use rune::{Color, El, ScrollSpec, Span, TextEdit, TextStyle, Tx, col, el, icon, row, text};
 use rune_kit::syntax::SyntaxTheme;
 use rune_kit::{
     Button, ButtonVariant, IconButton, IconButtonVariant, Markdown, SegmentedControl, Spinner,
+    TextArea, TextInput,
 };
 use rune_theme_opencode::icons as oc;
 
 use crate::lsp::{self, Problem, Severity};
 use crate::pack::{PackFile, PackFiles};
 use crate::settings::LogFont;
+use crate::studio::Studio;
 use crate::syntax;
 use crate::ui::{Paint, rail};
 use crate::workspace::PaneKind;
@@ -19,20 +21,20 @@ use crate::{App, PackSource};
 
 /// Lines drawn per file; a longer file says how much it left out.
 const LINES: usize = 4000;
+const FILE_LIST: f32 = 190.0;
 /// Problems listed under a file before the list scrolls.
 const LISTED: usize = 4;
+/// Progress lines a drafting turn shows, newest last.
+const PROGRESS_SHOWN: usize = 12;
 
 pub(crate) fn pack_view(pack: Result<&PackFiles, &str>, font: LogFont, app: &App, p: &Paint) -> El {
-    let working = app
-        .remote
-        .working_pack
-        .as_ref()
-        .filter(|_| app.showing_working());
-    let pack = match (working, pack) {
-        (Some(pack), _) => pack,
-        (None, Ok(pack)) if !pack.files.is_empty() => pack,
-        (None, Ok(_)) => return note("This pack has no files to show.", "", p),
-        (None, Err(error)) => return note("Could not read the pack.", error, p),
+    if let Some(studio) = app.remote.studio.as_ref().filter(|_| app.showing_working()) {
+        return studio_view(studio, pack.is_ok(), font, app, p);
+    }
+    let pack = match pack {
+        Ok(pack) if !pack.files.is_empty() => pack,
+        Ok(_) => return note("This pack has no files to show.", "", p),
+        Err(error) => return note("Could not read the pack.", error, p),
     };
     let open = app
         .run
@@ -71,19 +73,6 @@ pub(crate) fn pack_view(pack: Result<&PackFiles, &str>, font: LogFont, app: &App
         .min_h(0.0)
         .gap(8.0)
         .child(toolbar(app, pack, p))
-        .children(app.run.draft_note.as_ref().map(|note| {
-            let (message, color) = match note {
-                Ok(message) => (message, p.c.text_muted),
-                Err(error) => (error, p.fail),
-            };
-            text(message.clone())
-                .font(p.k.ty.small)
-                .color(color)
-                .selectable(true)
-                .selection_color(p.k.selection())
-                .wrap()
-                .key("pack-draft-note")
-        }))
         .child(
             row()
                 .w_full()
@@ -98,15 +87,14 @@ pub(crate) fn pack_view(pack: Result<&PackFiles, &str>, font: LogFont, app: &App
         )
 }
 
-/// Where the pack came from, the switch between the run's pack and a working copy, and the
-/// draft's pull, save and launch.
+/// Where the pack came from, the switch between the run's pack and the studio, and the button
+/// that opens the studio.
 fn toolbar(app: &App, pack: &PackFiles, p: &Paint) -> El {
     let mut bar = row().w_full().gap(8.0).center_y().h(28.0);
     let draft = app.draft_target();
-    if app.remote.working_pack.is_some() {
-        let showing = usize::from(app.showing_working());
+    if app.remote.studio.is_some() {
         bar = bar.child(
-            SegmentedControl::new(&["Run", "Draft"], Some(showing))
+            SegmentedControl::new(&["Run", "Draft"], Some(0))
                 .label("Pack")
                 .width(Some(130.0))
                 .on_pick(|app: &mut App, i: usize, _: &mut Tx| {
@@ -137,22 +125,19 @@ fn toolbar(app: &App, pack: &PackFiles, p: &Paint) -> El {
     let Some((draft, template)) = draft else {
         return bar;
     };
-    if !app.showing_working() {
-        if app.remote.working_pack.is_none() {
-            let label = if template.is_some() { "Draft" } else { "Edit" };
-            bar = bar.child(
-                Button::new(label)
-                    .variant(ButtonVariant::Neutral)
-                    .on_press(|app: &mut App| app.pull_draft())
-                    .build(p.k)
-                    .help(match &template {
-                        Some(template) => format!("Copy {template} into draft {draft}"),
-                        None => format!("Pull draft {draft} into a local folder"),
-                    })
-                    .key("pack-draft"),
-            );
-        }
-        return bar;
+    if app.remote.studio.is_none() {
+        let label = if template.is_some() { "Draft" } else { "Edit" };
+        bar = bar.child(
+            Button::new(label)
+                .variant(ButtonVariant::Neutral)
+                .on_press(|app: &mut App| app.pull_draft())
+                .build(p.k)
+                .help(match &template {
+                    Some(template) => format!("Copy {template} into draft {draft}"),
+                    None => format!("Open draft {draft} in the studio"),
+                })
+                .key("pack-draft"),
+        );
     }
     let edited = app.remote.working_edited;
     if app.agent_available() {
@@ -168,6 +153,67 @@ fn toolbar(app: &App, pack: &PackFiles, p: &Paint) -> El {
                 .key("pack-agent"),
         );
     }
+    bar
+}
+
+/// The studio: a draft's files as editable buffers, the drafting turn above them, and the run
+/// they came from a switch away.
+fn studio_view(studio: &Studio, has_run: bool, font: LogFont, app: &App, p: &Paint) -> El {
+    col()
+        .key("studio")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .gap(8.0)
+        .child(studio_toolbar(studio, has_run, app, p))
+        .children(studio_note(studio, p))
+        .child(generate_panel(studio, app, p))
+        .child(
+            row()
+                .w_full()
+                .grow(1.0)
+                .min_h(0.0)
+                .gap(10.0)
+                .child(studio_files(studio, p))
+                .child(studio_editor(studio, font, p)),
+        )
+}
+
+/// The studio's own bar: which draft the buffers edit, the switch back to the run's pack, and
+/// the pull, save and launch of that draft.
+fn studio_toolbar(studio: &Studio, has_run: bool, app: &App, p: &Paint) -> El {
+    let mut bar = row().w_full().gap(8.0).center_y().h(28.0);
+    if has_run {
+        bar = bar.child(
+            SegmentedControl::new(&["Run", "Draft"], Some(1))
+                .label("Pack")
+                .width(Some(130.0))
+                .on_pick(|app: &mut App, i: usize, _: &mut Tx| {
+                    app.show_pack(if i == 1 {
+                        PackSource::Working
+                    } else {
+                        PackSource::Run
+                    })
+                })
+                .build(p.k)
+                .key("pack-source"),
+        );
+    }
+    bar = bar.child(
+        text(format!("draft {}", studio.draft))
+            .font(p.mono(11.0, 400.0))
+            .color(p.c.text_faint)
+            .selectable(true)
+            .selection_color(p.k.selection())
+            .grow(1.0)
+            .min_w(0.0)
+            .truncate_head()
+            .help_when_truncated(format!("draft {}", studio.draft)),
+    );
+    if app.remote.draft_busy {
+        return bar.child(Spinner::new().size(14.0).build(p.k));
+    }
+    let edited = studio.edited();
     bar.child(
         Button::new("Pull")
             .variant(ButtonVariant::Neutral)
@@ -177,7 +223,7 @@ fn toolbar(app: &App, pack: &PackFiles, p: &Paint) -> El {
             .help(if edited {
                 "Save or undo your edits first".to_string()
             } else {
-                format!("Replace with draft {draft}'s newest save")
+                format!("Replace with draft {}'s newest save", studio.draft)
             })
             .key("pack-pull"),
     )
@@ -189,7 +235,7 @@ fn toolbar(app: &App, pack: &PackFiles, p: &Paint) -> El {
                 ButtonVariant::Neutral
             })
             .disabled(!edited)
-            .on_press(|app: &mut App| app.save_draft())
+            .on_press(|app: &mut App| app.save_studio())
             .build(p.k)
             .key("pack-save"),
     )
@@ -199,8 +245,452 @@ fn toolbar(app: &App, pack: &PackFiles, p: &Paint) -> El {
             .disabled(edited)
             .on_press(|app: &mut App| app.launch_working())
             .build(p.k)
+            .help(if edited {
+                "Save first".to_string()
+            } else {
+                format!("Launch a run of draft {}", studio.draft)
+            })
             .key("pack-launch"),
     )
+}
+
+/// What the last sync said, over the buffers; a save another writer landed first also offers the
+/// reload that takes the server's newest version.
+fn studio_note(studio: &Studio, p: &Paint) -> Option<El> {
+    let note = studio.note.as_ref()?;
+    let (message, color) = match note {
+        Ok(message) => (message.clone(), p.c.text_muted),
+        Err(error) => (error.clone(), p.fail),
+    };
+    Some(
+        row()
+            .key("studio-note")
+            .w_full()
+            .gap(8.0)
+            .center_y()
+            .child(
+                text(message)
+                    .font(p.k.ty.small)
+                    .color(color)
+                    .selectable(true)
+                    .selection_color(p.k.selection())
+                    .wrap()
+                    .grow(1.0)
+                    .min_w(0.0),
+            )
+            .children(studio.stale.is_some().then(|| {
+                Button::new("Reload")
+                    .variant(ButtonVariant::Neutral)
+                    .on_press(|app: &mut App| app.pull_draft())
+                    .build(p.k)
+                    .key("studio-reload")
+            })),
+    )
+}
+
+/// The drafting turn: the intent it runs on, what its last answer left, and the turn's own
+/// progress while it runs.
+fn generate_panel(studio: &Studio, app: &App, p: &Paint) -> El {
+    let edited = studio.edited();
+    let disabled = edited || studio.generating || studio.intent.text.trim().is_empty();
+    let label = if studio.generating {
+        let elapsed = studio
+            .started
+            .map_or(0.0, |at| (app.clock - at).max(0.0))
+            .floor();
+        format!("Drafting\u{2026} {elapsed:.0}s")
+    } else {
+        "Generate".to_string()
+    };
+    col()
+        .key("studio-generate")
+        .w_full()
+        .padding(10.0)
+        .gap(8.0)
+        .radius(p.k.radius.lg)
+        .fill(p.c.layer_01)
+        .border(p.hair, p.c.border_muted)
+        .child(
+            TextArea::new(&studio.intent)
+                .placeholder(
+                    "Describe the experiment you want \u{2014} the model, the knob to sweep, how to rank the arms.",
+                )
+                .label("Intent")
+                .width(None)
+                .auto_grow(16, 64)
+                .max_height(520.0)
+                .on_edit(|app: &mut App| studio_intent_edit(app))
+                .build(p.k)
+                .key("studio-intent"),
+        )
+        .child(
+            text("The engine's drafting turn writes the next version from the newest save and this intent. It takes a few minutes.")
+                .font(p.k.ty.small)
+                .color(p.c.text_faint)
+                .wrap(),
+        )
+        .child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .center_y()
+                .child(
+                    Button::new(label)
+                        .variant(if disabled {
+                            ButtonVariant::Neutral
+                        } else {
+                            ButtonVariant::Submit
+                        })
+                        .disabled(disabled)
+                        .on_press(|app: &mut App| app.generate_studio())
+                        .build(p.k)
+                        .key("studio-generate-button"),
+                )
+                .children(edited.then(|| {
+                    text("seeds from the newest save")
+                        .font(p.mono(11.0, 400.0))
+                        .color(p.c.text_faint)
+                }))
+                .children(app.draft_failure().is_some().then(|| {
+                    Button::new("Re-draft from this failure")
+                        .variant(ButtonVariant::Neutral)
+                        .disabled(studio.generating)
+                        .on_press(|app: &mut App| app.redraft_studio())
+                        .build(p.k)
+                        .key("studio-redraft")
+                }))
+                .children(studio.report.as_ref().map(|report| {
+                    text(format!(
+                        "v{} \u{b7} {} rounds \u{b7} ${:.2} \u{b7} check {}",
+                        report.compile.version,
+                        report.rounds,
+                        report.cost_usd,
+                        if report.ok { "passed" } else { "failed" }
+                    ))
+                    .font(p.mono(11.5, 400.0))
+                    .color(p.c.text_muted)
+                    .selectable(true)
+                    .selection_color(p.k.selection())
+                    .truncate()
+                })),
+        )
+        .children(
+            studio
+                .report
+                .as_ref()
+                .filter(|report| report.over_budget)
+                .map(|_| {
+                    text("The drafting turn ran past its budget; what it wrote is stored as it stood.")
+                        .font(p.k.ty.small)
+                        .color(p.c.text_muted)
+                        .wrap()
+                }),
+        )
+        .children(
+            (studio.generating && !studio.progress.lines.is_empty())
+                .then(|| progress_box(studio, p)),
+        )
+}
+
+/// The drafting turn's progress, newest last.
+fn progress_box(studio: &Studio, p: &Paint) -> El {
+    let from = studio.progress.lines.len().saturating_sub(PROGRESS_SHOWN);
+    let mut body = col().gap(0.0);
+    for entry in &studio.progress.lines[from..] {
+        body = body.child(
+            row()
+                .key(format!("studio-progress-{}", entry.round))
+                .gap(8.0)
+                .child(
+                    text(format!("r{}", entry.round))
+                        .font(p.mono(11.5, 400.0))
+                        .color(p.c.text_faint)
+                        .min_w(22.0),
+                )
+                .child(
+                    text(entry.line.clone())
+                        .font(p.mono(11.5, 400.0))
+                        .color(p.c.text_muted)
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .wrap(),
+                ),
+        );
+    }
+    col()
+        .key("studio-progress")
+        .w_full()
+        .max_h(224.0)
+        .padding(8.0)
+        .radius(p.k.radius.md)
+        .border(p.hair, p.c.border_muted)
+        .scroll(ScrollSpec { stick_bottom: true })
+        .child(body)
+}
+
+/// The draft's files, the one the editor shows picked out, and the field that adds one.
+fn studio_files(studio: &Studio, p: &Paint) -> El {
+    let mut list = col()
+        .key("studio-files")
+        .w(FILE_LIST)
+        .h_full()
+        .min_h(0.0)
+        .gap(1.0)
+        .padding(6.0)
+        .radius(p.k.radius.lg)
+        .fill(p.c.layer_01)
+        .border(p.hair, p.c.border_muted)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .scroll_edge_fade(8.0);
+    for (path, edit) in &studio.files {
+        let selected = studio.active.as_deref() == Some(path.as_str());
+        let flagged = studio.compile.as_ref().is_some_and(|compile| {
+            compile
+                .diagnostics
+                .iter()
+                .any(|found| found.file.as_deref() == Some(path.as_str()))
+        });
+        let edited_file = studio
+            .saved
+            .get(path)
+            .is_none_or(|saved| saved != &edit.text);
+        list = list.child(studio_file_row(path, selected, edited_file, flagged, p));
+    }
+    list.child(
+        TextInput::new(&studio.adding)
+            .placeholder("Add a file\u{2026}")
+            .label("New file")
+            .on_edit(|app: &mut App| studio_adding_edit(app))
+            .on_submit(|app: &mut App, _: &mut Tx| app.add_studio_file())
+            .build(p.k)
+            .key("studio-add-file"),
+    )
+}
+
+/// One file of the studio's buffers: picked to edit, marked when edited or refused by the
+/// compile, and removable.
+fn studio_file_row(path: &str, selected: bool, edited: bool, flagged: bool, p: &Paint) -> El {
+    let (dir, name) = match path.rsplit_once('/') {
+        Some((dir, name)) => (format!("{dir}/"), name.to_string()),
+        None => (String::new(), path.to_string()),
+    };
+    let pick = path.to_string();
+    let gone = path.to_string();
+    row()
+        .key(format!("studio-file-{path}"))
+        .role("button")
+        .label(format!("Show {path}"))
+        .w_full()
+        .h(26.0)
+        .px(6.0)
+        .gap(6.0)
+        .center_y()
+        .radius(p.k.radius.md)
+        .fill(if selected {
+            p.c.pressed
+        } else {
+            Color::TRANSPARENT
+        })
+        .hover(p.c.hover)
+        .focusable(true)
+        .on_press(move |app: &mut App| {
+            if let Some(studio) = app.remote.studio.as_mut() {
+                studio.active = Some(pick.clone());
+            }
+        })
+        .child(icon(&oc::CODE_LINES, 14.0).min_w(14.0).color(if selected {
+            p.c.icon_base
+        } else {
+            p.c.icon_faint
+        }))
+        .child(
+            row()
+                .grow(1.0)
+                .min_w(0.0)
+                .children(
+                    (!dir.is_empty())
+                        .then(|| text(dir).font(p.mono(11.0, 400.0)).color(p.c.text_faint)),
+                )
+                .child(
+                    text(name)
+                        .font(p.mono(11.0, if selected { 500.0 } else { 400.0 }))
+                        .color(if selected {
+                            p.c.text_base
+                        } else {
+                            p.c.text_muted
+                        })
+                        .truncate(),
+                ),
+        )
+        .children(match (flagged, edited) {
+            (true, _) => Some(el().size(6.0, 6.0).min_w(6.0).radius(3.0).fill(p.fail)),
+            (false, true) => Some(el().size(6.0, 6.0).min_w(6.0).radius(3.0).fill(p.live)),
+            _ => None,
+        })
+        .child(
+            IconButton::new(&oc::CLOSE)
+                .variant(IconButtonVariant::GhostMuted)
+                .label(format!("Remove {path}"))
+                .on_press(move |app: &mut App| app.remove_studio_file(&gone))
+                .build(p.k)
+                .key(format!("studio-file-remove-{path}")),
+        )
+}
+
+/// The file the studio edits, as a text area, with the compile's refusals under it.
+fn studio_editor(studio: &Studio, font: LogFont, p: &Paint) -> El {
+    let active = studio
+        .active
+        .as_deref()
+        .and_then(|path| studio.files.get(path).map(|edit| (path, edit)));
+    let Some((path, edit)) = active else {
+        return note(
+            "This draft holds no files.",
+            "Add one below the file list, or generate a version from an intent.",
+            p,
+        );
+    };
+    let found: Vec<&crux::dto::Diagnostic> = studio
+        .compile
+        .iter()
+        .flat_map(|compile| compile.diagnostics.iter())
+        .filter(|found| found.file.as_deref() == Some(path))
+        .collect();
+    let style = p.sized(TextStyle::new(11.5, 400.0).lh(18.0).family(font.family()));
+    let held = path.to_string();
+    let area = TextArea::new(edit)
+        .text_style(style)
+        .auto_grow(12, 100_000)
+        .on_edit(move |app: &mut App| studio_file_edit(app, &held))
+        .build(p.k)
+        .key(format!("studio-editor-{path}"));
+    col()
+        .key("studio-editor")
+        .grow(1.0)
+        .min_w(0.0)
+        .min_h(0.0)
+        .gap(6.0)
+        .child(
+            row()
+                .w_full()
+                .h(20.0)
+                .gap(8.0)
+                .center_y()
+                .child(
+                    text(path.to_string())
+                        .font(p.mono(11.5, 500.0))
+                        .color(p.c.text_base)
+                        .selectable(true)
+                        .selection_color(p.k.selection()),
+                )
+                .child(
+                    text(format!("{} lines", edit.text.lines().count()))
+                        .font(p.k.ty.small)
+                        .color(p.c.text_faint),
+                )
+                .child(el().grow(1.0)),
+        )
+        .child(
+            col()
+                .key("studio-editor-scroll")
+                .w_full()
+                .grow(1.0)
+                .min_h(0.0)
+                .scroll(ScrollSpec {
+                    stick_bottom: false,
+                })
+                .scroll_edge_fade(16.0)
+                .child(area),
+        )
+        .children(studio_diagnostics(&found, p))
+}
+
+/// The compile's refusals in the file being edited, each with where it was found.
+fn studio_diagnostics(found: &[&crux::dto::Diagnostic], p: &Paint) -> Option<El> {
+    if found.is_empty() {
+        return None;
+    }
+    let mut list = col()
+        .key("studio-diagnostics")
+        .w_full()
+        .max_h(LISTED as f32 * 26.0 + 8.0)
+        .padding(4.0)
+        .gap(0.0)
+        .radius(p.k.radius.lg)
+        .fill(p.c.layer_01)
+        .border(p.hair, p.c.border_muted)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .scroll_edge_fade(6.0);
+    for (i, found) in found.iter().enumerate() {
+        let at =
+            found
+                .file
+                .as_deref()
+                .map_or_else(String::new, |file| match (found.line, found.col) {
+                    (Some(line), Some(col)) => format!("{file}:{line}:{col}"),
+                    (Some(line), None) => format!("{file}:{line}"),
+                    _ => file.to_string(),
+                });
+        list = list.child(
+            row()
+                .key(format!("studio-diagnostic-{i}"))
+                .w_full()
+                .h(26.0)
+                .px(8.0)
+                .gap(8.0)
+                .center_y()
+                .child(icon(&oc::CIRCLE_X, 13.0).min_w(13.0).color(p.fail))
+                .children((!at.is_empty()).then(|| {
+                    text(at)
+                        .font(p.mono(11.0, 500.0))
+                        .color(p.c.text_faint)
+                        .truncate()
+                }))
+                .child(
+                    text(found.message.clone())
+                        .font(p.k.ty.small)
+                        .color(p.c.text_base)
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .truncate(),
+                )
+                .help(found.message.clone()),
+        );
+    }
+    Some(list)
+}
+
+/// The studio's intent field, wherever the studio went.
+fn studio_intent_edit(app: &mut App) -> &mut TextEdit {
+    if let Some(studio) = app.remote.studio.as_mut() {
+        return &mut studio.intent;
+    }
+    &mut app.scratch
+}
+
+/// The file list's new-file field, wherever the studio went.
+fn studio_adding_edit(app: &mut App) -> &mut TextEdit {
+    if let Some(studio) = app.remote.studio.as_mut() {
+        return &mut studio.adding;
+    }
+    &mut app.scratch
+}
+
+/// The buffer `file` names, wherever the studio went.
+fn studio_file_edit<'a>(app: &'a mut App, file: &str) -> &'a mut TextEdit {
+    if let Some(edit) = app
+        .remote
+        .studio
+        .as_mut()
+        .and_then(|studio| studio.files.get_mut(file))
+    {
+        return edit;
+    }
+    &mut app.scratch
 }
 
 /// What the language server found in `file` of `pack`.

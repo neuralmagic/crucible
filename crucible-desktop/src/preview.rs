@@ -5,6 +5,7 @@
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -13,7 +14,8 @@ use crucible::plan::starlark::{compile_file_with, declared_params, parent_or_cwd
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::session::RunFold;
+use crate::session::{RunFold, TaskView};
+use crucible_contract::emits::{DeclaredFile, EmitWire};
 
 /// What compiling a pack produced: its plan as a run's first event leaves it, and why it did not
 /// compile when it did not.
@@ -34,6 +36,87 @@ impl Preview {
         let source = self.source.clone()?;
         let text = std::fs::read_to_string(&source).unwrap_or_default();
         Some((source, definition_line(&text, task)))
+    }
+}
+
+/// The compile the controller holds for a draft's save, folded the way a run's first event
+/// leaves it: the graph and declared fields show what a launch of that version would start.
+/// This is the browser's only preview — the engine compiles on the desktop, the controller
+/// compiles for the studio — so the two share this shape.
+pub fn from_compile(compile: &crux::dto::DraftCompile) -> Preview {
+    let mut preview = Preview {
+        params_schema: compile.params_schema.clone(),
+        ..Preview::default()
+    };
+    let Some(graph) = &compile.graph else {
+        return preview;
+    };
+    let mut depends: HashMap<&str, Vec<String>> = HashMap::new();
+    for edge in &graph.edges {
+        depends
+            .entry(edge.to.as_str())
+            .or_default()
+            .push(edge.from.clone());
+    }
+    preview.fold.tasks = graph
+        .nodes
+        .iter()
+        .map(|node| {
+            task_of(
+                node,
+                depends.get(node.name.as_str()).map_or(&[], Vec::as_slice),
+            )
+        })
+        .collect();
+    preview
+}
+
+/// One compiled task as the run views draw it: the plan's shape without any attempt on it.
+fn task_of(node: &crux::dto::WorkflowNode, depends_on: &[String]) -> TaskView {
+    TaskView {
+        name: node.name.clone(),
+        kind: node.kind.clone(),
+        depends_on: depends_on.to_vec(),
+        required: node.required,
+        session: node.session.clone().unwrap_or_default(),
+        over: node.fanout.as_ref().map_or_else(String::new, |fanout| {
+            format!("{}.{}", fanout.over_task, fanout.over_field)
+        }),
+        when: node.when.as_ref().map_or_else(String::new, when_of),
+        timeout: String::new(),
+        command: node.command.clone().unwrap_or_default(),
+        emits: node
+            .emits
+            .iter()
+            .map(|field| EmitWire {
+                field: field.clone(),
+                ty: None,
+            })
+            .collect(),
+        files: node
+            .emits_files
+            .iter()
+            .map(|path| DeclaredFile::from(path.clone()))
+            .collect(),
+        keyed: node.keyed.clone(),
+        attempt: None,
+        result: None,
+        instances: Vec::new(),
+        revise: Vec::new(),
+        max_rounds: 0,
+        revised: None,
+        rounds: Vec::new(),
+        started_at: None,
+    }
+}
+
+/// `route.question in a|b`, the shape a plan's `when` carries on the wire.
+fn when_of(when: &crux::dto::WorkflowWhen) -> String {
+    let head = format!("{}.{}", when.route, when.question);
+    if when.labels.is_empty() {
+        head
+    } else {
+        format!("{head} in {}", when.labels.join("|"))
     }
 }
 
@@ -213,7 +296,36 @@ fn location(message: &str, pack: &Path) -> Option<(PathBuf, u32)> {
 mod tests {
     use std::path::Path;
 
-    use crate::preview::{compile, definition_line};
+    use crate::preview::{compile, definition_line, from_compile};
+
+    #[test]
+    fn a_compiled_draft_folds_the_way_a_runs_first_event_would() {
+        let compile: crux::dto::DraftCompile = serde_json::from_value(serde_json::json!({
+            "version": 3,
+            "graph": {
+                "nodes": [
+                    {"name": "scan", "kind": "command", "required": true, "emits": ["cves"], "command": "true"},
+                    {"name": "fix", "kind": "agent", "prompt": "p", "session": "fixes",
+                     "fanout": {"over_task": "scan", "over_field": "cves", "max_fanout": 4},
+                     "when": {"route": "triage", "question": "severity", "labels": ["high", "low"]},
+                     "emits_files": ["report.md"]}
+                ],
+                "edges": [{"from": "scan", "to": "fix"}]
+            }
+        }))
+        .unwrap();
+        let preview = from_compile(&compile);
+        let names: Vec<&str> = preview.fold.tasks.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["scan", "fix"]);
+        let fix = &preview.fold.tasks[1];
+        assert_eq!(fix.depends_on, ["scan"]);
+        assert_eq!(fix.over, "scan.cves");
+        assert_eq!(fix.when, "triage.severity in high|low");
+        assert_eq!(fix.session, "fixes");
+        assert_eq!(fix.files[0].path, "report.md");
+        assert_eq!(preview.fold.tasks[0].command, "true");
+        assert_eq!(preview.fold.tasks[0].emits[0].field, "cves");
+    }
 
     #[test]
     fn a_task_is_found_where_its_name_is_written() {

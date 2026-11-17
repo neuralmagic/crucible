@@ -1,6 +1,7 @@
 import { useMemo } from 'react';
 import type { components } from '../api/schema';
 import { $api } from '../api/client';
+import { useRunGraph } from '../api/useRunGraph';
 import { FoldSection, Section, SectionBody, SectionHeader } from '../ui';
 import { runGraphView, targetLabel } from './taskGraph';
 import type { OutputNode } from './taskGraph';
@@ -12,12 +13,7 @@ export type RunGraph = components['schemas']['RunGraphDto'];
 /// admitted a plan (every run from before the work-graph executor), which leaves `data` undefined —
 /// so the whole panel simply isn't there rather than showing an error a reader can do nothing about.
 export function RunTaskGraph({ runId, engineBounds = false }: { runId: string; engineBounds?: boolean }) {
-  const query = $api.useQuery(
-    'get',
-    '/api/runs/{run_id}/graph',
-    { params: { path: { run_id: runId } } },
-    { retry: 2 },
-  );
+  const query = useRunGraph(runId);
   const detail = $api.useQuery('get', '/api/runs/{run_id}', {
     params: { path: { run_id: runId } },
   });

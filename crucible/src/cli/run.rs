@@ -79,7 +79,8 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
         // The engine runtime a `--propose` openshell turn runs on; held for the duration of
         // `scope::run`.
         let engine = crate::agent::engine::EngineCtx::new()?;
-        return crate::scope::run(args, engine.handle());
+        cli.run.compile_secret_rules();
+        return crate::scope::run(args, engine.handle(), cli.run.secret_rules.clone());
     }
 
     #[cfg(feature = "autoresearch")]
@@ -148,6 +149,13 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
         // The engine runtime an openshell grounded turn runs on.
         let engine = crate::agent::engine::EngineCtx::new()?;
         return crate::scope::rank_grounded::run(args, engine.handle());
+    }
+
+    // The intent-to-pack drafting turn the controller's draft studio shells.
+    #[cfg(feature = "autoresearch")]
+    if let Some(Cmd::Draft(args)) = cli.command {
+        let engine = crate::agent::engine::EngineCtx::new()?;
+        return crate::draft::run(args, engine.handle());
     }
 
     if let Some(Cmd::Plan { action }) = &cli.command {

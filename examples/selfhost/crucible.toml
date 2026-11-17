@@ -31,6 +31,7 @@ frozen = true
 backend       = "openshell"
 harness       = "claude"
 model         = "claude-opus-4-6"
+allowed_tools = ["Read", "Edit", "Write", "Glob", "Grep", "Bash"]
 sandbox_image = "quay.io/wseaton/crucible-sandbox-rust@sha256:031c9dc4f513b5ac6517ec617825d39ca7ff4d79e0f8bc60f9211edd4d529b95"
 method_prompt = "method.md"
 goal          = "Cut the ns/line of StreamJsonParser over the bench corpus. Target: under 450 (half the baseline)."

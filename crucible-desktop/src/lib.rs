@@ -375,8 +375,6 @@ pub struct RunView {
     pub pack_file: Option<String>,
     /// The pack the user picked to show; `None` shows a draft run's working copy.
     pub pack_source: Option<PackSource>,
-    /// What the last pull or save said.
-    pub draft_note: Option<Result<String, String>>,
     /// Where the last brief for an agent was written, or why it was not.
     pub handoff_note: Option<Result<PathBuf, String>>,
 }
@@ -502,6 +500,8 @@ pub struct App {
     pub local_error: Option<String>,
     /// Why the controller refused the team last acted as, until the next pick.
     pub act_as_refused: Option<String>,
+    /// The loop's clock as of this poll, for elapsed times.
+    pub clock: f64,
 }
 
 impl App {
@@ -1135,9 +1135,11 @@ impl App {
         self.remote.live_detail = snapshot.detail;
         self.remote.live_base = snapshot.base;
         self.remote.registered = snapshot.registered;
+        self.remote.drafts = snapshot.drafts;
         self.answer_rerun(snapshot.reran);
         self.answer_launcher(snapshot.prepared, snapshot.launched);
-        self.answer_draft(snapshot.synced);
+        self.answer_studio(snapshot.studio);
+        self.apply_progress(snapshot.progressed);
         self.answer_drop(snapshot.dropped);
         self.answer_file(snapshot.file);
         self.answer_revisions(snapshot.revisions);
@@ -1151,13 +1153,15 @@ impl App {
             (Backend::Local, Some(Selection::Local(name))) => {
                 self.visible_packs().any(|pack| &pack.name == name)
             }
-            (Backend::Controller, Some(Selection::Live { playbook, .. })) => match &*self
-                .remote
-                .live
-            {
-                LiveView::Ready { .. } => self.remote.live.launches_of(playbook).next().is_some(),
-                LiveView::Loading | LiveView::Unavailable(_) => true,
-            },
+            (Backend::Controller, Some(Selection::Live { playbook, .. })) => {
+                match &*self.remote.live {
+                    LiveView::Ready { .. } => {
+                        self.remote.live.launches_of(playbook).next().is_some()
+                            || self.remote.drafts.iter().any(|draft| &draft.id == playbook)
+                    }
+                    LiveView::Loading | LiveView::Unavailable(_) => true,
+                }
+            }
             _ => false,
         };
         if !valid {
@@ -1776,6 +1780,7 @@ fn init() -> App {
         flight: None,
         local_error: None,
         act_as_refused: None,
+        clock: 0.0,
     }
 }
 
@@ -1812,6 +1817,7 @@ fn setup(app: &mut App, waker: Waker) {
 /// Nothing here touches a file, a process or the network: the workers own all of that and wake the
 /// loop once per finished snapshot.
 fn poll(app: &mut App, clock: f64, tx: &mut Tx) -> bool {
+    app.clock = clock;
     let mut changed = app.ignition.tick(clock);
     if let Some((version, snapshot)) = app.local.take(app.local_seen) {
         app.local_seen = version;
@@ -1871,6 +1877,7 @@ fn poll(app: &mut App, clock: f64, tx: &mut Tx) -> bool {
     app.history.saw(place);
     changed |= app.refresh_working();
     changed |= app.refresh_agent();
+    changed |= app.tick_studio(clock, tx);
     changed |= app.finish_sign_in();
     changed |= app.finish_login_editor();
     changed |= app.finish_release_check();

@@ -3076,6 +3076,7 @@ if [ -f "$d/turn-$n.json" ]; then cat "$d/turn-$n.json"; elif [ -f "$d/default.j
             harness: None,
             codex: Default::default(),
             disallowed_tools: Vec::new(),
+            allowed_tools: Vec::new(),
             reasoning_effort: None,
             agent_backend: crate::manifest::AgentBackend::Command,
             sandbox_image: None,

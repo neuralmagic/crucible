@@ -426,6 +426,15 @@ impl Transport for CachedTransport {
         self.read(path).await
     }
 
+    async fn send_long(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<(StatusCode, String)> {
+        self.inner.send_long(method, path, body).await
+    }
+
     async fn events(
         &self,
         path: &str,

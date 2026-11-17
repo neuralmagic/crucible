@@ -392,6 +392,8 @@ pub struct DraftVersionRow {
     pub core_rev: String,
     pub created_by: Option<String>,
     pub created_at: String,
+    /// The intent a generate was handed to write this version; an editor save carries none.
+    pub intent: Option<String>,
 }
 
 impl DraftVersionRow {
@@ -410,6 +412,7 @@ impl DraftVersionRow {
             core_rev: row.try_get("core_rev")?,
             created_by: row.try_get("created_by")?,
             created_at: row.try_get("created_at")?,
+            intent: row.try_get("intent")?,
         })
     }
 }
@@ -745,19 +748,21 @@ pub async fn create(
         return Err(DraftError::Conflict(format!("draft {id:?} already exists")));
     }
 
-    save_version(pool, id, files, actor, None).await
+    save_version(pool, id, files, actor, None, None).await
 }
 
 /// Store a save: store the file map's tree, compile it, and write the next version row either
 /// way. A `base_version` that is not the newest save is refused with [`DraftError::StaleBase`]
 /// carrying the version that overtook it, so the writer re-reads and merges instead of clobbering
-/// the other editor; `None` appends onto whatever is latest.
+/// the other editor; `None` appends onto whatever is latest. `intent` is what a generate was
+/// handed; an editor save passes `None` and stores none.
 pub async fn save_version(
     pool: &PgPool,
     id: &str,
     files: BTreeMap<String, String>,
     actor: Option<&str>,
     base_version: Option<i64>,
+    intent: Option<&str>,
 ) -> Result<SavedVersion, DraftError> {
     let draft = get(pool, id)
         .await
@@ -880,8 +885,8 @@ pub async fn save_version(
                                                 params_schema, schema_digest, graph, diagnostics,
                                                 agent_backend, agent_sandbox_image, core_rev,
                                                 created_by, created_at, agent_requirements,
-                                                tree_digest)
-           VALUES ($1, $14, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $15, $16)
+                                                tree_digest, intent)
+           VALUES ($1, $14, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $15, $16, $17)
            RETURNING version"#,
     )
     .bind(id)
@@ -904,6 +909,7 @@ pub async fn save_version(
     .bind(current + 1)
     .bind(agent.as_ref().map(|a| a.requirements_json()))
     .bind(tree_digest.as_str())
+    .bind(intent)
     .fetch_one(&mut *tx)
     .await
     .context("storing a draft version")
@@ -998,7 +1004,8 @@ pub async fn get(pool: &PgPool, id: &str) -> Result<Option<DraftRow>> {
 /// A draft's save history, newest first.
 pub async fn versions(pool: &PgPool, id: &str) -> Result<Vec<DraftVersionRow>> {
     let rows = sqlx::query(
-        r#"SELECT version, tree_digest, schema_digest, diagnostics, core_rev, created_by, created_at
+        r#"SELECT version, tree_digest, schema_digest, diagnostics, core_rev, created_by, created_at,
+                  intent
            FROM playbook_draft_versions WHERE draft_id = $1 ORDER BY version DESC"#,
     )
     .bind(id)
@@ -1094,6 +1101,7 @@ pub async fn files(
         saved_by: head.saved_by,
         saved_at: head.saved_at,
         diagnostics: head.diagnostics,
+        intent: head.intent,
         files: crate::playbooks::packs::text_files(tree)?,
     }))
 }
@@ -1137,6 +1145,8 @@ pub struct DraftFiles {
     pub saved_by: Option<String>,
     pub saved_at: String,
     pub diagnostics: Vec<Diagnostic>,
+    /// The intent a generate was handed to write this version; an editor save carries none.
+    pub intent: Option<String>,
     pub files: BTreeMap<String, String>,
 }
 
@@ -1146,6 +1156,7 @@ struct VersionHead {
     saved_by: Option<String>,
     saved_at: String,
     diagnostics: Vec<Diagnostic>,
+    intent: Option<String>,
 }
 
 /// A stored version's pack, the newest when `version` is `None`.
@@ -1155,7 +1166,7 @@ async fn version_pack(
     version: Option<i64>,
 ) -> Result<Option<(VersionHead, PackTree)>> {
     let row = sqlx::query(const_format::formatcp!(
-        "SELECT version, created_by, created_at, diagnostics, {PACK_COLS}
+        "SELECT version, created_by, created_at, diagnostics, intent, {PACK_COLS}
          FROM playbook_draft_versions WHERE draft_id = $1 AND ($2::BIGINT IS NULL OR version = $2)
          ORDER BY version DESC LIMIT 1"
     ))
@@ -1175,6 +1186,7 @@ async fn version_pack(
         saved_at: row.try_get("created_at")?,
         diagnostics: serde_json::from_value(diagnostics)
             .context("decoding stored draft diagnostics")?,
+        intent: row.try_get("intent")?,
     };
     let pack = crate::playbooks::pack_trees::load_row(pool, &row)
         .await
@@ -1733,7 +1745,7 @@ mod tests {
                 crate::testing::fixtures::incompressible_text(500 * 1024, seed),
             );
         }
-        match save_version(&pool, "studio", files, None, None).await {
+        match save_version(&pool, "studio", files, None, None, None).await {
             Err(DraftError::Invalid(msg)) => assert!(msg.contains("delivery budget"), "{msg}"),
             other => panic!("expected a delivery-budget refusal, got {other:?}"),
         }
@@ -1788,7 +1800,7 @@ mod tests {
             )
             .to_string(),
         );
-        let saved = save_version(&pool, "studio", files.clone(), None, None)
+        let saved = save_version(&pool, "studio", files.clone(), None, None, None)
             .await
             .expect("save");
         assert!(saved.diagnostics.is_empty(), "{:?}", saved.diagnostics);
@@ -1816,7 +1828,7 @@ mod tests {
                 "[agent]\nbackend = \"openshell\"\nsandbox_image = \"ghcr.io/org/sandbox:latest\"\n",
             ),
         );
-        let saved = save_version(&pool, "studio", files, None, None)
+        let saved = save_version(&pool, "studio", files, None, None, None)
             .await
             .expect("save");
         assert!(saved.diagnostics.is_empty(), "{:?}", saved.diagnostics);
@@ -1857,7 +1869,7 @@ mod tests {
             "crucible.toml".to_string(),
             format!("{SKELETON_MANIFEST}\n[dispatch]\ntarget = \"cluster-z\"\n"),
         );
-        let saved = save_version(&pool, "pinned", files.clone(), None, None)
+        let saved = save_version(&pool, "pinned", files.clone(), None, None, None)
             .await
             .expect("save");
         assert!(saved.diagnostics.is_empty(), "{:?}", saved.diagnostics);
@@ -1904,7 +1916,7 @@ mod tests {
             "crucible.toml".to_string(),
             format!("{SKELETON_MANIFEST}\n[dispatch]\ntarget = \"cluster-a\"\n"),
         );
-        let saved = save_version(&pool, "pinned", files, None, None)
+        let saved = save_version(&pool, "pinned", files, None, None, None)
             .await
             .expect("save");
         assert!(
@@ -2012,7 +2024,7 @@ mod tests {
         )
         .await
         .expect("create");
-        let again = save_version(&pool, "studio", skeleton(), None, None)
+        let again = save_version(&pool, "studio", skeleton(), None, None, None)
             .await
             .expect("save");
         assert_eq!(again.version, 2);
@@ -2069,7 +2081,7 @@ mod tests {
         for n in 0..8 {
             files.insert(format!("docs/{n}.md"), format!("doc {n}\n"));
         }
-        save_version(&pool, "studio", files.clone(), None, None)
+        save_version(&pool, "studio", files.clone(), None, None, None)
             .await
             .expect("save");
         let mut saved = vec![files.clone()];
@@ -2077,7 +2089,7 @@ mod tests {
 
         for round in 0..5 {
             files.insert(format!("docs/{}.md", round % 8), format!("edit {round}\n"));
-            save_version(&pool, "studio", files.clone(), None, None)
+            save_version(&pool, "studio", files.clone(), None, None, None)
                 .await
                 .expect("save");
             saved.push(files.clone());
@@ -2105,6 +2117,56 @@ mod tests {
         }
     }
 
+    /// The intent a generate was handed rides on the version it wrote; an editor save after it
+    /// stores none. The run surface reads the prompt off the frozen version, so a save that lost
+    /// it would read as a pack nobody asked for.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_generate_intent_rides_on_its_version_and_an_editor_save_stores_none(pool: PgPool) {
+        create(
+            &pool,
+            "studio",
+            "a drafted pack",
+            DraftSeed::Skeleton,
+            Some("wren"),
+            &crate::authz::model::Principal::platform(),
+        )
+        .await
+        .expect("create");
+
+        let saved = save_version(
+            &pool,
+            "studio",
+            skeleton(),
+            Some("wren"),
+            Some(1),
+            Some("sweep the attention backends"),
+        )
+        .await
+        .expect("save");
+        let read = files(&pool, "studio", Some(saved.version))
+            .await
+            .expect("read")
+            .expect("the version exists");
+        assert_eq!(read.intent.as_deref(), Some("sweep the attention backends"));
+        assert_eq!(
+            versions(&pool, "studio")
+                .await
+                .expect("versions")
+                .first()
+                .and_then(|v| v.intent.as_deref()),
+            Some("sweep the attention backends"),
+        );
+
+        save_version(&pool, "studio", skeleton(), Some("wren"), Some(2), None)
+            .await
+            .expect("save");
+        let read = files(&pool, "studio", None)
+            .await
+            .expect("read")
+            .expect("the version exists");
+        assert_eq!(read.intent, None, "an editor save carries no intent");
+    }
+
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn saves_version_and_round_trip_the_file_map(pool: PgPool) {
         let (first, second, third) = {
@@ -2120,14 +2182,14 @@ mod tests {
             .expect("create");
             let mut files = skeleton();
             files.insert("skills/read/SKILL.md".to_string(), "read it\n".to_string());
-            let second = save_version(&pool, "studio", files.clone(), Some("wren"), Some(1))
+            let second = save_version(&pool, "studio", files.clone(), Some("wren"), Some(1), None)
                 .await
                 .expect("save");
             files.insert(
                 "skills/read/SKILL.md".to_string(),
                 "read it twice\n".to_string(),
             );
-            let third = save_version(&pool, "studio", files, Some("agent:author"), Some(2))
+            let third = save_version(&pool, "studio", files, Some("agent:author"), Some(2), None)
                 .await
                 .expect("save");
             (first, second, third)
@@ -2210,8 +2272,15 @@ mod tests {
             let mut agent_files = skeleton();
             agent_files.insert("notes.md".to_string(), "the agent's edit\n".to_string());
             tokio::join!(
-                save_version(&pool, "studio", human_files, Some("wren"), Some(1)),
-                save_version(&pool, "studio", agent_files, Some("agent:author"), Some(1)),
+                save_version(&pool, "studio", human_files, Some("wren"), Some(1), None),
+                save_version(
+                    &pool,
+                    "studio",
+                    agent_files,
+                    Some("agent:author"),
+                    Some(1),
+                    None
+                ),
             )
         };
 
@@ -2257,7 +2326,7 @@ mod tests {
         let merged = {
             let mut files = skeleton();
             files.insert("notes.md".to_string(), "both edits\n".to_string());
-            save_version(&pool, "studio", files, Some("wren"), Some(2)).await
+            save_version(&pool, "studio", files, Some("wren"), Some(2), None).await
         }
         .expect("a save from the current base lands");
         assert_eq!(merged.version, 3);
@@ -2280,7 +2349,7 @@ mod tests {
         let saved = {
             let mut files = skeleton();
             files.insert("workflow.star".to_string(), "dpeth\n".to_string());
-            save_version(&pool, "studio", files, None, None)
+            save_version(&pool, "studio", files, None, None, None)
                 .await
                 .expect("save")
         };
@@ -2353,7 +2422,7 @@ mod tests {
 
         // A retired draft is read-only: its bytes are the merged pack's history now.
         let refused = {
-            save_version(&pool, "studio", skeleton(), None, None)
+            save_version(&pool, "studio", skeleton(), None, None, None)
                 .await
                 .expect_err("retired")
         };
@@ -2632,7 +2701,7 @@ mod tests {
         .expect("create");
         let mut second = skeleton();
         second.insert("skills/read/SKILL.md".to_string(), "read it\n".to_string());
-        save_version(&pool, "studio", second.clone(), None, Some(1))
+        save_version(&pool, "studio", second.clone(), None, Some(1), None)
             .await
             .expect("save");
         let recorded = |version: i64| {
@@ -2726,7 +2795,7 @@ mod tests {
         let mut files = skeleton();
         files.insert("workflow.star".to_string(), source.to_string());
         let saved = {
-            save_version(&pool, "studio", files, None, None)
+            save_version(&pool, "studio", files, None, None, None)
                 .await
                 .expect("save")
         };
@@ -2759,7 +2828,7 @@ mod tests {
         let mut files = skeleton();
         files.insert("workflow.star".to_string(), source.to_string());
         let saved = {
-            save_version(&pool, "studio", files, None, None)
+            save_version(&pool, "studio", files, None, None, None)
                 .await
                 .expect("save")
         };
@@ -2787,7 +2856,7 @@ mod tests {
             "params = {}\ndpeth\n".to_string(),
         );
         let refused = {
-            save_version(&pool, "studio", broken, None, None)
+            save_version(&pool, "studio", broken, None, None, None)
                 .await
                 .expect("save")
         };
@@ -3087,7 +3156,7 @@ mod tests {
             .await
             .expect("create");
         }
-        save_version(&pool, "studio", skeleton(), Some("alice"), None)
+        save_version(&pool, "studio", skeleton(), Some("alice"), None, None)
             .await
             .expect("save");
         let secret = bind_secret(&pool, "studio", "studio_token").await;
@@ -3568,7 +3637,7 @@ mod tests {
         .expect("template");
         let mut edited = skeleton();
         edited.insert("notes.md".to_string(), "second save\n".to_string());
-        save_version(&pool, "studio", edited.clone(), Some("alice"), None)
+        save_version(&pool, "studio", edited.clone(), Some("alice"), None, None)
             .await
             .expect("save");
 
@@ -3779,7 +3848,7 @@ mod tests {
             );
 
             let start = std::time::Instant::now();
-            save_version(&pool, "studio", files.clone(), None, None)
+            save_version(&pool, "studio", files.clone(), None, None, None)
                 .await
                 .expect("save");
             let total = ms(start);

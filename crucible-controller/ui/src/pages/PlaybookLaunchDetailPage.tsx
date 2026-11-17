@@ -1,4 +1,3 @@
-import { useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { $api } from '../api/client';
 import { formatError } from '../api/errors';
@@ -22,6 +21,7 @@ import {
   statusTone,
 } from '../ui';
 import type { SpecItem } from '../ui';
+import { CancelLaunchControl } from './CancelLaunchControl';
 import { absoluteTime, relativeTime } from './journeyView';
 import {
   dispatchFailure,
@@ -42,8 +42,11 @@ import { runStatusColor } from './runStatus';
 import { formatCost } from './runReport';
 import { RerunSection } from './RerunSection';
 import { LaunchWallTime } from './LaunchWallTime';
+import { PackOverviewSection } from './PackOverviewSection';
 import { RunLinks } from './RunLinks';
 import { RunTaskGraph } from './RunTaskGraph';
+import { TaskOutputSection } from './TaskOutputSection';
+import { EngineLogSection } from './EngineLogSection';
 
 type LaunchDetail = components['schemas']['PlaybookLaunchDetailDto'];
 
@@ -74,36 +77,6 @@ export function PlaybookLaunchDetailPage() {
         <LaunchView detail={detail.data} />
       )}
     </>
-  );
-}
-
-/// Stops a running launch: the controller parks it and deletes its pods. A first press arms the
-/// button; the second sends the cancel.
-function CancelControl({ launchKey }: { launchKey: string }) {
-  const cancel = $api.useMutation('post', '/api/playbook-runs/{key}/cancel');
-  const [armed, setArmed] = useState(false);
-  if (cancel.isSuccess) {
-    return <span className="text-sm text-ink-3">Cancelling</span>;
-  }
-  return (
-    <div className="flex flex-col items-end gap-1">
-      <Button
-        className={cn('uppercase', armed && 'border border-red text-red')}
-        disabled={cancel.isPending}
-        onClick={() => {
-          if (armed) {
-            cancel.mutate({ params: { path: { key: launchKey } } });
-          } else {
-            setArmed(true);
-          }
-        }}
-      >
-        {armed ? 'Confirm cancel' : 'Cancel'}
-      </Button>
-      {cancel.isError && (
-        <span className="text-sm text-red">{formatError(cancel.error)}</span>
-      )}
-    </div>
   );
 }
 
@@ -167,7 +140,7 @@ function LaunchView({ detail }: { detail: LaunchDetail }) {
         aside={
           <div className="flex items-start gap-3">
             {specs.length > 0 && <Spec items={specs} />}
-            {launch.status === 'running' && <CancelControl launchKey={launch.key} />}
+            {launch.status === 'running' && <CancelLaunchControl launchKey={launch.key} />}
             <Button
               className="uppercase"
               render={<Link to={relaunchPath(launch.playbook, launch.key)} />}
@@ -182,7 +155,21 @@ function LaunchView({ detail }: { detail: LaunchDetail }) {
 
       <ParamsSection launch={launch} />
 
+      {launch.draft_version !== null &&
+        launch.draft_version !== undefined &&
+        detail.source_exists && (
+          <PackOverviewSection draftId={launch.playbook} version={launch.draft_version} />
+        )}
+
       {runId !== null && <RunTaskGraph runId={runId} engineBounds />}
+
+      {runId !== null && (
+        <TaskOutputSection runId={runId} live={detail.runs[0]?.status === 'running'} />
+      )}
+
+      {runId !== null && (
+        <EngineLogSection runId={runId} live={detail.runs[0]?.status === 'running'} />
+      )}
 
       {runId !== null && detail.runs[0]?.status !== 'running' && (
         <RerunSection detail={detail} runId={runId} />

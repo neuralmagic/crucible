@@ -30,6 +30,7 @@ import {
 import type { BreadcrumbItem, SpecItem, StatusTone } from '../ui';
 import { outcomeSummary, roundOutcomeTone, type RoundRecord } from './approvalEvidence';
 import { FormActions, FormError, Note } from './formControls';
+import { EventTransition } from './eventView';
 import { issueStatusColor, type IssueStatus } from './issueStatus';
 import {
   firstFailedStage,
@@ -300,13 +301,7 @@ const eventColumns = eventHelper.columns([
     id: 'transition',
     header: 'Transition',
     meta: { shrink: true },
-    cell: ({ row }) => (
-      <span className="flex items-center gap-2">
-        <Status status={row.original.from} tone={statusTone(issueStatusColor(row.original.from))} />
-        <Mono tone="ink-3">→</Mono>
-        <Status status={row.original.to} tone={statusTone(issueStatusColor(row.original.to))} />
-      </span>
-    ),
+    cell: ({ row }) => <EventTransition from={row.original.from} to={row.original.to} />,
   }),
   eventHelper.accessor('actor', {
     header: 'Actor',

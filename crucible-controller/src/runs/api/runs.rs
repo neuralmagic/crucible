@@ -129,6 +129,7 @@ pub(crate) async fn get_run(
     let candidates = crate::runs::store::list_candidates_for_run(state.db.pool(), &run_id).await?;
     let transport_losses =
         crate::runs::task_results::count_transport_losses(state.db.pool(), &run_id).await?;
+    let has_plan = crate::runs::task_results::has_run_plan(state.db.pool(), &run_id).await?;
     let agent_tools = match state.agent_tools {
         true => crate::runs::agent_tools::for_run(state.db.pool(), &run_id).await?,
         false => Vec::new(),
@@ -136,6 +137,7 @@ pub(crate) async fn get_run(
     let detail = RunDetail {
         run: RunDto::from_parts(run, issue_key, repo, agent, transport_losses),
         candidates: candidates.into_iter().map(CandidateDto::from).collect(),
+        has_plan,
         agent_tools,
     };
     Ok(Json(detail).into_response())

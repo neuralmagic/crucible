@@ -15,6 +15,7 @@ pub mod console;
 pub mod decision;
 pub mod decision_request;
 pub mod distress;
+pub mod draft;
 pub mod driver_env;
 pub mod emits;
 pub mod envelope;

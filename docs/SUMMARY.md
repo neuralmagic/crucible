@@ -7,6 +7,7 @@
 - [Your first playbook](./playbooks.md)
 - [Launching from webhooks](./webhooks.md)
 - [Drafting with a local agent](./desktop-agent-local.md)
+- [Captured files and reports](./run-files.md)
 - [Branching and review](./playbook-patterns.md)
 - [Workflow DSL reference](./dsl-reference.md)
 - [Work graphs](./work-graphs.md)

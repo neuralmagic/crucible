@@ -1,0 +1,43 @@
+diff --git a/crates/rune-kit/src/text_input.rs b/crates/rune-kit/src/text_input.rs
+index d9c4c966..8a9aedab 100644
+--- a/crates/rune-kit/src/text_input.rs
++++ b/crates/rune-kit/src/text_input.rs
+@@ -378,6 +378,7 @@ pub struct TextArea {
+     label: Option<String>,
+     placeholder: String,
+     width: Option<f32>,
++    style: Option<TextStyle>,
+     rows: usize,
+     grow: Option<(usize, usize)>,
+     max_height: Option<f32>,
+@@ -413,6 +414,7 @@ impl TextArea {
+             label: None,
+             placeholder: String::new(),
+             width: Some(280.0),
++            style: None,
+             rows: 3,
+             grow: None,
+             max_height: None,
+@@ -434,6 +436,11 @@ impl TextArea {
+         self.width = w;
+         self
+     }
++    /// The type the field's text takes; the UI type when none is set.
++    pub fn text_style(mut self, style: TextStyle) -> Self {
++        self.style = Some(style);
++        self
++    }
+     pub fn rows(mut self, r: usize) -> Self {
+         self.rows = r.max(1);
+         self
+@@ -496,7 +503,9 @@ impl TextArea {
+     pub fn build(self, k: &Kit) -> El {
+         let c = &k.c;
+         let disabled = self.state == State::Disabled;
+-        let style = TextStyle { line_height: (13.0f32 * 1.35 * 2.0).round() / 2.0, ..k.ty.ui };
++        let style = self
++            .style
++            .unwrap_or(TextStyle { line_height: (13.0f32 * 1.35 * 2.0).round() / 2.0, ..k.ty.ui });
+         let red = self.invalid && !disabled && k.invalid_text;
+         let ink = if red { c.danger.fg } else { c.text_base };
+         let hint = if red { c.danger.fg } else { c.text_faint };

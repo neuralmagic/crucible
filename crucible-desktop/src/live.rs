@@ -3,7 +3,7 @@
 //!
 //! The controller and its key come from the profile in use; see [`crate::profile`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -301,6 +301,8 @@ enum Msg {
     Reconnect,
     /// Which launch to read as the base of a comparison; `None` stops.
     Compare(Option<String>),
+    /// Read the drafts rail now.
+    RefreshDrafts,
 }
 
 /// What the window asks for that runs as a task of its own.
@@ -317,14 +319,28 @@ enum Action {
         run: String,
         from: Vec<String>,
     },
-    /// Pull a draft's newest save into its working copy, creating the draft from `template`
+    /// Pull a draft's newest save as the studio's buffers, creating the draft from `template`
     /// first when it does not exist.
     Pull {
         draft: String,
         template: Option<String>,
     },
-    /// Save a working copy as its draft's next version.
-    Save(Working),
+    /// Save the studio's buffers as its draft's next version.
+    SaveStudio {
+        draft: String,
+        files: BTreeMap<String, String>,
+        base: i64,
+    },
+    /// Hand an intent to the draft's drafting turn, which stores what it writes as the next
+    /// version.
+    Generate {
+        draft: String,
+        intent: String,
+    },
+    /// The drafting turn's progress lines.
+    Progress {
+        draft: String,
+    },
     /// Push a pack folder as the next version of the draft named after it, creating the draft on
     /// first drop, and test-fire it under these ceilings.
     Drop {
@@ -358,9 +374,14 @@ enum Reply {
         from: Vec<String>,
         result: Result<crux::dto::RerunPreview, String>,
     },
-    Synced {
+    Studio {
+        ask: StudioAsk,
         draft: String,
-        result: Result<(Working, Option<String>), String>,
+        result: Result<StudioReply, String>,
+    },
+    Progressed {
+        draft: String,
+        result: Result<crux::dto::DraftProgress, String>,
     },
     Dropped {
         dir: PathBuf,
@@ -375,6 +396,14 @@ impl Action {
     /// Whether the launch list changes when this lands.
     fn launches(&self) -> bool {
         matches!(self, Action::Launch { .. } | Action::Drop { .. })
+    }
+
+    /// Whether the drafts rail changes when this lands.
+    fn drafts(&self) -> bool {
+        matches!(
+            self,
+            Action::Pull { .. } | Action::SaveStudio { .. } | Action::Generate { .. }
+        )
     }
 
     async fn run(self, c: Connection, dirs: &Dirs) -> Reply {
@@ -395,13 +424,37 @@ impl Action {
                 Reply::Reran { run, from, result }
             }
             Action::Pull { draft, template } => {
-                let result = pull(&c, dirs.drafts.as_deref(), &draft, template.as_deref()).await;
-                Reply::Synced { draft, result }
+                let result =
+                    pull_studio(&c, dirs.drafts.as_deref(), &draft, template.as_deref()).await;
+                Reply::Studio {
+                    ask: StudioAsk::Pull,
+                    draft,
+                    result,
+                }
             }
-            Action::Save(working) => {
-                let draft = working.draft.clone();
-                let result = save(&c, dirs.drafts.as_deref(), working).await;
-                Reply::Synced { draft, result }
+            Action::SaveStudio { draft, files, base } => {
+                let result = save_studio(&c, dirs.drafts.as_deref(), &draft, &files, base).await;
+                Reply::Studio {
+                    ask: StudioAsk::Save,
+                    draft,
+                    result,
+                }
+            }
+            Action::Generate { draft, intent } => {
+                let result = generate_studio(&c, dirs.drafts.as_deref(), &draft, &intent).await;
+                Reply::Studio {
+                    ask: StudioAsk::Generate,
+                    draft,
+                    result,
+                }
+            }
+            Action::Progress { draft } => {
+                let result = within(
+                    "the drafting turn's progress",
+                    c.client.draft_generate_progress(&draft),
+                )
+                .await;
+                Reply::Progressed { draft, result }
             }
             Action::Drop {
                 dir,
@@ -449,12 +502,23 @@ impl Action {
                 from,
                 result: Err(why),
             },
-            Action::Pull { draft, .. } => Reply::Synced {
+            Action::Pull { draft, .. } => Reply::Studio {
+                ask: StudioAsk::Pull,
                 draft,
                 result: Err(why),
             },
-            Action::Save(working) => Reply::Synced {
-                draft: working.draft,
+            Action::SaveStudio { draft, .. } => Reply::Studio {
+                ask: StudioAsk::Save,
+                draft,
+                result: Err(why),
+            },
+            Action::Generate { draft, .. } => Reply::Studio {
+                ask: StudioAsk::Generate,
+                draft,
+                result: Err(why),
+            },
+            Action::Progress { draft, .. } => Reply::Progressed {
+                draft,
                 result: Err(why),
             },
             Action::Drop { dir, .. } => Reply::Dropped {
@@ -571,15 +635,15 @@ async fn send_launch(c: &Connection, target: &Target, body: &Value) -> Result<St
     Ok(ack.key)
 }
 
-/// Pull `draft`'s newest save into its working copy under `drafts`, creating it from `template`
-/// first when the controller has no such draft.
-async fn pull(
+/// Pull `draft`'s newest save as the studio's buffers, creating it from `template` first when
+/// the controller has no such draft. On the desktop the save is also written under `drafts`, so
+/// the working copy's watcher, language server and agent handoffs keep reading it.
+async fn pull_studio(
     c: &Connection,
     drafts: Option<&Path>,
     draft: &str,
     template: Option<&str>,
-) -> Result<(Working, Option<String>), String> {
-    let root = drafts.ok_or("no home directory for working copies")?;
+) -> Result<StudioReply, String> {
     let newest = within(
         "the draft",
         c.client.draft_files::<crux::dto::DraftFiles>(draft, None),
@@ -603,8 +667,36 @@ async fn pull(
         }
         (Err(error), None) => return Err(error),
     };
-    let working = Working::write(root, draft, files.version, &files.files)?;
-    Ok((working, note))
+    let compile = within(
+        "the draft's compile",
+        c.client
+            .draft_preview::<crux::dto::DraftCompile>(draft, None),
+    )
+    .await;
+    let compile = match compile {
+        // A save landing between the two reads leaves the compile a version ahead of the
+        // buffers: the files carry their own diagnostics, and the next pull reads the pair.
+        Ok(compile) if compile.version == files.version => Some(compile),
+        _ => Some(crux::dto::DraftCompile {
+            version: files.version,
+            saved_by: files.saved_by,
+            saved_at: files.saved_at,
+            schema_digest: None,
+            params_schema: None,
+            graph: None,
+            diagnostics: files.diagnostics,
+            dispatch: Default::default(),
+        }),
+    };
+    if let Some(root) = drafts {
+        Working::write(root, draft, files.version, &files.files)?;
+    }
+    Ok(StudioReply::Pulled {
+        version: files.version,
+        files: files.files,
+        compile: Box::new(compile),
+        note,
+    })
 }
 
 /// Push pack folder `dir` as the next version of `draft`, creating the draft on first drop, and
@@ -674,44 +766,60 @@ async fn drop_pack(
     Ok(DropOutcome::Launched(ack.key))
 }
 
-/// Save a working copy as its draft's next version.
-async fn save(
+/// Save the studio's `files` as `draft`'s next version from `base`, and on the desktop write
+/// them under `drafts` as the working copy of that version.
+async fn save_studio(
     c: &Connection,
     drafts: Option<&Path>,
-    mut working: Working,
-) -> Result<(Working, Option<String>), String> {
-    let root = drafts.ok_or("no home directory for working copies")?;
-    let (files, digest) = crate::draft::read(&working.dir)?;
+    draft: &str,
+    files: &BTreeMap<String, String>,
+    base: i64,
+) -> Result<StudioReply, String> {
     if files.is_empty() {
-        return Err("The working copy holds no files".to_string());
+        return Err("The draft holds no files".to_string());
     }
-    let saved = within(
-        "the save",
-        c.client.save_draft(&working.draft, &files, working.base),
-    )
-    .await?;
+    let saved = within("the save", c.client.save_draft(draft, files, base)).await?;
     match saved {
         crux::client::DraftSave::Saved(raw) => {
             let saved: crux::dto::DraftCompile =
                 serde_json::from_value(raw).map_err(|e| format!("reading the save: {e}"))?;
-            working.saved(root, saved.version, digest)?;
-            let errors: Vec<&str> = saved
-                .diagnostics
-                .iter()
-                .map(|d| d.message.as_str())
-                .collect();
-            let note = if saved.schema_digest.is_none() || !errors.is_empty() {
-                format!(
-                    "Saved version {}, which does not compile: {}",
-                    saved.version,
-                    errors.join("; ")
-                )
-            } else {
-                format!("Saved version {}", saved.version)
-            };
-            Ok((working, Some(note)))
+            if let Some(root) = drafts {
+                Working::write(root, draft, saved.version, files)?;
+            }
+            Ok(StudioReply::Saved(Box::new(saved)))
         }
-        crux::client::DraftSave::Stale(stale) => Err(stale.error),
+        crux::client::DraftSave::Stale(stale) => Ok(StudioReply::Stale(stale)),
+    }
+}
+
+/// Hand `intent` to `draft`'s drafting turn, then read the version it stored as the studio's
+/// next buffers and mirror it under `drafts` on the desktop.
+async fn generate_studio(
+    c: &Connection,
+    drafts: Option<&Path>,
+    draft: &str,
+    intent: &str,
+) -> Result<StudioReply, String> {
+    // No `within`: the turn takes minutes, the request rides to its end, and the server bounds
+    // the work by its own drafting budget.
+    let generated = c
+        .client
+        .generate_draft(draft, intent)
+        .await
+        .map_err(|error| format!("{error:#}"))?;
+    match generated {
+        crux::client::DraftGenerate::Generated(result) => {
+            let files: crux::dto::DraftFiles =
+                within("the drafted files", c.client.draft_files(draft, None)).await?;
+            if let Some(root) = drafts {
+                Working::write(root, draft, files.version, &files.files)?;
+            }
+            Ok(StudioReply::Generated {
+                files: files.files,
+                result,
+            })
+        }
+        crux::client::DraftGenerate::Stale(stale) => Ok(StudioReply::Stale(stale)),
     }
 }
 
@@ -822,12 +930,50 @@ pub struct Reran {
     pub result: Result<crux::dto::RerunPreview, String>,
 }
 
-/// A working copy pulled or saved, and what the controller said of the save.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Synced {
+/// Which studio action a reply answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StudioAsk {
+    Pull,
+    Save,
+    Generate,
+}
+
+/// What a studio action came to.
+#[derive(Clone, Debug)]
+pub enum StudioReply {
+    /// The draft's newest save as buffers, and what the controller made of it.
+    Pulled {
+        version: i64,
+        files: BTreeMap<String, String>,
+        compile: Box<Option<crux::dto::DraftCompile>>,
+        note: Option<String>,
+    },
+    /// The save landed, with the compile of the stored version.
+    Saved(Box<crux::dto::DraftCompile>),
+    /// The drafting turn's answer, stored as the next version with its files.
+    Generated {
+        files: BTreeMap<String, String>,
+        result: Box<crux::dto::GeneratedDraft>,
+    },
+    /// Another writer's save landed first.
+    Stale(crux::dto::StaleBase),
+}
+
+/// A studio pull, save or generate as it landed, for the buffers it answers.
+#[derive(Clone, Debug)]
+pub struct StudioDone {
+    pub seq: u64,
+    pub ask: StudioAsk,
+    pub draft: String,
+    pub result: Result<StudioReply, String>,
+}
+
+/// The drafting turn's progress as last read, for the studio polling it.
+#[derive(Clone, Debug)]
+pub struct Progressed {
     pub seq: u64,
     pub draft: String,
-    pub result: Result<(Working, Option<String>), String>,
+    pub result: Result<crux::dto::DraftProgress, String>,
 }
 
 /// A launch that stopped running, for the window to announce. `seq` only grows.
@@ -876,6 +1022,9 @@ struct Fetcher {
     /// Registered playbook ids, the ones a launch form can start, and when they were read.
     registered: Vec<String>,
     registered_at: Option<Instant>,
+    /// The drafts rail, and when it was read.
+    drafts: Vec<crux::dto::PlaybookDraft>,
+    drafts_at: Option<Instant>,
 }
 
 /// One launch's detail, as of the run count and status the launch list showed when it was read:
@@ -1097,6 +1246,8 @@ impl Fetcher {
             wake,
             registered: Vec::new(),
             registered_at: None,
+            drafts: Vec::new(),
+            drafts_at: None,
         }
     }
 
@@ -1124,6 +1275,27 @@ impl Fetcher {
         ids.sort();
         let changed = ids != self.registered;
         self.registered = ids;
+        changed
+    }
+
+    /// Re-reads the drafts rail at most once a minute, and right away when a studio action asks.
+    async fn refresh_drafts(&mut self, force: bool) -> bool {
+        if !force
+            && self
+                .drafts_at
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(60))
+        {
+            return false;
+        }
+        self.drafts_at = Some(Instant::now());
+        let Ok(connection) = self.connection().await else {
+            return false;
+        };
+        let Ok(drafts) = within("the drafts", connection.client.drafts()).await else {
+            return false;
+        };
+        let changed = drafts != self.drafts;
+        self.drafts = drafts;
         changed
     }
 
@@ -1778,10 +1950,13 @@ pub struct Snapshot {
     pub finished: Vec<Finished>,
     /// Registered playbook ids: the ones the app can launch.
     pub registered: Vec<String>,
+    /// The drafts rail: drafts as the controller lists them.
+    pub drafts: Vec<crux::dto::PlaybookDraft>,
     pub prepared: Option<Prepared>,
     pub launched: Option<Launched>,
     pub reran: Option<Reran>,
-    pub synced: Option<Synced>,
+    pub studio: Option<StudioDone>,
+    pub progressed: Option<Progressed>,
     pub dropped: Option<Dropped>,
     /// The captured file last fetched for the Files pane.
     pub file: Option<Opened>,
@@ -1795,6 +1970,7 @@ struct Polled {
     base: Option<Base>,
     finished: Vec<Finished>,
     registered: Vec<String>,
+    drafts: Vec<crux::dto::PlaybookDraft>,
 }
 
 /// The UI-side handle to the live worker. Dropping it ends the poll loop and its streams.
@@ -1836,6 +2012,7 @@ impl Shared {
         self.snapshot.base = polled.base;
         self.snapshot.finished = polled.finished;
         self.snapshot.registered = polled.registered;
+        self.snapshot.drafts = polled.drafts;
     }
 
     fn answered(&mut self, reply: Reply) {
@@ -1864,8 +2041,16 @@ impl Shared {
                     result,
                 });
             }
-            Reply::Synced { draft, result } => {
-                self.snapshot.synced = Some(Synced { seq, draft, result });
+            Reply::Studio { ask, draft, result } => {
+                self.snapshot.studio = Some(StudioDone {
+                    seq,
+                    ask,
+                    draft,
+                    result,
+                });
+            }
+            Reply::Progressed { draft, result } => {
+                self.snapshot.progressed = Some(Progressed { seq, draft, result });
             }
             Reply::Dropped { dir, draft, result } => {
                 self.snapshot.dropped = Some(Dropped {
@@ -1944,6 +2129,7 @@ impl Client {
         let (shared, tx) = (Arc::clone(&self.shared), self.tx.clone());
         runtime.spawn(async move {
             let launches = action.launches();
+            let drafts = action.drafts();
             let reply = match connector.connect().await {
                 Ok(connection) => action.run(connection, &dirs).await,
                 Err(why) => action.failed(why, &dirs),
@@ -1951,6 +2137,9 @@ impl Client {
             publish(&shared, |shared| shared.answered(reply));
             if launches {
                 let _ = tx.send(Msg::Refresh);
+            }
+            if drafts {
+                let _ = tx.send(Msg::RefreshDrafts);
             }
         });
     }
@@ -1981,7 +2170,7 @@ impl Client {
         });
     }
 
-    /// Pull `draft` into its working copy, creating it from `template` when it is missing.
+    /// Pull `draft` as the studio's buffers, creating it from `template` when it is missing.
     pub fn pull(&self, draft: &str, template: Option<&str>) {
         self.start(Action::Pull {
             draft: draft.to_string(),
@@ -1989,9 +2178,28 @@ impl Client {
         });
     }
 
-    /// Save `working` as its draft's next version.
-    pub fn save(&self, working: Working) {
-        self.start(Action::Save(working));
+    /// Save the studio's `files` as `draft`'s next version from `base`.
+    pub fn save_studio(&self, draft: &str, files: &BTreeMap<String, String>, base: i64) {
+        self.start(Action::SaveStudio {
+            draft: draft.to_string(),
+            files: files.clone(),
+            base,
+        });
+    }
+
+    /// Hand `intent` to `draft`'s drafting turn.
+    pub fn generate(&self, draft: &str, intent: &str) {
+        self.start(Action::Generate {
+            draft: draft.to_string(),
+            intent: intent.to_string(),
+        });
+    }
+
+    /// Read `draft`'s drafting turn's progress lines.
+    pub fn progress(&self, draft: &str) {
+        self.start(Action::Progress {
+            draft: draft.to_string(),
+        });
     }
 
     /// Connect again with whatever crux's config now holds.
@@ -2073,6 +2281,9 @@ async fn run_client(
                 next_stream.get_or_insert_with(|| Instant::now() + STREAM_BATCH);
             }
             Ok(Some(Msg::Refresh)) => next_list = Instant::now(),
+            Ok(Some(Msg::RefreshDrafts)) => {
+                force |= fetcher.refresh_drafts(true).await;
+            }
             Ok(Some(Msg::Compare(base))) => {
                 compare = base;
                 force = fetcher.refresh_base(compare.as_deref()).await;
@@ -2097,6 +2308,7 @@ async fn run_client(
                 Err(error) => changed |= fetcher.unavailable(error),
             }
             changed |= fetcher.refresh_registered().await;
+            changed |= fetcher.refresh_drafts(false).await;
             changed |= fetcher.refresh_base(compare.as_deref()).await;
             next_list = now
                 + if fetcher.any_running() || !matches!(fetcher.view, LiveView::Ready { .. }) {
@@ -2129,6 +2341,7 @@ async fn run_client(
                 base: fetcher.base.clone(),
                 finished: fetcher.finished.clone(),
                 registered: fetcher.registered.clone(),
+                drafts: fetcher.drafts.clone(),
             };
             publish(&shared, |shared| shared.polled(polled));
         }
@@ -3021,14 +3234,17 @@ mod tests {
         client.preview_rerun("run-1", vec!["draft".into()]);
         client.pull("demo", None);
         let snapshot = snapshot_when(&client, Duration::from_secs(5), |s| {
-            s.reran.is_some() && s.synced.is_some()
+            s.reran.is_some() && s.studio.is_some()
         });
         let reran = snapshot.reran.unwrap();
         assert_eq!((reran.run.as_str(), reran.from.len()), ("run-1", 1));
         assert!(reran.result.unwrap_err().contains("no supervisor"));
-        let synced = snapshot.synced.unwrap();
-        assert_eq!(synced.draft, "demo");
-        assert!(synced.result.unwrap_err().contains("no supervisor"));
+        let pulled = snapshot.studio.unwrap();
+        assert_eq!(
+            (pulled.ask, pulled.draft.as_str()),
+            (StudioAsk::Pull, "demo")
+        );
+        assert!(pulled.result.unwrap_err().contains("no supervisor"));
     }
 
     /// Against the controller `crux` is configured for: read a registered pack with its Git
@@ -3057,17 +3273,25 @@ mod tests {
             .block_on(fetcher.connection())
             .expect("a connection");
 
-        let (working, note) = c
-            .wait(pull(&c, Some(root.path()), &draft, None))
+        let pulled = c
+            .wait(pull_studio(&c, Some(root.path()), &draft, None))
             .expect("the draft pulls");
+        let StudioReply::Pulled {
+            version,
+            files,
+            compile,
+            note,
+        } = pulled
+        else {
+            panic!("an existing draft is pulled, not refused");
+        };
         assert_eq!(note, None, "an existing draft is pulled, not created");
-        assert!(working.base > 0);
-        assert!(working.dir.join("crucible.toml").is_file());
+        assert!(version > 0);
+        assert!(files.contains_key("crucible.toml"));
+        assert_eq!(compile.map(|compile| compile.version), Some(version));
+        let working = crate::draft::Working::open(root.path(), &draft).expect("the mirror written");
+        assert_eq!(working.base, version);
         assert!(!working.edited());
-        assert_eq!(
-            crate::draft::Working::open(root.path(), &draft).as_ref(),
-            Some(&working)
-        );
 
         let registered = std::env::var("CRUCIBLE_E2E_PLAYBOOK").unwrap_or_else(|_| "triage".into());
         let pinned = runtime

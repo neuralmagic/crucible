@@ -3,6 +3,7 @@ import {
   EVIDENCE_CSP,
   choose,
   decodeText,
+  evidencePolicy,
   fileView,
   labelTone,
   notifyDecision,
@@ -50,6 +51,21 @@ describe('parseCsv', () => {
   });
 });
 
+/** A policy's directives, each with its source list. */
+function directives(policy: string): Map<string, string[]> {
+  return new Map(
+    policy.split(';').map((directive) => {
+      const [name = '', ...sources] = directive.trim().split(/\s+/);
+      return [name, sources];
+    }),
+  );
+}
+
+/** A source that reaches the network: a scheme or host, not a keyword or `data:`. */
+function isNetworkSource(source: string): boolean {
+  return !source.startsWith("'") && source !== 'data:';
+}
+
 describe('sandboxedDocument', () => {
   it('leads every document with the no-network policy', () => {
     const cases: [string, string][] = [
@@ -63,6 +79,17 @@ describe('sandboxedDocument', () => {
     }
     expect(EVIDENCE_CSP).toContain("default-src 'none'");
     expect(EVIDENCE_CSP).not.toContain('connect-src');
+  });
+
+  it('admits no network source, and only the scripts it is given', () => {
+    for (const [name, sources] of directives(EVIDENCE_CSP)) {
+      expect(sources.filter(isNetworkSource), name).toEqual([]);
+    }
+    const script = 'https://cdn.example/lib-1.0.0.min.js';
+    const policy = evidencePolicy([script]);
+    expect(directives(policy).get('script-src')).toEqual(["'unsafe-inline'", script]);
+    expect(policy.replace(` ${script}`, '')).toBe(EVIDENCE_CSP);
+    expect(sandboxedDocument('<p>chart</p>', 'text/html', policy)).toContain(`content="${policy}"`);
   });
 });
 

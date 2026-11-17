@@ -524,7 +524,24 @@ just lint
 ```
 
 `just lint` runs the format check, Clippy for all workspace targets, and all workspace
-tests. If `mdbook` and `mdbook-mermaid` are installed, you can build or serve the
+tests.
+
+The `crucible` test binary is dominated by end-to-end scenarios: `scope::pipeline` drafts,
+reviews, and freezes real packs through stand-in agents, and `plan::harness` and
+`runloop::driver` drive full loop turns. Together they are most of the suite's runtime. While
+iterating on unrelated code, skip them and run the rest:
+
+```bash
+cargo test -p crucible --features autoresearch --bin crucible -- \
+  --skip scope::pipeline --skip plan::harness --skip runloop::driver
+```
+
+On a 14-core laptop this runs the remaining 582 tests in about 52s instead of the full
+suite's 121s. The suite already keeps every core busy, so raising `--test-threads` above the
+core count does not speed it up and makes the timing-sensitive deadline tests flaky. Run the
+unfiltered command before handing a change off.
+
+If `mdbook` and `mdbook-mermaid` are installed, you can build or serve the
 documentation locally:
 
 ```bash

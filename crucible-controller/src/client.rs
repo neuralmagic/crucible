@@ -169,7 +169,7 @@ impl Db {
         )
         .await?;
         // Re-export the spend the moment it's booked: `kind` is the cost_tag (a bounded set —
-        // rank/rank-grounded/scope/run/capped), so this stays low-cardinality.
+        // rank/rank-grounded/scope/run/capped/draft), so this stays low-cardinality.
         if let Some(m) = &self.metrics {
             m.record_spend(kind, cost_usd);
         }
@@ -563,6 +563,10 @@ mod tests {
             (
                 "0088_launch_test_cursor.sql",
                 "af16ad3ccfe8fc97067cf24431cf50a2e4d443cbf9be0d7d2df1b743aa42f82e",
+            ),
+            (
+                "0089_draft_version_intent.sql",
+                "24e0f42929956d03e2fabefabf1aec4a61921389a783fb24e88b73f3ab88cfa6",
             ),
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");

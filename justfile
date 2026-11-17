@@ -110,7 +110,7 @@ controller-local port="8870" user=env_var("USER"):
     set -euo pipefail
     (cd crucible-controller/ui && bun install --frozen-lockfile && bun run build)
     SQLX_OFFLINE=true cargo build -p crucible -p crucible-controller -p crux --bins \
-        --features crucible-controller/embedded-db
+        --features crucible-controller/embedded-db,crucible/autoresearch
     bin="${CARGO_TARGET_DIR:-$PWD/target}/debug"
     state="${XDG_STATE_HOME:-$HOME/.local/state}/crucible-controller"
     mkdir -p "$state"

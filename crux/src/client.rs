@@ -26,6 +26,11 @@ use std::time::Duration;
 /// The whole-request deadline on an event stream.
 const EVENT_STREAM_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
+/// The whole-request deadline on a ride the server takes minutes to answer, such as a drafting
+/// turn. The server bounds the work itself; this only keeps a dropped connection from hanging.
+#[cfg(not(target_arch = "wasm32"))]
+const LONG_RIDE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
 /// How a [`Client`] reaches the controller: one request in, its status and body text out.
 ///
 /// The body comes back as text rather than a parsed value on purpose — a non-2xx body is usually
@@ -39,6 +44,18 @@ pub trait Transport: Send + Sync {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> Result<(reqwest::StatusCode, String)>;
+
+    /// A request the server answers only after minutes of its own work, such as a drafting turn.
+    /// The wire's usual request timeout must not cut it short: the server bounds the work, and the
+    /// caller holds the deadline. Wires with no request timeout ride [`Transport::send`] as is.
+    async fn send_long(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<(reqwest::StatusCode, String)> {
+        self.send(method, path, body).await
+    }
 
     /// GET a body that is not JSON and not necessarily UTF-8 — a run's captured file is whatever
     /// its task wrote. The default decodes through [`Transport::send`], which is correct for a
@@ -253,6 +270,33 @@ impl Transport for HttpTransport {
         body: Option<&serde_json::Value>,
     ) -> Result<(reqwest::StatusCode, String)> {
         let req = self.req(method, path);
+        let req = match body {
+            Some(b) => req.json(b),
+            None => req,
+        };
+        let resp = req
+            .send()
+            .await
+            .with_context(|| format!("requesting {path}"))?;
+        let status = resp.status();
+        let refused = self.refused_by(&resp);
+        let body = resp.text().await.unwrap_or_default();
+        if let Some(act_as) = refused {
+            act_as.note_refusal(&body);
+        }
+        Ok((status, body))
+    }
+
+    /// The native client's 120s request timeout is replaced per request, as the event stream
+    /// already does. The browser's fetch has no client-wide timeout to replace.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn send_long(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<(reqwest::StatusCode, String)> {
+        let req = self.req(method, path).timeout(LONG_RIDE_TIMEOUT);
         let req = match body {
             Some(b) => req.json(b),
             None => req,
@@ -1259,6 +1303,11 @@ impl Client {
         self.post("/api/playbook-drafts", Some(&body)).await
     }
 
+    /// The drafts rail: what is being authored, and whether it compiles.
+    pub async fn drafts(&self) -> Result<Vec<dto::PlaybookDraft>> {
+        self.get("/api/playbook-drafts").await
+    }
+
     pub async fn draft_files<T: DeserializeOwned>(
         &self,
         id: &str,
@@ -1468,11 +1517,52 @@ impl Client {
             self.hint_for(status)
         );
     }
+
+    /// Hand an intent to the engine's drafting turn and store what it wrote as the next version.
+    /// Rides the save's `base_version` semantics: [`DraftGenerate::Stale`] rather than an error
+    /// when a concurrent writer landed first.
+    pub async fn generate_draft(&self, id: &str, intent: &str) -> Result<DraftGenerate> {
+        let path = format!("/api/playbook-drafts/{}/generate", encode(id));
+        let body = serde_json::json!({ "intent": intent });
+        let (status, text) = self
+            .transport
+            .send_long(reqwest::Method::POST, &path, Some(&body))
+            .await?;
+        if status.is_success() {
+            return Ok(DraftGenerate::Generated(Box::new(parse(text, &path)?)));
+        }
+        if status == reqwest::StatusCode::CONFLICT
+            && let Ok(stale) = serde_json::from_str::<dto::StaleBase>(&text)
+        {
+            return Ok(DraftGenerate::Stale(stale));
+        }
+        bail!(
+            "{path} -> HTTP {status}: {}{}",
+            text.trim(),
+            self.hint_for(status)
+        );
+    }
+
+    /// The lines of the draft's most recent generate, oldest first.
+    pub async fn draft_generate_progress(&self, id: &str) -> Result<dto::DraftProgress> {
+        self.get(&format!(
+            "/api/playbook-drafts/{}/generate/progress",
+            encode(id)
+        ))
+        .await
+    }
 }
 
 /// What a draft save landed: the stored version, or the refusal naming the save that overtook it.
 pub enum DraftSave {
     Saved(serde_json::Value),
+    Stale(dto::StaleBase),
+}
+
+/// What a draft generate landed: the stored version with the turn's own report, or the refusal
+/// naming the save that overtook it.
+pub enum DraftGenerate {
+    Generated(Box<dto::GeneratedDraft>),
     Stale(dto::StaleBase),
 }
 

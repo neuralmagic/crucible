@@ -73,6 +73,10 @@ pub struct Remote {
     pub working_watch: crate::draft::Watcher,
     pub working_sent: Option<String>,
     pub working_seen: u64,
+    /// The draft open for editing, when one is.
+    pub studio: Option<crate::studio::Studio>,
+    /// The drafts rail, as the live worker last read it.
+    pub drafts: Vec<crux::dto::PlaybookDraft>,
     /// Whether the run views show the run or the pack as it compiles now; `None` shows the run
     /// when there is one.
     pub graph_source: Option<GraphSource>,
@@ -138,6 +142,8 @@ impl Remote {
             working_watch: crate::draft::Watcher::start(net.handle(), drafts),
             working_sent: None,
             working_seen: 0,
+            studio: None,
+            drafts: Vec::new(),
             graph_source: None,
             draft_busy: false,
             draft_after: 0,

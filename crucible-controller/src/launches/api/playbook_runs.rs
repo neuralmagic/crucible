@@ -32,7 +32,8 @@ pub struct PlaybookRunDto {
     /// The issue key the run is tracked under.
     pub key: String,
     pub playbook: String,
-    /// The registry row's description; null when the playbook was deregistered since.
+    /// The registry row's description; a draft launch has none, so it carries the issue title the
+    /// launch froze the draft's description into.
     pub description: Option<String>,
     /// The values exactly as launched — the prefill source.
     #[schema(value_type = Object)]
@@ -355,9 +356,10 @@ pub struct CancelAck {
 }
 
 /// `POST /api/playbook-runs/{key}/cancel` — stop a launch: park it as a human would, so nothing
-/// dispatches it again, then delete its running runs' pods on the clusters they run on and mark
-/// those runs `cancelled`. The daemon applies it on its next pass of the key. Who may is the
-/// policy's call on updating the run.
+/// dispatches it again, then stop its running runs — a pod run's pod is deleted on the cluster it
+/// runs on, a locally dispatched run's engine is signalled — and mark those runs `cancelled`. The
+/// daemon applies it on its next pass of the key. Who may is the policy's call on updating the
+/// run.
 #[utoipa::path(
     post,
     path = "/api/playbook-runs/{key}/cancel",
