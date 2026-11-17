@@ -339,6 +339,42 @@ Text is always drawn over shapes, whatever the order of the commands. A canvas i
 own size and is cut off where the pane is narrower, so keep it under about 600 points wide.
 Prefer a tone to a hex colour: a hex colour does not follow the theme.
 
+## Controls
+
+A view's `controls` are drawn in a row above its body: choices the reader makes that you
+would otherwise precompute as tabs. When the reader changes one, the app runs the plugin again
+with every control's value in the request's `params` and draws the new view in place of the
+old. Until the reader changes one, `params` is empty, so every control's `value` (or `on`) is
+its default. Return each control with the value you were given so it stays where the reader put
+it. The app sends only values the last view's controls offer: a select's value is one of its
+options, a range's lies on a step from `min`, or at `max`.
+
+`controls` sits beside `title` and `body`, and is left out when there are none. Each control is
+an object with one key, its kind:
+
+- `select`: one of `options`, each a `value` and a `label`; `value` is one of the options'.
+  At most 100 options, their values and labels each unique.
+- `toggle`: a switch, `on` or off.
+- `range`: a number from `min` to `max` in steps of `step`, set when the reader lets go of
+  it. `min` is below `max`, `step` is above 0, there are at most 1,000 steps from one end to
+  the other, and `value` lies between them.
+
+```json controls
+[
+  {"select": {"id": "lane", "label": "Lane", "value": "all", "options": [
+    {"value": "all", "label": "All"},
+    {"value": "go", "label": "Go"}
+  ]}},
+  {"toggle": {"id": "open", "label": "Open only", "on": false}},
+  {"range": {"id": "cvss", "label": "Min CVSS", "min": 0, "max": 10, "step": 0.5, "value": 0}}
+]
+```
+
+A script reads `params` as plain values (`params.lane` is `"go"`, `params.cvss` is `7.5`); the
+request carries each under its kind (`{"lane": {"select": "go"}}`), which a Rust plugin reads
+with `request.select("lane")`, `request.toggle("open")` and `request.range("cvss")`. At most 12
+controls, their ids unique among themselves.
+
 ## Whole-view limits
 
 Across the whole view, at most:

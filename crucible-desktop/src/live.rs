@@ -448,6 +448,7 @@ impl Action {
                     report: Arc::new(crate::report::Report {
                         name: crate::report::name_of(&wanted.plugin.0),
                         author: None,
+                        params: wanted.params.clone(),
                         view,
                     }),
                     wanted,
@@ -504,6 +505,7 @@ impl Action {
                 report: Arc::new(crate::report::Report {
                     name: crate::report::name_of(&wanted.plugin.0),
                     author: None,
+                    params: wanted.params.clone(),
                     view: Err(why),
                 }),
                 wanted,
@@ -790,7 +792,8 @@ async fn build_report(
             text,
         });
     }
-    crate::net::blocking(move || crate::report::run(&plugin, &inputs, read))
+    let params = wanted.params.clone();
+    crate::net::blocking(move || crate::report::run(&plugin, &inputs, read, params))
         .await
         .ok_or_else(stopped)?
 }
@@ -2914,6 +2917,7 @@ mod tests {
             captured("triage-python", "verdicts.json", size("python")),
         ];
         let wanted = |run: &str, settled: bool| crate::report::Wanted {
+            params: Default::default(),
             run: run.into(),
             plugin: ("ui/report.wasm.b64".into(), plugin.len()),
             listed: listed.iter().map(|f| (f.key.clone(), f.size)).collect(),
@@ -2963,6 +2967,24 @@ mod tests {
             built(&wanted("r3", false)).report.view,
             Err("No task has captured verdicts.json yet.".into())
         );
+
+        let laned = crate::report::Wanted {
+            params: [(
+                "task".to_string(),
+                crucible_view::Param::Select("triage-go".into()),
+            )]
+            .into(),
+            ..wanted("r1", true)
+        };
+        assert_ne!(
+            laned,
+            wanted("r1", true),
+            "params tell one report from another"
+        );
+        client.report(laned.clone(), plugin.clone(), listed.clone());
+        let built_laned = built(&laned);
+        assert_eq!(triaged(&built_laned), "34");
+        assert_eq!(built_laned.report.params, laned.params);
     }
 
     /// The first snapshot `ready` accepts, within `within`.

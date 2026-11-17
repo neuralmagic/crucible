@@ -1433,7 +1433,8 @@ fn detail(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
         }
         None => stats(&pane, p),
     };
-    body.child(stats).child(dock::workspace(&pane, app, p))
+    body.child(stats)
+        .child(dock::workspace(&pane, app, p, layer))
 }
 
 /// Stops the launch on screen while it runs, after a confirming second press.

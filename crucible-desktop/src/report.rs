@@ -7,13 +7,13 @@
 //! pack's.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::SystemTime;
 
-use crucible_view::{Cell, Column, ColumnKind, File, Node, Request, Row, View};
+use crucible_view::{Cell, Column, ColumnKind, Control, File, Node, Param, Request, Row, View};
 use rune::TextEdit;
 use rune_kit::{SortDir, TableState};
 
@@ -43,12 +43,14 @@ pub struct Report {
     pub name: String,
     /// The task that wrote the plugin during the run; `None` for the pack's own.
     pub author: Option<String>,
+    /// What the plugin was asked with.
+    pub params: BTreeMap<String, Param>,
     pub view: Result<View, String>,
 }
 
 /// A live run's report, as the Report pane asks the live worker for it. Asked again when any of
 /// it changes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Wanted {
     pub run: String,
     /// The plugin's path in the run's pack, and its length there.
@@ -57,6 +59,7 @@ pub struct Wanted {
     pub listed: Vec<(String, u64)>,
     /// The run has stopped, so a captured file's copy on disk can stand in for it.
     pub settled: bool,
+    pub params: BTreeMap<String, Param>,
 }
 
 /// What the live worker built for a [`Wanted`].
@@ -141,14 +144,20 @@ pub fn readable(sizes: impl Iterator<Item = u64>) -> Result<(), String> {
     Ok(())
 }
 
-/// The view `plugin` builds from `files`, the captured copies of its `inputs`.
-pub fn run(plugin: &Loaded, inputs: &[String], files: Vec<File>) -> Result<View, String> {
+/// The view `plugin` builds from `files`, the captured copies of its `inputs`, with the
+/// reader's `params`.
+pub fn run(
+    plugin: &Loaded,
+    inputs: &[String],
+    files: Vec<File>,
+    params: BTreeMap<String, Param>,
+) -> Result<View, String> {
     if files.is_empty() && !inputs.is_empty() {
         return Err(format!("No task has captured {} yet.", inputs.join(" or ")));
     }
     readable(files.iter().map(|file| file.text.len() as u64))?;
     plugin
-        .view(&Request { files })
+        .view(&Request { files, params })
         .map_err(|fault| fault.to_string())
 }
 
@@ -261,6 +270,7 @@ fn build(
     plugin: &Loaded,
     inputs: &[String],
     files: &[(String, String, PathBuf)],
+    params: &BTreeMap<String, Param>,
 ) -> Result<View, String> {
     let size = |path: &PathBuf| fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
     if let Some((task, input, path)) = files.iter().find(|(.., path)| size(path) > SHOWN_BYTES) {
@@ -279,16 +289,18 @@ fn build(
             text,
         });
     }
-    run(plugin, inputs, read)
+    run(plugin, inputs, read, params.clone())
 }
 
-/// A local pack's report, built again when its plugin or the files it reads change.
+/// A local pack's report, built again when its plugin, the files it reads or the reader's
+/// params change.
 #[derive(Default)]
 pub struct Reporter {
     plugin: Option<Mark>,
     author: Option<String>,
     loaded: Option<Result<(Loaded, Vec<String>), String>>,
     read: Vec<Mark>,
+    params: BTreeMap<String, Param>,
     report: Option<Arc<Report>>,
 }
 
@@ -296,6 +308,13 @@ impl Reporter {
     /// The same allocation until the report changes.
     pub fn report(&self) -> Option<&Arc<Report>> {
         self.report.as_ref()
+    }
+
+    /// What the next [`Reporter::refresh`] asks the plugin with; whether that changed.
+    pub fn ask(&mut self, params: BTreeMap<String, Param>) -> bool {
+        let changed = params != self.params;
+        self.params = params;
+        changed
     }
 
     /// Whether the report changed.
@@ -330,16 +349,18 @@ impl Reporter {
             Ok((plugin, inputs)) => {
                 let files = captured(pack, inputs);
                 let read: Vec<Mark> = files.iter().filter_map(|(.., path)| mark(path)).collect();
-                if !reloaded && read == self.read && self.report.is_some() {
+                let asked = self.report.as_ref().map(|report| &report.params);
+                if !reloaded && read == self.read && asked == Some(&self.params) {
                     return false;
                 }
                 self.read = read;
-                build(plugin, inputs, &files)
+                build(plugin, inputs, &files, &self.params)
             }
         };
         let report = Report {
             name,
             author: self.author.clone(),
+            params: self.params.clone(),
             view,
         };
         let changed = self.report.as_deref() != Some(&report);
@@ -358,12 +379,24 @@ pub struct Table<'a> {
     pub rows: &'a [Row],
 }
 
-/// What the Report pane keeps between frames: the tab picked in each set of tabs, the sections
-/// the reader folded or unfolded, and the shown table's filter, sort and selection.
+/// What the Report pane keeps between frames: the reader's controls, the tab picked in each
+/// set of tabs, the sections the reader folded or unfolded, and the shown table's filter, sort
+/// and selection.
 pub struct Shown {
     /// The selection and the report all of this was kept for.
     selection: Option<Selection>,
     report: Weak<Report>,
+    /// The controls of the last view drawn for the selection.
+    controls: Vec<Control>,
+    /// What the reader set each control to, by id.
+    picks: HashMap<String, Param>,
+    /// What the plugin is asked with: every control's value as of the reader's last change,
+    /// less those a later view no longer offers.
+    asked: BTreeMap<String, Param>,
+    /// The range being dragged and where it is, set on release.
+    sliding: Option<(String, f64)>,
+    /// The select whose options are open.
+    pub choosing: Option<String>,
     tabs: HashMap<String, usize>,
     sections: HashMap<String, bool>,
     pub table: TableState,
@@ -452,6 +485,11 @@ impl Default for Shown {
         Shown {
             selection: None,
             report: Weak::new(),
+            controls: Vec::new(),
+            picks: HashMap::new(),
+            asked: BTreeMap::new(),
+            sliding: None,
+            choosing: None,
             tabs: HashMap::new(),
             sections: HashMap::new(),
             table: fresh_table(),
@@ -468,7 +506,8 @@ fn fresh_table() -> TableState {
 
 impl Shown {
     /// Follows the pane to `report` under `selection`: another selection starts over, and
-    /// another report for the same one keeps its tabs and filters and sorts its table again.
+    /// another report for the same one keeps its controls and tabs and filters and sorts its
+    /// table again.
     pub fn follow(&mut self, selection: Option<&Selection>, report: Option<&Arc<Report>>) {
         let held = report.map_or_else(Weak::new, Arc::downgrade);
         if self.selection.as_ref() != selection {
@@ -477,16 +516,102 @@ impl Shown {
                 report: held,
                 ..Shown::default()
             };
+            self.declare(report);
             return;
         }
         if held.ptr_eq(&self.report) {
             return;
         }
         self.report = held;
+        self.declare(report);
         let table = report
             .and_then(|report| report.view.as_ref().ok())
             .and_then(|view| self.table(view));
         self.arrange(table.as_ref());
+    }
+
+    /// Takes the controls of `report`'s view, when it has one, and drops what the reader set
+    /// on controls it no longer has.
+    fn declare(&mut self, report: Option<&Arc<Report>>) {
+        let Some(view) = report.and_then(|report| report.view.as_ref().ok()) else {
+            return;
+        };
+        self.controls.clone_from(&view.controls);
+        let declared = |id: &str| view.controls.iter().any(|control| control.id() == id);
+        let offered = |id: &String, value: &mut Param| {
+            view.controls
+                .iter()
+                .any(|control| control.id() == id && control.coerce(Some(value)) == *value)
+        };
+        self.picks.retain(offered);
+        self.asked.retain(offered);
+        self.sliding = self.sliding.take().filter(|(id, _)| declared(id));
+        self.choosing = self.choosing.take().filter(|id| declared(id));
+    }
+
+    /// The controls of the last view drawn for the selection.
+    pub fn controls(&self) -> &[Control] {
+        &self.controls
+    }
+
+    /// What `control` shows: where it is being dragged, else what the reader set it to, else
+    /// its own value.
+    pub fn value(&self, control: &Control) -> Param {
+        match &self.sliding {
+            Some((id, at)) if id == control.id() => control.coerce(Some(&Param::Range(*at))),
+            _ => control.coerce(self.picks.get(control.id())),
+        }
+    }
+
+    /// Sets the control `id`, ending any drag, and asks with every control's value.
+    pub fn set(&mut self, id: &str, value: Param) {
+        self.sliding = None;
+        self.choosing = None;
+        let Some(control) = self.controls.iter().find(|control| control.id() == id) else {
+            return;
+        };
+        self.picks
+            .insert(id.to_string(), control.coerce(Some(&value)));
+        self.asked = self
+            .controls
+            .iter()
+            .map(|control| {
+                (
+                    control.id().to_string(),
+                    control.coerce(self.picks.get(control.id())),
+                )
+            })
+            .collect();
+    }
+
+    /// Moves the range `id` to `at` without asking the plugin again.
+    pub fn slide(&mut self, id: &str, at: f64) {
+        self.sliding = Some((id.to_string(), at));
+    }
+
+    /// Ends a drag without setting the range.
+    pub fn cancel_slide(&mut self) {
+        self.sliding = None;
+    }
+
+    /// Ends a drag of the range `id` where it is.
+    pub fn release(&mut self, id: &str) {
+        if let Some((sliding, at)) = self.sliding.take() {
+            if sliding == id {
+                self.set(id, Param::Range(at));
+            } else {
+                self.sliding = Some((sliding, at));
+            }
+        }
+    }
+
+    /// What the plugin is asked with for `selection`: every control's value once the reader
+    /// has set one, nothing before.
+    pub fn params(&self, selection: Option<&Selection>) -> BTreeMap<String, Param> {
+        if self.selection.as_ref() != selection {
+            return BTreeMap::new();
+        }
+        self.asked.clone()
     }
 
     /// The picked tab of the `len` tabs named `id`.
@@ -612,7 +737,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use crucible_view::{Cell, Column, ColumnKind, Node, Row, Tab, View};
+    use crucible_view::{Cell, Column, ColumnKind, Node, Param, Row, Tab, View};
     use rune_kit::SortDir;
 
     use std::sync::Arc;
@@ -775,10 +900,29 @@ mod tests {
     fn the_skill_s_examples_are_views_the_host_draws() {
         let limits = crucible_view::Limits::DEFAULT;
         let mut names = std::collections::BTreeSet::new();
-        for (_, json) in skill_examples("components.md") {
+        let mut kinds = std::collections::BTreeSet::new();
+        for (word, json) in skill_examples("components.md") {
+            if word == "controls" {
+                let controls: Vec<crucible_view::Control> =
+                    serde_json::from_str(&json).unwrap_or_else(|e| panic!("{e}: {json}"));
+                kinds.extend(controls.iter().map(|control| match control {
+                    crucible_view::Control::Select { .. } => "select",
+                    crucible_view::Control::Toggle { .. } => "toggle",
+                    crucible_view::Control::Range { .. } => "range",
+                }));
+                let view = View {
+                    title: "T".into(),
+                    body: Node::Stats { items: vec![] },
+                    controls,
+                };
+                view.check(&limits)
+                    .unwrap_or_else(|e| panic!("{e}: {json}"));
+                continue;
+            }
             let body: Node = serde_json::from_str(&json).unwrap_or_else(|e| panic!("{e}: {json}"));
             component_names(&body, &mut names);
             let view = View {
+                controls: vec![],
                 title: "T".into(),
                 body,
             };
@@ -807,6 +951,11 @@ mod tests {
             ],
             "every component has an example"
         );
+        assert_eq!(
+            kinds.into_iter().collect::<Vec<_>>(),
+            ["range", "select", "toggle"],
+            "every control has an example"
+        );
 
         let mut kinds = Vec::new();
         for (kind, json) in skill_examples("SKILL.md") {
@@ -814,6 +963,7 @@ mod tests {
                 "request" => {
                     let request: crucible_view::Request = serde_json::from_str(&json).unwrap();
                     assert_eq!(request.files.len(), 1);
+                    assert_eq!(request.select("lane"), Some("go"));
                 }
                 "reply" => match serde_json::from_str(&json).unwrap() {
                     crucible_view::Reply::View(view) => view.check(&limits).unwrap(),
@@ -1096,6 +1246,99 @@ mod tests {
                 .all(|at| *at < as_of && *at > as_of - 100.0 * 86_400.0),
             "{opened:?}"
         );
+
+        let [
+            crucible_view::Control::Select {
+                id: lane,
+                options,
+                value,
+                ..
+            },
+            crucible_view::Control::Range {
+                id: cvss,
+                min,
+                max,
+                value: least,
+                ..
+            },
+        ] = view.controls.as_slice()
+        else {
+            panic!("a lane select and a CVSS range");
+        };
+        assert_eq!(
+            (lane.as_str(), value.as_str(), cvss.as_str()),
+            ("lane", "all", "cvss")
+        );
+        assert_eq!((*min, *max, *least), (0.0, 10.0, 0.0));
+        assert_eq!(options.len(), 3, "all and each lane: {options:?}");
+        let first_lane = options[1].value.clone();
+
+        let report = Arc::clone(report);
+        let mut shown = Shown::default();
+        let selection = crate::Selection::Local("report-ts".into());
+        shown.follow(Some(&selection), Some(&report));
+        shown.set("lane", Param::Select(first_lane.clone()));
+        let params = shown.params(Some(&selection));
+        assert_eq!(params["cvss"], Param::Range(0.0));
+        assert!(reporter.ask(params.clone()));
+        assert!(reporter.refresh(dir.path()));
+        let laned = reporter.report().unwrap();
+        assert_eq!(laned.params, params);
+        let view = laned.view.as_ref().unwrap();
+        let triaged = |view: &View| {
+            let Node::Stack { children } = &view.body else {
+                panic!("the view is a stack");
+            };
+            let Node::Stats { items } = &children[0] else {
+                panic!("the view starts with its stats");
+            };
+            items[0].value.parse::<usize>().unwrap()
+        };
+        let one_lane = triaged(view);
+        assert!(one_lane > 0 && one_lane < 64, "{one_lane}");
+        assert!(matches!(
+            &view.controls[0],
+            crucible_view::Control::Select { value, .. } if *value == first_lane
+        ));
+
+        shown.follow(Some(&selection), Some(laned));
+        shown.set("lane", Param::Select("all".into()));
+        shown.set("cvss", Param::Range(9.2));
+        let params = shown.params(Some(&selection));
+        assert_eq!(params["cvss"], Param::Range(9.0), "on the range's step");
+        assert!(reporter.ask(params));
+        assert!(reporter.refresh(dir.path()));
+        let view = reporter.report().unwrap().view.as_ref().unwrap();
+        let severe = triaged(view);
+        assert!(severe > 0 && severe < 64, "{severe}");
+        let Node::Stack { children } = &view.body else {
+            panic!("the view is a stack");
+        };
+        let Node::Tabs { tabs, .. } = &children[1] else {
+            panic!("the view's tabs follow its stats");
+        };
+        let all = tabs.iter().find(|tab| tab.label == "All").unwrap();
+        let Node::Table { rows, .. } = &all.body else {
+            panic!("All is a table");
+        };
+        assert!(
+            rows.iter()
+                .all(|row| row.cells[2].text.parse::<f64>().unwrap() >= 9.0)
+        );
+
+        shown.set("cvss", Param::Range(10.0));
+        shown.set("lane", Param::Select(first_lane));
+        assert!(reporter.ask(shown.params(Some(&selection))));
+        assert!(reporter.refresh(dir.path()));
+        let view = reporter.report().unwrap().view.as_ref().unwrap();
+        assert_eq!(
+            view.body,
+            Node::Text {
+                text: "No ticket matches.".into(),
+                tone: crucible_view::Tone::Muted
+            }
+        );
+        assert_eq!(view.controls.len(), 2, "the controls stay to undo it");
     }
 
     #[test]
@@ -1135,6 +1378,7 @@ mod tests {
 
     fn tabbed() -> View {
         View {
+            controls: vec![],
             title: "T".into(),
             body: Node::Stack {
                 children: vec![
@@ -1188,6 +1432,7 @@ mod tests {
     fn a_folded_section_shows_no_table_until_it_is_unfolded() {
         for open in [true, false] {
             let view = View {
+                controls: vec![],
                 title: "T".into(),
                 body: Node::Stack {
                     children: vec![
@@ -1216,6 +1461,7 @@ mod tests {
     #[test]
     fn a_section_in_a_tab_shows_its_table_only_while_both_are_picked_and_open() {
         let view = View {
+            controls: vec![],
             title: "T".into(),
             body: Node::Tabs {
                 id: "by".into(),
@@ -1250,9 +1496,11 @@ mod tests {
     fn unfolding_a_section_filters_and_sorts_its_table_again() {
         let report = |names: &[&str]| {
             Arc::new(Report {
+                params: Default::default(),
                 name: "report".into(),
                 author: None,
                 view: Ok(View {
+                    controls: vec![],
                     title: "T".into(),
                     body: section("more", true, table("t", names)),
                 }),
@@ -1378,6 +1626,7 @@ mod tests {
             };
             tabs[1].body = table("all", names);
             Arc::new(Report {
+                params: Default::default(),
                 name: "report".into(),
                 author: None,
                 view: Ok(view),
@@ -1406,6 +1655,7 @@ mod tests {
         assert_eq!(ids(&shown, &second), ["a1", "b9", "b10"]);
 
         let failed = Arc::new(Report {
+            params: Default::default(),
             name: "report".into(),
             author: None,
             view: Err("torn".into()),
@@ -1667,5 +1917,268 @@ mod tests {
         shown.pick("tabs", 1);
         assert_eq!(shown.filter.text, "");
         assert_eq!(shown.len(&table), 4);
+    }
+
+    #[test]
+    fn the_reporter_builds_again_when_the_params_change_and_only_then() {
+        let dir = pack();
+        capture(dir.path(), "triage-go", "go");
+        capture(dir.path(), "triage-python", "python");
+        let mut reporter = Reporter::default();
+        assert!(reporter.refresh(dir.path()));
+        assert_eq!(triaged(&reporter), "64");
+        assert!(reporter.report().unwrap().params.is_empty());
+        assert!(!reporter.ask(Default::default()), "no params is no change");
+        assert!(!reporter.refresh(dir.path()));
+
+        let go: std::collections::BTreeMap<String, Param> =
+            [("task".to_string(), Param::Select("triage-go".into()))].into();
+        assert!(reporter.ask(go.clone()));
+        let before = Arc::clone(reporter.report().unwrap());
+        assert!(reporter.refresh(dir.path()));
+        assert_eq!(triaged(&reporter), "34");
+        assert_eq!(reporter.report().unwrap().params, go);
+        assert_eq!(
+            before.params.len(),
+            0,
+            "the last report stands until the next is built"
+        );
+        assert!(!reporter.ask(go.clone()), "the same params are no change");
+        assert!(!reporter.refresh(dir.path()), "nothing changed");
+
+        fs::write(
+            dir.path().join("state/files/triage-python/verdicts.json"),
+            "[]",
+        )
+        .unwrap();
+        reporter.refresh(dir.path());
+        assert_eq!(triaged(&reporter), "34");
+        assert_eq!(
+            reporter.report().unwrap().params,
+            go,
+            "a refresh keeps the params"
+        );
+
+        assert!(reporter.ask(Default::default()));
+        assert!(reporter.refresh(dir.path()));
+        assert_eq!(
+            triaged(&reporter),
+            "34",
+            "go alone has no python verdicts now"
+        );
+        assert!(reporter.report().unwrap().params.is_empty());
+    }
+
+    fn controlled(controls: Vec<crucible_view::Control>) -> Arc<Report> {
+        Arc::new(Report {
+            name: "report".into(),
+            author: None,
+            params: Default::default(),
+            view: Ok(View {
+                title: "T".into(),
+                body: Node::Stats { items: vec![] },
+                controls,
+            }),
+        })
+    }
+
+    #[test]
+    fn controls_are_kept_for_a_selection_and_dropped_when_the_view_drops_them() {
+        use crucible_view::Control;
+        let lane = || Control::select("lane", "Lane", &[("all", "All"), ("go", "Go")], "all");
+        let open = || Control::toggle("open", "Open", false);
+        let cvss = || Control::range("cvss", "CVSS", [0.0, 10.0], 0.5, 0.0);
+        let local = |name: &str| Selection::Local(name.into());
+        let a = local("a");
+        let first = controlled(vec![lane(), open(), cvss()]);
+        let mut shown = Shown::default();
+        shown.follow(Some(&a), Some(&first));
+        assert_eq!(shown.controls().len(), 3);
+        assert!(
+            shown.params(Some(&a)).is_empty(),
+            "nothing set, nothing asked"
+        );
+        assert_eq!(shown.value(&lane()), Param::Select("all".into()));
+
+        shown.set("lane", Param::Select("go".into()));
+        let every = shown.params(Some(&a));
+        assert_eq!(
+            every.into_iter().collect::<Vec<_>>(),
+            [
+                ("cvss".to_string(), Param::Range(0.0)),
+                ("lane".to_string(), Param::Select("go".into())),
+                ("open".to_string(), Param::Toggle(false)),
+            ],
+            "once one is set, every control is sent"
+        );
+        assert!(
+            shown.params(Some(&local("b"))).is_empty(),
+            "not for another selection"
+        );
+        assert!(shown.params(None).is_empty());
+
+        shown.set("lane", Param::Select("rust".into()));
+        assert_eq!(
+            shown.params(Some(&a))["lane"],
+            Param::Select("all".into()),
+            "a value the select does not offer falls back to its own"
+        );
+        shown.set("open", Param::Range(3.0));
+        assert_eq!(shown.params(Some(&a))["open"], Param::Toggle(false));
+        shown.set("lane", Param::Select("go".into()));
+        shown.set("open", Param::Toggle(true));
+        shown.set("ghost", Param::Toggle(true));
+        assert!(
+            !shown.params(Some(&a)).contains_key("ghost"),
+            "only declared controls go"
+        );
+
+        shown.slide("cvss", 7.3);
+        assert_eq!(shown.value(&cvss()), Param::Range(7.5));
+        assert_eq!(
+            shown.params(Some(&a))["cvss"],
+            Param::Range(0.0),
+            "not while dragged"
+        );
+        shown.release("other");
+        assert_eq!(
+            shown.value(&cvss()),
+            Param::Range(7.5),
+            "another range's release"
+        );
+        shown.release("cvss");
+        assert_eq!(shown.params(Some(&a))["cvss"], Param::Range(7.5));
+        shown.slide("cvss", 2.0);
+        shown.cancel_slide();
+        assert_eq!(
+            shown.value(&cvss()),
+            Param::Range(7.5),
+            "a cancelled drag sets nothing"
+        );
+        shown.slide("cvss", f64::NAN);
+        assert_eq!(shown.value(&cvss()), Param::Range(0.0));
+        shown.release("cvss");
+        assert_eq!(shown.params(Some(&a))["cvss"], Param::Range(0.0));
+        shown.set("cvss", Param::Range(1e300));
+        assert_eq!(shown.params(Some(&a))["cvss"], Param::Range(10.0));
+
+        let refreshed = controlled(vec![lane(), open(), cvss()]);
+        shown.follow(Some(&a), Some(&refreshed));
+        assert_eq!(
+            shown.params(Some(&a))["lane"],
+            Param::Select("go".into()),
+            "kept"
+        );
+
+        let failed = Arc::new(Report {
+            name: "report".into(),
+            author: None,
+            params: Default::default(),
+            view: Err("torn".into()),
+        });
+        shown.follow(Some(&a), Some(&failed));
+        assert_eq!(
+            shown.controls().len(),
+            3,
+            "a failed view keeps the last controls"
+        );
+        assert_eq!(shown.params(Some(&a))["lane"], Param::Select("go".into()));
+
+        shown.choosing = Some("lane".into());
+        shown.slide("cvss", 4.0);
+        let fewer = controlled(vec![open()]);
+        shown.follow(Some(&a), Some(&fewer));
+        assert_eq!(
+            shown.params(Some(&a)).into_iter().collect::<Vec<_>>(),
+            [("open".to_string(), Param::Toggle(true))],
+            "a control the view no longer has is dropped"
+        );
+        assert_eq!(shown.choosing, None);
+        shown.follow(Some(&a), Some(&first));
+        assert_eq!(
+            shown.value(&lane()),
+            Param::Select("all".into()),
+            "and stays dropped"
+        );
+        assert_eq!(shown.value(&cvss()), Param::Range(0.0));
+
+        let none = controlled(vec![]);
+        shown.follow(Some(&a), Some(&none));
+        assert!(shown.controls().is_empty());
+        assert!(shown.params(Some(&a)).is_empty());
+
+        shown.follow(Some(&a), Some(&first));
+        shown.set("open", Param::Toggle(true));
+        shown.follow(Some(&local("b")), Some(&first));
+        assert!(
+            shown.params(Some(&local("b"))).is_empty(),
+            "another selection starts over"
+        );
+        assert_eq!(shown.controls().len(), 3, "with its own report's controls");
+        assert_eq!(shown.value(&open()), Param::Toggle(false));
+        shown.follow(None, None);
+        assert!(shown.controls().is_empty());
+    }
+
+    #[test]
+    fn a_view_that_moves_its_controls_never_asks_again_on_its_own() {
+        use crucible_view::Control;
+        let a = Selection::Local("a".into());
+        let low = || controlled(vec![Control::range("cvss", "CVSS", [0.0, 4.0], 1.0, 0.0)]);
+        let high = || controlled(vec![Control::range("cvss", "CVSS", [5.0, 10.0], 1.0, 5.0)]);
+        let lanes = |options: &[(&str, &str)]| {
+            controlled(vec![
+                Control::select("lane", "Lane", options, "all"),
+                Control::toggle("open", "Open", false),
+            ])
+        };
+        let mut shown = Shown::default();
+        shown.follow(Some(&a), Some(&low()));
+        shown.set("cvss", Param::Range(2.0));
+        let asked = shown.params(Some(&a));
+        assert_eq!(asked["cvss"], Param::Range(2.0));
+        for _ in 0..3 {
+            shown.follow(Some(&a), Some(&high()));
+            assert!(
+                shown.params(Some(&a)).is_empty(),
+                "a value the view no longer offers is not asked for"
+            );
+            shown.follow(Some(&a), Some(&low()));
+            assert!(shown.params(Some(&a)).is_empty(), "and is not asked again");
+        }
+
+        shown.follow(Some(&a), Some(&lanes(&[("all", "All"), ("go", "Go")])));
+        shown.set("lane", Param::Select("go".into()));
+        assert_eq!(shown.params(Some(&a)).len(), 2);
+        shown.follow(Some(&a), Some(&lanes(&[("all", "All")])));
+        assert_eq!(
+            shown.params(Some(&a)).into_iter().collect::<Vec<_>>(),
+            [("open".to_string(), Param::Toggle(false))]
+        );
+        shown.follow(Some(&a), Some(&lanes(&[("all", "All"), ("go", "Go")])));
+        assert_eq!(
+            shown.params(Some(&a)).len(),
+            1,
+            "a view arriving never adds to what is asked"
+        );
+        assert_eq!(
+            shown.value(&Control::select(
+                "lane",
+                "Lane",
+                &[("all", "All"), ("go", "Go")],
+                "all"
+            )),
+            Param::Select("all".into()),
+            "what is shown is what was asked"
+        );
+
+        shown.set("ghost", Param::Toggle(true));
+        assert!(!shown.params(Some(&a)).contains_key("ghost"));
+        shown.follow(
+            Some(&a),
+            Some(&lanes(&[("all", "All"), ("ghost", "Ghost")])),
+        );
+        shown.set("open", Param::Toggle(true));
+        assert_eq!(shown.params(Some(&a))["lane"], Param::Select("all".into()));
     }
 }

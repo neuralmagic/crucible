@@ -405,6 +405,7 @@ mod tests {
                         (i64.extend_i32_u (local.get 1)))))"#;
         let plugin = Plugin::load(echo.as_bytes(), SMALL).unwrap();
         let request = Request {
+            params: Default::default(),
             files: vec![File {
                 path: "verdicts.json".into(),
                 task: "triage".into(),
@@ -711,6 +712,7 @@ mod tests {
         };
         let view = plugin
             .view(&Request {
+                params: Default::default(),
                 files: vec![file("go"), file("python")],
             })
             .unwrap();
@@ -908,7 +910,59 @@ mod tests {
             panic!("the folded section is a diagram");
         };
         assert!(source.starts_with("flowchart LR\n"), "{source}");
+        let [
+            crucible_view::Control::Select {
+                id, options, value, ..
+            },
+        ] = view.controls.as_slice()
+        else {
+            panic!("the report has one select");
+        };
+        let values: Vec<&str> = options.iter().map(|o| o.value.as_str()).collect();
+        assert_eq!(
+            (id.as_str(), value.as_str(), values),
+            ("task", "all", vec!["all", "triage-go", "triage-python"])
+        );
+        let triaged = |params: &[(&str, crucible_view::Param)]| {
+            let view = plugin
+                .view(&Request {
+                    files: vec![file("go"), file("python")],
+                    params: params
+                        .iter()
+                        .map(|(id, value)| (id.to_string(), value.clone()))
+                        .collect(),
+                })
+                .unwrap();
+            let Node::Stack { children } = &view.body else {
+                panic!("the report is a stack");
+            };
+            let Node::Stats { items } = &children[0] else {
+                panic!("the report starts with its stats");
+            };
+            let crucible_view::Control::Select { value, .. } = &view.controls[0] else {
+                panic!("the report has one select");
+            };
+            (items[0].value.clone(), value.clone())
+        };
+        let select = |value: &str| crucible_view::Param::Select(value.into());
+        assert_eq!(
+            triaged(&[("task", select("triage-go"))]),
+            ("34".into(), "triage-go".into())
+        );
+        assert_eq!(
+            triaged(&[("task", select("triage-python"))]),
+            ("30".into(), "triage-python".into())
+        );
+        assert_eq!(
+            triaged(&[("task", select("triage-rust"))]),
+            ("64".into(), "all".into())
+        );
+        assert_eq!(
+            triaged(&[("task", crucible_view::Param::Toggle(true))]),
+            ("64".into(), "all".into())
+        );
         let bad = plugin.view(&Request {
+            params: Default::default(),
             files: vec![File {
                 path: "verdicts.json".into(),
                 task: "triage-go".into(),

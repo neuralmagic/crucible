@@ -353,6 +353,7 @@ mod tests {
         View {
             title: "T".into(),
             body,
+            controls: vec![],
         }
     }
 

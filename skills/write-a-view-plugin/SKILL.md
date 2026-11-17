@@ -47,7 +47,8 @@ smaller, faster plugin and is worth it for a view that shapes a lot of data.
    together in `columns`, and what most readers skip in a folded `section`. Prose is
    `markdown`, a process or structure is a `mermaid` diagram, and what explains one row is
    that row's `detail`. Link a row to the task and file it came from. Use `canvas` only when nothing else
-   can draw it.
+   can draw it. When the reader should pick the slice (a lane, a threshold), declare
+   `controls` and read `params` instead of building a tab per slice.
 4. **Build.** See below.
 5. **Look at it.** Run the pack, open the Report pane, and read every tab. See "Checking".
 6. **Stop** when the view draws from a real run's files and says what was asked.
@@ -77,7 +78,7 @@ export function view({ files }: ViewRequest): View {
 ```
 
 - The types are in `crucible-view/js/crucible-view.d.ts`: `ViewRequest`, `View`, `ViewNode`,
-  `Tone`, and `Canvas`. Check against them with
+  `ViewControl`, `Tone`, and `Canvas`. Check against them with
   `tsc --strict --noEmitOnError --target es2022 --module es2022 --lib es2022 crucible-view.d.ts view.ts`
   and ship the `.js` it writes. The app runs JavaScript, not TypeScript.
 - `Canvas` is the browser's canvas as far as the app draws it: `new Canvas(width, height)`,
@@ -140,6 +141,7 @@ fn report(request: Request) -> Result<View, String> {
                 tone: Tone::Neutral,
             }],
         },
+        controls: vec![],
     })
 }
 ```
@@ -167,10 +169,11 @@ Keep the target directory out of the pack: the pack is saved whole. Build for
 | `crucible_view` | the address and length of the request JSON | the reply JSON |
 
 A JSON result is returned as one `i64`: the address in the high 32 bits, the length in the low
-32. The request and reply:
+32. The request and reply; `params` is left out until the reader changes a control:
 
 ```json request
-{"files": [{"path": "verdicts.json", "task": "triage-go", "text": "[]"}]}
+{"files": [{"path": "verdicts.json", "task": "triage-go", "text": "[]"}],
+ "params": {"lane": {"select": "go"}}}
 ```
 
 ```json reply

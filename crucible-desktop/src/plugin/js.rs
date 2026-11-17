@@ -197,6 +197,7 @@ mod tests {
 
     fn request(text: &str) -> Request {
         Request {
+            params: Default::default(),
             files: vec![File {
                 path: "verdicts.json".into(),
                 task: "triage".into(),
@@ -348,6 +349,74 @@ mod tests {
         assert_eq!(
             capped.view(&Request::default()),
             Err(Fault::Reply("over the 1048576 bytes allowed".into()))
+        );
+    }
+
+    #[test]
+    #[ignore = "needs assets/js-engine/plugin.wasm from `just desktop-js-engine`"]
+    fn a_script_reads_params_as_plain_values_and_declares_controls() {
+        use crucible_view::{Control, Param};
+        let script = Script::new(
+            engine(),
+            r#"export const inputs = [];
+               export function view({ files, params }) {
+                   return {
+                       title: JSON.stringify(params) + typeof params.min + files.length,
+                       body: { text: { text: "hi" } },
+                       controls: [
+                           { select: { id: "lane", label: "Lane", value: params.lane ?? "all",
+                               options: [{ value: "all", label: "All" }, { value: "go", label: "Go" }] } },
+                           { toggle: { id: "open", label: "Open", on: params.open ?? false } },
+                           { range: { id: "min", label: "Min", min: 0, max: 10, step: 0.5,
+                               value: params.min ?? 0 } },
+                       ],
+                   };
+               }"#,
+        );
+        let bare = script.view(&Request::default()).unwrap();
+        assert_eq!(bare.title, "{}undefined0");
+        assert_eq!(
+            bare.controls,
+            [
+                Control::select("lane", "Lane", &[("all", "All"), ("go", "Go")], "all"),
+                Control::toggle("open", "Open", false),
+                Control::range("min", "Min", [0.0, 10.0], 0.5, 0.0),
+            ]
+        );
+        let asked = Request {
+            params: [
+                ("lane".to_string(), Param::Select("go".into())),
+                ("open".to_string(), Param::Toggle(true)),
+                ("min".to_string(), Param::Range(7.5)),
+            ]
+            .into(),
+            ..request("[]")
+        };
+        let view = script.view(&asked).unwrap();
+        assert_eq!(view.title, r#"{"lane":"go","min":7.5,"open":true}number1"#);
+        assert_eq!(
+            view.controls[0],
+            Control::select("lane", "Lane", &[("all", "All"), ("go", "Go")], "go")
+        );
+        assert_eq!(
+            view.controls[2],
+            Control::range("min", "Min", [0.0, 10.0], 0.5, 7.5)
+        );
+
+        let twice = Script::new(
+            engine(),
+            r#"export const inputs = [];
+               export function view() {
+                   return { title: "T", body: { text: { text: "hi" } }, controls: [
+                       { toggle: { id: "a", label: "A", on: true } },
+                       { toggle: { id: "a", label: "B", on: false } } ] };
+               }"#,
+        );
+        assert_eq!(
+            twice.view(&Request::default()),
+            Err(Fault::View(crucible_view::Problem::DuplicateControl(
+                "a".into()
+            )))
         );
     }
 }

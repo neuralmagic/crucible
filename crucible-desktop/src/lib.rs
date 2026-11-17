@@ -434,8 +434,10 @@ pub struct App {
     /// The captured file the Files tab shows, by key; the first listed when none is picked.
     pub run_file: Option<String>,
     pub files_md_source: bool,
-    /// The Report pane's picked tabs and its table's sort.
+    /// The Report pane's controls, picked tabs and its table's sort.
     pub report_shown: report::Shown,
+    /// The local pack and params its report was last asked for.
+    report_asked: Option<(String, model::Params)>,
     /// The workspace the user arranged; `None` lays each run out by its graph's depth.
     pub layout: Option<Workspace>,
     /// Panes picked from a tab bar while the layout follows the run, oldest first.
@@ -1316,6 +1318,11 @@ impl App {
             }
             self.remote.file_sent = file;
         }
+        let asked = self.asked_report();
+        if asked != self.report_asked {
+            self.local.ask(asked.clone());
+            self.report_asked = asked;
+        }
         let report = self.wanted_report();
         if report != self.remote.report_sent {
             let asked = report.as_ref().and_then(|wanted| {
@@ -1396,7 +1403,36 @@ impl App {
             settled: self
                 .selected_live()
                 .is_some_and(|launch| !launch.status.is_running()),
+            params: self.report_shown.params(self.selection.as_ref()),
         })
+    }
+
+    /// The selected local pack and the params its report is built with, once the reader has
+    /// set a control.
+    fn asked_report(&self) -> Option<(String, model::Params)> {
+        let pack = self.selected_pack()?;
+        let params = self.report_shown.params(self.selection.as_ref());
+        (!params.is_empty()).then(|| (pack.name.clone(), params))
+    }
+
+    /// Sets the shown report's control `id`, which builds the report again.
+    pub fn set_report_control(&mut self, id: &str, value: crucible_view::Param) {
+        self.report_shown.set(id, value);
+        self.sync_live();
+    }
+
+    /// Ends a drag of the shown report's range `id`, which builds the report again.
+    pub fn release_report_range(&mut self, id: &str) {
+        self.report_shown.release(id);
+        self.sync_live();
+    }
+
+    /// Whether the shown report was built with other params than its controls now hold.
+    pub fn report_pending(&self) -> bool {
+        let Some(report) = self.shown_report() else {
+            return false;
+        };
+        report.view.is_ok() && report.params != self.report_shown.params(self.selection.as_ref())
     }
 
     fn answer_report(&mut self, built: Option<std::sync::Arc<report::Built>>) {
@@ -1935,6 +1971,7 @@ fn init() -> App {
         run_file: None,
         files_md_source: false,
         report_shown: report::Shown::default(),
+        report_asked: None,
         knobs: rune_knobs::Knobs::default(),
         page: Page::Runs,
         flight: None,

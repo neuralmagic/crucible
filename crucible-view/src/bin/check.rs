@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::process::ExitCode;
 
-use crucible_view::{Limits, Node, Reply, View};
+use crucible_view::{Control, Limits, Node, Reply, View};
 
 fn count(node: &Node, counts: &mut BTreeMap<&'static str, usize>) {
     let name = match node {
@@ -60,6 +60,14 @@ fn checked(input: &str) -> Result<String, String> {
         .map_err(|problem| format!("the view was refused: {problem}"))?;
     let mut counts = BTreeMap::new();
     count(&view.body, &mut counts);
+    for control in &view.controls {
+        let kind = match control {
+            Control::Select { .. } => "select",
+            Control::Toggle { .. } => "toggle",
+            Control::Range { .. } => "range",
+        };
+        *counts.entry(kind).or_default() += 1;
+    }
     let parts: Vec<String> = counts
         .into_iter()
         .map(|(name, n)| format!("{n} {name}"))
@@ -110,6 +118,19 @@ mod tests {
         assert_eq!(
             checked(charts),
             Ok("ok: \"T\" with 1 heatmap, 1 histogram, 1 stack".to_string())
+        );
+        let controlled = r#"{"title":"T","body":{"text":{"text":"a"}},"controls":[
+            {"toggle":{"id":"a","label":"A","on":true}},
+            {"range":{"id":"b","label":"B","min":0,"max":10,"step":1,"value":3}}]}"#;
+        assert_eq!(
+            checked(controlled),
+            Ok("ok: \"T\" with 1 range, 1 text, 1 toggle".to_string())
+        );
+        let unoffered = r#"{"title":"T","body":{"text":{"text":"a"}},"controls":[
+            {"select":{"id":"a","label":"A","options":[],"value":"x"}}]}"#;
+        assert_eq!(
+            checked(unoffered),
+            Err("the view was refused: the control a has a value it does not offer".to_string())
         );
         let log = r#"{"title":"T","body":{"plot":{"kind":"line","x":"a","y":"b","y_scale":"log",
             "series":[{"label":"s","points":[[1,0]]}]}}}"#;

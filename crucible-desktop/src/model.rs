@@ -117,8 +117,16 @@ impl PackView {
 
 #[derive(Clone, Debug)]
 pub enum Request {
-    Launch { pack: String, max_time: String },
+    Launch {
+        pack: String,
+        max_time: String,
+    },
+    /// The reader's params for one pack's report; every other pack's report goes back to none.
+    Params(Option<(String, Params)>),
 }
+
+/// A report's params, by control id.
+pub type Params = std::collections::BTreeMap<String, crucible_view::Param>;
 
 /// The UI-side handle. Dropping it stops the client thread.
 pub struct Client {
@@ -168,6 +176,11 @@ impl Client {
             pack: pack.to_string(),
             max_time: max_time.to_string(),
         });
+    }
+
+    /// Builds `pack`'s report with `params`, and every other pack's with none.
+    pub fn ask(&self, asked: Option<(String, Params)>) {
+        let _ = self.tx.send(Request::Params(asked));
     }
 
     /// The newest snapshot, unless the UI has already taken this version.
@@ -224,6 +237,21 @@ fn run_client(repo: PathBuf, rx: Receiver<Request>, shared: Arc<Mutex<Shared>>) 
                 }
                 shown = publish(&shared, snapshot(&packs, error.clone()));
                 next_local = Instant::now() + LIVE_TICK;
+            }
+            Ok(Request::Params(asked)) => {
+                let mut changed = false;
+                for pack in &mut packs {
+                    let params = match &asked {
+                        Some((name, params)) if *name == pack.name => params.clone(),
+                        _ => Params::new(),
+                    };
+                    if pack.reporter.ask(params) {
+                        changed |= pack.reporter.refresh(&pack.dir);
+                    }
+                }
+                if changed {
+                    shown = publish(&shared, snapshot(&packs, error.clone()));
+                }
             }
             Err(RecvTimeoutError::Disconnected) => return,
             Err(RecvTimeoutError::Timeout) => {}

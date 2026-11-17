@@ -3,7 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crucible_view::{
-    Bar, Cell, Column, ColumnKind, Context2d, FlowLink, FlowNode, LineCap, Node, PlotKind, Request,
+    Bar, Cell, Column, ColumnKind, Context2d, Control, FlowLink, FlowNode, LineCap, Node, PlotKind,
+    Request,
     Row, Scale, Segment, Series, Stat, Tab, TextAlign, Tone, View, Width, file_link, task_link,
 };
 use serde::Deserialize;
@@ -150,8 +151,19 @@ fn noted<'a>(text: &'a str, label: &str) -> &'a str {
 }
 
 fn report(request: Request) -> Result<View, String> {
+    let tasks: BTreeSet<&str> = request.files.iter().map(|f| f.task.as_str()).collect();
+    let task = request
+        .select("task")
+        .filter(|task| tasks.contains(task))
+        .unwrap_or("all");
+    let mut options = vec![("all", "All")];
+    options.extend(tasks.iter().map(|task| (*task, *task)));
     let mut tickets: BTreeMap<String, Ticket> = BTreeMap::new();
-    for file in &request.files {
+    for file in request
+        .files
+        .iter()
+        .filter(|file| task == "all" || file.task == task)
+    {
         let records: Vec<Record> = serde_json::from_str(&file.text)
             .map_err(|e| format!("{} from {}: {e}", file.path, file.task))?;
         for record in records {
@@ -254,6 +266,7 @@ fn report(request: Request) -> Result<View, String> {
                 },
             ],
         },
+        controls: vec![Control::select("task", "Lane", &options, task)],
     })
 }
 

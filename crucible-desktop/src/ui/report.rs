@@ -2,6 +2,7 @@
 
 mod axis;
 mod canvas;
+mod controls;
 mod flow;
 mod hue;
 mod plot;
@@ -17,7 +18,7 @@ use crate::App;
 use crate::ui::report::hue::dot;
 use crate::ui::{Paint, desk};
 
-pub(crate) fn report_view(app: &App, p: &Paint) -> El {
+pub(crate) fn report_view(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
     let Some(report) = app.shown_report() else {
         let why = if app.awaits_report() {
             "Drawing the view\u{2026}"
@@ -26,9 +27,21 @@ pub(crate) fn report_view(app: &App, p: &Paint) -> El {
         };
         return desk::note("report-note", why, "", p);
     };
+    let controls = controls::controls(app, p, layer);
     let view = match &report.view {
         Ok(view) => view,
-        Err(error) => return desk::note("report-note", "The view could not be drawn.", error, p),
+        Err(error) => {
+            let note = desk::note("report-note", "The view could not be drawn.", error, p);
+            return match controls {
+                Some(controls) => col()
+                    .key("report")
+                    .w_full()
+                    .gap(12.0)
+                    .child(controls)
+                    .child(note),
+                None => note,
+            };
+        }
     };
     col()
         .key("report")
@@ -53,6 +66,7 @@ pub(crate) fn report_view(app: &App, p: &Paint) -> El {
                         .color(p.c.text_faint)
                 })),
         )
+        .children(controls)
         .child(if app.report_shown.fills(&view.body) {
             node(&view.body, true, app, p)
         } else {

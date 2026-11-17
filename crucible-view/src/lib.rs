@@ -4,7 +4,7 @@
 //! captured file paths it reads, then `crucible_view` with a [`Request`] holding those files, and
 //! gets a [`Reply`]. The host draws the [`View`]; the plugin draws nothing.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -36,10 +36,166 @@ pub struct File {
     pub text: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
     pub files: Vec<File>,
+    /// Each [`Control`] of the last view by id, with the reader's value; empty until the reader
+    /// changes one.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, Param>,
+}
+
+impl Request {
+    /// The value of the select `id`.
+    pub fn select(&self, id: &str) -> Option<&str> {
+        match self.params.get(id)? {
+            Param::Select(value) => Some(value),
+            Param::Toggle(_) | Param::Range(_) => None,
+        }
+    }
+
+    /// Whether the toggle `id` is on.
+    pub fn toggle(&self, id: &str) -> Option<bool> {
+        match self.params.get(id)? {
+            Param::Toggle(on) => Some(*on),
+            Param::Select(_) | Param::Range(_) => None,
+        }
+    }
+
+    /// The value of the range `id`.
+    pub fn range(&self, id: &str) -> Option<f64> {
+        match self.params.get(id)? {
+            Param::Range(value) => Some(*value),
+            Param::Select(_) | Param::Toggle(_) => None,
+        }
+    }
+}
+
+/// A control's value, under the name of its kind.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Param {
+    Select(String),
+    Toggle(bool),
+    Range(f64),
+}
+
+/// A choice the reader makes above the view. Changing one runs the plugin again with every
+/// control's value in [`Request::params`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum Control {
+    /// One of `options`; `value` is one of theirs.
+    Select {
+        id: String,
+        label: String,
+        options: Vec<Choice>,
+        value: String,
+    },
+    Toggle {
+        id: String,
+        label: String,
+        on: bool,
+    },
+    /// A number from `min` to `max` in steps of `step`.
+    Range {
+        id: String,
+        label: String,
+        min: f64,
+        max: f64,
+        step: f64,
+        value: f64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Choice {
+    pub value: String,
+    pub label: String,
+}
+
+impl Control {
+    /// A select of `options`, each a value and its label.
+    pub fn select(id: &str, label: &str, options: &[(&str, &str)], value: &str) -> Control {
+        Control::Select {
+            id: id.to_string(),
+            label: label.to_string(),
+            options: options
+                .iter()
+                .map(|(value, label)| Choice {
+                    value: value.to_string(),
+                    label: label.to_string(),
+                })
+                .collect(),
+            value: value.to_string(),
+        }
+    }
+
+    pub fn toggle(id: &str, label: &str, on: bool) -> Control {
+        Control::Toggle {
+            id: id.to_string(),
+            label: label.to_string(),
+            on,
+        }
+    }
+
+    pub fn range(id: &str, label: &str, [min, max]: [f64; 2], step: f64, value: f64) -> Control {
+        Control::Range {
+            id: id.to_string(),
+            label: label.to_string(),
+            min,
+            max,
+            step,
+            value,
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        match self {
+            Control::Select { id, .. } | Control::Toggle { id, .. } | Control::Range { id, .. } => {
+                id
+            }
+        }
+    }
+
+    pub fn label(&self) -> &str {
+        match self {
+            Control::Select { label, .. }
+            | Control::Toggle { label, .. }
+            | Control::Range { label, .. } => label,
+        }
+    }
+
+    /// `asked` when it is a value of this control's kind, a select's among its options and a
+    /// range's moved onto its nearest step or its `max`; otherwise the control's own value.
+    pub fn coerce(&self, asked: Option<&Param>) -> Param {
+        match (self, asked) {
+            (Control::Select { options, .. }, Some(Param::Select(asked)))
+                if options.iter().any(|choice| &choice.value == asked) =>
+            {
+                Param::Select(asked.clone())
+            }
+            (Control::Select { value, .. }, _) => Param::Select(value.clone()),
+            (Control::Toggle { .. }, Some(Param::Toggle(on))) => Param::Toggle(*on),
+            (Control::Toggle { on, .. }, _) => Param::Toggle(*on),
+            (Control::Range { min, max, step, .. }, Some(Param::Range(asked)))
+                if asked.is_finite() && *step > 0.0 =>
+            {
+                let asked = asked.max(*min).min(*max);
+                let stepped = (min + ((asked - min) / step).round() * step)
+                    .max(*min)
+                    .min(*max);
+                if max - asked < (asked - stepped).abs() {
+                    Param::Range(*max)
+                } else {
+                    Param::Range(stepped)
+                }
+            }
+            (Control::Range { value, .. }, _) => Param::Range(*value),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -54,6 +210,9 @@ pub enum Reply {
 pub struct View {
     pub title: String,
     pub body: Node,
+    /// Drawn in a row above the body.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub controls: Vec<Control>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -403,6 +562,11 @@ pub struct Limits {
     /// Bytes of Markdown and Mermaid source across the view's components, and in one row's
     /// detail.
     pub prose: usize,
+    pub controls: usize,
+    /// Options in one select.
+    pub options: usize,
+    /// Steps from one end of a range to the other.
+    pub steps: u32,
 }
 
 impl Limits {
@@ -420,6 +584,9 @@ impl Limits {
         canvas_side: 4_000,
         text: 20_000,
         prose: 100_000,
+        controls: 12,
+        options: 100,
+        steps: 1_000,
     };
 }
 
@@ -506,6 +673,23 @@ pub enum Problem {
     HeatmapRow(String, usize, usize),
     #[error("the heatmap row {0} has a value that is not a number within 1e15 of zero")]
     HeatmapValue(String),
+    #[error("the view has more than {0} controls")]
+    Controls(usize),
+    #[error("two controls are named {0}")]
+    DuplicateControl(String),
+    #[error("the select {0} has more than {1} options")]
+    Options(String, usize),
+    #[error("the select {0} has two options with the value or label {1}")]
+    DuplicateOption(String, String),
+    #[error("the control {0} has a value it does not offer")]
+    ControlValue(String),
+    #[error(
+        "the range {0} is not numbers within 1e15 of zero with its min below its max and its \
+         step above 0"
+    )]
+    Range(String),
+    #[error("the range {0} has more than {1} steps")]
+    Steps(String, u32),
 }
 
 impl View {
@@ -517,8 +701,69 @@ impl View {
         if shown > 1 {
             return Err(Problem::Tables);
         }
-        Ok(())
+        controls_fit(&self.controls, limits)
     }
+}
+
+fn controls_fit(controls: &[Control], limits: &Limits) -> Result<(), Problem> {
+    if controls.len() > limits.controls {
+        return Err(Problem::Controls(limits.controls));
+    }
+    let mut ids = HashSet::new();
+    for control in controls {
+        let id = control.id();
+        fits(id, limits)?;
+        fits(control.label(), limits)?;
+        if !ids.insert(id) {
+            return Err(Problem::DuplicateControl(id.to_string()));
+        }
+        match control {
+            Control::Select { options, value, .. } => {
+                if options.len() > limits.options {
+                    return Err(Problem::Options(id.to_string(), limits.options));
+                }
+                let (mut values, mut labels) = (HashSet::new(), HashSet::new());
+                for choice in options {
+                    fits(&choice.value, limits)?;
+                    fits(&choice.label, limits)?;
+                    if !values.insert(choice.value.as_str()) {
+                        return Err(Problem::DuplicateOption(
+                            id.to_string(),
+                            choice.value.clone(),
+                        ));
+                    }
+                    if !labels.insert(choice.label.as_str()) {
+                        return Err(Problem::DuplicateOption(
+                            id.to_string(),
+                            choice.label.clone(),
+                        ));
+                    }
+                }
+                if !values.contains(value.as_str()) {
+                    return Err(Problem::ControlValue(id.to_string()));
+                }
+            }
+            Control::Toggle { .. } => {}
+            Control::Range {
+                min,
+                max,
+                step,
+                value,
+                ..
+            } => {
+                if ![min, max, step, value].into_iter().all(within) || min >= max || *step <= 0.0 {
+                    return Err(Problem::Range(id.to_string()));
+                }
+                if (max - min) / step > f64::from(limits.steps) {
+                    return Err(Problem::Steps(id.to_string(), limits.steps));
+                }
+                if !(*min..=*max).contains(value) {
+                    return Err(Problem::ControlValue(id.to_string()));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// What the view holds so far.
@@ -913,6 +1158,7 @@ mod tests {
         View {
             title: "Report".into(),
             body,
+            controls: vec![],
         }
     }
 
@@ -1569,6 +1815,9 @@ mod tests {
         flow_links: 2,
         text: 8,
         prose: 12,
+        controls: 2,
+        options: 3,
+        steps: 10,
     };
 
     #[test]
@@ -1901,6 +2150,7 @@ mod tests {
             View {
                 title: long.clone(),
                 body: Node::Stats { items: vec![] },
+                controls: vec![],
             }
             .check(&TIGHT),
             Err(Problem::Text(8))
@@ -1945,5 +2195,261 @@ mod tests {
             text: "x".repeat(8),
             tone: Tone::Neutral,
         }));
+    }
+
+    fn controlled(controls: Vec<crate::Control>) -> View {
+        View {
+            controls,
+            ..view(Node::Stats { items: vec![] })
+        }
+    }
+
+    #[test]
+    fn controls_read_back_as_written_and_are_left_out_when_none() {
+        use crate::{Choice, Control};
+        let with = controlled(vec![
+            Control::select("lane", "Lane", &[("all", "All"), ("go", "Go")], "all"),
+            Control::toggle("open", "Open only", true),
+            Control::range("cvss", "Min CVSS", [0.0, 10.0], 0.5, 7.0),
+        ]);
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(
+            json.ends_with(
+                r#""controls":[{"select":{"id":"lane","label":"Lane","options":[{"value":"all","label":"All"},{"value":"go","label":"Go"}],"value":"all"}},{"toggle":{"id":"open","label":"Open only","on":true}},{"range":{"id":"cvss","label":"Min CVSS","min":0.0,"max":10.0,"step":0.5,"value":7.0}}]}"#
+            ),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<View>(&json).unwrap(), with);
+        assert_eq!(with.check(&Limits::DEFAULT), Ok(()));
+        let none = controlled(vec![]);
+        let json = serde_json::to_string(&none).unwrap();
+        assert!(!json.contains("controls"), "{json}");
+        assert_eq!(serde_json::from_str::<View>(&json).unwrap(), none);
+        for off in [
+            r#"{"slider":{"id":"a","label":"A"}}"#,
+            r#"{"toggle":{"id":"a","label":"A","on":true,"hint":"x"}}"#,
+            r#"{"toggle":{"id":"a","label":"A"}}"#,
+            r#"{"select":{"id":"a","label":"A","options":[{"value":"x","label":"X","tone":"bad"}],"value":"x"}}"#,
+        ] {
+            assert!(serde_json::from_str::<Control>(off).is_err(), "{off}");
+        }
+        let choice: Choice = serde_json::from_str(r#"{"value":"go","label":"Go"}"#).unwrap();
+        assert_eq!(choice.label, "Go");
+    }
+
+    #[test]
+    fn controls_are_few_and_named_once_with_bounded_labels() {
+        use crate::Control;
+        let toggle = |id: &str| Control::toggle(id, "On", false);
+        assert_eq!(
+            controlled(vec![toggle("a"), toggle("b")]).check(&TIGHT),
+            Ok(())
+        );
+        assert_eq!(
+            controlled(vec![toggle("a"), toggle("b"), toggle("c")]).check(&TIGHT),
+            Err(Problem::Controls(2))
+        );
+        assert_eq!(
+            controlled(vec![toggle("a"), toggle("a")]).check(&TIGHT),
+            Err(Problem::DuplicateControl("a".into()))
+        );
+        let tabs = Node::Tabs {
+            id: "a".into(),
+            tabs: vec![Tab {
+                label: "x".into(),
+                count: None,
+                body: Node::Stats { items: vec![] },
+            }],
+        };
+        assert_eq!(
+            View {
+                controls: vec![toggle("a")],
+                ..view(tabs)
+            }
+            .check(&Limits::DEFAULT),
+            Ok(()),
+            "controls and components are named apart"
+        );
+        assert_eq!(
+            controlled(vec![toggle(&"x".repeat(9))]).check(&TIGHT),
+            Err(Problem::Text(8))
+        );
+        assert_eq!(
+            controlled(vec![Control::toggle("a", &"x".repeat(9), true)]).check(&TIGHT),
+            Err(Problem::Text(8))
+        );
+        assert_eq!(
+            controlled(vec![Control::toggle("", "", true)]).check(&TIGHT),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_select_s_value_is_one_of_a_bounded_set_of_distinct_options() {
+        use crate::Control;
+        let select = |options: &[(&str, &str)], value: &str| {
+            controlled(vec![Control::select("s", "S", options, value)]).check(&TIGHT)
+        };
+        assert_eq!(select(&[("a", "A"), ("b", "B"), ("c", "C")], "c"), Ok(()));
+        assert_eq!(
+            select(&[("a", "A"), ("b", "B"), ("c", "C"), ("d", "D")], "a"),
+            Err(Problem::Options("s".into(), 3))
+        );
+        assert_eq!(
+            select(&[("a", "A"), ("b", "B")], "z"),
+            Err(Problem::ControlValue("s".into()))
+        );
+        assert_eq!(select(&[], ""), Err(Problem::ControlValue("s".into())));
+        assert_eq!(
+            select(&[("a", "A"), ("a", "B")], "a"),
+            Err(Problem::DuplicateOption("s".into(), "a".into()))
+        );
+        assert_eq!(
+            select(&[("a", "A"), ("b", "A")], "a"),
+            Err(Problem::DuplicateOption("s".into(), "A".into()))
+        );
+        assert_eq!(select(&[("a", &"x".repeat(9))], "a"), Err(Problem::Text(8)));
+        assert_eq!(select(&[(&"x".repeat(9), "A")], "a"), Err(Problem::Text(8)));
+    }
+
+    #[test]
+    fn a_range_is_finite_ordered_and_steps_a_bounded_number_of_times() {
+        use crate::Control;
+        let range = |min: f64, max: f64, step: f64, value: f64| {
+            controlled(vec![Control::range("r", "R", [min, max], step, value)]).check(&TIGHT)
+        };
+        let off = Err(Problem::Range("r".into()));
+        assert_eq!(range(0.0, 10.0, 1.0, 0.0), Ok(()));
+        assert_eq!(range(0.0, 10.0, 1.0, 10.0), Ok(()));
+        assert_eq!(range(-1e15, 1e15, 2e14, 3.3), Ok(()));
+        assert_eq!(
+            range(0.0, 10.0, 0.999, 1.0),
+            Err(Problem::Steps("r".into(), 10))
+        );
+        assert_eq!(
+            range(0.0, 1.0, 1e-300, 1.0),
+            Err(Problem::Steps("r".into(), 10))
+        );
+        assert_eq!(
+            range(-1e15, 1e15, f64::MIN_POSITIVE, 0.0),
+            Err(Problem::Steps("r".into(), 10))
+        );
+        assert_eq!(
+            range(0.0, 10.0, 1.0, 10.5),
+            Err(Problem::ControlValue("r".into()))
+        );
+        assert_eq!(
+            range(0.0, 10.0, 1.0, -0.5),
+            Err(Problem::ControlValue("r".into()))
+        );
+        for (min, max, step, value) in [
+            (5.0, 5.0, 1.0, 5.0),
+            (6.0, 5.0, 1.0, 5.0),
+            (0.0, 10.0, 0.0, 1.0),
+            (0.0, 10.0, -1.0, 1.0),
+            (f64::NAN, 10.0, 1.0, 1.0),
+            (0.0, f64::NAN, 1.0, 1.0),
+            (0.0, 10.0, f64::NAN, 1.0),
+            (0.0, 10.0, 1.0, f64::NAN),
+            (f64::NEG_INFINITY, 10.0, 1.0, 1.0),
+            (0.0, f64::INFINITY, 1.0, 1.0),
+            (0.0, 10.0, f64::INFINITY, 1.0),
+            (0.0, 2e15, 1e15, 1.0),
+            (-2e15, 0.0, 1e15, -1.0),
+        ] {
+            assert_eq!(
+                range(min, max, step, value),
+                off,
+                "{min} {max} {step} {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_s_params_are_left_out_when_none_and_named_by_kind() {
+        use crate::{Param, Request};
+        let bare = Request {
+            files: vec![],
+            params: Default::default(),
+        };
+        assert_eq!(serde_json::to_string(&bare).unwrap(), r#"{"files":[]}"#);
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"files":[]}"#).unwrap(),
+            bare
+        );
+        let asked = Request {
+            files: vec![],
+            params: [
+                ("lane".to_string(), Param::Select("go".into())),
+                ("open".to_string(), Param::Toggle(true)),
+                ("cvss".to_string(), Param::Range(7.5)),
+            ]
+            .into(),
+        };
+        let json = serde_json::to_string(&asked).unwrap();
+        assert_eq!(
+            json,
+            r#"{"files":[],"params":{"cvss":{"range":7.5},"lane":{"select":"go"},"open":{"toggle":true}}}"#
+        );
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), asked);
+        assert_eq!(asked.select("lane"), Some("go"));
+        assert_eq!(asked.toggle("open"), Some(true));
+        assert_eq!(asked.range("cvss"), Some(7.5));
+        assert_eq!(asked.select("open"), None);
+        assert_eq!(asked.toggle("cvss"), None);
+        assert_eq!(asked.range("lane"), None);
+        assert_eq!(asked.select("missing"), None);
+        assert!(serde_json::from_str::<Request>(r#"{"files":[],"params":{"a":7}}"#).is_err());
+        assert!(serde_json::from_str::<Request>(r#"{"files":[],"extra":1}"#).is_err());
+    }
+
+    #[test]
+    fn a_control_takes_only_a_value_it_offers() {
+        use crate::{Control, Param};
+        let select = Control::select("s", "S", &[("a", "A"), ("b", "B")], "a");
+        let picked = |control: &Control, asked: Param| control.coerce(Some(&asked));
+        assert_eq!(
+            picked(&select, Param::Select("b".into())),
+            Param::Select("b".into())
+        );
+        assert_eq!(
+            picked(&select, Param::Select("z".into())),
+            Param::Select("a".into())
+        );
+        assert_eq!(
+            picked(&select, Param::Toggle(true)),
+            Param::Select("a".into())
+        );
+        assert_eq!(select.coerce(None), Param::Select("a".into()));
+        let toggle = Control::toggle("t", "T", true);
+        assert_eq!(picked(&toggle, Param::Toggle(false)), Param::Toggle(false));
+        assert_eq!(picked(&toggle, Param::Range(0.0)), Param::Toggle(true));
+        assert_eq!(toggle.coerce(None), Param::Toggle(true));
+        let range = Control::range("r", "R", [1.0, 10.0], 0.5, 7.0);
+        assert_eq!(picked(&range, Param::Range(3.3)), Param::Range(3.5));
+        assert_eq!(picked(&range, Param::Range(3.2)), Param::Range(3.0));
+        assert_eq!(picked(&range, Param::Range(-50.0)), Param::Range(1.0));
+        assert_eq!(picked(&range, Param::Range(1e300)), Param::Range(10.0));
+        assert_eq!(picked(&range, Param::Range(f64::NAN)), Param::Range(7.0));
+        assert_eq!(
+            picked(&range, Param::Range(f64::INFINITY)),
+            Param::Range(7.0)
+        );
+        assert_eq!(picked(&range, Param::Select("3".into())), Param::Range(7.0));
+        assert_eq!(range.coerce(None), Param::Range(7.0));
+        let uneven = Control::range("r", "R", [0.0, 10.0], 3.0, 0.0);
+        assert_eq!(picked(&uneven, Param::Range(9.9)), Param::Range(10.0));
+        assert_eq!(picked(&uneven, Param::Range(9.4)), Param::Range(9.0));
+        assert_eq!(picked(&uneven, Param::Range(7.4)), Param::Range(6.0));
+        for at in [0.0, 3.0, 9.0, 10.0] {
+            assert_eq!(picked(&uneven, Param::Range(at)), Param::Range(at), "{at}");
+        }
+        let unchecked = Control::range("r", "R", [10.0, 0.0], f64::NAN, 1.0);
+        assert_eq!(picked(&unchecked, Param::Range(5.0)), Param::Range(1.0));
+        let backwards = Control::range("r", "R", [10.0, 0.0], 1.0, 1.0);
+        assert!(matches!(
+            picked(&backwards, Param::Range(5.0)),
+            Param::Range(value) if value.is_finite()
+        ));
     }
 }

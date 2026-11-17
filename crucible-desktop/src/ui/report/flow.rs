@@ -474,6 +474,7 @@ mod tests {
             );
             let (_, commands) = drawing(&nodes, &links, &PALETTE).unwrap();
             let view = crucible_view::View {
+                controls: vec![],
                 title: "T".into(),
                 body: crucible_view::Node::Canvas {
                     width: WIDTH,

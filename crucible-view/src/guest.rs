@@ -3,7 +3,10 @@
 //! ```ignore
 //! crucible_view::plugin!(inputs = ["verdicts.json"], view = report);
 //!
-//! fn report(request: crucible_view::Request) -> Result<crucible_view::View, String> { .. }
+//! fn report(request: crucible_view::Request) -> Result<crucible_view::View, String> {
+//!     let lane = request.select("lane").unwrap_or("all");
+//!     ..
+//! }
 //! ```
 //!
 //! A result is returned as one `u64`: its address in the high half, its length in the low half.

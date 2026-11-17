@@ -94,6 +94,7 @@ mod tests {
         View {
             title: "T".into(),
             body: Node::Flow { nodes, links },
+            controls: vec![],
         }
         .check(&Limits::DEFAULT)
     }

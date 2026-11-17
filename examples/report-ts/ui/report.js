@@ -293,10 +293,26 @@ function ageByPackage(tickets) {
         },
     };
 }
-export function view({ files }) {
-    const tickets = read(files);
+export function view({ files, params }) {
+    const every = read(files);
+    const allLanes = [...new Set(every.map((t) => t.lane))].sort();
+    const lane = typeof params.lane === "string" && allLanes.includes(params.lane) ? params.lane : "all";
+    const minCvss = typeof params.cvss === "number" ? params.cvss : 0;
+    const controls = [
+        {
+            select: {
+                id: "lane",
+                label: "Lane",
+                options: [{ value: "all", label: "All" }, ...allLanes.map((l) => ({ value: l, label: l }))],
+                value: lane,
+            },
+        },
+        { range: { id: "cvss", label: "Min CVSS", min: 0, max: 10, step: 0.5, value: minCvss } },
+    ];
+    const tickets = every.filter((t) => (lane === "all" || t.lane === lane) && t.cvss >= minCvss);
     if (tickets.length === 0) {
-        return { title: "Triage", body: { text: { text: "No verdicts were captured.", tone: "muted" } } };
+        const why = every.length === 0 ? "No verdicts were captured." : "No ticket matches.";
+        return { title: "Triage", body: { text: { text: why, tone: "muted" } }, controls };
     }
     const of = (action) => tickets.filter((t) => t.action === action);
     const [fix, decide, spot, close] = [of("fix"), of("decide"), of("spot"), of("close")];
@@ -304,7 +320,7 @@ export function view({ files }) {
     const lanes = [...new Set(tickets.map((t) => t.lane))].sort();
     const act = [...fix, ...decide];
     const first = fix[0];
-    const summary = `**${tickets.length} tickets** from the ${lanes.join(" and ")} lanes.\n\n` +
+    const summary = `**${tickets.length} tickets** from the ${lanes.join(" and ")} ${lanes.length === 1 ? "lane" : "lanes"}.\n\n` +
         `- **${fix.length} are affected** and need a fix, ${high(fix)} of them CVSS 7 or higher` +
         (first ? `; start with \`${first.key}\` (${first.cvss.toFixed(1)}, open ${first.age} days).\n` : ".\n") +
         `- **${decide.length} could not be decided** and need a person.\n` +
@@ -392,5 +408,6 @@ export function view({ files }) {
                 ],
             },
         },
+        controls,
     };
 }

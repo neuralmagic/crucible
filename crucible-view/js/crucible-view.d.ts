@@ -3,7 +3,7 @@
 // a view. The host compiles and runs it; it has no imports, no network and no files.
 //
 //   export const inputs = ["verdicts.json"];
-//   export function view({ files }: ViewRequest): View { ... }
+//   export function view({ files, params }: ViewRequest): View { ... }
 
 /** A colour role from the app's theme. */
 type Tone = "neutral" | "muted" | "good" | "warn" | "bad" | "info";
@@ -22,12 +22,34 @@ interface CapturedFile {
 
 interface ViewRequest {
   files: CapturedFile[];
+  /**
+   * Each control of the last view by id, with the reader's value: a select's option value, a
+   * toggle's `on`, a range's number. Empty until the reader changes one.
+   */
+  params: Record<string, string | boolean | number>;
 }
 
 interface View {
   title: string;
   body: ViewNode;
+  /** Drawn in a row above the body; at most 12, ids unique among them. */
+  controls?: ViewControl[];
 }
+
+/**
+ * A choice the reader makes above the view. Changing one runs `view` again with every
+ * control's value in `params`; return each control with that value so it stays put.
+ */
+type ViewControl =
+  | {
+      /** `value` is one of `options`; at most 100 options, values and labels each unique. */
+      select: { id: string; label: string; options: { value: string; label: string }[]; value: string };
+    }
+  | { toggle: { id: string; label: string; on: boolean } }
+  | {
+      /** `min` below `max`, `step` above 0, at most 1,000 steps, `value` from `min` to `max`. */
+      range: { id: string; label: string; min: number; max: number; step: number; value: number };
+    };
 
 interface ViewCell {
   text: string;

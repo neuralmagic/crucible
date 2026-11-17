@@ -20,7 +20,15 @@
   let reply;
   try {
     const asked = JSON.parse(new TextDecoder().decode(bytes));
-    reply = "view" in asked ? { view: view(asked.view) } : { inputs };
+    if ("view" in asked) {
+      const params = {};
+      for (const [id, value] of Object.entries(asked.view.params ?? {})) {
+        params[id] = Object.values(value)[0];
+      }
+      reply = { view: view({ files: asked.view.files, params }) };
+    } else {
+      reply = { inputs };
+    }
   } catch (error) {
     const stack = error && error.stack ? `\n${error.stack}` : "";
     reply = { error: `${error}${stack}`.trim() };
