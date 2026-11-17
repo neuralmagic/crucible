@@ -41,7 +41,9 @@ smaller, faster plugin and is worth it for a view that shapes a lot of data.
    someone runs after the run.
 3. **Choose components.** Read `components.md`. Headline numbers are `stats`, a pivot is a
    `grid`, the rows are a `table`, a category split is `bars`, an ordered x axis is a `line`
-   plot, two measures are a `scatter` plot. Put alternatives in `tabs`, charts that read
+   plot (on a `time` axis for dates, with `categories` for named steps), two measures are a
+   `scatter` plot, one measure's spread is a `histogram`, and a count by two categories is a
+   `heatmap`. Put alternatives in `tabs`, charts that read
    together in `columns`, and what most readers skip in a folded `section`. Prose is
    `markdown`, a process or structure is a `mermaid` diagram, and what explains one row is
    that row's `detail`. Link a row to the task and file it came from. Use `canvas` only when nothing else

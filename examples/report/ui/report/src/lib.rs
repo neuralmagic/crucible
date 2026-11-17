@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crucible_view::{
     Bar, Cell, Column, ColumnKind, Context2d, FlowLink, FlowNode, LineCap, Node, PlotKind, Request,
-    Row, Segment, Series, Stat, Tab, TextAlign, Tone, View, Width, file_link, task_link,
+    Row, Scale, Segment, Series, Stat, Tab, TextAlign, Tone, View, Width, file_link, task_link,
 };
 use serde::Deserialize;
 
@@ -216,6 +216,9 @@ fn report(request: Request) -> Result<View, String> {
                         children: vec![across_releases(&tickets), age_by_score(&tickets)],
                     },
                     how_decided(&tickets),
+                    Node::Columns {
+                        children: vec![days_open(&tickets), by_category_and_release(&tickets)],
+                    },
                 ],
             },
         },
@@ -263,12 +266,8 @@ fn stat(label: &str, value: usize, tone: Tone) -> Stat {
 }
 
 fn by_release(tickets: &[Ticket]) -> Node {
-    let releases: BTreeSet<&str> = tickets
-        .iter()
-        .map(|t| t.verdict.release.name.as_str())
-        .collect();
     Node::Bars {
-        bars: releases
+        bars: releases(tickets)
             .into_iter()
             .map(|release| Bar {
                 label: release.into(),
@@ -289,12 +288,18 @@ fn by_release(tickets: &[Ticket]) -> Node {
     }
 }
 
-/// Each category's count per release, on the release number.
-fn across_releases(tickets: &[Ticket]) -> Node {
-    let releases: BTreeSet<&str> = tickets
+fn releases(tickets: &[Ticket]) -> Vec<&str> {
+    tickets
         .iter()
         .map(|t| t.verdict.release.name.as_str())
-        .collect();
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Each category's count per release, a release a category on the x axis.
+fn across_releases(tickets: &[Ticket]) -> Node {
+    let releases = releases(tickets);
     Node::Plot {
         kind: PlotKind::Line,
         x: "release".into(),
@@ -306,17 +311,59 @@ fn across_releases(tickets: &[Ticket]) -> Node {
                 tone: category.tone(),
                 points: releases
                     .iter()
-                    .filter_map(|release| {
+                    .enumerate()
+                    .map(|(i, release)| {
                         let count = tickets
                             .iter()
                             .filter(|t| t.verdict.release.name == *release)
                             .filter(|t| t.category == category)
                             .count();
-                        Some([release.parse().ok()?, count as f64])
+                        [i as f64, count as f64]
                     })
                     .collect(),
             })
             .collect(),
+        x_scale: Scale::Linear,
+        y_scale: Scale::Linear,
+        categories: releases.iter().map(|release| release.to_string()).collect(),
+    }
+}
+
+/// How long the tickets have been open.
+fn days_open(tickets: &[Ticket]) -> Node {
+    Node::Histogram {
+        x: "days open".into(),
+        values: tickets.iter().map(|t| t.age_days).collect(),
+        bins: Some(8),
+        tone: Tone::Neutral,
+    }
+}
+
+/// Tickets per category and release.
+fn by_category_and_release(tickets: &[Ticket]) -> Node {
+    let releases = releases(tickets);
+    Node::Heatmap {
+        x: releases.iter().map(|release| release.to_string()).collect(),
+        y: Category::ALL
+            .iter()
+            .map(|category| category.label().to_string())
+            .collect(),
+        values: Category::ALL
+            .into_iter()
+            .map(|category| {
+                releases
+                    .iter()
+                    .map(|release| {
+                        tickets
+                            .iter()
+                            .filter(|t| t.category == category)
+                            .filter(|t| t.verdict.release.name == *release)
+                            .count() as f64
+                    })
+                    .collect()
+            })
+            .collect(),
+        tone: Tone::Info,
     }
 }
 
@@ -401,6 +448,9 @@ fn age_by_score(tickets: &[Ticket]) -> Node {
                     .collect(),
             })
             .collect(),
+        x_scale: Scale::Linear,
+        y_scale: Scale::Linear,
+        categories: vec![],
     }
 }
 
@@ -409,12 +459,7 @@ fn age_by_score(tickets: &[Ticket]) -> Node {
 fn drawing(tickets: &[Ticket]) -> Node {
     use std::f32::consts::{FRAC_PI_2, TAU};
 
-    let releases: Vec<&str> = tickets
-        .iter()
-        .map(|t| t.verdict.release.name.as_str())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    let releases = releases(tickets);
     let count = |category: Category, release: &str| {
         tickets
             .iter()

@@ -749,14 +749,17 @@ mod tests {
         let [
             Node::Columns { children: side },
             Node::Flow { nodes, links },
+            Node::Columns { children: under },
         ] = charts.as_slice()
         else {
-            panic!("Charts is two plots side by side over a flow");
+            panic!("Charts is two plots side by side over a flow over two more charts");
         };
         let [
             Node::Plot {
                 kind: PlotKind::Line,
                 series: lines,
+                categories,
+                x_scale: crucible_view::Scale::Linear,
                 ..
             },
             Node::Plot {
@@ -768,6 +771,41 @@ mod tests {
         else {
             panic!("the plots are a line plot and a scatter plot");
         };
+        assert_eq!(categories, &["3.3", "3.4", "3.5"]);
+        assert!(
+            lines
+                .iter()
+                .flat_map(|series| &series.points)
+                .all(|point| [0.0, 1.0, 2.0].contains(&point[0])),
+            "x indexes a release"
+        );
+        let [
+            Node::Histogram {
+                values: ages,
+                bins: Some(8),
+                ..
+            },
+            Node::Heatmap {
+                x: heat_x,
+                y: heat_y,
+                values: heat,
+                ..
+            },
+        ] = under.as_slice()
+        else {
+            panic!("under the flow are a histogram and a heatmap");
+        };
+        assert_eq!(ages.len(), 64);
+        assert_eq!(heat_x, categories);
+        assert_eq!(heat_y.len(), 6);
+        assert_eq!(heat.iter().flatten().sum::<f64>(), 64.0);
+        assert!(
+            nodes
+                .iter()
+                .filter(|node| node.id.starts_with("basis:"))
+                .all(|node| node.tone == crucible_view::Tone::Neutral),
+            "the bases take the palette's colours"
+        );
         let columns = crucible_view::flow_columns(nodes, links).unwrap();
         let reaching = |column: usize| -> f64 {
             links

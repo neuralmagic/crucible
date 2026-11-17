@@ -1,19 +1,20 @@
 //! The Report tab: the view a pack's plugin built from the run's captured files.
 
+mod axis;
 mod canvas;
 mod flow;
+mod hue;
+mod plot;
 
 use std::borrow::Cow;
-use std::collections::HashSet;
 
-use crucible_view::{
-    Bar, Cell, Column, ColumnKind, Node, PlotKind, Row, Series, Stat, Tab, Tone, Width,
-};
-use rune::{Align, Color, El, LineCap, Shape, Tx, canvas, col, el, icon, row, text};
+use crucible_view::{Cell, Column, ColumnKind, Node, Row, Stat, Tab, Tone, Width};
+use rune::{Align, Color, El, Tx, col, el, icon, row, text};
 use rune_kit::{IconButton, IconButtonVariant, Kit, Markdown, Table, TableColumn, TextInput};
 use rune_theme_opencode::icons as oc;
 
 use crate::App;
+use crate::ui::report::hue::dot;
 use crate::ui::{Paint, desk};
 
 pub(crate) fn report_view(app: &App, p: &Paint) -> El {
@@ -77,6 +78,8 @@ fn least_width(node: &Node) -> f32 {
         Node::Stats { .. }
         | Node::Bars { .. }
         | Node::Plot { .. }
+        | Node::Histogram { .. }
+        | Node::Heatmap { .. }
         | Node::Grid { .. }
         | Node::Table { .. }
         | Node::Text { .. }
@@ -124,9 +127,35 @@ fn node(node_: &Node, fills: bool, app: &App, p: &Paint) -> El {
         } => section(id, title, *open, body, fills, app, p),
         Node::Tabs { id, tabs } => tabs_view(id, tabs, fills, app, p),
         Node::Stats { items } => stats(items, p),
-        Node::Bars { bars: all } => bars(all, p),
-        Node::Plot { kind, x, y, series } => plot(*kind, x, y, series, p),
-        Node::Flow { nodes, links } => match flow::drawing(nodes, links) {
+        Node::Bars { bars } => plot::bars(bars, p),
+        Node::Plot {
+            kind,
+            x,
+            y,
+            series,
+            x_scale,
+            y_scale,
+            categories,
+        } => plot::plot(
+            &plot::Plotted {
+                kind: *kind,
+                x,
+                y,
+                series,
+                x_scale: *x_scale,
+                y_scale: *y_scale,
+                categories,
+            },
+            p,
+        ),
+        Node::Histogram {
+            x,
+            values,
+            bins,
+            tone,
+        } => plot::histogram(x, values, *bins, *tone, p),
+        Node::Heatmap { x, y, values, tone } => plot::heatmap(x, y, values, *tone, p),
+        Node::Flow { nodes, links } => match flow::drawing(nodes, links, &flow_palette(p)) {
             Some((height, commands)) => col()
                 .w_full()
                 .max_w(720.0)
@@ -155,6 +184,13 @@ fn node(node_: &Node, fills: bool, app: &App, p: &Paint) -> El {
     }
 }
 
+/// The palette's colours as a flow's stages are drawn in them.
+fn flow_palette(p: &Paint) -> Vec<crucible_view::Style> {
+    (0..hue::palette(p.dark).len())
+        .map(|i| hue::style(hue::Hue::Palette(i), p.k))
+        .collect()
+}
+
 /// Markdown whose links lead to the web or into the run.
 fn markdown(body: String, key: &str, p: &Paint) -> El {
     Markdown::new(body)
@@ -181,16 +217,6 @@ fn ink(tone: Tone, k: &Kit) -> Option<Color> {
         Tone::Warn => Some(k.c.warning.fg),
         Tone::Bad => Some(k.c.danger.fg),
         Tone::Info => Some(k.c.info.fg),
-    }
-}
-
-fn dot(tone: Tone, k: &Kit) -> Color {
-    match tone {
-        Tone::Neutral | Tone::Muted => k.c.icon_faint,
-        Tone::Good => k.c.success.icon,
-        Tone::Warn => k.c.warning.icon,
-        Tone::Bad => k.c.danger.icon,
-        Tone::Info => k.c.info.icon,
     }
 }
 
@@ -314,197 +340,6 @@ fn stats(items: &[Stat], p: &Paint) -> El {
         );
     }
     tiles
-}
-
-fn bars(all: &[Bar], p: &Paint) -> El {
-    let total = |bar: &Bar| bar.segments.iter().map(|s| s.value).sum::<f64>();
-    let most = all.iter().map(total).fold(0.0, f64::max);
-    let key = legend(
-        all.iter()
-            .flat_map(|bar| &bar.segments)
-            .map(|segment| (segment.label.as_str(), segment.tone)),
-        p,
-    );
-    let mut chart = col()
-        .key("report-bars")
-        .w_full()
-        .max_w(720.0)
-        .padding(12.0)
-        .gap(8.0)
-        .radius(p.k.radius.lg)
-        .fill(p.c.layer_01)
-        .border(p.hair, p.c.border_muted)
-        .child(key);
-    for bar in all {
-        let mut track = row().grow(1.0).min_w(0.0).h(12.0).gap(1.0);
-        for segment in bar.segments.iter().filter(|s| s.value > 0.0) {
-            track = track.child(
-                el().grow(segment.value as f32)
-                    .h_full()
-                    .radius(2.0)
-                    .fill(dot(segment.tone, p.k))
-                    .help(format!("{} {}", segment.label, segment.value)),
-            );
-        }
-        let rest = most - total(bar);
-        if rest > 0.0 {
-            track = track.child(el().grow(rest as f32).h_full());
-        }
-        chart = chart.child(
-            row()
-                .key(format!("report-bar-{}", bar.label))
-                .w_full()
-                .h(20.0)
-                .gap(10.0)
-                .center_y()
-                .child(
-                    text(bar.label.clone())
-                        .font(p.mono(11.5, 440.0))
-                        .color(p.c.text_base)
-                        .w(110.0)
-                        .truncate(),
-                )
-                .child(track)
-                .child(
-                    row().w(44.0).justify_end().child(
-                        text(total(bar).to_string())
-                            .font(p.mono(11.5, 440.0))
-                            .color(p.c.text_muted),
-                    ),
-                ),
-        );
-    }
-    chart
-}
-
-/// Each label once, in the order first seen, beside its colour.
-fn legend<'a>(items: impl Iterator<Item = (&'a str, Tone)>, p: &Paint) -> El {
-    let mut seen: HashSet<&str> = HashSet::new();
-    let mut key = row().w_full().gap(14.0).flex_wrap();
-    for (label, tone) in items {
-        if !seen.insert(label) {
-            continue;
-        }
-        key = key.child(
-            row()
-                .gap(6.0)
-                .center_y()
-                .child(el().size(8.0, 8.0).radius(2.0).fill(dot(tone, p.k)))
-                .child(
-                    text(label.to_string())
-                        .font(p.k.ty.small)
-                        .color(p.c.text_muted),
-                ),
-        );
-    }
-    key
-}
-
-/// The plot's own coordinates: as wide as its card lets it be, and this tall in points.
-const PLOT: [f32; 2] = [560.0, 220.0];
-/// Where the plot starts, past the vertical axis's numbers.
-const GUTTER: f32 = 48.0;
-
-/// The least and greatest of `values`, widened to include zero when `zero`, and never empty.
-fn span(values: impl Iterator<Item = f64> + Clone, zero: bool) -> (f64, f64) {
-    let low = values.clone().fold(f64::INFINITY, f64::min);
-    let high = values.fold(f64::NEG_INFINITY, f64::max);
-    if !low.is_finite() || !high.is_finite() {
-        return (0.0, 1.0);
-    }
-    let low = if zero { low.min(0.0) } else { low };
-    if high > low {
-        (low, high)
-    } else {
-        (low - 0.5, low + 0.5)
-    }
-}
-
-fn short(value: f64) -> String {
-    if value.fract() == 0.0 {
-        format!("{value:.0}")
-    } else {
-        format!("{value:.1}")
-    }
-}
-
-fn plot(kind: PlotKind, x: &str, y: &str, series: &[Series], p: &Paint) -> El {
-    let points = series.iter().flat_map(|s| s.points.iter());
-    let (x0, x1) = span(points.clone().map(|point| point[0]), false);
-    let (y0, y1) = span(points.map(|point| point[1]), true);
-    let [w, h] = PLOT;
-    let inset = 6.0;
-    let at = |point: &[f64; 2]| {
-        let across = ((point[0] - x0) / (x1 - x0)) as f32;
-        let up = ((point[1] - y0) / (y1 - y0)) as f32;
-        [
-            inset + across * (w - 2.0 * inset),
-            h - inset - up * (h - 2.0 * inset),
-        ]
-    };
-    let mut shape = Shape::new();
-    for line in 0..=4 {
-        let down = inset + line as f32 / 4.0 * (h - 2.0 * inset);
-        shape = shape.line([0.0, down], [w, down], 1.0, LineCap::Butt, p.c.border_muted);
-    }
-    for one in series {
-        let color = dot(one.tone, p.k);
-        let placed: Vec<[f32; 2]> = one.points.iter().map(at).collect();
-        if kind == PlotKind::Line && placed.len() > 1 {
-            shape = shape.stroke(placed.clone(), 1.75, color);
-        }
-        for [cx, cy] in placed {
-            let r = 3.0;
-            shape = shape.fill(
-                vec![[cx, cy - r], [cx + r, cy], [cx, cy + r], [cx - r, cy]],
-                color,
-            );
-        }
-    }
-    let number = |value: f64| {
-        text(short(value))
-            .font(p.mono(10.5, 400.0))
-            .color(p.c.text_faint)
-    };
-    let name = |label: &str| {
-        text(label.to_string())
-            .font(p.k.ty.small_medium)
-            .color(p.c.text_muted)
-    };
-    col()
-        .key(format!("report-plot-{y}-{x}"))
-        .w_full()
-        .max_w(720.0)
-        .padding(12.0)
-        .gap(8.0)
-        .radius(p.k.radius.lg)
-        .fill(p.c.layer_01)
-        .border(p.hair, p.c.border_muted)
-        .child(legend(series.iter().map(|s| (s.label.as_str(), s.tone)), p))
-        .child(name(y))
-        .child(
-            row()
-                .w_full()
-                .child(
-                    col()
-                        .w(GUTTER)
-                        .h(h)
-                        .child(number(y1))
-                        .child(el().grow(1.0))
-                        .child(number(y0)),
-                )
-                .child(canvas(shape.view_box(w, h)).grow(1.0).min_w(0.0).h(h)),
-        )
-        .child(
-            row()
-                .w_full()
-                .pl(GUTTER)
-                .child(number(x0))
-                .child(el().grow(1.0))
-                .child(name(x))
-                .child(el().grow(1.0))
-                .child(number(x1)),
-        )
 }
 
 fn grid(columns: &[String], rows: &[Vec<Cell>], p: &Paint) -> El {

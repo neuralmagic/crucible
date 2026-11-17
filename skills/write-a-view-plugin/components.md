@@ -156,7 +156,7 @@ lead somewhere only for a run on a controller.
 ## Charts
 
 `bars` are horizontal bars on one scale, each split into segments. Segments with the same
-`label` share a legend entry. Values are finite and not negative.
+`label` share a legend entry and a colour. Values are finite and not negative.
 
 ```json
 {"bars": {"bars": [
@@ -172,9 +172,9 @@ lead somewhere only for a run on a controller.
 ```
 
 `plot` is points on shared axes: `line` joins each series in the order given, `scatter` leaves
-marks. `x` and `y` name what the axes measure. A point is `[x, y]`, both finite. The vertical
-axis starts at zero unless a value is below it; the horizontal runs from the least to the
-greatest x.
+marks. `x` and `y` name what the axes measure. A point is `[x, y]`, both finite. Each axis is
+ticked at round numbers (1, 2 or 5 times a power of ten) with a grid line on each tick. A
+linear vertical axis includes zero; the horizontal runs from about the least to the greatest x.
 
 ```json
 {"plot": {
@@ -188,16 +188,74 @@ greatest x.
 }}
 ```
 
-A series is coloured by its tone, and there are six tones, so two series with one tone look the
-same. Past five or six series, split the chart or use a table. A bar segment's value is from 0
-to 1e15, and a point's x and y are within 1e15 of zero.
+`x_scale` and `y_scale` are `linear` (the default), `log` or `time`. On a `log` axis every
+value is above zero and the ticks are powers of ten. On a `time` axis a value is Unix seconds
+from the start of the year 1 to the start of 9999, and the ticks are dates or times in UTC at
+steps that suit the span: seconds, minutes, hours, days, weeks, months or years.
+
+```json
+{"plot": {
+  "kind": "line",
+  "x": "opened",
+  "y": "tickets",
+  "x_scale": "time",
+  "y_scale": "log",
+  "series": [{"label": "go", "points": [[1788566400, 1], [1789776000, 4], [1791504000, 30]]}]
+}}
+```
+
+`categories` names the x axis's places: an x is the index of a name, from 0, and the ticks are
+the names, at most 12 of them written when there are more. An x that is not an index of a name
+is refused, and so is a plot with categories on a `log` or `time` x axis.
+
+```json
+{"plot": {
+  "kind": "line",
+  "x": "release",
+  "y": "tickets",
+  "categories": ["3.3", "3.4", "3.5"],
+  "series": [{"label": "affected", "tone": "bad", "points": [[0, 2], [1, 3], [2, 1]]}]
+}}
+```
+
+While a plot holds at most 1,000 points, hovering one shows its series and its x and y.
+
+`histogram` counts `values` into bins of equal width from the least value to the greatest and
+draws a bar per bin on a count axis. `bins` is from 1 to 100; without it the app takes the
+square root of the number of values, at most 30. Hovering a bar shows its range and count.
+
+```json
+{"histogram": {"x": "days open", "values": [18, 21, 25, 40, 44, 57, 57, 90], "bins": 4}}
+```
+
+`heatmap` is a matrix: `x` labels its columns, `y` its rows, and `values` holds a row per `y`
+label with a value per `x` label. Each cell is filled in the one `tone` as deep as its value's
+place between the least value and the greatest, and its value is written in it while there are
+at most 16 columns. Every row has one value per column. While it holds at most 2,000 cells,
+hovering one shows its row, column and value.
+
+```json
+{"heatmap": {
+  "x": ["3.3", "3.4", "3.5"],
+  "y": ["affected", "not_affected"],
+  "values": [[2, 3, 1], [10, 14, 9]],
+  "tone": "info"
+}}
+```
+
+A series, bar segment or flow stage with a tone is drawn in that tone's colour. One left
+`neutral` (or without a tone) takes the next colour of a palette of ten the app keeps distinct
+in both themes, the same colour in the marks and the legend. Use tones for what they mean
+(`bad` is bad) and leave the rest neutral. A histogram or heatmap left neutral takes the
+palette's first colour. A bar segment's value is from 0 to 1e15, and a point's x and y, a
+histogram's values and a heatmap's values are within 1e15 of zero.
 
 `flow` is quantities moving between stages, drawn as ribbons: a Sankey diagram. Use it to show
 how a total splits and where each part ended up. A node is a stage and a link is a ribbon as
 wide as its `value`. The app puts a stage with nothing flowing into it in the first column and
 every other stage one column past the furthest stage that flows into it; stages in a column
-are stacked in the order given. A ribbon takes the tone of the stage it reaches unless it has
-its own.
+are stacked in the order given. A ribbon takes the colour of the stage it reaches unless it has
+a tone of its own other than `neutral`.
 
 ```json
 {"flow": {
@@ -286,9 +344,10 @@ Prefer a tone to a hex colour: a hex colour does not follow the theme.
 Across the whole view, at most:
 
 - 2,000 components, nested at most 8 deep;
-- 20,000 stats, bars, segments, series, grid cells, table columns, and flow stages and links;
-- 50,000 points, counting plot points, the points of each canvas path filled or stroked, and 4
-  for each `fill_rect` or `stroke_rect`;
+- 20,000 stats, bars, segments, series, plot categories, grid cells, heatmap cells and labels,
+  table columns, and flow stages and links;
+- 50,000 points, counting plot points, histogram values, the points of each canvas path filled
+  or stroked, and 4 for each `fill_rect` or `stroke_rect`;
 - 20,000 canvas commands;
 - 20,000 bytes in any one title, label, cell or address.
 

@@ -253,6 +253,46 @@ function howDecided(tickets) {
         },
     };
 }
+/** The verdicts are read as of this moment, in Unix seconds: 1 Nov 2026, UTC. */
+const AS_OF = Date.UTC(2026, 10, 1) / 1000;
+/** Tickets opened so far, per lane, over the days they were opened. */
+function openedOverTime(tickets) {
+    const lanes = [...new Set(tickets.map((t) => t.lane))].sort();
+    return {
+        plot: {
+            kind: "line",
+            x: "opened",
+            y: "tickets",
+            x_scale: "time",
+            series: lanes.map((lane) => ({
+                label: lane,
+                points: tickets
+                    .filter((t) => t.lane === lane)
+                    .map((t) => AS_OF - t.age * 86400)
+                    .sort((a, b) => a - b)
+                    .map((opened, i) => [opened, i + 1]),
+            })),
+        },
+    };
+}
+/** Days open against CVSS, a series per package, on a log scale of days. */
+function ageByPackage(tickets) {
+    const packages = [...new Set(tickets.map((t) => t.pkg.split(" ")[0]))].sort();
+    return {
+        plot: {
+            kind: "scatter",
+            x: "CVSS",
+            y: "days open",
+            y_scale: "log",
+            series: packages.map((pkg) => ({
+                label: pkg,
+                points: tickets
+                    .filter((t) => t.pkg.split(" ")[0] === pkg)
+                    .map((t) => [t.cvss, Math.max(1, t.age)]),
+            })),
+        },
+    };
+}
 export function view({ files }) {
     const tickets = read(files);
     if (tickets.length === 0) {
@@ -328,6 +368,24 @@ export function view({ files }) {
                                     },
                                 },
                                 { label: "All", count: tickets.length, body: table("all", tickets) },
+                                {
+                                    label: "Charts",
+                                    body: {
+                                        stack: {
+                                            children: [
+                                                {
+                                                    columns: {
+                                                        children: [
+                                                            openedOverTime(tickets),
+                                                            { histogram: { x: "CVSS", values: tickets.map((t) => t.cvss), bins: 10, tone: "warn" } },
+                                                        ],
+                                                    },
+                                                },
+                                                ageByPackage(tickets),
+                                            ],
+                                        },
+                                    },
+                                },
                             ],
                         },
                     },

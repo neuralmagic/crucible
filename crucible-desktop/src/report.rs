@@ -536,6 +536,8 @@ impl Shown {
             | Node::Stats { .. }
             | Node::Bars { .. }
             | Node::Plot { .. }
+            | Node::Histogram { .. }
+            | Node::Heatmap { .. }
             | Node::Flow { .. }
             | Node::Canvas { .. }
             | Node::Grid { .. }
@@ -557,6 +559,8 @@ impl Shown {
             | Node::Stats { .. }
             | Node::Bars { .. }
             | Node::Plot { .. }
+            | Node::Histogram { .. }
+            | Node::Heatmap { .. }
             | Node::Flow { .. }
             | Node::Canvas { .. }
             | Node::Grid { .. }
@@ -754,6 +758,8 @@ mod tests {
             Node::Stats { .. } => "stats",
             Node::Bars { .. } => "bars",
             Node::Plot { .. } => "plot",
+            Node::Histogram { .. } => "histogram",
+            Node::Heatmap { .. } => "heatmap",
             Node::Flow { .. } => "flow",
             Node::Canvas { .. } => "canvas",
             Node::Grid { .. } => "grid",
@@ -782,8 +788,22 @@ mod tests {
         assert_eq!(
             names.into_iter().collect::<Vec<_>>(),
             [
-                "bars", "canvas", "columns", "flow", "grid", "markdown", "mermaid", "plot",
-                "section", "stack", "stats", "table", "tabs", "text"
+                "bars",
+                "canvas",
+                "columns",
+                "flow",
+                "grid",
+                "heatmap",
+                "histogram",
+                "markdown",
+                "mermaid",
+                "plot",
+                "section",
+                "stack",
+                "stats",
+                "table",
+                "tabs",
+                "text"
             ],
             "every component has an example"
         );
@@ -979,8 +999,18 @@ mod tests {
         assert_eq!(
             names.into_iter().collect::<Vec<_>>(),
             [
-                "canvas", "columns", "flow", "markdown", "section", "stack", "stats", "table",
-                "tabs", "text"
+                "canvas",
+                "columns",
+                "flow",
+                "histogram",
+                "markdown",
+                "plot",
+                "section",
+                "stack",
+                "stats",
+                "table",
+                "tabs",
+                "text"
             ]
         );
         let mut shown = Shown::default();
@@ -1015,6 +1045,57 @@ mod tests {
         assert!(detail.contains("](run:file/triage-"), "{detail}");
         let lane = row.cells[8].href.as_deref().unwrap();
         assert!(lane.starts_with("run:task/triage-"), "{lane}");
+
+        let charts = tabs.iter().find(|tab| tab.label == "Charts").unwrap();
+        let Node::Stack { children: charts } = &charts.body else {
+            panic!("Charts is a stack");
+        };
+        let [
+            Node::Columns { children: side },
+            Node::Plot {
+                series, y_scale, ..
+            },
+        ] = charts.as_slice()
+        else {
+            panic!("Charts is two charts side by side over a plot");
+        };
+        assert_eq!(*y_scale, crucible_view::Scale::Log);
+        assert_eq!(series.len(), 8, "a series per package");
+        assert!(
+            series
+                .iter()
+                .all(|one| one.tone == crucible_view::Tone::Neutral),
+            "past the six tones"
+        );
+        let [
+            Node::Plot {
+                x_scale: crucible_view::Scale::Time,
+                series: lanes,
+                ..
+            },
+            Node::Histogram {
+                values,
+                bins: Some(10),
+                ..
+            },
+        ] = side.as_slice()
+        else {
+            panic!("a time plot beside a histogram");
+        };
+        assert_eq!(values.len(), 64);
+        let opened: Vec<f64> = lanes
+            .iter()
+            .flat_map(|lane| &lane.points)
+            .map(|point| point[0])
+            .collect();
+        assert_eq!(opened.len(), 64);
+        let as_of = 1_793_491_200.0;
+        assert!(
+            opened
+                .iter()
+                .all(|at| *at < as_of && *at > as_of - 100.0 * 86_400.0),
+            "{opened:?}"
+        );
     }
 
     #[test]

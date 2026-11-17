@@ -13,6 +13,8 @@ use std::collections::HashMap;
 
 use crucible_view::{Draw, FlowLink, FlowNode, Style, TextAlign, Tone, flow_columns};
 
+use crate::ui::report::hue::{Hue, Hues};
+
 /// The drawing's width, and the height its tallest column fills.
 pub(crate) const WIDTH: f32 = 600.0;
 const HEIGHT: f32 = 240.0;
@@ -103,9 +105,13 @@ fn short(value: f64) -> String {
     }
 }
 
-/// The flow as a canvas of [`WIDTH`] by the returned height; `None` for one the catalog's
-/// check would have refused.
-pub(crate) fn drawing(nodes: &[FlowNode], links: &[FlowLink]) -> Option<(f32, Vec<Draw>)> {
+/// The flow as a canvas of [`WIDTH`] by the returned height, a neutral stage in the next of
+/// `palette`; `None` for one the catalog's check would have refused.
+pub(crate) fn drawing(
+    nodes: &[FlowNode],
+    links: &[FlowLink],
+    palette: &[Style],
+) -> Option<(f32, Vec<Draw>)> {
     let (placed, scale) = place(nodes, links)?;
     let index: HashMap<&str, usize> = nodes
         .iter()
@@ -131,10 +137,17 @@ pub(crate) fn drawing(nodes: &[FlowNode], links: &[FlowLink]) -> Option<(f32, Ve
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    let shade = |tone: Tone| match tone {
-        Tone::Neutral => Tone::Muted,
-        tone => tone,
-    };
+    let mut hues = Hues::default();
+    let styles: Vec<Style> = nodes
+        .iter()
+        .map(|node| match hues.pick(&node.id, node.tone) {
+            Hue::Tone(tone) => Style::Tone(tone),
+            Hue::Palette(i) => palette
+                .get(i % palette.len().max(1))
+                .copied()
+                .unwrap_or(Style::Tone(Tone::Muted)),
+        })
+        .collect();
     let mut commands = vec![Draw::GlobalAlpha(0.35)];
     let (mut left, mut entered) = (vec![0.0_f32; nodes.len()], vec![0.0_f32; nodes.len()]);
     for (from, to, link) in ordered {
@@ -146,7 +159,10 @@ pub(crate) fn drawing(nodes: &[FlowNode], links: &[FlowLink]) -> Option<(f32, Ve
         entered[to] += thick;
         let middle = (x0 + x1) / 2.0;
         commands.extend([
-            Draw::FillStyle(Style::Tone(shade(link.tone.unwrap_or(nodes[to].tone)))),
+            Draw::FillStyle(match link.tone {
+                Some(Tone::Neutral) | None => styles[to],
+                Some(tone) => Style::Tone(tone),
+            }),
             Draw::BeginPath,
             Draw::MoveTo([x0, y0]),
             Draw::BezierCurveTo([middle, y0, middle, y1, x1, y1]),
@@ -158,9 +174,9 @@ pub(crate) fn drawing(nodes: &[FlowNode], links: &[FlowLink]) -> Option<(f32, Ve
     }
 
     commands.push(Draw::GlobalAlpha(1.0));
-    for (node, at) in nodes.iter().zip(&placed) {
+    for (style, at) in styles.iter().zip(&placed) {
         commands.extend([
-            Draw::FillStyle(Style::Tone(shade(node.tone))),
+            Draw::FillStyle(*style),
             Draw::FillRect([at.x, at.top, BAR, at.height.max(1.0)]),
         ]);
     }
@@ -198,6 +214,8 @@ mod tests {
     use crucible_view::{Draw, FlowLink, FlowNode, Style, TextAlign, Tone};
 
     use crate::ui::report::flow::{WIDTH, drawing, place};
+
+    const PALETTE: [Style; 2] = [Style::Rgba([1, 2, 3, 255]), Style::Rgba([4, 5, 6, 255])];
 
     fn node(id: &str, tone: Tone) -> FlowNode {
         FlowNode {
@@ -270,7 +288,7 @@ mod tests {
     fn ribbons_fill_their_bars_edge_to_edge_and_take_the_tone_they_reach() {
         let (nodes, links) = triage();
         let (placed, scale) = place(&nodes, &links).unwrap();
-        let (height, commands) = drawing(&nodes, &links).unwrap();
+        let (height, commands) = drawing(&nodes, &links, &PALETTE).unwrap();
         assert_eq!(height, 256.0);
         let starts: Vec<[f32; 2]> = commands
             .iter()
@@ -335,7 +353,7 @@ mod tests {
             tone: Some(Tone::Warn),
             ..link("a", "b", 2.5)
         }];
-        let (_, commands) = drawing(&nodes, &toned).unwrap();
+        let (_, commands) = drawing(&nodes, &toned, &PALETTE).unwrap();
         assert!(commands.contains(&Draw::FillStyle(Style::Tone(Tone::Warn))));
         let bars: Vec<Style> = commands
             .iter()
@@ -347,8 +365,8 @@ mod tests {
             .collect();
         assert_eq!(
             bars,
-            [Style::Tone(Tone::Muted), Style::Tone(Tone::Good)],
-            "a neutral stage is drawn muted, not in the text colour"
+            [PALETTE[0], Style::Tone(Tone::Good)],
+            "a neutral stage takes the palette's first colour"
         );
         assert!(
             commands
@@ -359,9 +377,77 @@ mod tests {
         let (placed, scale) = place(&nodes, &[]).unwrap();
         assert_eq!(scale, 0.0);
         assert!(placed.iter().all(|at| at.height == 0.0));
-        assert!(drawing(&nodes, &[]).is_some());
-        assert!(drawing(&[], &[]).is_none());
-        assert!(drawing(&nodes, &[link("a", "nowhere", 1.0)]).is_none());
+        assert!(drawing(&nodes, &[], &PALETTE).is_some());
+
+        let neutral: Vec<FlowNode> = ["a", "b", "c", "d"]
+            .map(|id| node(id, Tone::Neutral))
+            .into_iter()
+            .chain([node("e", Tone::Muted)])
+            .collect();
+        let fed = vec![
+            link("a", "b", 1.0),
+            link("c", "d", 1.0),
+            link("a", "e", 1.0),
+        ];
+        let stages = |palette: &[Style]| -> Vec<Style> {
+            let (_, commands) = drawing(&neutral, &fed, palette).unwrap();
+            commands
+                .iter()
+                .zip(commands.iter().skip(1))
+                .filter_map(|(style, next)| match (style, next) {
+                    (Draw::FillStyle(style), Draw::FillRect(_)) => Some(*style),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            stages(&PALETTE),
+            [
+                PALETTE[0],
+                PALETTE[1],
+                PALETTE[0],
+                PALETTE[1],
+                Style::Tone(Tone::Muted)
+            ],
+            "the palette wraps and a muted stage stays muted"
+        );
+        assert_eq!(stages(&[])[0], Style::Tone(Tone::Muted), "no palette");
+        let (_, commands) = drawing(&neutral, &fed, &PALETTE).unwrap();
+        let ribbons: Vec<Style> = commands
+            .iter()
+            .zip(commands.iter().skip(1))
+            .filter_map(|(style, next)| match (style, next) {
+                (Draw::FillStyle(style), Draw::BeginPath) => Some(*style),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ribbons,
+            [PALETTE[1], Style::Tone(Tone::Muted), PALETTE[1]],
+            "a ribbon takes the colour of the stage it reaches"
+        );
+        let plain: Vec<FlowLink> = fed
+            .iter()
+            .map(|one| FlowLink {
+                tone: Some(Tone::Neutral),
+                ..one.clone()
+            })
+            .collect();
+        let (_, commands) = drawing(&neutral, &plain, &PALETTE).unwrap();
+        let plain_ribbons: Vec<Style> = commands
+            .iter()
+            .zip(commands.iter().skip(1))
+            .filter_map(|(style, next)| match (style, next) {
+                (Draw::FillStyle(style), Draw::BeginPath) => Some(*style),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            plain_ribbons, ribbons,
+            "a ribbon left neutral takes its stage's colour"
+        );
+        assert!(drawing(&[], &[], &PALETTE).is_none());
+        assert!(drawing(&nodes, &[link("a", "nowhere", 1.0)], &PALETTE).is_none());
     }
 
     #[test]
@@ -386,7 +472,7 @@ mod tests {
                     && at.top + at.height <= 256.0),
                 "{placed:?}"
             );
-            let (_, commands) = drawing(&nodes, &links).unwrap();
+            let (_, commands) = drawing(&nodes, &links, &PALETTE).unwrap();
             let view = crucible_view::View {
                 title: "T".into(),
                 body: crucible_view::Node::Canvas {

@@ -87,6 +87,35 @@ pub enum Node {
         /// What the vertical axis measures.
         y: String,
         series: Vec<Series>,
+        #[serde(default, skip_serializing_if = "Scale::is_linear")]
+        x_scale: Scale,
+        #[serde(default, skip_serializing_if = "Scale::is_linear")]
+        y_scale: Scale,
+        /// The names an x value indexes, from 0; empty for a numeric x axis.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        categories: Vec<String>,
+    },
+    /// Values counted into bins of equal width, drawn as bars.
+    Histogram {
+        /// What the values measure.
+        x: String,
+        values: Vec<f64>,
+        /// From 1 to [`MAX_BINS`]; the app picks when not given.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bins: Option<u32>,
+        #[serde(default)]
+        tone: Tone,
+    },
+    /// A matrix of values, each cell shaded by its place between the least and the greatest.
+    Heatmap {
+        /// The columns' labels.
+        x: Vec<String>,
+        /// The rows' labels.
+        y: Vec<String>,
+        /// A row of values per `y` label, a value per `x` label.
+        values: Vec<Vec<f64>>,
+        #[serde(default)]
+        tone: Tone,
     },
     /// Quantities flowing between stages, drawn as ribbons: a Sankey diagram.
     Flow {
@@ -208,6 +237,24 @@ pub enum PlotKind {
     Scatter,
 }
 
+/// How a plot's axis places its values.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Scale {
+    #[default]
+    Linear,
+    /// Powers of ten evenly apart; every value is above zero.
+    Log,
+    /// Unix seconds, shown as dates and times in UTC within [`TIME_SPAN`].
+    Time,
+}
+
+impl Scale {
+    fn is_linear(&self) -> bool {
+        *self == Scale::Linear
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Series {
@@ -316,8 +363,16 @@ pub enum Tone {
     Info,
 }
 
-/// The largest value a bar segment, plot point or ribbon may hold, either side of zero.
+/// The largest value a bar segment, plot point, histogram value, heatmap cell or ribbon may
+/// hold, either side of zero.
 pub const MAGNITUDE: f64 = 1e15;
+
+/// The first and last second a time axis may show: the start of the years 1 and 9999, in Unix
+/// seconds.
+pub const TIME_SPAN: [f64; 2] = [-62_135_596_800.0, 253_370_764_800.0];
+
+/// The most bins a histogram may ask for.
+pub const MAX_BINS: u32 = 100;
 
 /// How much a view may hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -328,10 +383,11 @@ pub struct Limits {
     pub cells: usize,
     /// Cells in one grid, its header among them.
     pub grid_cells: usize,
-    /// Stats, bars, segments, series, grid cells, table columns, and flow stages and ribbons
-    /// across the view.
+    /// Stats, bars, segments, series, plot categories, grid cells, heatmap cells and labels,
+    /// table columns, and flow stages and ribbons across the view.
     pub items: usize,
-    /// Plot points, and the points of every canvas path filled or stroked, across the view.
+    /// Plot points, histogram values, and the points of every canvas path filled or stroked,
+    /// across the view.
     pub points: usize,
     /// Points in one stretch of a canvas path, from one move or close to the next.
     pub path_points: usize,
@@ -378,8 +434,8 @@ pub enum Problem {
     #[error("a grid holds more than {0} cells")]
     GridCells(usize),
     #[error(
-        "the view holds more than {0} stats, bars, segments, series, grid cells, columns, \
-         stages and ribbons"
+        "the view holds more than {0} stats, bars, segments, series, categories, grid and \
+         heatmap cells, heatmap labels, columns, stages and ribbons"
     )]
     Items(usize),
     #[error("a title, label, cell or address is longer than {0} bytes")]
@@ -406,7 +462,7 @@ pub enum Problem {
     CanvasNumber(usize),
     #[error("a canvas path runs more than {0} points without a move or a close")]
     PathPoints(usize),
-    #[error("the view's plots and canvas paths hold more than {0} points")]
+    #[error("the view's plots, histograms and canvas paths hold more than {0} points")]
     Points(usize),
     #[error("the series {0} has a point that is not a number within 1e15 of zero")]
     Point(String),
@@ -432,6 +488,24 @@ pub enum Problem {
     Detail(usize),
     #[error("columns may not hold a table")]
     ColumnsTable,
+    #[error("the series {0} has a value that is not above 0 on a log axis")]
+    Log(String),
+    #[error("the series {0} has a time outside the years 1 to 9998")]
+    Time(String),
+    #[error("the series {0} has an x that is not the index of one of the plot's categories")]
+    Category(String),
+    #[error("a plot with categories has a log or time x axis")]
+    CategoryScale,
+    #[error("a histogram's bin count is not from 1 to {0}")]
+    Bins(u32),
+    #[error("the histogram {0} has a value that is not a number within 1e15 of zero")]
+    HistogramValue(String),
+    #[error("a heatmap has {0} rows of values for {1} y labels")]
+    HeatmapRows(usize, usize),
+    #[error("the heatmap row {0} has {1} values for {2} x labels")]
+    HeatmapRow(String, usize, usize),
+    #[error("the heatmap row {0} has a value that is not a number within 1e15 of zero")]
+    HeatmapValue(String),
 }
 
 impl View {
@@ -625,16 +699,74 @@ impl Node {
                 }
                 Ok(0)
             }
-            Node::Plot { x, y, series, .. } => {
+            Node::Plot {
+                x,
+                y,
+                series,
+                x_scale,
+                y_scale,
+                categories,
+                ..
+            } => {
                 fits(x, limits)?;
                 fits(y, limits)?;
                 seen.items(series.len(), limits)?;
+                seen.items(categories.len(), limits)?;
+                for name in categories {
+                    fits(name, limits)?;
+                }
+                if !categories.is_empty() && *x_scale != Scale::Linear {
+                    return Err(Problem::CategoryScale);
+                }
                 for one in series {
                     fits(&one.label, limits)?;
                     seen.points(one.points.len(), limits)?;
-                    let within = |v: &f64| (-MAGNITUDE..=MAGNITUDE).contains(v);
                     if !one.points.iter().flatten().all(within) {
                         return Err(Problem::Point(one.label.clone()));
+                    }
+                    for [px, py] in &one.points {
+                        on_scale(*x_scale, *px, &one.label)?;
+                        on_scale(*y_scale, *py, &one.label)?;
+                        let indexes = categories.is_empty()
+                            || (px.fract() == 0.0 && *px >= 0.0 && *px < categories.len() as f64);
+                        if !indexes {
+                            return Err(Problem::Category(one.label.clone()));
+                        }
+                    }
+                }
+                Ok(0)
+            }
+            Node::Histogram {
+                x, values, bins, ..
+            } => {
+                fits(x, limits)?;
+                seen.points(values.len(), limits)?;
+                if bins.is_some_and(|bins| !(1..=MAX_BINS).contains(&bins)) {
+                    return Err(Problem::Bins(MAX_BINS));
+                }
+                if !values.iter().all(within) {
+                    return Err(Problem::HistogramValue(x.clone()));
+                }
+                Ok(0)
+            }
+            Node::Heatmap { x, y, values, .. } => {
+                let cells = x.len().saturating_mul(y.len());
+                seen.items(
+                    cells.saturating_add(x.len()).saturating_add(y.len()),
+                    limits,
+                )?;
+                for label in x.iter().chain(y) {
+                    fits(label, limits)?;
+                }
+                if values.len() != y.len() {
+                    return Err(Problem::HeatmapRows(values.len(), y.len()));
+                }
+                for (row, label) in values.iter().zip(y) {
+                    if row.len() != x.len() {
+                        return Err(Problem::HeatmapRow(label.clone(), row.len(), x.len()));
+                    }
+                    if !row.iter().all(within) {
+                        return Err(Problem::HeatmapValue(label.clone()));
                     }
                 }
                 Ok(0)
@@ -710,13 +842,25 @@ impl Node {
     }
 }
 
+fn within(value: &f64) -> bool {
+    (-MAGNITUDE..=MAGNITUDE).contains(value)
+}
+
+/// Whether `value` can be placed on an axis of `scale`.
+fn on_scale(scale: Scale, value: f64, series: &str) -> Result<(), Problem> {
+    match scale {
+        Scale::Linear => Ok(()),
+        Scale::Log if value > 0.0 => Ok(()),
+        Scale::Log => Err(Problem::Log(series.to_string())),
+        Scale::Time if (TIME_SPAN[0]..=TIME_SPAN[1]).contains(&value) => Ok(()),
+        Scale::Time => Err(Problem::Time(series.to_string())),
+    }
+}
+
 fn cells_fit(cells: &[Cell], limits: &Limits) -> Result<(), Problem> {
     for cell in cells {
         fits(&cell.text, limits)?;
-        if cell
-            .value
-            .is_some_and(|value| !(-MAGNITUDE..=MAGNITUDE).contains(&value))
-        {
+        if cell.value.is_some_and(|value| !within(&value)) {
             return Err(Problem::CellValue(cell.text.clone()));
         }
         if let Some(href) = &cell.href {
@@ -732,8 +876,8 @@ fn cells_fit(cells: &[Cell], limits: &Limits) -> Result<(), Problem> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        Bar, Cell, Column, File, Limits, Link, Node, PlotKind, Problem, Reply, Row, Segment,
-        Series, Stat, Tab, Tone, View, file_link, task_link,
+        Bar, Cell, Column, File, Limits, Link, MAX_BINS, Node, PlotKind, Problem, Reply, Row,
+        Scale, Segment, Series, Stat, TIME_SPAN, Tab, Tone, View, file_link, task_link,
     };
 
     fn table(id: &str, rows: Vec<Row>) -> Node {
@@ -1079,6 +1223,9 @@ mod tests {
                     tone: Tone::Bad,
                     points,
                 }],
+                x_scale: Scale::Linear,
+                y_scale: Scale::Linear,
+                categories: vec![],
             })
         };
         assert_eq!(
@@ -1105,6 +1252,307 @@ mod tests {
         );
         let pie = r#"{"plot":{"kind":"pie","x":"a","y":"b","series":[]}}"#;
         assert!(serde_json::from_str::<Node>(pie).is_err());
+    }
+
+    fn scaled(x_scale: Scale, y_scale: Scale, categories: &[&str], points: Vec<[f64; 2]>) -> View {
+        view(Node::Plot {
+            kind: PlotKind::Line,
+            x: "x".into(),
+            y: "y".into(),
+            series: vec![Series {
+                label: "s".into(),
+                tone: Tone::Neutral,
+                points,
+            }],
+            x_scale,
+            y_scale,
+            categories: categories.iter().map(|name| name.to_string()).collect(),
+        })
+    }
+
+    #[test]
+    fn a_plot_s_axes_read_back_as_written_and_default_to_linear() {
+        let bare: Node =
+            serde_json::from_str(r#"{"plot":{"kind":"line","x":"a","y":"b","series":[]}}"#)
+                .unwrap();
+        let Node::Plot {
+            x_scale,
+            y_scale,
+            categories,
+            ..
+        } = &bare
+        else {
+            panic!("a plot");
+        };
+        assert_eq!((*x_scale, *y_scale), (Scale::Linear, Scale::Linear));
+        assert!(categories.is_empty());
+        assert_eq!(
+            serde_json::to_string(&bare).unwrap(),
+            r#"{"plot":{"kind":"line","x":"a","y":"b","series":[]}}"#
+        );
+        let set = scaled(Scale::Time, Scale::Log, &[], vec![[0.0, 1.0]]);
+        let json = serde_json::to_string(&set).unwrap();
+        assert!(
+            json.contains(r#""x_scale":"time","y_scale":"log""#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<View>(&json).unwrap(), set);
+        let named = scaled(Scale::Linear, Scale::Linear, &["3.4", "3.5"], vec![]);
+        let json = serde_json::to_string(&named).unwrap();
+        assert!(json.contains(r#""categories":["3.4","3.5"]"#), "{json}");
+        assert_eq!(serde_json::from_str::<View>(&json).unwrap(), named);
+        for off in [
+            r#"{"plot":{"kind":"line","x":"a","y":"b","series":[],"x_scale":"sqrt"}}"#,
+            r#"{"plot":{"kind":"line","x":"a","y":"b","series":[],"scale":"log"}}"#,
+            r#"{"plot":{"kind":"line","x":"a","y":"b","series":[],"categories":"a"}}"#,
+        ] {
+            assert!(serde_json::from_str::<Node>(off).is_err(), "{off}");
+        }
+    }
+
+    #[test]
+    fn a_log_axis_holds_only_values_above_zero() {
+        let on_x = |x: f64| scaled(Scale::Log, Scale::Linear, &[], vec![[x, -5.0]]);
+        let on_y = |y: f64| scaled(Scale::Linear, Scale::Log, &[], vec![[-5.0, y]]);
+        for fine in [5e-324, 1e-300, 1.0, 1e15] {
+            assert_eq!(on_x(fine).check(&Limits::DEFAULT), Ok(()));
+            assert_eq!(on_y(fine).check(&Limits::DEFAULT), Ok(()));
+        }
+        for off in [0.0, -0.0, -1.0, -1e15] {
+            assert_eq!(
+                on_x(off).check(&Limits::DEFAULT),
+                Err(Problem::Log("s".into()))
+            );
+            assert_eq!(
+                on_y(off).check(&Limits::DEFAULT),
+                Err(Problem::Log("s".into()))
+            );
+        }
+        for off in [f64::NAN, f64::INFINITY, 1.1e15] {
+            assert_eq!(
+                on_y(off).check(&Limits::DEFAULT),
+                Err(Problem::Point("s".into()))
+            );
+        }
+    }
+
+    #[test]
+    fn a_time_axis_holds_the_years_1_to_9998() {
+        let at = |t: f64| scaled(Scale::Time, Scale::Linear, &[], vec![[t, 1.0]]);
+        for fine in [TIME_SPAN[0], 0.0, 1_763_251_200.5, TIME_SPAN[1]] {
+            assert_eq!(at(fine).check(&Limits::DEFAULT), Ok(()), "{fine}");
+        }
+        for off in [TIME_SPAN[0] - 1.0, TIME_SPAN[1] + 1.0, -1e15, 1e15] {
+            assert_eq!(
+                at(off).check(&Limits::DEFAULT),
+                Err(Problem::Time("s".into())),
+                "{off}"
+            );
+        }
+        let on_y = scaled(Scale::Linear, Scale::Time, &[], vec![[1e15, 1e15]]);
+        assert_eq!(on_y.check(&Limits::DEFAULT), Err(Problem::Time("s".into())));
+    }
+
+    #[test]
+    fn a_categorical_x_is_an_index_into_the_names() {
+        let names = ["3.3", "3.4", "3.5"];
+        let at = |x: f64| scaled(Scale::Linear, Scale::Linear, &names, vec![[x, 1.0]]);
+        for fine in [0.0, 1.0, 2.0, -0.0] {
+            assert_eq!(at(fine).check(&Limits::DEFAULT), Ok(()), "{fine}");
+        }
+        for off in [3.0, -1.0, 0.5, 2.0000001, 1e15] {
+            assert_eq!(
+                at(off).check(&Limits::DEFAULT),
+                Err(Problem::Category("s".into())),
+                "{off}"
+            );
+        }
+        assert_eq!(
+            scaled(Scale::Linear, Scale::Linear, &[], vec![[0.5, 1.0]]).check(&Limits::DEFAULT),
+            Ok(()),
+            "no categories, any x"
+        );
+        for scale in [Scale::Log, Scale::Time] {
+            assert_eq!(
+                scaled(scale, Scale::Linear, &names, vec![]).check(&Limits::DEFAULT),
+                Err(Problem::CategoryScale)
+            );
+        }
+        assert_eq!(
+            Problem::CategoryScale.to_string(),
+            "a plot with categories has a log or time x axis"
+        );
+        assert_eq!(
+            scaled(Scale::Linear, Scale::Log, &names, vec![[1.0, 2.0]]).check(&Limits::DEFAULT),
+            Ok(())
+        );
+        let many: Vec<&str> = vec!["c"; 6];
+        assert_eq!(
+            scaled(Scale::Linear, Scale::Linear, &many, vec![]).check(&TIGHT),
+            Err(Problem::Items(6)),
+            "the series and its categories are items"
+        );
+        assert_eq!(
+            scaled(Scale::Linear, Scale::Linear, &many[..5], vec![]).check(&TIGHT),
+            Ok(())
+        );
+        assert_eq!(
+            scaled(Scale::Linear, Scale::Linear, &["123456789"], vec![]).check(&TIGHT),
+            Err(Problem::Text(8))
+        );
+    }
+
+    fn histogram(values: Vec<f64>, bins: Option<u32>) -> View {
+        view(Node::Histogram {
+            x: "days".into(),
+            values,
+            bins,
+            tone: Tone::Neutral,
+        })
+    }
+
+    #[test]
+    fn a_histogram_s_values_are_bounded_and_counted_as_points() {
+        assert_eq!(histogram(vec![], None).check(&Limits::DEFAULT), Ok(()));
+        assert_eq!(
+            histogram(vec![-1e15, 0.0, 1e15], Some(1)).check(&Limits::DEFAULT),
+            Ok(())
+        );
+        assert_eq!(
+            histogram(vec![1.0], Some(MAX_BINS)).check(&Limits::DEFAULT),
+            Ok(())
+        );
+        for bins in [0, MAX_BINS + 1, u32::MAX] {
+            assert_eq!(
+                histogram(vec![1.0], Some(bins)).check(&Limits::DEFAULT),
+                Err(Problem::Bins(100))
+            );
+        }
+        for off in [f64::NAN, f64::NEG_INFINITY, 1.1e15] {
+            assert_eq!(
+                histogram(vec![1.0, off], None).check(&Limits::DEFAULT),
+                Err(Problem::HistogramValue("days".into()))
+            );
+        }
+        assert_eq!(histogram(vec![0.0; 6], None).check(&TIGHT), Ok(()));
+        assert_eq!(
+            histogram(vec![0.0; 7], None).check(&TIGHT),
+            Err(Problem::Points(6))
+        );
+        let shared = view(Node::Stack {
+            children: vec![
+                histogram(vec![0.0; 3], None).body,
+                scaled(Scale::Linear, Scale::Linear, &[], vec![[0.0, 0.0]; 4]).body,
+            ],
+        });
+        assert_eq!(shared.check(&TIGHT), Err(Problem::Points(6)));
+        let json = serde_json::to_string(&histogram(vec![2.0], None)).unwrap();
+        assert!(
+            json.contains(r#"{"histogram":{"x":"days","values":[2.0],"tone":"neutral"}}"#),
+            "{json}"
+        );
+        let read: Node =
+            serde_json::from_str(r#"{"histogram":{"x":"d","values":[1,2.5],"bins":20}}"#).unwrap();
+        assert_eq!(
+            read,
+            Node::Histogram {
+                x: "d".into(),
+                values: vec![1.0, 2.5],
+                bins: Some(20),
+                tone: Tone::Neutral,
+            }
+        );
+        for off in [
+            r#"{"histogram":{"x":"d","values":[1],"bins":2.5}}"#,
+            r#"{"histogram":{"x":"d","values":[1],"bins":-1}}"#,
+            r#"{"histogram":{"x":"d","values":[null]}}"#,
+            r#"{"histogram":{"values":[1]}}"#,
+        ] {
+            assert!(serde_json::from_str::<Node>(off).is_err(), "{off}");
+        }
+    }
+
+    fn heatmap(x: &[&str], y: &[&str], values: Vec<Vec<f64>>) -> View {
+        view(Node::Heatmap {
+            x: x.iter().map(|label| label.to_string()).collect(),
+            y: y.iter().map(|label| label.to_string()).collect(),
+            values,
+            tone: Tone::Neutral,
+        })
+    }
+
+    #[test]
+    fn a_heatmap_is_a_full_matrix_of_bounded_values() {
+        assert_eq!(
+            heatmap(&["a", "b"], &["r"], vec![vec![1.0, -1e15]]).check(&Limits::DEFAULT),
+            Ok(())
+        );
+        assert_eq!(heatmap(&[], &[], vec![]).check(&Limits::DEFAULT), Ok(()));
+        assert_eq!(
+            heatmap(&[], &["r"], vec![vec![]]).check(&Limits::DEFAULT),
+            Ok(())
+        );
+        assert_eq!(
+            heatmap(&["a"], &["r", "s"], vec![vec![1.0]]).check(&Limits::DEFAULT),
+            Err(Problem::HeatmapRows(1, 2))
+        );
+        assert_eq!(
+            heatmap(&["a"], &[], vec![vec![1.0]]).check(&Limits::DEFAULT),
+            Err(Problem::HeatmapRows(1, 0))
+        );
+        assert_eq!(
+            heatmap(&["a", "b"], &["r", "s"], vec![vec![1.0, 2.0], vec![3.0]])
+                .check(&Limits::DEFAULT),
+            Err(Problem::HeatmapRow("s".into(), 1, 2))
+        );
+        assert_eq!(
+            heatmap(&["a"], &["r"], vec![vec![1.0, 2.0]]).check(&Limits::DEFAULT),
+            Err(Problem::HeatmapRow("r".into(), 2, 1))
+        );
+        for off in [f64::NAN, f64::INFINITY, -1.1e15] {
+            assert_eq!(
+                heatmap(&["a"], &["r"], vec![vec![off]]).check(&Limits::DEFAULT),
+                Err(Problem::HeatmapValue("r".into()))
+            );
+        }
+        assert_eq!(
+            heatmap(&["a"], &["r", "s"], vec![vec![1.0], vec![2.0]]).check(&TIGHT),
+            Ok(()),
+            "two cells and three labels"
+        );
+        assert_eq!(
+            heatmap(&["a", "b"], &["r", "s"], vec![vec![1.0; 2]; 2]).check(&TIGHT),
+            Err(Problem::Items(6)),
+            "four cells and four labels"
+        );
+        assert_eq!(
+            heatmap(&["123456789"], &["r"], vec![vec![1.0]]).check(&TIGHT),
+            Err(Problem::Text(8))
+        );
+        assert_eq!(
+            heatmap(&["a"], &["123456789"], vec![vec![1.0]]).check(&TIGHT),
+            Err(Problem::Text(8))
+        );
+        let huge = Node::Heatmap {
+            x: vec![String::new(); 200],
+            y: vec![String::new(); 200],
+            values: vec![],
+            tone: Tone::Neutral,
+        };
+        assert_eq!(
+            view(huge).check(&Limits::DEFAULT),
+            Err(Problem::Items(20_000)),
+            "counted before the rows are read"
+        );
+        let json = serde_json::to_string(&heatmap(&["a"], &["r"], vec![vec![1.0]])).unwrap();
+        assert_eq!(
+            json,
+            r#"{"title":"Report","body":{"heatmap":{"x":["a"],"y":["r"],"values":[[1.0]],"tone":"neutral"}}}"#
+        );
+        assert!(
+            serde_json::from_str::<Node>(r#"{"heatmap":{"x":[],"y":[],"values":[],"z":1}}"#)
+                .is_err()
+        );
     }
 
     const TIGHT: Limits = Limits {
@@ -1206,6 +1654,9 @@ mod tests {
             x: "x".into(),
             y: "y".into(),
             series: all,
+            x_scale: Scale::Linear,
+            y_scale: Scale::Linear,
+            categories: vec![],
         };
         let pair = |a: Node, b: Node| {
             view(Node::Stack {

@@ -35,6 +35,8 @@ fn count(node: &Node, counts: &mut BTreeMap<&'static str, usize>) {
         Node::Stats { .. } => "stats",
         Node::Bars { .. } => "bars",
         Node::Plot { .. } => "plot",
+        Node::Histogram { .. } => "histogram",
+        Node::Heatmap { .. } => "heatmap",
         Node::Flow { .. } => "flow",
         Node::Canvas { .. } => "canvas",
         Node::Grid { .. } => "grid",
@@ -101,6 +103,22 @@ mod tests {
         assert_eq!(
             checked(laid_out),
             Ok("ok: \"T\" with 1 columns, 1 section, 1 stats, 1 text".to_string())
+        );
+        let charts = r#"{"title":"T","body":{"stack":{"children":[
+            {"histogram":{"x":"days","values":[1,2,3]}},
+            {"heatmap":{"x":["a"],"y":["r"],"values":[[1]]}}]}}}"#;
+        assert_eq!(
+            checked(charts),
+            Ok("ok: \"T\" with 1 heatmap, 1 histogram, 1 stack".to_string())
+        );
+        let log = r#"{"title":"T","body":{"plot":{"kind":"line","x":"a","y":"b","y_scale":"log",
+            "series":[{"label":"s","points":[[1,0]]}]}}}"#;
+        assert_eq!(
+            checked(log),
+            Err(
+                "the view was refused: the series s has a value that is not above 0 on a log axis"
+                    .to_string()
+            )
         );
     }
 

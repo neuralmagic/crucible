@@ -8,6 +8,9 @@
 /** A colour role from the app's theme. */
 type Tone = "neutral" | "muted" | "good" | "warn" | "bad" | "info";
 
+/** How a plot's axis places values: `log` holds only values above zero, `time` is Unix seconds shown in UTC. */
+type Scale = "linear" | "log" | "time";
+
 /** A captured file handed to the plugin. */
 interface CapturedFile {
   /** The path the task declared. */
@@ -57,8 +60,21 @@ type ViewNode =
         kind: "line" | "scatter";
         x: string;
         y: string;
+        /** A series left `neutral` takes the next colour of the app's palette. */
         series: { label: string; tone?: Tone; points: [number, number][] }[];
+        x_scale?: Scale;
+        y_scale?: Scale;
+        /** Names an x value indexes, from 0; the x axis is then linear. */
+        categories?: string[];
       };
+    }
+  | {
+      /** `values` counted into `bins` (1 to 100) bins of equal width; the app picks when not given. */
+      histogram: { x: string; values: number[]; bins?: number; tone?: Tone };
+    }
+  | {
+      /** A row of `values` per `y` label, a value per `x` label, shaded from least to greatest. */
+      heatmap: { x: string[]; y: string[]; values: number[][]; tone?: Tone };
     }
   | {
       /** Quantities flowing between stages, drawn as ribbons: a Sankey diagram. */
