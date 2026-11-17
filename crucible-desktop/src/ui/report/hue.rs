@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use crucible_view::{Style, Tone};
+use rune::color::{srgb_decode, srgb_encode};
 use rune::{Color, oklch};
 use rune_kit::Kit;
 
@@ -13,6 +14,16 @@ pub(crate) enum Hue {
     Tone(Tone),
     /// The palette's colour at this index, wrapping past its end.
     Palette(usize),
+}
+
+/// The hue of a chart's only item: its tone, or the palette's first colour when neutral.
+impl From<Tone> for Hue {
+    fn from(tone: Tone) -> Hue {
+        match tone {
+            Tone::Neutral => Hue::Palette(0),
+            tone => Hue::Tone(tone),
+        }
+    }
 }
 
 /// Hands out hues by name: a neutral name takes the palette's next colour and a toned one
@@ -68,6 +79,18 @@ pub(crate) fn palette(dark: bool) -> [Color; 10] {
     })
 }
 
+/// The colour a tone's text is written in.
+pub(crate) fn ink(tone: Tone, k: &Kit) -> Color {
+    match tone {
+        Tone::Neutral => k.c.text_base,
+        Tone::Muted => k.c.text_muted,
+        Tone::Good => k.c.success.fg,
+        Tone::Warn => k.c.warning.fg,
+        Tone::Bad => k.c.danger.fg,
+        Tone::Info => k.c.info.fg,
+    }
+}
+
 /// The colour a tone's mark is drawn in.
 pub(crate) fn dot(tone: Tone, k: &Kit) -> Color {
     match tone {
@@ -90,19 +113,39 @@ pub(crate) fn colour(hue: Hue, k: &Kit) -> Color {
 pub(crate) fn style(hue: Hue, k: &Kit) -> Style {
     match hue {
         Hue::Tone(tone) => Style::Tone(tone),
-        Hue::Palette(_) => colour(hue, k)
-            .hex()
-            .parse()
-            .unwrap_or(Style::Tone(Tone::Muted)),
+        Hue::Palette(_) => Style::Rgba(rgba(colour(hue, k))),
+    }
+}
+
+/// `color` as sRGB bytes with straight alpha.
+fn rgba(color: Color) -> [u8; 4] {
+    let byte = |c: f32| (c * 255.0).round() as u8;
+    [
+        byte(srgb_encode(color.r)),
+        byte(srgb_encode(color.g)),
+        byte(srgb_encode(color.b)),
+        byte(color.a),
+    ]
+}
+
+/// sRGB bytes with straight alpha as a colour.
+pub(crate) fn from_rgba([r, g, b, a]: [u8; 4]) -> Color {
+    let unit = |c: u8| f32::from(c) / 255.0;
+    Color {
+        r: srgb_decode(unit(r)),
+        g: srgb_decode(unit(g)),
+        b: srgb_decode(unit(b)),
+        a: unit(a),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crucible_view::{Style, Tone};
+    use rune::Color;
     use rune_kit::Kit;
 
-    use crate::ui::report::hue::{Hue, Hues, colour, palette, style};
+    use crate::ui::report::hue::{Hue, Hues, colour, from_rgba, palette, rgba, style};
 
     #[test]
     fn a_neutral_name_takes_the_next_colour_and_keeps_it() {
@@ -160,5 +203,47 @@ mod tests {
         };
         assert_eq!(a, 255);
         assert!(b > r && b > g, "the first colour is blue: {r} {g} {b}");
+    }
+
+    #[test]
+    fn a_colour_s_bytes_match_its_hex_both_ways() {
+        let kit = Kit::neutral(false);
+        for color in palette(true).into_iter().chain(palette(false)).chain([
+            kit.c.text_base,
+            Color::WHITE,
+            Color::TRANSPARENT,
+        ]) {
+            assert_eq!(
+                Ok(Style::Rgba(rgba(color))),
+                color.hex().parse(),
+                "{color:?}"
+            );
+        }
+        for bytes in [
+            [0, 0, 0, 0],
+            [1, 2, 3, 4],
+            [0x3b, 0x82, 0xf6, 0x80],
+            [255; 4],
+        ] {
+            assert_eq!(
+                Some(from_rgba(bytes)),
+                rune::color::hex(&Style::Rgba(bytes).to_string())
+            );
+            assert_eq!(rgba(from_rgba(bytes)), bytes);
+        }
+    }
+
+    #[test]
+    fn a_lone_item_takes_its_tone_or_the_first_colour() {
+        for tone in [
+            Tone::Neutral,
+            Tone::Muted,
+            Tone::Good,
+            Tone::Warn,
+            Tone::Bad,
+            Tone::Info,
+        ] {
+            assert_eq!(Hue::from(tone), Hues::default().pick("", tone));
+        }
     }
 }

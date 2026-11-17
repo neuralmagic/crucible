@@ -8,6 +8,8 @@ use crate::App;
 use crate::report::shown::Shown;
 use crate::ui::Paint;
 use crate::ui::report::Slot;
+use crate::ui::report::axis::unit;
+use crate::ui::report::figures::stepped;
 
 /// How wide a range's track is drawn.
 const TRACK: f32 = 160.0;
@@ -130,7 +132,7 @@ fn range<S: Slot>(
     p: &Paint,
 ) -> El {
     let span = max - min;
-    let frac = ((value - min) / span).clamp(0.0, 1.0) as f32;
+    let frac = unit((value - min) / span, 0.0);
     let set = id.to_string();
     let track = el()
         .key(format!("report-range-{id}"))
@@ -180,37 +182,9 @@ fn range<S: Slot>(
                 .border(p.hair.max(1.0), p.c.text_accent),
         );
     row().gap(8.0).center_y().child(track).child(
-        text(figure(value, step))
+        text(stepped(value, step))
             .key(format!("report-range-value-{id}"))
             .font(p.mono(11.0, 440.0))
             .color(p.c.text_base),
     )
-}
-
-/// `value` with as many decimals as `step` has, up to six.
-fn figure(value: f64, step: f64) -> String {
-    let mut places = 0;
-    let mut scaled = step;
-    while places < 6 && (scaled - scaled.round()).abs() > 1e-9 * scaled.abs() {
-        scaled *= 10.0;
-        places += 1;
-    }
-    format!("{value:.places$}")
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::ui::report::controls::figure;
-
-    #[test]
-    fn a_range_s_value_shows_the_decimals_its_step_has() {
-        assert_eq!(figure(7.0, 1.0), "7");
-        assert_eq!(figure(7.5, 0.5), "7.5");
-        assert_eq!(figure(0.3, 0.1), "0.3");
-        assert_eq!(figure(0.25, 0.05), "0.25");
-        assert_eq!(figure(1e15, 1e14), "1000000000000000");
-        assert_eq!(figure(-2.0, 2.0), "-2");
-        assert_eq!(figure(1.0, 1e-12), "1.000000");
-        assert_eq!(figure(3.0, f64::MIN_POSITIVE), "3.000000");
-    }
 }

@@ -3,6 +3,7 @@
 mod axis;
 mod canvas;
 mod controls;
+mod figures;
 mod flow;
 mod hue;
 mod plot;
@@ -18,7 +19,9 @@ use rune_theme_opencode::icons as oc;
 use crate::App;
 use crate::report::Report;
 use crate::report::shown::Shown;
-use crate::ui::report::hue::dot;
+use crate::ui::report::axis::unit;
+use crate::ui::report::figures::figure;
+use crate::ui::report::hue::{dot, ink};
 use crate::ui::{Paint, desk};
 
 /// Where a drawn report and its reader state live on the app, and what its links lead to.
@@ -127,8 +130,21 @@ fn view<S: Slot>(report: &Report, app: &App, p: &Paint, layer: &mut Vec<El>) -> 
 
 /// The narrowest a child of `columns` is drawn before the next one wraps under it.
 const COLUMN: f32 = 320.0;
+/// A card's padding on each side.
+const PAD: f32 = 12.0;
 /// What a card adds to the width of what it holds: its padding on both sides.
-const CARD: f32 = 24.0;
+const CARD: f32 = 2.0 * PAD;
+/// The widest a card or a block of text is drawn.
+const MEASURE: f32 = 720.0;
+
+/// A card [`MEASURE`] wide at most, holding a chart.
+fn card(p: &Paint) -> El {
+    desk::surface(p)
+        .w_full()
+        .max_w(MEASURE)
+        .padding(PAD)
+        .gap(8.0)
+}
 
 /// The width `node` draws at when it has the room: its widest canvas or flow.
 fn least_width(node: &Node) -> f32 {
@@ -199,18 +215,7 @@ fn node<S: Slot>(node_: &Node, fills: bool, at: &str, app: &App, p: &Paint) -> E
             x_scale,
             y_scale,
             categories,
-        } => plot::plot(
-            &plot::Plotted {
-                kind: *kind,
-                x,
-                y,
-                series,
-                x_scale: *x_scale,
-                y_scale: *y_scale,
-                categories,
-            },
-            p,
-        ),
+        } => plot::plot(*kind, [x, y], series, [*x_scale, *y_scale], categories, p),
         Node::Histogram {
             x,
             values,
@@ -218,23 +223,18 @@ fn node<S: Slot>(node_: &Node, fills: bool, at: &str, app: &App, p: &Paint) -> E
             tone,
         } => plot::histogram(x, values, *bins, *tone, p),
         Node::Heatmap { x, y, values, tone } => plot::heatmap(x, y, values, *tone, p),
-        Node::Flow { nodes, links } => match flow::drawing(nodes, links, &flow_palette(p)) {
-            Some((height, commands)) => col()
-                .w_full()
-                .max_w(720.0)
-                .padding(CARD / 2.0)
-                .radius(p.k.radius.lg)
-                .fill(p.c.layer_01)
-                .border(p.hair, p.c.border_muted)
-                .child(canvas::fitted(
+        Node::Flow { nodes, links } => {
+            match flow::drawing(nodes, links, &|hue| hue::style(hue, p.k)) {
+                Some((height, commands)) => card(p).child(canvas::fitted(
                     format!("report-canvas-{at}"),
                     flow::WIDTH,
                     height,
                     &commands,
                     p,
                 )),
-            None => el(),
-        },
+                None => el(),
+            }
+        }
         Node::Canvas {
             width,
             height,
@@ -244,7 +244,7 @@ fn node<S: Slot>(node_: &Node, fills: bool, at: &str, app: &App, p: &Paint) -> E
         Node::Table { columns, .. } => table::<S>(columns, app, p),
         Node::Text { text: body, tone } => text(body.clone())
             .font(p.k.ty.ui)
-            .color(ink(*tone, p.k).unwrap_or(p.c.text_base))
+            .color(ink(*tone, p.k))
             .selectable(true)
             .selection_color(p.k.selection())
             .wrap(),
@@ -256,19 +256,12 @@ fn node<S: Slot>(node_: &Node, fills: bool, at: &str, app: &App, p: &Paint) -> E
             &format!("report-note-{at}"),
             headline,
             detail,
-            ink(*tone, p.k).unwrap_or(p.c.text_base),
+            ink(*tone, p.k),
             p,
         ),
         Node::Markdown { text: body } => markdown::<S>(body.clone(), "report-markdown", p),
         Node::Mermaid { source } => markdown::<S>(fenced(source), "report-mermaid", p),
     }
-}
-
-/// The palette's colours as a flow's stages are drawn in them.
-fn flow_palette(p: &Paint) -> Vec<crucible_view::Style> {
-    (0..hue::palette(p.dark).len())
-        .map(|i| hue::style(hue::Hue::Palette(i), p.k))
-        .collect()
 }
 
 /// Markdown whose links lead to the web or into the run.
@@ -279,7 +272,7 @@ fn markdown<S: Slot>(body: String, key: &str, p: &Paint) -> El {
         .build(p.k)
         .key(key.to_string())
         .w_full()
-        .max_w(720.0)
+        .max_w(MEASURE)
 }
 
 /// `source` as Markdown holding one `mermaid` fence, longer than any run of backticks in it.
@@ -287,17 +280,6 @@ fn fenced(source: &str) -> String {
     let longest = source.split(|c| c != '`').map(str::len).max().unwrap_or(0);
     let fence = "`".repeat(longest.max(2) + 1);
     format!("{fence}mermaid\n{source}\n{fence}\n")
-}
-
-fn ink(tone: Tone, k: &Kit) -> Option<Color> {
-    match tone {
-        Tone::Neutral => None,
-        Tone::Muted => Some(k.c.text_muted),
-        Tone::Good => Some(k.c.success.fg),
-        Tone::Warn => Some(k.c.warning.fg),
-        Tone::Bad => Some(k.c.danger.fg),
-        Tone::Info => Some(k.c.info.fg),
-    }
 }
 
 /// A title the reader clicks to fold or unfold `body` under it.
@@ -411,14 +393,11 @@ fn stats(items: &[Stat], p: &Paint) -> El {
     let mut tiles = row().key("report-stats").w_full().gap(10.0).flex_wrap();
     for (i, item) in items.iter().enumerate() {
         tiles = tiles.child(
-            col()
+            desk::surface(p)
                 .key(format!("report-stat-{i}"))
                 .min_w(120.0)
                 .padding(12.0)
                 .gap(2.0)
-                .radius(p.k.radius.lg)
-                .fill(p.c.layer_01)
-                .border(p.hair, p.c.border_muted)
                 .child(
                     text(item.label.clone())
                         .font(p.k.ty.small_medium)
@@ -427,7 +406,7 @@ fn stats(items: &[Stat], p: &Paint) -> El {
                 .child(
                     text(item.value.clone())
                         .font(p.mono(20.0, 560.0))
-                        .color(ink(item.tone, p.k).unwrap_or(p.c.text_base)),
+                        .color(ink(item.tone, p.k)),
                 ),
         );
     }
@@ -436,11 +415,11 @@ fn stats(items: &[Stat], p: &Paint) -> El {
 
 /// `value` of `max` as a bar, full at `max` and empty at 0 or below.
 fn meter(at: &str, label: &str, value: f64, max: f64, tone: Tone, p: &Paint) -> El {
-    let share = share(value / max);
+    let share = unit(value / max, 0.0);
     col()
         .key(format!("report-meter-{at}"))
         .w_full()
-        .max_w(720.0)
+        .max_w(MEASURE)
         .gap(6.0)
         .child(
             row()
@@ -456,21 +435,12 @@ fn meter(at: &str, label: &str, value: f64, max: f64, tone: Tone, p: &Paint) -> 
                         .truncate(),
                 )
                 .child(
-                    text(format!("{} / {}", axis::figure(value), axis::figure(max)))
+                    text(format!("{} / {}", figure(value), figure(max)))
                         .font(p.mono(12.0, 480.0))
-                        .color(ink(tone, p.k).unwrap_or(p.c.text_base)),
+                        .color(ink(tone, p.k)),
                 ),
         )
         .child(track(share, 6.0, dot(tone, p.k), p.c.border_muted))
-}
-
-/// `fraction` from 0 to 1, and 0 when it is not a number.
-fn share(fraction: f64) -> f32 {
-    if fraction.is_nan() {
-        0.0
-    } else {
-        fraction.clamp(0.0, 1.0) as f32
-    }
 }
 
 /// A bar `tall` points high on `under`, filled in `color` for `share` of its width.
@@ -488,7 +458,7 @@ fn track(share: f32, tall: f32, color: Color, under: Color) -> El {
 fn with_bar(body: El, cell: &Cell, k: &Kit) -> El {
     match cell.bar {
         Some(bar) => col().grow(1.0).min_w(0.0).gap(3.0).child(body).child(track(
-            share(bar),
+            unit(bar, 0.0),
             3.0,
             dot(cell.tone, k),
             k.c.border_muted,
@@ -497,16 +467,16 @@ fn with_bar(body: El, cell: &Cell, k: &Kit) -> El {
     }
 }
 
-/// `cell`'s text cut to its width, with the whole text on hover when cut.
-fn cut(cell: &Cell, font: rune::TextStyle, color: Color, align: Align) -> El {
-    text(cell.text.clone())
+/// `body` cut to its width, with the whole text on hover when cut.
+fn cut(body: &str, font: rune::TextStyle, color: Color, align: Align) -> El {
+    text(body.to_string())
         .font(font)
         .color(color)
         .align(align)
         .truncate()
         .w_full()
         .min_w(0.0)
-        .help_when_truncated(cell.text.clone())
+        .help_when_truncated(body.to_string())
 }
 
 fn grid(columns: &[String], rows: &[Vec<Cell>], p: &Paint) -> El {
@@ -517,13 +487,12 @@ fn grid(columns: &[String], rows: &[Vec<Cell>], p: &Paint) -> El {
             row().w(96.0).justify_end().child(body)
         }
     };
+    let align = |i: usize| if i == 0 { Align::Start } else { Align::End };
     let mut head = row().w_full().h(26.0).px(10.0).center_y();
     for (i, title) in columns.iter().enumerate() {
         head = head.child(cell(
             i,
-            text(title.clone())
-                .font(p.k.ty.small_medium)
-                .color(p.c.text_muted),
+            cut(title, p.k.ty.small_medium, p.c.text_muted, align(i)),
         ));
     }
     let mut lines = vec![head];
@@ -531,25 +500,15 @@ fn grid(columns: &[String], rows: &[Vec<Cell>], p: &Paint) -> El {
         let mut line = row().w_full().h(28.0).px(10.0).center_y();
         for (i, value) in cells.iter().enumerate() {
             let font = p.mono(12.0, 440.0);
-            let color = ink(value.tone, p.k).unwrap_or(p.c.text_base);
-            let align = if i == 0 { Align::Start } else { Align::End };
-            line = line.child(cell(
-                i,
-                match value.bar {
-                    Some(_) => with_bar(cut(value, font, color, align), value, p.k),
-                    None => text(value.text.clone()).font(font).color(color),
-                },
-            ));
+            let body = cut(&value.text, font, ink(value.tone, p.k), align(i));
+            line = line.child(cell(i, with_bar(body, value, p.k)));
         }
         lines.push(line);
     }
-    col()
+    desk::surface(p)
         .key("report-grid")
         .w_full()
-        .max_w(720.0)
-        .radius(p.k.radius.lg)
-        .fill(p.c.layer_01)
-        .border(p.hair, p.c.border_muted)
+        .max_w(MEASURE)
         .child(desk::stacked("report-grid-rows", lines, p))
 }
 
@@ -661,13 +620,10 @@ fn filter<S: Slot>(app: &App, p: &Paint) -> El {
 /// The selected row's detail, under the table.
 fn detail<S: Slot>(shown: &Row, p: &Paint) -> El {
     let body = shown.detail.clone().unwrap_or_default();
-    col()
+    desk::surface(p)
         .key("report-detail")
         .w_full()
         .h(260.0)
-        .radius(p.k.radius.lg)
-        .fill(p.c.layer_01)
-        .border(p.hair, p.c.border_muted)
         .child(
             row()
                 .w_full()
@@ -748,8 +704,11 @@ fn drawn<S: Slot>(cell: &Cell, kind: ColumnKind, link: Option<Color>, k: &Kit) -
             } else {
                 Align::Start
             };
-            let color = ink(cell.tone, k).unwrap_or(k.c.text_base);
-            rune_kit::Cell::el(with_bar(cut(cell, font, color, align), cell, k))
+            rune_kit::Cell::el(with_bar(
+                cut(&cell.text, font, ink(cell.tone, k), align),
+                cell,
+                k,
+            ))
         }
         (ColumnKind::Text | ColumnKind::Mono | ColumnKind::Number, None) => {
             let body = rune_kit::Cell::text(cell.text.clone());
@@ -758,10 +717,7 @@ fn drawn<S: Slot>(cell: &Cell, kind: ColumnKind, link: Option<Color>, k: &Kit) -
             } else {
                 body.mono()
             };
-            match ink(cell.tone, k) {
-                Some(color) => body.color(color),
-                None => body,
-            }
+            body.color(ink(cell.tone, k))
         }
     }
 }
@@ -770,26 +726,7 @@ fn drawn<S: Slot>(cell: &Cell, kind: ColumnKind, link: Option<Color>, k: &Kit) -
 mod tests {
     use crucible_view::{Context2d, Node, Tab};
 
-    use crate::ui::report::{CARD, fenced, flow, least_width, share};
-
-    #[test]
-    fn a_share_is_clamped_to_0_and_1_and_is_0_when_not_a_number() {
-        for (fraction, drawn) in [
-            (0.0, 0.0),
-            (-0.0, 0.0),
-            (0.45, 0.45),
-            (1.0, 1.0),
-            (70.0 / 64.0, 1.0),
-            (-3.0 / 64.0, 0.0),
-            (1e15 / 5e-324, 1.0),
-            (-1e15 / 5e-324, 0.0),
-            (f64::NAN, 0.0),
-        ] {
-            let got = share(fraction);
-            assert!(got.is_finite() && (0.0..=1.0).contains(&got), "{fraction}");
-            assert_eq!(got, drawn, "{fraction}");
-        }
-    }
+    use crate::ui::report::{CARD, fenced, flow, least_width};
 
     #[test]
     fn a_column_is_as_wide_as_its_widest_canvas_or_flow() {

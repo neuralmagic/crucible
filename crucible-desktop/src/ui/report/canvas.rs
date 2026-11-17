@@ -9,6 +9,7 @@ use crucible_view::{
 use rune::{Color, El, Shape, canvas, col, el, row, text};
 
 use crate::ui::Paint;
+use crate::ui::report::hue::{dot, from_rgba, ink};
 
 /// The widest box a line of canvas text with no max width is laid out in.
 const TEXT_BOX: f32 = 400.0;
@@ -112,13 +113,9 @@ fn fit(room: f32, width: f32) -> f32 {
 
 fn colour(style: Style, p: &Paint) -> Color {
     match style {
-        Style::Tone(Tone::Neutral) => p.c.text_base,
-        Style::Tone(Tone::Muted) => p.c.text_muted,
-        Style::Tone(Tone::Good) => p.c.success.icon,
-        Style::Tone(Tone::Warn) => p.c.warning.icon,
-        Style::Tone(Tone::Bad) => p.c.danger.icon,
-        Style::Tone(Tone::Info) => p.c.info.icon,
-        Style::Rgba(_) => rune::color::hex(&style.to_string()).unwrap_or(p.c.text_base),
+        Style::Tone(tone @ (Tone::Neutral | Tone::Muted)) => ink(tone, p.k),
+        Style::Tone(tone) => dot(tone, p.k),
+        Style::Rgba(bytes) => from_rgba(bytes),
     }
 }
 

@@ -8,6 +8,8 @@ use jiff::Timestamp;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
 
+use crate::ui::report::figures::{figure, number, power};
+
 /// The most ticks an axis is labelled at.
 const MOST_TICKS: usize = 7;
 /// The least step between ticks, as a share of the largest value on the axis.
@@ -77,7 +79,7 @@ impl<'a> Axis<'a> {
     }
 
     fn numbers(values: &[f64], zero: bool, least_step: f64) -> Axis<'a> {
-        let (lo, hi) = extent(values);
+        let (lo, hi) = extent(values.iter().copied()).unwrap_or((0.0, 1.0));
         let (lo, hi) = if zero {
             (lo.min(0.0), hi.max(0.0))
         } else {
@@ -122,13 +124,8 @@ impl<'a> Axis<'a> {
     }
 
     fn log(values: &[f64]) -> Axis<'a> {
-        let above: Vec<f64> = values.iter().copied().filter(|v| *v > 0.0).collect();
-        let (low, high) = extent(&above);
-        let (low, high) = if above.is_empty() {
-            (1.0, 10.0)
-        } else {
-            (low, high)
-        };
+        let (low, high) =
+            extent(values.iter().copied().filter(|v| *v > 0.0)).unwrap_or((1.0, 10.0));
         let lo = low.log10().floor();
         let hi = high.log10().ceil().max(lo + 1.0);
         let decades = hi - lo;
@@ -173,7 +170,7 @@ impl<'a> Axis<'a> {
     }
 
     fn time(values: &[f64]) -> Axis<'a> {
-        let (lo, hi) = extent(values);
+        let (lo, hi) = extent(values.iter().copied()).unwrap_or((0.0, 1.0));
         let middle = lo / 2.0 + hi / 2.0;
         let (lo, hi) = if hi - lo >= 10.0 {
             (lo, hi)
@@ -214,12 +211,7 @@ impl<'a> Axis<'a> {
             Kind::Log => self.lo,
             _ => value,
         };
-        let at = (value - self.lo) / (self.hi - self.lo);
-        if at.is_finite() {
-            at.clamp(0.0, 1.0) as f32
-        } else {
-            0.0
-        }
+        unit((value - self.lo) / (self.hi - self.lo), 0.0)
     }
 
     /// `value` as a reader is shown it on hover.
@@ -235,14 +227,19 @@ impl<'a> Axis<'a> {
     }
 }
 
-/// The least and greatest of `values`, or 0 and 1 when there are none.
-fn extent(values: &[f64]) -> (f64, f64) {
-    let lo = values.iter().copied().fold(f64::INFINITY, f64::min);
-    let hi = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    if lo.is_finite() && hi.is_finite() {
-        (lo, hi)
+/// The least and greatest of `values`, or `None` when there are none or either is not finite.
+pub(crate) fn extent(values: impl Iterator<Item = f64> + Clone) -> Option<(f64, f64)> {
+    let lo = values.clone().fold(f64::INFINITY, f64::min);
+    let hi = values.fold(f64::NEG_INFINITY, f64::max);
+    (lo.is_finite() && hi.is_finite()).then_some((lo, hi))
+}
+
+/// `at` clamped to 0 to 1, and `or` when it is not a number.
+pub(crate) fn unit(at: f64, or: f32) -> f32 {
+    if at.is_nan() {
+        or
     } else {
-        (0.0, 1.0)
+        at.clamp(0.0, 1.0) as f32
     }
 }
 
@@ -301,71 +298,6 @@ fn steps(lo: f64, hi: f64, least_step: f64) -> Option<(f64, f64, f64)> {
         step = nice(step * 1.01, true)?;
     }
     None
-}
-
-/// `text`, a fixed-point number, without the zeros that end its fraction.
-fn trimmed(text: String) -> String {
-    if text.contains('.') {
-        text.trim_end_matches('0').trim_end_matches('.').to_string()
-    } else {
-        text
-    }
-}
-
-/// A tick's label: `value` with as many decimals as `step` needs, thousands as k, M, B or T.
-pub(crate) fn number(value: f64, step: f64) -> String {
-    if value == 0.0 || !value.is_finite() {
-        return "0".to_string();
-    }
-    let (unit, suffix) = [(1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "k")]
-        .into_iter()
-        .find(|(unit, _)| value.abs() >= *unit)
-        .unwrap_or((1.0, ""));
-    let decimals = -(step.abs() / unit).log10().floor();
-    let decimals = if decimals.is_finite() {
-        decimals.max(0.0) as usize
-    } else {
-        0
-    };
-    if decimals > 4 && value.abs() < 1e-3 {
-        let digits = (value.abs().log10().floor() - step.abs().log10().floor()).clamp(0.0, 17.0);
-        return scientific(value, digits as usize);
-    }
-    format!(
-        "{}{suffix}",
-        trimmed(format!("{:.*}", decimals, value / unit))
-    )
-}
-
-/// `value` to four significant figures, written as a tick is.
-pub(crate) fn figure(value: f64) -> String {
-    if value == 0.0 || !value.is_finite() {
-        return "0".to_string();
-    }
-    let step = 10_f64.powf(value.abs().log10().floor() - 3.0);
-    if step > 0.0 && step.is_finite() {
-        number(value, step)
-    } else {
-        scientific(value, 3)
-    }
-}
-
-fn scientific(value: f64, digits: usize) -> String {
-    let text = format!("{:.*e}", digits, value);
-    match text.split_once('e') {
-        Some((mantissa, exponent)) => format!("{}e{exponent}", trimmed(mantissa.to_string())),
-        None => text,
-    }
-}
-
-/// `m` times ten to the `e`.
-fn power(m: i32, e: i32) -> String {
-    if (-4..=15).contains(&e) {
-        let value = f64::from(m) * 10_f64.powi(e);
-        number(value, value)
-    } else {
-        format!("{m}e{e}")
-    }
 }
 
 /// The second `second` in UTC, written with `format`.
@@ -526,7 +458,7 @@ fn calendar(lo: f64, hi: f64, months: bool, step: i32) -> Vec<i64> {
 mod tests {
     use crucible_view::{MAGNITUDE, Scale, TIME_SPAN};
 
-    use crate::ui::report::axis::{Axis, figure, nice, number, steps, widen};
+    use crate::ui::report::axis::{Axis, extent, nice, steps, unit, widen};
 
     fn labels<'a>(axis: &'a Axis<'_>) -> Vec<&'a str> {
         axis.ticks()
@@ -671,22 +603,36 @@ mod tests {
     }
 
     #[test]
-    fn numbers_are_written_compactly() {
-        assert_eq!(number(1234.0, 100.0), "1.2k");
-        assert_eq!(number(3_400_000.0, 100_000.0), "3.4M");
-        assert_eq!(number(2e9, 1e9), "2B");
-        assert_eq!(number(-1500.0, 500.0), "-1.5k");
-        assert_eq!(number(500.0, 500.0), "500");
-        assert_eq!(number(0.25, 0.05), "0.25");
-        assert_eq!(number(0.0, 0.05), "0");
-        assert_eq!(number(f64::NAN, 1.0), "0");
-        assert_eq!(figure(57.0), "57");
-        assert_eq!(figure(0.1 + 0.2), "0.3");
-        assert_eq!(figure(1_234_567.0), "1.235M");
-        assert_eq!(figure(-0.000_012_34), "-1.234e-5");
-        assert_eq!(figure(5e-324), "4.941e-324");
-        assert_eq!(figure(MAGNITUDE), "1000T");
-        assert_eq!(figure(7.5), "7.5");
+    fn an_extent_is_the_least_and_greatest_of_finite_values() {
+        assert_eq!(extent([3.0, -1.0, 2.0].into_iter()), Some((-1.0, 3.0)));
+        assert_eq!(extent([5.0].into_iter()), Some((5.0, 5.0)));
+        assert_eq!(extent(std::iter::empty()), None);
+        assert_eq!(extent([1.0, f64::INFINITY].into_iter()), None);
+        assert_eq!(extent([f64::NEG_INFINITY, 1.0].into_iter()), None);
+    }
+
+    #[test]
+    fn a_unit_is_clamped_to_0_and_1_and_is_its_fallback_when_not_a_number() {
+        for (at, drawn) in [
+            (0.0, 0.0),
+            (-0.0, 0.0),
+            (0.45, 0.45),
+            (1.0, 1.0),
+            (70.0 / 64.0, 1.0),
+            (-3.0 / 64.0, 0.0),
+            (1e15 / 5e-324, 1.0),
+            (-1e15 / 5e-324, 0.0),
+            (f64::INFINITY, 1.0),
+            (f64::NEG_INFINITY, 0.0),
+        ] {
+            for or in [0.0, 0.5] {
+                let got = unit(at, or);
+                assert!(got.is_finite() && (0.0..=1.0).contains(&got), "{at}");
+                assert_eq!(got, drawn, "{at}");
+            }
+        }
+        assert_eq!(unit(f64::NAN, 0.0), 0.0);
+        assert_eq!(unit(f64::NAN, 0.5), 0.5);
     }
 
     #[test]

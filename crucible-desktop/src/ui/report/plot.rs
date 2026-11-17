@@ -6,8 +6,10 @@ use crucible_view::{Bar, PlotKind, Scale, Series, Tone};
 use rune::{Color, El, LineCap, Shape, canvas, col, el, row, text};
 
 use crate::ui::Paint;
-use crate::ui::report::axis::{Axis, figure, widen};
-use crate::ui::report::hue::{Hues, colour};
+use crate::ui::report::axis::{Axis, Tick, extent, unit, widen};
+use crate::ui::report::card;
+use crate::ui::report::figures::{figure, short};
+use crate::ui::report::hue::{Hue, Hues, colour};
 
 /// The most points a plot holds while each shows its series and values on hover.
 const HOVER_POINTS: usize = 1_000;
@@ -33,25 +35,13 @@ const LABEL: f32 = 80.0;
 const ROW: f32 = 26.0;
 const ROW_LABEL: f32 = 110.0;
 
-fn card(key: String, p: &Paint) -> El {
-    col()
-        .key(key)
-        .w_full()
-        .max_w(720.0)
-        .padding(12.0)
-        .gap(8.0)
-        .radius(p.k.radius.lg)
-        .fill(p.c.layer_01)
-        .border(p.hair, p.c.border_muted)
-}
-
-fn name(label: &str, p: &Paint) -> El {
+fn axis_name(label: &str, p: &Paint) -> El {
     text(label.to_string())
         .font(p.k.ty.small_medium)
         .color(p.c.text_muted)
 }
 
-fn number(label: &str, p: &Paint) -> El {
+fn tick_label(label: &str, p: &Paint) -> El {
     text(label.to_string())
         .font(p.mono(10.5, 400.0))
         .color(p.c.text_faint)
@@ -88,14 +78,6 @@ fn brief(text: &str) -> String {
     }
 }
 
-fn short(value: f64) -> String {
-    if value.fract() == 0.0 {
-        format!("{value:.0}")
-    } else {
-        format!("{value:.1}")
-    }
-}
-
 pub(crate) fn bars(all: &[Bar], p: &Paint) -> El {
     let total = |bar: &Bar| bar.segments.iter().map(|s| s.value).sum::<f64>();
     let most = all.iter().map(total).fold(0.0, f64::max);
@@ -116,7 +98,7 @@ pub(crate) fn bars(all: &[Bar], p: &Paint) -> El {
             .map(|(segment, color)| (segment.label.as_str(), *color)),
         p,
     );
-    let mut chart = card("report-bars".into(), p).child(key);
+    let mut chart = card(p).key("report-bars").child(key);
     for (i, (bar, colours)) in all.iter().zip(&coloured).enumerate() {
         let mut track = row().grow(1.0).min_w(0.0).h(12.0).gap(1.0);
         for (segment, color) in bar.segments.iter().zip(colours) {
@@ -215,6 +197,23 @@ fn grid(x: &Axis<'_>, y: &Axis<'_>, p: &Paint) -> Shape {
     shape
 }
 
+/// A row of `ticks`' labels, each centred where `place` puts it across the row.
+fn ticks_under(ticks: &[Tick], place: impl Fn(f32) -> f32, p: &Paint) -> El {
+    let mut labels = el().grow(1.0).min_w(0.0).h(14.0);
+    for tick in ticks {
+        labels = labels.child(centred(
+            place(tick.at as f32),
+            0.0,
+            LABEL,
+            14.0,
+            row()
+                .justify_center()
+                .child(tick_label(&tick.label, p).truncate()),
+        ));
+    }
+    labels
+}
+
 /// The axes' names and tick labels around `shape`, with `marks` laid over it.
 fn framed(
     x: &Axis<'_>,
@@ -233,25 +232,13 @@ fn framed(
                 .w(GUTTER - 8.0)
                 .h(14.0)
                 .justify_end()
-                .child(number(&tick.label, p)),
+                .child(tick_label(&tick.label, p)),
         );
-    }
-    let mut labels = el().grow(1.0).min_w(0.0).h(14.0);
-    for tick in x.ticks() {
-        labels = labels.child(centred(
-            across(tick.at as f32),
-            0.0,
-            LABEL,
-            14.0,
-            row()
-                .justify_center()
-                .child(number(&tick.label, p).truncate()),
-        ));
     }
     col()
         .w_full()
         .gap(6.0)
-        .child(name(names[1], p))
+        .child(axis_name(names[1], p))
         .child(
             row().w_full().child(gutter).child(
                 el().grow(1.0)
@@ -266,37 +253,31 @@ fn framed(
                     .children(marks),
             ),
         )
-        .child(row().w_full().pl(GUTTER).child(labels))
+        .child(
+            row()
+                .w_full()
+                .pl(GUTTER)
+                .child(ticks_under(x.ticks(), across, p)),
+        )
         .child(
             row()
                 .w_full()
                 .pl(GUTTER)
                 .justify_center()
-                .child(name(names[0], p)),
+                .child(axis_name(names[0], p)),
         )
 }
 
-/// What a plot is drawn from.
-pub(crate) struct Plotted<'a> {
-    pub kind: PlotKind,
-    pub x: &'a str,
-    pub y: &'a str,
-    pub series: &'a [Series],
-    pub x_scale: Scale,
-    pub y_scale: Scale,
-    pub categories: &'a [String],
-}
-
-pub(crate) fn plot(plotted: &Plotted<'_>, p: &Paint) -> El {
-    let Plotted {
-        kind,
-        x: x_name,
-        y: y_name,
-        series,
-        x_scale,
-        y_scale,
-        categories,
-    } = *plotted;
+/// `series` on an x and a y axis, given as `[x, y]` pairs of names and scales; the x axis names
+/// `categories` when there are any.
+pub(crate) fn plot(
+    kind: PlotKind,
+    [x_name, y_name]: [&str; 2],
+    series: &[Series],
+    [x_scale, y_scale]: [Scale; 2],
+    categories: &[String],
+    p: &Paint,
+) -> El {
     let points = || series.iter().flat_map(|s| s.points.iter());
     let xs: Vec<f64> = points().map(|point| point[0]).collect();
     let ys: Vec<f64> = points().map(|point| point[1]).collect();
@@ -344,7 +325,8 @@ pub(crate) fn plot(plotted: &Plotted<'_>, p: &Paint) -> El {
             }
         }
     }
-    card(format!("report-plot-{y_name}-{x_name}"), p)
+    card(p)
+        .key(format!("report-plot-{y_name}-{x_name}"))
         .child(legend(
             series
                 .iter()
@@ -366,13 +348,7 @@ pub(crate) struct Binned {
 /// `values` counted into `bins` bins, or about the square root of their number up to
 /// [`DEFAULT_BINS`], from the least to the greatest; the greatest falls in the last bin.
 pub(crate) fn binned(values: &[f64], bins: Option<u32>) -> Binned {
-    let lo = values.iter().copied().fold(f64::INFINITY, f64::min);
-    let hi = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let (lo, hi) = if lo.is_finite() && hi.is_finite() {
-        widen(lo, hi)
-    } else {
-        (0.0, 1.0)
-    };
+    let (lo, hi) = extent(values.iter().copied()).map_or((0.0, 1.0), |(lo, hi)| widen(lo, hi));
     let asked =
         bins.unwrap_or_else(|| ((values.len() as f64).sqrt().ceil() as u32).clamp(1, DEFAULT_BINS));
     let asked = asked.clamp(1, crucible_view::MAX_BINS);
@@ -407,7 +383,7 @@ pub(crate) fn histogram(
     let x = Axis::new(Scale::Linear, &[lo, edge(counts.len())], false);
     let most = counts.iter().copied().max().unwrap_or(0);
     let y = Axis::counts(most as f64);
-    let color = colour(Hues::default().pick("", tone), p.k);
+    let color = colour(Hue::from(tone), p.k);
     let mut shape = grid(&x, &y, p);
     let mut marks = Vec::new();
     for (i, count) in counts.iter().enumerate() {
@@ -431,24 +407,14 @@ pub(crate) fn histogram(
                 .help_row(format!("count {count}")),
         ));
     }
-    card(format!("report-histogram-{x_name}"), p).child(framed(
-        &x,
-        &y,
-        [x_name, "count"],
-        shape,
-        marks,
-        p,
-    ))
+    card(p)
+        .key(format!("report-histogram-{x_name}"))
+        .child(framed(&x, &y, [x_name, "count"], shape, marks, p))
 }
 
 /// Where `value` falls from `lo` to `hi`, from 0 to 1; halfway when they are one value.
 fn share(value: f64, lo: f64, hi: f64) -> f32 {
-    let at = (value - lo) / (hi - lo);
-    if at.is_finite() {
-        at.clamp(0.0, 1.0) as f32
-    } else {
-        0.5
-    }
+    unit((value - lo) / (hi - lo), 0.5)
 }
 
 /// `color` as deep as the place `at` from 0 to 1 calls for.
@@ -463,10 +429,9 @@ pub(crate) fn heatmap(
     tone: Tone,
     p: &Paint,
 ) -> El {
-    let all = || values.iter().flatten().copied();
-    let lo = all().fold(f64::INFINITY, f64::min);
-    let hi = all().fold(f64::NEG_INFINITY, f64::max);
-    let color = colour(Hues::default().pick("", tone), p.k);
+    let span = extent(values.iter().flatten().copied());
+    let (lo, hi) = span.unwrap_or((0.0, 1.0));
+    let color = colour(Hue::from(tone), p.k);
     let cells = x.len().saturating_mul(y.len());
     let label = |body: &str| {
         text(body.to_string())
@@ -474,7 +439,7 @@ pub(crate) fn heatmap(
             .color(p.c.text_base)
             .truncate()
     };
-    let mut chart = card("report-heatmap".into(), p);
+    let mut chart = card(p).key("report-heatmap");
     if cells <= HOVER_CELLS {
         let written = x.len() <= WRITTEN;
         for (row_label, row_values) in y.iter().zip(values) {
@@ -552,27 +517,14 @@ pub(crate) fn heatmap(
             ),
         );
     }
-    let mut under = el().grow(1.0).min_w(0.0).h(14.0);
-    for tick in Axis::names(x).ticks() {
-        under = under.child(centred(
-            tick.at as f32,
-            0.0,
-            LABEL,
-            14.0,
-            row()
-                .justify_center()
-                .child(number(&tick.label, p).truncate()),
-        ));
-    }
-    let (least, greatest) = if lo.is_finite() && hi.is_finite() {
-        (figure(lo), figure(hi))
-    } else {
-        (String::new(), String::new())
+    let (least, greatest) = match span {
+        Some((lo, hi)) => (figure(lo), figure(hi)),
+        None => (String::new(), String::new()),
     };
     let mut scale = row()
         .gap(2.0)
         .center_y()
-        .child(number(&least, p))
+        .child(tick_label(&least, p))
         .child(el().w(4.0));
     for step in 0..5 {
         scale = scale.child(
@@ -582,12 +534,16 @@ pub(crate) fn heatmap(
         );
     }
     chart
-        .child(row().w_full().pl(ROW_LABEL + 8.0).child(under))
+        .child(row().w_full().pl(ROW_LABEL + 8.0).child(ticks_under(
+            Axis::names(x).ticks(),
+            |at| at,
+            p,
+        )))
         .child(
             row()
                 .w_full()
                 .justify_end()
-                .child(scale.child(el().w(4.0)).child(number(&greatest, p))),
+                .child(scale.child(el().w(4.0)).child(tick_label(&greatest, p))),
         )
 }
 

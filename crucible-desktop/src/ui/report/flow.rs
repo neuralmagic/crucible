@@ -13,6 +13,7 @@ use std::collections::HashMap;
 
 use crucible_view::{Draw, FlowLink, FlowNode, Style, TextAlign, Tone, flow_columns};
 
+use crate::ui::report::figures::short;
 use crate::ui::report::hue::{Hue, Hues};
 
 /// The drawing's width, and the height its tallest column fills.
@@ -97,20 +98,12 @@ pub(crate) fn place(nodes: &[FlowNode], links: &[FlowLink]) -> Option<(Vec<Place
     Some((placed, scale))
 }
 
-fn short(value: f64) -> String {
-    if value.fract() == 0.0 {
-        format!("{value:.0}")
-    } else {
-        format!("{value:.1}")
-    }
-}
-
-/// The flow as a canvas of [`WIDTH`] by the returned height, a neutral stage in the next of
-/// `palette`; `None` for one the catalog's check would have refused.
+/// The flow as a canvas of [`WIDTH`] by the returned height, each stage in the style `style`
+/// gives its hue; `None` for one the catalog's check would have refused.
 pub(crate) fn drawing(
     nodes: &[FlowNode],
     links: &[FlowLink],
-    palette: &[Style],
+    style: &dyn Fn(Hue) -> Style,
 ) -> Option<(f32, Vec<Draw>)> {
     let (placed, scale) = place(nodes, links)?;
     let index: HashMap<&str, usize> = nodes
@@ -140,13 +133,7 @@ pub(crate) fn drawing(
     let mut hues = Hues::default();
     let styles: Vec<Style> = nodes
         .iter()
-        .map(|node| match hues.pick(&node.id, node.tone) {
-            Hue::Tone(tone) => Style::Tone(tone),
-            Hue::Palette(i) => palette
-                .get(i % palette.len().max(1))
-                .copied()
-                .unwrap_or(Style::Tone(Tone::Muted)),
-        })
+        .map(|node| style(hues.pick(&node.id, node.tone)))
         .collect();
     let mut commands = vec![Draw::GlobalAlpha(0.35)];
     let (mut left, mut entered) = (vec![0.0_f32; nodes.len()], vec![0.0_f32; nodes.len()]);
@@ -213,10 +200,18 @@ pub(crate) fn drawing(
 #[cfg(test)]
 mod tests {
     use crucible_view::{Draw, FlowLink, FlowNode, Style, TextAlign, Tone};
+    use rune_kit::Kit;
 
     use crate::ui::report::flow::{WIDTH, drawing, place};
+    use crate::ui::report::hue::{self, Hue};
 
-    const PALETTE: [Style; 2] = [Style::Rgba([1, 2, 3, 255]), Style::Rgba([4, 5, 6, 255])];
+    fn style(hue: Hue) -> Style {
+        hue::style(hue, &Kit::neutral(true))
+    }
+
+    fn palette(i: usize) -> Style {
+        style(Hue::Palette(i))
+    }
 
     fn node(id: &str, tone: Tone) -> FlowNode {
         FlowNode {
@@ -289,7 +284,7 @@ mod tests {
     fn ribbons_fill_their_bars_edge_to_edge_and_take_the_tone_they_reach() {
         let (nodes, links) = triage();
         let (placed, scale) = place(&nodes, &links).unwrap();
-        let (height, commands) = drawing(&nodes, &links, &PALETTE).unwrap();
+        let (height, commands) = drawing(&nodes, &links, &style).unwrap();
         assert_eq!(height, 256.0);
         let starts: Vec<[f32; 2]> = commands
             .iter()
@@ -354,7 +349,7 @@ mod tests {
             tone: Some(Tone::Warn),
             ..link("a", "b", 2.5)
         }];
-        let (_, commands) = drawing(&nodes, &toned, &PALETTE).unwrap();
+        let (_, commands) = drawing(&nodes, &toned, &style).unwrap();
         assert!(commands.contains(&Draw::FillStyle(Style::Tone(Tone::Warn))));
         let bars: Vec<Style> = commands
             .iter()
@@ -366,7 +361,7 @@ mod tests {
             .collect();
         assert_eq!(
             bars,
-            [PALETTE[0], Style::Tone(Tone::Good)],
+            [palette(0), Style::Tone(Tone::Good)],
             "a neutral stage takes the palette's first colour"
         );
         assert!(
@@ -378,7 +373,7 @@ mod tests {
         let (placed, scale) = place(&nodes, &[]).unwrap();
         assert_eq!(scale, 0.0);
         assert!(placed.iter().all(|at| at.height == 0.0));
-        assert!(drawing(&nodes, &[], &PALETTE).is_some());
+        assert!(drawing(&nodes, &[], &style).is_some());
 
         let neutral: Vec<FlowNode> = ["a", "b", "c", "d"]
             .map(|id| node(id, Tone::Neutral))
@@ -390,8 +385,8 @@ mod tests {
             link("c", "d", 1.0),
             link("a", "e", 1.0),
         ];
-        let stages = |palette: &[Style]| -> Vec<Style> {
-            let (_, commands) = drawing(&neutral, &fed, palette).unwrap();
+        let stages = || -> Vec<Style> {
+            let (_, commands) = drawing(&neutral, &fed, &style).unwrap();
             commands
                 .iter()
                 .zip(commands.iter().skip(1))
@@ -402,18 +397,17 @@ mod tests {
                 .collect()
         };
         assert_eq!(
-            stages(&PALETTE),
+            stages(),
             [
-                PALETTE[0],
-                PALETTE[1],
-                PALETTE[0],
-                PALETTE[1],
+                palette(0),
+                palette(1),
+                palette(2),
+                palette(3),
                 Style::Tone(Tone::Muted)
             ],
-            "the palette wraps and a muted stage stays muted"
+            "each neutral stage takes the next colour and a muted stage stays muted"
         );
-        assert_eq!(stages(&[])[0], Style::Tone(Tone::Muted), "no palette");
-        let (_, commands) = drawing(&neutral, &fed, &PALETTE).unwrap();
+        let (_, commands) = drawing(&neutral, &fed, &style).unwrap();
         let ribbons: Vec<Style> = commands
             .iter()
             .zip(commands.iter().skip(1))
@@ -424,7 +418,7 @@ mod tests {
             .collect();
         assert_eq!(
             ribbons,
-            [PALETTE[1], Style::Tone(Tone::Muted), PALETTE[1]],
+            [palette(1), Style::Tone(Tone::Muted), palette(3)],
             "a ribbon takes the colour of the stage it reaches"
         );
         let plain: Vec<FlowLink> = fed
@@ -434,7 +428,7 @@ mod tests {
                 ..one.clone()
             })
             .collect();
-        let (_, commands) = drawing(&neutral, &plain, &PALETTE).unwrap();
+        let (_, commands) = drawing(&neutral, &plain, &style).unwrap();
         let plain_ribbons: Vec<Style> = commands
             .iter()
             .zip(commands.iter().skip(1))
@@ -447,8 +441,8 @@ mod tests {
             plain_ribbons, ribbons,
             "a ribbon left neutral takes its stage's colour"
         );
-        assert!(drawing(&[], &[], &PALETTE).is_none());
-        assert!(drawing(&nodes, &[link("a", "nowhere", 1.0)], &PALETTE).is_none());
+        assert!(drawing(&[], &[], &style).is_none());
+        assert!(drawing(&nodes, &[link("a", "nowhere", 1.0)], &style).is_none());
     }
 
     #[test]
@@ -473,7 +467,7 @@ mod tests {
                     && at.top + at.height <= 256.0),
                 "{placed:?}"
             );
-            let (_, commands) = drawing(&nodes, &links, &PALETTE).unwrap();
+            let (_, commands) = drawing(&nodes, &links, &style).unwrap();
             let view = crucible_view::View {
                 controls: vec![],
                 title: "T".into(),
