@@ -143,7 +143,7 @@ fn view<S: Slot>(report: &Report, app: &App, p: &Paint, layer: &mut Vec<El>) -> 
     };
     let mut drawn = col().key("report");
     if S::shown(app).play.keyed() {
-        drawn = drawn.focusable(true);
+        drawn = drawn.focusable(true).no_focus_ring();
     }
     drawn
         .w_full()
@@ -707,7 +707,8 @@ fn detail<S: Slot>(shown: &Row, p: &Paint) -> El {
     desk::surface(p)
         .key("report-detail")
         .w_full()
-        .h(260.0)
+        .grow(1.0)
+        .min_h(260.0)
         .child(
             row()
                 .w_full()
