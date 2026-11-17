@@ -293,19 +293,9 @@ example-report-view:
     RUSTFLAGS="--remap-path-prefix=$HOME=/home --remap-path-prefix={{ justfile_directory() }}=." cargo build --release --target wasm32-unknown-unknown --manifest-path examples/report/ui/report/Cargo.toml --target-dir target/view-plugins
     cp target/view-plugins/wasm32-unknown-unknown/release/report_view.wasm examples/report/ui/report.wasm
 
-# Build the report example's scatter plot as a view plugin written in Go.
-example-report-view-go:
-    cd examples/report/ui/report-go && GOOS=wasip1 GOARCH=wasm go build -buildmode=c-shared -o report-go.wasm .
-
-# Build what the self-report example's agent needs: a kit in the pack holding the view plugin
-# skill and a copy of crucible-view that builds outside this workspace, then its image.
-example-self-report-kit:
-    rm -rf examples/self-report/kit
-    mkdir -p examples/self-report/kit/crucible-view examples/self-report/kit/skill
-    cp -R crucible-view/src crucible-view/js examples/self-report/kit/crucible-view/
-    cp skills/write-a-view-plugin/*.md examples/self-report/kit/skill/
-    printf '[package]\nname = "crucible-view"\nversion = "0.0.0"\nedition = "2024"\n\n[dependencies]\nserde = { version = "1", features = ["derive"] }\nserde_json = "1"\nthiserror = "2"\n\n[[bin]]\nname = "crucible-view-check"\npath = "src/bin/check.rs"\n' > examples/self-report/kit/crucible-view/Cargo.toml
-    podman build -t localhost/crucible-view-agent -f examples/self-report/agent/Containerfile examples/self-report
+# Type-check the report-ts example's view plugin and write the JavaScript the app runs.
+example-report-ts-view:
+    npx --yes -p typescript@5.9.3 tsc --strict --noEmitOnError --target es2022 --module es2022 --lib es2022 --outDir examples/report-ts/ui crucible-view/js/crucible-view.d.ts examples/report-ts/ui/report.ts
 
 # Fetch the engine JavaScript view plugins run in: Javy's QuickJS module, checked against the
 # release's digest.
