@@ -1727,8 +1727,7 @@ impl crate::App {
             .map(|team| team.slug.clone())
     }
 
-    /// What the runs page on screen can share: the selected playbook, or the draft it launched
-    /// from.
+    /// The selected playbook or source draft, when it is in the caller's readable catalog.
     pub fn shared_here(&self) -> Option<Shared> {
         let Some(crate::Selection::Live {
             playbook,

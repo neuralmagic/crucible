@@ -2206,6 +2206,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_private_source_becomes_shareable_when_the_readable_catalog_grants_access() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let readable = Arc::new(AtomicBool::new(false));
+        let granted = Arc::clone(&readable);
+        let (url, _) =
+            crate::testserver::serve(move |request| match request.split_whitespace().nth(1) {
+                Some("/api/whoami") => r#"{"user":"wren","role":"operator"}"#.into(),
+                Some("/api/playbook-runs") => serde_json::json!([{
+                    "key": "playbook:private:1", "playbook": "private",
+                    "origin": "draft", "draft_version": 1, "status": "done",
+                    "created_by": "finch",
+                }])
+                .to_string(),
+                Some("/api/playbook-drafts") if granted.load(Ordering::SeqCst) => {
+                    r#"[{"id":"private","owner":"user:finch","actions":["read"]}]"#.into()
+                }
+                _ => "[]".into(),
+            });
+        let keys = tempfile::tempdir().unwrap();
+        let net = crate::net::Net::uncached_for_tests();
+        let (wake, _rx) = mpsc::unbounded_channel();
+        let mut fetcher = Fetcher::new(
+            net.connector(crate::testserver::target("t", &url, keys.path())),
+            wake,
+        );
+        net.handle().unwrap().block_on(async {
+            fetcher.refresh_list().await.unwrap();
+            fetcher.refresh_catalog().await;
+            assert_eq!(fetcher.view.launches()[0].id, "private");
+            assert!(fetcher.shareable.is_empty());
+
+            readable.store(true, Ordering::SeqCst);
+            fetcher.catalog_at = None;
+            assert!(fetcher.refresh_catalog().await);
+            assert_eq!(fetcher.view.launches()[0].id, "private");
+            assert_eq!(
+                fetcher.shareable,
+                vec![crux::client::Shared::Draft("private".into())]
+            );
+        });
+    }
+
     fn launch(status: &str) -> LivePlaybook {
         LivePlaybook {
             id: "demo".into(),
