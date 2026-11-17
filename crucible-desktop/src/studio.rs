@@ -89,7 +89,7 @@ pub fn draft_id(playbook: &str, user: &str) -> String {
 }
 
 impl App {
-    fn user(&self) -> Option<&str> {
+    pub(crate) fn user(&self) -> Option<&str> {
         match &*self.remote.live {
             live::LiveView::Ready { identity, .. } if !identity.user.is_empty() => {
                 Some(&identity.user)

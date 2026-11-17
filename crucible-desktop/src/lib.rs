@@ -80,7 +80,7 @@ use std::sync::OnceLock;
 use rune::{AppSpec, TextEdit, Tx, Waker};
 
 use crate::editor::Editor;
-use crate::filter::{LandedFilter, LaunchFilter, OriginFilter, OwnerFilter};
+use crate::filter::{Filters, LaunchFilter};
 use crate::link::Link;
 use crate::live::{LiveDetail, LiveDraft, LivePlaybook, LiveView, Row, Target};
 use crate::logline::{LogLine, LogView};
@@ -400,9 +400,6 @@ pub struct App {
     pub backend: Backend,
     pub packs: Vec<PackView>,
     pub playbook_search: TextEdit,
-    pub owner_filter: OwnerFilter,
-    pub origin_filter: OriginFilter,
-    pub landed_filter: LandedFilter,
     /// Whether the sidebar shows the owner, origin and landed filters.
     pub filters_open: bool,
     pub selection: Option<Selection>,
@@ -526,12 +523,26 @@ impl App {
         self.playbook_search.text.trim().to_ascii_lowercase()
     }
 
+    /// The sidebar's switches as they apply to whoever is signed in.
+    pub fn filters(&self) -> Filters {
+        self.settings.filters.for_viewer(self.user().is_some())
+    }
+
+    pub fn set_filters(&mut self, filters: Filters) {
+        self.settings.set_filters(filters);
+    }
+
     pub fn launch_filter(&self) -> LaunchFilter {
+        let Filters {
+            owner,
+            origin,
+            landed,
+        } = self.filters();
         LaunchFilter {
             query: self.query(),
-            owner: self.owner_filter,
-            origin: self.origin_filter,
-            landed: self.landed_filter,
+            owner,
+            origin,
+            landed,
         }
     }
 
@@ -1752,9 +1763,6 @@ fn init() -> App {
         backend: Backend::Controller,
         packs: Vec::new(),
         playbook_search: TextEdit::new(""),
-        owner_filter: OwnerFilter::All,
-        origin_filter: OriginFilter::All,
-        landed_filter: LandedFilter::Any,
         filters_open: false,
         selection: None,
         log_search: TextEdit::new(""),

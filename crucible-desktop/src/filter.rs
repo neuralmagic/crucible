@@ -1,10 +1,14 @@
 //! The sidebar's search and switches over live launches and drafts.
 
+use serde::{Deserialize, Serialize};
+
 use crate::live::{LiveDraft, LivePlaybook};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum OwnerFilter {
     All,
+    #[default]
     Mine,
 }
 
@@ -28,8 +32,10 @@ impl OwnerFilter {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum OriginFilter {
+    #[default]
     All,
     Schedules,
     Drafts,
@@ -59,8 +65,10 @@ impl OriginFilter {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum LandedFilter {
+    #[default]
     Any,
     Hour,
     Day,
@@ -92,6 +100,33 @@ impl LandedFilter {
             LandedFilter::Week => 604_800,
         };
         landed > 0 && now.saturating_sub(landed) <= window
+    }
+}
+
+/// The sidebar's switches, as the config file keeps them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Filters {
+    pub owner: OwnerFilter,
+    pub origin: OriginFilter,
+    pub landed: LandedFilter,
+}
+
+impl Filters {
+    pub fn is_default(&self) -> bool {
+        *self == Filters::default()
+    }
+
+    /// With no signed-in user there is no "mine", so the owner switch is off.
+    pub fn for_viewer(self, signed_in: bool) -> Filters {
+        Filters {
+            owner: if signed_in {
+                self.owner
+            } else {
+                OwnerFilter::All
+            },
+            ..self
+        }
     }
 }
 
@@ -134,7 +169,7 @@ impl LaunchFilter {
 
 #[cfg(test)]
 mod tests {
-    use crate::filter::{LandedFilter, LaunchFilter, OriginFilter, OwnerFilter};
+    use crate::filter::{Filters, LandedFilter, LaunchFilter, OriginFilter, OwnerFilter};
     use crate::live::LiveDraft;
 
     #[test]
@@ -144,6 +179,26 @@ mod tests {
         assert!(OwnerFilter::Mine.keeps("user:weaton", "weaton"));
         assert!(!OwnerFilter::Mine.keeps("lwilkins", "weaton"));
         assert!(!OwnerFilter::Mine.keeps("weaton", ""));
+    }
+
+    #[test]
+    fn the_switches_start_on_just_mine_and_the_owner_one_needs_a_signed_in_user() {
+        let start = Filters::default();
+        assert_eq!(
+            (start.owner, start.origin, start.landed),
+            (OwnerFilter::Mine, OriginFilter::All, LandedFilter::Any)
+        );
+        assert!(start.is_default());
+        assert_eq!(start.for_viewer(true), start);
+        let anonymous = start.for_viewer(false);
+        assert_eq!(anonymous.owner, OwnerFilter::All);
+        let picked = Filters {
+            owner: OwnerFilter::All,
+            origin: OriginFilter::Schedules,
+            landed: LandedFilter::Day,
+        };
+        assert!(!picked.is_default());
+        assert_eq!(picked.for_viewer(false), picked);
     }
 
     #[test]
