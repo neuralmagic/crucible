@@ -96,14 +96,23 @@ impl LiveView {
             .collect()
     }
 
-    /// Each playbook's newest launch the filter keeps: running ones first, then newest first.
+    /// One launch per playbook the filter keeps, its newest running one, else its newest:
+    /// running playbooks first, then by newest launch.
     pub fn playbooks(&self, filter: &LaunchFilter) -> Vec<&LivePlaybook> {
-        let mut seen = HashSet::new();
-        let mut rows: Vec<&LivePlaybook> = self
-            .kept(filter)
-            .into_iter()
-            .filter(|launch| seen.insert(launch.id.as_str()))
-            .collect();
+        let mut at: HashMap<&str, usize> = HashMap::new();
+        let mut rows: Vec<&LivePlaybook> = Vec::new();
+        for launch in self.kept(filter) {
+            match at.get(launch.id.as_str()).and_then(|&i| rows.get_mut(i)) {
+                Some(row) if launch.status.is_running() && !row.status.is_running() => {
+                    *row = launch;
+                }
+                Some(_) => {}
+                None => {
+                    at.insert(launch.id.as_str(), rows.len());
+                    rows.push(launch);
+                }
+            }
+        }
         rows.sort_by_key(|row| !row.status.is_running());
         rows
     }
@@ -119,8 +128,8 @@ impl LiveView {
         self.drafts().iter().find(|draft| draft.id == id)
     }
 
-    /// The sidebar's rows the filter keeps: each playbook's newest launch and each draft no
-    /// launch ran, running ones first, then newest first.
+    /// The sidebar's rows the filter keeps: [`LiveView::playbooks`] with each draft no launch
+    /// ran placed among the ones not running by its save.
     pub fn rows(&self, filter: &LaunchFilter) -> Vec<Row<'_>> {
         let (me, now) = self.viewer();
         let drafts = self
@@ -128,13 +137,16 @@ impl LiveView {
             .iter()
             .filter(|draft| filter.keeps_draft(draft, me, now))
             .map(Row::Draft);
-        let mut rows: Vec<Row> = self
-            .playbooks(filter)
-            .into_iter()
-            .map(Row::Launch)
-            .chain(drafts)
-            .collect();
-        rows.sort_by_key(|row| (!row.running(), std::cmp::Reverse(row.at())));
+        let playbooks = self.playbooks(filter);
+        let running = playbooks
+            .iter()
+            .take_while(|launch| launch.status.is_running())
+            .count();
+        let mut rows: Vec<Row> = playbooks.into_iter().map(Row::Launch).collect();
+        let mut rest = rows.split_off(running);
+        rest.extend(drafts);
+        rest.sort_by_key(|row| std::cmp::Reverse(row.at()));
+        rows.extend(rest);
         rows
     }
 
@@ -268,10 +280,6 @@ impl Row<'_> {
             Row::Launch(launch) => &launch.id,
             Row::Draft(draft) => &draft.id,
         }
-    }
-
-    fn running(&self) -> bool {
-        matches!(self, Row::Launch(launch) if launch.status.is_running())
     }
 
     fn at(&self) -> i64 {
@@ -2580,10 +2588,10 @@ mod tests {
         assert_eq!(
             keys(&view.playbooks(&everything())),
             [
+                "playbook:nightly:1",
                 "playbook:hourly:0",
                 "playbook:weekly:4",
                 "playbook:adhoc:3",
-                "playbook:nightly:2",
             ]
         );
         assert_eq!(view.playbook_count(), 4);
@@ -2613,6 +2621,24 @@ mod tests {
         );
         assert_eq!(view.draft("stale").map(|d| d.version), Some(2));
         assert_eq!(view.draft("nightly"), None);
+    }
+
+    #[test]
+    fn running_rows_keep_the_order_of_their_playbooks_ahead_of_any_draft() {
+        let view = with_drafts(
+            ready(vec![
+                firing("fanout", 2, "manual", "running"),
+                firing("fanout", 8, "manual", "done"),
+                firing("hourly", 5, "schedule", "running"),
+                firing("adhoc", 1, "manual", "done"),
+            ]),
+            vec![draft("fresh", 9)],
+        );
+        assert_eq!(
+            row_ids(&view.rows(&everything())),
+            ["fanout", "hourly", "fresh", "adhoc"],
+            "a playbook whose older launch still runs sorts by its newest launch"
+        );
     }
 
     #[test]
@@ -2693,6 +2719,29 @@ mod tests {
         let launches = [firing("ran", 1, "draft", "done")];
         assert_eq!(unlaunched(&drafts, &launches), [draft("idle", 2)]);
         assert_eq!(unlaunched(&drafts, &[]), drafts);
+    }
+
+    #[test]
+    fn a_playbook_reads_as_running_while_an_older_launch_outlives_a_newer_one() {
+        let view = ready(vec![
+            firing("fanout", 1, "manual", "cancelled"),
+            firing("fanout", 2, "manual", "running"),
+            firing("fanout", 3, "manual", "running"),
+            firing("fanout", 4, "manual", "done"),
+        ]);
+        assert_eq!(
+            keys(&view.playbooks(&everything())),
+            ["playbook:fanout:3"],
+            "the newest of the launches still running"
+        );
+        let settled = ready(vec![
+            firing("fanout", 2, "manual", "done"),
+            firing("fanout", 4, "manual", "done"),
+        ]);
+        assert_eq!(
+            keys(&settled.playbooks(&everything())),
+            ["playbook:fanout:4"]
+        );
     }
 
     #[test]

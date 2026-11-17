@@ -546,7 +546,7 @@ impl App {
         }
     }
 
-    /// The sidebar's live rows: each playbook's newest launch the filters keep.
+    /// The sidebar's live rows: one launch per playbook the filters keep, a running one first.
     pub fn visible_playbooks(&self) -> Vec<&LivePlaybook> {
         self.remote.live.playbooks(&self.launch_filter())
     }
