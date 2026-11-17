@@ -215,10 +215,11 @@ $ crux providers                                 # id, kind, model, harness, pri
 `PRICE` is USD per million tokens as `input/output/cache read/cache write`. A dash means the
 engine prices the run from the vendor's list, which charges nothing for a model no vendor sells.
 
-### `secrets` / `secret-bind`
+### `secrets` / `secret-rotate` / `secret-bind`
 
 ```
 $ crux secrets                                   # id, name, kind, visibility, mode, owner — never a value
+$ crux secret-rotate 01a0 < new-value.txt        # the next version, read from stdin; prints the version
 $ crux secret-bind 01a0 --playbook calibrate --env GH_TOKEN --declared-name pr-token
 ```
 

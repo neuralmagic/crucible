@@ -96,6 +96,9 @@ Commands:
   secret-create         Register a secret. The value is read from piped stdin, never from an
                         argument or a terminal: `pbpaste | crux secret-create NAME --kind opaque`.
                         Prints metadata, never the value
+  secret-rotate         Write a managed secret's next version. The value is read from piped stdin,
+                        never from an argument or a terminal: `crux secret-rotate ID < FILE`. Prints
+                        metadata, never the value
   secret-bind           Bind a secret to a draft, playbook, repo, or domain, so a run at that scope
                         receives it. One scope flag and one projection flag
   draft-preview         What a draft version compiled to: its schema digest and diagnostics, without
@@ -247,6 +250,9 @@ Commands:
   secret-create         Register a secret. The value is read from piped stdin, never from an
                         argument or a terminal: `pbpaste | crux secret-create NAME --kind opaque`.
                         Prints metadata, never the value
+  secret-rotate         Write a managed secret's next version. The value is read from piped stdin,
+                        never from an argument or a terminal: `crux secret-rotate ID < FILE`. Prints
+                        metadata, never the value
   secret-bind           Bind a secret to a draft, playbook, repo, or domain, so a run at that scope
                         receives it. One scope flag and one projection flag
   draft-preview         What a draft version compiled to: its schema digest and diagnostics, without
@@ -3750,6 +3756,61 @@ Options:
                                  yourself
       --json                     
   -h, --help                     Print help
+==== crux secret-rotate --help ====
+Write a managed secret's next version. The value is read from piped stdin, never from an argument or
+a terminal: `crux secret-rotate ID < FILE`. Prints metadata, never the value
+
+Usage: crux secret-rotate [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+          The secret's id, as `secrets` lists it
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else
+          `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var
+          wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine,
+          `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the
+          controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux secret-rotate -h ====
+Write a managed secret's next version. The value is read from piped stdin, never from an argument or
+a terminal: `crux secret-rotate ID < FILE`. Prints metadata, never the value
+
+Usage: crux secret-rotate [OPTIONS] <ID>
+
+Arguments:
+  <ID>  The secret's id, as `secrets` lists it
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux`
+                               (else `~/.config/crux`), which may be absent; a path given here must
+                               exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this
+                               machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person
+                               who minted it, or the controller's static token, which authenticates
+                               as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
 ==== crux secret-bind --help ====
 Bind a secret to a draft, playbook, repo, or domain, so a run at that scope receives it. One scope
 flag and one projection flag
@@ -4711,6 +4772,9 @@ Commands:
   secret-create         Register a secret. The value is read from piped stdin, never from an
                         argument or a terminal: `pbpaste | crux secret-create NAME --kind opaque`.
                         Prints metadata, never the value
+  secret-rotate         Write a managed secret's next version. The value is read from piped stdin,
+                        never from an argument or a terminal: `crux secret-rotate ID < FILE`. Prints
+                        metadata, never the value
   secret-bind           Bind a secret to a draft, playbook, repo, or domain, so a run at that scope
                         receives it. One scope flag and one projection flag
   draft-preview         What a draft version compiled to: its schema digest and diagnostics, without
@@ -4836,6 +4900,9 @@ Commands:
   secret-create         Register a secret. The value is read from piped stdin, never from an
                         argument or a terminal: `pbpaste | crux secret-create NAME --kind opaque`.
                         Prints metadata, never the value
+  secret-rotate         Write a managed secret's next version. The value is read from piped stdin,
+                        never from an argument or a terminal: `crux secret-rotate ID < FILE`. Prints
+                        metadata, never the value
   secret-bind           Bind a secret to a draft, playbook, repo, or domain, so a run at that scope
                         receives it. One scope flag and one projection flag
   draft-preview         What a draft version compiled to: its schema digest and diagnostics, without
