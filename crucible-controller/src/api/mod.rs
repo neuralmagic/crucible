@@ -126,6 +126,8 @@ pub(crate) mod tests;
         crate::launches::api::schedules::get_schedule,
         crate::launches::api::schedules::update_schedule,
         crate::launches::api::schedules::delete_schedule,
+        crate::launches::api::schedules::fire_schedule,
+        crate::launches::api::schedules::test_fire_schedule,
         crate::launches::api::schedules::preview_schedule,
         crate::launches::api::watches::create_watch,
         crate::launches::api::watches::list_watches,
@@ -342,6 +344,9 @@ pub(crate) mod tests;
         crate::launches::api::schedules::ScheduleBody,
         crate::launches::api::schedules::SchedulePreviewBody,
         crate::launches::api::schedules::SchedulePreviewDto,
+        crate::launches::api::schedules::TestFireBody,
+        crate::launches::api::schedules::TestFireAck,
+        crate::launches::model::TestCursor,
         crate::launches::api::watches::WatchDto,
         crate::launches::api::watches::WatchBody,
         crate::launches::api::watches::WatchHitDto,
@@ -608,6 +613,8 @@ pub fn router(state: ApiState) -> Router {
             crate::launches::api::schedules::update_schedule,
             crate::launches::api::schedules::delete_schedule
         ))
+        .routes(routes!(crate::launches::api::schedules::fire_schedule))
+        .routes(routes!(crate::launches::api::schedules::test_fire_schedule))
         .routes(routes!(
             crate::launches::api::watches::create_watch,
             crate::launches::api::watches::list_watches

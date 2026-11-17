@@ -17,6 +17,10 @@ Commands:
   runs                  The runs leaderboard
   run                   One run with its candidates, as JSON
   schedules             Recurrences: what fires when, and whether each is enabled
+  schedule-fire         Fire a schedule now instead of at its next window. Its run advances the
+                        cursor
+  schedule-test-fire    Launch a schedule once without moving it or its cursor. Costs money against
+                        its max_cost
   watches               Tracker watches: what each sweeps, and whether each is enabled
   watch                 One tracker watch, as JSON
   webhooks              Webhooks: what each launches, how it verifies, and when it last took a
@@ -164,6 +168,10 @@ Commands:
   runs                  The runs leaderboard
   run                   One run with its candidates, as JSON
   schedules             Recurrences: what fires when, and whether each is enabled
+  schedule-fire         Fire a schedule now instead of at its next window. Its run advances the
+                        cursor
+  schedule-test-fire    Launch a schedule once without moving it or its cursor. Costs money against
+                        its max_cost
   watches               Tracker watches: what each sweeps, and whether each is enabled
   watch                 One tracker watch, as JSON
   webhooks              Webhooks: what each launches, how it verifies, and when it last took a
@@ -831,6 +839,120 @@ Options:
       --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person
                                who minted it, or the controller's static token, which authenticates
                                as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux schedule-fire --help ====
+Fire a schedule now instead of at its next window. Its run advances the cursor
+
+Usage: crux schedule-fire [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+          The schedule's id, as `schedules` lists it
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else
+          `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var
+          wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine,
+          `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the
+          controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux schedule-fire -h ====
+Fire a schedule now instead of at its next window. Its run advances the cursor
+
+Usage: crux schedule-fire [OPTIONS] <ID>
+
+Arguments:
+  <ID>  The schedule's id, as `schedules` lists it
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux`
+                               (else `~/.config/crux`), which may be absent; a path given here must
+                               exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this
+                               machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person
+                               who minted it, or the controller's static token, which authenticates
+                               as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux schedule-test-fire --help ====
+Launch a schedule once without moving it or its cursor. Costs money against its max_cost
+
+Usage: crux schedule-test-fire [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+          The schedule's id, as `schedules` lists it
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else
+          `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var
+          wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --cursor <CURSOR>
+          Give the firing this cursor value in place of the stored one
+
+      --no-cursor
+          Give the firing no cursor, as on the schedule's first firing
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine,
+          `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the
+          controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+      --json
+          
+
+  -h, --help
+          Print help
+==== crux schedule-test-fire -h ====
+Launch a schedule once without moving it or its cursor. Costs money against its max_cost
+
+Usage: crux schedule-test-fire [OPTIONS] <ID>
+
+Arguments:
+  <ID>  The schedule's id, as `schedules` lists it
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux`
+                               (else `~/.config/crux`), which may be absent; a path given here must
+                               exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --cursor <CURSOR>        Give the firing this cursor value in place of the stored one
+      --no-cursor              Give the firing no cursor, as on the schedule's first firing
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this
+                               machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person
+                               who minted it, or the controller's static token, which authenticates
+                               as nobody [env: CONTROLLER_API_TOKEN]
+      --json                   
   -h, --help                   Print help
 ==== crux watches --help ====
 Tracker watches: what each sweeps, and whether each is enabled
@@ -2536,7 +2658,7 @@ Options:
           [env: CONTROLLER_CONFIG=]
 
       --cursor <CURSOR>
-          Line to resume from, as the previous window's `cursor=` line reported it
+          Byte offset to resume from, as the previous window's `cursor=` line reported it
           
           [default: 0]
 
@@ -2580,8 +2702,8 @@ Options:
       --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux`
                                (else `~/.config/crux`), which may be absent; a path given here must
                                exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
-      --cursor <CURSOR>        Line to resume from, as the previous window's `cursor=` line reported
-                               it [default: 0]
+      --cursor <CURSOR>        Byte offset to resume from, as the previous window's `cursor=` line
+                               reported it [default: 0]
       --limit <LIMIT>          Lines in this window. Capped at 200, which is also the default
       --url <URL>              Controller base URL: the API route. Defaults to a controller on this
                                machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
@@ -4510,6 +4632,10 @@ Commands:
   runs                  The runs leaderboard
   run                   One run with its candidates, as JSON
   schedules             Recurrences: what fires when, and whether each is enabled
+  schedule-fire         Fire a schedule now instead of at its next window. Its run advances the
+                        cursor
+  schedule-test-fire    Launch a schedule once without moving it or its cursor. Costs money against
+                        its max_cost
   watches               Tracker watches: what each sweeps, and whether each is enabled
   watch                 One tracker watch, as JSON
   webhooks              Webhooks: what each launches, how it verifies, and when it last took a
@@ -4631,6 +4757,10 @@ Commands:
   runs                  The runs leaderboard
   run                   One run with its candidates, as JSON
   schedules             Recurrences: what fires when, and whether each is enabled
+  schedule-fire         Fire a schedule now instead of at its next window. Its run advances the
+                        cursor
+  schedule-test-fire    Launch a schedule once without moving it or its cursor. Costs money against
+                        its max_cost
   watches               Tracker watches: what each sweeps, and whether each is enabled
   watch                 One tracker watch, as JSON
   webhooks              Webhooks: what each launches, how it verifies, and when it last took a

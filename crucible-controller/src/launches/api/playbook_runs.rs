@@ -303,6 +303,50 @@ pub(crate) async fn get_playbook_run(
     .into_response())
 }
 
+/// How `update` on a playbook launch was decided.
+pub(crate) enum LaunchUpdate {
+    /// No launch is under the key.
+    NoLaunch,
+    Allowed,
+    Refused(crate::authz::owner::Refused),
+}
+
+/// Decide `update` on playbook launch `key` against the launch's owner. Every route that stops a
+/// launch decides here.
+pub(crate) async fn decide_launch_update(
+    state: &ApiState,
+    caller: &crate::authz::Caller,
+    key: &str,
+) -> ApiResult<LaunchUpdate> {
+    let owner: Option<Option<String>> =
+        sqlx::query_scalar("SELECT owner FROM playbook_launches WHERE key = $1")
+            .bind(key)
+            .fetch_optional(state.db.pool())
+            .await
+            .map_err(anyhow::Error::from)?;
+    let Some(owner) = owner else {
+        return Ok(LaunchUpdate::NoLaunch);
+    };
+    let launch = crate::authz::decision::Resource::new(
+        crate::authz::action::ResourceType::Run,
+        key,
+        crate::authz::model::Principal::stored(owner.as_deref()),
+    );
+    Ok(
+        match crate::authz::owner::decide_on(
+            state,
+            caller,
+            &launch,
+            crate::authz::action::Verb::Update,
+        )
+        .await
+        {
+            Ok(_) => LaunchUpdate::Allowed,
+            Err(refusal) => LaunchUpdate::Refused(refusal),
+        },
+    )
+}
+
 /// What a cancel queued: the launch, who asked, and the reason it is parked under.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CancelAck {
@@ -332,37 +376,25 @@ pub(crate) async fn cancel_playbook_run(
     identity: crate::identity::session::Identity,
     caller: crate::authz::Caller,
 ) -> ApiResult<Response> {
-    let owner: Option<Option<String>> =
-        sqlx::query_scalar("SELECT owner FROM playbook_launches WHERE key = $1")
-            .bind(&key)
-            .fetch_optional(state.db.pool())
-            .await
-            .map_err(anyhow::Error::from)?;
-    let Some(owner) = owner else {
-        return Ok(not_found(format!("no playbook launch {key:?}")));
-    };
-    let launch = crate::authz::decision::Resource::new(
-        crate::authz::action::ResourceType::Run,
-        &key,
-        crate::authz::model::Principal::stored(owner.as_deref()),
-    );
-    if let Err(refusal) =
-        crate::authz::owner::decide_on(&state, &caller, &launch, crate::authz::action::Verb::Update)
-            .await
-    {
-        return Ok(refusal.into_response());
+    match decide_launch_update(&state, &caller, &key).await? {
+        LaunchUpdate::NoLaunch => return Ok(not_found(format!("no playbook launch {key:?}"))),
+        LaunchUpdate::Refused(refusal) => return Ok(refusal.into_response()),
+        LaunchUpdate::Allowed => {}
     }
     let reason = format!(
         "cancelled by {}",
         identity.0.as_deref().unwrap_or("an operator")
     );
-    state.sink.submit(crate::daemon::queue::Override {
-        key: crate::daemon::queue::IssueKey(key.clone()),
-        kind: crate::daemon::queue::OverrideKind::Cancel,
-        reason: Some(reason.clone()),
-        priority: None,
-        actor: identity.0.clone(),
-    });
+    state
+        .sink
+        .submit(crate::daemon::queue::Override {
+            key: crate::daemon::queue::IssueKey(key.clone()),
+            kind: crate::daemon::queue::OverrideKind::Cancel,
+            reason: Some(reason.clone()),
+            priority: None,
+            actor: identity.0.clone(),
+        })
+        .await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(CancelAck {

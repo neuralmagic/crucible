@@ -49,8 +49,11 @@ fn sample_issue(key: &str) -> NewIssue {
 }
 
 /// A sink the test can read back: POSTs enqueue overrides without ever touching the DB.
-fn test_sink() -> QueueOverrideSink {
-    QueueOverrideSink::new(Arc::new(OverrideStore::new()), WorkQueue::new())
+fn test_sink(db: &Db) -> QueueOverrideSink {
+    QueueOverrideSink::new(
+        Arc::new(OverrideStore::new(db.pool().clone())),
+        WorkQueue::new(),
+    )
 }
 
 fn app(db: Db) -> Router {
@@ -198,7 +201,7 @@ async fn spawn_mock_jira(
 }
 
 fn app_with_roles(db: Db, admins: Vec<String>, operators: Vec<String>) -> Router {
-    app_with_sink(db, test_sink(), admins, operators)
+    app_with_sink(db.clone(), test_sink(&db), admins, operators)
 }
 
 fn app_with_sink(
@@ -1956,10 +1959,10 @@ async fn events_stream_emits_a_transition_as_sse_json(pool: PgPool) -> Result<()
 
 #[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn park_json_enqueues_override_without_touching_the_db(pool: PgPool) -> Result<()> {
+async fn park_json_enqueues_override_without_parking_the_issue(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#1")).await?;
-    let sink = test_sink();
+    let sink = test_sink(&db);
     let app = app_with_sink(
         db.clone(),
         sink.clone(),
@@ -1982,14 +1985,14 @@ async fn park_json_enqueues_override_without_touching_the_db(pool: PgPool) -> Re
     assert_eq!(v["reason"], "no repro");
 
     {
-        let calls = sink.pending();
+        let calls = sink.pending().await?;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].key.0, "owner/repo#1");
         assert_eq!(calls[0].kind, OverrideKind::Park);
         assert_eq!(calls[0].reason.as_deref(), Some("no repro"));
     }
 
-    // The POST must never write the DB: the issue is still `new`, not `parked`.
+    // The POST must not park the issue itself: it is still `new`, not `parked`.
     let issue = crate::issues::store::get_issue(db.pool(), "owner/repo#1")
         .await?
         .expect("issue");
@@ -2002,7 +2005,7 @@ async fn park_json_enqueues_override_without_touching_the_db(pool: PgPool) -> Re
 async fn park_carries_the_proxy_identity_as_the_actor(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#1")).await?;
-    let sink = test_sink();
+    let sink = test_sink(&db);
     let app = app_with_sink(db, sink.clone(), vec![], vec!["wren".to_string()]);
 
     let res = app
@@ -2018,7 +2021,7 @@ async fn park_carries_the_proxy_identity_as_the_actor(pool: PgPool) -> Result<()
     let v: serde_json::Value = serde_json::from_slice(&body)?;
     assert_eq!(v["actor"], "wren", "ack echoes the actor");
 
-    let calls = sink.pending();
+    let calls = sink.pending().await?;
     assert_eq!(calls[0].actor.as_deref(), Some("wren"));
     Ok(())
 }
@@ -2028,7 +2031,7 @@ async fn park_carries_the_proxy_identity_as_the_actor(pool: PgPool) -> Result<()
 async fn park_form_redirects_and_enqueues(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#1")).await?;
-    let sink = test_sink();
+    let sink = test_sink(&db);
     let app = app_with_sink(
         db.clone(),
         sink.clone(),
@@ -2048,7 +2051,7 @@ async fn park_form_redirects_and_enqueues(pool: PgPool) -> Result<()> {
     assert_eq!(res.headers().get(header::LOCATION).unwrap(), "/inbox");
 
     {
-        let calls = sink.pending();
+        let calls = sink.pending().await?;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].reason.as_deref(), Some("no repro"));
     }
@@ -2064,7 +2067,7 @@ async fn park_form_redirects_and_enqueues(pool: PgPool) -> Result<()> {
 async fn unpark_and_bump_enqueue_without_a_body(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#1")).await?;
-    let sink = test_sink();
+    let sink = test_sink(&db);
     let app = app_with_sink(db, sink.clone(), vec![], vec!["operator".to_string()]);
 
     let res = app
@@ -2077,7 +2080,7 @@ async fn unpark_and_bump_enqueue_without_a_body(pool: PgPool) -> Result<()> {
         )
         .await?;
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
-    let pending = sink.pending();
+    let pending = sink.pending().await?;
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].kind, OverrideKind::Unpark);
 
@@ -2091,7 +2094,7 @@ async fn unpark_and_bump_enqueue_without_a_body(pool: PgPool) -> Result<()> {
         .await?;
     assert_eq!(res.status(), StatusCode::ACCEPTED);
 
-    let pending = sink.pending();
+    let pending = sink.pending().await?;
     assert_eq!(
         pending.len(),
         1,
@@ -3135,7 +3138,7 @@ async fn pause_resume_unwatch_require_admin_and_transition_correctly(pool: PgPoo
 async fn scope_now_post_enqueues_override_with_justification(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#1")).await?;
-    let sink = test_sink();
+    let sink = test_sink(&db);
     let app = router(ApiState {
         roles: crate::identity::auth::Roles::new(vec!["wren".to_string()], vec![], vec![]),
         sink: sink.clone(),
@@ -3171,7 +3174,7 @@ async fn scope_now_post_enqueues_override_with_justification(pool: PgPool) -> Re
     assert_eq!(v["reason"], "customer escalation");
     assert_eq!(v["actor"], "wren");
 
-    let calls = sink.pending();
+    let calls = sink.pending().await?;
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].key.0, "owner/repo#1");
     assert!(
@@ -3191,7 +3194,7 @@ async fn scope_now_post_enqueues_override_with_justification(pool: PgPool) -> Re
 async fn redispatch_post_enqueues_override_and_is_admin_gated(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#1")).await?;
-    let sink = test_sink();
+    let sink = test_sink(&db);
     let app = router(ApiState {
         roles: crate::identity::auth::Roles::new(vec!["wren".to_string()], vec![], vec![]),
         sink: sink.clone(),
@@ -3228,7 +3231,7 @@ async fn redispatch_post_enqueues_override_and_is_admin_gated(pool: PgPool) -> R
     assert_eq!(v["actor"], "wren");
 
     // The POST only enqueued an intent — it never wrote the DB (reconcile is the only writer).
-    let calls = sink.pending();
+    let calls = sink.pending().await?;
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].key.0, "owner/repo#1");
     assert!(
@@ -3502,6 +3505,8 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/schedules",
         "/api/schedules/preview",
         "/api/schedules/{id}",
+        "/api/schedules/{id}/fire",
+        "/api/schedules/{id}/test-fire",
         "/api/watches",
         "/api/watches/trackers",
         "/api/watches/preview",
@@ -7777,7 +7782,7 @@ async fn a_launch_is_cancelled_by_its_owner_or_an_administrator_and_no_one_else(
     pool: PgPool,
 ) -> Result<()> {
     let (db, dir) = db_with(pool);
-    let sink = test_sink();
+    let sink = test_sink(&db);
     let app = app_with_sink(
         db.clone(),
         sink.clone(),
@@ -7807,7 +7812,7 @@ async fn a_launch_is_cancelled_by_its_owner_or_an_administrator_and_no_one_else(
         StatusCode::NOT_FOUND,
         "a stranger may not cancel, nor learn the launch is there"
     );
-    assert!(sink.pending().is_empty());
+    assert!(sink.pending().await?.is_empty());
 
     let (status, body) = send(&app, "POST", &cancel, "alice", None).await;
     assert_eq!(
@@ -7818,7 +7823,7 @@ async fn a_launch_is_cancelled_by_its_owner_or_an_administrator_and_no_one_else(
     );
     let v: serde_json::Value = serde_json::from_slice(&body)?;
     assert_eq!(v["reason"], "cancelled by alice");
-    let calls = sink.pending();
+    let calls = sink.pending().await?;
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].key.0, key);
     assert_eq!(calls[0].kind, crate::daemon::queue::OverrideKind::Cancel);
@@ -7826,7 +7831,7 @@ async fn a_launch_is_cancelled_by_its_owner_or_an_administrator_and_no_one_else(
 
     let (status, _) = send(&app, "POST", &cancel, "wren", None).await;
     assert_eq!(status, StatusCode::ACCEPTED, "an administrator may");
-    assert_eq!(sink.pending()[0].actor.as_deref(), Some("wren"));
+    assert_eq!(sink.pending().await?[0].actor.as_deref(), Some("wren"));
 
     let issue = crate::issues::store::get_issue(db.pool(), &key)
         .await?
@@ -7846,6 +7851,93 @@ async fn a_launch_is_cancelled_by_its_owner_or_an_administrator_and_no_one_else(
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+/// Parking a playbook launch admits whoever may cancel it, and a platform operator as for any
+/// issue. Anyone else does not learn the launch is there, and an issue that is not a launch
+/// stays operator-only.
+#[cfg(feature = "autoresearch")]
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_launch_is_parked_by_its_owner_or_an_operator_and_no_one_else(
+    pool: PgPool,
+) -> Result<()> {
+    let (db, dir) = db_with(pool);
+    let sink = test_sink(&db);
+    let app = app_with_sink(
+        db.clone(),
+        sink.clone(),
+        vec!["wren".to_string()],
+        vec!["olive".to_string()],
+    );
+    register_survey(&app, dir.path(), LAUNCH_WORKFLOW).await;
+    let (status, ack) = post_launch(
+        &app,
+        "survey",
+        serde_json::json!({"params": {"topic": "t", "depth": "deep"}, "max_cost": 1.0, "max_time": "30m"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{ack}");
+    let key = ack["key"].as_str().expect("key").to_string();
+    sqlx::query(
+        "UPDATE playbook_launches SET created_by = 'alice', owner = 'user:alice' WHERE key = $1",
+    )
+    .bind(&key)
+    .execute(db.pool())
+    .await?;
+    let park = format!("/api/issues/{}/park", urlencoding_encode(&key));
+    let reason = || Some(serde_json::json!({"reason": "stop"}));
+
+    let (status, _) = send(&app, "POST", &park, "mallory", reason()).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a stranger may not park, nor learn the launch is there"
+    );
+    assert!(sink.pending().await?.is_empty());
+
+    let (status, body) = send(&app, "POST", &park, "alice", reason()).await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "the launcher may: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let calls = sink.pending().await?;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].key.0, key);
+    assert_eq!(calls[0].kind, OverrideKind::Park);
+    assert_eq!(calls[0].actor.as_deref(), Some("alice"));
+
+    for (user, role) in [("olive", "an operator"), ("wren", "an administrator")] {
+        let (status, _) = send(&app, "POST", &park, user, reason()).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{role} may");
+        assert_eq!(sink.pending().await?[0].actor.as_deref(), Some(user));
+    }
+    let denials: Vec<String> =
+        sqlx::query_scalar("SELECT actor FROM authz_audit WHERE decision = 'deny' ORDER BY id")
+            .fetch_all(db.pool())
+            .await?;
+    assert_eq!(
+        denials,
+        ["user:mallory"],
+        "an operator's park of another's launch is not recorded as a denial"
+    );
+
+    crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#1")).await?;
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/api/issues/owner%2Frepo%231/park",
+        "alice",
+        reason(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "an issue that is not a launch stays operator-only"
+    );
     Ok(())
 }
 
@@ -8702,6 +8794,165 @@ async fn a_schedule_round_trips_through_its_crud_surface(pool: PgPool) -> Result
     Ok(())
 }
 
+/// Firing a schedule now makes it due at once, and the sweep launches it as the schedule's own
+/// firing. A disabled schedule and an id naming nothing are refused.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn firing_a_schedule_now_makes_it_due_for_the_sweep(pool: PgPool) -> Result<()> {
+    let (db, dir) = db_with(pool.clone());
+    let app = app_with_admins(db.clone(), vec!["wren".to_string()]);
+    register_survey(&app, dir.path(), LAUNCH_WORKFLOW).await;
+    let (status, created) = send_json(
+        &app,
+        HttpRequest::post("/api/schedules"),
+        schedule_body("0 0 1 1 *", "UTC"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().expect("id").to_string();
+    let window = created["next_due_at"].as_str().expect("due").to_string();
+    let fire = format!("/api/schedules/{id}/fire");
+
+    assert!(
+        crate::launches::schedules::fire_due(&db, jiff::Timestamp::now(), 8, 5)
+            .await?
+            .is_empty(),
+        "its window is months out"
+    );
+    let (status, fired) = send_json(&app, HttpRequest::post(&fire), serde_json::Value::Null).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{fired}");
+    let due: jiff::Timestamp = fired["next_due_at"].as_str().expect("due").parse()?;
+    assert!(due <= jiff::Timestamp::now(), "{due} is due");
+    let events: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT from_status, to_status, actor FROM events WHERE key = $1 ORDER BY id",
+    )
+    .bind(format!("schedule:{id}"))
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        events.last(),
+        Some(&(
+            "waiting".to_string(),
+            "due".to_string(),
+            Some("wren".to_string())
+        ))
+    );
+
+    let launched = crate::launches::schedules::fire_due(&db, jiff::Timestamp::now(), 8, 5).await?;
+    assert_eq!(launched.len(), 1, "{launched:?}");
+    let (status, rows) = get_json_value(&app, "/api/playbook-runs").await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert_eq!(rows[0]["key"], launched[0].as_str());
+    assert_eq!(rows[0]["origin"], "schedule");
+    assert_eq!(rows[0]["schedule"], id.as_str());
+    assert_eq!(rows[0]["advance_dedupe"], true);
+    let (_, after) = get_json_value(&app, &format!("/api/schedules/{id}")).await;
+    assert_eq!(
+        after["next_due_at"],
+        window.as_str(),
+        "the window it was waiting on still stands"
+    );
+
+    let (status, refused) =
+        send_json(&app, HttpRequest::post(&fire), serde_json::Value::Null).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .expect("error")
+            .contains(launched[0].as_str()),
+        "the refusal names the launch in flight: {refused}"
+    );
+    let (_, held) = get_json_value(&app, &format!("/api/schedules/{id}")).await;
+    assert_eq!(held["next_due_at"], window.as_str());
+
+    let mut off = schedule_body("0 0 1 1 *", "UTC");
+    off["enabled"] = serde_json::Value::Bool(false);
+    let (status, _) = send_json(&app, HttpRequest::put(format!("/api/schedules/{id}")), off).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, refused) =
+        send_json(&app, HttpRequest::post(&fire), serde_json::Value::Null).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    let (_, still) = get_json_value(&app, &format!("/api/schedules/{id}")).await;
+    assert_eq!(still["next_due_at"], serde_json::Value::Null);
+
+    let (status, _) = send_json(
+        &app,
+        HttpRequest::post("/api/schedules/no-such-schedule/fire"),
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+/// A test firing launches the schedule's own authorization at once, listed as its firing and
+/// marked as one that cannot advance, and the schedule reads back exactly as it did. A cursor the
+/// schedule has no place for is a field refusal; an id naming nothing is a 404.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn test_firing_a_schedule_launches_without_moving_it(pool: PgPool) -> Result<()> {
+    let (db, dir) = db_with(pool.clone());
+    let app = app_with_admins(db.clone(), vec!["wren".to_string()]);
+    register_survey(&app, dir.path(), LAUNCH_WORKFLOW).await;
+    let mut body = schedule_body("0 0 1 1 *", "UTC");
+    body["enabled"] = serde_json::Value::Bool(false);
+    let (status, created) = send_json(&app, HttpRequest::post("/api/schedules"), body).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().expect("id").to_string();
+    let test_fire = format!("/api/schedules/{id}/test-fire");
+
+    let (status, ack) = send_json(&app, HttpRequest::post(&test_fire), serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{ack}");
+    assert_eq!(ack["schedule"], id.as_str());
+    assert_eq!(ack["cursor"], serde_json::json!({"from": "stored"}));
+    let key = ack["key"].as_str().expect("key");
+
+    let (status, rows) = get_json_value(&app, "/api/playbook-runs").await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert_eq!(rows[0]["key"], key);
+    assert_eq!(rows[0]["origin"], "schedule");
+    assert_eq!(rows[0]["schedule"], id.as_str());
+    assert_eq!(rows[0]["advance_dedupe"], false);
+    assert_eq!(rows[0]["params"]["topic"], "attention sinks");
+    let given: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT test_cursor FROM playbook_launches WHERE key = $1")
+            .bind(key)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(given, Some(serde_json::json!({"from": "stored"})));
+    let actor: Option<String> =
+        sqlx::query_scalar("SELECT actor FROM events WHERE key = $1 ORDER BY id LIMIT 1")
+            .bind(key)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(actor.as_deref(), Some("wren"));
+
+    let (_, after) = get_json_value(&app, &format!("/api/schedules/{id}")).await;
+    assert_eq!(after, created, "the schedule is exactly as it was saved");
+
+    for cursor in [
+        serde_json::json!({"from": "value", "value": "2026-01-01T00:00:00Z"}),
+        serde_json::json!({"from": "none"}),
+    ] {
+        let (status, refused) = send_json(
+            &app,
+            HttpRequest::post(&test_fire),
+            serde_json::json!({"cursor": cursor}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+        assert_eq!(refused["fields"][0]["field"], "cursor");
+    }
+
+    let (status, _) = send_json(
+        &app,
+        HttpRequest::post("/api/schedules/no-such-schedule/test-fire"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    Ok(())
+}
+
 /// A schedule is validated exactly like an immediate launch, plus its recurrence: bad values, bad
 /// ceilings, a bad expression, and an unknown zone all come back addressed to their form field.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
@@ -9052,6 +9303,50 @@ fn draft_files() -> serde_json::Value {
         "crucible.toml": "[repo]\npath = \".\"\n\n[agent]\n\n[workflow]\ntype = \"playbook\"\nfile = \"workflow.star\"\n",
         "workflow.star": "params = {}\nhello = command(name = \"hello\", run = \"echo hello\")\nworkflow(type = \"playbook\", tasks = [hello], result = hello)\n",
     })
+}
+
+/// Deleting a draft is decided against its owner, not the caller's platform role: a viewer
+/// deletes their own draft, and another viewer's draft does not exist for them.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_viewer_deletes_their_own_draft_and_no_one_elses(pool: PgPool) -> Result<()> {
+    let (db, _dir) = db_with(pool);
+    let app = app_with_roles(db, vec!["wren".to_string()], vec![]);
+    for (user, id) in [("alice", "alices"), ("bob", "bobs")] {
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/playbook-drafts",
+            user,
+            Some(serde_json::json!({"id": id, "description": "a drafted pack"})),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    let (status, _) = send(&app, "DELETE", "/api/playbook-drafts/bobs", "alice", None).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a viewer may not delete another's draft, nor learn it is there"
+    );
+    let (status, _) = send(&app, "GET", "/api/playbook-drafts/bobs", "bob", None).await;
+    assert_eq!(status, StatusCode::OK, "the refused delete dropped nothing");
+
+    let (status, body) = send(&app, "DELETE", "/api/playbook-drafts/alices", "alice", None).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "a viewer deletes their own draft: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let (status, _) = send(&app, "GET", "/api/playbook-drafts/alices", "alice", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    Ok(())
 }
 
 /// A draft is not a registered pack: it lists on its own rail, with its version history, and never
@@ -11751,6 +12046,7 @@ async fn run_log_serves_local_output_and_points_a_pod_run_at_its_pod(pool: PgPoo
             .contains("admitted 3 tasks")
     );
     assert!(!log["truncated"].as_bool().expect("truncated"));
+    assert_eq!(log["source"], "local");
 
     // No cluster to reach and nothing ingested yet: the pod run says where its output lives, and
     // names the cluster as well as the namespace so the hint is runnable.
@@ -11758,6 +12054,7 @@ async fn run_log_serves_local_output_and_points_a_pod_run_at_its_pod(pool: PgPoo
     assert_eq!(status, StatusCode::OK, "{pod}");
     assert_eq!(pod["dispatch"], "pod");
     assert_eq!(pod["text"], serde_json::Value::Null);
+    assert_eq!(pod["source"], serde_json::Value::Null);
     assert_eq!(
         pod["location"],
         "pod loop-abc in namespace autoresearch on cluster hub"
@@ -11780,6 +12077,7 @@ async fn run_log_serves_local_output_and_points_a_pod_run_at_its_pod(pool: PgPoo
         "{stored}"
     );
     assert_eq!(stored["location"], serde_json::Value::Null);
+    assert_eq!(stored["source"], "session");
 
     // The engine log kept at completion is the pod's own output and wins over the session.
     crate::runs::blob_store::put_run_engine_log(
@@ -11793,6 +12091,7 @@ async fn run_log_serves_local_output_and_points_a_pod_run_at_its_pod(pool: PgPoo
     let text = engine["text"].as_str().expect("text");
     assert!(text.contains("gateway_boot: driver=kubernetes"), "{engine}");
     assert!(!text.contains("task roundup: pass"), "{engine}");
+    assert_eq!(engine["source"], "stored");
 
     // A log longer than one response serves its tail by default, and reads back from its first
     // line by following `next` from 0.
@@ -11817,6 +12116,18 @@ async fn run_log_serves_local_output_and_points_a_pod_run_at_its_pod(pool: PgPoo
         from = page["next"].as_u64();
     }
     assert_eq!(read, long);
+
+    let line = long.lines().next().expect("a line").len() + 1;
+    let (_, few) = get_json_value(&app, "/api/runs/run-pod/log?from=0&lines=2").await;
+    assert_eq!(few["text"].as_str().expect("text").lines().count(), 2);
+    assert_eq!(few["next"], 2 * line);
+    let (_, small) = get_json_value(&app, "/api/runs/run-pod/log?from=0&bytes=600").await;
+    assert_eq!(small["next"], line, "one line fits in 600 bytes");
+    let (_, caught_up) =
+        get_json_value(&app, &format!("/api/runs/run-pod/log?from={}", long.len())).await;
+    assert_eq!(caught_up["text"], "");
+    assert_eq!(caught_up["next"], serde_json::Value::Null);
+    assert_eq!(caught_up["total_bytes"], long.len());
 
     let (status, unknown) = get_json_value(&app, "/api/runs/nobody/log").await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{unknown}");

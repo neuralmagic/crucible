@@ -1182,11 +1182,30 @@ pub async fn collect_run_pod(
     if let Some(ns) = ns.as_deref() {
         let _ = dispatcher.delete(&row.cluster, ns, pod_name).await;
     }
+    if let Some(ns) = ns.as_deref() {
+        teardown_run_gateway(dispatcher, &row.cluster, profile, pod_name, ns).await;
+    }
+    Ok(())
+}
+
+/// Delete the gateway of the run on `pod_name` when `profile` isolates gateways. A failure is
+/// logged and left to the gateway sweep.
+pub(crate) async fn teardown_run_gateway(
+    dispatcher: &dyn PodDispatcher,
+    cluster: &str,
+    profile: Option<&crucible::deploy::DeployProfile>,
+    pod_name: &str,
+    loop_namespace: &str,
+) {
     if let Some(profile) = profile.filter(|p| crucible::deploy::render::gateway::isolated(p))
-        && let Some(ns) = ns.as_deref()
-        && let Err(e) =
-            crate::runs::workpod::gateway::teardown(dispatcher, &row.cluster, profile, pod_name, ns)
-                .await
+        && let Err(e) = crate::runs::workpod::gateway::teardown(
+            dispatcher,
+            cluster,
+            profile,
+            pod_name,
+            loop_namespace,
+        )
+        .await
     {
         tracing::warn!(
             error = format!("{e:#}"),
@@ -1194,7 +1213,6 @@ pub async fn collect_run_pod(
             "deleting the run's gateway failed; the gateway sweep removes it"
         );
     }
-    Ok(())
 }
 
 /// Prefer the kubelet-captured termination-message envelope, falling back to the marker log scrape

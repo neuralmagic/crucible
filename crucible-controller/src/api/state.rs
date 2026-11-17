@@ -352,13 +352,13 @@ impl ApiState {
             crate::daemon::autopilot_flag::AutopilotFlag::seeded(db.pool().clone(), true);
         let clusters = Arc::new(crate::runs::clusters::ClusterClients::new(None));
         let queue = WorkQueue::new();
+        let overrides = Arc::new(crate::daemon::overrides::OverrideStore::new(
+            db.pool().clone(),
+        ));
         Self {
             db,
             schedules,
-            sink: QueueOverrideSink::new(
-                Arc::new(crate::daemon::overrides::OverrideStore::new()),
-                queue.clone(),
-            ),
+            sink: QueueOverrideSink::new(overrides, queue.clone()),
             queue,
             caps: None,
             roles: crate::identity::auth::Roles::new(vec![], vec![], vec![]),
@@ -420,7 +420,7 @@ impl axum::extract::FromRef<ApiState> for crate::identity::auth::Roles {
 
 /// The one error a handler answers with. Every variant is a status; the body is the same
 /// `{"error": …}` the routes have always sent, the field list for a refused form, the rule for a
-/// policy denial, and the bare message for a failure nobody planned for.
+/// policy denial, and a fixed message for a failure nobody planned for.
 #[derive(Debug)]
 pub enum ApiError {
     BadRequest(String),
@@ -441,7 +441,7 @@ pub enum ApiError {
         action: crate::authz::action::Action,
         decision: crate::authz::decision::Decision,
     },
-    /// Something unplanned went wrong: a 500 with the error chain as its text.
+    /// Something unplanned went wrong: a 500 that logs the error chain and names none of it.
     Internal(anyhow::Error),
 }
 
@@ -489,7 +489,11 @@ impl IntoResponse for ApiError {
                     .into_response();
             }
             ApiError::Internal(e) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response();
+                tracing::error!(error = format!("{e:#}"), "request failed");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
             }
         };
         (status, Json(ErrorBody::new(message))).into_response()
@@ -554,5 +558,66 @@ impl ErrorBody {
         ErrorBody {
             error: error.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    use crate::api::state::ApiError;
+
+    #[derive(Clone, Default)]
+    struct Log(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Log {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_internal_error_answers_a_fixed_body_and_logs_its_chain() {
+        let log = Log::default();
+        let writer = log.clone();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(move || writer.clone())
+                    .with_ansi(false),
+            ),
+        );
+        let _makes_interest_per_dispatcher = tracing::Dispatch::new(tracing_subscriber::registry());
+
+        let cause = anyhow::Error::new(std::io::Error::other("connection reset by peer"))
+            .context("listing the api keys");
+        let response = tracing::dispatcher::with_default(&dispatch, || {
+            ApiError::Internal(cause).into_response()
+        });
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], br#"{"error":"internal error"}"#);
+
+        let logged = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("ERROR"), "{logged}");
+        assert!(logged.contains("request failed"), "{logged}");
+        assert!(
+            logged.contains("listing the api keys: connection reset by peer"),
+            "{logged}"
+        );
     }
 }

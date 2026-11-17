@@ -180,6 +180,28 @@ pub enum PodUsers {
     Host,
 }
 
+/// How a build compresses the layers it adds to its image.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Compression {
+    /// What every registry and runtime takes.
+    #[default]
+    Gzip,
+    /// An OCI image with zstd layers, for registries and runtimes that take them.
+    Zstd,
+}
+
 /// Where and how every Job of one server runs.
 #[derive(Debug, Clone)]
 pub struct Site {

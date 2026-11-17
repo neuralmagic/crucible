@@ -1,10 +1,18 @@
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
+import { Dialog } from '@base-ui-components/react/dialog';
+import { useQueryClient } from '@tanstack/react-query';
+import { useNavigate } from 'react-router-dom';
 import { $api } from '../api/client';
+import { formatError } from '../api/errors';
 import { eyebrowFor, narrow, scopedPath } from '../ownerContext';
 import { useOwnerContext } from '../useOwnerContext';
 import {
+  ALERT_POPUP,
+  Button,
   createDataColumnHelper,
   DataTable,
+  DIALOG_BACKDROP,
+  DIALOG_TITLE,
   Empty,
   formatStamp,
   Identifier,
@@ -15,7 +23,16 @@ import {
   useDataTable,
 } from '../ui';
 import type { StatusTone } from '../ui';
-import { scheduleView, type ScheduleDto, type ScheduleState } from './schedulesView';
+import {
+  CURSOR_FROM,
+  isCursorFrom,
+  scheduleView,
+  testCursor,
+  type CursorFrom,
+  type ScheduleDto,
+  type ScheduleState,
+} from './schedulesView';
+import { FormError, SelectField, TextAreaField } from './formControls';
 import { shortRev } from './draftStudio';
 import { scheduleFiringsPath } from './playbookRunsView';
 
@@ -103,7 +120,130 @@ const columnsFor = (team: string | null) => helper.columns([
       );
     },
   }),
+  helper.display({
+    id: 'fire',
+    header: 'Fire',
+    meta: { pad: 'tight', shrink: true },
+    cell: ({ row }) => (
+      <div className="flex gap-2">
+        <FireButton id={row.original.id} enabled={row.original.enabled} />
+        <TestFireButton schedule={row.original} />
+      </div>
+    ),
+  }),
 ]);
+
+/// Launches the schedule once, moving nothing, and opens that launch. A schedule with a cursor
+/// asks first which cursor the firing gets.
+function TestFireButton({ schedule }: { schedule: ScheduleDto }) {
+  const navigate = useNavigate();
+  const testFire = $api.useMutation('post', '/api/schedules/{id}/test-fire');
+  const [open, setOpen] = useState(false);
+  const [from, setFrom] = useState<CursorFrom>('stored');
+  const [value, setValue] = useState('');
+  const cursor = testCursor(from, value);
+  const hasCursor = schedule.cursor !== null && schedule.cursor !== undefined;
+
+  const launch = (body: { cursor?: NonNullable<typeof cursor> }) => {
+    testFire.mutate(
+      { params: { path: { id: schedule.id } }, body },
+      {
+        onSuccess: (fired) => {
+          void navigate(`/playbook-runs/${encodeURIComponent(fired.key)}`);
+        },
+      },
+    );
+  };
+
+  return (
+    <>
+      <Button
+        className="uppercase"
+        disabled={testFire.isPending}
+        onClick={() => {
+          if (hasCursor) {
+            setOpen(true);
+          } else {
+            launch({});
+          }
+        }}
+      >
+        Test fire
+      </Button>
+      <Dialog.Root open={open} onOpenChange={setOpen}>
+        <Dialog.Portal>
+          <Dialog.Backdrop className={DIALOG_BACKDROP} />
+          <Dialog.Popup data-testid="schedule-test-fire" className={ALERT_POPUP}>
+            <Dialog.Title className={DIALOG_TITLE}>Test fire {schedule.playbook}</Dialog.Title>
+            <div className="grid gap-3.5 px-4 py-3.5">
+              <SelectField
+                id="test-fire-cursor"
+                label="Cursor"
+                value={from}
+                onChange={(picked) => {
+                  if (isCursorFrom(picked)) {
+                    setFrom(picked);
+                  }
+                }}
+                options={CURSOR_FROM}
+              />
+              {from === 'value' ? (
+                <TextAreaField id="test-fire-value" label="Value" mono required autoFocus value={value} onChange={setValue} />
+              ) : null}
+              {testFire.isError ? <FormError>{formatError(testFire.error)}</FormError> : null}
+            </div>
+            <div className="flex justify-end border-t border-rule">
+              <Button
+                className="uppercase"
+                onClick={() => {
+                  setOpen(false);
+                }}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="filled"
+                className="uppercase"
+                disabled={testFire.isPending || cursor === null}
+                onClick={() => {
+                  if (cursor !== null) {
+                    launch({ cursor });
+                  }
+                }}
+              >
+                Launch
+              </Button>
+            </div>
+          </Dialog.Popup>
+        </Dialog.Portal>
+      </Dialog.Root>
+    </>
+  );
+}
+
+function FireButton({ id, enabled }: { id: string; enabled: boolean }) {
+  const queryClient = useQueryClient();
+  const fire = $api.useMutation('post', '/api/schedules/{id}/fire');
+
+  return (
+    <Button
+      className="uppercase"
+      disabled={!enabled || fire.isPending}
+      onClick={() => {
+        fire.mutate(
+          { params: { path: { id } } },
+          {
+            onSuccess: () => {
+              void queryClient.invalidateQueries({ queryKey: ['get', '/api/schedules'] });
+            },
+          },
+        );
+      }}
+    >
+      Fire now
+    </Button>
+  );
+}
 
 /// Every schedule and whether it will actually fire.
 export function SchedulesPage() {

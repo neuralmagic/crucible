@@ -830,7 +830,7 @@ async fn full_chain_new_to_done_with_once_idempotence() -> Result<()> {
 
     // The assembled daemon — the same `assemble` the binary calls.
     let queue = WorkQueue::new();
-    let overrides = Arc::new(OverrideStore::new());
+    let overrides = Arc::new(OverrideStore::new(db.pool().clone()));
     let wiring = daemon::assemble(
         &db,
         &cfg,
@@ -1115,7 +1115,7 @@ async fn crash_recovery_reconciles_a_missed_completion() -> Result<()> {
             &db,
             &cfg,
             WorkQueue::new(),
-            Arc::new(OverrideStore::new()),
+            Arc::new(OverrideStore::new(db.pool().clone())),
             completions1,
             crucible_controller::authz::policy::ActivePolicy::default_set()
                 .expect("the shipped default policy set loads"),
@@ -1169,7 +1169,7 @@ async fn crash_recovery_reconciles_a_missed_completion() -> Result<()> {
             &db,
             &cfg,
             WorkQueue::new(),
-            Arc::new(OverrideStore::new()),
+            Arc::new(OverrideStore::new(db.pool().clone())),
             completions2,
             crucible_controller::authz::policy::ActivePolicy::default_set()
                 .expect("the shipped default policy set loads"),
@@ -1456,7 +1456,7 @@ async fn a_pinned_pack_dispatches_every_launch_to_its_cluster() -> Result<()> {
     cfg.runtime.dispatcher = launcher.clone();
 
     let queue = WorkQueue::new();
-    let overrides = Arc::new(OverrideStore::new());
+    let overrides = Arc::new(OverrideStore::new(db.pool().clone()));
     let wiring = daemon::assemble(
         &db,
         &cfg,
@@ -1795,7 +1795,7 @@ async fn standing_launches_fire_through_one_sweep() -> Result<()> {
     // The assembled daemon and the API it shares its queue and override store with — the same
     // wiring the binary does.
     let queue = WorkQueue::new();
-    let overrides = Arc::new(OverrideStore::new());
+    let overrides = Arc::new(OverrideStore::new(db.pool().clone()));
     let wiring = daemon::assemble(
         &db,
         &cfg,
@@ -2073,7 +2073,7 @@ async fn launch_rig(opts: RigOpts) -> Result<LaunchRig> {
     } else {
         queue.clone()
     };
-    let overrides = Arc::new(OverrideStore::new());
+    let overrides = Arc::new(OverrideStore::new(db.pool().clone()));
     let wiring = daemon::assemble(
         &db,
         &cfg,

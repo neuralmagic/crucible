@@ -160,6 +160,7 @@ crucible-kueue \
 | `--suspend` (`SUSPEND`) | `true` | Create Jobs, JobSets and PyTorchJobs suspended for Kueue |
 | `--namespace` (`NAMESPACES`) | discovered | Namespaces the server is installed in; empty lists LocalQueues cluster-wide to find them |
 | `--pull-secret` (`PULL_SECRETS`) | none | Image pull secrets pod templates may name, as `name` or `name=registry` (host or host/path prefix; repeat for more registries). The server adds a secret to any pod whose image is on its registry and lists it in the plan's `server_changes`. With none, `imagePullSecrets` is refused |
+| `--storage-class` (`STORAGE_CLASSES`) | none | StorageClasses a volume claim template may name (repeat for more). With none, `storageClassName` is refused and every claim takes the cluster's default class |
 | `--cluster-domain` (`CLUSTER_DOMAIN`) | `cluster.local` | The cluster's DNS domain, for the host of an exposed workload's Service |
 | `--accelerator-resource` (`ACCELERATOR_RESOURCES`) | `nvidia.com/gpu`, `nvidia.com/mig-*`, `amd.com/gpu`, `habana.ai/gaudi`, `google.com/tpu` | Resources `hardware_describe` counts; `*` matches a prefix |
 | `--accelerator-product-label` (`ACCELERATOR_PRODUCT_LABELS`) | `nvidia.com/gpu.product`, `amd.com/gpu.product-name`, `habana.ai/gaudi.product`, `cloud.google.com/gke-tpu-accelerator` | Node labels naming the product |

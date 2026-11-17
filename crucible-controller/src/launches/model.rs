@@ -304,6 +304,33 @@ impl LaunchFilter {
     }
 }
 
+/// What a schedule's test firing receives as its cursor. Stored on the launch, which is what
+/// marks it a test firing.
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+#[serde(tag = "from", rename_all = "snake_case")]
+pub(crate) enum TestCursor {
+    /// The value the schedule holds now.
+    #[default]
+    Stored,
+    /// Nothing, as on the schedule's first firing.
+    None,
+    /// This value in place of the stored one.
+    Value { value: String },
+}
+
+impl TestCursor {
+    /// The cursor the firing receives, given what the schedule holds.
+    pub(crate) fn resolve(&self, stored: Option<String>) -> Option<String> {
+        match self {
+            TestCursor::Stored => stored,
+            TestCursor::None => None,
+            TestCursor::Value { value } => Some(value.clone()),
+        }
+    }
+}
+
 /// One launch as the runs surface reads it: the frozen authorization a relaunch prefills from,
 /// joined to what the run did (the issue's status, the spend its runs booked).
 #[derive(Debug, Clone, PartialEq)]

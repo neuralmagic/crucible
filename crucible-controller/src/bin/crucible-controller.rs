@@ -722,7 +722,8 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
     // One work queue shared between the worker and the override sink (human park/unpark/bump lands
     // in the same FIFO as the discovery/approval/pod-watch sources); the store carries the intent
     // the key alone can't.
-    let override_store = std::sync::Arc::new(crucible_controller::OverrideStore::new());
+    let override_store =
+        std::sync::Arc::new(crucible_controller::OverrideStore::new(db.pool().clone()));
     let queue = crucible_controller::WorkQueue::new();
 
     // The HTTP API + debug UI, mounted on the same runtime. Binds loopback without
