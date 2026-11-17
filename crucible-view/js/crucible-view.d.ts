@@ -28,7 +28,10 @@ interface View {
 
 interface ViewCell {
   text: string;
-  /** An http(s) address the cell opens. */
+  /**
+   * The address the cell opens: `http(s)://...`, `run:task/<task>` for a task of the run, or
+   * `run:file/<task>/<path>` for a file it captured, with the task as a `CapturedFile` names it.
+   */
   href?: string;
   tone?: Tone;
 }
@@ -65,10 +68,19 @@ type ViewNode =
           kind?: "text" | "mono" | "badge";
           width?: "narrow" | "medium" | "wide" | "fill";
         }[];
-        rows: { id: string; cells: ViewCell[] }[];
+        /** `detail` is Markdown shown under the table while the row is selected. */
+        rows: { id: string; cells: ViewCell[]; detail?: string }[];
       };
     }
   | { text: { text: string; tone?: Tone } }
+  | {
+      /** Markdown. A link takes the addresses a cell's `href` does; a `mermaid` fence is drawn. */
+      markdown: { text: string };
+    }
+  | {
+      /** A Mermaid diagram from its source. */
+      mermaid: { source: string };
+    }
   | CanvasNode;
 
 /** What `Canvas.node()` returns. Build it with a `Canvas`, not by hand. */

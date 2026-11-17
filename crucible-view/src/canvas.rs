@@ -164,16 +164,24 @@ pub enum Draw {
     },
 }
 
+/// The furthest from zero a canvas number may be.
+pub const CANVAS_REACH: f32 = 1_000_000.0;
+/// The most line segments a curve is drawn as.
+pub const CURVE_STEPS: usize = 64;
+/// The most line segments an arc is drawn as, one each 7.5 degrees of a full turn.
+pub const ARC_STEPS: usize = 48;
+
 impl Draw {
-    /// Whether every number the command holds is finite.
-    pub(crate) fn finite(&self) -> bool {
+    /// Whether every number the command holds is within [`CANVAS_REACH`] of zero.
+    pub(crate) fn in_reach(&self) -> bool {
+        let near = |n: &f32| n.abs() <= CANVAS_REACH;
         match self {
-            Draw::GlobalAlpha(n) | Draw::LineWidth(n) => n.is_finite(),
-            Draw::MoveTo(n) | Draw::LineTo(n) => n.iter().all(|n| n.is_finite()),
+            Draw::GlobalAlpha(n) | Draw::LineWidth(n) => near(n),
+            Draw::MoveTo(n) | Draw::LineTo(n) => n.iter().all(near),
             Draw::QuadraticCurveTo(n) | Draw::Rect(n) | Draw::FillRect(n) | Draw::StrokeRect(n) => {
-                n.iter().all(|n| n.is_finite())
+                n.iter().all(near)
             }
-            Draw::BezierCurveTo(n) => n.iter().all(|n| n.is_finite()),
+            Draw::BezierCurveTo(n) => n.iter().all(near),
             Draw::Arc {
                 x,
                 y,
@@ -181,10 +189,8 @@ impl Draw {
                 start_angle,
                 end_angle,
                 ..
-            } => [x, y, radius, start_angle, end_angle]
-                .iter()
-                .all(|n| n.is_finite()),
-            Draw::FillText { x, y, .. } => x.is_finite() && y.is_finite(),
+            } => [x, y, radius, start_angle, end_angle].into_iter().all(near),
+            Draw::FillText { x, y, .. } => near(x) && near(y),
             Draw::FillStyle(_)
             | Draw::StrokeStyle(_)
             | Draw::LineCap(_)
@@ -196,6 +202,17 @@ impl Draw {
             | Draw::ClosePath
             | Draw::Fill
             | Draw::Stroke => true,
+        }
+    }
+
+    /// The most points the command adds to the current path.
+    pub fn path_points(&self) -> usize {
+        match self {
+            Draw::MoveTo(_) | Draw::LineTo(_) | Draw::ClosePath => 1,
+            Draw::QuadraticCurveTo(_) | Draw::BezierCurveTo(_) => CURVE_STEPS + 1,
+            Draw::Arc { .. } => ARC_STEPS + 1,
+            Draw::Rect(_) => 5,
+            _ => 0,
         }
     }
 }
@@ -400,15 +417,16 @@ mod tests {
         assert!(serde_json::from_str::<Node>(unknown).is_err());
     }
 
+    fn canvas(width: f32, commands: Vec<Draw>) -> View {
+        view(Node::Canvas {
+            width,
+            height: 100.0,
+            commands,
+        })
+    }
+
     #[test]
-    fn a_canvas_is_bounded_and_its_numbers_finite() {
-        let canvas = |width: f32, commands: Vec<Draw>| {
-            view(Node::Canvas {
-                width,
-                height: 100.0,
-                commands,
-            })
-        };
+    fn a_canvas_is_bounded_and_its_numbers_within_reach() {
         assert_eq!(canvas(100.0, vec![]).check(&Limits::DEFAULT), Ok(()));
         for width in [0.0, -5.0, 4_001.0, f32::NAN] {
             assert_eq!(
@@ -417,12 +435,127 @@ mod tests {
             );
         }
         assert_eq!(
-            canvas(100.0, vec![Draw::LineTo([1.0, f32::INFINITY])]).check(&Limits::DEFAULT),
-            Err(Problem::CanvasNumber(0))
+            canvas(100.0, vec![Draw::LineTo([1.0, -1e6])]).check(&Limits::DEFAULT),
+            Ok(())
         );
+        for off in [f32::INFINITY, f32::NAN, 1.1e6, f32::MIN] {
+            for command in [
+                Draw::LineTo([1.0, off]),
+                Draw::FillRect([0.0, 0.0, off, 1.0]),
+                Draw::BezierCurveTo([0.0, 0.0, 0.0, 0.0, 0.0, off]),
+                Draw::Arc {
+                    x: 0.0,
+                    y: 0.0,
+                    radius: off,
+                    start_angle: 0.0,
+                    end_angle: 1.0,
+                    counterclockwise: false,
+                },
+                Draw::LineWidth(off),
+            ] {
+                assert_eq!(
+                    canvas(100.0, vec![Draw::Save, command]).check(&Limits::DEFAULT),
+                    Err(Problem::CanvasNumber(1))
+                );
+            }
+        }
         assert_eq!(
-            canvas(100.0, vec![Draw::Fill; 20_001]).check(&Limits::DEFAULT),
+            canvas(100.0, vec![Draw::Save; 20_001]).check(&Limits::DEFAULT),
             Err(Problem::Commands(20_000))
         );
+        let two = Node::Stack {
+            children: vec![
+                Node::Canvas {
+                    width: 1.0,
+                    height: 1.0,
+                    commands: vec![Draw::Save; 10_001],
+                };
+                2
+            ],
+        };
+        assert_eq!(
+            view(two).check(&Limits::DEFAULT),
+            Err(Problem::Commands(20_000))
+        );
+        assert_eq!(
+            canvas(100.0, vec![Draw::Font("x".repeat(20_001))]).check(&Limits::DEFAULT),
+            Err(Problem::Text(20_000))
+        );
+    }
+
+    #[test]
+    fn every_fill_and_stroke_counts_the_whole_path_it_draws() {
+        let limits = Limits {
+            points: 100,
+            path_points: 20,
+            ..Limits::DEFAULT
+        };
+        let mut drawn_once = vec![Draw::LineTo([0.0, 0.0]); 20];
+        drawn_once.push(Draw::Stroke);
+        assert_eq!(canvas(100.0, drawn_once.clone()).check(&limits), Ok(()));
+
+        let mut drawn_often = drawn_once.clone();
+        drawn_often.extend(vec![Draw::Fill; 4]);
+        assert_eq!(canvas(100.0, drawn_often.clone()).check(&limits), Ok(()));
+        drawn_often.push(Draw::Stroke);
+        assert_eq!(
+            canvas(100.0, drawn_often).check(&limits),
+            Err(Problem::Points(100))
+        );
+
+        let mut fresh = Vec::new();
+        for _ in 0..5 {
+            fresh.push(Draw::BeginPath);
+            fresh.extend(drawn_once.clone());
+        }
+        assert_eq!(canvas(100.0, fresh).check(&limits), Ok(()));
+
+        let rects = |count: usize| {
+            let mut commands = vec![Draw::FillRect([0.0, 0.0, 1.0, 1.0]); count];
+            commands.insert(0, Draw::BeginPath);
+            canvas(100.0, commands)
+        };
+        assert_eq!(rects(25).check(&limits), Ok(()));
+        assert_eq!(rects(26).check(&limits), Err(Problem::Points(100)));
+    }
+
+    #[test]
+    fn a_stretch_of_path_is_bounded_and_a_move_or_close_starts_another() {
+        let limits = Limits {
+            path_points: 20,
+            ..Limits::DEFAULT
+        };
+        let line = Draw::LineTo([0.0, 0.0]);
+        assert_eq!(
+            canvas(100.0, vec![line.clone(); 21]).check(&limits),
+            Err(Problem::PathPoints(20))
+        );
+        for restart in [
+            Draw::MoveTo([0.0, 0.0]),
+            Draw::ClosePath,
+            Draw::Rect([0.0; 4]),
+        ] {
+            let mut commands = vec![line.clone(); 19];
+            commands.push(restart);
+            commands.extend(vec![line.clone(); 19]);
+            assert_eq!(canvas(100.0, commands).check(&limits), Ok(()));
+        }
+        let curve = Draw::QuadraticCurveTo([0.0; 4]);
+        assert_eq!(curve.path_points(), 65);
+        assert_eq!(
+            canvas(100.0, vec![curve]).check(&limits),
+            Err(Problem::PathPoints(20))
+        );
+        let arc = Draw::Arc {
+            x: 0.0,
+            y: 0.0,
+            radius: 1.0,
+            start_angle: 0.0,
+            end_angle: 1.0,
+            counterclockwise: false,
+        };
+        assert_eq!(arc.path_points(), 49);
+        assert_eq!(Draw::Rect([0.0; 4]).path_points(), 5);
+        assert_eq!(Draw::Fill.path_points(), 0);
     }
 }

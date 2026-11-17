@@ -315,4 +315,39 @@ mod tests {
         let view = reaches.view(&Request::default()).unwrap();
         assert_eq!(view.title, "undefinedundefinedundefined");
     }
+
+    #[test]
+    #[ignore = "needs assets/js-engine/plugin.wasm from `just desktop-js-engine`"]
+    fn a_reply_over_a_mebibyte_arrives_whole() {
+        let source = r#"export const inputs = [];
+            export function view() {
+                const rows = [];
+                for (let i = 0; i < 70; i++) {
+                    rows.push({ id: String(i), cells: [{ text: "x".repeat(20000) }] });
+                }
+                return { title: "T", body: { table: {
+                    id: "t", columns: [{ id: "c", title: "C" }], rows } } };
+            }"#;
+        let script = Script::new(engine(), source);
+        let view = script.view(&Request::default()).unwrap();
+        let Node::Table { rows, .. } = &view.body else {
+            panic!("the view is a table");
+        };
+        assert_eq!(rows.len(), 70);
+        assert_eq!(rows[69].cells[0].text.len(), 20_000);
+
+        let wasm = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/js-engine/plugin.wasm"),
+        )
+        .unwrap();
+        let small = Limits {
+            reply_bytes: 1 << 20,
+            ..Limits::DEFAULT
+        };
+        let capped = Script::new(Arc::new(JsEngine::load(&wasm, small).unwrap()), source);
+        assert_eq!(
+            capped.view(&Request::default()),
+            Err(Fault::Reply("over the 1048576 bytes allowed".into()))
+        );
+    }
 }

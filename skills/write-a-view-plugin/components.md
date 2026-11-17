@@ -47,9 +47,13 @@ are right-aligned. At most 600 cells, header included.
 ## Table
 
 `table` holds any number of rows and sorts by a click on a column header, in natural order of
-the cell text. A cell with `href` is a link, and a double click on a row opens its first link.
-A column's `kind` is `text`, `mono` or `badge` (a dot in the cell's tone before the text); its
-`width` is `narrow`, `medium`, `wide` or `fill`. Both are optional.
+the cell text. A cell with `href` is a link (see Links), and a double click on a row opens its
+first link. A column's `kind` is `text`, `mono` or `badge` (a dot in the cell's tone before the
+text); its `width` is `narrow`, `medium`, `wide` or `fill`. Both are optional.
+
+A row's optional `detail` is Markdown shown in a panel under the table while that row is
+selected. Put there what does not fit a cell: the whole rationale, the evidence, links to the
+task and file it came from. Keep the cells to what a reader scans and sorts by.
 
 ```json
 {"table": {
@@ -64,7 +68,7 @@ A column's `kind` is `text`, `mono` or `badge` (a dot in the cell's tone before 
       {"text": "DEMO-101", "href": "https://issues.example.com/browse/DEMO-101"},
       {"text": "affected", "tone": "bad"},
       {"text": "The handler is reachable from the public listener."}
-    ]}
+    ], "detail": "### DEMO-101\n\nThe handler is reachable from the public listener.\n\nTriaged by [triage-go](run:task/triage-go), from [its verdicts](run:file/triage-go/verdicts.json)."}
   ]
 }}
 ```
@@ -75,8 +79,45 @@ Rules the app checks:
 - A table `id` and a tabs `id` are unique in the view.
 - Only one table is on screen at a time. Put each table in its own tab; a stack may not hold
   two, and may not hold a table beside tabs that hold one.
-- An `href` starts with `http://` or `https://`.
-- All tables together hold at most 500,000 cells.
+- An `href` is one of the addresses under Links.
+- All tables together hold at most 500,000 cells, and a row's `detail` at most 100,000 bytes.
+
+## Text
+
+`text` is one plain paragraph in a tone. `markdown` is Markdown: headings, lists, tables, code
+blocks, links, and diagrams in `mermaid` fences. Images are not drawn.
+
+```json
+{"markdown": {"text": "## Reachability\n\n- **8 affected**, 3 of them on the public listener\n- see [triage-go](run:task/triage-go)\n\n`grpc 1.64.0` is in every image."}}
+```
+
+`mermaid` is one diagram from its Mermaid source: a flowchart, a sequence, state, class or
+entity-relationship diagram, a gantt chart, a pie, a mindmap, a timeline, and others. A source
+the app cannot read is shown as its text. Reach for it for structure and process (how a
+verdict was reached, what calls what); use `plot`, `bars` and `flow` for quantities.
+
+```json
+{"mermaid": {"source": "flowchart LR\n  ticket([Ticket]) --> shipped{Shipped?}\n  shipped -- no --> not_shipped\n  shipped -- yes --> verdict{Verdict}\n  verdict -- affected --> affected\n  verdict -- not affected --> not_affected"}}
+```
+
+All `markdown` and `mermaid` in a view together hold at most 100,000 bytes.
+
+## Links
+
+An address, in a cell's `href` or a Markdown link, is one of:
+
+| Address | Leads to |
+| --- | --- |
+| `https://...` or `http://...` | the web page, in the browser |
+| `run:task/<task>` | that task of the run, in the Tasks pane; `task[key]` is one instance of a fan-out, in the Data pane |
+| `run:file/<task>/<path>` | that captured file, in the Files pane |
+
+`<task>` and `<path>` are a file's `task` and `path` exactly as the request gives them, so the
+address of a file the plugin read is `run:file/` + `task` + `/` + `path`. In Rust,
+`crucible_view::task_link` and `file_link` build them. Any other address in a cell is refused;
+in Markdown it is drawn and leads nowhere. A cell whose task or file this run does not have is
+drawn as plain text. A local run shows tasks but lists no captured files, so `run:file` links
+lead somewhere only for a run on a controller.
 
 ## Charts
 
@@ -114,8 +155,8 @@ greatest x.
 ```
 
 A series is coloured by its tone, and there are six tones, so two series with one tone look the
-same. Past five or six series, split the chart or use a table. At most 1,000 segments in one
-set of bars and 20,000 points in one plot.
+same. Past five or six series, split the chart or use a table. A bar segment's value is from 0
+to 1e15, and a point's x and y are within 1e15 of zero.
 
 `flow` is quantities moving between stages, drawn as ribbons: a Sankey diagram. Use it to show
 how a total splits and where each part ended up. A node is a stage and a link is a ribbon as
@@ -155,7 +196,11 @@ labels short: the first and last columns have about 120 points for theirs.
 `canvas` is free drawing with the commands of the HTML canvas's 2D context, under the same
 names in snake case. `width` and `height` are points, 1 to 4,000; coordinates start at the top
 left with y down; angles are radians and arcs run clockwise. A command with no arguments is its
-name as a string. At most 20,000 commands.
+name as a string. Every number is within 1,000,000 of zero.
+
+A path may run 1,000 points before its next `move_to`, `close_path` or `rect`. A line adds one
+point, a curve up to 65, an arc up to 49 and a `rect` 5. Every `fill` and `stroke` counts all
+the points of the path it draws, so call `begin_path` before each new shape.
 
 ```json
 {"canvas": {"width": 240, "height": 120, "commands": [
@@ -204,5 +249,13 @@ Prefer a tone to a hex colour: a hex colour does not follow the theme.
 
 ## Whole-view limits
 
-At most 2,000 components nested at most 8 deep. A view past any limit on this page is refused
-whole, with the limit named in the pane.
+Across the whole view, at most:
+
+- 2,000 components, nested at most 8 deep;
+- 20,000 stats, bars, segments, series, grid cells, table columns, and flow stages and links;
+- 50,000 points, counting plot points, the points of each canvas path filled or stroked, and 4
+  for each `fill_rect` or `stroke_rect`;
+- 20,000 canvas commands;
+- 20,000 bytes in any one title, label, cell or address.
+
+A view past any limit on this page is refused whole, with the limit named in the pane.

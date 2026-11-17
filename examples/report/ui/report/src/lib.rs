@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crucible_view::{
     Bar, Cell, Column, ColumnKind, Context2d, FlowLink, FlowNode, LineCap, Node, PlotKind, Request,
-    Row, Segment, Series, Stat, Tab, TextAlign, Tone, View, Width,
+    Row, Segment, Series, Stat, Tab, TextAlign, Tone, View, Width, file_link, task_link,
 };
 use serde::Deserialize;
 
@@ -138,6 +138,8 @@ struct Ticket {
     category: Category,
     verdict: Verdict,
     source: String,
+    /// The address of the captured file the ticket came from.
+    file: String,
 }
 
 /// The rest of the line after `label` in `text`.
@@ -169,6 +171,7 @@ fn report(request: Request) -> Result<View, String> {
                     category,
                     verdict,
                     source: file.task.clone(),
+                    file: file_link(file),
                 },
             );
         }
@@ -192,7 +195,7 @@ fn report(request: Request) -> Result<View, String> {
             label: "Summary".into(),
             count: None,
             body: Node::Stack {
-                children: vec![by_release(&tickets), pivot(&tickets)],
+                children: vec![by_release(&tickets), pivot(&tickets), categories()],
             },
         },
         Tab {
@@ -506,6 +509,50 @@ fn pivot(tickets: &[Ticket]) -> Node {
     Node::Grid { columns, rows }
 }
 
+/// How a ticket gets its category, as a diagram.
+fn categories() -> Node {
+    Node::Mermaid {
+        source: "flowchart LR
+    ticket([Ticket]) --> shipped{Shipped?}
+    shipped -- no --> not_shipped
+    shipped -- yes --> present{In the final image?}
+    present -- no --> sbom_inaccurate
+    present -- yes --> fixed{Already fixed?}
+    fixed -- yes --> already_fixed
+    fixed -- no --> verdict{Verdict}
+    verdict -- affected --> affected
+    verdict -- not affected --> not_affected
+    verdict -- neither --> needs_review"
+            .into(),
+    }
+}
+
+/// What a selected row shows under the table: the whole rationale and where it came from.
+fn detail(ticket: &Ticket) -> String {
+    let v = &ticket.verdict;
+    format!(
+        "### {key}: {category}\n\n{rationale}\n\n\
+         | Field | Value |\n|---|---|\n\
+         | Package | `{package} {version}` |\n\
+         | Image | `{image}` |\n\
+         | CVE | {cve} |\n\
+         | Confidence | {confidence} |\n\n\
+         Triaged by [{task}]({task_at}), from [its verdicts]({file}). \
+         [Open the ticket]({TICKETS}{key}).\n",
+        key = ticket.key,
+        category = ticket.category.label(),
+        rationale = v.rationale.replace('\n', "\n\n"),
+        package = v.package.name,
+        version = v.package.version,
+        image = v.artifact.locator,
+        cve = v.cve_ids.join(", "),
+        confidence = v.confidence,
+        task = ticket.source,
+        task_at = task_link(&ticket.source),
+        file = ticket.file,
+    )
+}
+
 fn table<'a>(id: &str, tickets: impl Iterator<Item = &'a Ticket>) -> Node {
     let column = |id: &str, title: &str, kind: ColumnKind, width: Width| Column {
         id: id.into(),
@@ -547,9 +594,10 @@ fn table<'a>(id: &str, tickets: impl Iterator<Item = &'a Ticket>) -> Node {
                         Cell::text(&v.package.name),
                         Cell::text(&v.package.version),
                         Cell::text(&v.artifact.locator),
-                        Cell::text(&ticket.source).tone(Tone::Muted),
+                        Cell::text(&ticket.source).link(task_link(&ticket.source)),
                         Cell::text(why),
                     ],
+                    detail: Some(detail(ticket)),
                 }
             })
             .collect(),

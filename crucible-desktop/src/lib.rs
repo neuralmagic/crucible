@@ -543,6 +543,63 @@ impl App {
         row.cells.iter().find_map(|cell| cell.href.clone())
     }
 
+    /// The shown report table's one selected row, when it has a detail.
+    pub fn report_detail(&self) -> Option<&crucible_view::Row> {
+        let state = &self.report_shown.table;
+        let id = state
+            .selected()
+            .next()
+            .filter(|_| state.selected_len() == 1)?;
+        let row = self.report_table()?.rows.iter().find(|row| row.id == id)?;
+        row.detail.is_some().then_some(row)
+    }
+
+    /// The task a report names, or the fan-out and instance key for `task[key]`.
+    fn report_task<'a>(&self, named: &'a str) -> Option<(&'a str, Option<&'a str>)> {
+        let tasks = self.run_tasks();
+        report::task_named(|name| tasks.iter().any(|task| task.name == name), named)
+    }
+
+    /// The key of the captured file a report names as `<task>/<path>`.
+    fn report_file(&self, named: &str) -> Option<String> {
+        let files = self.selected_detail()?.files.as_ref()?.as_ref().ok()?;
+        report::file_named(files, named).map(|file| file.key.clone())
+    }
+
+    /// Whether an address a report holds leads to the web or to something this run has.
+    pub fn report_leads(&self, href: &str) -> bool {
+        match crucible_view::Link::parse(href) {
+            Some(crucible_view::Link::Web(_)) => true,
+            Some(crucible_view::Link::Task(task)) => self.report_task(task).is_some(),
+            Some(crucible_view::Link::File(file)) => self.report_file(file).is_some(),
+            None => false,
+        }
+    }
+
+    /// Opens a web address a report holds, or shows the task or captured file it names.
+    pub fn follow_report_link(&mut self, href: &str, tx: &mut Tx) {
+        match crucible_view::Link::parse(href) {
+            Some(crucible_view::Link::Web(url)) => {
+                let _ = tx.open_url(url);
+            }
+            Some(crucible_view::Link::Task(named)) => match self.report_task(named) {
+                Some((task, Some(key))) => self.pick_instance(task, key),
+                Some((task, None)) => {
+                    self.pick_task(task, None);
+                    self.show_pane(PaneKind::Tasks);
+                }
+                None => {}
+            },
+            Some(crucible_view::Link::File(named)) => {
+                if let Some(key) = self.report_file(named) {
+                    self.pick_file(&key);
+                    self.show_pane(PaneKind::Files);
+                }
+            }
+            None => {}
+        }
+    }
+
     /// The local packs matching the sidebar's search field.
     pub fn visible_packs(&self) -> impl Iterator<Item = &PackView> {
         let query = self.query();
@@ -1329,7 +1386,7 @@ impl App {
 
     /// The report the Report tab shows: the selected local pack's, or the one built for the
     /// selected live run.
-    pub fn shown_report(&self) -> Option<&report::Report> {
+    pub fn shown_report(&self) -> Option<&std::sync::Arc<report::Report>> {
         if let Some(pack) = self.selected_pack() {
             return pack.report.as_ref();
         }
@@ -1339,6 +1396,13 @@ impl App {
             .as_deref()
             .filter(|built| built.wanted.run == run)
             .map(|built| &built.report)
+    }
+
+    /// Drops what the Report pane kept for a selection or a report it no longer shows.
+    fn follow_report(&mut self) {
+        let report = self.shown_report().cloned();
+        self.report_shown
+            .follow(self.selection.as_ref(), report.as_ref());
     }
 
     /// Whether the live worker has been asked for a report it has not built yet.
@@ -1567,6 +1631,7 @@ impl App {
         self.selection = Some(selection);
         self.page = Page::Runs;
         self.sync_live();
+        self.follow_report();
     }
 
     fn forget_run_view(&mut self) {
@@ -1940,6 +2005,7 @@ fn poll(app: &mut App, clock: f64, tx: &mut Tx) -> bool {
         changed = true;
     }
     app.sync_live();
+    app.follow_report();
     app.sync_admin();
     app.sync_fleet();
     app.sync_tray();
@@ -2030,14 +2096,12 @@ pub fn run() {
         poll: Some(poll),
         on_key: Some(commands::on_key),
         scenes: &[
-            // `CRUCIBLE_PACK` opens that example pack (`playbook` when unset), `CRUCIBLE_TAB`
-            // shows that pane (tasks, timeline, graph, pack, files, report, launch or log),
-            // `CRUCIBLE_FILE` the captured file the Files pane shows, by key, and `CRUCIBLE_PICK`
-            // opens that task's card.
+            // `CRUCIBLE_TAB` shows that pane (tasks, timeline, graph, pack, files, report, launch
+            // or log), `CRUCIBLE_FILE` the captured file the Files pane shows, by key, and
+            // `CRUCIBLE_PICK` opens that task's card.
             ("local", |app: &mut App| {
                 app.backend = Backend::Local;
-                let pack = std::env::var("CRUCIBLE_PACK").unwrap_or_else(|_| "playbook".into());
-                app.select(Selection::Local(pack));
+                app.select(Selection::Local("playbook".into()));
                 app.run.expanded = std::env::var("CRUCIBLE_PICK").ok();
                 scene_tab(app);
             }),

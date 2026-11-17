@@ -21,6 +21,8 @@ pub struct Limits {
     /// build.
     pub fuel: u64,
     pub memory_bytes: usize,
+    /// Entries one table may hold.
+    pub table_elements: usize,
     pub reply_bytes: usize,
     pub inputs: usize,
     pub view: crucible_view::Limits,
@@ -30,6 +32,7 @@ impl Limits {
     pub const DEFAULT: Limits = Limits {
         fuel: 100_000_000_000,
         memory_bytes: 256 << 20,
+        table_elements: 1 << 20,
         reply_bytes: 64 << 20,
         inputs: 16,
         view: crucible_view::Limits::DEFAULT,
@@ -115,16 +118,26 @@ impl wasi::Guest for Held {
         self.clock
     }
 
-    fn write(&mut self, fd: i32, bytes: &[u8]) {
+    fn room(&self, fd: i32) -> usize {
         if fd == 1 {
-            let room = self.output_limit.saturating_sub(self.output.len());
-            self.overflowed |= bytes.len() > room;
-            self.output
-                .extend_from_slice(&bytes[..bytes.len().min(room)]);
+            self.output_limit.saturating_sub(self.output.len())
         } else {
-            let room = SAID.saturating_sub(self.said.len());
-            self.said.extend_from_slice(&bytes[..bytes.len().min(room)]);
+            SAID.saturating_sub(self.said.len())
         }
+    }
+
+    fn write(&mut self, fd: i32, bytes: &[u8], whole: usize) {
+        let kept = &bytes[..bytes.len().min(self.room(fd))];
+        if fd == 1 {
+            self.overflowed |= whole > kept.len();
+            self.output.extend_from_slice(kept);
+        } else {
+            self.said.extend_from_slice(kept);
+        }
+    }
+
+    fn unread(&self) -> usize {
+        self.input.len().saturating_sub(self.taken)
     }
 
     fn read(&mut self, buffer: &mut [u8]) -> usize {
@@ -138,6 +151,8 @@ impl wasi::Guest for Held {
 
 /// The most of a plugin's output a fault quotes.
 const SAID: usize = 2048;
+/// The most tables one plugin may have.
+const TABLES: usize = 8;
 
 struct Call {
     store: Store<Held>,
@@ -204,18 +219,7 @@ impl Plugin {
     }
 
     fn call(&self) -> Result<Call, Fault> {
-        let call = start(&self.engine, &self.module, &self.limits)?;
-        if let Ok(initialize) = call
-            .instance
-            .get_typed_func::<(), ()>(&call.store, "_initialize")
-        {
-            let mut call = call;
-            initialize
-                .call(&mut call.store, ())
-                .map_err(|e| said(fault(e), &call.store))?;
-            return Ok(call);
-        }
-        Ok(call)
+        start(&self.engine, &self.module, &self.limits)
     }
 }
 
@@ -243,6 +247,8 @@ fn start(engine: &Engine, module: &Module, limits: &Limits) -> Result<Call, Faul
     let store_limits = StoreLimitsBuilder::new()
         .memory_size(limits.memory_bytes)
         .memories(1)
+        .table_elements(limits.table_elements)
+        .tables(TABLES)
         .instances(1)
         .trap_on_grow_failure(true)
         .build();
@@ -345,6 +351,7 @@ mod tests {
     const SMALL: Limits = Limits {
         fuel: 5_000_000,
         memory_bytes: 2 << 20,
+        table_elements: 1024,
         reply_bytes: 4096,
         inputs: 2,
         view: crucible_view::Limits::DEFAULT,
@@ -425,6 +432,7 @@ mod tests {
             ("wasi_snapshot_preview1", "path_open"),
             ("wasi_snapshot_preview1", "sock_send"),
             ("wasi_snapshot_preview1", "fd_readdir"),
+            ("wasi_snapshot_preview1", "fd_prestat_get"),
             ("env", "fetch"),
             ("env", "random_get"),
         ] {
@@ -446,10 +454,12 @@ mod tests {
             (import "wasi_snapshot_preview1" "clock_time_get"
                 (func $clock (param i32 i64 i32) (result i32)))
             (import "wasi_snapshot_preview1" "random_get" (func $random (param i32 i32) (result i32)))
-            (import "wasi_snapshot_preview1" "fd_prestat_get"
-                (func $prestat (param i32 i32) (result i32)))
-            (import "wasi_snapshot_preview1" "args_sizes_get"
-                (func $args (param i32 i32) (result i32)))
+            (import "wasi_snapshot_preview1" "fd_fdstat_get"
+                (func $stat (param i32 i32) (result i32)))
+            (import "wasi_snapshot_preview1" "fd_seek"
+                (func $seek (param i32 i64 i32 i32) (result i32)))
+            (import "wasi_snapshot_preview1" "fd_read"
+                (func $read (param i32 i32 i32 i32) (result i32)))
             (import "wasi_snapshot_preview1" "environ_sizes_get"
                 (func $environ (param i32 i32) (result i32)))
             (import "wasi_snapshot_preview1" "fd_write"
@@ -461,9 +471,9 @@ mod tests {
             (data (i32.const 500) "\58\02\00\00\05\00\00\00")
             (func $nothing (result i32)
                 (i64.store (i32.const 100) (i64.const 7))
-                (i32.store (i32.const 400) (i32.const 7))
                 (i32.store (i32.const 404) (i32.const 7))
                 (i32.store (i32.const 408) (i32.const 7))
+                (i32.store (i32.const 540) (i32.const 7))
                 (i32.and (i32.and (i32.and
                     (i32.and
                         (i32.eqz (i32.or
@@ -478,16 +488,21 @@ mod tests {
                             (call $random (i32.const 208) (i32.const 8))))
                         (i64.eq (i64.load (i32.const 200)) (i64.load (i32.const 208)))))
                     (i32.and
-                        (i32.eq (call $prestat (i32.const 3) (i32.const 300)) (i32.const 8))
+                        (i32.eq (call $stat (i32.const 3) (i32.const 300)) (i32.const 8))
                         (i32.and
-                            (i32.eqz (call $args (i32.const 400) (i32.const 404)))
-                            (i32.eqz (i32.or
-                                (i32.load (i32.const 400))
-                                (i32.load (i32.const 404)))))))
+                            (i32.eq
+                                (call $seek (i32.const 0) (i64.const 0) (i32.const 0) (i32.const 304))
+                                (i32.const 70))
+                            (i32.and
+                                (i32.eqz (call $read
+                                    (i32.const 0) (i32.const 500) (i32.const 1) (i32.const 540)))
+                                (i32.eqz (i32.load (i32.const 540)))))))
                     (i32.and
                         (i32.and
-                            (i32.eqz (call $environ (i32.const 408) (i32.const 408)))
-                            (i32.eqz (i32.load (i32.const 408))))
+                            (i32.eqz (call $environ (i32.const 404) (i32.const 408)))
+                            (i32.eqz (i32.or
+                                (i32.load (i32.const 404))
+                                (i32.load (i32.const 408)))))
                         (i32.and
                             (i32.eqz (call $write
                                 (i32.const 1) (i32.const 500) (i32.const 1) (i32.const 520)))
@@ -496,13 +511,14 @@ mod tests {
                 (if (result i64) (call $nothing)
                     (then (i64.or (i64.shl (i64.const 8) (i64.const 32)) (i64.const 11)))
                     (else (i64.or (i64.shl (i64.const 32) (i64.const 32)) (i64.const 13)))))
-            (func (export "_initialize") (call $exit (i32.const 3))))"#;
-        let quiet = probe.replace("(call $exit (i32.const 3))", "");
-        let plugin = Plugin::load(quiet.as_bytes(), SMALL).unwrap();
+            (func (export "crucible_alloc") (param i32) (result i32) (i32.const 1024))
+            (func (export "crucible_view") (param i32 i32) (result i64)
+                (call $exit (i32.const 3))
+                (i64.const 0)))"#;
+        let plugin = Plugin::load(probe.as_bytes(), SMALL).unwrap();
         assert_eq!(plugin.inputs().unwrap(), ["nothing"]);
-        let exiting = Plugin::load(probe.as_bytes(), SMALL).unwrap();
-        let Err(Fault::Trap(why)) = exiting.inputs() else {
-            panic!("an exit while starting stops the plugin");
+        let Err(Fault::Trap(why)) = plugin.view(&Request::default()) else {
+            panic!("an exit stops the plugin");
         };
         assert!(why.contains("exit status 3"), "{why}");
     }
@@ -519,10 +535,110 @@ mod tests {
         assert_eq!(plugin.view(&Request::default()), Err(Fault::Memory));
         let big = r#"(module (memory (export "memory") 64))"#;
         let plugin = Plugin::load(big.as_bytes(), SMALL).unwrap();
-        assert!(matches!(
-            plugin.inputs(),
-            Err(Fault::Trap(_) | Fault::Memory)
-        ));
+        let Err(Fault::Trap(why)) = plugin.inputs() else {
+            panic!("64 pages is over the limit");
+        };
+        assert!(why.contains("memory"), "{why}");
+    }
+
+    #[test]
+    fn a_plugin_that_grows_past_its_table_limit_is_stopped() {
+        let grows = |by: u32| {
+            let wat = format!(
+                r#"(module
+                    (memory (export "memory") 1)
+                    (table 1 funcref)
+                    (data (i32.const 8) "[]")
+                    (func (export "crucible_inputs") (result i64)
+                        (drop (table.grow (ref.null func) (i32.const {by})))
+                        (i64.or (i64.shl (i64.const 8) (i64.const 32)) (i64.const 2))))"#
+            );
+            Plugin::load(wat.as_bytes(), SMALL).unwrap().inputs()
+        };
+        assert_eq!(grows(1023), Ok(vec![]));
+        assert_eq!(grows(1024), Err(Fault::Memory));
+        let big = r#"(module (memory (export "memory") 1) (table 2000 funcref))"#;
+        let plugin = Plugin::load(big.as_bytes(), SMALL).unwrap();
+        let Err(Fault::Trap(why)) = plugin.inputs() else {
+            panic!("2000 entries is over the limit");
+        };
+        assert!(why.contains("table"), "{why}");
+        let many: String = (0..9).map(|_| "(table 1 funcref)").collect();
+        let wat = format!(r#"(module (memory (export "memory") 1) {many})"#);
+        let plugin = Plugin::load(wat.as_bytes(), SMALL).unwrap();
+        assert!(matches!(plugin.inputs(), Err(Fault::Trap(_))));
+    }
+
+    #[test]
+    fn a_host_call_costs_fuel_for_what_it_moves_and_refuses_a_long_list() {
+        let calling = |call: &str| {
+            let wat = format!(
+                r#"(module
+                    (import "wasi_snapshot_preview1" "random_get"
+                        (func $random (param i32 i32) (result i32)))
+                    (import "wasi_snapshot_preview1" "fd_write"
+                        (func $write (param i32 i32 i32 i32) (result i32)))
+                    (import "wasi_snapshot_preview1" "fd_read"
+                        (func $read (param i32 i32 i32 i32) (result i32)))
+                    (memory (export "memory") 1)
+                    (data (i32.const 8) "[]")
+                    (data (i32.const 16) "[\"refused\"]")
+                    (data (i32.const 500) "\00\00\00\00\ff\ff\ff\ff")
+                    (func (export "crucible_inputs") (result i64)
+                        (if (result i64) (i32.eq {call} (i32.const 28))
+                            (then (i64.or (i64.shl (i64.const 16) (i64.const 32)) (i64.const 11)))
+                            (else (i64.or (i64.shl (i64.const 8) (i64.const 32)) (i64.const 2))))))"#
+            );
+            Plugin::load(wat.as_bytes(), SMALL).unwrap().inputs()
+        };
+        assert_eq!(
+            calling("(call $random (i32.const 1024) (i32.const 0x7fffffff))"),
+            Err(Fault::Fuel)
+        );
+        assert_eq!(
+            calling("(call $random (i32.const 1024) (i32.const 4096))"),
+            Ok(vec![])
+        );
+        for call in ["$write (i32.const 2)", "$read (i32.const 0)"] {
+            let listing = |count: &str| {
+                calling(&format!(
+                    "(call {call} (i32.const 500) (i32.const {count}) (i32.const 600))"
+                ))
+            };
+            assert_eq!(listing("1"), Ok(vec![]), "{call}");
+            assert_eq!(listing("1025"), Ok(vec!["refused".to_string()]), "{call}");
+            assert_eq!(listing("-1"), Ok(vec!["refused".to_string()]), "{call}");
+        }
+    }
+
+    #[test]
+    fn a_write_is_kept_whole_up_to_the_reply_limit() {
+        let writes = r#"(module
+            (import "wasi_snapshot_preview1" "fd_write"
+                (func $write (param i32 i32 i32 i32) (result i32)))
+            (memory (export "memory") 32)
+            (data (i32.const 0) "\00\00\01\00\00\00\18\00")
+            (func (export "run") (result i32)
+                (drop (call $write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 16)))
+                (i32.load (i32.const 16))))"#;
+        let wrote = |reply_bytes: usize| {
+            let limits = Limits {
+                reply_bytes,
+                ..SMALL
+            };
+            let (engine, module) = crate::plugin::module(writes.as_bytes()).unwrap();
+            let mut call = crate::plugin::start(&engine, &module, &limits).unwrap();
+            let run = call
+                .instance
+                .get_typed_func::<(), u32>(&call.store, "run")
+                .unwrap();
+            let reported = run.call(&mut call.store, ()).unwrap();
+            let held = call.store.data();
+            (reported, held.output.len(), held.overflowed)
+        };
+        assert_eq!(wrote(2 << 20), (0x18_0000, 0x18_0000, false));
+        assert_eq!(wrote(0x18_0000), (0x18_0000, 0x18_0000, false));
+        assert_eq!(wrote(4096), (0x18_0000, 4096, true));
     }
 
     #[test]
@@ -702,11 +818,32 @@ mod tests {
         };
         assert_eq!(rows.len(), 64);
         assert_eq!(columns[0].id, "ticket");
-        let ticket = &rows.iter().find(|row| row.id == "DEMO-101").unwrap().cells[0];
+        let row = rows.iter().find(|row| row.id == "DEMO-101").unwrap();
         assert_eq!(
-            ticket.href.as_deref(),
+            row.cells[0].href.as_deref(),
             Some("https://issues.example.com/browse/DEMO-101")
         );
+        assert_eq!(
+            (row.cells[9].text.as_str(), row.cells[9].href.as_deref()),
+            ("triage-go", Some("run:task/triage-go"))
+        );
+        let detail = row.detail.as_deref().unwrap();
+        assert!(
+            detail.starts_with("### DEMO-101: sbom_inaccurate\n"),
+            "{detail}"
+        );
+        for part in [
+            "The final-artifact package scan for the image reported absent.",
+            "| Field | Value |\n|---|---|\n| Package | `google.golang.org/grpc 1.64.0` |",
+            "[triage-go](run:task/triage-go)",
+            "[its verdicts](run:file/triage-go/verdicts.json)",
+        ] {
+            assert!(detail.contains(part), "{part} in {detail}");
+        }
+        let [_, _, Node::Mermaid { source }] = summary.as_slice() else {
+            panic!("Summary ends with how a ticket is categorised");
+        };
+        assert!(source.starts_with("flowchart LR\n"), "{source}");
         let bad = plugin.view(&Request {
             files: vec![File {
                 path: "verdicts.json".into(),
@@ -718,57 +855,5 @@ mod tests {
             panic!("a torn file is the plugin's error");
         };
         assert!(why.starts_with("verdicts.json from triage-go:"), "{why}");
-    }
-
-    #[test]
-    #[ignore = "needs examples/report/ui/report-go/report-go.wasm from `just example-report-view-go`"]
-    fn a_plugin_built_with_go_draws_the_same_scatter() {
-        let pack = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/report");
-        let request = Request {
-            files: ["go", "python"]
-                .into_iter()
-                .map(|lane| File {
-                    path: "verdicts.json".into(),
-                    task: format!("triage-{lane}"),
-                    text: std::fs::read_to_string(pack.join(format!("inbox/{lane}.json"))).unwrap(),
-                })
-                .collect(),
-        };
-        let scatter = |wasm: &str| {
-            let plugin =
-                Plugin::load(&std::fs::read(pack.join(wasm)).unwrap(), Limits::DEFAULT).unwrap();
-            assert_eq!(plugin.inputs().unwrap(), ["verdicts.json"]);
-            let mut found = Vec::new();
-            let mut nodes = vec![plugin.view(&request).unwrap().body];
-            while let Some(node) = nodes.pop() {
-                match node {
-                    Node::Stack { children } => nodes.extend(children),
-                    Node::Tabs { tabs, .. } => nodes.extend(tabs.into_iter().map(|tab| tab.body)),
-                    Node::Plot {
-                        kind: PlotKind::Scatter,
-                        series,
-                        ..
-                    } => found = series,
-                    _ => {}
-                }
-            }
-            let mut marks: Vec<(String, Vec<[u64; 2]>)> = found
-                .into_iter()
-                .map(|series| {
-                    let mut points: Vec<[u64; 2]> = series
-                        .points
-                        .iter()
-                        .map(|point| point.map(f64::to_bits))
-                        .collect();
-                    points.sort();
-                    (series.label, points)
-                })
-                .collect();
-            marks.sort();
-            marks
-        };
-        let go = scatter("ui/report-go/report-go.wasm");
-        assert_eq!(go.iter().map(|(_, points)| points.len()).sum::<usize>(), 64);
-        assert_eq!(go, scatter("ui/report.wasm"));
     }
 }

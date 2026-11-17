@@ -445,11 +445,11 @@ impl Action {
             } => {
                 let view = build_report(&c, dirs.files.as_deref(), &wanted, plugin, listed).await;
                 Reply::Report(crate::report::Built {
-                    report: crate::report::Report {
+                    report: Arc::new(crate::report::Report {
                         name: crate::report::name_of(&wanted.plugin.0),
                         author: None,
                         view,
-                    },
+                    }),
                     wanted,
                 })
             }
@@ -501,11 +501,11 @@ impl Action {
                 result: Err(why),
             }),
             Action::Report { wanted, .. } => Reply::Report(crate::report::Built {
-                report: crate::report::Report {
+                report: Arc::new(crate::report::Report {
                     name: crate::report::name_of(&wanted.plugin.0),
                     author: None,
                     view: Err(why),
-                },
+                }),
                 wanted,
             }),
         }
@@ -760,14 +760,19 @@ async fn build_report(
         crate::net::blocking(move || crate::report::load(&path, plugin.as_bytes()))
             .await
             .ok_or_else(stopped)??;
+    let asked: Vec<&Captured> = listed
+        .iter()
+        .filter(|file| inputs.contains(&file.path))
+        .collect();
+    if let Some(file) = asked.iter().find(|file| !file.shown()) {
+        return Err(format!(
+            "{} is {} bytes, more than a view reads.",
+            file.key, file.size
+        ));
+    }
+    crate::report::readable(asked.iter().map(|file| file.size))?;
     let mut read = Vec::new();
-    for file in listed.iter().filter(|file| inputs.contains(&file.path)) {
-        if !file.shown() {
-            return Err(format!(
-                "{} is {} bytes, more than a view reads.",
-                file.key, file.size
-            ));
-        }
+    for file in asked {
         let kept = file_on_disk(files, &wanted.run, &file.key)
             .filter(|(_, bytes)| wanted.settled && *bytes == file.size);
         let opened = match kept {

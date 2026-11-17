@@ -13,7 +13,9 @@ mod flow;
 #[cfg(target_arch = "wasm32")]
 pub mod guest;
 
-pub use crate::canvas::{Context2d, Draw, LineCap, NotAStyle, Style, TextAlign};
+pub use crate::canvas::{
+    ARC_STEPS, CANVAS_REACH, CURVE_STEPS, Context2d, Draw, LineCap, NotAStyle, Style, TextAlign,
+};
 pub use crate::flow::{FlowLink, FlowNode, flow_columns};
 
 /// The export that reserves `len` bytes in the plugin's memory and returns their address.
@@ -101,6 +103,47 @@ pub enum Node {
         #[serde(default)]
         tone: Tone,
     },
+    /// Markdown: headings, lists, tables, code, links, and diagrams in `mermaid` fences. A link
+    /// is a [`Link`]; one that is not leads nowhere.
+    Markdown { text: String },
+    /// A Mermaid diagram from its source.
+    Mermaid { source: String },
+}
+
+/// Where an address leads: the web, or a place in the run the view is drawn for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Link<'a> {
+    /// `http://` or `https://` and the rest.
+    Web(&'a str),
+    /// `run:task/<task>`, the task as a [`File`] names it.
+    Task(&'a str),
+    /// `run:file/<task>/<path>`, held as `<task>/<path>`.
+    File(&'a str),
+}
+
+impl<'a> Link<'a> {
+    pub fn parse(href: &'a str) -> Option<Link<'a>> {
+        if href.starts_with("https://") || href.starts_with("http://") {
+            return Some(Link::Web(href));
+        }
+        let place = href.strip_prefix("run:")?;
+        if let Some(task) = place.strip_prefix("task/") {
+            return (!task.is_empty()).then_some(Link::Task(task));
+        }
+        let file = place.strip_prefix("file/")?;
+        let (task, path) = file.split_once('/')?;
+        (!task.is_empty() && !path.is_empty()).then_some(Link::File(file))
+    }
+}
+
+/// The address of `task` in the run.
+pub fn task_link(task: &str) -> String {
+    format!("run:task/{task}")
+}
+
+/// The address of the captured file `file` in the run.
+pub fn file_link(file: &File) -> String {
+    format!("run:file/{}/{}", file.task, file.path)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -132,7 +175,7 @@ pub struct Bar {
 #[serde(deny_unknown_fields)]
 pub struct Segment {
     pub label: String,
-    /// Finite and not negative.
+    /// From 0 to [`MAGNITUDE`].
     pub value: f64,
     #[serde(default)]
     pub tone: Tone,
@@ -151,7 +194,7 @@ pub struct Series {
     pub label: String,
     #[serde(default)]
     pub tone: Tone,
-    /// Each point's x then y, both finite.
+    /// Each point's x then y, both within [`MAGNITUDE`] of zero.
     pub points: Vec<[f64; 2]>,
 }
 
@@ -187,19 +230,22 @@ pub enum Width {
     Fill,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Row {
     /// Unique within its table.
     pub id: String,
     pub cells: Vec<Cell>,
+    /// Markdown shown under the table while the row is selected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Cell {
     pub text: String,
-    /// An http(s) address the cell opens.
+    /// The [`Link`] the cell opens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub href: Option<String>,
     #[serde(default)]
@@ -238,24 +284,37 @@ pub enum Tone {
     Info,
 }
 
+/// The largest value a bar segment, plot point or ribbon may hold, either side of zero.
+pub const MAGNITUDE: f64 = 1e15;
+
 /// How much a view may hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     pub nodes: usize,
     pub depth: usize,
+    /// Table cells across the view.
     pub cells: usize,
+    /// Cells in one grid, its header among them.
     pub grid_cells: usize,
-    /// Segments across one set of bars.
-    pub segments: usize,
-    /// Points across one plot.
+    /// Stats, bars, segments, series, grid cells, table columns, and flow stages and ribbons
+    /// across the view.
+    pub items: usize,
+    /// Plot points, and the points of every canvas path filled or stroked, across the view.
     pub points: usize,
+    /// Points in one stretch of a canvas path, from one move or close to the next.
+    pub path_points: usize,
     /// Stages and ribbons in one flow.
     pub flow_nodes: usize,
     pub flow_links: usize,
-    /// Commands in one canvas.
+    /// Canvas commands across the view.
     pub commands: usize,
     /// The longest side of a canvas, in points.
     pub canvas_side: u16,
+    /// Bytes in one title, label, cell or address.
+    pub text: usize,
+    /// Bytes of Markdown and Mermaid source across the view's components, and in one row's
+    /// detail.
+    pub prose: usize,
 }
 
 impl Limits {
@@ -264,12 +323,15 @@ impl Limits {
         depth: 8,
         cells: 500_000,
         grid_cells: 600,
-        segments: 1_000,
-        points: 20_000,
+        items: 20_000,
+        points: 50_000,
+        path_points: 1_000,
         flow_nodes: 60,
         flow_links: 400,
         commands: 20_000,
         canvas_side: 4_000,
+        text: 20_000,
+        prose: 100_000,
     };
 }
 
@@ -283,9 +345,14 @@ pub enum Problem {
     Cells(usize),
     #[error("a grid holds more than {0} cells")]
     GridCells(usize),
-    #[error("a set of bars holds more than {0} segments")]
-    Segments(usize),
-    #[error("the bar segment {0} is negative or not a number")]
+    #[error(
+        "the view holds more than {0} stats, bars, segments, series, grid cells, columns, \
+         stages and ribbons"
+    )]
+    Items(usize),
+    #[error("a title, label, cell or address is longer than {0} bytes")]
+    Text(usize),
+    #[error("the bar segment {0} is not a number from 0 to 1e15")]
     Value(String),
     #[error("a flow holds more than {0} stages")]
     FlowNodes(usize),
@@ -295,19 +362,21 @@ pub enum Problem {
     FlowDuplicate(String),
     #[error("a flow's ribbon names the stage {0}, which it does not have")]
     FlowUnknown(String),
-    #[error("the ribbon from {0} to {1} has a value that is not greater than zero")]
+    #[error("the ribbon from {0} to {1} has a value that is not above 0 and at most 1e15")]
     FlowValue(String, String),
     #[error("a flow's ribbons lead back to a stage they came from")]
     FlowCycle,
     #[error("a canvas is not between 1 and {0} points on each side")]
     CanvasSize(u16),
-    #[error("a canvas holds more than {0} commands")]
+    #[error("the view's canvases hold more than {0} commands")]
     Commands(usize),
-    #[error("canvas command {0} holds a number that is not finite")]
+    #[error("canvas command {0} holds a number that is not within 1,000,000 of zero")]
     CanvasNumber(usize),
-    #[error("a plot holds more than {0} points")]
+    #[error("a canvas path runs more than {0} points without a move or a close")]
+    PathPoints(usize),
+    #[error("the view's plots and canvas paths hold more than {0} points")]
     Points(usize),
-    #[error("the series {0} has a point that is not a number")]
+    #[error("the series {0} has a point that is not a number within 1e15 of zero")]
     Point(String),
     #[error("{0} has a row of {1} cells for {2} columns")]
     RowWidth(String, usize, usize),
@@ -321,14 +390,19 @@ pub enum Problem {
     NoTabs(String),
     #[error("more than one table is shown at once")]
     Tables,
-    #[error("{0} is not an http(s) address")]
+    #[error("{0} is not an http(s) address or a run link")]
     Href(String),
+    #[error("the view's Markdown and diagrams hold more than {0} bytes")]
+    Prose(usize),
+    #[error("a row's detail is longer than {0} bytes")]
+    Detail(usize),
 }
 
 impl View {
     /// Whether the host can draw this view within `limits`.
     pub fn check(&self, limits: &Limits) -> Result<(), Problem> {
         let mut seen = Seen::default();
+        fits(&self.title, limits)?;
         let shown = self.body.check(limits, 1, &mut seen)?;
         if shown > 1 {
             return Err(Problem::Tables);
@@ -337,10 +411,15 @@ impl View {
     }
 }
 
+/// What the view holds so far.
 #[derive(Default)]
 struct Seen {
     nodes: usize,
     cells: usize,
+    items: usize,
+    points: usize,
+    commands: usize,
+    prose: usize,
     ids: HashSet<String>,
 }
 
@@ -352,6 +431,29 @@ impl Seen {
             Err(Problem::DuplicateId(id.to_string()))
         }
     }
+
+    fn items(&mut self, more: usize, limits: &Limits) -> Result<(), Problem> {
+        self.items = self.items.saturating_add(more);
+        if self.items > limits.items {
+            return Err(Problem::Items(limits.items));
+        }
+        Ok(())
+    }
+
+    fn points(&mut self, more: usize, limits: &Limits) -> Result<(), Problem> {
+        self.points = self.points.saturating_add(more);
+        if self.points > limits.points {
+            return Err(Problem::Points(limits.points));
+        }
+        Ok(())
+    }
+}
+
+fn fits(text: &str, limits: &Limits) -> Result<(), Problem> {
+    if text.len() > limits.text {
+        return Err(Problem::Text(limits.text));
+    }
+    Ok(())
 }
 
 impl Node {
@@ -373,30 +475,47 @@ impl Node {
                 Ok(shown)
             }
             Node::Tabs { id, tabs } => {
+                fits(id, limits)?;
                 seen.name(id)?;
                 if tabs.is_empty() {
                     return Err(Problem::NoTabs(id.clone()));
                 }
                 let mut shown = 0;
                 for tab in tabs {
+                    fits(&tab.label, limits)?;
                     shown = shown.max(tab.body.check(limits, depth + 1, seen)?);
                 }
                 Ok(shown)
             }
-            Node::Stats { .. } | Node::Text { .. } => Ok(0),
+            Node::Stats { items } => {
+                seen.items(items.len(), limits)?;
+                for item in items {
+                    fits(&item.label, limits)?;
+                    fits(&item.value, limits)?;
+                }
+                Ok(0)
+            }
+            Node::Text { text, .. } => fits(text, limits).map(|()| 0),
+            Node::Markdown { text: source } | Node::Mermaid { source } => {
+                seen.prose = seen.prose.saturating_add(source.len());
+                if seen.prose > limits.prose {
+                    return Err(Problem::Prose(limits.prose));
+                }
+                Ok(0)
+            }
             Node::Bars { bars } => {
-                let segments: usize = bars.iter().map(|bar| bar.segments.len()).sum();
-                if segments > limits.segments {
-                    return Err(Problem::Segments(limits.segments));
+                seen.items(bars.len(), limits)?;
+                for bar in bars {
+                    fits(&bar.label, limits)?;
+                    seen.items(bar.segments.len(), limits)?;
+                    for segment in &bar.segments {
+                        fits(&segment.label, limits)?;
+                        if !(0.0..=MAGNITUDE).contains(&segment.value) {
+                            return Err(Problem::Value(segment.label.clone()));
+                        }
+                    }
                 }
-                let off = bars
-                    .iter()
-                    .flat_map(|bar| &bar.segments)
-                    .find(|segment| !segment.value.is_finite() || segment.value < 0.0);
-                match off {
-                    Some(segment) => Err(Problem::Value(segment.label.clone())),
-                    None => Ok(0),
-                }
+                Ok(0)
             }
             Node::Flow { nodes, links } => {
                 if nodes.len() > limits.flow_nodes {
@@ -404,6 +523,11 @@ impl Node {
                 }
                 if links.len() > limits.flow_links {
                     return Err(Problem::FlowLinks(limits.flow_links));
+                }
+                seen.items(nodes.len() + links.len(), limits)?;
+                for node in nodes {
+                    fits(&node.id, limits)?;
+                    fits(&node.label, limits)?;
                 }
                 flow_columns(nodes, links).map(|_| 0)
             }
@@ -416,31 +540,61 @@ impl Node {
                 if ![width, height].iter().all(|n| (1.0..=side).contains(*n)) {
                     return Err(Problem::CanvasSize(limits.canvas_side));
                 }
-                if commands.len() > limits.commands {
+                seen.commands = seen.commands.saturating_add(commands.len());
+                if seen.commands > limits.commands {
                     return Err(Problem::Commands(limits.commands));
                 }
-                match commands.iter().position(|command| !command.finite()) {
-                    Some(at) => Err(Problem::CanvasNumber(at)),
-                    None => Ok(0),
+                let (mut path, mut stretch) = (0_usize, 0_usize);
+                for (at, command) in commands.iter().enumerate() {
+                    if !command.in_reach() {
+                        return Err(Problem::CanvasNumber(at));
+                    }
+                    match command {
+                        Draw::BeginPath => (path, stretch) = (0, 0),
+                        Draw::Fill | Draw::Stroke => seen.points(path, limits)?,
+                        Draw::FillRect(_) | Draw::StrokeRect(_) => seen.points(4, limits)?,
+                        Draw::Font(text) | Draw::FillText { text, .. } => fits(text, limits)?,
+                        Draw::MoveTo(_) => (path, stretch) = (path + 1, 1),
+                        Draw::ClosePath | Draw::Rect(_) => {
+                            path += command.path_points();
+                            stretch = 1;
+                        }
+                        other => {
+                            path += other.path_points();
+                            stretch += other.path_points();
+                        }
+                    }
+                    if stretch > limits.path_points {
+                        return Err(Problem::PathPoints(limits.path_points));
+                    }
                 }
+                Ok(0)
             }
-            Node::Plot { series, .. } => {
-                let points: usize = series.iter().map(|s| s.points.len()).sum();
-                if points > limits.points {
-                    return Err(Problem::Points(limits.points));
+            Node::Plot { x, y, series, .. } => {
+                fits(x, limits)?;
+                fits(y, limits)?;
+                seen.items(series.len(), limits)?;
+                for one in series {
+                    fits(&one.label, limits)?;
+                    seen.points(one.points.len(), limits)?;
+                    let within = |v: &f64| (-MAGNITUDE..=MAGNITUDE).contains(v);
+                    if !one.points.iter().flatten().all(within) {
+                        return Err(Problem::Point(one.label.clone()));
+                    }
                 }
-                let off = series
-                    .iter()
-                    .find(|s| s.points.iter().flatten().any(|v| !v.is_finite()));
-                match off {
-                    Some(series) => Err(Problem::Point(series.label.clone())),
-                    None => Ok(0),
-                }
+                Ok(0)
             }
             Node::Grid { columns, rows } => {
-                let cells = columns.len() * (rows.len() + 1);
+                let cells = columns
+                    .len()
+                    .max(1)
+                    .saturating_mul(rows.len().saturating_add(1));
                 if cells > limits.grid_cells {
                     return Err(Problem::GridCells(limits.grid_cells));
+                }
+                seen.items(cells, limits)?;
+                for title in columns {
+                    fits(title, limits)?;
                 }
                 for row in rows {
                     if row.len() != columns.len() {
@@ -450,19 +604,25 @@ impl Node {
                             columns.len(),
                         ));
                     }
-                    links(row)?;
+                    cells_fit(row, limits)?;
                 }
                 Ok(0)
             }
             Node::Table { id, columns, rows } => {
+                fits(id, limits)?;
                 seen.name(id)?;
+                seen.items(columns.len(), limits)?;
                 let mut names = HashSet::new();
                 for column in columns {
+                    fits(&column.id, limits)?;
+                    fits(&column.title, limits)?;
                     if !names.insert(column.id.as_str()) {
                         return Err(Problem::DuplicateColumn(id.clone(), column.id.clone()));
                     }
                 }
-                seen.cells += columns.len() * rows.len();
+                seen.cells = seen
+                    .cells
+                    .saturating_add(columns.len().max(1).saturating_mul(rows.len()));
                 if seen.cells > limits.cells {
                     return Err(Problem::Cells(limits.cells));
                 }
@@ -475,10 +635,18 @@ impl Node {
                             columns.len(),
                         ));
                     }
+                    fits(&row.id, limits)?;
+                    if row
+                        .detail
+                        .as_ref()
+                        .is_some_and(|detail| detail.len() > limits.prose)
+                    {
+                        return Err(Problem::Detail(limits.prose));
+                    }
                     if !ids.insert(row.id.as_str()) {
                         return Err(Problem::DuplicateRow(id.clone(), row.id.clone()));
                     }
-                    links(&row.cells)?;
+                    cells_fit(&row.cells, limits)?;
                 }
                 Ok(1)
             }
@@ -486,12 +654,14 @@ impl Node {
     }
 }
 
-fn links(cells: &[Cell]) -> Result<(), Problem> {
+fn cells_fit(cells: &[Cell], limits: &Limits) -> Result<(), Problem> {
     for cell in cells {
-        if let Some(href) = &cell.href
-            && !(href.starts_with("https://") || href.starts_with("http://"))
-        {
-            return Err(Problem::Href(href.clone()));
+        fits(&cell.text, limits)?;
+        if let Some(href) = &cell.href {
+            fits(href, limits)?;
+            if Link::parse(href).is_none() {
+                return Err(Problem::Href(href.clone()));
+            }
         }
     }
     Ok(())
@@ -500,8 +670,8 @@ fn links(cells: &[Cell]) -> Result<(), Problem> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        Bar, Cell, Column, Limits, Node, PlotKind, Problem, Reply, Row, Segment, Series, Tab, Tone,
-        View,
+        Bar, Cell, Column, File, Limits, Link, Node, PlotKind, Problem, Reply, Row, Segment,
+        Series, Stat, Tab, Tone, View, file_link, task_link,
     };
 
     fn table(id: &str, rows: Vec<Row>) -> Node {
@@ -529,6 +699,7 @@ mod tests {
         Row {
             id: id.to_string(),
             cells: vec![Cell::text(id), Cell::text("affected").tone(Tone::Bad)],
+            detail: None,
         }
     }
 
@@ -599,6 +770,7 @@ mod tests {
             vec![Row {
                 id: "1".into(),
                 cells: vec![Cell::text("only")],
+                detail: None,
             }],
         );
         assert_eq!(
@@ -631,12 +803,134 @@ mod tests {
             vec![Row {
                 id: "1".into(),
                 cells: vec![Cell::text("x").link("file:///etc/passwd"), Cell::text("y")],
+                detail: None,
             }],
         );
         assert_eq!(
             view(bad).check(&Limits::DEFAULT),
             Err(Problem::Href("file:///etc/passwd".into()))
         );
+    }
+
+    #[test]
+    fn a_link_leads_to_the_web_or_into_the_run() {
+        assert_eq!(
+            Link::parse("https://example.com/a"),
+            Some(Link::Web("https://example.com/a"))
+        );
+        assert_eq!(
+            Link::parse("run:task/triage[go]"),
+            Some(Link::Task("triage[go]"))
+        );
+        assert_eq!(
+            Link::parse("run:file/triage-go/evidence/probe.json"),
+            Some(Link::File("triage-go/evidence/probe.json"))
+        );
+        for off in [
+            "",
+            "run:",
+            "run:task/",
+            "run:file/",
+            "run:file/triage-go",
+            "run:file/triage-go/",
+            "run:file//x",
+            "run:pane/files",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "slack://open",
+            "HTTP://example.com",
+        ] {
+            assert_eq!(Link::parse(off), None, "{off}");
+        }
+        let file = File {
+            path: "verdicts.json".into(),
+            task: "triage[go]".into(),
+            text: String::new(),
+        };
+        assert_eq!(
+            Link::parse(&file_link(&file)),
+            Some(Link::File("triage[go]/verdicts.json"))
+        );
+        assert_eq!(
+            Link::parse(&task_link(&file.task)),
+            Some(Link::Task("triage[go]"))
+        );
+        let linked = table(
+            "t",
+            vec![Row {
+                id: "1".into(),
+                cells: vec![
+                    Cell::text("x").link(task_link("triage")),
+                    Cell::text("y").link(file_link(&file)),
+                ],
+                detail: None,
+            }],
+        );
+        assert_eq!(view(linked).check(&Limits::DEFAULT), Ok(()));
+    }
+
+    #[test]
+    fn markdown_and_diagrams_share_a_budget_and_a_row_s_detail_has_its_own() {
+        let markdown = |bytes: usize| Node::Markdown {
+            text: "x".repeat(bytes),
+        };
+        let mermaid = |bytes: usize| Node::Mermaid {
+            source: "x".repeat(bytes),
+        };
+        let pair = |a: Node, b: Node| {
+            view(Node::Stack {
+                children: vec![a, b],
+            })
+        };
+        assert_eq!(pair(markdown(6), mermaid(6)).check(&TIGHT), Ok(()));
+        assert_eq!(
+            pair(markdown(6), mermaid(7)).check(&TIGHT),
+            Err(Problem::Prose(12))
+        );
+        let detailed = |bytes: usize| {
+            view(Node::Stack {
+                children: vec![
+                    markdown(12),
+                    Node::Table {
+                        id: "t".into(),
+                        columns: vec![],
+                        rows: vec![
+                            Row {
+                                id: "1".into(),
+                                cells: vec![],
+                                detail: Some("x".repeat(bytes)),
+                            },
+                            Row {
+                                id: "2".into(),
+                                cells: vec![],
+                                detail: Some("x".repeat(12)),
+                            },
+                        ],
+                    },
+                ],
+            })
+        };
+        assert_eq!(detailed(12).check(&TIGHT), Ok(()));
+        assert_eq!(detailed(13).check(&TIGHT), Err(Problem::Detail(12)));
+
+        let json = r##"{"markdown":{"text":"# Hi"}}"##;
+        assert_eq!(
+            serde_json::from_str::<Node>(json).unwrap(),
+            Node::Markdown {
+                text: "# Hi".into()
+            }
+        );
+        let row = Row {
+            id: "1".into(),
+            cells: vec![],
+            detail: Some("why".into()),
+        };
+        assert_eq!(
+            serde_json::to_string(&row).unwrap(),
+            r#"{"id":"1","cells":[],"detail":"why"}"#
+        );
+        let bare: Row = serde_json::from_str(r#"{"id":"1","cells":[]}"#).unwrap();
+        assert_eq!(bare.detail, None);
     }
 
     #[test]
@@ -658,7 +952,8 @@ mod tests {
         };
         assert_eq!(bars(3.0, 2).check(&Limits::DEFAULT), Ok(()));
         assert_eq!(bars(0.0, 1).check(&Limits::DEFAULT), Ok(()));
-        for value in [-1.0, f64::INFINITY] {
+        assert_eq!(bars(1e15, 1).check(&Limits::DEFAULT), Ok(()));
+        for value in [-1.0, f64::INFINITY, f64::NAN, 1.1e15, f64::MAX] {
             assert_eq!(
                 bars(value, 1).check(&Limits::DEFAULT),
                 Err(Problem::Value("affected".into()))
@@ -670,9 +965,10 @@ mod tests {
             )
             .is_err()
         );
+        assert_eq!(bars(1.0, 19_999).check(&Limits::DEFAULT), Ok(()));
         assert_eq!(
-            bars(1.0, 1_001).check(&Limits::DEFAULT),
-            Err(Problem::Segments(1_000))
+            bars(1.0, 20_000).check(&Limits::DEFAULT),
+            Err(Problem::Items(20_000))
         );
     }
 
@@ -694,13 +990,16 @@ mod tests {
             plot(vec![[7.5, 12.0], [-1.0, 0.0]]).check(&Limits::DEFAULT),
             Ok(())
         );
+        assert_eq!(plot(vec![[-1e15, 1e15]]).check(&Limits::DEFAULT), Ok(()));
+        for off in [f64::NAN, f64::INFINITY, -1.1e15, f64::MAX] {
+            assert_eq!(
+                plot(vec![[1.0, off]]).check(&Limits::DEFAULT),
+                Err(Problem::Point("affected".into()))
+            );
+        }
         assert_eq!(
-            plot(vec![[1.0, f64::NAN]]).check(&Limits::DEFAULT),
-            Err(Problem::Point("affected".into()))
-        );
-        assert_eq!(
-            plot(vec![[0.0, 0.0]; 20_001]).check(&Limits::DEFAULT),
-            Err(Problem::Points(20_000))
+            plot(vec![[0.0, 0.0]; 50_001]).check(&Limits::DEFAULT),
+            Err(Problem::Points(50_000))
         );
         let json = serde_json::to_string(&plot(vec![[1.0, 2.0]])).unwrap();
         assert!(json.contains(r#""kind":"scatter""#), "{json}");
@@ -713,20 +1012,25 @@ mod tests {
         assert!(serde_json::from_str::<Node>(pie).is_err());
     }
 
+    const TIGHT: Limits = Limits {
+        nodes: 3,
+        depth: 2,
+        cells: 2,
+        grid_cells: 4,
+        items: 6,
+        points: 6,
+        path_points: 4,
+        commands: 8,
+        canvas_side: 10,
+        flow_nodes: 2,
+        flow_links: 2,
+        text: 8,
+        prose: 12,
+    };
+
     #[test]
     fn a_view_over_its_limits_is_refused() {
-        let limits = Limits {
-            nodes: 3,
-            depth: 2,
-            cells: 2,
-            grid_cells: 4,
-            segments: 2,
-            points: 2,
-            commands: 2,
-            canvas_side: 10,
-            flow_nodes: 2,
-            flow_links: 2,
-        };
+        let limits = TIGHT;
         let deep = Node::Stack {
             children: vec![Node::Stack {
                 children: vec![Node::Stats { items: vec![] }],
@@ -752,5 +1056,162 @@ mod tests {
             .check(&limits),
             Err(Problem::NoTabs("t".into()))
         );
+    }
+
+    #[test]
+    fn rows_without_columns_still_count() {
+        let grid = |rows: usize| {
+            view(Node::Grid {
+                columns: vec![],
+                rows: vec![vec![]; rows],
+            })
+        };
+        assert_eq!(grid(599).check(&Limits::DEFAULT), Ok(()));
+        assert_eq!(
+            grid(600).check(&Limits::DEFAULT),
+            Err(Problem::GridCells(600))
+        );
+        let table = |rows: usize| {
+            view(Node::Table {
+                id: "t".into(),
+                columns: vec![],
+                rows: (0..rows)
+                    .map(|i| Row {
+                        id: i.to_string(),
+                        cells: vec![],
+                        detail: None,
+                    })
+                    .collect(),
+            })
+        };
+        assert_eq!(table(500_000).check(&Limits::DEFAULT), Ok(()));
+        assert_eq!(
+            table(500_001).check(&Limits::DEFAULT),
+            Err(Problem::Cells(500_000))
+        );
+    }
+
+    #[test]
+    fn limits_hold_across_the_whole_view() {
+        let stat = || Stat {
+            label: "a".into(),
+            value: "1".into(),
+            tone: Tone::Neutral,
+        };
+        let stats = |count: usize| Node::Stats {
+            items: vec![stat(); count],
+        };
+        let series = |points: usize| Series {
+            label: "s".into(),
+            tone: Tone::Neutral,
+            points: vec![[0.0, 0.0]; points],
+        };
+        let plot = |all: Vec<Series>| Node::Plot {
+            kind: PlotKind::Line,
+            x: "x".into(),
+            y: "y".into(),
+            series: all,
+        };
+        let pair = |a: Node, b: Node| {
+            view(Node::Stack {
+                children: vec![a, b],
+            })
+        };
+        assert_eq!(pair(stats(3), stats(3)).check(&TIGHT), Ok(()));
+        assert_eq!(
+            pair(stats(3), stats(4)).check(&TIGHT),
+            Err(Problem::Items(6))
+        );
+        assert_eq!(
+            view(plot(vec![series(0); 7])).check(&TIGHT),
+            Err(Problem::Items(6))
+        );
+        assert_eq!(
+            view(Node::Bars {
+                bars: (0..7)
+                    .map(|_| Bar {
+                        label: "b".into(),
+                        segments: vec![],
+                    })
+                    .collect(),
+            })
+            .check(&TIGHT),
+            Err(Problem::Items(6))
+        );
+        assert_eq!(
+            pair(plot(vec![series(3)]), plot(vec![series(3)])).check(&TIGHT),
+            Ok(())
+        );
+        assert_eq!(
+            pair(plot(vec![series(3)]), plot(vec![series(4)])).check(&TIGHT),
+            Err(Problem::Points(6))
+        );
+        let wide = Node::Table {
+            id: "t".into(),
+            columns: (0..7)
+                .map(|i| Column {
+                    id: i.to_string(),
+                    title: String::new(),
+                    kind: Default::default(),
+                    width: Default::default(),
+                })
+                .collect(),
+            rows: vec![],
+        };
+        assert_eq!(view(wide).check(&TIGHT), Err(Problem::Items(6)));
+    }
+
+    #[test]
+    fn a_long_title_label_cell_or_address_is_refused() {
+        let long = "x".repeat(9);
+        let over = |body: Node| view(body).check(&TIGHT) == Err(Problem::Text(8));
+        assert_eq!(
+            View {
+                title: long.clone(),
+                body: Node::Stats { items: vec![] },
+            }
+            .check(&TIGHT),
+            Err(Problem::Text(8))
+        );
+        assert!(over(Node::Text {
+            text: long.clone(),
+            tone: Tone::Neutral,
+        }));
+        assert!(over(Node::Stats {
+            items: vec![Stat {
+                label: "a".into(),
+                value: long.clone(),
+                tone: Tone::Neutral,
+            }],
+        }));
+        assert!(over(Node::Tabs {
+            id: "t".into(),
+            tabs: vec![Tab {
+                label: long.clone(),
+                count: None,
+                body: Node::Stats { items: vec![] },
+            }],
+        }));
+        assert!(over(Node::Grid {
+            columns: vec!["a".into()],
+            rows: vec![vec![Cell::text(long.clone())]],
+        }));
+        assert!(over(Node::Grid {
+            columns: vec!["a".into()],
+            rows: vec![vec![Cell::text("a").link(format!("https://{long}"))]],
+        }));
+        assert!(over(Node::Table {
+            id: "t".into(),
+            columns: vec![],
+            rows: vec![Row {
+                id: long.clone(),
+                cells: vec![],
+                detail: None,
+            }],
+        }));
+        assert!(!over(Node::Text {
+            text: "x".repeat(8),
+            tone: Tone::Neutral,
+        }));
     }
 }

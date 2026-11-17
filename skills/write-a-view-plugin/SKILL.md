@@ -10,9 +10,9 @@ The desktop app hands it the files a run's tasks captured and draws what it retu
 Report pane. The plugin computes and the app draws: you return a tree of components from a
 fixed set, never pixels or HTML.
 
-`examples/report` is a working pack to copy from: `ui/report/` is the plugin in Rust,
-`ui/report-go/` the same scatter plot in Go. `components.md` beside this file lists every
-component with its JSON.
+Two working packs to copy from: `examples/report-ts` has its plugin in TypeScript
+(`ui/report.ts`), `examples/report` in Rust (`ui/report/`). `components.md` beside this file
+lists every component with its JSON.
 
 Write it in TypeScript unless the pack already has a Rust plugin. A script is text a reviewer
 can read, needs no build beyond a type check, and checks in under a second. Rust gives a
@@ -20,13 +20,14 @@ smaller, faster plugin and is worth it for a view that shapes a lot of data.
 
 ## What a plugin can and cannot do
 
-- It sees only the captured files it names, as text. A file over 8 MiB or not UTF-8 is refused.
+- It sees only the captured files it names, as text. A file over 8 MiB or not UTF-8 is refused,
+  and so are files that together hold more than 32 MiB.
 - It has no network, filesystem, arguments or environment. Its clock counts its own readings
   and its random bytes never change, so the view must depend on the files alone.
 - It runs under limits: about two seconds of work, 256 MiB of memory, a 64 MiB reply, 16 input
   paths. Past one, the pane shows the error instead of the view.
 - A view the app cannot check is refused whole: an unknown component or field, a row whose
-  cells do not match its columns, a number that is not finite, more than one table on screen.
+  cells do not match its columns, a number out of range, more than one table on screen.
 
 ## The loop
 
@@ -40,8 +41,10 @@ smaller, faster plugin and is worth it for a view that shapes a lot of data.
    someone runs after the run.
 3. **Choose components.** Read `components.md`. Headline numbers are `stats`, a pivot is a
    `grid`, the rows are a `table`, a category split is `bars`, an ordered x axis is a `line`
-   plot, two measures are a `scatter` plot. Put alternatives in `tabs`. Use `canvas` only when
-   nothing else can draw it.
+   plot, two measures are a `scatter` plot. Put alternatives in `tabs`. Prose is `markdown`, a
+   process or structure is a `mermaid` diagram, and what explains one row is that row's
+   `detail`. Link a row to the task and file it came from. Use `canvas` only when nothing else
+   can draw it.
 4. **Build.** See below.
 5. **Look at it.** Run the pack, open the Report pane, and read every tab. See "Checking".
 6. **Stop** when the view draws from a real run's files and says what was asked.
@@ -146,14 +149,13 @@ cargo build --release --target wasm32-unknown-unknown --target-dir <outside the 
 cp <target dir>/wasm32-unknown-unknown/release/report_view.wasm ui/report.wasm
 ```
 
-Keep the target directory out of the pack: the pack is saved whole. Do not use
-`wasm32-wasip1` features the host does not answer (files, sockets, the real clock): the module
-is refused when it imports them.
+Keep the target directory out of the pack: the pack is saved whole. Build for
+`wasm32-unknown-unknown`, not a WASI target: a module that imports anything is refused.
 
-## Other languages
+## What a compiled plugin exports
 
-Any language that builds WebAssembly works; `crucible-view` is a convenience, not a requirement.
-The module exports `memory` and three functions:
+`crucible-view`'s `plugin!` writes these for a Rust plugin. A module built another way exports
+`memory` and three functions, and imports nothing:
 
 | Export | Takes | Returns |
 | --- | --- | --- |
@@ -175,11 +177,6 @@ A JSON result is returned as one `i64`: the address in the high 32 bits, the len
 ```json reply
 {"error": "verdicts.json from triage-go: expected a list"}
 ```
-
-Go builds with the standard toolchain: `//go:wasmexport` on the three functions, an empty
-`main`, and `GOOS=wasip1 GOARCH=wasm go build -buildmode=c-shared`. Keep every buffer you hand
-back reachable, or the collector frees it. A Go module is about 3 MB and takes seconds to
-start, against about 200 KB for Rust, so prefer Rust for a pack that ships.
 
 ## Where the plugin goes
 
@@ -236,8 +233,9 @@ When the pane shows an error:
 - `the plugin's view was refused: ...`: the sentence names the rule; see `components.md`.
 - `the plugin trapped: ...; it wrote: ...`: a panic or runtime fault. What follows `it wrote`
   is the plugin's own standard error.
-- `the plugin imports <name>, which the host does not offer`: built for a target or with a
-  library that needs the system. Remove the dependency that pulls it in.
+- `the plugin imports <name>, which the host does not offer`: built for a WASI target or with
+  a library that needs the system. Build for `wasm32-unknown-unknown` and remove the dependency
+  that pulls it in.
 - `the script does not compile: ...`: a syntax error in the `.js`, with its line.
 - `reading the JavaScript engine ...`: the app has no engine module; `just desktop-js-engine`
   fetches it.

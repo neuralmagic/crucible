@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::SystemTime;
 
 use crucible_view::{Column, File, Node, Request, Row, View};
@@ -17,7 +17,8 @@ use rune_kit::{SortDir, TableState};
 
 use base64::Engine;
 
-use crate::captured::SHOWN_BYTES;
+use crate::Selection;
+use crate::captured::{Captured, SHOWN_BYTES};
 use crate::pack::PackFiles;
 use crate::plugin::{JsEngine, Limits, Loaded, Plugin, Script};
 
@@ -31,6 +32,8 @@ const SCRIPT: &str = ".js";
 const WRITTEN: [&str; 2] = [".view.wasm", ".view.js"];
 /// Where a local run keeps the files its tasks captured, one directory per task.
 const CAPTURED: &str = "state/files";
+/// The most bytes of captured files one view reads.
+pub const READ_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Report {
@@ -58,7 +61,7 @@ pub struct Wanted {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Built {
     pub wanted: Wanted,
-    pub report: Report,
+    pub report: Arc<Report>,
 }
 
 /// The plugin a controller's pack carries as text, base64 or JavaScript: its path and that
@@ -125,14 +128,46 @@ pub fn load(path: &str, bytes: &[u8]) -> Result<(Loaded, Vec<String>), String> {
     Ok((plugin, inputs))
 }
 
+/// Refuses files of `sizes` that together hold more than [`READ_BYTES`].
+pub fn readable(sizes: impl Iterator<Item = u64>) -> Result<(), String> {
+    let total = sizes.fold(0_u64, u64::saturating_add);
+    if total > READ_BYTES {
+        return Err(format!(
+            "The files this view reads hold {total} bytes, more than the {READ_BYTES} a view reads."
+        ));
+    }
+    Ok(())
+}
+
 /// The view `plugin` builds from `files`, the captured copies of its `inputs`.
 pub fn run(plugin: &Loaded, inputs: &[String], files: Vec<File>) -> Result<View, String> {
     if files.is_empty() && !inputs.is_empty() {
         return Err(format!("No task has captured {} yet.", inputs.join(" or ")));
     }
+    readable(files.iter().map(|file| file.text.len() as u64))?;
     plugin
         .view(&Request { files })
         .map_err(|fault| fault.to_string())
+}
+
+/// The task a run link names, or the fan-out and instance key for `task[key]`; `runs` says
+/// whether the run has a task of a name.
+pub fn task_named(runs: impl Fn(&str) -> bool, named: &str) -> Option<(&str, Option<&str>)> {
+    if runs(named) {
+        return Some((named, None));
+    }
+    let (task, key) = named.strip_suffix(']')?.split_once('[')?;
+    runs(task).then_some((task, Some(key)))
+}
+
+/// The captured file a run link names as `<task>/<path>`, the task as a plugin is given it.
+pub fn file_named<'a>(files: &'a [Captured], named: &str) -> Option<&'a Captured> {
+    files.iter().find(|file| {
+        named
+            .strip_prefix(file.owner().as_str())
+            .and_then(|rest| rest.strip_prefix('/'))
+            == Some(file.path.as_str())
+    })
 }
 
 /// A file's path, size and modification time.
@@ -225,14 +260,16 @@ fn build(
     inputs: &[String],
     files: &[(String, String, PathBuf)],
 ) -> Result<View, String> {
+    let size = |path: &PathBuf| fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    if let Some((task, input, path)) = files.iter().find(|(.., path)| size(path) > SHOWN_BYTES) {
+        return Err(format!(
+            "{task}/{input} is {} bytes, more than a view reads.",
+            size(path)
+        ));
+    }
+    readable(files.iter().map(|(.., path)| size(path)))?;
     let mut read = Vec::new();
     for (task, input, path) in files {
-        let size = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
-        if size > SHOWN_BYTES {
-            return Err(format!(
-                "{task}/{input} is {size} bytes, more than a view reads."
-            ));
-        }
         let text = fs::read_to_string(path).map_err(|e| format!("reading {task}/{input}: {e}"))?;
         read.push(File {
             path: input.clone(),
@@ -250,11 +287,12 @@ pub struct Reporter {
     author: Option<String>,
     loaded: Option<Result<(Loaded, Vec<String>), String>>,
     read: Vec<Mark>,
-    report: Option<Report>,
+    report: Option<Arc<Report>>,
 }
 
 impl Reporter {
-    pub fn report(&self) -> Option<&Report> {
+    /// The same allocation until the report changes.
+    pub fn report(&self) -> Option<&Arc<Report>> {
         self.report.as_ref()
     }
 
@@ -297,13 +335,15 @@ impl Reporter {
                 build(plugin, inputs, &files)
             }
         };
-        let report = Some(Report {
+        let report = Report {
             name,
             author: self.author.clone(),
             view,
-        });
-        let changed = report != self.report;
-        self.report = report;
+        };
+        let changed = self.report.as_deref() != Some(&report);
+        if changed {
+            self.report = Some(Arc::new(report));
+        }
         changed
     }
 }
@@ -319,14 +359,19 @@ pub struct Table<'a> {
 /// What the Report pane keeps between frames: the tab picked in each set of tabs, and the shown
 /// table's sort and selection.
 pub struct Shown {
+    /// The selection and the report all of this was kept for.
+    selection: Option<Selection>,
+    report: Weak<Report>,
     tabs: HashMap<String, usize>,
     pub table: TableState,
     order: Option<Order>,
 }
 
-/// A table's rows' indices in sorted order.
+/// A table's rows' indices in sorted order, and the sort that gave it.
 pub struct Order {
     table: String,
+    column: String,
+    dir: SortDir,
     rows: Vec<usize>,
 }
 
@@ -345,6 +390,8 @@ impl Order {
         rows.sort_by(|&a, &b| dir.apply(rune_kit::natural_cmp(cell(a), cell(b))));
         Some(Order {
             table: table.id.to_string(),
+            column: column.to_string(),
+            dir,
             rows,
         })
     }
@@ -353,6 +400,8 @@ impl Order {
 impl Default for Shown {
     fn default() -> Self {
         Shown {
+            selection: None,
+            report: Weak::new(),
             tabs: HashMap::new(),
             table: fresh_table(),
             order: None,
@@ -365,6 +414,31 @@ fn fresh_table() -> TableState {
 }
 
 impl Shown {
+    /// Follows the pane to `report` under `selection`: another selection starts over, and
+    /// another report for the same one keeps its tabs and sorts its table again.
+    pub fn follow(&mut self, selection: Option<&Selection>, report: Option<&Arc<Report>>) {
+        let held = report.map_or_else(Weak::new, Arc::downgrade);
+        if self.selection.as_ref() != selection {
+            *self = Shown {
+                selection: selection.cloned(),
+                report: held,
+                ..Shown::default()
+            };
+            return;
+        }
+        if held.ptr_eq(&self.report) {
+            return;
+        }
+        self.report = held;
+        let again = self.order.take().and_then(|order| {
+            let table = self.table_in(&report?.view.as_ref().ok()?.body)?;
+            (table.id == order.table)
+                .then(|| Order::of(&table, &order.column, order.dir))
+                .flatten()
+        });
+        self.order = again;
+    }
+
     /// The picked tab of the `len` tabs named `id`.
     pub fn tab(&self, id: &str, len: usize) -> usize {
         self.tabs
@@ -401,7 +475,9 @@ impl Shown {
             | Node::Flow { .. }
             | Node::Canvas { .. }
             | Node::Grid { .. }
-            | Node::Text { .. } => None,
+            | Node::Text { .. }
+            | Node::Markdown { .. }
+            | Node::Mermaid { .. } => None,
         }
     }
 
@@ -432,7 +508,13 @@ mod tests {
     use crucible_view::{Cell, Column, Node, Row, Tab, View};
     use rune_kit::SortDir;
 
-    use crate::report::{Order, Reporter, Shown};
+    use std::sync::Arc;
+
+    use crate::Selection;
+    use crate::captured::Captured;
+    use crate::report::{
+        Order, READ_BYTES, Report, Reporter, Shown, file_named, readable, task_named,
+    };
 
     fn example() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/report")
@@ -564,6 +646,8 @@ mod tests {
             Node::Grid { .. } => "grid",
             Node::Table { .. } => "table",
             Node::Text { .. } => "text",
+            Node::Markdown { .. } => "markdown",
+            Node::Mermaid { .. } => "mermaid",
         };
         names.insert(name);
     }
@@ -585,7 +669,8 @@ mod tests {
         assert_eq!(
             names.into_iter().collect::<Vec<_>>(),
             [
-                "bars", "canvas", "flow", "grid", "plot", "stack", "stats", "table", "tabs", "text"
+                "bars", "canvas", "flow", "grid", "markdown", "mermaid", "plot", "stack", "stats",
+                "table", "tabs", "text"
             ],
             "every component has an example"
         );
@@ -746,6 +831,56 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs assets/js-engine/plugin.wasm from `just desktop-js-engine`"]
+    fn the_typescript_example_s_script_draws_its_view() {
+        let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/report-ts");
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("ui")).unwrap();
+        fs::copy(
+            example.join("ui/report.js"),
+            dir.path().join("ui/report.js"),
+        )
+        .unwrap();
+        for lane in ["go", "python"] {
+            let captured = dir
+                .path()
+                .join("state/files")
+                .join(format!("triage-{lane}"));
+            fs::create_dir_all(&captured).unwrap();
+            fs::copy(
+                example.join(format!("inbox/{lane}.json")),
+                captured.join("verdicts.json"),
+            )
+            .unwrap();
+        }
+        let mut reporter = Reporter::default();
+        assert!(reporter.refresh(dir.path()));
+        let report = reporter.report().unwrap();
+        let view = report.view.as_ref().unwrap();
+        assert_eq!(
+            view.title,
+            "Triage: 19 to act on, 22 to spot-check, 23 to close"
+        );
+        let mut names = std::collections::BTreeSet::new();
+        component_names(&view.body, &mut names);
+        assert_eq!(
+            names.into_iter().collect::<Vec<_>>(),
+            [
+                "canvas", "flow", "markdown", "stack", "stats", "table", "tabs", "text"
+            ]
+        );
+        let mut shown = Shown::default();
+        assert!(shown.table(view).is_none(), "the first tab holds no table");
+        shown.pick("queue", 3);
+        let row = &shown.table(view).unwrap().rows[0];
+        let detail = row.detail.as_deref().unwrap();
+        assert!(detail.contains("](run:task/triage-"), "{detail}");
+        assert!(detail.contains("](run:file/triage-"), "{detail}");
+        let lane = row.cells[8].href.as_deref().unwrap();
+        assert!(lane.starts_with("run:task/triage-"), "{lane}");
+    }
+
+    #[test]
     fn a_torn_file_is_the_report_s_error() {
         let dir = pack();
         let captured = dir.path().join("state/files/triage-go");
@@ -774,6 +909,7 @@ mod tests {
                 .map(|name| Row {
                     id: name.to_string(),
                     cells: vec![Cell::text(*name)],
+                    detail: None,
                 })
                 .collect(),
         }
@@ -843,5 +979,152 @@ mod tests {
         shown.sort(Order::of(&table, "name", SortDir::Ascending));
         shown.pick("by", 1);
         assert_eq!(ids(&shown), ["item10", "item2", "item1"]);
+    }
+
+    #[test]
+    fn another_report_is_sorted_again_and_another_selection_starts_over() {
+        let report = |names: &[&str]| {
+            let mut view = tabbed();
+            let Node::Stack { children } = &mut view.body else {
+                panic!("tabbed is a stack");
+            };
+            let Node::Tabs { tabs, .. } = &mut children[1] else {
+                panic!("tabbed holds tabs");
+            };
+            tabs[1].body = table("all", names);
+            Arc::new(Report {
+                name: "report".into(),
+                author: None,
+                view: Ok(view),
+            })
+        };
+        let ids = |shown: &Shown, report: &Report| -> Vec<String> {
+            let table = shown.table(report.view.as_ref().unwrap()).unwrap();
+            (0..table.rows.len())
+                .map(|i| shown.row(&table, i).unwrap().id.clone())
+                .collect()
+        };
+        let local = |name: &str| Selection::Local(name.into());
+        let first = report(&["item10", "item2", "item1"]);
+        let mut shown = Shown::default();
+        shown.follow(Some(&local("a")), Some(&first));
+        shown.pick("by", 1);
+        let table = shown.table(first.view.as_ref().unwrap()).unwrap();
+        shown.sort(Order::of(&table, "name", SortDir::Ascending));
+        assert_eq!(ids(&shown, &first), ["item1", "item2", "item10"]);
+        shown.follow(Some(&local("a")), Some(&first));
+        assert_eq!(ids(&shown, &first), ["item1", "item2", "item10"]);
+
+        let second = report(&["b9", "b10", "a1"]);
+        shown.follow(Some(&local("a")), Some(&second));
+        assert_eq!(shown.tab("by", 2), 1, "the picked tab is kept");
+        assert_eq!(ids(&shown, &second), ["a1", "b9", "b10"]);
+
+        let failed = Arc::new(Report {
+            name: "report".into(),
+            author: None,
+            view: Err("torn".into()),
+        });
+        shown.follow(Some(&local("a")), Some(&failed));
+        shown.follow(Some(&local("a")), Some(&second));
+        assert_eq!(ids(&shown, &second), ["b9", "b10", "a1"]);
+
+        shown.sort(Order::of(
+            &shown.table(second.view.as_ref().unwrap()).unwrap(),
+            "name",
+            SortDir::Ascending,
+        ));
+        shown.follow(Some(&local("b")), Some(&second));
+        assert_eq!(
+            shown.tab("by", 2),
+            0,
+            "another selection starts on its first tab"
+        );
+        shown.pick("by", 1);
+        assert_eq!(ids(&shown, &second), ["b9", "b10", "a1"]);
+        shown.follow(None, None);
+        assert_eq!(shown.tab("by", 2), 0);
+    }
+
+    #[test]
+    fn a_view_reads_only_so_many_bytes_in_all() {
+        assert_eq!(
+            readable([READ_BYTES / 2, READ_BYTES / 2].into_iter()),
+            Ok(())
+        );
+        let over = readable([READ_BYTES, 1].into_iter()).unwrap_err();
+        assert!(over.contains("33554433 bytes"), "{over}");
+        assert!(readable([u64::MAX, u64::MAX].into_iter()).is_err());
+
+        let dir = pack();
+        for task in ["a", "b", "c", "d", "e"] {
+            let captured = dir.path().join("state/files").join(task);
+            fs::create_dir_all(&captured).unwrap();
+            let file = fs::File::create(captured.join("verdicts.json")).unwrap();
+            file.set_len(7 * 1024 * 1024).unwrap();
+        }
+        let mut reporter = Reporter::default();
+        assert!(reporter.refresh(dir.path()));
+        let error = reporter.report().unwrap().view.clone().unwrap_err();
+        assert!(
+            error.starts_with("The files this view reads hold 36700160 bytes"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_run_link_names_a_task_an_instance_or_a_captured_file() {
+        let runs = |name: &str| ["triage", "odd[name]"].contains(&name);
+        assert_eq!(task_named(runs, "triage"), Some(("triage", None)));
+        assert_eq!(task_named(runs, "triage[go]"), Some(("triage", Some("go"))));
+        assert_eq!(task_named(runs, "odd[name]"), Some(("odd[name]", None)));
+        assert_eq!(
+            task_named(runs, "triage[a[b]]"),
+            Some(("triage", Some("a[b]")))
+        );
+        for off in ["tri", "other[go]", "triage]", "triage[go", ""] {
+            assert_eq!(task_named(runs, off), None, "{off}");
+        }
+
+        let file = |task: &str, instance: Option<&str>, path: &str, key: &str| Captured {
+            task: task.into(),
+            instance: instance.map(Into::into),
+            path: path.into(),
+            size: 1,
+            key: key.into(),
+        };
+        let files = [
+            file(
+                "triage",
+                Some("go"),
+                "verdicts.json",
+                "triage-0/verdicts.json",
+            ),
+            file(
+                "triage",
+                Some("py"),
+                "evidence/probe.json",
+                "triage-1/evidence/probe.json",
+            ),
+            file("report", None, "out.md", "report/out.md"),
+        ];
+        let key = |named: &str| file_named(&files, named).map(|file| file.key.as_str());
+        assert_eq!(
+            key("triage[go]/verdicts.json"),
+            Some("triage-0/verdicts.json")
+        );
+        assert_eq!(
+            key("triage[py]/evidence/probe.json"),
+            Some("triage-1/evidence/probe.json")
+        );
+        assert_eq!(key("report/out.md"), Some("report/out.md"));
+        for off in [
+            "triage/verdicts.json",
+            "triage[go]verdicts.json",
+            "report/",
+            "out.md",
+        ] {
+            assert_eq!(key(off), None, "{off}");
+        }
     }
 }

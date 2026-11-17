@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Problem, Tone};
+use crate::{MAGNITUDE, Problem, Tone};
 
 /// A stage: a bar as tall as what flows through it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,7 +24,7 @@ pub struct FlowNode {
 pub struct FlowLink {
     pub from: String,
     pub to: String,
-    /// Finite and greater than zero.
+    /// Greater than zero, and at most [`MAGNITUDE`].
     pub value: f64,
     /// The ribbon's colour; the tone of the stage it reaches when not given.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -48,7 +48,7 @@ pub fn flow_columns(nodes: &[FlowNode], links: &[FlowLink]) -> Result<Vec<usize>
                 .copied()
                 .ok_or_else(|| Problem::FlowUnknown(id.clone()))
         };
-        if !link.value.is_finite() || link.value <= 0.0 {
+        if !(link.value > 0.0 && link.value <= MAGNITUDE) {
             return Err(Problem::FlowValue(link.from.clone(), link.to.clone()));
         }
         ends.push((end(&link.from)?, end(&link.to)?));
@@ -130,7 +130,9 @@ mod tests {
             checked(nodes(), vec![link("a", "z", 1.0)]),
             Err(Problem::FlowUnknown("z".into()))
         );
-        for value in [0.0, -2.0, f64::NAN] {
+        assert_eq!(checked(nodes(), vec![link("a", "b", 1e15)]), Ok(()));
+        assert_eq!(checked(nodes(), vec![link("a", "b", 1e-300)]), Ok(()));
+        for value in [0.0, -2.0, f64::NAN, f64::INFINITY, 1.1e15] {
             assert_eq!(
                 checked(nodes(), vec![link("a", "b", value)]),
                 Err(Problem::FlowValue("a".into(), "b".into()))

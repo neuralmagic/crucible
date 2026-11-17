@@ -30,6 +30,8 @@ fn count(node: &Node, counts: &mut BTreeMap<&'static str, usize>) {
         Node::Grid { .. } => "grid",
         Node::Table { .. } => "table",
         Node::Text { .. } => "text",
+        Node::Markdown { .. } => "markdown",
+        Node::Mermaid { .. } => "mermaid",
     };
     *counts.entry(name).or_default() += 1;
 }

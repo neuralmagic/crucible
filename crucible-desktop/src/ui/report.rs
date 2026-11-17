@@ -4,12 +4,14 @@ mod canvas;
 mod flow;
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 
 use crucible_view::{
-    Bar, Cell, Column, ColumnKind, Node, PlotKind, Series, Stat, Tab, Tone, Width,
+    Bar, Cell, Column, ColumnKind, Node, PlotKind, Row, Series, Stat, Tab, Tone, Width,
 };
 use rune::{Align, Color, El, LineCap, Shape, Tx, canvas, col, el, row, text};
-use rune_kit::{Kit, Table, TableColumn};
+use rune_kit::{IconButton, IconButtonVariant, Kit, Markdown, Table, TableColumn};
+use rune_theme_opencode::icons as oc;
 
 use crate::App;
 use crate::ui::{Paint, desk};
@@ -99,7 +101,27 @@ fn node(node_: &Node, fills: bool, app: &App, p: &Paint) -> El {
             .selectable(true)
             .selection_color(p.k.selection())
             .wrap(),
+        Node::Markdown { text: body } => markdown(body.clone(), "report-markdown", p),
+        Node::Mermaid { source } => markdown(fenced(source), "report-mermaid", p),
     }
+}
+
+/// Markdown whose links lead to the web or into the run.
+fn markdown(body: String, key: &str, p: &Paint) -> El {
+    Markdown::new(body)
+        .selectable(true)
+        .on_link_tx(|app: &mut App, href: &str, tx: &mut Tx| app.follow_report_link(href, tx))
+        .build(p.k)
+        .key(key.to_string())
+        .w_full()
+        .max_w(720.0)
+}
+
+/// `source` as Markdown holding one `mermaid` fence, longer than any run of backticks in it.
+fn fenced(source: &str) -> String {
+    let longest = source.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest.max(2) + 1);
+    format!("{fence}mermaid\n{source}\n{fence}\n")
 }
 
 fn ink(tone: Tone, k: &Kit) -> Option<Color> {
@@ -257,13 +279,12 @@ fn bars(all: &[Bar], p: &Paint) -> El {
 
 /// Each label once, in the order first seen, beside its colour.
 fn legend<'a>(items: impl Iterator<Item = (&'a str, Tone)>, p: &Paint) -> El {
-    let mut seen: Vec<&str> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
     let mut key = row().w_full().gap(14.0).flex_wrap();
     for (label, tone) in items {
-        if seen.contains(&label) {
+        if !seen.insert(label) {
             continue;
         }
-        seen.push(label);
         key = key.child(
             row()
                 .gap(6.0)
@@ -451,7 +472,7 @@ fn table(columns: &[Column], app: &App, p: &Paint) -> El {
         .collect();
     let k = p.k;
     let link = p.accent;
-    table
+    let table = table
         .name("Report")
         .cell(move |app: &App, i, column| {
             let Some(at) = kinds.iter().position(|(id, _)| id == column) else {
@@ -461,23 +482,83 @@ fn table(columns: &[Column], app: &App, p: &Paint) -> El {
                 return rune_kit::Cell::text("");
             };
             let kind = kinds.get(at).map_or(ColumnKind::Text, |(_, kind)| *kind);
-            drawn(cell, kind, link, k)
+            let leads = cell
+                .href
+                .as_deref()
+                .is_some_and(|href| app.report_leads(href));
+            drawn(cell, kind, leads.then_some(link), k)
         })
         .on_sort(|app: &mut App, column, dir, _| app.sort_report(column, dir))
         .on_open(|app: &mut App, id, tx: &mut Tx| {
-            if let Some(url) = app.report_link(id) {
-                let _ = tx.open_url(&url);
+            if let Some(href) = app.report_link(id) {
+                app.follow_report_link(&href, tx);
             }
         })
         .zebra(true)
         .build(app, k)
         .key("report-table")
         .grow(1.0)
+        .min_h(0.0);
+    let Some(shown) = app.report_detail() else {
+        return table;
+    };
+    col()
+        .w_full()
+        .grow(1.0)
         .min_h(0.0)
+        .gap(10.0)
+        .child(table)
+        .child(detail(shown, p))
 }
 
-fn drawn(cell: &Cell, kind: ColumnKind, link: Color, k: &Kit) -> rune_kit::Cell {
-    if let Some(url) = cell.href.clone() {
+/// The selected row's detail, under the table.
+fn detail(shown: &Row, p: &Paint) -> El {
+    let body = shown.detail.clone().unwrap_or_default();
+    col()
+        .key("report-detail")
+        .w_full()
+        .h(260.0)
+        .radius(p.k.radius.lg)
+        .fill(p.c.layer_01)
+        .border(p.hair, p.c.border_muted)
+        .child(
+            row()
+                .w_full()
+                .h(32.0)
+                .pl(12.0)
+                .pr(6.0)
+                .center_y()
+                .child(
+                    text(shown.id.clone())
+                        .font(p.mono(11.5, 520.0))
+                        .color(p.c.text_muted)
+                        .truncate(),
+                )
+                .child(el().grow(1.0))
+                .child(
+                    IconButton::new(&oc::XMARK_SMALL)
+                        .variant(IconButtonVariant::GhostMuted)
+                        .label("Close")
+                        .on_press(|app: &mut App| app.report_shown.table.clear_selection())
+                        .build(p.k)
+                        .key("report-detail-close"),
+                ),
+        )
+        .child(el().h(p.hair).w_full().fill(p.c.border_muted))
+        .child(desk::scrolled(
+            "report-detail-scroll",
+            col().w_full().padding(12.0).child(markdown(
+                body,
+                &format!("report-detail-{}", shown.id),
+                p,
+            )),
+            p,
+        ))
+}
+
+/// `link` is the colour of a cell whose address leads somewhere.
+fn drawn(cell: &Cell, kind: ColumnKind, link: Option<Color>, k: &Kit) -> rune_kit::Cell {
+    if let (Some(url), Some(link)) = (cell.href.clone(), link) {
         let style = if kind == ColumnKind::Mono {
             k.ty.mono
         } else {
@@ -490,9 +571,7 @@ fn drawn(cell: &Cell, kind: ColumnKind, link: Color, k: &Kit) -> rune_kit::Cell 
                 .role("link")
                 .label(format!("Open {url}"))
                 .help(url.clone())
-                .on_press_tx(move |_: &mut App, tx| {
-                    let _ = tx.open_url(&url);
-                }),
+                .on_press_tx(move |app: &mut App, tx| app.follow_report_link(&url, tx)),
         );
     }
     match kind {
@@ -519,5 +598,24 @@ fn drawn(cell: &Cell, kind: ColumnKind, link: Color, k: &Kit) -> rune_kit::Cell 
                 None => body,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ui::report::fenced;
+
+    #[test]
+    fn a_diagram_s_fence_is_longer_than_any_run_of_backticks_in_it() {
+        assert_eq!(
+            fenced("graph TD\n  a --> b"),
+            "```mermaid\ngraph TD\n  a --> b\n```\n"
+        );
+        assert_eq!(
+            fenced("graph TD\n```\n# not a heading"),
+            "````mermaid\ngraph TD\n```\n# not a heading\n````\n"
+        );
+        assert!(fenced("a ````` b").starts_with("``````mermaid\n"));
+        assert_eq!(fenced(""), "```mermaid\n\n```\n");
     }
 }

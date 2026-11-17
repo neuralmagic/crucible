@@ -97,7 +97,7 @@ pub struct PackView {
     pub pack: PackFiles,
     pub preview: Preview,
     /// The pack's own view of the run, when it ships one.
-    pub report: Option<crate::report::Report>,
+    pub report: Option<std::sync::Arc<crate::report::Report>>,
 }
 
 impl PackView {

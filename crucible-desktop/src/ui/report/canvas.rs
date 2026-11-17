@@ -1,10 +1,10 @@
 //! Draws a view's canvas: its commands, read as the HTML canvas's 2D context reads them, become
 //! one vector shape with the text laid over it.
 
-use std::f32::consts::{PI, TAU};
+use std::f32::consts::TAU;
 
-use crucible_view::{Draw, LineCap, Style, TextAlign, Tone};
-use rune::{Color, El, Path, Shape, canvas, el, row, text};
+use crucible_view::{ARC_STEPS, CURVE_STEPS, Draw, LineCap, Style, TextAlign, Tone};
+use rune::{Color, El, Shape, canvas, el, row, text};
 
 use crate::ui::Paint;
 
@@ -57,57 +57,139 @@ fn colour(style: Style, p: &Paint) -> Color {
     }
 }
 
-/// The current path: its subpaths, and where the last one started and stands.
+/// A stretch of the current path: its points, and whether it joins back to its first.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Subpath {
+    points: Vec<[f32; 2]>,
+    closed: bool,
+}
+
+/// The current path, flattened to points as its commands arrive.
 #[derive(Default)]
 struct Pen {
-    subpaths: Vec<Path>,
-    start: Option<[f32; 2]>,
-    at: Option<[f32; 2]>,
+    subpaths: Vec<Subpath>,
 }
 
 impl Pen {
+    fn at(&self) -> Option<[f32; 2]> {
+        self.subpaths.last()?.points.last().copied()
+    }
+
     fn move_to(&mut self, to: [f32; 2]) {
-        self.subpaths.push(Path::new().move_to(to));
-        self.start = Some(to);
-        self.at = Some(to);
+        self.subpaths.push(Subpath {
+            points: vec![to],
+            closed: false,
+        });
     }
 
-    /// Extends the last subpath with `draw`, which ends at `to`; starts one at `to` when there
-    /// is none, as the 2D context does.
-    fn extend(&mut self, to: [f32; 2], draw: impl FnOnce(Path) -> Path) {
-        match (self.at, self.subpaths.pop()) {
-            (Some(_), Some(last)) => {
-                self.subpaths.push(draw(last));
-                self.at = Some(to);
-            }
-            (_, last) => {
-                self.subpaths.extend(last);
-                self.move_to(to);
-            }
+    /// A line to `to`; a move there when the path is empty, as the 2D context does.
+    fn line_to(&mut self, to: [f32; 2]) {
+        match self.subpaths.last_mut() {
+            Some(last) => last.points.push(to),
+            None => self.move_to(to),
         }
     }
 
+    /// A curve from where the pen stands, or from `control` when the path is empty, flattened
+    /// to at most [`CURVE_STEPS`] lines. `length` is that of its control polygon and `along`
+    /// the curve's point at each fraction of the way.
+    fn curve(
+        &mut self,
+        control: [f32; 2],
+        length: impl Fn([f32; 2]) -> f32,
+        along: impl Fn([f32; 2], f32) -> [f32; 2],
+    ) {
+        let from = match self.at() {
+            Some(from) => from,
+            None => {
+                self.move_to(control);
+                control
+            }
+        };
+        let steps = ((length(from) / 0.1).sqrt() * 0.5)
+            .ceil()
+            .clamp(1.0, CURVE_STEPS as f32) as usize;
+        for step in 1..=steps {
+            self.line_to(along(from, step as f32 / steps as f32));
+        }
+    }
+
+    /// Joins the last stretch back to its start and starts the next one there.
     fn close(&mut self) {
-        if let Some(last) = self.subpaths.pop() {
-            self.subpaths.push(last.close());
-            self.at = self.start;
-        }
+        let Some(last) = self.subpaths.last_mut() else {
+            return;
+        };
+        let Some(start) = last.points.first().copied() else {
+            return;
+        };
+        last.closed = true;
+        self.move_to(start);
     }
 
-    fn rect(&mut self, [x, y, w, h]: [f32; 4]) {
-        self.move_to([x, y]);
-        for corner in [[x + w, y], [x + w, y + h], [x, y + h]] {
-            self.extend(corner, |path| path.line_to(corner));
+    /// Takes a path command; false for any other.
+    fn take(&mut self, command: &Draw) -> bool {
+        match command {
+            Draw::BeginPath => self.subpaths.clear(),
+            Draw::MoveTo(to) => self.move_to(*to),
+            Draw::LineTo(to) => self.line_to(*to),
+            Draw::QuadraticCurveTo([cx, cy, x, y]) => {
+                let (c, p) = ([*cx, *cy], [*x, *y]);
+                self.curve(
+                    c,
+                    |a| dist(a, c) + dist(c, p),
+                    |a, t| {
+                        let u = 1.0 - t;
+                        [0, 1].map(|i| u * u * a[i] + 2.0 * u * t * c[i] + t * t * p[i])
+                    },
+                );
+            }
+            Draw::BezierCurveTo([ax, ay, bx, by, x, y]) => {
+                let (c1, c2, p) = ([*ax, *ay], [*bx, *by], [*x, *y]);
+                self.curve(
+                    c1,
+                    |a| dist(a, c1) + dist(c1, c2) + dist(c2, p),
+                    |a, t| {
+                        let u = 1.0 - t;
+                        let (b0, b1, b2, b3) =
+                            (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
+                        [0, 1].map(|i| b0 * a[i] + b1 * c1[i] + b2 * c2[i] + b3 * p[i])
+                    },
+                );
+            }
+            Draw::Arc {
+                x,
+                y,
+                radius,
+                start_angle,
+                end_angle,
+                counterclockwise,
+            } => {
+                for point in arc_points(
+                    [*x, *y],
+                    *radius,
+                    *start_angle,
+                    *end_angle,
+                    *counterclockwise,
+                ) {
+                    self.line_to(point);
+                }
+            }
+            Draw::Rect([x, y, w, h]) => {
+                self.move_to([*x, *y]);
+                for corner in [[x + w, *y], [x + w, y + h], [*x, y + h]] {
+                    self.line_to(corner);
+                }
+                self.close();
+            }
+            Draw::ClosePath => self.close(),
+            _ => return false,
         }
-        self.close();
-        self.move_to([x, y]);
+        true
     }
+}
 
-    fn arc(&mut self, centre: [f32; 2], radius: f32, from: f32, to: f32, counterclockwise: bool) {
-        for point in arc_points(centre, radius, from, to, counterclockwise) {
-            self.extend(point, |path| path.line_to(point));
-        }
-    }
+fn dist(a: [f32; 2], b: [f32; 2]) -> f32 {
+    ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt()
 }
 
 /// The points of an arc, a line segment at most 7.5 degrees apart.
@@ -128,7 +210,7 @@ fn arc_points(
         sweep = sweep.rem_euclid(TAU);
     }
     let sweep = sweep.min(TAU);
-    let steps = ((sweep / (PI / 24.0)).ceil() as usize).max(1);
+    let steps = ((sweep / (TAU / ARC_STEPS as f32)).ceil() as usize).clamp(1, ARC_STEPS);
     (0..=steps)
         .map(|step| {
             let turned = sweep * step as f32 / steps as f32;
@@ -206,41 +288,20 @@ pub(crate) fn canvas_view(width: f32, height: f32, commands: &[Draw], p: &Paint)
                     state = earlier;
                 }
             }
-            Draw::BeginPath => pen = Pen::default(),
-            Draw::MoveTo(to) => pen.move_to(*to),
-            Draw::LineTo(to) => pen.extend(*to, |path| path.line_to(*to)),
-            Draw::QuadraticCurveTo([cx, cy, x, y]) => {
-                pen.extend([*x, *y], |path| path.quad_to([*cx, *cy], [*x, *y]));
-            }
-            Draw::BezierCurveTo([ax, ay, bx, by, x, y]) => {
-                pen.extend([*x, *y], |path| {
-                    path.cubic_to([*ax, *ay], [*bx, *by], [*x, *y])
-                });
-            }
-            Draw::Arc {
-                x,
-                y,
-                radius,
-                start_angle,
-                end_angle,
-                counterclockwise,
-            } => pen.arc(
-                [*x, *y],
-                *radius,
-                *start_angle,
-                *end_angle,
-                *counterclockwise,
-            ),
-            Draw::Rect(rect) => pen.rect(*rect),
-            Draw::ClosePath => pen.close(),
             Draw::Fill => {
-                for path in &pen.subpaths {
-                    shape = shape.fill_path(path, fill);
+                for sub in &pen.subpaths {
+                    shape = shape.fill(sub.points.clone(), fill);
                 }
             }
             Draw::Stroke => {
-                for path in &pen.subpaths {
-                    shape = shape.stroke_path(path, state.line_width, rune_cap(state.cap), stroke);
+                for sub in &pen.subpaths {
+                    shape = shape.stroke_with(
+                        sub.points.clone(),
+                        sub.closed,
+                        state.line_width,
+                        rune_cap(state.cap),
+                        stroke,
+                    );
                 }
             }
             Draw::FillRect([x, y, w, h]) => {
@@ -250,15 +311,18 @@ pub(crate) fn canvas_view(width: f32, height: f32, commands: &[Draw], p: &Paint)
                 );
             }
             Draw::StrokeRect([x, y, w, h]) => {
-                let outline = Path::new()
-                    .move_to([*x, *y])
-                    .line_to([x + w, *y])
-                    .line_to([x + w, y + h])
-                    .line_to([*x, y + h])
-                    .close();
-                shape = shape.stroke_path(&outline, state.line_width, rune_cap(state.cap), stroke);
+                shape = shape.stroke_with(
+                    vec![[*x, *y], [x + w, *y], [x + w, y + h], [*x, y + h]],
+                    true,
+                    state.line_width,
+                    rune_cap(state.cap),
+                    stroke,
+                );
             }
             Draw::FillText { text: body, x, y } => labels.push(label(body, [*x, *y], &state, p)),
+            path => {
+                pen.take(path);
+            }
         }
     }
     el().key("report-canvas")
@@ -271,7 +335,9 @@ pub(crate) fn canvas_view(width: f32, height: f32, commands: &[Draw], p: &Paint)
 mod tests {
     use std::f32::consts::{PI, TAU};
 
-    use crate::ui::report::canvas::{Font, Pen, arc_points};
+    use crucible_view::Draw;
+
+    use crate::ui::report::canvas::{Font, Pen, Subpath, arc_points};
 
     fn near(a: [f32; 2], b: [f32; 2]) -> bool {
         (a[0] - b[0]).abs() < 1e-3 && (a[1] - b[1]).abs() < 1e-3
@@ -331,18 +397,111 @@ mod tests {
         ));
     }
 
+    fn points(pen: &Pen) -> usize {
+        pen.subpaths.iter().map(|sub| sub.points.len()).sum()
+    }
+
+    fn arc(end_angle: f32) -> Draw {
+        Draw::Arc {
+            x: 0.0,
+            y: 0.0,
+            radius: 5.0,
+            start_angle: 0.0,
+            end_angle,
+            counterclockwise: false,
+        }
+    }
+
     #[test]
-    fn a_pen_starts_a_subpath_when_a_line_has_none_and_closes_back_to_its_start() {
+    fn a_line_with_no_path_starts_one_and_a_close_starts_the_next_at_its_start() {
         let mut pen = Pen::default();
-        pen.extend([3.0, 4.0], |path| path.line_to([3.0, 4.0]));
-        assert_eq!((pen.subpaths.len(), pen.at), (1, Some([3.0, 4.0])));
-        pen.extend([9.0, 4.0], |path| path.line_to([9.0, 4.0]));
-        assert_eq!((pen.subpaths.len(), pen.at), (1, Some([9.0, 4.0])));
-        pen.close();
-        assert_eq!(pen.at, Some([3.0, 4.0]));
-        pen.rect([0.0, 0.0, 2.0, 2.0]);
-        assert_eq!((pen.subpaths.len(), pen.at), (3, Some([0.0, 0.0])));
-        pen.close();
-        Pen::default().close();
+        pen.take(&Draw::LineTo([3.0, 4.0]));
+        pen.take(&Draw::LineTo([9.0, 4.0]));
+        pen.take(&Draw::LineTo([9.0, 8.0]));
+        assert_eq!((pen.subpaths.len(), pen.at()), (1, Some([9.0, 8.0])));
+        pen.take(&Draw::ClosePath);
+        assert!(pen.subpaths[0].closed);
+        assert_eq!(pen.subpaths[0].points.len(), 3);
+        assert_eq!((pen.subpaths.len(), pen.at()), (2, Some([3.0, 4.0])));
+        pen.take(&Draw::LineTo([0.0, 0.0]));
+        assert_eq!(pen.subpaths[1].points, [[3.0, 4.0], [0.0, 0.0]]);
+
+        pen.take(&Draw::Rect([1.0, 1.0, 2.0, 2.0]));
+        assert_eq!(
+            pen.subpaths[2],
+            Subpath {
+                points: vec![[1.0, 1.0], [3.0, 1.0], [3.0, 3.0], [1.0, 3.0]],
+                closed: true,
+            }
+        );
+        assert_eq!(pen.at(), Some([1.0, 1.0]));
+        pen.take(&Draw::BeginPath);
+        assert_eq!((points(&pen), pen.at()), (0, None));
+        pen.take(&Draw::ClosePath);
+        assert_eq!(points(&pen), 0);
+        assert!(!pen.take(&Draw::Fill));
+    }
+
+    #[test]
+    fn a_curve_ends_on_its_point_and_starts_at_its_control_when_the_path_is_empty() {
+        let mut pen = Pen::default();
+        pen.take(&Draw::QuadraticCurveTo([10.0, 0.0, 10.0, 10.0]));
+        assert_eq!(pen.subpaths[0].points[0], [10.0, 0.0]);
+        assert!(near(pen.at().unwrap(), [10.0, 10.0]));
+
+        let mut pen = Pen::default();
+        pen.take(&Draw::MoveTo([0.0, 0.0]));
+        pen.take(&Draw::BezierCurveTo([0.0, 10.0, 10.0, 10.0, 10.0, 0.0]));
+        let points = &pen.subpaths[0].points;
+        assert!(near(points[points.len() - 1], [10.0, 0.0]));
+        let peak = points.iter().map(|point| point[1]).fold(0.0, f32::max);
+        assert!((7.3..=7.5).contains(&peak), "{points:?}");
+        assert!(points.len() > 6 && points.len() <= 65, "{}", points.len());
+    }
+
+    #[test]
+    fn no_command_adds_more_points_than_the_catalog_counts_for_it() {
+        let far = 1_000_000.0;
+        let commands = [
+            Draw::LineTo([1.0, 1.0]),
+            Draw::MoveTo([0.0, 0.0]),
+            Draw::LineTo([5.0, 5.0]),
+            Draw::QuadraticCurveTo([far, -far, -far, far]),
+            Draw::BezierCurveTo([far, far, -far, -far, far, -far]),
+            Draw::QuadraticCurveTo([0.0, 0.0, 0.0, 0.0]),
+            arc(TAU),
+            arc(1_000.0 * TAU),
+            arc(0.01),
+            Draw::Rect([0.0, 0.0, far, far]),
+            Draw::ClosePath,
+            Draw::ClosePath,
+            Draw::BeginPath,
+            Draw::BezierCurveTo([far, far, -far, -far, far, -far]),
+            Draw::BeginPath,
+            arc(-0.1),
+            Draw::BeginPath,
+            Draw::ClosePath,
+        ];
+        let mut pen = Pen::default();
+        for command in &commands {
+            let before = if *command == Draw::BeginPath {
+                0
+            } else {
+                points(&pen)
+            };
+            assert!(pen.take(command));
+            let added = points(&pen) - before;
+            assert!(
+                added <= command.path_points(),
+                "{command:?} added {added} points"
+            );
+        }
+        assert!(
+            pen.subpaths
+                .iter()
+                .flat_map(|sub| &sub.points)
+                .flatten()
+                .all(|n| n.is_finite())
+        );
     }
 }

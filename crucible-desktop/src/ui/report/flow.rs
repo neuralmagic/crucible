@@ -33,7 +33,7 @@ pub(crate) struct Placed {
 }
 
 /// Each stage's bar, in the nodes' order, and how many points one unit of value is tall.
-pub(crate) fn place(nodes: &[FlowNode], links: &[FlowLink]) -> Option<(Vec<Placed>, f32)> {
+pub(crate) fn place(nodes: &[FlowNode], links: &[FlowLink]) -> Option<(Vec<Placed>, f64)> {
     let columns = flow_columns(nodes, links).ok()?;
     let count = columns.iter().max()? + 1;
     let index: HashMap<&str, usize> = nodes
@@ -62,7 +62,8 @@ pub(crate) fn place(nodes: &[FlowNode], links: &[FlowLink]) -> Option<(Vec<Place
             (total > 0.0).then(|| f64::from((HEIGHT - gaps(column)).max(1.0)) / total)
         })
         .fold(f64::INFINITY, f64::min);
-    let scale = if scale.is_finite() { scale as f32 } else { 0.0 };
+    let scale = if scale.is_finite() { scale } else { 0.0 };
+    let tall = |i: usize| (through[i] * scale) as f32;
     let step = if count > 1 {
         (WIDTH - 2.0 * GUTTER - BAR) / (count - 1) as f32
     } else {
@@ -78,14 +79,10 @@ pub(crate) fn place(nodes: &[FlowNode], links: &[FlowLink]) -> Option<(Vec<Place
         nodes.len()
     ];
     for (column, inside) in members.iter().enumerate() {
-        let used: f32 = inside
-            .iter()
-            .map(|i| through[*i] as f32 * scale)
-            .sum::<f32>()
-            + gaps(inside);
+        let used: f32 = inside.iter().map(|i| tall(*i)).sum::<f32>() + gaps(inside);
         let mut top = MARGIN + (HEIGHT - used) / 2.0;
         for &i in inside {
-            let height = through[i] as f32 * scale;
+            let height = tall(i);
             placed[i] = Placed {
                 x: GUTTER + step * column as f32,
                 top,
@@ -141,7 +138,7 @@ pub(crate) fn drawing(nodes: &[FlowNode], links: &[FlowLink]) -> Option<(f32, Ve
     let mut commands = vec![Draw::GlobalAlpha(0.35)];
     let (mut left, mut entered) = (vec![0.0_f32; nodes.len()], vec![0.0_f32; nodes.len()]);
     for (from, to, link) in ordered {
-        let thick = link.value as f32 * scale;
+        let thick = (link.value * scale) as f32;
         let (start, end) = (placed[from], placed[to]);
         let (x0, x1) = (start.x + BAR, end.x);
         let (y0, y1) = (start.top + left[from], end.top + entered[to]);
@@ -245,7 +242,7 @@ mod tests {
     fn bars_are_as_tall_as_what_flows_through_them_and_fit_the_drawing() {
         let (nodes, links) = triage();
         let (placed, scale) = place(&nodes, &links).unwrap();
-        let tall = |i: usize| (placed[i].height / scale).round();
+        let tall = |i: usize| (f64::from(placed[i].height) / scale).round();
         assert_eq!(
             [tall(0), tall(1), tall(2), tall(3), tall(4), tall(5)],
             [34.0, 30.0, 40.0, 24.0, 8.0, 56.0]
@@ -286,7 +283,7 @@ mod tests {
         assert_eq!(starts[0], [placed[0].x + 10.0, placed[0].top]);
         assert_eq!(
             starts[1][1],
-            placed[0].top + 30.0 * scale,
+            placed[0].top + (30.0 * scale) as f32,
             "stacked down the bar"
         );
 
@@ -365,5 +362,40 @@ mod tests {
         assert!(drawing(&nodes, &[]).is_some());
         assert!(drawing(&[], &[]).is_none());
         assert!(drawing(&nodes, &[link("a", "nowhere", 1.0)]).is_none());
+    }
+
+    #[test]
+    fn values_at_either_end_of_what_the_catalog_allows_stay_on_the_drawing() {
+        let nodes = vec![
+            node("a", Tone::Neutral),
+            node("b", Tone::Good),
+            node("c", Tone::Bad),
+        ];
+        for links in [
+            vec![link("a", "b", 1e-300), link("a", "c", 1e-300)],
+            vec![link("a", "b", 1e15), link("a", "c", 1e15)],
+            vec![link("a", "b", 1e-300), link("a", "c", 1e15)],
+            vec![link("a", "b", 5e-324)],
+        ] {
+            let (placed, scale) = place(&nodes, &links).unwrap();
+            assert!(scale.is_finite());
+            assert!(
+                placed.iter().all(|at| at.top.is_finite()
+                    && (0.0..=240.0).contains(&at.height)
+                    && at.top >= 0.0
+                    && at.top + at.height <= 256.0),
+                "{placed:?}"
+            );
+            let (_, commands) = drawing(&nodes, &links).unwrap();
+            let view = crucible_view::View {
+                title: "T".into(),
+                body: crucible_view::Node::Canvas {
+                    width: WIDTH,
+                    height: 256.0,
+                    commands,
+                },
+            };
+            assert_eq!(view.check(&crucible_view::Limits::DEFAULT), Ok(()));
+        }
     }
 }
