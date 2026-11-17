@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use crucible_view::{
     Bar, Cell, Column, ColumnKind, Node, PlotKind, Row, Series, Stat, Tab, Tone, Width,
 };
-use rune::{Align, Color, El, LineCap, Shape, Tx, canvas, col, el, row, text};
+use rune::{Align, Color, El, LineCap, Shape, Tx, canvas, col, el, icon, row, text};
 use rune_kit::{IconButton, IconButtonVariant, Kit, Markdown, Table, TableColumn, TextInput};
 use rune_theme_opencode::icons as oc;
 
@@ -52,7 +52,37 @@ pub(crate) fn report_view(app: &App, p: &Paint) -> El {
                         .color(p.c.text_faint)
                 })),
         )
-        .child(node(&view.body, true, app, p))
+        .child(if app.report_shown.fills(&view.body) {
+            node(&view.body, true, app, p)
+        } else {
+            desk::scrolled("report-scroll", node(&view.body, false, app, p), p)
+        })
+}
+
+/// The narrowest a child of `columns` is drawn before the next one wraps under it.
+const COLUMN: f32 = 320.0;
+/// What a card adds to the width of what it holds: its padding on both sides.
+const CARD: f32 = 24.0;
+
+/// The width `node` draws at whatever room it is given: its widest canvas or flow.
+fn least_width(node: &Node) -> f32 {
+    let widest =
+        |nodes: &mut dyn Iterator<Item = &Node>| nodes.map(least_width).fold(0.0, f32::max);
+    match node {
+        Node::Stack { children } | Node::Columns { children } => widest(&mut children.iter()),
+        Node::Section { body, .. } => least_width(body),
+        Node::Tabs { tabs, .. } => widest(&mut tabs.iter().map(|tab| &tab.body)),
+        Node::Canvas { width, .. } => *width,
+        Node::Flow { .. } => flow::WIDTH + CARD,
+        Node::Stats { .. }
+        | Node::Bars { .. }
+        | Node::Plot { .. }
+        | Node::Grid { .. }
+        | Node::Table { .. }
+        | Node::Text { .. }
+        | Node::Markdown { .. }
+        | Node::Mermaid { .. } => 0.0,
+    }
 }
 
 /// `fills` when the node takes the height its parent has left, as a table's ancestors do;
@@ -65,15 +95,34 @@ fn node(node_: &Node, fills: bool, app: &App, p: &Paint) -> El {
                 stack = stack.grow(1.0).min_h(0.0);
             }
             for (i, child) in children.iter().enumerate() {
-                let drawn = node(child, fills, app, p);
+                let drawn = node(child, fills && app.report_shown.fills(child), app, p);
                 stack = stack.child(match child {
-                    Node::Tabs { .. } | Node::Table { .. } => drawn,
+                    Node::Tabs { .. } | Node::Table { .. } | Node::Section { .. } => drawn,
                     _ => drawn.key(format!("report-part-{i}")),
                 });
             }
             stack
         }
-        Node::Tabs { id, tabs } => tabs_view(id, tabs, app, p),
+        Node::Columns { children } => {
+            let mut line = row().w_full().gap(12.0).flex_wrap().items_start();
+            for (i, child) in children.iter().enumerate() {
+                line = line.child(
+                    col()
+                        .key(format!("report-column-{i}"))
+                        .grow(1.0)
+                        .min_w(COLUMN.max(least_width(child)))
+                        .child(node(child, false, app, p)),
+                );
+            }
+            line
+        }
+        Node::Section {
+            id,
+            title,
+            open,
+            body,
+        } => section(id, title, *open, body, fills, app, p),
+        Node::Tabs { id, tabs } => tabs_view(id, tabs, fills, app, p),
         Node::Stats { items } => stats(items, p),
         Node::Bars { bars: all } => bars(all, p),
         Node::Plot { kind, x, y, series } => plot(*kind, x, y, series, p),
@@ -81,7 +130,7 @@ fn node(node_: &Node, fills: bool, app: &App, p: &Paint) -> El {
             Some((height, commands)) => col()
                 .w_full()
                 .max_w(720.0)
-                .padding(12.0)
+                .padding(CARD / 2.0)
                 .radius(p.k.radius.lg)
                 .fill(p.c.layer_01)
                 .border(p.hair, p.c.border_muted)
@@ -145,7 +194,57 @@ fn dot(tone: Tone, k: &Kit) -> Color {
     }
 }
 
-fn tabs_view(id: &str, tabs: &[Tab], app: &App, p: &Paint) -> El {
+/// A title the reader clicks to fold or unfold `body` under it.
+fn section(
+    id: &str,
+    title: &str,
+    open: bool,
+    body: &Node,
+    fills: bool,
+    app: &App,
+    p: &Paint,
+) -> El {
+    let unfolded = app.report_shown.open(id, open);
+    let glyph = if unfolded {
+        p.k.glyph.triangle_down
+    } else {
+        p.k.glyph.triangle_right
+    };
+    let set = id.to_string();
+    let header = row()
+        .key(format!("report-section-{id}"))
+        .role("button")
+        .label(title.to_string())
+        .expanded(unfolded)
+        .focusable(true)
+        .focus_ring(2.0, 0.0, p.c.border_focus)
+        .w_full()
+        .h(28.0)
+        .gap(6.0)
+        .center_y()
+        .on_press(move |app: &mut App| app.toggle_report_section(&set, open))
+        .child(icon(glyph, 14.0).color(p.c.icon_weaker))
+        .child(
+            text(title.to_string())
+                .font(p.k.ty.small_medium)
+                .color(p.c.text_base)
+                .truncate(),
+        );
+    let mut shown = col()
+        .key(format!("report-sectioned-{id}"))
+        .w_full()
+        .gap(8.0)
+        .child(header);
+    if fills {
+        shown = shown.grow(1.0).min_h(0.0);
+    }
+    if unfolded {
+        shown = shown.child(node(body, fills, app, p));
+    }
+    shown
+}
+
+fn tabs_view(id: &str, tabs: &[Tab], fills: bool, app: &App, p: &Paint) -> El {
     let picked = app.report_shown.tab(id, tabs.len());
     let options: Vec<(String, String)> = tabs
         .iter()
@@ -173,14 +272,15 @@ fn tabs_view(id: &str, tabs: &[Tab], app: &App, p: &Paint) -> El {
     let mut shown = col()
         .key(format!("report-tabbed-{id}"))
         .w_full()
-        .grow(1.0)
-        .min_h(0.0)
         .gap(10.0)
         .child(bar);
+    if fills {
+        shown = shown.grow(1.0).min_h(0.0);
+    }
     if let Some(tab) = tabs.get(picked) {
-        let fills = app.report_shown.shows_table(&tab.body);
-        let body = node(&tab.body, fills, app, p);
-        shown = shown.child(if fills {
+        let filled = app.report_shown.fills(&tab.body);
+        let body = node(&tab.body, fills && filled, app, p);
+        shown = shown.child(if !fills || filled {
             body
         } else {
             desk::scrolled(&format!("report-scroll-{id}"), body, p)
@@ -631,7 +731,45 @@ fn drawn(cell: &Cell, kind: ColumnKind, link: Option<Color>, k: &Kit) -> rune_ki
 
 #[cfg(test)]
 mod tests {
-    use crate::ui::report::fenced;
+    use crucible_view::{Context2d, Node, Tab};
+
+    use crate::ui::report::{CARD, fenced, flow, least_width};
+
+    #[test]
+    fn a_column_is_as_wide_as_its_widest_canvas_or_flow() {
+        let canvas = |width: f32| Context2d::new(width, 10.0).finish();
+        assert_eq!(least_width(&Node::Markdown { text: "x".into() }), 0.0);
+        assert_eq!(least_width(&Node::Stack { children: vec![] }), 0.0);
+        assert_eq!(least_width(&canvas(4_000.0)), 4_000.0);
+        let flowing = Node::Flow {
+            nodes: vec![],
+            links: vec![],
+        };
+        assert_eq!(least_width(&flowing), flow::WIDTH + CARD);
+        let nested = Node::Section {
+            id: "s".into(),
+            title: "S".into(),
+            open: false,
+            body: Box::new(Node::Tabs {
+                id: "t".into(),
+                tabs: vec![
+                    Tab {
+                        label: "a".into(),
+                        count: None,
+                        body: canvas(300.0),
+                    },
+                    Tab {
+                        label: "b".into(),
+                        count: None,
+                        body: Node::Columns {
+                            children: vec![canvas(120.0), canvas(700.0)],
+                        },
+                    },
+                ],
+            }),
+        };
+        assert_eq!(least_width(&nested), 700.0);
+    }
 
     #[test]
     fn a_diagram_s_fence_is_longer_than_any_run_of_backticks_in_it() {

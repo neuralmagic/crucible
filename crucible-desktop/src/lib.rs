@@ -551,6 +551,14 @@ impl App {
         self.report_shown.arrange(table.as_ref());
     }
 
+    /// Folds or unfolds the shown report's section `id`, which starts `open` or not.
+    pub fn toggle_report_section(&mut self, id: &str, open: bool) {
+        let report = self.shown_report().cloned();
+        if let Some(view) = report.as_ref().and_then(|report| report.view.as_ref().ok()) {
+            self.report_shown.toggle(view, id, open);
+        }
+    }
+
     /// The first address the shown report table's row `id` links to.
     pub fn report_link(&self, id: &str) -> Option<String> {
         let table = self.report_table()?;

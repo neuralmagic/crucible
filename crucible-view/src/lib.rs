@@ -61,6 +61,18 @@ pub struct View {
 pub enum Node {
     /// Children top to bottom.
     Stack { children: Vec<Node> },
+    /// Children side by side at equal widths, wrapping onto further lines when narrow. Holds
+    /// no table.
+    Columns { children: Vec<Node> },
+    /// A body under a title the reader folds and unfolds.
+    Section {
+        id: String,
+        title: String,
+        /// Whether it starts unfolded.
+        #[serde(default = "unfolded", skip_serializing_if = "is_unfolded")]
+        open: bool,
+        body: Box<Node>,
+    },
     /// One body shown at a time.
     Tabs { id: String, tabs: Vec<Tab> },
     /// A row of headline numbers.
@@ -108,6 +120,14 @@ pub enum Node {
     Markdown { text: String },
     /// A Mermaid diagram from its source.
     Mermaid { source: String },
+}
+
+fn unfolded() -> bool {
+    true
+}
+
+fn is_unfolded(open: &bool) -> bool {
+    *open
 }
 
 /// Where an address leads: the web, or a place in the run the view is drawn for.
@@ -410,6 +430,8 @@ pub enum Problem {
     Prose(usize),
     #[error("a row's detail is longer than {0} bytes")]
     Detail(usize),
+    #[error("columns may not hold a table")]
+    ColumnsTable,
 }
 
 impl View {
@@ -434,6 +456,7 @@ struct Seen {
     points: usize,
     commands: usize,
     prose: usize,
+    tables: usize,
     ids: HashSet<String>,
 }
 
@@ -487,6 +510,24 @@ impl Node {
                     shown += child.check(limits, depth + 1, seen)?;
                 }
                 Ok(shown)
+            }
+            Node::Columns { children } => {
+                let tables = seen.tables;
+                for child in children {
+                    child.check(limits, depth + 1, seen)?;
+                }
+                if seen.tables > tables {
+                    return Err(Problem::ColumnsTable);
+                }
+                Ok(0)
+            }
+            Node::Section {
+                id, title, body, ..
+            } => {
+                fits(id, limits)?;
+                fits(title, limits)?;
+                seen.name(id)?;
+                body.check(limits, depth + 1, seen)
             }
             Node::Tabs { id, tabs } => {
                 fits(id, limits)?;
@@ -625,6 +666,7 @@ impl Node {
             Node::Table { id, columns, rows } => {
                 fits(id, limits)?;
                 seen.name(id)?;
+                seen.tables += 1;
                 seen.items(columns.len(), limits)?;
                 let mut names = HashSet::new();
                 for column in columns {
@@ -1212,6 +1254,192 @@ mod tests {
             rows: vec![],
         };
         assert_eq!(view(wide).check(&TIGHT), Err(Problem::Items(6)));
+    }
+
+    fn section(id: &str, open: bool, body: Node) -> Node {
+        Node::Section {
+            id: id.into(),
+            title: "More".into(),
+            open,
+            body: Box::new(body),
+        }
+    }
+
+    fn columns(children: Vec<Node>) -> Node {
+        Node::Columns { children }
+    }
+
+    fn stats() -> Node {
+        Node::Stats { items: vec![] }
+    }
+
+    #[test]
+    fn columns_read_back_as_written_and_may_be_empty() {
+        let json = r#"{"columns":{"children":[{"text":{"text":"a","tone":"neutral"}},{"stats":{"items":[]}}]}}"#;
+        let node: Node = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            node,
+            columns(vec![
+                Node::Text {
+                    text: "a".into(),
+                    tone: Tone::Neutral,
+                },
+                stats(),
+            ])
+        );
+        assert_eq!(serde_json::to_string(&node).unwrap(), json);
+        assert_eq!(view(columns(vec![])).check(&Limits::DEFAULT), Ok(()));
+        assert!(serde_json::from_str::<Node>(r#"{"columns":{"children":[],"gap":4}}"#).is_err());
+        assert!(serde_json::from_str::<Node>(r#"{"columns":{}}"#).is_err());
+    }
+
+    #[test]
+    fn columns_hold_no_table_however_deep() {
+        assert_eq!(
+            view(columns(vec![stats(), table("t", vec![])])).check(&Limits::DEFAULT),
+            Err(Problem::ColumnsTable)
+        );
+        let hidden = Node::Tabs {
+            id: "tabs".into(),
+            tabs: vec![
+                Tab {
+                    label: "a".into(),
+                    count: None,
+                    body: stats(),
+                },
+                Tab {
+                    label: "b".into(),
+                    count: None,
+                    body: section("s", false, table("t", vec![row("1")])),
+                },
+            ],
+        };
+        assert_eq!(
+            view(columns(vec![Node::Stack {
+                children: vec![hidden.clone()],
+            }]))
+            .check(&Limits::DEFAULT),
+            Err(Problem::ColumnsTable)
+        );
+        assert_eq!(view(hidden.clone()).check(&Limits::DEFAULT), Ok(()));
+        let beside = Node::Stack {
+            children: vec![columns(vec![stats(), stats()]), table("t", vec![row("1")])],
+        };
+        assert_eq!(view(beside).check(&Limits::DEFAULT), Ok(()));
+    }
+
+    #[test]
+    fn columns_count_toward_nodes_and_depth() {
+        let limits = TIGHT;
+        assert_eq!(view(columns(vec![stats(), stats()])).check(&limits), Ok(()));
+        assert_eq!(
+            view(columns(vec![stats(), stats(), stats()])).check(&limits),
+            Err(Problem::Nodes(3))
+        );
+        assert_eq!(
+            view(columns(vec![columns(vec![stats()])])).check(&limits),
+            Err(Problem::Depth(2))
+        );
+    }
+
+    #[test]
+    fn a_section_starts_open_unless_it_says_otherwise() {
+        let bare: Node = serde_json::from_str(
+            r#"{"section":{"id":"s","title":"More","body":{"stats":{"items":[]}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(bare, section("s", true, stats()));
+        assert_eq!(
+            serde_json::to_string(&bare).unwrap(),
+            r#"{"section":{"id":"s","title":"More","body":{"stats":{"items":[]}}}}"#
+        );
+        let closed = section("s", false, stats());
+        let json = serde_json::to_string(&closed).unwrap();
+        assert_eq!(
+            json,
+            r#"{"section":{"id":"s","title":"More","open":false,"body":{"stats":{"items":[]}}}}"#
+        );
+        assert_eq!(serde_json::from_str::<Node>(&json).unwrap(), closed);
+        for off in [
+            r#"{"section":{"id":"s","title":"More"}}"#,
+            r#"{"section":{"title":"More","body":{"stats":{"items":[]}}}}"#,
+            r#"{"section":{"id":"s","title":"More","open":"yes","body":{"stats":{"items":[]}}}}"#,
+            r#"{"section":{"id":"s","title":"More","folded":true,"body":{"stats":{"items":[]}}}}"#,
+        ] {
+            assert!(serde_json::from_str::<Node>(off).is_err(), "{off}");
+        }
+    }
+
+    #[test]
+    fn a_section_is_named_once_and_its_title_and_id_are_bounded() {
+        let pair = |a: Node, b: Node| {
+            view(Node::Stack {
+                children: vec![a, b],
+            })
+        };
+        assert_eq!(
+            pair(section("s", true, stats()), section("s", false, stats())).check(&Limits::DEFAULT),
+            Err(Problem::DuplicateId("s".into()))
+        );
+        assert_eq!(
+            view(section("t", true, table("t", vec![]))).check(&Limits::DEFAULT),
+            Err(Problem::DuplicateId("t".into()))
+        );
+        let tabbed = Node::Tabs {
+            id: "s".into(),
+            tabs: vec![Tab {
+                label: "a".into(),
+                count: None,
+                body: stats(),
+            }],
+        };
+        assert_eq!(
+            pair(tabbed, section("s", true, stats())).check(&Limits::DEFAULT),
+            Err(Problem::DuplicateId("s".into()))
+        );
+        assert_eq!(
+            view(section(&"x".repeat(9), true, stats())).check(&TIGHT),
+            Err(Problem::Text(8))
+        );
+        let titled = Node::Section {
+            id: "s".into(),
+            title: "x".repeat(9),
+            open: true,
+            body: Box::new(stats()),
+        };
+        assert_eq!(view(titled).check(&TIGHT), Err(Problem::Text(8)));
+        assert_eq!(
+            view(section(&"x".repeat(8), true, stats())).check(&TIGHT),
+            Ok(())
+        );
+        assert_eq!(
+            view(section("a", true, section("b", true, stats()))).check(&TIGHT),
+            Err(Problem::Depth(2))
+        );
+    }
+
+    #[test]
+    fn a_folded_section_s_table_counts_as_shown() {
+        for open in [true, false] {
+            assert_eq!(
+                view(section("s", open, table("t", vec![row("1")]))).check(&Limits::DEFAULT),
+                Ok(())
+            );
+            let two = Node::Stack {
+                children: vec![section("s", open, table("a", vec![])), table("b", vec![])],
+            };
+            assert_eq!(view(two).check(&Limits::DEFAULT), Err(Problem::Tables));
+            let folded_pair = Node::Stack {
+                children: vec![
+                    section("s", open, table("a", vec![])),
+                    section("u", !open, table("b", vec![])),
+                ],
+            };
+            assert_eq!(
+                view(folded_pair).check(&Limits::DEFAULT),
+                Err(Problem::Tables)
+            );
+        }
     }
 
     #[test]

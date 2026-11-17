@@ -41,9 +41,10 @@ smaller, faster plugin and is worth it for a view that shapes a lot of data.
    someone runs after the run.
 3. **Choose components.** Read `components.md`. Headline numbers are `stats`, a pivot is a
    `grid`, the rows are a `table`, a category split is `bars`, an ordered x axis is a `line`
-   plot, two measures are a `scatter` plot. Put alternatives in `tabs`. Prose is `markdown`, a
-   process or structure is a `mermaid` diagram, and what explains one row is that row's
-   `detail`. Link a row to the task and file it came from. Use `canvas` only when nothing else
+   plot, two measures are a `scatter` plot. Put alternatives in `tabs`, charts that read
+   together in `columns`, and what most readers skip in a folded `section`. Prose is
+   `markdown`, a process or structure is a `mermaid` diagram, and what explains one row is
+   that row's `detail`. Link a row to the task and file it came from. Use `canvas` only when nothing else
    can draw it.
 4. **Build.** See below.
 5. **Look at it.** Run the pack, open the Report pane, and read every tab. See "Checking".

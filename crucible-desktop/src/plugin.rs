@@ -747,6 +747,13 @@ mod tests {
             panic!("Charts is a stack");
         };
         let [
+            Node::Columns { children: side },
+            Node::Flow { nodes, links },
+        ] = charts.as_slice()
+        else {
+            panic!("Charts is two plots side by side over a flow");
+        };
+        let [
             Node::Plot {
                 kind: PlotKind::Line,
                 series: lines,
@@ -757,10 +764,9 @@ mod tests {
                 series: marks,
                 ..
             },
-            Node::Flow { nodes, links },
-        ] = charts.as_slice()
+        ] = side.as_slice()
         else {
-            panic!("Charts is a line plot, a scatter plot and a flow");
+            panic!("the plots are a line plot and a scatter plot");
         };
         let columns = crucible_view::flow_columns(nodes, links).unwrap();
         let reaching = |column: usize| -> f64 {
@@ -856,8 +862,12 @@ mod tests {
         ] {
             assert!(detail.contains(part), "{part} in {detail}");
         }
-        let [_, _, Node::Mermaid { source }] = summary.as_slice() else {
+        let [_, _, Node::Section { id, open, body, .. }] = summary.as_slice() else {
             panic!("Summary ends with how a ticket is categorised");
+        };
+        assert_eq!((id.as_str(), *open), ("categorised", false));
+        let Node::Mermaid { source } = body.as_ref() else {
+            panic!("the folded section is a diagram");
         };
         assert!(source.starts_with("flowchart LR\n"), "{source}");
         let bad = plugin.view(&Request {

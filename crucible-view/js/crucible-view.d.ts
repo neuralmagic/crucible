@@ -41,6 +41,14 @@ interface ViewCell {
 /** One component: an object with one key, its name. */
 type ViewNode =
   | { stack: { children: ViewNode[] } }
+  | {
+      /** Side by side at equal widths, wrapping when narrow. Holds no table, however deep. */
+      columns: { children: ViewNode[] };
+    }
+  | {
+      /** `body` under a `title` the reader folds and unfolds; unfolded unless `open` is false. */
+      section: { id: string; title: string; open?: boolean; body: ViewNode };
+    }
   | { tabs: { id: string; tabs: { label: string; count?: number; body: ViewNode }[] } }
   | { stats: { items: { label: string; value: string; tone?: Tone }[] } }
   | { bars: { bars: { label: string; segments: { label: string; value: number; tone?: Tone }[] }[] } }

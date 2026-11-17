@@ -20,6 +20,27 @@ beside its label.
 ]}}
 ```
 
+`columns` puts its children side by side at equal widths, and wraps them onto further lines
+when the pane is narrower than about 320 points for each, or than the widest `canvas` or `flow`
+a child holds. Use it for two or three charts that read together. A child is as tall as its
+content, and `columns` may not hold a table, however deep.
+
+```json
+{"columns": {"children": [
+  {"stats": {"items": [{"label": "Affected", "value": "8", "tone": "bad"}]}},
+  {"stats": {"items": [{"label": "Closable", "value": "48", "tone": "good"}]}}
+]}}
+```
+
+`section` is a `body` under a `title` the reader clicks to fold and unfold. It starts unfolded
+unless `open` is `false`; fold what most readers skip. The app keeps what the reader folded
+across refreshes of the same run. A section's `id` is unique in the view, like a tab's.
+
+```json
+{"section": {"id": "how", "title": "How a ticket is categorised", "open": false,
+  "body": {"markdown": {"text": "A ticket not in the final image is `sbom_inaccurate`."}}}}
+```
+
 ## Numbers
 
 `stats` is a row of headline numbers. A `value` is text, so format it yourself.
@@ -87,9 +108,11 @@ task and file it came from. Keep the cells to what a reader scans and sorts by.
 Rules the app checks:
 
 - Every row has one cell per column, and a row `id` is unique in its table.
-- A table `id` and a tabs `id` are unique in the view.
+- A table `id`, a tabs `id` and a section `id` are unique in the view.
 - Only one table is on screen at a time. Put each table in its own tab; a stack may not hold
-  two, and may not hold a table beside tabs that hold one.
+  two, and may not hold a table beside tabs that hold one. A folded section's table counts,
+  since the reader may unfold it.
+- `columns` hold no table.
 - An `href` is one of the addresses under Links.
 - All tables together hold at most 500,000 cells, and a row's `detail` at most 100,000 bytes.
 

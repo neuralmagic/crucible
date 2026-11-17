@@ -358,13 +358,14 @@ pub struct Table<'a> {
     pub rows: &'a [Row],
 }
 
-/// What the Report pane keeps between frames: the tab picked in each set of tabs, and the shown
-/// table's filter, sort and selection.
+/// What the Report pane keeps between frames: the tab picked in each set of tabs, the sections
+/// the reader folded or unfolded, and the shown table's filter, sort and selection.
 pub struct Shown {
     /// The selection and the report all of this was kept for.
     selection: Option<Selection>,
     report: Weak<Report>,
     tabs: HashMap<String, usize>,
+    sections: HashMap<String, bool>,
     pub table: TableState,
     /// What the box over the shown table holds: a row is drawn when it holds every word.
     pub filter: TextEdit,
@@ -452,6 +453,7 @@ impl Default for Shown {
             selection: None,
             report: Weak::new(),
             tabs: HashMap::new(),
+            sections: HashMap::new(),
             table: fresh_table(),
             filter: TextEdit::new(""),
             sorted: None,
@@ -504,22 +506,55 @@ impl Shown {
         self.order = None;
     }
 
-    /// The one table `view` shows with the tabs as picked.
+    /// Whether the section `id`, which starts `open` or not, is unfolded.
+    pub fn open(&self, id: &str, open: bool) -> bool {
+        self.sections.get(id).copied().unwrap_or(open)
+    }
+
+    /// Folds the section `id` of `view` when it is unfolded and unfolds it when it is folded,
+    /// then filters and sorts the table that leaves shown.
+    pub fn toggle(&mut self, view: &View, id: &str, open: bool) {
+        let unfolded = self.open(id, open);
+        self.sections.insert(id.to_string(), !unfolded);
+        let table = self.table(view);
+        self.arrange(table.as_ref());
+    }
+
+    /// The one table `view` shows with the tabs as picked and the sections as folded.
     pub fn table<'a>(&self, view: &'a View) -> Option<Table<'a>> {
         self.table_in(&view.body)
     }
 
-    /// Whether `node` shows a table with the tabs as picked.
-    pub fn shows_table(&self, node: &Node) -> bool {
-        self.table_in(node).is_some()
+    /// Whether `node` takes the height its parent leaves, as a table and tabs do, rather than
+    /// the height of its content.
+    pub fn fills(&self, node: &Node) -> bool {
+        match node {
+            Node::Stack { children } => children.iter().any(|child| self.fills(child)),
+            Node::Section { id, open, body, .. } => self.open(id, *open) && self.fills(body),
+            Node::Tabs { .. } | Node::Table { .. } => true,
+            Node::Columns { .. }
+            | Node::Stats { .. }
+            | Node::Bars { .. }
+            | Node::Plot { .. }
+            | Node::Flow { .. }
+            | Node::Canvas { .. }
+            | Node::Grid { .. }
+            | Node::Text { .. }
+            | Node::Markdown { .. }
+            | Node::Mermaid { .. } => false,
+        }
     }
 
     fn table_in<'a>(&self, node: &'a Node) -> Option<Table<'a>> {
         match node {
             Node::Stack { children } => children.iter().find_map(|child| self.table_in(child)),
             Node::Tabs { id, tabs } => self.table_in(&tabs.get(self.tab(id, tabs.len()))?.body),
+            Node::Section { id, open, body, .. } => {
+                self.open(id, *open).then(|| self.table_in(body)).flatten()
+            }
             Node::Table { id, columns, rows } => Some(Table { id, columns, rows }),
-            Node::Stats { .. }
+            Node::Columns { .. }
+            | Node::Stats { .. }
             | Node::Bars { .. }
             | Node::Plot { .. }
             | Node::Flow { .. }
@@ -700,6 +735,16 @@ mod tests {
                 }
                 "stack"
             }
+            Node::Columns { children } => {
+                for child in children {
+                    component_names(child, names);
+                }
+                "columns"
+            }
+            Node::Section { body, .. } => {
+                component_names(body, names);
+                "section"
+            }
             Node::Tabs { tabs, .. } => {
                 for tab in tabs {
                     component_names(&tab.body, names);
@@ -737,8 +782,8 @@ mod tests {
         assert_eq!(
             names.into_iter().collect::<Vec<_>>(),
             [
-                "bars", "canvas", "flow", "grid", "markdown", "mermaid", "plot", "stack", "stats",
-                "table", "tabs", "text"
+                "bars", "canvas", "columns", "flow", "grid", "markdown", "mermaid", "plot",
+                "section", "stack", "stats", "table", "tabs", "text"
             ],
             "every component has an example"
         );
@@ -934,11 +979,35 @@ mod tests {
         assert_eq!(
             names.into_iter().collect::<Vec<_>>(),
             [
-                "canvas", "flow", "markdown", "stack", "stats", "table", "tabs", "text"
+                "canvas", "columns", "flow", "markdown", "section", "stack", "stats", "table",
+                "tabs", "text"
             ]
         );
         let mut shown = Shown::default();
         assert!(shown.table(view).is_none(), "the first tab holds no table");
+        let Node::Stack { children } = &view.body else {
+            panic!("the view is a stack");
+        };
+        let Node::Tabs { tabs, .. } = &children[1] else {
+            panic!("the view's tabs follow its stats");
+        };
+        assert!(!shown.fills(&tabs[0].body), "Overview sizes to its content");
+        let Node::Stack { children: overview } = &tabs[0].body else {
+            panic!("Overview is a stack");
+        };
+        assert!(matches!(
+            overview.as_slice(),
+            [Node::Columns { .. }, Node::Section { open: true, .. }]
+        ));
+        shown.pick("queue", 1);
+        assert_eq!(shown.table(view).unwrap().id, "act");
+        shown.toggle(view, "ruler", true);
+        assert!(!shown.open("ruler", true));
+        assert_eq!(
+            shown.table(view).unwrap().id,
+            "act",
+            "folding the ruler leaves the table"
+        );
         shown.pick("queue", 3);
         let row = &shown.table(view).unwrap().rows[0];
         let detail = row.detail.as_deref().unwrap();
@@ -1017,12 +1086,179 @@ mod tests {
         let view = tabbed();
         let mut shown = Shown::default();
         assert!(shown.table(&view).is_none(), "Summary holds no table");
-        assert!(!shown.shows_table(&view.body));
+        assert!(shown.fills(&view.body), "tabs fill");
         shown.pick("by", 1);
         assert_eq!(shown.table(&view).unwrap().id, "all");
-        assert!(shown.shows_table(&view.body));
+        assert!(shown.fills(&view.body));
         shown.pick("by", 9);
         assert_eq!(shown.tab("by", 2), 1, "a tab past the end is the last");
+    }
+
+    fn section(id: &str, open: bool, body: Node) -> Node {
+        Node::Section {
+            id: id.into(),
+            title: id.into(),
+            open,
+            body: Box::new(body),
+        }
+    }
+
+    #[test]
+    fn a_folded_section_shows_no_table_until_it_is_unfolded() {
+        for open in [true, false] {
+            let view = View {
+                title: "T".into(),
+                body: Node::Stack {
+                    children: vec![
+                        Node::Markdown { text: "x".into() },
+                        section("more", open, table("t", &["a"])),
+                    ],
+                },
+            };
+            assert_eq!(view.check(&crucible_view::Limits::DEFAULT), Ok(()));
+            let mut shown = Shown::default();
+            assert_eq!(shown.open("more", open), open);
+            assert_eq!(shown.table(&view).is_some(), open);
+            assert_eq!(shown.fills(&view.body), open);
+            shown.toggle(&view, "more", open);
+            assert_eq!(shown.open("more", open), !open);
+            assert_eq!(shown.table(&view).is_some(), !open);
+            assert_eq!(shown.fills(&view.body), !open);
+            shown.toggle(&view, "more", open);
+            assert_eq!(shown.open("more", open), open);
+            assert_eq!(shown.table(&view).is_some(), open);
+            assert!(!shown.open("other", false), "another section keeps its own");
+            assert!(shown.open("other", true));
+        }
+    }
+
+    #[test]
+    fn a_section_in_a_tab_shows_its_table_only_while_both_are_picked_and_open() {
+        let view = View {
+            title: "T".into(),
+            body: Node::Tabs {
+                id: "by".into(),
+                tabs: vec![
+                    Tab {
+                        label: "a".into(),
+                        count: None,
+                        body: Node::Stats { items: vec![] },
+                    },
+                    Tab {
+                        label: "b".into(),
+                        count: None,
+                        body: section("rows", false, table("t", &["a"])),
+                    },
+                ],
+            },
+        };
+        let mut shown = Shown::default();
+        shown.toggle(&view, "rows", false);
+        assert!(shown.table(&view).is_none(), "tab a is picked");
+        shown.pick("by", 1);
+        assert_eq!(shown.table(&view).unwrap().id, "t");
+        assert!(
+            shown.open("rows", false),
+            "picking a tab keeps the sections"
+        );
+        shown.toggle(&view, "rows", false);
+        assert!(shown.table(&view).is_none());
+    }
+
+    #[test]
+    fn unfolding_a_section_filters_and_sorts_its_table_again() {
+        let report = |names: &[&str]| {
+            Arc::new(Report {
+                name: "report".into(),
+                author: None,
+                view: Ok(View {
+                    title: "T".into(),
+                    body: section("more", true, table("t", names)),
+                }),
+            })
+        };
+        let ids = |shown: &Shown, report: &Report| -> Option<Vec<String>> {
+            let table = shown.table(report.view.as_ref().unwrap())?;
+            Some(
+                (0..shown.len(&table))
+                    .map(|i| shown.row(&table, i).unwrap().id.clone())
+                    .collect(),
+            )
+        };
+        let selection = Selection::Local("a".into());
+        let first = report(&["b2", "a1", "b1"]);
+        let mut shown = Shown::default();
+        shown.follow(Some(&selection), Some(&first));
+        shown.filter = rune::TextEdit::new("b");
+        let table = shown.table(first.view.as_ref().unwrap()).unwrap();
+        shown.sort(&table, "name", SortDir::Ascending);
+        assert_eq!(ids(&shown, &first).unwrap(), ["b1", "b2"]);
+
+        shown.toggle(first.view.as_ref().unwrap(), "more", true);
+        assert_eq!(ids(&shown, &first), None);
+        let second = report(&["b9", "a1", "b3", "c1"]);
+        shown.follow(Some(&selection), Some(&second));
+        assert_eq!(ids(&shown, &second), None, "still folded");
+        shown.toggle(second.view.as_ref().unwrap(), "more", true);
+        assert_eq!(
+            ids(&shown, &second).unwrap(),
+            ["b3", "b9"],
+            "the filter and sort apply to the rows that came while it was folded"
+        );
+    }
+
+    #[test]
+    fn columns_and_content_size_to_their_content() {
+        let shown = Shown::default();
+        let content = [
+            Node::Columns { children: vec![] },
+            Node::Stats { items: vec![] },
+            Node::Markdown { text: "x".into() },
+            Node::Stack { children: vec![] },
+            section("s", true, Node::Stats { items: vec![] }),
+            section(
+                "t",
+                false,
+                Node::Tabs {
+                    id: "x".into(),
+                    tabs: vec![],
+                },
+            ),
+        ];
+        for node in &content {
+            assert!(!shown.fills(node), "{node:?}");
+        }
+        let filling = [
+            table("t", &[]),
+            Node::Tabs {
+                id: "x".into(),
+                tabs: vec![],
+            },
+            Node::Stack {
+                children: vec![Node::Stats { items: vec![] }, table("t", &[])],
+            },
+            section(
+                "s",
+                true,
+                Node::Stack {
+                    children: vec![table("t", &[])],
+                },
+            ),
+        ];
+        for node in &filling {
+            assert!(shown.fills(node), "{node:?}");
+        }
+        let columned = Node::Columns {
+            children: vec![Node::Tabs {
+                id: "x".into(),
+                tabs: vec![],
+            }],
+        };
+        assert!(
+            !shown.fills(&columned),
+            "tabs in columns size to their content"
+        );
+        assert!(shown.table_in(&columned).is_none());
     }
 
     #[test]
@@ -1111,11 +1347,21 @@ mod tests {
             "and so does the filter"
         );
 
+        shown.toggle(second.view.as_ref().unwrap(), "more", true);
+        shown.follow(Some(&local("a")), Some(&first));
+        assert!(
+            !shown.open("more", true),
+            "another report keeps the sections"
+        );
         shown.follow(Some(&local("b")), Some(&second));
         assert_eq!(
             shown.tab("by", 2),
             0,
             "another selection starts on its first tab"
+        );
+        assert!(
+            shown.open("more", true),
+            "and with its sections as they start"
         );
         shown.pick("by", 1);
         assert_eq!(ids(&shown, &second), ["b9", "b10", "a1"]);

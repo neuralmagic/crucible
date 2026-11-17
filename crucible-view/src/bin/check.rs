@@ -16,6 +16,16 @@ fn count(node: &Node, counts: &mut BTreeMap<&'static str, usize>) {
             }
             "stack"
         }
+        Node::Columns { children } => {
+            for child in children {
+                count(child, counts);
+            }
+            "columns"
+        }
+        Node::Section { body, .. } => {
+            count(body, counts);
+            "section"
+        }
         Node::Tabs { tabs, .. } => {
             for tab in tabs {
                 count(&tab.body, counts);
@@ -86,6 +96,12 @@ mod tests {
             Ok("ok: \"T\" with 1 stack, 1 stats, 2 text".to_string())
         );
         assert_eq!(checked(&format!(r#"{{"view":{view}}}"#)), checked(view));
+        let laid_out = r#"{"title":"T","body":{"section":{"id":"s","title":"More","body":
+            {"columns":{"children":[{"text":{"text":"a"}},{"stats":{"items":[]}}]}}}}}"#;
+        assert_eq!(
+            checked(laid_out),
+            Ok("ok: \"T\" with 1 columns, 1 section, 1 stats, 1 text".to_string())
+        );
     }
 
     #[test]

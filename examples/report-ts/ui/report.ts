@@ -332,12 +332,26 @@ export function view({ files }: ViewRequest): View {
               tabs: [
                 {
                   label: "Overview",
-                  body: { stack: { children: [{ markdown: { text: summary } }, ticketMap(tickets), howDecided(tickets)] } },
+                  body: {
+                    stack: {
+                      children: [
+                        { columns: { children: [{ markdown: { text: summary } }, howDecided(tickets)] } },
+                        { section: { id: "map", title: "Ticket map", body: ticketMap(tickets) } },
+                      ],
+                    },
+                  },
                 },
                 {
                   label: "Act first",
                   count: act.length,
-                  body: { stack: { children: [severityRuler(tickets), table("act", act)] } },
+                  body: {
+                    stack: {
+                      children: [
+                        { section: { id: "ruler", title: "By CVSS", body: severityRuler(tickets) } },
+                        table("act", act),
+                      ],
+                    },
+                  },
                 },
                 {
                   label: "Spot-check",

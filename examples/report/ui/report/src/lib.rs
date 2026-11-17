@@ -195,7 +195,16 @@ fn report(request: Request) -> Result<View, String> {
             label: "Summary".into(),
             count: None,
             body: Node::Stack {
-                children: vec![by_release(&tickets), pivot(&tickets), categories()],
+                children: vec![
+                    by_release(&tickets),
+                    pivot(&tickets),
+                    Node::Section {
+                        id: "categorised".into(),
+                        title: "How a ticket is categorised".into(),
+                        open: false,
+                        body: Box::new(categories()),
+                    },
+                ],
             },
         },
         Tab {
@@ -203,8 +212,9 @@ fn report(request: Request) -> Result<View, String> {
             count: None,
             body: Node::Stack {
                 children: vec![
-                    across_releases(&tickets),
-                    age_by_score(&tickets),
+                    Node::Columns {
+                        children: vec![across_releases(&tickets), age_by_score(&tickets)],
+                    },
                     how_decided(&tickets),
                 ],
             },
