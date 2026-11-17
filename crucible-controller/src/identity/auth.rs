@@ -263,7 +263,9 @@ impl BearerGuard {
 
 /// Middleware: 401 any request that doesn't carry a credential the guard recognizes. The whole
 /// `X-Auth-Request-*` family is dropped before anything else runs. With no expected token and no
-/// issuer, every request passes as `CONTROLLER_DEV_IDENTITY`, and the surface is loopback-bound.
+/// issuer, every request passes as `CONTROLLER_DEV_IDENTITY`, and the surface is loopback-bound:
+/// it answers only requests that name this machine, and takes a browser's writes only from its own
+/// pages.
 ///
 /// The credentials: the session cookie this controller minted (its claims come off the session,
 /// and a non-GET additionally needs a same-origin `Sec-Fetch-Site` or `Origin`, because the cookie
@@ -281,6 +283,12 @@ pub(crate) async fn require_auth(
     }
 
     if guard.is_open() {
+        if !names_this_machine(&req) {
+            return forbidden("an open controller answers only on localhost or a loopback address");
+        }
+        if !is_safe(req.method()) && sent_from_a_page(&req) && !same_origin(&req) {
+            return forbidden("a write to an open controller must come from its own pages");
+        }
         let resolved = match &guard.dev_identity {
             Some(value) => match value.to_str() {
                 Ok(name) => Resolved::named(name),
@@ -574,12 +582,43 @@ fn same_origin(req: &Request) -> bool {
 }
 
 fn cross_origin() -> Response {
+    forbidden("a cookie-authenticated write must come from this origin")
+}
+
+fn forbidden(error: &'static str) -> Response {
     (
         StatusCode::FORBIDDEN,
         [(header::CONTENT_TYPE, "application/json")],
-        r#"{"status":"error","error":"a cookie-authenticated write must come from this origin"}"#,
+        format!(r#"{{"status":"error","error":"{error}"}}"#),
     )
         .into_response()
+}
+
+/// Whether the request is addressed to `localhost` or a loopback address, in its target or its
+/// `Host`. A request that names no host is.
+fn names_this_machine(req: &Request) -> bool {
+    let authority = match (req.uri().authority(), req.headers().get(header::HOST)) {
+        (Some(authority), _) => authority.clone(),
+        (None, None) => return true,
+        (None, Some(host)) => match host.to_str().ok().and_then(|host| host.parse().ok()) {
+            Some(authority) => authority,
+            None => return false,
+        },
+    };
+    let host = authority.host();
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Whether a browser sent the request for a page: it says which site, or which origin.
+fn sent_from_a_page(req: &Request) -> bool {
+    ["sec-fetch-site", "origin"]
+        .iter()
+        .any(|name| req.headers().contains_key(*name))
 }
 
 fn asserted_headers(headers: &HeaderMap) -> Vec<HeaderName> {
@@ -1098,6 +1137,123 @@ mod tests {
             let (status, body) = call(app, req(Some("Bearer anything"), &CLAIMS)).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(body, "wren|");
+        }
+
+        /// `method` on `/probe`, with `headers`.
+        fn sent(method: Method, headers: &[(&str, &str)]) -> HttpRequest<Body> {
+            let mut b = HttpRequest::builder().method(method).uri("/probe");
+            for (name, value) in headers {
+                b = b.header(*name, *value);
+            }
+            b.body(Body::empty()).expect("request")
+        }
+
+        fn open_app() -> axum::Router {
+            let guard = BearerGuard::default()
+                .with_dev_identity(Some("wren".into()))
+                .expect("an open guard takes a dev identity");
+            axum::Router::new()
+                .route(
+                    "/probe",
+                    get(|| async { "read" }).post(|| async { "written" }),
+                )
+                .layer(axum::middleware::from_fn_with_state(
+                    Arc::new(guard),
+                    require_auth,
+                ))
+        }
+
+        #[tokio::test]
+        async fn an_open_guard_answers_only_requests_that_name_this_machine() {
+            let app = open_app();
+            for host in [
+                "127.0.0.1:8870",
+                "127.0.0.1",
+                "127.8.9.10:1",
+                "localhost:8870",
+                "LocalHost",
+                "[::1]:8870",
+                "[::1]",
+            ] {
+                for method in [Method::GET, Method::POST] {
+                    let (status, body) =
+                        call(app.clone(), sent(method.clone(), &[("host", host)])).await;
+                    assert_eq!(status, StatusCode::OK, "{method} Host: {host}: {body}");
+                }
+            }
+            let (status, _) = call(app.clone(), sent(Method::POST, &[])).await;
+            assert_eq!(status, StatusCode::OK, "a request that names no host");
+
+            for host in [
+                "rebound.example:8870",
+                "rebound.example",
+                "127.0.0.1.rebound.example:8870",
+                "localhost.rebound.example",
+                "10.0.0.5:8870",
+                "192.168.1.20",
+                "[2001:db8::1]:8870",
+                "0.0.0.0:8870",
+                "",
+                "127.0.0.1:8870, rebound.example",
+            ] {
+                for method in [Method::GET, Method::POST] {
+                    let (status, body) =
+                        call(app.clone(), sent(method.clone(), &[("host", host)])).await;
+                    assert_eq!(status, StatusCode::FORBIDDEN, "{method} Host: {host:?}");
+                    assert!(body.contains("localhost or a loopback address"), "{body}");
+                }
+            }
+
+            let targeted = HttpRequest::get("http://rebound.example:8870/probe")
+                .header("host", "127.0.0.1:8870")
+                .body(Body::empty())
+                .expect("request");
+            let (status, _) = call(app, targeted).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "the target wins over Host");
+        }
+
+        #[tokio::test]
+        async fn an_open_guard_takes_a_browsers_writes_only_from_its_own_pages() {
+            let app = open_app();
+            let host = ("host", "127.0.0.1:8870");
+            let own: [&[(&str, &str)]; 3] = [
+                &[host, ("sec-fetch-site", "same-origin")],
+                &[host, ("origin", "http://127.0.0.1:8870")],
+                &[host],
+            ];
+            for headers in own {
+                let (status, body) = call(app.clone(), sent(Method::POST, headers)).await;
+                assert_eq!(status, StatusCode::OK, "{headers:?}: {body}");
+            }
+            let elsewhere: [&[(&str, &str)]; 6] = [
+                &[host, ("sec-fetch-site", "cross-site")],
+                &[host, ("sec-fetch-site", "same-site")],
+                &[host, ("sec-fetch-site", "none")],
+                &[host, ("origin", "https://page.example")],
+                &[host, ("origin", "http://127.0.0.1:9999")],
+                &[host, ("origin", "null")],
+            ];
+            for headers in elsewhere {
+                for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+                    let (status, body) = call(app.clone(), sent(method.clone(), headers)).await;
+                    assert_eq!(status, StatusCode::FORBIDDEN, "{method} {headers:?}");
+                    assert!(body.contains("its own pages"), "{body}");
+                }
+                let (status, body) = call(app.clone(), sent(Method::GET, headers)).await;
+                assert_eq!(status, StatusCode::OK, "a read: {headers:?}: {body}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_guarded_deployment_answers_on_its_own_hostname() {
+            let app = app(static_only());
+            let named = HttpRequest::get("/probe")
+                .header("host", "crucible.example.com")
+                .header("authorization", "Bearer s3cr3t")
+                .body(Body::empty())
+                .expect("request");
+            let (status, _) = call(app, named).await;
+            assert_eq!(status, StatusCode::OK);
         }
 
         #[test]
