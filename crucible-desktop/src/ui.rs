@@ -51,7 +51,7 @@ use rune_theme_opencode::icons as oc;
 
 use crate::editor::Editor;
 use crate::filter::{LandedFilter, OriginFilter, OwnerFilter};
-use crate::live::{LaunchStatus, LiveDetail, LivePlaybook, LiveView};
+use crate::live::{LaunchStatus, LiveDetail, LiveDraft, LivePlaybook, LiveView, Row};
 use crate::logline::{LogLine, activity};
 use crate::model::{PackView, Verdict};
 use crate::net::Down;
@@ -511,6 +511,50 @@ fn live_pane<'a>(
                 .as_ref()
                 .map(|files| files.as_ref().map(Vec::as_slice).map_err(Clone::clone))
         }),
+    }
+}
+
+/// A draft no launch ran: its newest save, and nothing of a run.
+fn draft_pane<'a>(
+    draft: &LiveDraft,
+    pack: Option<&'a Result<PackFiles, String>>,
+    log_font: LogFont,
+) -> Pane<'a> {
+    Pane {
+        title: draft.id.clone(),
+        subtitle: draft
+            .description
+            .clone()
+            .unwrap_or_else(|| format!("{} \u{b7} by {}", draft_meta(draft), draft.by)),
+        path: format!("draft {} v{}", draft.id, draft.version),
+        verdict: Verdict::NotRun,
+        spent: 0.0,
+        cap: 0.0,
+        passed: 0,
+        failed: 0,
+        tasks: &[],
+        time: "\u{2014}".to_string(),
+        time_note: None,
+        meta: Some(draft.owner.clone()),
+        streaming: false,
+        problem: None,
+        log: &[],
+        transcript: &[],
+        agent_events: &[],
+        log_font,
+        launchable: false,
+        preview: None,
+        previewing: false,
+        run_tasks: &[],
+        empty: ("No launches listed.", String::new()),
+        pack: match pack {
+            Some(pack) => pack.as_ref().map_err(Clone::clone),
+            None if draft.version > 0 => Err("Reading the pack\u{2026}".to_string()),
+            None => Err("Nothing saved.".to_string()),
+        },
+        launch: None,
+        run_id: None,
+        files: Some(Ok(&[])),
     }
 }
 
@@ -983,7 +1027,7 @@ fn pack_list(app: &App, p: &Paint) -> El {
     match app.backend {
         Backend::Controller => match &*app.remote.live {
             LiveView::Ready { now, .. } => {
-                let playbooks = app.visible_playbooks();
+                let playbooks = app.visible_rows();
                 if playbooks.is_empty() {
                     list = list.child(note(
                         if app.filtering() {
@@ -1236,11 +1280,14 @@ fn ignited(mark: El, spark: Spark, ember: Color) -> El {
 /// The side of the status slot the flare starts from.
 const IGNITION: f32 = 12.0;
 
-fn live_rows(app: &App, playbooks: &[&LivePlaybook], now: i64, p: &Paint) -> Vec<El> {
+fn live_rows(app: &App, rows: &[Row], now: i64, p: &Paint) -> Vec<El> {
     let current = app.selected_playbook();
-    playbooks
-        .iter()
-        .map(|playbook| {
+    rows.iter()
+        .map(|row| {
+            let playbook = match row {
+                Row::Launch(playbook) => playbook,
+                Row::Draft(draft) => return draft_row(draft, current, now, p),
+            };
             let id = playbook.id.clone();
             let status = match (
                 verdict_status(playbook.verdict(), p),
@@ -1263,6 +1310,28 @@ fn live_rows(app: &App, playbooks: &[&LivePlaybook], now: i64, p: &Paint) -> Vec
             item.build(p.k).key(format!("live-{}", playbook.id))
         })
         .collect()
+}
+
+fn draft_meta(draft: &LiveDraft) -> String {
+    if draft.compiles {
+        format!("draft \u{b7} v{}", draft.version)
+    } else {
+        format!("draft \u{b7} v{} \u{b7} does not compile", draft.version)
+    }
+}
+
+fn draft_row(draft: &LiveDraft, current: Option<&str>, now: i64, p: &Paint) -> El {
+    let id = draft.id.clone();
+    let mut item = SidebarRow::new(draft.id.clone())
+        .subtitle(draft_meta(draft))
+        .height(ROW * p.text)
+        .status(verdict_status(Verdict::NotRun, p))
+        .selected(current == Some(draft.id.as_str()))
+        .on_select(move |app: &mut App, _: &mut Tx| app.select(Selection::playbook(&id)));
+    if draft.saved > 0 {
+        item = item.detail(age(draft.saved, now));
+    }
+    item.build(p.k).key(format!("draft-{}", draft.id))
 }
 
 /// The launches of the selected live playbook the filters keep, when there is more than one.
@@ -1352,10 +1421,16 @@ fn detail(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
         Some(Selection::Local(_)) => app.selected_pack().map(|pack| local_pane(pack, font)),
         Some(Selection::Live { launch, .. }) => {
             let pinned = launch.is_some() && playbook_launches(app).is_some();
-            app.selected_live().map(|live| Pane {
-                preview: app.remote.working_preview.as_ref(),
-                ..live_pane(live, app.selected_detail(), font, pinned)
-            })
+            app.selected_live()
+                .map(|live| live_pane(live, app.selected_detail(), font, pinned))
+                .or_else(|| {
+                    app.selected_draft()
+                        .map(|draft| draft_pane(draft, app.selected_draft_pack(), font))
+                })
+                .map(|pane| Pane {
+                    preview: app.remote.working_preview.as_ref(),
+                    ..pane
+                })
         }
         None => None,
     }
@@ -1432,7 +1507,8 @@ fn detail(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
         }
         None => stats(&pane, p),
     };
-    body.child(stats).child(dock::workspace(&pane, app, p))
+    body.children(app.selected_draft().is_none().then_some(stats))
+        .child(dock::workspace(&pane, app, p))
 }
 
 /// Stops the launch on screen while it runs, after a confirming second press.

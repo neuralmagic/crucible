@@ -1259,6 +1259,11 @@ impl Client {
         self.post("/api/playbook-drafts", Some(&body)).await
     }
 
+    /// Every draft the caller may read.
+    pub async fn playbook_drafts<T: DeserializeOwned>(&self) -> Result<T> {
+        self.get("/api/playbook-drafts").await
+    }
+
     pub async fn draft_files<T: DeserializeOwned>(
         &self,
         id: &str,
