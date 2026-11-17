@@ -1,0 +1,43 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0077"
+title = "A launch fans out into one run per picked value"
+status = "proposed"
+date = "2026-11-17"
+refs = [
+    "RFC-0002:C-PLAYBOOK-PARAMS",
+    "ADR-0074",
+    "ADR-0076",
+]
+
+[content]
+context = """
+A playbook that acts on one release at a time is often launched for several releases with the same inputs. Each such launch is filled in and submitted separately, although only the release and the values keyed by it differ. Teaching the playbook to take a list would turn every release-scoped task into a mapped one and every keyed declaration of [[ADR-0074]] and [[ADR-0076]] into a list of objects."""
+decision = """
+A string declaration with choices or choices_from MAY set fan_out = True. The engine still binds one value per compile; the schema emits x-fan-out.
+
+- **Wire.** A controller launch MAY give the fan_out parameter as a JSON array of strings. Each element starts its own ordinary run, bound to that element. A parameter keyed by the fan_out parameter through choices_from, placeholder_from, or confirm_from, and any gate of one, MAY be a JSON object from picked values to that run's value; an absent key leaves it unsupplied for that run. A plain string still applies to every run.
+- **Admission.** The controller validates each run's values as it would a single launch's, reports every refusal prefixed with the run's value, and adopts all of the runs in one transaction or none. The ack keeps key, the first run's, and adds keys, every run's.
+- **Single-run launches.** A rerun, a schedule, and a scheduled one-shot refuse more than one picked value.
+- **Form.** The form renders the parameter as a checkbox group in offered order, folding after five entries; a picked entry past the fold stays shown. With several picked, each picked value gets a section of its own keyed parameters, and the ceilings say they apply per run."""
+consequences = """
+- Several releases launch from one form, and each run is the same single-release run a separate launch would have started.
+- Ceilings bind each run, so a fanned-out launch can spend that many times the ceiling.
+- A fan_out parameter's text value that starts with [ is read as an array."""
+
+[[content.alternatives]]
+text = "The controller fans out a launch into one ordinary run per picked value"
+status = "accepted"
+pros = [
+    "The playbook, its keyed declarations, and every run stay single-valued.",
+    "Each run is retried, rerun, and audited on its own.",
+]
+cons = ["A launch acknowledges several keys."]
+
+[[content.alternatives]]
+text = "A list-typed parameter the playbook maps over in one run"
+status = "rejected"
+pros = ["One run to watch."]
+cons = ["Every keyed declaration and release-scoped task becomes per-element.", "One release's failure fails the others' run."]
+rejection_reason = "It pushes per-value structure into every pack that wants it."

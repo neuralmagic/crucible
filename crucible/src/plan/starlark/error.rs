@@ -211,6 +211,12 @@ pub enum CompileError {
     ParamBadConfirmFrom { param: String, detail: &'static str },
     #[error("parameter {param:?} sets allow_other without choices or choices_from")]
     ParamAllowOtherWithoutChoices { param: String },
+    #[error("parameter {param:?} sets fan_out without choices or choices_from to pick from")]
+    ParamFanOutWithoutChoices { param: String },
+    #[error(
+        "parameters {first:?} and {second:?} both set fan_out; a launch fans out over at most one"
+    )]
+    ParamFanOutTwice { first: String, second: String },
     #[error("parameter {param:?} is keyed by {keyed_by:?}, but {detail}")]
     ParamKeyedByInvalid {
         param: String,

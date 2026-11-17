@@ -222,8 +222,10 @@ pub(crate) struct LaunchRequest<'a> {
 /// accepted, and the ceilings the admin caps allowed.
 pub(crate) struct AuthorizedLaunch<P> {
     pub pack: P,
-    /// The validated `{name: value}` object as stored.
+    /// The validated `{name: value}` object as stored, of the first launch when it fans out.
     pub params: serde_json::Value,
+    /// The validated objects of the other launches a fan-out param's picked values ask for.
+    pub more: Vec<serde_json::Value>,
     pub max_cost: f64,
     pub max_time: crate::model::MaxTime,
     /// The `{param: {run_id, digest}}` choice snapshots the values were validated against.
@@ -262,22 +264,82 @@ pub(crate) async fn admit<P: Admissible>(
         crate::playbooks::choices::attach(state.db.pool(), target.id(), &schema)
             .await
             .map_err(|e| ApiError::from(e).into_response())?;
-    let params = crate::playbooks::registry::validate_params(&schema, request.params)
+    let sets = crate::playbooks::registry::expand_fan_out(&schema, request.params)
         .map_err(invalid_fields)?;
-    check_plan(
-        target.tree(state.db.pool()).await?,
-        &params,
-        &max_time,
-        target.variant(),
-    )
-    .await?;
+    let fanned = sets.len() > 1;
+    let mut runs = Vec::with_capacity(sets.len());
+    let mut errors = Vec::new();
+    for set in &sets {
+        match crate::playbooks::registry::validate_params(&schema, set) {
+            Ok(params) => runs.push(params),
+            Err(refused) => errors.extend(refused.into_iter().map(|mut e| {
+                if fanned {
+                    e.message = format!("for {}: {}", fan_value(&schema, set), e.message);
+                }
+                e
+            })),
+        }
+    }
+    if !errors.is_empty() {
+        return Err(invalid_fields(errors));
+    }
+    let tree = target.tree(state.db.pool()).await?;
+    for params in &runs {
+        check_plan(tree.clone(), params, &max_time, target.variant()).await?;
+    }
+    let mut runs = runs.into_iter();
+    let Some(params) = runs.next() else {
+        return Err(invalid_fields(vec![FieldError {
+            field: String::new(),
+            message: "the values ask for no launch".to_string(),
+        }]));
+    };
     Ok(AuthorizedLaunch {
         pack,
         params,
+        more: runs.collect(),
         max_cost: request.max_cost,
         max_time,
         choice_snapshots,
     })
+}
+
+impl<P> AuthorizedLaunch<P> {
+    /// The one launch a standing or rerun launch makes; a fan-out over several values is refused,
+    /// since each fires or reruns as one run.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn single(&self, what: &str) -> Result<(), Response> {
+        if self.more.is_empty() {
+            return Ok(());
+        }
+        Err(invalid_fields(vec![FieldError {
+            field: String::new(),
+            message: format!(
+                "{what} launches one run, and these values fan out into {}; pick one value",
+                self.more.len() + 1
+            ),
+        }]))
+    }
+
+    /// Every launch's validated values, the first one first.
+    pub(crate) fn all_params(&self) -> impl Iterator<Item = &serde_json::Value> {
+        std::iter::once(&self.params).chain(&self.more)
+    }
+}
+
+fn fan_value(
+    schema: &serde_json::Value,
+    set: &std::collections::BTreeMap<String, String>,
+) -> String {
+    let properties = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object);
+    properties
+        .into_iter()
+        .flatten()
+        .find(|(_, p)| p.get("x-fan-out") == Some(&serde_json::Value::Bool(true)))
+        .and_then(|(name, _)| Some(format!("{name} = {:?}", set.get(name)?)))
+        .unwrap_or_default()
 }
 
 /// [`admit`] up to the values, for a standing launch whose values are only complete at each

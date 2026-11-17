@@ -620,7 +620,10 @@ pub(crate) struct LaunchPlaybookBody {
 /// with, read back the way the dispatch will read them.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PlaybookLaunchAck {
+    /// The first launch's issue key.
     pub key: String,
+    /// Every launch's issue key, `key` first: one per picked value of a fan-out param.
+    pub keys: Vec<String>,
     pub playbook: String,
     pub params: std::collections::BTreeMap<String, String>,
     pub schema_digest: String,
@@ -692,6 +695,12 @@ pub(crate) async fn launch_playbook(
         Ok(a) => a,
         Err(refusal) => return refusal,
     };
+    if body.rerun.is_some()
+        && let Err(refusal) = authorized.single("a rerun")
+    {
+        return refusal;
+    }
+    let fanned: Vec<serde_json::Value> = authorized.all_params().cloned().collect();
     let pack = authorized.pack;
     if let Err(refused) = decide_launch(&state, &caller, pack.target()).await {
         return refused;
@@ -739,7 +748,15 @@ pub(crate) async fn launch_playbook(
     let actor = saver.actor.as_deref();
     let owner = caller.subject_principal().map(|p| p.to_string());
     let dispatch_target = saver.dispatch_target.clone();
-    let key = format!("playbook:{id}:{}", uuid::Uuid::now_v7());
+    let keys: Vec<String> = fanned
+        .iter()
+        .map(|_| format!("playbook:{id}:{}", uuid::Uuid::now_v7()))
+        .collect();
+    let runs: Vec<crate::launches::store::LaunchRun<'_>> = keys
+        .iter()
+        .zip(&fanned)
+        .map(|(key, params)| crate::launches::store::LaunchRun { key, params })
+        .collect();
     let launch = crate::launches::model::NewPlaybookLaunch {
         choice_snapshots: Some(&authorized.choice_snapshots),
         playbook: &pack.id,
@@ -760,9 +777,9 @@ pub(crate) async fn launch_playbook(
         dispatch: saver.pin(),
     };
     use crate::launches::store::AdoptPlaybookOutcome;
-    match crate::launches::store::adopt_playbook_launch(
+    match crate::launches::store::adopt_playbook_launches(
         state.db.pool(),
-        &key,
+        &runs,
         &launch,
         pack.revision(),
     )
@@ -795,31 +812,36 @@ pub(crate) async fn launch_playbook(
         Err(e) => return ApiError::from(e).into_response(),
     }
 
-    let max_time = authorized.max_time;
-    state
-        .audit(
-            crate::event_log::Event::now(
-                &key,
-                "new",
-                "new",
-                Some(&format!(
-                    "playbook {id} launched at {} ({} params, max_cost {}, max_time {max_time})",
-                    pack.rev,
-                    body.params.len(),
-                    body.max_cost
-                )),
-                None,
+    let max_time = &authorized.max_time;
+    for key in &keys {
+        state
+            .audit(
+                crate::event_log::Event::now(
+                    key,
+                    "new",
+                    "new",
+                    Some(&format!(
+                        "playbook {id} launched at {} ({} params, max_cost {}, max_time {max_time}, \
+                         1 of {} launches)",
+                        pack.rev,
+                        body.params.len(),
+                        body.max_cost,
+                        keys.len()
+                    )),
+                    None,
+                )
+                .by(actor),
+                "launch_playbook",
             )
-            .by(actor),
-            "launch_playbook",
-        )
-        .await;
-    state.queue.enqueue_urgent(IssueKey(key.clone()));
+            .await;
+        state.queue.enqueue_urgent(IssueKey(key.clone()));
+    }
 
     (
         StatusCode::CREATED,
         Json(PlaybookLaunchAck {
-            key,
+            key: keys.first().cloned().unwrap_or_default(),
+            keys,
             playbook: pack.id,
             params: body.params,
             schema_digest: pack.schema_digest,

@@ -1457,6 +1457,123 @@ pub fn validate_params(
     }
 }
 
+/// The launches one request asks for: one per value of the schema's `x-fan-out` param, sent as a
+/// JSON array of strings or one plain value. A param keyed by it, or the gate of one, may be sent
+/// as a JSON object from fan-out values to that launch's value; a value it leaves out is unset.
+/// Any other value applies to every launch. A schema without a fan-out param is one launch.
+pub fn expand_fan_out(
+    schema: &serde_json::Value,
+    params: &std::collections::BTreeMap<String, String>,
+) -> Result<Vec<std::collections::BTreeMap<String, String>>, Vec<FieldError>> {
+    let properties = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object);
+    let Some(fan) = properties
+        .into_iter()
+        .flatten()
+        .find_map(|(name, property)| {
+            (property.get("x-fan-out") == Some(&serde_json::Value::Bool(true))).then_some(name)
+        })
+    else {
+        return Ok(vec![params.clone()]);
+    };
+    let Some(raw) = params.get(fan) else {
+        return Ok(vec![params.clone()]);
+    };
+    let refuse = |field: &str, message: String| {
+        Err(vec![FieldError {
+            field: field.to_owned(),
+            message,
+        }])
+    };
+    let values: Vec<String> = if raw.trim_start().starts_with('[') {
+        match serde_json::from_str(raw) {
+            Ok(values) => values,
+            Err(_) => {
+                return refuse(fan, format!("{raw:?} is not a JSON array of strings"));
+            }
+        }
+    } else {
+        vec![raw.clone()]
+    };
+    if values.is_empty() {
+        return refuse(fan, format!("pick at least one {fan}"));
+    }
+    if let Some(repeat) = values
+        .iter()
+        .enumerate()
+        .find_map(|(i, v)| values[..i].contains(v).then_some(v))
+    {
+        return refuse(fan, format!("{repeat:?} is picked twice"));
+    }
+    let dependents = fan_out_dependents(properties.into_iter().flatten(), fan);
+    let mut per_value = std::collections::BTreeMap::new();
+    for name in &dependents {
+        let Some(text) = params.get(name) else {
+            continue;
+        };
+        let Ok(serde_json::Value::Object(by_value)) = serde_json::from_str(text) else {
+            continue;
+        };
+        let mut values_of = std::collections::BTreeMap::new();
+        for (key, value) in by_value {
+            if !values.contains(&key) {
+                return refuse(
+                    name,
+                    format!("{name} sets a value for {key:?}, which is not a picked {fan}"),
+                );
+            }
+            let text = match value {
+                serde_json::Value::String(text) => text,
+                other => other.to_string(),
+            };
+            values_of.insert(key, text);
+        }
+        per_value.insert(name.clone(), values_of);
+    }
+    Ok(values
+        .iter()
+        .map(|value| {
+            let mut run = params.clone();
+            run.insert(fan.clone(), value.clone());
+            for (name, values_of) in &per_value {
+                match values_of.get(value) {
+                    Some(text) => run.insert(name.clone(), text.clone()),
+                    None => run.remove(name),
+                };
+            }
+            run
+        })
+        .collect())
+}
+
+/// The params whose choices, placeholder, or confirmation are keyed by `fan`, and the gates that
+/// enable them: what a fanned-out launch may set per value.
+fn fan_out_dependents<'a>(
+    properties: impl Iterator<Item = (&'a String, &'a serde_json::Value)> + Clone,
+    fan: &str,
+) -> std::collections::BTreeSet<String> {
+    let keyed: std::collections::BTreeSet<String> = properties
+        .clone()
+        .filter(|(_, property)| {
+            ["x-choices-from", "x-placeholder-from", "x-confirm-from"]
+                .iter()
+                .any(|source| {
+                    property.pointer(&format!("/{source}/keyed_by"))
+                        == Some(&serde_json::Value::String(fan.to_owned()))
+                })
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    let gates = properties.filter_map(|(name, property)| {
+        keyed
+            .contains(name)
+            .then(|| property.get("x-enabled-by")?.as_str().map(str::to_owned))
+            .flatten()
+    });
+    gates.chain(keyed.iter().cloned()).collect()
+}
+
 /// A choices refresh carries `choices.refresh = true` alone, and only a playbook that declares
 /// choices_from, placeholder_from, or confirm_from has anything to refresh. The declared params' schema does not apply: a refresh
 /// compiles without them.
@@ -1597,6 +1714,79 @@ mod tests {
 
     /// The schema is the pack's declaration; a launcher's values are checked against it field by
     /// field, so the form can pin each message to the input that produced it.
+    #[test]
+    fn a_fan_out_launch_is_one_value_set_per_picked_value_with_keyed_params_set_per_value() {
+        let schema = serde_json::json!({"type": "object", "properties": {
+            "release": {"type": "string", "x-fan-out": true, "enum": ["a", "b", "c"]},
+            "component": {"type": "string",
+                          "x-choices-from": {"task": "t", "field": "f", "keyed_by": "release"}},
+            "override": {"type": "boolean"},
+            "branch": {"type": "string", "x-enabled-by": "override",
+                       "x-placeholder-from": {"task": "t", "field": "g", "keyed_by": "release"}},
+            "context": {"type": "string"}}});
+        let supplied = |pairs: &[(&str, &str)]| -> std::collections::BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        let runs = expand_fan_out(
+            &schema,
+            &supplied(&[
+                ("release", r#"["b", "a"]"#),
+                ("component", r#"{"a": "tpu"}"#),
+                ("override", r#"{"b": true}"#),
+                ("branch", r#"{"b": "main"}"#),
+                ("context", r#"{"a": "not per value"}"#),
+            ]),
+        )
+        .expect("expands");
+        assert_eq!(
+            runs,
+            vec![
+                supplied(&[
+                    ("release", "b"),
+                    ("override", "true"),
+                    ("branch", "main"),
+                    ("context", r#"{"a": "not per value"}"#),
+                ]),
+                supplied(&[
+                    ("release", "a"),
+                    ("component", "tpu"),
+                    ("context", r#"{"a": "not per value"}"#),
+                ]),
+            ]
+        );
+        assert_eq!(
+            expand_fan_out(
+                &schema,
+                &supplied(&[("release", "a"), ("component", "gpu")])
+            )
+            .expect("one value"),
+            vec![supplied(&[("release", "a"), ("component", "gpu")])]
+        );
+        for (pairs, message) in [
+            (vec![("release", "[]")], "pick at least one release"),
+            (vec![("release", r#"["a", "a"]"#)], "\"a\" is picked twice"),
+            (vec![("release", "[a]")], "is not a JSON array of strings"),
+            (
+                vec![("release", r#"["a"]"#), ("component", r#"{"c": "tpu"}"#)],
+                "component sets a value for \"c\", which is not a picked release",
+            ),
+        ] {
+            let errors = expand_fan_out(&schema, &supplied(&pairs)).expect_err("refused");
+            assert!(
+                errors.iter().any(|e| e.message.contains(message)),
+                "{message}: {errors:?}"
+            );
+        }
+        let plain = serde_json::json!({"type": "object", "properties": {"r": {"type": "string"}}});
+        assert_eq!(
+            expand_fan_out(&plain, &supplied(&[("r", r#"["a", "b"]"#)])).expect("no fan-out"),
+            vec![supplied(&[("r", r#"["a", "b"]"#)])]
+        );
+    }
+
     #[test]
     fn validate_params_names_every_offending_field() {
         let schema: serde_json::Value = serde_json::from_str(

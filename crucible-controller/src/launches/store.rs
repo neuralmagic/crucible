@@ -377,13 +377,21 @@ pub(crate) enum AdoptDraftOutcome {
     },
 }
 
-/// Mint one draft launch. The registry foreign key cannot cover a draft, so this is where the
-/// integrity lives: the draft version the endpoint authorized against is re-read `FOR SHARE`, and
-/// a save that landed in between is the same drift refusal the registered path answers with.
-#[tracing::instrument(name = "db.adopt_draft_launch", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", key = %key), err)]
-pub(crate) async fn adopt_draft_launch(
+/// One launch of a fanned-out request: its key and the values it runs with.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LaunchRun<'a> {
+    pub key: &'a str,
+    pub params: &'a serde_json::Value,
+}
+
+/// Mint a draft launch, or every launch of a fanned-out one, together or not at all. The registry
+/// foreign key cannot cover a draft, so this is where the integrity lives: the draft version the
+/// endpoint authorized against is re-read `FOR SHARE`, and a save that landed in between is the
+/// same drift refusal the registered path answers with.
+#[tracing::instrument(name = "db.adopt_draft_launch", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", launches = runs.len()), err)]
+pub(crate) async fn adopt_draft_launches(
     pool: &PgPool,
-    key: &str,
+    runs: &[LaunchRun<'_>],
     launch: &NewPlaybookLaunch<'_>,
     exposure: &crate::playbooks::exposure::Extraction,
 ) -> Result<AdoptDraftOutcome> {
@@ -417,7 +425,7 @@ pub(crate) async fn adopt_draft_launch(
             current: format!("version {}", newest.unwrap_or_default()),
         },
         Some(_) => {
-            if insert_playbook_launch_with(&mut tx, key, launch, exposure).await? {
+            if insert_runs(&mut tx, runs, launch, exposure).await? {
                 tx.commit().await.context("adopt_draft_launch: commit")?;
                 return Ok(AdoptDraftOutcome::Adopted);
             }
@@ -430,13 +438,34 @@ pub(crate) async fn adopt_draft_launch(
     Ok(outcome)
 }
 
-/// Mint one registered launch. The registry row is re-read `FOR SHARE`, and the launch is refused
-/// unless it still serves the schema and holds the revision the endpoint authorized, so the pack
-/// copied to the launch is the one its values were validated against.
-#[tracing::instrument(name = "db.adopt_playbook_launch", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", key = %key), err)]
+/// [`adopt_playbook_launches`] for one launch.
+#[cfg(test)]
 pub(crate) async fn adopt_playbook_launch(
     pool: &PgPool,
     key: &str,
+    launch: &NewPlaybookLaunch<'_>,
+    authorized: PackRevision<'_>,
+) -> Result<AdoptPlaybookOutcome> {
+    adopt_playbook_launches(
+        pool,
+        &[LaunchRun {
+            key,
+            params: launch.params,
+        }],
+        launch,
+        authorized,
+    )
+    .await
+}
+
+/// Mint a registered launch, or every launch of a fanned-out one, together or not at all. The
+/// registry row is re-read `FOR SHARE`, and the launch is refused unless it still serves the schema
+/// and holds the revision the endpoint authorized, so the pack copied to the launch is the one its
+/// values were validated against.
+#[tracing::instrument(name = "db.adopt_playbook_launch", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", launches = runs.len()), err)]
+pub(crate) async fn adopt_playbook_launches(
+    pool: &PgPool,
+    runs: &[LaunchRun<'_>],
     launch: &NewPlaybookLaunch<'_>,
     authorized: PackRevision<'_>,
 ) -> Result<AdoptPlaybookOutcome> {
@@ -453,9 +482,9 @@ pub(crate) async fn adopt_playbook_launch(
             AdoptPlaybookOutcome::Repinned { rev: current.rev }
         }
         Some(_) => {
-            if insert_playbook_launch_with(
+            if insert_runs(
                 &mut tx,
-                key,
+                runs,
                 launch,
                 &crate::playbooks::exposure::Extraction::Absent,
             )
@@ -471,6 +500,24 @@ pub(crate) async fn adopt_playbook_launch(
         .await
         .context("adopt_playbook_launch: rollback")?;
     Ok(outcome)
+}
+
+async fn insert_runs(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    runs: &[LaunchRun<'_>],
+    launch: &NewPlaybookLaunch<'_>,
+    exposure: &crate::playbooks::exposure::Extraction,
+) -> Result<bool> {
+    for run in runs {
+        let one = NewPlaybookLaunch {
+            params: run.params,
+            ..launch.clone()
+        };
+        if !insert_playbook_launch_with(tx, run.key, &one, exposure).await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// A launch's own pack whose exposure the engine refuses to extract.
@@ -608,6 +655,92 @@ mod tests {
 
     fn exposure_doc(marker: &str) -> serde_json::Value {
         serde_json::json!({"version": 1, "outputs": [{"kind": marker, "count": 1}]})
+    }
+
+    /// The launches of one fanned-out request land together, each with its own values, or none
+    /// of them does.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_fanned_out_request_adopts_every_launch_or_none(pool: PgPool) -> Result<()> {
+        pin(
+            &pool,
+            PackTree::from_pairs(&[("crucible.toml", b"a")])?,
+            &exposure_doc("row"),
+        )
+        .await;
+        let row = crate::playbooks::registry::get(&pool, "survey")
+            .await?
+            .expect("registered");
+        let max_time = crate::model::MaxTime::parse("30m").expect("duration");
+        let first = serde_json::json!({"release": "a"});
+        let second = serde_json::json!({"release": "b"});
+        let launch_of = |params| NewPlaybookLaunch {
+            choice_snapshots: None,
+            playbook: "survey",
+            repo: "owner/repo",
+            title: "survey",
+            params,
+            schema_digest: "sha256:schema",
+            max_cost: 1.0,
+            max_time: &max_time,
+            advance_dedupe: false,
+            dedupe_schedule: None,
+            origin: crate::model::LaunchOrigin::Manual,
+            draft_version: None,
+            created_by: Some("wren"),
+            owner: None,
+            launcher_groups: None,
+            rerun: None,
+            dispatch: Default::default(),
+        };
+        let adopted = adopt_playbook_launches(
+            &pool,
+            &[
+                LaunchRun {
+                    key: "survey-a",
+                    params: &first,
+                },
+                LaunchRun {
+                    key: "survey-b",
+                    params: &second,
+                },
+            ],
+            &launch_of(&first),
+            row.revision(),
+        )
+        .await?;
+        assert!(matches!(adopted, AdoptPlaybookOutcome::Adopted));
+        for (key, release) in [("survey-a", "a"), ("survey-b", "b")] {
+            let launched = get_playbook_launch(&pool, key).await?.expect("launch");
+            assert_eq!(
+                launched.params,
+                vec![("release".to_owned(), release.to_owned())],
+                "{key}"
+            );
+        }
+
+        let third = serde_json::json!({"release": "c"});
+        let refused = adopt_playbook_launches(
+            &pool,
+            &[
+                LaunchRun {
+                    key: "survey-c",
+                    params: &third,
+                },
+                LaunchRun {
+                    key: "survey-a",
+                    params: &first,
+                },
+            ],
+            &launch_of(&third),
+            row.revision(),
+        )
+        .await;
+        assert!(refused.is_err(), "a key already taken fails the request");
+        assert!(
+            get_playbook_launch(&pool, "survey-c").await?.is_none(),
+            "the launch ahead of the failed one did not land"
+        );
+        Ok(())
     }
 
     /// A registered launch records the registry row's exposure with the pack it copies, so a

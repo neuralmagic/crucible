@@ -278,6 +278,7 @@ async fn authorize_schedule(
         },
     )
     .await?;
+    authorized.single("a schedule")?;
     Ok((authorized, spec, cursor))
 }
 

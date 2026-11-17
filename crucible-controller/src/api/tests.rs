@@ -7738,6 +7738,82 @@ async fn launching_a_playbook_the_caller_may_not_read_is_not_found(pool: PgPool)
     Ok(())
 }
 
+/// Picking several values of a fan-out param launches one run per value, each bound to its own
+/// value; a request any one of whose values is refused launches nothing.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_fan_out_launch_starts_one_run_per_picked_value_or_none(pool: PgPool) -> Result<()> {
+    let (db, dir) = db_with(pool);
+    let app = app_with_admins(db.clone(), vec!["wren".to_string()]);
+    register_survey(
+        &app,
+        dir.path(),
+        &LAUNCH_WORKFLOW.replace(
+            "\"depth\": {\"type\": \"string\", \"required\": True},",
+            "\"depth\": {\"type\": \"string\", \"required\": True, \"choices\": [\"deep\", \"shallow\", \"skim\"], \"fan_out\": True},",
+        ),
+    )
+    .await;
+    let launch = |depth: serde_json::Value| {
+        serde_json::json!({
+            "params": {"topic": "attention", "depth": depth.to_string()},
+            "max_cost": 1.0,
+            "max_time": "5m",
+        })
+    };
+
+    let (status, refused) = send_as(
+        &app,
+        "POST",
+        "/api/playbooks/survey/launch",
+        "wren",
+        launch(serde_json::json!(["deep", "sideways"])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    assert_eq!(refused["fields"][0]["field"], "depth");
+    assert!(
+        refused["fields"][0]["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("for depth = \"sideways\": ")),
+        "{refused}"
+    );
+    let launches: i64 = sqlx::query_scalar("SELECT count(*) FROM playbook_launches")
+        .fetch_one(db.pool())
+        .await?;
+    assert_eq!(launches, 0);
+
+    let (status, ack) = send_as(
+        &app,
+        "POST",
+        "/api/playbooks/survey/launch",
+        "wren",
+        launch(serde_json::json!(["skim", "deep"])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{ack}");
+    let keys: Vec<&str> = ack["keys"]
+        .as_array()
+        .expect("keys")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert_eq!(keys.len(), 2, "{ack}");
+    assert_eq!(ack["key"], keys[0]);
+    for (key, depth) in keys.iter().zip(["skim", "deep"]) {
+        let stored: serde_json::Value =
+            sqlx::query_scalar("SELECT params FROM playbook_launches WHERE key = $1")
+                .bind(key)
+                .fetch_one(db.pool())
+                .await?;
+        assert_eq!(
+            stored,
+            serde_json::json!({"topic": "attention", "depth": depth}),
+            "{key}"
+        );
+    }
+    Ok(())
+}
+
 // --- one-shot runs surface ----------------------------------------------------
 
 async fn get_json_value(app: &Router, path: &str) -> (StatusCode, serde_json::Value) {

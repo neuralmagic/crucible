@@ -496,11 +496,13 @@ impl Operation for DraftDiff {
 }
 
 fn parse_string_map(s: &str) -> Result<BTreeMap<String, String>, String> {
-    serde_json::from_str(s).map_err(|e| {
-        format!(
-            "not a JSON object of string to string; a draft launch takes form values as strings: {e}"
-        )
-    })
+    let object: serde_json::Map<String, Value> = serde_json::from_str(s).map_err(|e| {
+        format!("not a JSON object; a draft launch takes form values as an object: {e}")
+    })?;
+    Ok(crate::dto::string_params(&object)
+        .into_iter()
+        .filter_map(|(name, value)| Some((name, value.as_str()?.to_owned())))
+        .collect())
 }
 
 /// Test-fire a draft. The values are the newest save's stored schema's, strings because the
@@ -510,7 +512,9 @@ fn parse_string_map(s: &str) -> Result<BTreeMap<String, String>, String> {
 #[derive(Debug, Clone, PartialEq, clap::Args, Deserialize, schemars::JsonSchema)]
 pub struct DraftLaunch {
     pub draft_id: String,
-    /// The form values its schema accepts, as a JSON object of string to string.
+    /// The form values its schema accepts, as a JSON object. A fan-out param takes an array of
+    /// values, one run each; a param keyed by it takes an object from those values to each
+    /// run's value.
     #[arg(long, default_value = "{}", value_parser = parse_string_map)]
     #[serde(default)]
     #[schemars(
@@ -592,8 +596,9 @@ impl Operation for DraftLaunch {
     }
 
     fn render(&self, c: &Client, ack: Self::Output) -> Result<String> {
-        let url = c.web_url(&format!("/playbook-runs/{}", encode(&ack.key)));
-        Ok(render::launched(&ack, &url))
+        Ok(render::launched_all(&ack, |key| {
+            c.web_url(&format!("/playbook-runs/{}", encode(key)))
+        }))
     }
 
     fn json(&self) -> bool {
@@ -816,6 +821,19 @@ pub async fn draft_delete(c: &Client, draft_id: &str) -> Result<String> {
 mod tests {
     use crate::ops::drafts::*;
     use crate::ops::test_client;
+
+    #[test]
+    fn draft_launch_values_that_are_not_strings_go_as_their_json_text() {
+        assert_eq!(
+            super::parse_string_map(r#"{"release": ["a", "b"], "dry_run": false, "pr": "1"}"#),
+            Ok(BTreeMap::from([
+                ("dry_run".to_string(), "false".to_string()),
+                ("pr".to_string(), "1".to_string()),
+                ("release".to_string(), r#"["a","b"]"#.to_string()),
+            ]))
+        );
+        assert!(super::parse_string_map("[]").is_err());
+    }
 
     /// Both directions of the mapping refuse a path that leaves the pack. The controller is not
     /// the only writer of these maps, and a directory handed back is not one at all.

@@ -7259,6 +7259,51 @@ workflow(type = "playbook", tasks = [options])"#,
         let _ = std::fs::remove_dir_all(&pack);
     }
 
+    #[test]
+    fn a_fan_out_parameter_is_one_offered_string_and_its_schema_says_so() {
+        let path = std::path::PathBuf::from("workflow.star");
+        let read = |block: &str| read_params(&format!("params = {{{block}}}\n"), &path);
+        let declared = read(
+            r#""release": {"type": "string", "required": True, "choices": ["a", "b"], "fan_out": True}"#,
+        )
+        .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        assert_eq!(
+            declared.json_schema()["properties"]["release"]["x-fan-out"],
+            serde_json::json!(true)
+        );
+        assert!(matches!(
+            read(
+                r#""n": {"type": "list<string>", "default": [], "choices_from": {"task": "t", "field": "f"}, "fan_out": True}"#
+            ),
+            Err(CompileError::ParamConstraintMismatch {
+                constraint: "choices_from",
+                ..
+            })
+        ));
+        assert!(matches!(
+            read(r#""n": {"type": "int", "default": 1, "fan_out": True}"#),
+            Err(CompileError::ParamConstraintMismatch {
+                constraint: "fan_out",
+                ..
+            })
+        ));
+        assert!(matches!(
+            read(r#""r": {"type": "string", "default": "", "fan_out": True}"#),
+            Err(CompileError::ParamFanOutWithoutChoices { param }) if param == "r"
+        ));
+        assert!(matches!(
+            read(r#""a": {"type": "string", "default": "", "choices": ["x"], "fan_out": True}, "b": {"type": "string", "default": "", "choices": ["y"], "fan_out": True}"#),
+            Err(CompileError::ParamFanOutTwice { first, second }) if first == "a" && second == "b"
+        ));
+        assert!(matches!(
+            read(r#""r": {"type": "string", "default": "", "choices": ["x"], "fan_out": "yes"}"#),
+            Err(CompileError::ParamFieldWrongShape {
+                field: "fan_out",
+                ..
+            })
+        ));
+    }
+
     /// Values bind before evaluation, so the compiled graph is what they produced rather than a
     /// template of them: nothing downstream has a parameter left to resolve.
     #[test]

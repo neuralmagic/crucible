@@ -61,9 +61,9 @@ describe('parseParamsSchema', () => {
         choicesSnapshot: null,
         allowOther: false,
         placeholderFrom: null,
-        placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null,
+        placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null, fanOut: false,
       },
-      { name: 'depth', valueType: 'string', required: false, defaultValue: 'shallow', pattern: null, description: null, multiline: false, choices: null, enabledBy: null, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null },
+      { name: 'depth', valueType: 'string', required: false, defaultValue: 'shallow', pattern: null, description: null, multiline: false, choices: null, enabledBy: null, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null, fanOut: false },
       {
         name: 'since',
         valueType: 'string',
@@ -78,9 +78,9 @@ describe('parseParamsSchema', () => {
         choicesSnapshot: null,
         allowOther: false,
         placeholderFrom: null,
-        placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null,
+        placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null, fanOut: false,
       },
-      { name: 'note', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null, multiline: false, choices: null, enabledBy: null, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null },
+      { name: 'note', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null, multiline: false, choices: null, enabledBy: null, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null, fanOut: false },
     ]);
   });
 
@@ -92,7 +92,7 @@ describe('parseParamsSchema', () => {
       additionalProperties: false,
     });
     expect(specs).toEqual([
-      { name: 'topic', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null, multiline: false, choices: null, enabledBy: null, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null },
+      { name: 'topic', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null, multiline: false, choices: null, enabledBy: null, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null, fanOut: false },
     ]);
   });
 
@@ -445,7 +445,7 @@ describe('validateParam', () => {
       choicesSnapshot: null,
       allowOther: false,
       placeholderFrom: null,
-      placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null,
+      placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null, fanOut: false,
     };
     expect(validateParam(rustOnly, 'whatever')).toBeNull();
   });
@@ -679,7 +679,7 @@ describe('runSnapshot', () => {
 describe('paramBlocks', () => {
   const spec = (name: string, valueType: ParamFieldSpec['valueType'], enabledBy: string | null = null): ParamFieldSpec => ({
     name, valueType, required: false, defaultValue: null, pattern: null, description: null, multiline: false,
-    choices: valueType === 'boolean' ? ['true', 'false'] : null, enabledBy, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null,
+    choices: valueType === 'boolean' ? ['true', 'false'] : null, enabledBy, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null, fanOut: false,
   });
 
   it('moves a gate to the head of a group at its first gated field and leaves other booleans alone', () => {

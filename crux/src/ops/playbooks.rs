@@ -116,7 +116,8 @@ pub struct Launch {
     /// Playbook id.
     #[schemars(description = "Playbook id, as `crucible_playbooks` lists it.")]
     pub id: String,
-    /// The params object its schema accepts, as JSON.
+    /// The params object its schema accepts, as JSON. A fan-out param takes an array of values,
+    /// one run each; a param keyed by it takes an object from those values to each run's value.
     #[arg(long, default_value = "{}", value_parser = parse_json)]
     #[serde(default)]
     #[schemars(
@@ -166,12 +167,21 @@ pub struct Launch {
     pub json: bool,
 }
 
+/// Launch values as the controller reads them, every one a string: a JSON array names several
+/// values of a fan-out param, and a JSON object sets a param per fan-out value.
+pub(crate) fn launch_params(params: &Value) -> Value {
+    match params.as_object() {
+        Some(object) => Value::Object(dto::string_params(object)),
+        None => params.clone(),
+    }
+}
+
 impl Operation for Launch {
     type Output = dto::LaunchAck;
 
     async fn call(&self, c: &Client) -> Result<Value> {
         let mut body = serde_json::json!({
-            "params": self.params,
+            "params": launch_params(&self.params),
             "max_cost": self.max_cost,
             "max_time": self.max_time,
         });
@@ -187,8 +197,9 @@ impl Operation for Launch {
     }
 
     fn render(&self, c: &Client, ack: Self::Output) -> Result<String> {
-        let url = c.web_url(&format!("/playbook-runs/{}", encode(&ack.key)));
-        Ok(render::launched(&ack, &url))
+        Ok(render::launched_all(&ack, |key| {
+            c.web_url(&format!("/playbook-runs/{}", encode(key)))
+        }))
     }
 
     fn json(&self) -> bool {
@@ -406,6 +417,16 @@ fn import_preview_path(import_id: &str, id: Option<&str>, description: Option<&s
 mod tests {
     use crate::ops::playbooks::*;
     use crate::ops::test_client;
+
+    #[test]
+    fn launch_values_that_are_not_strings_go_as_their_json_text() {
+        assert_eq!(
+            super::launch_params(
+                &serde_json::json!({"release": ["a", "b"], "component": {"a": "x"}, "pr": "1"})
+            ),
+            serde_json::json!({"release": r#"["a","b"]"#, "component": r#"{"a":"x"}"#, "pr": "1"})
+        );
+    }
 
     #[test]
     fn a_launch_carries_the_link_that_opens_it_in_the_tracker() {

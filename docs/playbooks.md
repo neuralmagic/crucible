@@ -420,6 +420,20 @@ until it is checked. Before the task has passed once, the checkbox is shown with
 optional. The pack should still check at run time, since the sheet can change after the last
 refresh.
 
+Add `"fan_out": True` to a string with `choices` or `choices_from` to let one launch start a run
+per picked value. The form shows the choices as checkboxes, the first five and a "Show N more",
+and gives each picked value its own section of the parameters keyed by it. The playbook still
+sees one value per run. Through the API or `crux launch --params`, send the values as a
+JSON array and a keyed parameter as an object from each value to that run's value:
+
+```json
+{"target_release": ["3.7 Fast-1", "3.6"], "target_component": {"3.7 Fast-1": "vLLM [TPU]"}}
+```
+
+A run whose key is missing takes the parameter's default. Every run is validated before any
+starts, and either all of them start or none do. Ceilings apply to each run. Reruns and schedules
+take one value.
+
 The launch form offers the list as a select and says how old it is. With `allow_other`, the
 select ends in "Other…", which opens a text input.
 

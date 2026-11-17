@@ -1115,14 +1115,14 @@ mod tests {
                 "draft-launch",
                 "calibrate",
                 "--params",
-                r#"{"n": 1}"#,
+                r#"["n", 1]"#,
                 "--max-cost",
                 "4",
                 "--max-time",
                 "30m",
             ])
             .is_err(),
-            "a draft launch takes form values as strings"
+            "a draft launch takes form values as an object"
         );
 
         match Cli::try_parse_from([

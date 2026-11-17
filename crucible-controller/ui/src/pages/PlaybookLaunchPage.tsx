@@ -45,8 +45,10 @@ import {
   runSnapshot,
   scheduleBody,
   validateCronExpr,
+  ceilingHint,
+  runCount,
   validateMaxTime,
-  validateParam,
+  validateParams,
   type LaunchMode,
   type ParamFieldSpec,
   type Recurrence,
@@ -190,9 +192,7 @@ export function PlaybookLaunchPage() {
   };
 
   const checkField = (name: string) => {
-    const spec = specs.find((s) => s.name === name);
-    if (spec === undefined) return;
-    const message = validateParam(spec, values[name] ?? '', values);
+    const message = validateParams(specs, values).get(name) ?? null;
     setFieldErrors((previous) => {
       const next = new Map(previous);
       if (message === null) next.delete(name);
@@ -214,11 +214,7 @@ export function PlaybookLaunchPage() {
   };
 
   const checkValues = (): boolean => {
-    const clientErrors = new Map<string, string>();
-    for (const spec of specs) {
-      const message = validateParam(spec, values[spec.name] ?? '', values);
-      if (message !== null) clientErrors.set(spec.name, message);
-    }
+    const clientErrors = validateParams(specs, values);
     setFieldErrors(clientErrors);
     const ceilingsOk = checkCeilings();
     return clientErrors.size === 0 && ceilingsOk;
@@ -286,7 +282,7 @@ export function PlaybookLaunchPage() {
           { maxCost, maxTime, schemaDigest: pack?.schema_digest ?? '', dispatchTarget }
         ),
       });
-      void navigate(`/issues/${encodeURIComponent(ack.key)}`);
+      void navigate(ack.keys.length > 1 ? '/playbook-runs' : `/issues/${encodeURIComponent(ack.key)}`);
     } catch (err: unknown) {
       applyRejection(err);
     }
@@ -440,7 +436,7 @@ export function PlaybookLaunchPage() {
                 setCeilingErrors(new Map());
               }}
               error={ceilingErrors.get('max_cost') ?? null}
-              hint={costCap === null ? undefined : `Capped at $${costCap} per run.`}
+              hint={ceilingHint(costCap === null ? null : `Capped at $${costCap} per run.`, runCount(specs, values))}
             />
             <DispatchTargetField
               id="launch-dispatch-target"
@@ -465,7 +461,7 @@ export function PlaybookLaunchPage() {
                 checkCeilings();
               }}
               error={ceilingErrors.get('max_time') ?? null}
-              hint={`Wall clock: 90s, 30m, 2h${timeCap === null ? '' : `. Capped at ${timeCap}.`}`}
+              hint={ceilingHint(`Wall clock: 90s, 30m, 2h${timeCap === null ? '' : `. Capped at ${timeCap}.`}`, runCount(specs, values))}
             />
           </FormGrid>
         </SectionBody>

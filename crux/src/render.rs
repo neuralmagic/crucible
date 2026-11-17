@@ -1617,6 +1617,19 @@ pub fn launched(ack: &dto::LaunchAck, run_url: &str) -> String {
     out
 }
 
+/// [`launched`] for every launch a fan-out made, the first in full.
+pub fn launched_all(ack: &dto::LaunchAck, run_url: impl Fn(&str) -> String) -> String {
+    let mut out = launched(ack, &run_url(&ack.key));
+    for key in ack.keys.iter().filter(|key| **key != ack.key) {
+        out.push_str(&format!(
+            "launched {} as {key}\n  {}\n",
+            ack.playbook,
+            run_url(key)
+        ));
+    }
+    out
+}
+
 /// Where the requests went, what they carried, and who the controller says that makes you.
 ///
 /// The three are printed together because the interesting case is when they disagree: an
@@ -2031,6 +2044,22 @@ mod tests {
         )
         .expect("wire shape");
         assert!(runs(&list).contains("run-2"));
+    }
+
+    #[test]
+    fn a_fanned_out_launch_names_every_run_and_where_to_watch_it() {
+        let ack: dto::LaunchAck = serde_json::from_str(
+            r#"{"key":"pb-1","keys":["pb-1","pb-2"],"playbook":"report","max_cost":1.0,
+                "max_time":"30m"}"#,
+        )
+        .expect("wire shape");
+        let out = launched_all(&ack, |key| format!("https://c.example/playbook-runs/{key}"));
+        assert!(out.contains("launched report as pb-1"), "{out}");
+        assert!(
+            out.contains("launched report as pb-2\n  https://c.example/playbook-runs/pb-2"),
+            "{out}"
+        );
+        assert_eq!(out.matches("launched report as").count(), 2, "{out}");
     }
 
     #[test]
