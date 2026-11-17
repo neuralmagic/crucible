@@ -39,7 +39,9 @@ ignore = [
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive via ujira -> keyring secret-service backend; unmaintained, not vulnerable" },
     { id = "RUSTSEC-2026-0319", reason = "anymap2 via kingfisher-rules -> liquid-core (rule templating); unmaintained, not vulnerable" },
     { id = "RUSTSEC-2020-0163", reason = "term_size via kingfisher-core -> tokei; unmaintained, not vulnerable" },
-    { id = "RUSTSEC-2026-0441", reason = "pin-utils via postgresql_embedded -> reqwest-retry -> wasmtimer, a wasm32-only dependency never built for our targets; unmaintained, not vulnerable" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono via cedar-policy, cel, gcp_auth, oauth2/openidconnect, oci-client, parquet, rmcp and schemars, no direct use; unmaintained, not vulnerable" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz via kingfisher-core -> tokei -> tera, a build dependency; unmaintained, not vulnerable" },
+    { id = "RUSTSEC-2026-0559", reason = "chrono-tz-build, the build script of chrono-tz; compile-time only" },
 ]
 
 [licenses]
