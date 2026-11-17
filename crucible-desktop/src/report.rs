@@ -18,7 +18,7 @@ use crucible_view::{File, Param, Request, View};
 
 use base64::Engine;
 
-use crate::captured::{Captured, SHOWN_BYTES};
+use crate::captured::Captured;
 use crate::pack::PackFiles;
 use crate::plugin::{Limits, Loaded, Module, Script};
 
@@ -34,6 +34,8 @@ const WRITTEN: [&str; 2] = [".view.wasm", ".view.js"];
 const CAPTURED: &str = "state/files";
 /// The most bytes of captured files one view reads.
 pub const READ_BYTES: u64 = 32 * 1024 * 1024;
+/// The most bytes one captured file a view reads may hold.
+pub const FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Report {
@@ -49,8 +51,8 @@ pub struct Report {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Wanted {
     pub run: String,
-    /// The plugin's path in the run's pack, and its length there.
-    pub plugin: (String, usize),
+    /// The plugin's path in the run's pack.
+    pub plugin: String,
     /// Each file the run captured, by key and listed size.
     pub listed: Vec<(String, u64)>,
     /// The run has stopped, so a captured file's copy on disk can stand in for it.
@@ -63,6 +65,20 @@ pub struct Wanted {
 pub struct Built {
     pub wanted: Wanted,
     pub report: Arc<Report>,
+}
+
+impl Built {
+    /// The pack's own plugin's `view` for `wanted`.
+    pub fn new(wanted: Wanted, view: Result<View, String>) -> Built {
+        Built {
+            report: Arc::new(Report {
+                author: None,
+                params: wanted.params.clone(),
+                view,
+            }),
+            wanted,
+        }
+    }
 }
 
 /// How a plugin's file holds it, from the file's name.
@@ -105,53 +121,84 @@ pub fn text_plugin(pack: &PackFiles) -> Option<(&str, &str)> {
         .min_by_key(|(path, _)| *path)
 }
 
-/// The engine JavaScript plugins run in: the module `CRUCIBLE_JS_ENGINE` names, else the one
-/// `just desktop-js-engine` fetches into this crate's assets.
-pub fn js_engine() -> Result<Arc<Module>, String> {
-    let path = std::env::var_os("CRUCIBLE_JS_ENGINE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/js-engine/plugin.wasm")
-        });
-    let wasm = fs::read(&path)
-        .map_err(|e| format!("reading the JavaScript engine {}: {e}", path.display()))?;
-    Module::load(&wasm, Limits::DEFAULT)
-        .map(Arc::new)
-        .map_err(|fault| fault.to_string())
+/// A loaded plugin and the captured file paths it reads, or why it did not load.
+pub type Plugin = Result<(Loaded, Vec<String>), String>;
+
+/// The plugins a worker has loaded: the JavaScript engine once a script needs it, and the last
+/// plugin that loaded, kept while its path and bytes stay the same.
+#[derive(Default)]
+pub struct Plugins {
+    engine: Option<Arc<Module>>,
+    held: Option<(String, Vec<u8>, Arc<Plugin>)>,
 }
 
-/// The plugin `bytes` hold, in the form `path` names, and the captured file paths it reads.
-pub fn load(path: &str, bytes: &[u8]) -> Result<(Loaded, Vec<String>), String> {
-    let plugin = match Form::of(path) {
-        Some(Form::Script) => {
-            Loaded::Js(Script::new(js_engine()?, &String::from_utf8_lossy(bytes)))
+impl Plugins {
+    /// The plugin `bytes` hold, in the form `path` names.
+    pub fn load(&mut self, path: &str, bytes: &[u8]) -> Arc<Plugin> {
+        if let Some((held_path, held_bytes, plugin)) = &self.held
+            && held_path == path
+            && held_bytes == bytes
+        {
+            return Arc::clone(plugin);
         }
-        Some(Form::Encoded) => {
-            let packed: String = String::from_utf8_lossy(bytes).split_whitespace().collect();
-            let wasm = base64::engine::general_purpose::STANDARD
-                .decode(packed)
-                .map_err(|e| format!("the plugin is not base64: {e}"))?;
-            Loaded::Wasm(Module::load(&wasm, Limits::DEFAULT).map_err(|f| f.to_string())?)
+        let plugin = Arc::new(self.compile(path, bytes));
+        if plugin.is_ok() {
+            self.held = Some((path.to_string(), bytes.to_vec(), Arc::clone(&plugin)));
         }
-        Some(Form::Wasm) | None => {
-            Loaded::Wasm(Module::load(bytes, Limits::DEFAULT).map_err(|f| f.to_string())?)
-        }
-    };
-    let inputs = plugin.inputs().map_err(|f| f.to_string())?;
-    Ok((plugin, inputs))
-}
-
-/// Refuses `files`, each named with its size, when one holds more than [`SHOWN_BYTES`] or all
-/// together more than [`READ_BYTES`].
-pub fn admit(files: &[(String, u64)]) -> Result<(), String> {
-    if let Some((name, size)) = files.iter().find(|(_, size)| *size > SHOWN_BYTES) {
-        return Err(format!("{name} is {size} bytes, more than a view reads."));
+        plugin
     }
-    readable(files.iter().map(|(_, size)| *size))
+
+    /// The plugin held now.
+    #[cfg(test)]
+    pub fn held(&self) -> Option<&Arc<Plugin>> {
+        self.held.as_ref().map(|(_, _, plugin)| plugin)
+    }
+
+    fn engine(&mut self) -> Result<Arc<Module>, String> {
+        if let Some(engine) = &self.engine {
+            return Ok(Arc::clone(engine));
+        }
+        let engine = Script::engine()?;
+        self.engine = Some(Arc::clone(&engine));
+        Ok(engine)
+    }
+
+    fn compile(&mut self, path: &str, bytes: &[u8]) -> Plugin {
+        let plugin = match Form::of(path) {
+            Some(Form::Script) => {
+                Loaded::Js(Script::new(self.engine()?, &String::from_utf8_lossy(bytes)))
+            }
+            Some(Form::Encoded) => {
+                let packed: String = String::from_utf8_lossy(bytes).split_whitespace().collect();
+                let wasm = base64::engine::general_purpose::STANDARD
+                    .decode(packed)
+                    .map_err(|e| format!("the plugin is not base64: {e}"))?;
+                Loaded::Wasm(Module::load(&wasm, Limits::DEFAULT).map_err(|f| f.to_string())?)
+            }
+            Some(Form::Wasm) | None => {
+                Loaded::Wasm(Module::load(bytes, Limits::DEFAULT).map_err(|f| f.to_string())?)
+            }
+        };
+        let inputs = plugin.inputs().map_err(|f| f.to_string())?;
+        Ok((plugin, inputs))
+    }
+}
+
+/// Refuses `files`, each named with its size, when one holds more than [`FILE_BYTES`] or all
+/// together more than [`READ_BYTES`].
+pub fn admit<'a>(files: impl IntoIterator<Item = (&'a str, u64)>) -> Result<(), String> {
+    let mut total = 0_u64;
+    for (name, size) in files {
+        if size > FILE_BYTES {
+            return Err(format!("{name} is {size} bytes, more than a view reads."));
+        }
+        total = total.saturating_add(size);
+    }
+    readable(std::iter::once(total))
 }
 
 /// Refuses files of `sizes` that together hold more than [`READ_BYTES`].
-pub fn readable(sizes: impl Iterator<Item = u64>) -> Result<(), String> {
+fn readable(sizes: impl Iterator<Item = u64>) -> Result<(), String> {
     let total = sizes.fold(0_u64, u64::saturating_add);
     if total > READ_BYTES {
         return Err(format!(
@@ -258,7 +305,7 @@ fn written_plugin(pack: &Path) -> Option<(PathBuf, String)> {
 }
 
 /// Each task directory's copy of each of `inputs`, in task then input order.
-fn captured(pack: &Path, inputs: &[String]) -> Vec<(String, String, PathBuf)> {
+fn captured(pack: &Path, inputs: &[String]) -> Vec<(String, String, Mark)> {
     let mut tasks: Vec<PathBuf> = fs::read_dir(pack.join(CAPTURED))
         .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
         .unwrap_or_default();
@@ -272,9 +319,8 @@ fn captured(pack: &Path, inputs: &[String]) -> Vec<(String, String, PathBuf)> {
             continue;
         };
         for input in inputs {
-            let path = dir.join(input);
-            if path.is_file() {
-                files.push((task.clone(), input.clone(), path));
+            if let Some(mark) = mark(&dir.join(input)) {
+                files.push((task.clone(), input.clone(), mark));
             }
         }
     }
@@ -284,19 +330,16 @@ fn captured(pack: &Path, inputs: &[String]) -> Vec<(String, String, PathBuf)> {
 fn build(
     plugin: &Loaded,
     inputs: &[String],
-    files: &[(String, String, PathBuf)],
+    files: &[(String, String, Mark)],
     params: &BTreeMap<String, Param>,
 ) -> Result<View, String> {
     let sized: Vec<(String, u64)> = files
         .iter()
-        .map(|(task, input, path)| {
-            let size = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
-            (format!("{task}/{input}"), size)
-        })
+        .map(|(task, input, (_, size, _))| (format!("{task}/{input}"), *size))
         .collect();
-    admit(&sized)?;
+    admit(sized.iter().map(|(name, size)| (name.as_str(), *size)))?;
     let mut read = Vec::new();
-    for (task, input, path) in files {
+    for (task, input, (path, ..)) in files {
         let text = fs::read_to_string(path).map_err(|e| format!("reading {task}/{input}: {e}"))?;
         read.push(File {
             path: input.clone(),
@@ -312,9 +355,8 @@ fn build(
 #[derive(Default)]
 pub struct Reporter {
     plugin: Option<Mark>,
-    loaded: Option<Result<(Loaded, Vec<String>), String>>,
+    loaded: Option<Arc<Plugin>>,
     read: Vec<Mark>,
-    params: BTreeMap<String, Param>,
     report: Option<Arc<Report>>,
 }
 
@@ -324,15 +366,14 @@ impl Reporter {
         self.report.as_ref()
     }
 
-    /// What the next [`Reporter::refresh`] asks the plugin with; whether that changed.
-    pub fn ask(&mut self, params: BTreeMap<String, Param>) -> bool {
-        let changed = params != self.params;
-        self.params = params;
-        changed
-    }
-
-    /// Whether the report changed.
-    pub fn refresh(&mut self, pack: &Path) -> bool {
+    /// Builds `pack`'s report with `params`, loading its plugin through `plugins`; whether the
+    /// report changed.
+    pub fn refresh(
+        &mut self,
+        pack: &Path,
+        params: &BTreeMap<String, Param>,
+        plugins: &mut Plugins,
+    ) -> bool {
         let (file, author) = match written_plugin(pack) {
             Some((path, task)) => (Some(path), Some(task)),
             None => (plugin_file(pack), None),
@@ -340,10 +381,9 @@ impl Reporter {
         let plugin = file.and_then(|path| mark(&path));
         let reloaded = plugin != self.plugin;
         if reloaded {
-            self.loaded = plugin.as_ref().map(|(path, ..)| {
-                let bytes =
-                    fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
-                load(&path.to_string_lossy(), &bytes)
+            self.loaded = plugin.as_ref().map(|(path, ..)| match fs::read(path) {
+                Ok(bytes) => plugins.load(&path.to_string_lossy(), &bytes),
+                Err(e) => Arc::new(Err(format!("reading {}: {e}", path.display()))),
             });
             self.plugin = plugin;
         }
@@ -351,7 +391,7 @@ impl Reporter {
             self.read.clear();
             return self.report.take().is_some();
         };
-        let view = match loaded {
+        let view = match &**loaded {
             Err(error) => {
                 if !reloaded {
                     return false;
@@ -360,18 +400,18 @@ impl Reporter {
             }
             Ok((plugin, inputs)) => {
                 let files = captured(pack, inputs);
-                let read: Vec<Mark> = files.iter().filter_map(|(.., path)| mark(path)).collect();
+                let read: Vec<Mark> = files.iter().map(|(.., mark)| mark.clone()).collect();
                 let asked = self.report.as_ref().map(|report| &report.params);
-                if !reloaded && read == self.read && asked == Some(&self.params) {
+                if !reloaded && read == self.read && asked == Some(params) {
                     return false;
                 }
                 self.read = read;
-                build(plugin, inputs, &files, &self.params)
+                build(plugin, inputs, &files, params)
             }
         };
         let report = Report {
             author,
-            params: self.params.clone(),
+            params: params.clone(),
             view,
         };
         let changed = self.report.as_deref() != Some(&report);
@@ -391,9 +431,12 @@ mod tests {
 
     use std::sync::Arc;
 
-    use crate::captured::{Captured, SHOWN_BYTES};
+    use crate::captured::Captured;
+    use crate::model::Params;
     use crate::report::shown::{Scoped, Shown};
-    use crate::report::{READ_BYTES, Reporter, admit, file_named, readable, task_named};
+    use crate::report::{
+        FILE_BYTES, Plugins, READ_BYTES, Reporter, admit, file_named, readable, task_named,
+    };
 
     fn example() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/report")
@@ -419,6 +462,11 @@ mod tests {
             dir.join("verdicts.json"),
         )
         .unwrap();
+    }
+
+    /// Builds `pack`'s report with no params and nothing loaded before.
+    fn refresh(reporter: &mut Reporter, pack: &Path) -> bool {
+        reporter.refresh(pack, &Params::new(), &mut Plugins::default())
     }
 
     fn triaged(reporter: &Reporter) -> String {
@@ -469,7 +517,7 @@ mod tests {
         .unwrap();
         capture(dir.path(), "triage-go", "go");
         let mut reporter = Reporter::default();
-        assert!(reporter.refresh(dir.path()));
+        assert!(refresh(&mut reporter, dir.path()));
         assert_eq!(triaged(&reporter), "34");
     }
 
@@ -605,10 +653,51 @@ mod tests {
     }
 
     #[test]
+    fn a_plugin_is_loaded_again_only_when_its_path_or_bytes_change() {
+        let wasm = fs::read(example().join("ui/report.wasm"))
+            .expect("build it with `just example-report-view`");
+        let mut plugins = Plugins::default();
+        let first = plugins.load("ui/report.wasm", &wasm);
+        assert!(first.is_ok());
+        assert!(Arc::ptr_eq(&first, &plugins.load("ui/report.wasm", &wasm)));
+        let moved = plugins.load("ui/other.wasm", &wasm);
+        assert!(!Arc::ptr_eq(&first, &moved), "another path");
+        assert!(Arc::ptr_eq(&moved, &plugins.load("ui/other.wasm", &wasm)));
+        let broken = plugins.load("ui/other.wasm", b"not wasm");
+        assert!(broken.is_err());
+        assert!(
+            !Arc::ptr_eq(&broken, &plugins.load("ui/other.wasm", b"not wasm")),
+            "a plugin that did not load is tried again"
+        );
+        assert!(
+            Arc::ptr_eq(&moved, &plugins.load("ui/other.wasm", &wasm)),
+            "and does not drop the last that did"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs assets/js-engine/plugin.wasm from `just desktop-js-engine`"]
+    fn the_javascript_engine_is_loaded_once_for_every_script() {
+        let script = |title: &str| {
+            format!(
+                r#"export const inputs = [];
+                   export function view() {{
+                       return {{ title: "{title}", body: {{ stats: {{ items: [] }} }} }};
+                   }}"#
+            )
+        };
+        let mut plugins = Plugins::default();
+        assert!(plugins.load("ui/a.js", script("A").as_bytes()).is_ok());
+        let engine = Arc::clone(plugins.engine.as_ref().unwrap());
+        assert!(plugins.load("ui/b.js", script("B").as_bytes()).is_ok());
+        assert!(Arc::ptr_eq(&engine, plugins.engine.as_ref().unwrap()));
+    }
+
+    #[test]
     fn a_pack_without_a_plugin_has_no_report() {
         let dir = tempfile::tempdir().unwrap();
         let mut reporter = Reporter::default();
-        assert!(!reporter.refresh(dir.path()));
+        assert!(!refresh(&mut reporter, dir.path()));
         assert!(reporter.report().is_none());
     }
 
@@ -616,34 +705,34 @@ mod tests {
     fn the_report_follows_the_captured_files_and_the_plugin() {
         let dir = pack();
         let mut reporter = Reporter::default();
-        assert!(reporter.refresh(dir.path()));
+        assert!(refresh(&mut reporter, dir.path()));
         let report = reporter.report().unwrap();
         assert_eq!(
             report.view,
             Err("No task has captured verdicts.json yet.".into())
         );
-        assert!(!reporter.refresh(dir.path()), "nothing changed");
+        assert!(!refresh(&mut reporter, dir.path()), "nothing changed");
 
         capture(dir.path(), "triage-go", "go");
-        assert!(reporter.refresh(dir.path()));
+        assert!(refresh(&mut reporter, dir.path()));
         assert_eq!(triaged(&reporter), "34");
-        assert!(!reporter.refresh(dir.path()), "nothing changed");
+        assert!(!refresh(&mut reporter, dir.path()), "nothing changed");
 
         capture(dir.path(), "triage-python", "python");
-        assert!(reporter.refresh(dir.path()));
+        assert!(refresh(&mut reporter, dir.path()));
         assert_eq!(triaged(&reporter), "64");
 
         fs::write(dir.path().join("ui/report.wasm"), b"not wasm").unwrap();
-        assert!(reporter.refresh(dir.path()));
+        assert!(refresh(&mut reporter, dir.path()));
         let error = reporter.report().unwrap().view.clone().unwrap_err();
         assert!(
             error.starts_with("not a plugin the host can load"),
             "{error}"
         );
-        assert!(!reporter.refresh(dir.path()), "nothing changed");
+        assert!(!refresh(&mut reporter, dir.path()), "nothing changed");
 
         fs::remove_file(dir.path().join("ui/report.wasm")).unwrap();
-        assert!(reporter.refresh(dir.path()));
+        assert!(refresh(&mut reporter, dir.path()));
         assert!(reporter.report().is_none());
     }
 
@@ -652,7 +741,7 @@ mod tests {
         let dir = pack();
         capture(dir.path(), "triage-go", "go");
         let mut reporter = Reporter::default();
-        assert!(reporter.refresh(dir.path()));
+        assert!(refresh(&mut reporter, dir.path()));
         assert_eq!(reporter.report().unwrap().author, None);
 
         let written = dir.path().join("state/files/explain/out");
@@ -662,20 +751,20 @@ mod tests {
             written.join("mine.view.wasm"),
         )
         .unwrap();
-        assert!(reporter.refresh(dir.path()));
+        assert!(refresh(&mut reporter, dir.path()));
         let report = reporter.report().unwrap();
         assert_eq!(report.author.as_deref(), Some("explain"));
         assert_eq!(triaged(&reporter), "34");
-        assert!(!reporter.refresh(dir.path()), "nothing changed");
+        assert!(!refresh(&mut reporter, dir.path()), "nothing changed");
 
         fs::write(written.join("mine.view.wasm"), b"not wasm").unwrap();
-        assert!(reporter.refresh(dir.path()));
+        assert!(refresh(&mut reporter, dir.path()));
         let report = reporter.report().unwrap();
         assert_eq!(report.author.as_deref(), Some("explain"));
         assert!(report.view.is_err());
 
         fs::remove_file(written.join("mine.view.wasm")).unwrap();
-        assert!(reporter.refresh(dir.path()));
+        assert!(refresh(&mut reporter, dir.path()));
         assert_eq!(reporter.report().unwrap().author, None);
         assert_eq!(triaged(&reporter), "34");
     }
@@ -698,7 +787,7 @@ mod tests {
         fs::write(dir.path().join("ui/summary.js"), script("From the pack")).unwrap();
         capture(dir.path(), "triage-go", "go");
         let mut reporter = Reporter::default();
-        assert!(reporter.refresh(dir.path()));
+        assert!(refresh(&mut reporter, dir.path()));
         let rows = |reporter: &Reporter| {
             let report = reporter.report().unwrap();
             let view = report.view.as_ref().unwrap();
@@ -716,14 +805,14 @@ mod tests {
         let written = dir.path().join("state/files/explain");
         fs::create_dir_all(&written).unwrap();
         fs::write(written.join("report.view.js"), script("From the task")).unwrap();
-        assert!(reporter.refresh(dir.path()));
+        assert!(refresh(&mut reporter, dir.path()));
         assert_eq!(
             rows(&reporter),
             (Some("explain".into()), "From the task".into(), "34".into())
         );
 
         fs::write(written.join("report.view.js"), "export const inputs = [;").unwrap();
-        assert!(reporter.refresh(dir.path()));
+        assert!(refresh(&mut reporter, dir.path()));
         let error = reporter.report().unwrap().view.clone().unwrap_err();
         assert!(error.starts_with("the script does not compile:"), "{error}");
     }
@@ -752,7 +841,7 @@ mod tests {
             .unwrap();
         }
         let mut reporter = Reporter::default();
-        assert!(reporter.refresh(dir.path()));
+        assert!(refresh(&mut reporter, dir.path()));
         let report = Arc::clone(reporter.report().unwrap());
         let view = report.view.as_ref().unwrap();
         assert_eq!(
@@ -954,10 +1043,10 @@ mod tests {
         let selection = crate::Selection::Local("report-ts".into());
         shown.follow(Some(&selection), Some(&report));
         shown.shown.set("lane", Param::Select(first_lane.clone()));
-        let params = shown.params(Some(&selection));
+        let params = shown.shown.params().clone();
         assert_eq!(params["cvss"], Param::Range(0.0));
-        assert!(reporter.ask(params.clone()));
-        assert!(reporter.refresh(dir.path()));
+        let mut plugins = Plugins::default();
+        assert!(reporter.refresh(dir.path(), &params, &mut plugins));
         let laned = reporter.report().unwrap();
         assert_eq!(laned.params, params);
         let view = laned.view.as_ref().unwrap();
@@ -980,10 +1069,9 @@ mod tests {
         shown.follow(Some(&selection), Some(laned));
         shown.shown.set("lane", Param::Select("all".into()));
         shown.shown.set("cvss", Param::Range(9.2));
-        let params = shown.params(Some(&selection));
+        let params = shown.shown.params();
         assert_eq!(params["cvss"], Param::Range(9.0), "on the range's step");
-        assert!(reporter.ask(params));
-        assert!(reporter.refresh(dir.path()));
+        assert!(reporter.refresh(dir.path(), params, &mut plugins));
         let view = reporter.report().unwrap().view.as_ref().unwrap();
         let severe = triaged(view);
         assert!(severe > 0 && severe < 64, "{severe}");
@@ -1004,8 +1092,7 @@ mod tests {
 
         shown.shown.set("cvss", Param::Range(10.0));
         shown.shown.set("lane", Param::Select(first_lane));
-        assert!(reporter.ask(shown.params(Some(&selection))));
-        assert!(reporter.refresh(dir.path()));
+        assert!(reporter.refresh(dir.path(), shown.shown.params(), &mut plugins));
         let view = reporter.report().unwrap().view.as_ref().unwrap();
         assert_eq!(
             view.body,
@@ -1025,7 +1112,7 @@ mod tests {
         fs::create_dir_all(&captured).unwrap();
         fs::write(captured.join("verdicts.json"), "[{").unwrap();
         let mut reporter = Reporter::default();
-        assert!(reporter.refresh(dir.path()));
+        assert!(refresh(&mut reporter, dir.path()));
         let error = reporter.report().unwrap().view.clone().unwrap_err();
         assert!(
             error.starts_with("verdicts.json from triage-go:"),
@@ -1049,15 +1136,18 @@ mod tests {
                 .map(|(i, size)| (format!("t/{i}.json"), *size))
                 .collect()
         };
-        assert_eq!(admit(&sized(&[SHOWN_BYTES, SHOWN_BYTES])), Ok(()));
+        let admit = |files: Vec<(String, u64)>| {
+            admit(files.iter().map(|(name, size)| (name.as_str(), *size)))
+        };
+        assert_eq!(admit(sized(&[FILE_BYTES, FILE_BYTES])), Ok(()));
         assert_eq!(
-            admit(&sized(&[1, SHOWN_BYTES + 1])),
+            admit(sized(&[1, FILE_BYTES + 1])),
             Err(format!(
                 "t/1.json is {} bytes, more than a view reads.",
-                SHOWN_BYTES + 1
+                FILE_BYTES + 1
             ))
         );
-        let over = admit(&sized(&[SHOWN_BYTES; 5])).unwrap_err();
+        let over = admit(sized(&[FILE_BYTES; 5])).unwrap_err();
         assert!(over.starts_with("The files this view reads hold"), "{over}");
 
         let dir = pack();
@@ -1068,7 +1158,7 @@ mod tests {
             file.set_len(7 * 1024 * 1024).unwrap();
         }
         let mut reporter = Reporter::default();
-        assert!(reporter.refresh(dir.path()));
+        assert!(refresh(&mut reporter, dir.path()));
         let error = reporter.report().unwrap().view.clone().unwrap_err();
         assert!(
             error.starts_with("The files this view reads hold 36700160 bytes"),
@@ -1138,17 +1228,19 @@ mod tests {
         capture(dir.path(), "triage-go", "go");
         capture(dir.path(), "triage-python", "python");
         let mut reporter = Reporter::default();
-        assert!(reporter.refresh(dir.path()));
+        let mut plugins = Plugins::default();
+        let none = Params::new();
+        assert!(reporter.refresh(dir.path(), &none, &mut plugins));
         assert_eq!(triaged(&reporter), "64");
         assert!(reporter.report().unwrap().params.is_empty());
-        assert!(!reporter.ask(Default::default()), "no params is no change");
-        assert!(!reporter.refresh(dir.path()));
+        assert!(
+            !reporter.refresh(dir.path(), &none, &mut plugins),
+            "no params is no change"
+        );
 
-        let go: std::collections::BTreeMap<String, Param> =
-            [("task".to_string(), Param::Select("triage-go".into()))].into();
-        assert!(reporter.ask(go.clone()));
+        let go: Params = [("task".to_string(), Param::Select("triage-go".into()))].into();
         let before = Arc::clone(reporter.report().unwrap());
-        assert!(reporter.refresh(dir.path()));
+        assert!(reporter.refresh(dir.path(), &go, &mut plugins));
         assert_eq!(triaged(&reporter), "34");
         assert_eq!(reporter.report().unwrap().params, go);
         assert_eq!(
@@ -1156,15 +1248,17 @@ mod tests {
             0,
             "the last report stands until the next is built"
         );
-        assert!(!reporter.ask(go.clone()), "the same params are no change");
-        assert!(!reporter.refresh(dir.path()), "nothing changed");
+        assert!(
+            !reporter.refresh(dir.path(), &go, &mut plugins),
+            "the same params are no change"
+        );
 
         fs::write(
             dir.path().join("state/files/triage-python/verdicts.json"),
             "[]",
         )
         .unwrap();
-        reporter.refresh(dir.path());
+        reporter.refresh(dir.path(), &go, &mut plugins);
         assert_eq!(triaged(&reporter), "34");
         assert_eq!(
             reporter.report().unwrap().params,
@@ -1172,8 +1266,7 @@ mod tests {
             "a refresh keeps the params"
         );
 
-        assert!(reporter.ask(Default::default()));
-        assert!(reporter.refresh(dir.path()));
+        assert!(reporter.refresh(dir.path(), &none, &mut plugins));
         assert_eq!(
             triaged(&reporter),
             "34",

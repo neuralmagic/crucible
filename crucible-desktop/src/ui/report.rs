@@ -55,7 +55,7 @@ impl Slot for RunReport {
     }
 
     fn ask(app: &mut App) {
-        app.sync_live();
+        app.sync_report();
     }
 }
 

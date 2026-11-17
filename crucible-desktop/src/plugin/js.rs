@@ -3,6 +3,7 @@
 //! the script gets nothing the engine module does not: no files, network or real clock.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crucible_view::{Reply, View};
@@ -34,6 +35,21 @@ enum Answer {
 }
 
 impl Script {
+    /// The engine scripts run in: the module `CRUCIBLE_JS_ENGINE` names, else the one
+    /// `just desktop-js-engine` fetches into this crate's assets.
+    pub fn engine() -> Result<Arc<Module>, String> {
+        let path = std::env::var_os("CRUCIBLE_JS_ENGINE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/js-engine/plugin.wasm")
+            });
+        let wasm = std::fs::read(&path)
+            .map_err(|e| format!("reading the JavaScript engine {}: {e}", path.display()))?;
+        Module::load(&wasm, Limits::DEFAULT)
+            .map(Arc::new)
+            .map_err(|fault| fault.to_string())
+    }
+
     pub fn new(engine: Arc<Module>, source: &str) -> Script {
         Script {
             engine,
@@ -149,10 +165,7 @@ mod tests {
     use crate::plugin::{Fault, Limits, Loaded, Module, Script};
 
     fn engine() -> Arc<Module> {
-        let path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/js-engine/plugin.wasm");
-        let wasm = std::fs::read(path).expect("fetch it with `just desktop-js-engine`");
-        Arc::new(Module::load(&wasm, Limits::DEFAULT).unwrap())
+        Script::engine().expect("fetch it with `just desktop-js-engine`")
     }
 
     fn loaded(engine: Arc<Module>, source: &str) -> Loaded {

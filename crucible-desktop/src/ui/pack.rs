@@ -13,7 +13,7 @@ use crate::lsp::{self, Problem, Severity};
 use crate::pack::{PackFile, PackFiles};
 use crate::settings::LogFont;
 use crate::syntax;
-use crate::ui::{Paint, rail};
+use crate::ui::{Paint, desk, rail};
 use crate::workspace::PaneKind;
 use crate::{App, PackSource};
 
@@ -31,8 +31,8 @@ pub(crate) fn pack_view(pack: Result<&PackFiles, &str>, font: LogFont, app: &App
     let pack = match (working, pack) {
         (Some(pack), _) => pack,
         (None, Ok(pack)) if !pack.files.is_empty() => pack,
-        (None, Ok(_)) => return note("This pack has no files to show.", "", p),
-        (None, Err(error)) => return note("Could not read the pack.", error, p),
+        (None, Ok(_)) => return desk::note("pack-note", "This pack has no files to show.", "", p),
+        (None, Err(error)) => return desk::note("pack-note", "Could not read the pack.", error, p),
     };
     let open = app
         .run
@@ -351,7 +351,8 @@ fn file_row(file: &PackFile, selected: bool, worst: Option<Severity>, p: &Paint)
 
 fn source(file: &PackFile, found_problems: &[Problem], font: LogFont, app: &App, p: &Paint) -> El {
     let Some(text_body) = &file.text else {
-        return note(
+        return desk::note(
+            "pack-note",
             &format!("{} is not text, or too big to show.", file.path),
             "",
             p,
@@ -604,34 +605,6 @@ fn copy_path(app: &App, file: &str, p: &Paint) -> Option<El> {
             .build(p.k)
             .key("pack-copy-path"),
     )
-}
-
-fn note(headline: &str, detail: &str, p: &Paint) -> El {
-    let mut card = col()
-        .key("pack-note")
-        .w_full()
-        .padding(24.0)
-        .gap(6.0)
-        .radius(p.k.radius.lg)
-        .fill(p.c.layer_01)
-        .border(p.hair, p.c.border_muted)
-        .child(
-            text(headline.to_string())
-                .font(p.k.ty.ui_medium)
-                .color(p.c.text_base)
-                .wrap(),
-        );
-    if !detail.is_empty() {
-        card = card.child(
-            text(detail.to_string())
-                .font(p.mono(11.0, 400.0))
-                .color(p.c.text_muted)
-                .selectable(true)
-                .selection_color(p.k.selection())
-                .wrap(),
-        );
-    }
-    card
 }
 
 #[cfg(test)]

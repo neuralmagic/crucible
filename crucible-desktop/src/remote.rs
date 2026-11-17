@@ -52,8 +52,7 @@ pub struct Remote {
     pub finder_client: finder::Client,
     pub finder_seen: u64,
 
-    /// The report last asked of the live worker, and the one it last built.
-    pub report_sent: Option<crate::report::Wanted>,
+    /// The report the live worker last built for the Report pane.
     pub report: Option<std::sync::Arc<crate::report::Built>>,
     /// The captured file last asked of the live worker, by run, key and listed size.
     pub file_sent: Option<(String, String, u64)>,
@@ -128,7 +127,6 @@ impl Remote {
             finder: None,
             finder_client: finder::Client::spawn(connector),
             finder_seen: 0,
-            report_sent: None,
             report: None,
             file_sent: None,
             opened_file: None,

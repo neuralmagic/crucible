@@ -165,6 +165,25 @@ impl Selection {
     }
 }
 
+/// What the Report pane asks a worker to build.
+#[derive(Clone, Debug, PartialEq)]
+enum ReportAsk {
+    /// A local pack's report, with the reader's params.
+    Local(String, model::Params),
+    Live(report::Wanted),
+}
+
+impl ReportAsk {
+    /// Whether the worker has yet to answer: `local` is what the local worker last built,
+    /// `shown` whether the pane has a report to draw.
+    fn awaited(&self, local: Option<&model::PackReport>, shown: bool) -> bool {
+        match self {
+            ReportAsk::Local(pack, _) => local.is_none_or(|built| built.pack != *pack),
+            ReportAsk::Live(_) => !shown,
+        }
+    }
+}
+
 /// Where a launch form stands.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Stage {
@@ -437,8 +456,10 @@ pub struct App {
     /// The Report pane's report, controls, picked tabs and its table's sort, kept for the
     /// selection.
     pub report_shown: report::shown::Scoped<Selection>,
-    /// The local pack and params its report was last asked for.
-    report_asked: Option<(String, model::Params)>,
+    /// The report last asked of a worker for the Report pane.
+    report_sent: Option<ReportAsk>,
+    /// The report the local worker last built for the Report pane.
+    local_report: Option<model::PackReport>,
     /// The workspace the user arranged; `None` lays each run out by its graph's depth.
     pub layout: Option<Workspace>,
     /// Panes picked from a tab bar while the layout follows the run, oldest first.
@@ -926,6 +947,7 @@ impl App {
     fn apply_local(&mut self, snapshot: Snapshot) {
         self.packs = snapshot.packs;
         self.local_error = snapshot.error;
+        self.local_report = snapshot.report;
         self.reconcile();
     }
 
@@ -1253,30 +1275,11 @@ impl App {
         let file = self.wanted_file();
         if file != self.remote.file_sent {
             if let Some((run, key, size)) = &file {
-                let settled = self
-                    .selected_live()
-                    .is_some_and(|launch| !launch.status.is_running());
-                self.remote.live_client.file(run, key, *size, settled);
+                self.remote
+                    .live_client
+                    .file(run, key, *size, self.selected_settled());
             }
             self.remote.file_sent = file;
-        }
-        let asked = self.asked_report();
-        if asked != self.report_asked {
-            self.local.ask(asked.clone());
-            self.report_asked = asked;
-        }
-        let report = self.wanted_report();
-        if report != self.remote.report_sent {
-            let asked = report.as_ref().and_then(|wanted| {
-                let detail = self.selected_detail()?;
-                let (_, plugin) = report::text_plugin(detail.pack.as_ref().ok()?)?;
-                let listed = detail.files.as_ref()?.as_ref().ok()?.clone();
-                Some((wanted.clone(), plugin.to_string(), listed))
-            });
-            if let Some((wanted, plugin, listed)) = asked {
-                self.remote.live_client.report(wanted, plugin, listed);
-            }
-            self.remote.report_sent = report;
         }
         let history = self.wanted_revisions();
         if history != self.remote.revisions_sent {
@@ -1329,37 +1332,73 @@ impl App {
         self.remote.revisions_sent = None;
     }
 
-    /// The selected live run's report, while the Report tab is open, its pack carries a plugin
-    /// and its captured files are listed.
-    fn wanted_report(&self) -> Option<report::Wanted> {
+    /// Whether the selected live launch has stopped, so its captured files' copies on disk can
+    /// stand in for them.
+    fn selected_settled(&self) -> bool {
+        self.selected_live()
+            .is_some_and(|launch| !launch.status.is_running())
+    }
+
+    /// Asks the worker behind the selection for the report the Report pane shows.
+    fn sync_report(&mut self) {
+        self.follow_report();
+        let wanted = self.wanted_report();
+        if wanted == self.report_sent {
+            return;
+        }
+        match &wanted {
+            Some(ReportAsk::Local(pack, params)) => {
+                self.local.report(Some((pack.clone(), params.clone())));
+            }
+            Some(ReportAsk::Live(asked)) => {
+                if let Some((_, (_, text), listed)) = self.live_report_source() {
+                    self.remote.live_client.report(
+                        asked.clone(),
+                        text.to_string(),
+                        listed.to_vec(),
+                    );
+                }
+            }
+            None => {}
+        }
+        let was_local = matches!(self.report_sent, Some(ReportAsk::Local(..)));
+        if was_local && !matches!(wanted, Some(ReportAsk::Local(..))) {
+            self.local.report(None);
+        }
+        self.report_sent = wanted;
+    }
+
+    /// The report the Report pane shows while it is open: the selected local pack's, or the
+    /// selected live run's when its pack carries a plugin and its captured files are listed.
+    fn wanted_report(&self) -> Option<ReportAsk> {
         if !self.workspace().showing(PaneKind::Report) {
             return None;
         }
-        let detail = self.selected_detail()?;
-        let (plugin, text) = report::text_plugin(detail.pack.as_ref().ok()?)?;
-        let files = detail.files.as_ref()?.as_ref().ok()?;
-        Some(report::Wanted {
-            run: detail.run_id.clone()?,
-            plugin: (plugin.to_string(), text.len()),
+        let params = self.report_shown.shown.params().clone();
+        if let Some(pack) = self.selected_pack() {
+            return Some(ReportAsk::Local(pack.name.clone(), params));
+        }
+        let (run, (plugin, _), files) = self.live_report_source()?;
+        Some(ReportAsk::Live(report::Wanted {
+            run: run.to_string(),
+            plugin: plugin.to_string(),
             listed: files.iter().map(|f| (f.key.clone(), f.size)).collect(),
-            settled: self
-                .selected_live()
-                .is_some_and(|launch| !launch.status.is_running()),
-            params: self.report_shown.params(self.selection.as_ref()),
-        })
+            settled: self.selected_settled(),
+            params,
+        }))
     }
 
-    /// The selected local pack and the params its report is built with, once the reader has
-    /// set a control.
-    fn asked_report(&self) -> Option<(String, model::Params)> {
-        let pack = self.selected_pack()?;
-        let params = self.report_shown.params(self.selection.as_ref());
-        (!params.is_empty()).then(|| (pack.name.clone(), params))
+    /// The selected live run, its pack's plugin as path and text, and the files it captured.
+    fn live_report_source(&self) -> Option<(&str, (&str, &str), &[captured::Captured])> {
+        let detail = self.selected_detail()?;
+        let plugin = report::text_plugin(detail.pack.as_ref().ok()?)?;
+        let files = detail.files.as_ref()?.as_ref().ok()?;
+        Some((detail.run_id.as_deref()?, plugin, files))
     }
 
     fn answer_report(&mut self, built: Option<std::sync::Arc<report::Built>>) {
         if let Some(built) = built
-            && Some(&built.wanted) == self.remote.report_sent.as_ref()
+            && matches!(&self.report_sent, Some(ReportAsk::Live(sent)) if *sent == built.wanted)
         {
             self.remote.report = Some(built);
         }
@@ -1369,7 +1408,11 @@ impl App {
     /// selected live run.
     pub fn shown_report(&self) -> Option<&std::sync::Arc<report::Report>> {
         if let Some(pack) = self.selected_pack() {
-            return pack.report.as_ref();
+            return self
+                .local_report
+                .as_ref()
+                .filter(|built| built.pack == pack.name)
+                .and_then(|built| built.report.as_ref());
         }
         let run = self.selected_detail()?.run_id.as_deref()?;
         self.remote
@@ -1386,9 +1429,11 @@ impl App {
             .follow(self.selection.as_ref(), report.as_ref());
     }
 
-    /// Whether the live worker has been asked for a report it has not built yet.
+    /// Whether a worker has been asked for a report it has not built yet.
     pub fn awaits_report(&self) -> bool {
-        self.remote.report_sent.is_some() && self.shown_report().is_none()
+        self.report_sent.as_ref().is_some_and(|ask| {
+            ask.awaited(self.local_report.as_ref(), self.shown_report().is_some())
+        })
     }
 
     /// The run, key and listed size of the captured file the Files tab shows, while it is open
@@ -1612,7 +1657,7 @@ impl App {
         self.selection = Some(selection);
         self.page = Page::Runs;
         self.sync_live();
-        self.follow_report();
+        self.sync_report();
     }
 
     fn forget_run_view(&mut self) {
@@ -1756,7 +1801,7 @@ impl App {
         self.forget_run_view();
         self.reconcile();
         self.sync_live();
-        self.follow_report();
+        self.sync_report();
     }
 
     pub fn launch(&mut self) {
@@ -1894,7 +1939,8 @@ fn init() -> App {
         run_file: None,
         files_md_source: false,
         report_shown: report::shown::Scoped::default(),
-        report_asked: None,
+        report_sent: None,
+        local_report: None,
         knobs: rune_knobs::Knobs::default(),
         page: Page::Runs,
         flight: None,
@@ -1988,7 +2034,7 @@ fn poll(app: &mut App, clock: f64, tx: &mut Tx) -> bool {
         changed = true;
     }
     app.sync_live();
-    app.follow_report();
+    app.sync_report();
     app.sync_admin();
     app.sync_fleet();
     app.sync_tray();
@@ -2175,9 +2221,8 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use crate::GraphSource;
-    use crate::model::default_repo;
-    use crate::{Group, Page};
+    use crate::model::{self, default_repo};
+    use crate::{GraphSource, Group, Page, ReportAsk, report};
 
     #[test]
     fn a_page_is_a_tab_of_at_most_one_group_and_the_rest_stand_alone() {
@@ -2210,6 +2255,32 @@ mod tests {
         assert!(!previews(None, false, false));
         assert!(previews(Some(GraphSource::Preview), true, false));
         assert!(!previews(Some(GraphSource::Run), false, true));
+    }
+
+    #[test]
+    fn a_report_is_awaited_until_its_worker_answers_for_it() {
+        let built = |pack: &str| model::PackReport {
+            pack: pack.into(),
+            report: None,
+        };
+        let local = ReportAsk::Local("demo".into(), model::Params::new());
+        assert!(local.awaited(None, false));
+        assert!(local.awaited(Some(&built("other")), false), "another's");
+        assert!(
+            !local.awaited(Some(&built("demo")), false),
+            "a pack with no plugin has been answered"
+        );
+        assert!(!local.awaited(Some(&built("demo")), true));
+
+        let live = ReportAsk::Live(report::Wanted {
+            run: "r1".into(),
+            plugin: "ui/report.js".into(),
+            listed: Vec::new(),
+            settled: true,
+            params: model::Params::new(),
+        });
+        assert!(live.awaited(Some(&built("demo")), false));
+        assert!(!live.awaited(None, true));
     }
 
     #[test]

@@ -72,15 +72,6 @@ impl<K: PartialEq + Clone> Scoped<K> {
         }
         self.shown.follow(report);
     }
-
-    /// What the plugin is asked with for `key`: every control's value once the reader has set
-    /// one, nothing before or for another key.
-    pub fn params(&self, key: Option<&K>) -> BTreeMap<String, Param> {
-        if self.key.as_ref() != key {
-            return BTreeMap::new();
-        }
-        self.shown.params()
-    }
 }
 
 /// What a cell sorts by before its text: its value, or its text as a number in a number
@@ -272,8 +263,8 @@ impl Shown {
 
     /// What the plugin is asked with: every control's value once the reader has set one,
     /// nothing before.
-    pub fn params(&self) -> BTreeMap<String, Param> {
-        self.asked.clone()
+    pub fn params(&self) -> &BTreeMap<String, Param> {
+        &self.asked
     }
 
     /// Whether the report was built with other params than its controls now hold.
@@ -993,7 +984,7 @@ mod tests {
         shown.follow(Some(&a), Some(&first));
         assert_eq!(shown.shown.controls().len(), 3);
         assert!(
-            shown.params(Some(&a)).is_empty(),
+            shown.shown.params().is_empty(),
             "nothing set, nothing asked"
         );
         assert_eq!(shown.shown.value(&lane()), Param::Select("all".into()));
@@ -1001,9 +992,9 @@ mod tests {
 
         shown.shown.set("lane", Param::Select("go".into()));
         assert!(shown.shown.pending(), "built before the lane was set");
-        let every = shown.params(Some(&a));
+        let every = shown.shown.params();
         assert_eq!(
-            every.into_iter().collect::<Vec<_>>(),
+            every.clone().into_iter().collect::<Vec<_>>(),
             [
                 ("cvss".to_string(), Param::Range(0.0)),
                 ("lane".to_string(), Param::Select("go".into())),
@@ -1011,32 +1002,27 @@ mod tests {
             ],
             "once one is set, every control is sent"
         );
-        assert!(
-            shown.params(Some(&local("b"))).is_empty(),
-            "not for another selection"
-        );
-        assert!(shown.params(None).is_empty());
 
         shown.shown.set("lane", Param::Select("rust".into()));
         assert_eq!(
-            shown.params(Some(&a))["lane"],
+            shown.shown.params()["lane"],
             Param::Select("all".into()),
             "a value the select does not offer falls back to its own"
         );
         shown.shown.set("open", Param::Range(3.0));
-        assert_eq!(shown.params(Some(&a))["open"], Param::Toggle(false));
+        assert_eq!(shown.shown.params()["open"], Param::Toggle(false));
         shown.shown.set("lane", Param::Select("go".into()));
         shown.shown.set("open", Param::Toggle(true));
         shown.shown.set("ghost", Param::Toggle(true));
         assert!(
-            !shown.params(Some(&a)).contains_key("ghost"),
+            !shown.shown.params().contains_key("ghost"),
             "only declared controls go"
         );
 
         shown.shown.slide("cvss", 7.3);
         assert_eq!(shown.shown.value(&cvss()), Param::Range(7.5));
         assert_eq!(
-            shown.params(Some(&a))["cvss"],
+            shown.shown.params()["cvss"],
             Param::Range(0.0),
             "not while dragged"
         );
@@ -1047,7 +1033,7 @@ mod tests {
             "another range's release"
         );
         shown.shown.release("cvss");
-        assert_eq!(shown.params(Some(&a))["cvss"], Param::Range(7.5));
+        assert_eq!(shown.shown.params()["cvss"], Param::Range(7.5));
         shown.shown.slide("cvss", 2.0);
         shown.shown.cancel_slide();
         assert_eq!(
@@ -1058,14 +1044,14 @@ mod tests {
         shown.shown.slide("cvss", f64::NAN);
         assert_eq!(shown.shown.value(&cvss()), Param::Range(0.0));
         shown.shown.release("cvss");
-        assert_eq!(shown.params(Some(&a))["cvss"], Param::Range(0.0));
+        assert_eq!(shown.shown.params()["cvss"], Param::Range(0.0));
         shown.shown.set("cvss", Param::Range(1e300));
-        assert_eq!(shown.params(Some(&a))["cvss"], Param::Range(10.0));
+        assert_eq!(shown.shown.params()["cvss"], Param::Range(10.0));
 
         let refreshed = controlled(vec![lane(), open(), cvss()]);
         shown.follow(Some(&a), Some(&refreshed));
         assert_eq!(
-            shown.params(Some(&a))["lane"],
+            shown.shown.params()["lane"],
             Param::Select("go".into()),
             "kept"
         );
@@ -1082,14 +1068,14 @@ mod tests {
             "a failed view keeps the last controls"
         );
         assert!(!shown.shown.pending(), "a failed view waits on nothing");
-        assert_eq!(shown.params(Some(&a))["lane"], Param::Select("go".into()));
+        assert_eq!(shown.shown.params()["lane"], Param::Select("go".into()));
 
         shown.shown.choosing = Some("lane".into());
         shown.shown.slide("cvss", 4.0);
         let fewer = controlled(vec![open()]);
         shown.follow(Some(&a), Some(&fewer));
         assert_eq!(
-            shown.params(Some(&a)).into_iter().collect::<Vec<_>>(),
+            shown.shown.params().clone().into_iter().collect::<Vec<_>>(),
             [("open".to_string(), Param::Toggle(true))],
             "a control the view no longer has is dropped"
         );
@@ -1105,13 +1091,13 @@ mod tests {
         let none = controlled(vec![]);
         shown.follow(Some(&a), Some(&none));
         assert!(shown.shown.controls().is_empty());
-        assert!(shown.params(Some(&a)).is_empty());
+        assert!(shown.shown.params().is_empty());
 
         shown.follow(Some(&a), Some(&first));
         shown.shown.set("open", Param::Toggle(true));
         shown.follow(Some(&local("b")), Some(&first));
         assert!(
-            shown.params(Some(&local("b"))).is_empty(),
+            shown.shown.params().is_empty(),
             "another selection starts over"
         );
         assert_eq!(
@@ -1120,8 +1106,10 @@ mod tests {
             "with its own report's controls"
         );
         assert_eq!(shown.shown.value(&open()), Param::Toggle(false));
+        shown.shown.set("open", Param::Toggle(true));
         shown.follow(None, None);
         assert!(shown.shown.controls().is_empty());
+        assert!(shown.shown.params().is_empty(), "and so does no selection");
     }
 
     #[test]
@@ -1139,29 +1127,29 @@ mod tests {
         let mut shown = Scoped::default();
         shown.follow(Some(&a), Some(&low()));
         shown.shown.set("cvss", Param::Range(2.0));
-        let asked = shown.params(Some(&a));
+        let asked = shown.shown.params();
         assert_eq!(asked["cvss"], Param::Range(2.0));
         for _ in 0..3 {
             shown.follow(Some(&a), Some(&high()));
             assert!(
-                shown.params(Some(&a)).is_empty(),
+                shown.shown.params().is_empty(),
                 "a value the view no longer offers is not asked for"
             );
             shown.follow(Some(&a), Some(&low()));
-            assert!(shown.params(Some(&a)).is_empty(), "and is not asked again");
+            assert!(shown.shown.params().is_empty(), "and is not asked again");
         }
 
         shown.follow(Some(&a), Some(&lanes(&[("all", "All"), ("go", "Go")])));
         shown.shown.set("lane", Param::Select("go".into()));
-        assert_eq!(shown.params(Some(&a)).len(), 2);
+        assert_eq!(shown.shown.params().len(), 2);
         shown.follow(Some(&a), Some(&lanes(&[("all", "All")])));
         assert_eq!(
-            shown.params(Some(&a)).into_iter().collect::<Vec<_>>(),
+            shown.shown.params().clone().into_iter().collect::<Vec<_>>(),
             [("open".to_string(), Param::Toggle(false))]
         );
         shown.follow(Some(&a), Some(&lanes(&[("all", "All"), ("go", "Go")])));
         assert_eq!(
-            shown.params(Some(&a)).len(),
+            shown.shown.params().len(),
             1,
             "a view arriving never adds to what is asked"
         );
@@ -1177,13 +1165,13 @@ mod tests {
         );
 
         shown.shown.set("ghost", Param::Toggle(true));
-        assert!(!shown.params(Some(&a)).contains_key("ghost"));
+        assert!(!shown.shown.params().contains_key("ghost"));
         shown.follow(
             Some(&a),
             Some(&lanes(&[("all", "All"), ("ghost", "Ghost")])),
         );
         shown.shown.set("open", Param::Toggle(true));
-        assert_eq!(shown.params(Some(&a))["lane"], Param::Select("all".into()));
+        assert_eq!(shown.shown.params()["lane"], Param::Select("all".into()));
     }
 
     fn csv_of(columns: &[&str], rows: &[&[&str]], cells: usize) -> String {

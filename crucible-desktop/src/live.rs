@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crucible_contract::session::SessionEvent;
@@ -25,6 +25,7 @@ use crate::logline::LogLine;
 use crate::model::Verdict;
 use crate::net::{Connection, Connector, Down, Task, reaching, within};
 use crate::pack::PackFiles;
+use crate::report::{Built, Plugins};
 use crate::revisions::{self, Revisions, Wanted};
 use crate::session::RunFold;
 
@@ -376,7 +377,7 @@ enum Reply {
     },
     File(Opened),
     Revisions(Revisions),
-    Report(crate::report::Built),
+    Report(Built),
 }
 
 impl Action {
@@ -385,7 +386,7 @@ impl Action {
         matches!(self, Action::Launch { .. } | Action::Drop { .. })
     }
 
-    async fn run(self, c: Connection, dirs: &Dirs) -> Reply {
+    async fn run(self, c: Connection, dirs: &Dirs, plugins: &Arc<Mutex<Plugins>>) -> Reply {
         match self {
             Action::Prepare(target) => {
                 let result = prepare(&c, &target).await;
@@ -426,13 +427,7 @@ impl Action {
                 size,
                 settled,
             } => {
-                let files = dirs.files.as_deref();
-                let kept =
-                    file_on_disk(files, &run, &key).filter(|(_, bytes)| settled && *bytes == size);
-                Reply::File(match kept {
-                    Some((opened, _)) => opened,
-                    None => fetch_file(&c, files, run, key).await,
-                })
+                Reply::File(captured_file(&c, dirs.files.as_deref(), run, key, size, settled).await)
             }
             Action::Revisions(wanted) => Reply::Revisions(Revisions {
                 result: read_revisions(&c, &wanted).await,
@@ -443,15 +438,9 @@ impl Action {
                 plugin,
                 listed,
             } => {
-                let view = build_report(&c, dirs.files.as_deref(), &wanted, plugin, listed).await;
-                Reply::Report(crate::report::Built {
-                    report: Arc::new(crate::report::Report {
-                        author: None,
-                        params: wanted.params.clone(),
-                        view,
-                    }),
-                    wanted,
-                })
+                let files = dirs.files.as_deref();
+                let view = build_report(&c, files, plugins, &wanted, plugin, listed).await;
+                Reply::Report(Built::new(wanted, view))
             }
         }
     }
@@ -500,14 +489,7 @@ impl Action {
                 wanted,
                 result: Err(why),
             }),
-            Action::Report { wanted, .. } => Reply::Report(crate::report::Built {
-                report: Arc::new(crate::report::Report {
-                    author: None,
-                    params: wanted.params.clone(),
-                    view: Err(why),
-                }),
-                wanted,
-            }),
+            Action::Report { wanted, .. } => Reply::Report(Built::new(wanted, Err(why))),
         }
     }
 }
@@ -746,37 +728,41 @@ async fn save(
     }
 }
 
-/// A run's report: load the plugin, fetch the captured files it asks for, and run it.
+/// A run's report: load the plugin through `plugins`, fetch the captured files it asks for, and
+/// run it.
 async fn build_report(
     c: &Connection,
     files: Option<&Path>,
+    plugins: &Arc<Mutex<Plugins>>,
     wanted: &crate::report::Wanted,
     plugin: String,
     listed: Vec<Captured>,
 ) -> Result<crucible_view::View, String> {
     let stopped = || "building the view stopped early".to_string();
-    let path = wanted.plugin.0.clone();
-    let (plugin, inputs) =
-        crate::net::blocking(move || crate::report::load(&path, plugin.as_bytes()))
-            .await
-            .ok_or_else(stopped)??;
+    let (path, plugins) = (wanted.plugin.clone(), Arc::clone(plugins));
+    let loaded = crate::net::blocking(move || {
+        let mut plugins = plugins.lock().unwrap_or_else(PoisonError::into_inner);
+        plugins.load(&path, plugin.as_bytes())
+    })
+    .await
+    .ok_or_else(stopped)?;
+    let (_, inputs) = (*loaded).as_ref().map_err(String::clone)?;
     let asked: Vec<&Captured> = listed
         .iter()
         .filter(|file| inputs.contains(&file.path))
         .collect();
-    let sized: Vec<(String, u64)> = asked
-        .iter()
-        .map(|file| (file.key.clone(), file.size))
-        .collect();
-    crate::report::admit(&sized)?;
+    crate::report::admit(asked.iter().map(|file| (file.key.as_str(), file.size)))?;
     let mut read = Vec::new();
     for file in asked {
-        let kept = file_on_disk(files, &wanted.run, &file.key)
-            .filter(|(_, bytes)| wanted.settled && *bytes == file.size);
-        let opened = match kept {
-            Some((opened, _)) => opened,
-            None => fetch_file(c, files, wanted.run.clone(), file.key.clone()).await,
-        };
+        let opened = captured_file(
+            c,
+            files,
+            wanted.run.clone(),
+            file.key.clone(),
+            file.size,
+            wanted.settled,
+        )
+        .await;
         let text = match opened.body {
             Ok(Body::Text(text)) => text,
             Ok(Body::Binary(_)) => return Err(format!("{} is not text.", file.key)),
@@ -789,9 +775,29 @@ async fn build_report(
         });
     }
     let params = wanted.params.clone();
-    crate::net::blocking(move || crate::report::run(&plugin, &inputs, read, params))
-        .await
-        .ok_or_else(stopped)?
+    crate::net::blocking(move || {
+        let (plugin, inputs) = (*loaded).as_ref().map_err(String::clone)?;
+        crate::report::run(plugin, inputs, read, params)
+    })
+    .await
+    .ok_or_else(stopped)?
+}
+
+/// The file `run` captured under `key`: its copy on disk when the run has `settled` and the copy
+/// is the `size` the listing gives, else fetched.
+async fn captured_file(
+    c: &Connection,
+    files: Option<&Path>,
+    run: String,
+    key: String,
+    size: u64,
+    settled: bool,
+) -> Opened {
+    let kept = file_on_disk(files, &run, &key).filter(|(_, bytes)| settled && *bytes == size);
+    match kept {
+        Some((opened, _)) => opened,
+        None => fetch_file(c, files, run, key).await,
+    }
 }
 
 /// A captured file's copy on disk and its length, when it has been fetched before.
@@ -1866,7 +1872,7 @@ pub struct Snapshot {
     pub file: Option<Opened>,
     pub revisions: Option<Arc<Revisions>>,
     /// The report last built for the Report pane.
-    pub report: Option<Arc<crate::report::Built>>,
+    pub report: Option<Arc<Built>>,
 }
 
 /// What one pass of the poll loop read.
@@ -1889,6 +1895,7 @@ pub struct Client {
     shared: Arc<Mutex<Shared>>,
     connector: Connector,
     dirs: Dirs,
+    plugins: Arc<Mutex<Plugins>>,
     /// The poll loop.
     _poll: Option<Task>,
 }
@@ -2002,6 +2009,7 @@ impl Client {
             shared,
             connector,
             dirs,
+            plugins: Arc::default(),
             _poll: poll,
         }
     }
@@ -2024,10 +2032,11 @@ impl Client {
         };
         let (connector, dirs) = (self.connector.clone(), self.dirs.clone());
         let (shared, tx) = (Arc::clone(&self.shared), self.tx.clone());
+        let plugins = Arc::clone(&self.plugins);
         runtime.spawn(async move {
             let launches = action.launches();
             let reply = match connector.connect().await {
-                Ok(connection) => action.run(connection, &dirs).await,
+                Ok(connection) => action.run(connection, &dirs, &plugins).await,
                 Err(why) => action.failed(why, &dirs),
             };
             publish(&shared, |shared| shared.answered(reply));
@@ -2915,7 +2924,7 @@ mod tests {
         let wanted = |run: &str, settled: bool| crate::report::Wanted {
             params: Default::default(),
             run: run.into(),
-            plugin: ("ui/report.wasm.b64".into(), plugin.len()),
+            plugin: "ui/report.wasm.b64".into(),
             listed: listed.iter().map(|f| (f.key.clone(), f.size)).collect(),
             settled,
         };
@@ -2925,7 +2934,7 @@ mod tests {
             });
             snapshot.report.unwrap()
         };
-        let triaged = |built: &crate::report::Built| {
+        let triaged = |built: &Built| {
             let view = built.report.view.as_ref().unwrap();
             let crucible_view::Node::Stack { children } = &view.body else {
                 panic!("the report is a stack");
@@ -2939,6 +2948,8 @@ mod tests {
         client.report(wanted("r1", false), plugin.clone(), listed.clone());
         let first = built(&wanted("r1", false));
         assert_eq!(triaged(&first), "64");
+        let held = |client: &Client| client.plugins.lock().unwrap().held().cloned();
+        let loaded = held(&client).expect("the worker keeps the plugin it loaded");
         let fetched = asked.lock().unwrap().clone();
         assert_eq!(fetched.len(), 2, "{fetched:?}");
         assert!(fetched.iter().all(|line| line.contains("verdicts.json")));
@@ -2980,6 +2991,10 @@ mod tests {
         let built_laned = built(&laned);
         assert_eq!(triaged(&built_laned), "34");
         assert_eq!(built_laned.report.params, laned.params);
+        assert!(
+            held(&client).is_some_and(|held| Arc::ptr_eq(&loaded, &held)),
+            "the plugin is loaded once while its text stays the same"
+        );
     }
 
     /// The first snapshot `ready` accepts, within `within`.

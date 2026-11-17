@@ -68,6 +68,16 @@ impl Verdict {
 pub struct Snapshot {
     pub packs: Vec<PackView>,
     pub error: Option<String>,
+    /// The report last built for the Report pane.
+    pub report: Option<PackReport>,
+}
+
+/// A local pack's own view of its run, as built for the Report pane.
+#[derive(Clone)]
+pub struct PackReport {
+    pub pack: String,
+    /// `None` when the pack ships no plugin.
+    pub report: Option<Arc<crate::report::Report>>,
 }
 
 impl Snapshot {
@@ -96,8 +106,6 @@ pub struct PackView {
     pub agent_events: Vec<crate::session::AgentStep>,
     pub pack: PackFiles,
     pub preview: Preview,
-    /// The pack's own view of the run, when it ships one.
-    pub report: Option<std::sync::Arc<crate::report::Report>>,
 }
 
 impl PackView {
@@ -121,8 +129,9 @@ pub enum Request {
         pack: String,
         max_time: String,
     },
-    /// The reader's params for one pack's report; every other pack's report goes back to none.
-    Params(Option<(String, Params)>),
+    /// The pack whose report the Report pane shows and the params it is asked with; `None`
+    /// while it shows none.
+    Report(Option<(String, Params)>),
 }
 
 /// A report's params, by control id.
@@ -159,6 +168,7 @@ impl Client {
                 Snapshot {
                     packs: Vec::new(),
                     error: Some(format!("starting the local worker: {error}")),
+                    report: None,
                 },
             );
         }
@@ -178,9 +188,9 @@ impl Client {
         });
     }
 
-    /// Builds `pack`'s report with `params`, and every other pack's with none.
-    pub fn ask(&self, asked: Option<(String, Params)>) {
-        let _ = self.tx.send(Request::Params(asked));
+    /// Builds the report of the pack `asked` names with its params, and keeps it current.
+    pub fn report(&self, asked: Option<(String, Params)>) {
+        let _ = self.tx.send(Request::Report(asked));
     }
 
     /// The newest snapshot, unless the UI has already taken this version.
@@ -208,6 +218,30 @@ fn publish(shared: &Mutex<Shared>, snapshot: Snapshot) -> Vec<Option<String>> {
     elapsed
 }
 
+/// The report the Report pane asked for, kept current on each tick.
+struct Asked {
+    pack: String,
+    params: Params,
+    reporter: crate::report::Reporter,
+}
+
+impl Asked {
+    /// Builds the report again from `packs`; whether it changed.
+    fn refresh(&mut self, packs: &[Pack], plugins: &mut crate::report::Plugins) -> bool {
+        match packs.iter().find(|pack| pack.name == self.pack) {
+            Some(pack) => self.reporter.refresh(&pack.dir, &self.params, plugins),
+            None => false,
+        }
+    }
+
+    fn built(&self) -> PackReport {
+        PackReport {
+            pack: self.pack.clone(),
+            report: self.reporter.report().cloned(),
+        }
+    }
+}
+
 fn run_client(repo: PathBuf, rx: Receiver<Request>, shared: Arc<Mutex<Shared>>) {
     let crucible = crucible_binary(&repo);
     let mut error: Option<String> = None;
@@ -215,8 +249,11 @@ fn run_client(repo: PathBuf, rx: Receiver<Request>, shared: Arc<Mutex<Shared>>) 
         error = Some(message);
         Vec::new()
     });
+    let mut plugins = crate::report::Plugins::default();
+    let mut asked: Option<Asked> = None;
+    let mut built: Option<PackReport> = None;
     let mut next_local = Instant::now();
-    let mut shown = publish(&shared, snapshot(&packs, error.clone()));
+    let mut shown = publish(&shared, snapshot(&packs, error.clone(), built.clone()));
 
     loop {
         let now = Instant::now();
@@ -235,23 +272,25 @@ fn run_client(repo: PathBuf, rx: Receiver<Request>, shared: Arc<Mutex<Shared>>) 
                     }
                     None => error = Some(format!("no playbook named {pack}")),
                 }
-                shown = publish(&shared, snapshot(&packs, error.clone()));
+                shown = publish(&shared, snapshot(&packs, error.clone(), built.clone()));
                 next_local = Instant::now() + LIVE_TICK;
             }
-            Ok(Request::Params(asked)) => {
-                let mut changed = false;
-                for pack in &mut packs {
-                    let params = match &asked {
-                        Some((name, params)) if *name == pack.name => params.clone(),
-                        _ => Params::new(),
-                    };
-                    if pack.reporter.ask(params) {
-                        changed |= pack.reporter.refresh(&pack.dir);
-                    }
-                }
-                if changed {
-                    shown = publish(&shared, snapshot(&packs, error.clone()));
-                }
+            Ok(Request::Report(None)) => asked = None,
+            Ok(Request::Report(Some((pack, params)))) => {
+                let reporter = asked
+                    .take()
+                    .filter(|held| held.pack == pack)
+                    .map(|held| held.reporter)
+                    .unwrap_or_default();
+                let mut held = Asked {
+                    pack,
+                    params,
+                    reporter,
+                };
+                held.refresh(&packs, &mut plugins);
+                built = Some(held.built());
+                asked = Some(held);
+                shown = publish(&shared, snapshot(&packs, error.clone(), built.clone()));
             }
             Err(RecvTimeoutError::Disconnected) => return,
             Err(RecvTimeoutError::Timeout) => {}
@@ -263,6 +302,12 @@ fn run_client(repo: PathBuf, rx: Receiver<Request>, shared: Arc<Mutex<Shared>>) 
             for pack in &mut packs {
                 changed |= pack.tick();
             }
+            if let Some(held) = &mut asked
+                && held.refresh(&packs, &mut plugins)
+            {
+                built = Some(held.built());
+                changed = true;
+            }
             next_local = now
                 + if packs.iter().any(Pack::running) {
                     LIVE_TICK
@@ -270,17 +315,18 @@ fn run_client(repo: PathBuf, rx: Receiver<Request>, shared: Arc<Mutex<Shared>>) 
                     IDLE_TICK
                 };
         }
-        let next = snapshot(&packs, error.clone());
+        let next = snapshot(&packs, error.clone(), built.clone());
         if changed || next.elapsed() != shown {
             shown = publish(&shared, next);
         }
     }
 }
 
-fn snapshot(packs: &[Pack], error: Option<String>) -> Snapshot {
+fn snapshot(packs: &[Pack], error: Option<String>, report: Option<PackReport>) -> Snapshot {
     Snapshot {
         packs: packs.iter().map(Pack::view).collect(),
         error,
+        report,
     }
 }
 
@@ -296,7 +342,6 @@ struct Pack {
     files: PackFiles,
     /// The pack as it compiles now, redone whenever its files change.
     preview: Preview,
-    reporter: crate::report::Reporter,
     started: bool,
     since: Option<Instant>,
     stderr: PathBuf,
@@ -352,8 +397,6 @@ impl Pack {
         run.read_new();
         let started = dir.join(RUN_START).is_file();
         let files = PackFiles::read_dir(&dir);
-        let mut reporter = crate::report::Reporter::default();
-        reporter.refresh(&dir);
         Some(Pack {
             workflow,
             manifest: manifest_path
@@ -369,7 +412,6 @@ impl Pack {
             budget_usd,
             run,
             preview: crate::preview::compile(&dir),
-            reporter,
             files,
             started,
             since: None,
@@ -399,7 +441,6 @@ impl Pack {
             self.preview = crate::preview::compile(&self.dir);
             changed = true;
         }
-        changed |= self.reporter.refresh(&self.dir);
         if let Some(mut child) = self.run.child.take() {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -479,7 +520,6 @@ impl Pack {
             agent_events: self.run.fold.agent_events.clone(),
             pack: self.files.clone(),
             preview: self.preview.clone(),
-            report: self.reporter.report().cloned(),
         }
     }
 }
@@ -996,6 +1036,83 @@ printf '%s\n' '{SHUTDOWN}' >> "$d/state/session.jsonl"
         fs::write(&workflow, "x = 2\n").unwrap();
         wait_for(&client, &mut seen, "the saved text", |snapshot| {
             text(snapshot).as_deref() == Some("x = 2\n")
+        });
+    }
+
+    #[test]
+    fn the_report_pane_s_pack_has_its_report_built_and_kept_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = fake_repo(dir.path());
+        let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/report");
+        let pack = repo.join("examples/demo");
+        fs::create_dir_all(pack.join("ui")).unwrap();
+        fs::copy(example.join("ui/report.wasm"), pack.join("ui/report.wasm"))
+            .expect("build it with `just example-report-view`");
+        let capture = |task: &str, lane: &str| {
+            let captured = pack.join("state/files").join(task);
+            fs::create_dir_all(&captured).unwrap();
+            fs::copy(
+                example.join(format!("inbox/{lane}.json")),
+                captured.join("verdicts.json"),
+            )
+            .unwrap();
+        };
+        capture("triage-go", "go");
+        let triaged = |snapshot: &Snapshot| {
+            let built = snapshot.report.as_ref()?;
+            let view = built.report.as_ref()?.view.as_ref().ok()?;
+            let crucible_view::Node::Stack { children } = &view.body else {
+                return None;
+            };
+            let crucible_view::Node::Stats { items } = children.first()? else {
+                return None;
+            };
+            Some((built.pack.clone(), items.first()?.value.clone()))
+        };
+
+        let client = Client::spawn(repo);
+        let mut seen = 0;
+        let found = wait_for(&client, &mut seen, "discovery", |snapshot| {
+            !snapshot.packs.is_empty()
+        });
+        assert!(
+            found.report.is_none(),
+            "nothing is built before it is asked"
+        );
+        client.report(Some(("demo".into(), Params::new())));
+        wait_for(&client, &mut seen, "the report", |snapshot| {
+            triaged(snapshot) == Some(("demo".into(), "34".into()))
+        });
+
+        capture("triage-python", "python");
+        wait_for(&client, &mut seen, "the new captured file", |snapshot| {
+            triaged(snapshot) == Some(("demo".into(), "64".into()))
+        });
+
+        let go: Params = [(
+            "task".to_string(),
+            crucible_view::Param::Select("triage-go".into()),
+        )]
+        .into();
+        client.report(Some(("demo".into(), go.clone())));
+        let laned = wait_for(&client, &mut seen, "the params", |snapshot| {
+            triaged(snapshot) == Some(("demo".into(), "34".into()))
+        });
+        let built = laned.report.unwrap().report.unwrap();
+        assert_eq!(built.params, go);
+
+        client.report(Some(("elsewhere".into(), Params::new())));
+        wait_for(&client, &mut seen, "a pack with no plugin", |snapshot| {
+            snapshot
+                .report
+                .as_ref()
+                .is_some_and(|built| built.pack == "elsewhere" && built.report.is_none())
+        });
+
+        client.report(None);
+        client.report(Some(("demo".into(), Params::new())));
+        wait_for(&client, &mut seen, "the pack asked again", |snapshot| {
+            triaged(snapshot) == Some(("demo".into(), "64".into()))
         });
     }
 
