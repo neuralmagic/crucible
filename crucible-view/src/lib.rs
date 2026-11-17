@@ -69,7 +69,6 @@ macro_rules! plugin {
 
 /// A captured file handed to a plugin.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct File {
     /// The path the task declared.
     pub path: String,
@@ -79,7 +78,6 @@ pub struct File {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Request {
     pub files: Vec<File>,
     /// Each [`Control`] of the last view by id, with the reader's value; empty until the reader
@@ -329,10 +327,10 @@ pub enum Node {
     /// A matrix of values, each cell shaded by its place between the least and the greatest.
     Heatmap {
         /// The columns' labels.
-        x: Vec<String>,
+        columns: Vec<String>,
         /// The rows' labels.
-        y: Vec<String>,
-        /// A row of values per `y` label, a value per `x` label.
+        rows: Vec<String>,
+        /// A row of values per row label, a value per column label.
         values: Vec<Vec<f64>>,
         #[serde(default)]
         tone: Tone,
@@ -348,7 +346,8 @@ pub enum Node {
         height: f32,
         commands: Vec<Draw>,
     },
-    /// A small table drawn whole, such as a pivot.
+    /// A small table drawn whole, such as a pivot. A cell's `href` and `value` are checked
+    /// and otherwise ignored.
     Grid {
         columns: Vec<String>,
         rows: Vec<Vec<Cell>>,
@@ -562,7 +561,7 @@ pub enum ColumnKind {
     #[default]
     Text,
     Mono,
-    /// A label coloured by the cell's tone.
+    /// The text after a dot in the cell's tone.
     Badge,
     /// Right-aligned figures, sorted as numbers: a cell's `value`, else its text when that is
     /// a number.
@@ -908,8 +907,8 @@ pub enum Problem {
     PathPoints(usize),
     #[error("the view's plots, histograms and canvas paths hold more than {0} points")]
     Points(usize),
-    #[error("the series {0} has a point that is not a number within 1e15 of zero")]
-    Point(String),
+    #[error("{0} has a value that is not a number within 1e15 of zero")]
+    Magnitude(String),
     #[error("{0} has a row of {1} cells for {2} columns")]
     RowWidth(String, usize, usize),
     #[error("two components are named {0}")]
@@ -924,8 +923,6 @@ pub enum Problem {
     Tables,
     #[error("{0} is not an http(s) address or a run link")]
     Href(String),
-    #[error("the cell {0} has a value that is not a number within 1e15 of zero")]
-    CellValue(String),
     #[error("the cell {0} has a bar that is not a number from 0 to 1")]
     CellBar(String),
     #[error(
@@ -949,14 +946,10 @@ pub enum Problem {
     CategoryScale,
     #[error("a histogram's bin count is not from 1 to {0}")]
     Bins(u32),
-    #[error("the histogram {0} has a value that is not a number within 1e15 of zero")]
-    HistogramValue(String),
-    #[error("a heatmap has {0} rows of values for {1} y labels")]
+    #[error("a heatmap has {0} rows of values for {1} row labels")]
     HeatmapRows(usize, usize),
-    #[error("the heatmap row {0} has {1} values for {2} x labels")]
+    #[error("the heatmap row {0} has {1} values for {2} columns")]
     HeatmapRow(String, usize, usize),
-    #[error("the heatmap row {0} has a value that is not a number within 1e15 of zero")]
-    HeatmapValue(String),
     #[error("the view has more than {0} controls")]
     Controls(usize),
     #[error("two controls are named {0}")]
@@ -1272,7 +1265,7 @@ impl Node {
                     fits(&one.label, limits)?;
                     seen.points(one.points.len(), limits)?;
                     if !one.points.iter().flatten().all(within) {
-                        return Err(Problem::Point(one.label.clone()));
+                        return Err(Problem::Magnitude(format!("the series {}", one.label)));
                     }
                     for [px, py] in &one.points {
                         on_scale(*x_scale, *px, &one.label)?;
@@ -1295,28 +1288,35 @@ impl Node {
                     return Err(Problem::Bins(MAX_BINS));
                 }
                 if !values.iter().all(within) {
-                    return Err(Problem::HistogramValue(x.clone()));
+                    return Err(Problem::Magnitude(format!("the histogram {x}")));
                 }
                 Ok(0)
             }
-            Node::Heatmap { x, y, values, .. } => {
-                let cells = x.len().saturating_mul(y.len());
+            Node::Heatmap {
+                columns,
+                rows,
+                values,
+                ..
+            } => {
+                let cells = columns.len().saturating_mul(rows.len());
                 seen.items(
-                    cells.saturating_add(x.len()).saturating_add(y.len()),
+                    cells
+                        .saturating_add(columns.len())
+                        .saturating_add(rows.len()),
                     limits,
                 )?;
-                for label in x.iter().chain(y) {
+                for label in columns.iter().chain(rows) {
                     fits(label, limits)?;
                 }
-                if values.len() != y.len() {
-                    return Err(Problem::HeatmapRows(values.len(), y.len()));
+                if values.len() != rows.len() {
+                    return Err(Problem::HeatmapRows(values.len(), rows.len()));
                 }
-                for (row, label) in values.iter().zip(y) {
-                    if row.len() != x.len() {
-                        return Err(Problem::HeatmapRow(label.clone(), row.len(), x.len()));
+                for (row, label) in values.iter().zip(rows) {
+                    if row.len() != columns.len() {
+                        return Err(Problem::HeatmapRow(label.clone(), row.len(), columns.len()));
                     }
                     if !row.iter().all(within) {
-                        return Err(Problem::HeatmapValue(label.clone()));
+                        return Err(Problem::Magnitude(format!("the heatmap row {label}")));
                     }
                 }
                 Ok(0)
@@ -1410,7 +1410,7 @@ fn cells_fit(cells: &[Cell], limits: &Limits) -> Result<(), Problem> {
     for cell in cells {
         fits(&cell.text, limits)?;
         if cell.value.is_some_and(|value| !within(&value)) {
-            return Err(Problem::CellValue(cell.text.clone()));
+            return Err(Problem::Magnitude(format!("the cell {}", cell.text)));
         }
         if cell.bar.is_some_and(|bar| !(0.0..=1.0).contains(&bar)) {
             return Err(Problem::CellBar(cell.text.clone()));
@@ -1588,7 +1588,7 @@ mod tests {
         for off in [f64::NAN, f64::INFINITY, 1.1e15] {
             assert_eq!(
                 view(valued(off)).check(&Limits::DEFAULT),
-                Err(Problem::CellValue("3 min".into()))
+                Err(Problem::Magnitude("the cell 3 min".into()))
             );
         }
         assert_eq!(
@@ -1789,9 +1789,13 @@ mod tests {
         for off in [f64::NAN, f64::INFINITY, -1.1e15, f64::MAX] {
             assert_eq!(
                 plot(vec![[1.0, off]]).check(&Limits::DEFAULT),
-                Err(Problem::Point("affected".into()))
+                Err(Problem::Magnitude("the series affected".into()))
             );
         }
+        assert_eq!(
+            Problem::Magnitude("the series affected".into()).to_string(),
+            "the series affected has a value that is not a number within 1e15 of zero"
+        );
         assert_eq!(
             plot(vec![[0.0, 0.0]; 50_001]).check(&Limits::DEFAULT),
             Err(Problem::Points(50_000))
@@ -1884,7 +1888,7 @@ mod tests {
         for off in [f64::NAN, f64::INFINITY, 1.1e15] {
             assert_eq!(
                 on_y(off).check(&Limits::DEFAULT),
-                Err(Problem::Point("s".into()))
+                Err(Problem::Magnitude("the series s".into()))
             );
         }
     }
@@ -1984,7 +1988,7 @@ mod tests {
         for off in [f64::NAN, f64::NEG_INFINITY, 1.1e15] {
             assert_eq!(
                 histogram(vec![1.0, off], None).check(&Limits::DEFAULT),
-                Err(Problem::HistogramValue("days".into()))
+                Err(Problem::Magnitude("the histogram days".into()))
             );
         }
         assert_eq!(histogram(vec![0.0; 6], None).check(&TIGHT), Ok(()));
@@ -2025,10 +2029,10 @@ mod tests {
         }
     }
 
-    fn heatmap(x: &[&str], y: &[&str], values: Vec<Vec<f64>>) -> View {
+    fn heatmap(columns: &[&str], rows: &[&str], values: Vec<Vec<f64>>) -> View {
         view(Node::Heatmap {
-            x: x.iter().map(|label| label.to_string()).collect(),
-            y: y.iter().map(|label| label.to_string()).collect(),
+            columns: columns.iter().map(|label| label.to_string()).collect(),
+            rows: rows.iter().map(|label| label.to_string()).collect(),
             values,
             tone: Tone::Neutral,
         })
@@ -2065,7 +2069,7 @@ mod tests {
         for off in [f64::NAN, f64::INFINITY, -1.1e15] {
             assert_eq!(
                 heatmap(&["a"], &["r"], vec![vec![off]]).check(&Limits::DEFAULT),
-                Err(Problem::HeatmapValue("r".into()))
+                Err(Problem::Magnitude("the heatmap row r".into()))
             );
         }
         assert_eq!(
@@ -2087,8 +2091,8 @@ mod tests {
             Err(Problem::Text(8))
         );
         let huge = Node::Heatmap {
-            x: vec![String::new(); 200],
-            y: vec![String::new(); 200],
+            columns: vec![String::new(); 200],
+            rows: vec![String::new(); 200],
             values: vec![],
             tone: Tone::Neutral,
         };
@@ -2100,11 +2104,16 @@ mod tests {
         let json = serde_json::to_string(&heatmap(&["a"], &["r"], vec![vec![1.0]])).unwrap();
         assert_eq!(
             json,
-            r#"{"title":"Report","body":{"heatmap":{"x":["a"],"y":["r"],"values":[[1.0]],"tone":"neutral"}}}"#
+            r#"{"title":"Report","body":{"heatmap":{"columns":["a"],"rows":["r"],"values":[[1.0]],"tone":"neutral"}}}"#
         );
         assert!(
-            serde_json::from_str::<Node>(r#"{"heatmap":{"x":[],"y":[],"values":[],"z":1}}"#)
-                .is_err()
+            serde_json::from_str::<Node>(
+                r#"{"heatmap":{"columns":[],"rows":[],"values":[],"z":1}}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<Node>(r#"{"heatmap":{"x":[],"y":[],"values":[]}}"#).is_err()
         );
     }
 
@@ -2988,7 +2997,21 @@ mod tests {
         assert_eq!(asked.range("lane"), None);
         assert_eq!(asked.select("missing"), None);
         assert!(serde_json::from_str::<Request>(r#"{"files":[],"params":{"a":7}}"#).is_err());
-        assert!(serde_json::from_str::<Request>(r#"{"files":[],"extra":1}"#).is_err());
+        assert_eq!(
+            serde_json::from_str::<Request>(
+                r#"{"files":[{"path":"p","task":"t","text":"x","size":1}],"run":"r1"}"#
+            )
+            .unwrap(),
+            Request {
+                files: vec![crate::File {
+                    path: "p".into(),
+                    task: "t".into(),
+                    text: "x".into(),
+                }],
+                params: Default::default(),
+            },
+            "a field the host adds later is passed over"
+        );
     }
 
     #[test]

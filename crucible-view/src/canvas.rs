@@ -377,13 +377,26 @@ impl Context2d {
 
     /// Clockwise from `start_angle` to `end_angle`.
     pub fn arc(&mut self, x: f32, y: f32, radius: f32, start_angle: f32, end_angle: f32) {
+        self.arc_with_anticlockwise(x, y, radius, start_angle, end_angle, false);
+    }
+
+    /// From `start_angle` to `end_angle`, anticlockwise when `anticlockwise`.
+    pub fn arc_with_anticlockwise(
+        &mut self,
+        x: f32,
+        y: f32,
+        radius: f32,
+        start_angle: f32,
+        end_angle: f32,
+        anticlockwise: bool,
+    ) {
         self.commands.push(Draw::Arc {
             x,
             y,
             radius,
             start_angle,
             end_angle,
-            counterclockwise: false,
+            counterclockwise: anticlockwise,
         });
     }
 
@@ -490,6 +503,8 @@ mod tests {
         ctx.quadratic_curve_to(1.0, 2.0, 3.0, 4.0);
         ctx.bezier_curve_to(1.0, 2.0, 3.0, 4.0, 5.0, 6.0);
         ctx.arc(50.0, 40.0, 20.0, 0.0, 3.0);
+        ctx.arc_with_anticlockwise(50.0, 40.0, 10.0, 3.0, 0.0, true);
+        ctx.arc_with_anticlockwise(50.0, 40.0, 5.0, 0.0, 1.0, false);
         ctx.close_path();
         ctx.stroke();
         ctx.set_text_align(TextAlign::Center);
@@ -505,6 +520,8 @@ mod tests {
             r#"{"move_to":[0.0,0.0]}"#,
             r#"{"bezier_curve_to":[1.0,2.0,3.0,4.0,5.0,6.0]}"#,
             r#"{"arc":{"x":50.0,"y":40.0,"radius":20.0,"start_angle":0.0,"end_angle":3.0,"counterclockwise":false}}"#,
+            r#"{"arc":{"x":50.0,"y":40.0,"radius":10.0,"start_angle":3.0,"end_angle":0.0,"counterclockwise":true}}"#,
+            r#"{"arc":{"x":50.0,"y":40.0,"radius":5.0,"start_angle":0.0,"end_angle":1.0,"counterclockwise":false}}"#,
             r#"{"text_align":"center"}"#,
             r#"{"fill_text":{"text":"70%","x":50.0,"y":44.0}}"#,
         ] {

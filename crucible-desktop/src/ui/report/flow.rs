@@ -147,8 +147,8 @@ pub(crate) fn drawing(
         let middle = (x0 + x1) / 2.0;
         commands.extend([
             Draw::FillStyle(match link.tone {
-                Some(Tone::Neutral) | None => styles[to],
-                Some(tone) => Style::Tone(tone),
+                Tone::Neutral => styles[to],
+                tone => Style::Tone(tone),
             }),
             Draw::BeginPath,
             Draw::MoveTo([x0, y0]),
@@ -226,7 +226,7 @@ mod tests {
             from: from.into(),
             to: to.into(),
             value,
-            tone: None,
+            tone: Tone::Neutral,
         }
     }
 
@@ -346,7 +346,7 @@ mod tests {
     fn a_ribbon_s_own_tone_wins_and_odd_flows_still_draw() {
         let nodes = vec![node("a", Tone::Neutral), node("b", Tone::Good)];
         let toned = vec![FlowLink {
-            tone: Some(Tone::Warn),
+            tone: Tone::Warn,
             ..link("a", "b", 2.5)
         }];
         let (_, commands) = drawing(&nodes, &toned, &style).unwrap();
@@ -420,26 +420,6 @@ mod tests {
             ribbons,
             [palette(1), Style::Tone(Tone::Muted), palette(3)],
             "a ribbon takes the colour of the stage it reaches"
-        );
-        let plain: Vec<FlowLink> = fed
-            .iter()
-            .map(|one| FlowLink {
-                tone: Some(Tone::Neutral),
-                ..one.clone()
-            })
-            .collect();
-        let (_, commands) = drawing(&neutral, &plain, &style).unwrap();
-        let plain_ribbons: Vec<Style> = commands
-            .iter()
-            .zip(commands.iter().skip(1))
-            .filter_map(|(style, next)| match (style, next) {
-                (Draw::FillStyle(style), Draw::BeginPath) => Some(*style),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            plain_ribbons, ribbons,
-            "a ribbon left neutral takes its stage's colour"
         );
         assert!(drawing(&[], &[], &style).is_none());
         assert!(drawing(&nodes, &[link("a", "nowhere", 1.0)], &style).is_none());

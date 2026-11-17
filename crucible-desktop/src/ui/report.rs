@@ -222,7 +222,12 @@ fn node<S: Slot>(node_: &Node, fills: bool, at: &str, app: &App, p: &Paint) -> E
             bins,
             tone,
         } => plot::histogram(x, values, *bins, *tone, p),
-        Node::Heatmap { x, y, values, tone } => plot::heatmap(x, y, values, *tone, p),
+        Node::Heatmap {
+            columns,
+            rows,
+            values,
+            tone,
+        } => plot::heatmap(columns, rows, values, *tone, p),
         Node::Flow { nodes, links } => {
             match flow::drawing(nodes, links, &|hue| hue::style(hue, p.k)) {
                 Some((height, commands)) => card(p).child(canvas::fitted(

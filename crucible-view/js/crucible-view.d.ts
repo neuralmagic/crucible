@@ -118,18 +118,24 @@ type ViewNode =
       histogram: { x: string; values: number[]; bins?: number; tone?: Tone };
     }
   | {
-      /** A row of `values` per `y` label, a value per `x` label, shaded from least to greatest. */
-      heatmap: { x: string[]; y: string[]; values: number[][]; tone?: Tone };
+      /** A row of `values` per row label, a value per column label, shaded from least to greatest. */
+      heatmap: { columns: string[]; rows: string[]; values: number[][]; tone?: Tone };
     }
   | {
       /** Quantities flowing between stages, drawn as ribbons: a Sankey diagram. */
       flow: {
         nodes: { id: string; label: string; tone?: Tone }[];
-        /** `value` is greater than zero, and no ribbon leads back to an earlier stage. */
+        /**
+         * `value` is greater than zero, and no ribbon leads back to an earlier stage. A `neutral`
+         * tone takes the tone of the stage it reaches.
+         */
         links: { from: string; to: string; value: number; tone?: Tone }[];
       };
     }
-  | { grid: { columns: string[]; rows: ViewCell[][] } }
+  | {
+      /** A small table drawn whole. It checks a cell's `href` and `value` and ignores them. */
+      grid: { columns: string[]; rows: ViewCell[][] };
+    }
   | {
       table: {
         id: string;
@@ -173,6 +179,7 @@ declare class CanvasContext2D {
   strokeStyle: Tone | `#${string}`;
   globalAlpha: number;
   lineWidth: number;
+  /** `square` is drawn as `butt`. */
   lineCap: "butt" | "round" | "square";
   /** Read for its `px` size and the words `bold` and `monospace`. */
   font: string;

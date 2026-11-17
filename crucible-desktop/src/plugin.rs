@@ -1,6 +1,6 @@
-//! Runs a pack's view plugin: a WebAssembly module interpreted under a fuel and memory limit,
-//! whose only imports may be the WASI calls [`wasi`] answers with nothing. Every call gets a
-//! fresh instance.
+//! Runs a pack's view plugin: a WebAssembly module with no imports, interpreted under a fuel
+//! and memory limit. Only the JavaScript engine module may import the WASI calls [`wasi`]
+//! answers with nothing. Every call gets a fresh instance.
 
 mod js;
 mod wasi;
@@ -142,12 +142,21 @@ impl Loaded {
     }
 }
 
-/// A module whose only imports are WASI calls the host answers, and the limits each of its
-/// calls runs under: a plugin, or the engine a script runs in.
+/// A module and the limits each of its calls runs under: a plugin, or the engine a script runs
+/// in.
 pub struct Module {
     engine: Engine,
     module: wasmi::Module,
     limits: Limits,
+    imports: Imports,
+}
+
+/// What a module may import.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Imports {
+    Nothing,
+    /// The WASI calls the host answers.
+    Wasi,
 }
 
 /// The most tables one plugin may have.
@@ -160,14 +169,25 @@ struct Call {
 }
 
 impl Module {
+    /// A pack's plugin, which imports nothing.
     pub fn load(wasm: &[u8], limits: Limits) -> Result<Module, Fault> {
+        Module::new(wasm, limits, Imports::Nothing)
+    }
+
+    /// The JavaScript engine, which may import the WASI calls the host answers.
+    pub fn engine(wasm: &[u8], limits: Limits) -> Result<Module, Fault> {
+        Module::new(wasm, limits, Imports::Wasi)
+    }
+
+    fn new(wasm: &[u8], limits: Limits, imports: Imports) -> Result<Module, Fault> {
         let mut config = Config::default();
         config.consume_fuel(true).wasm_simd(true);
         let engine = Engine::new(&config);
         let module = wasmi::Module::new(&engine, wasm).map_err(|e| Fault::Module(e.to_string()))?;
-        let foreign = module
-            .imports()
-            .find(|import| import.module() != wasi::MODULE || !wasi::offers(import.name()));
+        let foreign = module.imports().find(|import| match imports {
+            Imports::Nothing => true,
+            Imports::Wasi => import.module() != wasi::MODULE || !wasi::offers(import.name()),
+        });
         match foreign {
             Some(import) => Err(Fault::Import(format!(
                 "{}.{}",
@@ -178,6 +198,7 @@ impl Module {
                 engine,
                 module,
                 limits,
+                imports,
             }),
         }
     }
@@ -238,7 +259,9 @@ impl Module {
             .set_fuel(limits.fuel)
             .map_err(|e| Fault::Module(e.to_string()))?;
         let mut linker = Linker::new(&self.engine);
-        wasi::link(&mut linker).map_err(|e| Fault::Module(e.to_string()))?;
+        if self.imports == Imports::Wasi {
+            wasi::link(&mut linker).map_err(|e| Fault::Module(e.to_string()))?;
+        }
         let instance = linker
             .instantiate_and_start(&mut store, &self.module)
             .map_err(|e| said(fault(e), &store))?;
@@ -375,16 +398,49 @@ mod tests {
         assert_eq!(plugin.inputs(), Err(Fault::Export("crucible_inputs")));
     }
 
+    fn importing(module: &str, name: &str) -> String {
+        format!(
+            r#"(module
+                (import "{module}" "{name}" (func (param i32 i32) (result i32)))
+                (memory (export "memory") 1))"#
+        )
+    }
+
     #[test]
-    fn only_the_wasi_calls_the_host_answers_may_be_imported() {
-        let importing = |module: &str, name: &str| {
-            let wat = format!(
-                r#"(module
-                    (import "{module}" "{name}" (func (param i32 i32) (result i32)))
-                    (memory (export "memory") 1))"#
+    fn a_pack_s_plugin_may_import_nothing() {
+        for (module, name) in [
+            ("wasi_snapshot_preview1", "random_get"),
+            ("wasi_snapshot_preview1", "fd_write"),
+            ("wasi_snapshot_preview1", "clock_time_get"),
+            ("wasi_snapshot_preview1", "path_open"),
+            ("env", "fetch"),
+        ] {
+            assert_eq!(
+                Module::load(importing(module, name).as_bytes(), SMALL).err(),
+                Some(Fault::Import(format!("{module}.{name}"))),
             );
-            Module::load(wat.as_bytes(), SMALL).err()
-        };
+        }
+        for (kind, name) in [
+            ("(memory 1)", "memory"),
+            ("(table 1 funcref)", "table"),
+            ("(global i32)", "base"),
+        ] {
+            let wat = format!(r#"(module (import "env" "{name}" {kind}))"#);
+            assert_eq!(
+                Module::load(wat.as_bytes(), SMALL).err(),
+                Some(Fault::Import(format!("env.{name}"))),
+            );
+        }
+        let bare = r#"(module (memory (export "memory") 1))"#;
+        assert!(Module::load(bare.as_bytes(), SMALL).is_ok());
+        assert!(matches!(
+            Module::load(b"not wasm", SMALL),
+            Err(Fault::Module(_))
+        ));
+    }
+
+    #[test]
+    fn the_engine_may_import_only_the_wasi_calls_the_host_answers() {
         for (module, name) in [
             ("wasi_snapshot_preview1", "path_open"),
             ("wasi_snapshot_preview1", "sock_send"),
@@ -394,13 +450,31 @@ mod tests {
             ("env", "random_get"),
         ] {
             assert_eq!(
-                importing(module, name),
+                Module::engine(importing(module, name).as_bytes(), SMALL).err(),
                 Some(Fault::Import(format!("{module}.{name}"))),
             );
         }
-        assert_eq!(importing("wasi_snapshot_preview1", "random_get"), None);
+        for name in [
+            "clock_time_get",
+            "environ_get",
+            "environ_sizes_get",
+            "fd_close",
+            "fd_fdstat_get",
+            "fd_read",
+            "fd_seek",
+            "fd_write",
+            "proc_exit",
+            "random_get",
+        ] {
+            let wat = format!(
+                r#"(module
+                    (import "wasi_snapshot_preview1" "{name}" (func))
+                    (memory (export "memory") 1))"#
+            );
+            assert!(Module::engine(wat.as_bytes(), SMALL).is_ok(), "{name}");
+        }
         assert!(matches!(
-            Module::load(b"not wasm", SMALL),
+            Module::engine(b"not wasm", SMALL),
             Err(Fault::Module(_))
         ));
     }
@@ -472,7 +546,7 @@ mod tests {
             (func (export "crucible_view") (param i32 i32) (result i64)
                 (call $exit (i32.const 3))
                 (i64.const 0)))"#;
-        let plugin = Loaded::Wasm(Module::load(probe.as_bytes(), SMALL).unwrap());
+        let plugin = Loaded::Wasm(Module::engine(probe.as_bytes(), SMALL).unwrap());
         assert_eq!(plugin.inputs().unwrap(), ["nothing"]);
         let Err(Fault::Trap(why)) = plugin.view(&Request::default()) else {
             panic!("an exit stops the plugin");
@@ -546,7 +620,7 @@ mod tests {
                             (then (i64.or (i64.shl (i64.const 16) (i64.const 32)) (i64.const 11)))
                             (else (i64.or (i64.shl (i64.const 8) (i64.const 32)) (i64.const 2))))))"#
             );
-            Loaded::Wasm(Module::load(wat.as_bytes(), SMALL).unwrap()).inputs()
+            Loaded::Wasm(Module::engine(wat.as_bytes(), SMALL).unwrap()).inputs()
         };
         assert_eq!(
             calling("(call $random (i32.const 1024) (i32.const 0x7fffffff))"),
@@ -583,7 +657,7 @@ mod tests {
                 reply_bytes,
                 ..SMALL
             };
-            let mut call = Module::load(writes.as_bytes(), limits)
+            let mut call = Module::engine(writes.as_bytes(), limits)
                 .unwrap()
                 .start()
                 .unwrap();

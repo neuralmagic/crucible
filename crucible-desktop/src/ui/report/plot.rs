@@ -423,8 +423,8 @@ fn shade(color: Color, at: f32) -> Color {
 }
 
 pub(crate) fn heatmap(
-    x: &[String],
-    y: &[String],
+    columns: &[String],
+    rows: &[String],
     values: &[Vec<f64>],
     tone: Tone,
     p: &Paint,
@@ -432,7 +432,7 @@ pub(crate) fn heatmap(
     let span = extent(values.iter().flatten().copied());
     let (lo, hi) = span.unwrap_or((0.0, 1.0));
     let color = colour(Hue::from(tone), p.k);
-    let cells = x.len().saturating_mul(y.len());
+    let cells = columns.len().saturating_mul(rows.len());
     let label = |body: &str| {
         text(body.to_string())
             .font(p.mono(11.0, 440.0))
@@ -441,10 +441,10 @@ pub(crate) fn heatmap(
     };
     let mut chart = card(p).key("report-heatmap");
     if cells <= HOVER_CELLS {
-        let written = x.len() <= WRITTEN;
-        for (row_label, row_values) in y.iter().zip(values) {
+        let written = columns.len() <= WRITTEN;
+        for (row_label, row_values) in rows.iter().zip(values) {
             let mut line = row().grow(1.0).min_w(0.0).h_full().gap(2.0);
-            for (column, value) in x.iter().zip(row_values) {
+            for (column, value) in columns.iter().zip(row_values) {
                 let at = share(*value, lo, hi);
                 let ink = if at > 0.55 {
                     p.c.bg_base
@@ -481,7 +481,7 @@ pub(crate) fn heatmap(
             );
         }
     } else {
-        let tall = (y.len() as f32 * 4.0).clamp(ROW, 520.0);
+        let tall = (rows.len() as f32 * 4.0).clamp(ROW, 520.0);
         let mut shape = Shape::new();
         for (j, row_values) in values.iter().enumerate() {
             for (i, value) in row_values.iter().enumerate() {
@@ -497,9 +497,8 @@ pub(crate) fn heatmap(
                 );
             }
         }
-        let rows = Axis::names(y);
         let mut labels = el().w(ROW_LABEL).h(tall);
-        for tick in rows.ticks() {
+        for tick in Axis::names(rows).ticks() {
             labels = labels.child(
                 row()
                     .absolute(0.0, tick.at as f32 * tall - 7.0)
@@ -510,7 +509,7 @@ pub(crate) fn heatmap(
         }
         chart = chart.child(
             row().w_full().gap(8.0).child(labels).child(
-                canvas(shape.view_box(x.len().max(1) as f32, y.len().max(1) as f32))
+                canvas(shape.view_box(columns.len().max(1) as f32, rows.len().max(1) as f32))
                     .grow(1.0)
                     .min_w(0.0)
                     .h(tall),
@@ -535,7 +534,7 @@ pub(crate) fn heatmap(
     }
     chart
         .child(row().w_full().pl(ROW_LABEL + 8.0).child(ticks_under(
-            Axis::names(x).ticks(),
+            Axis::names(columns).ticks(),
             |at| at,
             p,
         )))

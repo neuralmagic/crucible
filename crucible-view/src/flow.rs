@@ -26,9 +26,9 @@ pub struct FlowLink {
     pub to: String,
     /// Greater than zero, and at most [`MAGNITUDE`].
     pub value: f64,
-    /// The ribbon's colour; the tone of the stage it reaches when not given.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tone: Option<Tone>,
+    /// Neutral takes the tone of the stage it reaches.
+    #[serde(default)]
+    pub tone: Tone,
 }
 
 /// The column each node is drawn in, in the nodes' order: 0 for a node nothing flows into,
@@ -86,7 +86,7 @@ mod tests {
             from: from.into(),
             to: to.into(),
             value,
-            tone: None,
+            tone: Tone::Neutral,
         }
     }
 
@@ -156,7 +156,7 @@ mod tests {
         let flow = Node::Flow {
             nodes: vec![node("a"), node("b")],
             links: vec![FlowLink {
-                tone: Some(Tone::Bad),
+                tone: Tone::Bad,
                 ..link("a", "b", 3.0)
             }],
         };
@@ -166,7 +166,16 @@ mod tests {
             r#"{"flow":{"nodes":[{"id":"a","label":"A","tone":"neutral"},{"id":"b","label":"B","tone":"neutral"}],"links":[{"from":"a","to":"b","value":3.0,"tone":"bad"}]}}"#
         );
         assert_eq!(serde_json::from_str::<Node>(&json).unwrap(), flow);
-        let bare = r#"{"flow":{"nodes":[{"id":"a","label":"A"}],"links":[]}}"#;
-        assert!(serde_json::from_str::<Node>(bare).is_ok());
+        let bare = r#"{"flow":{"nodes":[{"id":"a","label":"A"},{"id":"b","label":"B"}],"links":[{"from":"a","to":"b","value":3.0}]}}"#;
+        assert_eq!(
+            serde_json::from_str::<Node>(bare).unwrap(),
+            Node::Flow {
+                nodes: vec![node("a"), node("b")],
+                links: vec![link("a", "b", 3.0)],
+            }
+        );
+        let null = bare.replace(r#""value":3.0"#, r#""value":3.0,"tone":null"#);
+        assert_ne!(null, bare);
+        assert!(serde_json::from_str::<Node>(&null).is_err());
     }
 }

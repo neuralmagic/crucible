@@ -385,8 +385,8 @@ fn days_open(tickets: &[Ticket]) -> Node {
 fn by_category_and_release(tickets: &[Ticket]) -> Node {
     let releases = releases(tickets);
     Node::Heatmap {
-        x: releases.iter().map(|release| release.to_string()).collect(),
-        y: Category::ALL
+        columns: releases.iter().map(|release| release.to_string()).collect(),
+        rows: Category::ALL
             .iter()
             .map(|category| category.label().to_string())
             .collect(),
@@ -463,7 +463,7 @@ fn how_decided(tickets: &[Ticket]) -> Node {
                 from,
                 to,
                 value: count as f64,
-                tone: None,
+                tone: Tone::Neutral,
             })
             .collect(),
     }
@@ -856,8 +856,8 @@ mod tests {
                 ..
             },
             Node::Heatmap {
-                x: heat_x,
-                y: heat_y,
+                columns: heat_columns,
+                rows: heat_rows,
                 values: heat,
                 ..
             },
@@ -866,8 +866,8 @@ mod tests {
             panic!("under the flow are a histogram and a heatmap");
         };
         assert_eq!(ages.len(), 64);
-        assert_eq!(heat_x, categories);
-        assert_eq!(heat_y.len(), 6);
+        assert_eq!(heat_columns, categories);
+        assert_eq!(heat_rows.len(), 6);
         assert_eq!(heat.iter().flatten().sum::<f64>(), 64.0);
         assert!(
             nodes

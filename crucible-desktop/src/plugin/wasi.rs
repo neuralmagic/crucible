@@ -1,7 +1,7 @@
-//! The WASI preview 1 calls a plugin may import, answered without giving it anything: no files
-//! or environment, a clock that only counts its own readings, and the same "random" bytes every
-//! time. Its standard input is what the host chose to hand it, and its standard output and
-//! error go back to the host. These are the calls the JavaScript engine module needs to start.
+//! The WASI preview 1 calls the JavaScript engine module may import, answered without giving it
+//! anything: no files or environment, a clock that only counts its own readings, and the same
+//! "random" bytes every time. Its standard input is what the host chose to hand it, and its
+//! standard output and error go back to the host.
 //!
 //! Each call charges fuel for the bytes it moves and refuses a list of more than [`BUFFERS`]
 //! buffers.

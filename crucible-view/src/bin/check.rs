@@ -67,7 +67,7 @@ mod tests {
         );
         let charts = r#"{"title":"T","body":{"stack":{"children":[
             {"histogram":{"x":"days","values":[1,2,3]}},
-            {"heatmap":{"x":["a"],"y":["r"],"values":[[1]]}}]}}}"#;
+            {"heatmap":{"columns":["a"],"rows":["r"],"values":[[1]]}}]}}}"#;
         assert_eq!(
             checked(charts),
             Ok("ok: \"T\" with 1 heatmap, 1 histogram, 1 stack".to_string())

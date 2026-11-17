@@ -61,7 +61,8 @@ empty at 0 or below and full at `max` or above. Put several in `columns`.
 ```
 
 `grid` is a small table drawn whole, for a pivot. The first column is the label and the rest
-are right-aligned. At most 600 cells, header included.
+are right-aligned. At most 600 cells, header included. A grid draws no links and does not sort,
+so it ignores a cell's `href` and `value`, though it checks them as a table does.
 
 ```json
 {"grid": {
@@ -268,16 +269,16 @@ square root of the number of values, at most 30. Hovering a bar shows its range 
 {"histogram": {"x": "days open", "values": [18, 21, 25, 40, 44, 57, 57, 90], "bins": 4}}
 ```
 
-`heatmap` is a matrix: `x` labels its columns, `y` its rows, and `values` holds a row per `y`
-label with a value per `x` label. Each cell is filled in the one `tone` as deep as its value's
-place between the least value and the greatest, and its value is written in it while there are
-at most 16 columns. Every row has one value per column. While it holds at most 2,000 cells,
-hovering one shows its row, column and value.
+`heatmap` is a matrix: `columns` labels its columns, `rows` its rows, and `values` holds a row
+per row label with a value per column label. Each cell is filled in the one `tone` as deep as
+its value's place between the least value and the greatest, and its value is written in it
+while there are at most 16 columns. Every row has one value per column. While it holds at most
+2,000 cells, hovering one shows its row, column and value.
 
 ```json
 {"heatmap": {
-  "x": ["3.3", "3.4", "3.5"],
-  "y": ["affected", "not_affected"],
+  "columns": ["3.3", "3.4", "3.5"],
+  "rows": ["affected", "not_affected"],
   "values": [[2, 3, 1], [10, 14, 9]],
   "tone": "info"
 }}
@@ -327,8 +328,9 @@ labels short: the first and last columns have about 120 points for theirs.
 
 `canvas` is free drawing with the commands of the HTML canvas's 2D context, under the same
 names in snake case. `width` and `height` are points, 1 to 4,000; coordinates start at the top
-left with y down; angles are radians and arcs run clockwise. A command with no arguments is its
-name as a string. Every number is within 1,000,000 of zero.
+left with y down; angles are radians and an arc runs clockwise unless it sets
+`counterclockwise`. A command with no arguments is its name as a string. Every number is within
+1,000,000 of zero.
 
 A path may run 1,000 points before its next `move_to`, `close_path` or `rect`. A line adds one
 point, a curve up to 65, an arc up to 49 and a `rect` 5. Every `fill` and `stroke` counts all
@@ -368,7 +370,7 @@ the points of the path it draws, so call `begin_path` before each new shape.
 | --- | --- |
 | `fill_style`, `stroke_style` | a tone name, or `#rgb`, `#rrggbb`, `#rrggbbaa` |
 | `global_alpha`, `line_width` | a number |
-| `line_cap` | `butt` or `round` |
+| `line_cap` | `butt` or `round`; a script's `square` is drawn as `butt` |
 | `font` | a CSS font string, read for its `px` size and the words `bold` and `monospace` |
 | `text_align` | `start`, `left`, `center`, `right` or `end` |
 | `text_baseline` | `top`, `middle`, `alphabetic` or `bottom` |
@@ -394,9 +396,9 @@ is not the 2D context's: its text shows on hover over its rectangle, and each co
 Shapes and text are painted in the order of their commands.
 
 In Rust, `crucible_view::Context2d` records the same commands with the method names `web-sys`
-uses (`set_fill_style`, `begin_path`, `fill_rect`, `fill_text`, `fill_text_with_max_width`,
-`set_transform`), and `finish()` returns the component. In a script, `ctx.hint(x, y, width,
-height, text)` adds a hint.
+uses (`set_fill_style`, `begin_path`, `fill_rect`, `arc`, `arc_with_anticlockwise`, `fill_text`,
+`fill_text_with_max_width`, `set_transform`), and `finish()` returns the component. In a
+script, `ctx.hint(x, y, width, height, text)` adds a hint.
 
 What a browser's canvas has and this does not: clipping, holes in a fill (the `evenodd` rule;
 each subpath fills on its own), images, gradients, patterns, shadows, `stroke_text`,

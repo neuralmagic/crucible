@@ -45,7 +45,7 @@ impl Script {
             });
         let wasm = std::fs::read(&path)
             .map_err(|e| format!("reading the JavaScript engine {}: {e}", path.display()))?;
-        Module::load(&wasm, Limits::DEFAULT)
+        Module::engine(&wasm, Limits::DEFAULT)
             .map(Arc::new)
             .map_err(|fault| fault.to_string())
     }
@@ -340,7 +340,7 @@ mod tests {
             ..Limits::DEFAULT
         };
         let spins = loaded(
-            Arc::new(Module::load(&wasm, tight).unwrap()),
+            Arc::new(Module::engine(&wasm, tight).unwrap()),
             "export const inputs = []; export function view() { for (;;) {} }",
         );
         assert_eq!(spins.view(&Request::default()), Err(Fault::Fuel));
@@ -413,7 +413,7 @@ mod tests {
             reply_bytes: 1 << 20,
             ..Limits::DEFAULT
         };
-        let capped = loaded(Arc::new(Module::load(&wasm, small).unwrap()), source);
+        let capped = loaded(Arc::new(Module::engine(&wasm, small).unwrap()), source);
         assert_eq!(
             capped.view(&Request::default()),
             Err(Fault::Reply("over the 1048576 bytes allowed".into()))
