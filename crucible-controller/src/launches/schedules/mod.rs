@@ -17,12 +17,12 @@ pub mod cron;
 use crate::client::Db;
 use crate::clock::stamp;
 use crate::event_log::Event;
-use crate::launches::model::CursorSpec;
+use crate::launches::model::{CursorSpec, TestCursor};
 use crate::launches::standing::{
     self, Claim, Claimed, Failed, FireError, LaunchTrigger, NewStanding, Recorded, Standing,
     SweepCfg, TriggerFuture,
 };
-use crate::model::Trigger;
+use crate::model::{Status, Trigger};
 use crate::playbooks::registry::FieldError;
 use anyhow::{Context, Result};
 use cron::CronSpec;
@@ -190,16 +190,17 @@ impl ScheduleStore {
         Ok(())
     }
 
-    /// The stored cursor file of the schedule that fired `issue_key`: the pack-relative path the
-    /// run receives it at, where the pack's own `[[workspace.inject]]` picks it up, and its body.
-    /// `None` when the launch is not a firing of a file-cursor schedule with a stored value, in
-    /// which case the pack's own copy stands.
+    /// The cursor file of the schedule that fired `issue_key`: the pack-relative path the run
+    /// receives it at, where the pack's own `[[workspace.inject]]` picks it up, and its body. The
+    /// body is the schedule's stored value, or what a test firing was given in its place. `None`
+    /// when the launch is not a firing of a file-cursor schedule with a value to deliver, in which
+    /// case the pack's own copy stands.
     pub(crate) async fn cursor_file(
         &self,
         issue_key: &str,
     ) -> Result<Option<(crucible_contract::pack_tree::PackFilePath, Vec<u8>)>> {
-        let stored = sqlx::query_as::<_, (Option<String>, Option<String>)>(
-            "SELECT s.cursor_path, s.cursor_value
+        let row = sqlx::query_as::<_, (Option<String>, Option<String>, Option<serde_json::Value>)>(
+            "SELECT s.cursor_path, s.cursor_value, pl.test_cursor
              FROM playbook_launches pl
              JOIN playbook_schedules s ON s.id = pl.dedupe_schedule
              WHERE pl.key = $1 AND pl.origin = 'schedule'",
@@ -208,7 +209,16 @@ impl ScheduleStore {
         .fetch_optional(self.db.pool())
         .await
         .context("read the launch's cursor file")?;
-        let Some((Some(path), Some(value))) = stored else {
+        let Some((Some(path), stored, test)) = row else {
+            return Ok(None);
+        };
+        let value = match test {
+            Some(test) => serde_json::from_value::<TestCursor>(test)
+                .with_context(|| format!("stored test cursor of {issue_key}"))?
+                .resolve(stored),
+            None => stored,
+        };
+        let Some(value) = value else {
             return Ok(None);
         };
         let path = path
@@ -234,6 +244,50 @@ struct CursorTarget {
     cursor_from: Option<String>,
     cursor_param: Option<String>,
     cursor_path: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct StoredCursor {
+    cursor_from: Option<String>,
+    cursor_param: Option<String>,
+    cursor_path: Option<String>,
+    cursor_value: Option<String>,
+}
+
+/// The statuses a launch can still finish a run from, and so still advance a cursor from.
+const IN_FLIGHT: [Status; 5] = [
+    Status::New,
+    Status::Scoped,
+    Status::AwaitingApproval,
+    Status::Building,
+    Status::Running,
+];
+
+/// What [`ScheduleStore::fire_now`] did with a schedule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FireNow {
+    /// Due at once; the next sweep fires it.
+    Due,
+    Disabled,
+    /// Left alone: this launch may still advance the cursor, and a second firing would start
+    /// from the value it started from.
+    InFlight(String),
+    Missing,
+}
+
+/// Why a test firing did not launch.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum TestFireError {
+    #[error("no schedule {0:?}")]
+    Missing(String),
+    #[error("schedule {0:?} declares no cursor to stand in for; test-fire it with `stored`")]
+    NoCursor(String),
+    #[error("the cursor value is {bytes} bytes, over the {CURSOR_FILE_MAX_BYTES} byte cursor cap")]
+    TooLarge { bytes: usize },
+    #[error("{}", .0.message)]
+    Refused(FireError),
+    #[error(transparent)]
+    Store(#[from] anyhow::Error),
 }
 
 /// What to schedule: the authorization every firing launches with, plus when it recurs.
@@ -488,6 +542,130 @@ impl ScheduleStore {
     /// are ordinary runs and stay.
     pub(crate) async fn delete(&self, id: &str) -> Result<bool> {
         standing::delete(self.db.pool(), id).await
+    }
+
+    /// Make an enabled schedule due at `now`, so the next sweep fires it as it would a cron
+    /// window. A window already overdue keeps its own time. Refused while a launch that may
+    /// advance its cursor is in flight: the last run to finish writes the cursor, so two firings
+    /// from one value can move it backwards.
+    pub(crate) async fn fire_now(&self, id: &str, now: Timestamp) -> Result<FireNow> {
+        let mut tx = self.db.pool().begin().await.context("fire now: begin")?;
+        // The sweep mints a firing under this same row lock, so a firing it is committing is
+        // visible to the in-flight read below.
+        let enabled: Option<bool> = sqlx::query_scalar(
+            "SELECT c.enabled FROM playbook_schedules s
+             JOIN playbook_standing_launches c USING (id)
+             WHERE s.id = $1 FOR UPDATE OF s",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("fire now: lock the schedule")?;
+        match enabled {
+            None => return Ok(FireNow::Missing),
+            Some(false) => return Ok(FireNow::Disabled),
+            Some(true) => {}
+        }
+        let statuses: Vec<&str> = IN_FLIGHT.iter().map(|s| s.as_str()).collect();
+        let in_flight: Option<String> = sqlx::query_scalar(
+            "SELECT pl.key FROM playbook_launches pl JOIN issues i ON i.key = pl.key
+             WHERE pl.dedupe_schedule = $1 AND pl.advance_dedupe AND i.status = ANY($2)
+             ORDER BY pl.created_at, pl.key LIMIT 1",
+        )
+        .bind(id)
+        .bind(&statuses)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("fire now: the schedule's launches in flight")?;
+        if let Some(key) = in_flight {
+            return Ok(FireNow::InFlight(key));
+        }
+        sqlx::query(
+            "UPDATE playbook_schedules SET next_due_at = LEAST(next_due_at, $2) WHERE id = $1",
+        )
+        .bind(id)
+        .bind(stamp(now))
+        .execute(&mut *tx)
+        .await
+        .context("make the schedule due now")?;
+        tx.commit().await.context("fire now: commit")?;
+        Ok(FireNow::Due)
+    }
+
+    /// Mint one launch of schedule `id` that receives `cursor` and cannot move the schedule: not
+    /// its cursor, its due window, or its failure count. Enabled or not. Returns the launch key.
+    pub(crate) async fn test_fire(
+        &self,
+        id: &str,
+        cursor: &TestCursor,
+        actor: Option<&str>,
+        policy: Option<&crate::authz::policy::ActivePolicy>,
+        now: Timestamp,
+    ) -> Result<String, TestFireError> {
+        let mut tx = self.db.pool().begin().await.context("test fire: begin")?;
+        let stored = sqlx::query_as::<_, StoredCursor>(
+            "SELECT cursor_from, cursor_param, cursor_path, cursor_value
+             FROM playbook_schedules WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("test fire: read the schedule's cursor")?
+        .ok_or_else(|| TestFireError::Missing(id.to_string()))?;
+        let spec = CursorSpec::from_columns(
+            stored.cursor_from.as_deref(),
+            stored.cursor_param.as_deref(),
+            stored.cursor_path.as_deref(),
+        );
+        let mut claim = Claim::new(id, format!("schedule {id} test-fired"));
+        claim.dedupe_schedule = Some(id.to_string());
+        claim.subject = Some("test fire".to_string());
+        claim.actor = actor.map(str::to_string);
+        match (&spec, cursor) {
+            (None, TestCursor::Stored) => {}
+            (None, _) => return Err(TestFireError::NoCursor(id.to_string())),
+            (Some(CursorSpec::Field { param, .. }), _) => {
+                if let Some(value) = cursor.resolve(stored.cursor_value) {
+                    claim
+                        .overlay
+                        .insert(param.clone(), serde_json::Value::String(value));
+                }
+            }
+            (Some(CursorSpec::File { .. }), TestCursor::Value { value })
+                if value.len() > CURSOR_FILE_MAX_BYTES =>
+            {
+                return Err(TestFireError::TooLarge { bytes: value.len() });
+            }
+            (Some(CursorSpec::File { .. }), _) => {}
+        }
+        let fired = standing::mint(
+            &mut tx,
+            self.db.pool(),
+            Trigger::Schedule,
+            &claim,
+            now,
+            policy,
+        )
+        .await
+        .map_err(TestFireError::Refused)?;
+        let given = serde_json::to_value(cursor).context("test fire: encode the cursor")?;
+        sqlx::query(
+            "UPDATE playbook_launches SET advance_dedupe = FALSE, test_cursor = $2 WHERE key = $1",
+        )
+        .bind(&fired.key)
+        .bind(given)
+        .execute(&mut *tx)
+        .await
+        .context("test fire: mark the launch a test firing")?;
+        for event in &fired.events {
+            crate::event_log::insert(&mut *tx, &event.event()).await?;
+        }
+        tx.commit().await.context("test fire: commit")?;
+        for event in &fired.events {
+            self.db.events().publish(&event.event());
+        }
+        tracing::info!(schedule = %id, issue_key = %fired.key, "schedules: test firing launched");
+        Ok(fired.key)
     }
 
     /// Disable every mutable recurring target when the administrator restores adopted-only policy.
@@ -2248,6 +2426,403 @@ mod tests {
             Some(later.clone()),
             "an undue row is untouched"
         );
+        Ok(())
+    }
+
+    /// Firing now is a firing: the sweep launches it ahead of its window with the stored cursor,
+    /// as the schedule's own launch, and the cron window it was waiting on still stands.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_schedule_fired_now_launches_ahead_of_its_window(pool: PgPool) -> Result<()> {
+        let db = Db::new(pool.clone());
+        let store = ScheduleStore::new(db.clone());
+        register_row(&pool, "survey").await;
+        let scheduled = schedule_with_cursor(&pool, &cursor(), Some("2026-08-23T00:00:00Z")).await;
+        set_due(&pool, &scheduled.id, Some("2026-08-23T13:00:00Z")).await;
+
+        let now = ts("2026-08-23T12:20:00Z");
+        assert!(fire_due(&db, now, 8, 5).await?.is_empty(), "not due yet");
+        assert_eq!(store.fire_now(&scheduled.id, now).await?, FireNow::Due);
+        let fired = fire_due(&db, ts("2026-08-23T12:20:02Z"), 8, 5).await?;
+        assert_eq!(fired.len(), 1, "{fired:?}");
+
+        let launched =
+            crate::launches::store::list_playbook_runs(&pool, &LaunchFilter::key(&fired[0]), 10)
+                .await?;
+        assert_eq!(launched[0].origin, LaunchOrigin::Schedule);
+        assert!(launched[0].advance_dedupe);
+        assert_eq!(
+            launched[0].params,
+            serde_json::json!({
+                "topic": "attention sinks",
+                "since": "2026-08-23T00:00:00Z",
+            }),
+            "the stored cursor rides in"
+        );
+
+        store
+            .advance_cursor(&fired[0], "run-1", &scan_result("2026-08-23T12:19:00Z"))
+            .await?;
+        let row = store.get(&scheduled.id).await?.expect("row");
+        assert_eq!(row.cursor_value.as_deref(), Some("2026-08-23T12:19:00Z"));
+        assert_eq!(row.last_fired_at.as_deref(), Some("2026-08-23T12:20:02Z"));
+        assert_eq!(
+            row.next_due_at.as_deref(),
+            Some("2026-08-23T13:00:00Z"),
+            "the window it was waiting on still fires"
+        );
+        assert!(
+            events_for(&pool, &Trigger::Schedule.event_key(&scheduled.id))
+                .await
+                .iter()
+                .all(|(_, to, _)| to != "skipped"),
+            "no window was missed"
+        );
+        Ok(())
+    }
+
+    /// A disabled schedule is not made due, and neither is an id that names nothing.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn firing_now_refuses_a_disabled_or_missing_schedule(pool: PgPool) -> Result<()> {
+        let db = Db::new(pool.clone());
+        let store = ScheduleStore::new(db.clone());
+        register_row(&pool, "survey").await;
+        let disabled = schedule_due_at(&pool, "0 * * * *", None).await;
+        sqlx::query("UPDATE playbook_standing_launches SET enabled = FALSE WHERE id = $1")
+            .bind(&disabled.id)
+            .execute(&pool)
+            .await?;
+
+        let now = ts("2026-08-23T12:20:00Z");
+        assert_eq!(store.fire_now(&disabled.id, now).await?, FireNow::Disabled);
+        assert_eq!(
+            store.fire_now("no-such-schedule", now).await?,
+            FireNow::Missing
+        );
+        let row = store.get(&disabled.id).await?.expect("row");
+        assert_eq!(row.next_due_at, None);
+        assert!(fire_due(&db, now, 8, 5).await?.is_empty());
+        Ok(())
+    }
+
+    /// A window the controller is already behind on keeps its own time, so the windows it slept
+    /// through are still counted from there.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn firing_now_keeps_an_overdue_window(pool: PgPool) -> Result<()> {
+        let store = ScheduleStore::new(Db::new(pool.clone()));
+        register_row(&pool, "survey").await;
+        let scheduled = schedule_due_at(&pool, "0 * * * *", Some("2026-08-23T06:00:00Z")).await;
+
+        assert_eq!(
+            store
+                .fire_now(&scheduled.id, ts("2026-08-23T12:20:00Z"))
+                .await?,
+            FireNow::Due
+        );
+        let row = store.get(&scheduled.id).await?.expect("row");
+        assert_eq!(row.next_due_at.as_deref(), Some("2026-08-23T06:00:00Z"));
+        Ok(())
+    }
+
+    async fn set_status(pool: &PgPool, key: &str, status: Status) {
+        sqlx::query("UPDATE issues SET status = $2 WHERE key = $1")
+            .bind(key)
+            .bind(status.as_str())
+            .execute(pool)
+            .await
+            .expect("status");
+    }
+
+    async fn launch_of(pool: &PgPool, key: &str) -> crate::launches::model::PlaybookRun {
+        crate::launches::store::list_playbook_runs(pool, &LaunchFilter::key(key), 10)
+            .await
+            .expect("launches")
+            .into_iter()
+            .next()
+            .expect("launch")
+    }
+
+    /// Two firings started from one cursor value can move it backwards, so a firing whose run may
+    /// still write the cursor holds the next one off until it lands. A test firing writes
+    /// nothing and holds nothing off.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn firing_now_waits_for_a_launch_that_may_still_advance_the_cursor(
+        pool: PgPool,
+    ) -> Result<()> {
+        let db = Db::new(pool.clone());
+        let store = ScheduleStore::new(db.clone());
+        register_row(&pool, "survey").await;
+        let scheduled = schedule_with_cursor(&pool, &cursor(), Some("2026-08-23T00:00:00Z")).await;
+        let now = ts("2026-08-23T12:20:00Z");
+
+        let test = store
+            .test_fire(&scheduled.id, &TestCursor::Stored, None, None, now)
+            .await?;
+        assert_eq!(launch_of(&pool, &test).await.status, Status::New);
+        assert_eq!(store.fire_now(&scheduled.id, now).await?, FireNow::Due);
+
+        let fired = fire_due(&db, now, 8, 5).await?;
+        for status in IN_FLIGHT {
+            set_status(&pool, &fired[0], status).await;
+            assert_eq!(
+                store.fire_now(&scheduled.id, now).await?,
+                FireNow::InFlight(fired[0].clone()),
+                "{status:?}"
+            );
+        }
+        let row = store.get(&scheduled.id).await?.expect("row");
+        assert_eq!(
+            row.next_due_at.as_deref(),
+            Some("2026-08-23T13:00:00Z"),
+            "a refused firing leaves the window alone"
+        );
+
+        for status in [Status::Done, Status::PrOpen, Status::Parked] {
+            set_status(&pool, &fired[0], status).await;
+            set_due(&pool, &scheduled.id, Some("2026-08-23T13:00:00Z")).await;
+            assert_eq!(
+                store.fire_now(&scheduled.id, now).await?,
+                FireNow::Due,
+                "{status:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A test firing launches what a firing would, with the stored cursor, and leaves the schedule
+    /// exactly as it was: its cursor (even once the run finishes), its window, its last firing
+    /// and its failure count.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_test_firing_receives_the_stored_cursor_and_moves_nothing(
+        pool: PgPool,
+    ) -> Result<()> {
+        let db = Db::new(pool.clone());
+        let store = ScheduleStore::new(db.clone());
+        register_row(&pool, "survey").await;
+        let scheduled = schedule_with_cursor(&pool, &cursor(), Some("2026-08-23T00:00:00Z")).await;
+        set_due(&pool, &scheduled.id, Some("2026-08-23T13:00:00Z")).await;
+        sqlx::query("UPDATE playbook_standing_launches SET consecutive_failures = 2 WHERE id = $1")
+            .bind(&scheduled.id)
+            .execute(&pool)
+            .await?;
+        let before = store.get(&scheduled.id).await?.expect("row");
+
+        let key = store
+            .test_fire(
+                &scheduled.id,
+                &TestCursor::Stored,
+                Some("finch"),
+                None,
+                ts("2026-08-23T12:20:00Z"),
+            )
+            .await?;
+        let launched = launch_of(&pool, &key).await;
+        assert_eq!(launched.origin, LaunchOrigin::Schedule);
+        assert_eq!(launched.schedule.as_deref(), Some(scheduled.id.as_str()));
+        assert!(!launched.advance_dedupe);
+        assert_eq!(
+            launched.params,
+            serde_json::json!({
+                "topic": "attention sinks",
+                "since": "2026-08-23T00:00:00Z",
+            })
+        );
+        let events: Vec<(Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT reason, actor FROM events WHERE key = $1 ORDER BY id")
+                .bind(&key)
+                .fetch_all(&pool)
+                .await?;
+        assert_eq!(
+            events,
+            [(
+                Some(format!("schedule {} test-fired", scheduled.id)),
+                Some("finch".to_string())
+            )]
+        );
+
+        store
+            .advance_cursor(&key, "run-1", &scan_result("2026-08-23T12:19:00Z"))
+            .await?;
+        assert_eq!(
+            store.get(&scheduled.id).await?.expect("row"),
+            before,
+            "the schedule is untouched"
+        );
+        assert!(
+            fire_due(&db, ts("2026-08-23T12:20:30Z"), 8, 5)
+                .await?
+                .is_empty(),
+            "and still waits for its window"
+        );
+        Ok(())
+    }
+
+    /// A given value stands in for the stored cursor, and `none` launches as a first firing does:
+    /// without the param, so the pack's own default stands. A disabled schedule test-fires too.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_test_firing_takes_a_given_cursor_or_none(pool: PgPool) -> Result<()> {
+        let store = ScheduleStore::new(Db::new(pool.clone()));
+        register_row(&pool, "survey").await;
+        let scheduled = schedule_with_cursor(&pool, &cursor(), Some("2026-08-23T00:00:00Z")).await;
+        sqlx::query("UPDATE playbook_standing_launches SET enabled = FALSE WHERE id = $1")
+            .bind(&scheduled.id)
+            .execute(&pool)
+            .await?;
+        let now = ts("2026-08-23T12:20:00Z");
+
+        let given = TestCursor::Value {
+            value: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let key = store
+            .test_fire(&scheduled.id, &given, None, None, now)
+            .await?;
+        assert_eq!(
+            launch_of(&pool, &key).await.params,
+            serde_json::json!({"topic": "attention sinks", "since": "2026-01-01T00:00:00Z"})
+        );
+
+        let key = store
+            .test_fire(&scheduled.id, &TestCursor::None, None, None, now)
+            .await?;
+        assert_eq!(launch_of(&pool, &key).await.params, params());
+
+        let row = store.get(&scheduled.id).await?.expect("row");
+        assert_eq!(row.cursor_value.as_deref(), Some("2026-08-23T00:00:00Z"));
+        assert!(!row.enabled);
+        Ok(())
+    }
+
+    /// A file cursor's test firing receives the stored body, the given one, or nothing at the
+    /// path the schedule named, and the stored body is still what the next real firing gets.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_test_firing_of_a_file_cursor_delivers_what_it_was_given(pool: PgPool) -> Result<()> {
+        let db = Db::new(pool.clone());
+        let store = ScheduleStore::new(db.clone());
+        register_row(&pool, "survey").await;
+        let scheduled = schedule_with_cursor(&pool, &file_cursor(), Some("{\"seen\": [1]}")).await;
+        let now = ts("2026-08-23T12:20:00Z");
+        let path: crucible_contract::pack_tree::PackFilePath = "state/cursor.json".parse()?;
+
+        let stored = store
+            .test_fire(&scheduled.id, &TestCursor::Stored, None, None, now)
+            .await?;
+        assert_eq!(
+            store.cursor_file(&stored).await?,
+            Some((path.clone(), b"{\"seen\": [1]}".to_vec()))
+        );
+
+        let given = TestCursor::Value {
+            value: "{\"seen\": []}".to_string(),
+        };
+        let given = store
+            .test_fire(&scheduled.id, &given, None, None, now)
+            .await?;
+        assert_eq!(
+            store.cursor_file(&given).await?,
+            Some((path.clone(), b"{\"seen\": []}".to_vec()))
+        );
+
+        let none = store
+            .test_fire(&scheduled.id, &TestCursor::None, None, None, now)
+            .await?;
+        assert_eq!(store.cursor_file(&none).await?, None);
+
+        let real = fire_due(&db, ts("2026-08-23T12:20:30Z"), 8, 5).await?;
+        assert_eq!(
+            store.cursor_file(&real[0]).await?,
+            Some((path, b"{\"seen\": [1]}".to_vec()))
+        );
+        Ok(())
+    }
+
+    /// A cursor the schedule cannot take is refused before anything launches, and the refusal
+    /// costs the schedule nothing.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_test_firing_refuses_a_cursor_the_schedule_cannot_take(pool: PgPool) -> Result<()> {
+        let store = ScheduleStore::new(Db::new(pool.clone()));
+        register_row(&pool, "survey").await;
+        let now = ts("2026-08-23T12:20:00Z");
+        let value = |value: &str| TestCursor::Value {
+            value: value.to_string(),
+        };
+
+        assert!(matches!(
+            store
+                .test_fire("no-such-schedule", &TestCursor::Stored, None, None, now)
+                .await,
+            Err(TestFireError::Missing(_))
+        ));
+
+        let plain = schedule_due_at(&pool, "0 * * * *", Some("2026-08-23T13:00:00Z")).await;
+        for cursor in [value("x"), TestCursor::None] {
+            assert!(matches!(
+                store.test_fire(&plain.id, &cursor, None, None, now).await,
+                Err(TestFireError::NoCursor(_))
+            ));
+        }
+        store
+            .test_fire(&plain.id, &TestCursor::Stored, None, None, now)
+            .await?;
+
+        let file = schedule_with_cursor(&pool, &file_cursor(), None).await;
+        let oversize = value(&"x".repeat(CURSOR_FILE_MAX_BYTES + 1));
+        assert!(matches!(
+            store.test_fire(&file.id, &oversize, None, None, now).await,
+            Err(TestFireError::TooLarge { bytes }) if bytes == CURSOR_FILE_MAX_BYTES + 1
+        ));
+
+        let field = schedule_with_cursor(&pool, &cursor(), None).await;
+        sqlx::query(
+            "UPDATE playbook_standing_launches SET adopted_params_schema = $2::jsonb WHERE id = $1",
+        )
+        .bind(&field.id)
+        .bind(
+            r#"{"type":"object","properties":{"topic":{"type":"string"},
+                "since":{"type":"string","maxLength":4}}}"#,
+        )
+        .execute(&pool)
+        .await?;
+        let refused = store
+            .test_fire(&field.id, &value("2026-01-01T00:00:00Z"), None, None, now)
+            .await;
+        assert!(
+            matches!(
+                &refused,
+                Err(TestFireError::Refused(e)) if e.cause == standing::FailureCause::Overlay
+            ),
+            "{refused:?}"
+        );
+
+        let launched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM playbook_launches")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(launched, 1, "only the plain schedule's stored test firing");
+        let row = store.get(&field.id).await?.expect("row");
+        assert_eq!(row.consecutive_failures, 0);
+        assert!(row.enabled);
+        Ok(())
+    }
+
+    /// The row itself holds a test firing to never advancing: it cannot be flipped back.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_test_firing_cannot_be_made_to_advance(pool: PgPool) -> Result<()> {
+        let store = ScheduleStore::new(Db::new(pool.clone()));
+        register_row(&pool, "survey").await;
+        let scheduled = schedule_with_cursor(&pool, &cursor(), None).await;
+        let key = store
+            .test_fire(
+                &scheduled.id,
+                &TestCursor::Stored,
+                None,
+                None,
+                ts("2026-08-23T12:20:00Z"),
+            )
+            .await?;
+        let flipped =
+            sqlx::query("UPDATE playbook_launches SET advance_dedupe = TRUE WHERE key = $1")
+                .bind(&key)
+                .execute(&pool)
+                .await;
+        assert!(flipped.is_err(), "the check constraint refuses it");
         Ok(())
     }
 

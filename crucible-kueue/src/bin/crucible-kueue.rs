@@ -180,6 +180,14 @@ struct Cli {
         value_parser = PullSecret::parse
     )]
     pull_secrets: Vec<PullSecret>,
+    /// A StorageClass a volume claim template may name. With none, a claim names none and takes
+    /// the cluster's default class. Repeatable.
+    #[arg(
+        long = "storage-class",
+        env = "CRUCIBLE_KUEUE_STORAGE_CLASSES",
+        value_delimiter = ','
+    )]
+    storage_classes: Vec<String>,
     /// The cluster's DNS domain, for the host an exposed workload's Service is reached at.
     #[arg(
         long = "cluster-domain",
@@ -256,6 +264,7 @@ impl Cli {
             },
             namespaces: self.namespaces.clone(),
             pull_secrets: config::merge_pull_secrets(self.pull_secrets.clone()),
+            storage_classes: self.storage_classes.iter().cloned().collect(),
             cluster_domain: self.cluster_domain.clone(),
         })
     }
@@ -539,6 +548,10 @@ mod tests {
             "ml-a,ml-b",
             "--pull-secret",
             "quay-pull=quay.io/example,quay-pull=quay.io/crucible,public-only",
+            "--storage-class",
+            "gpu-local,shared",
+            "--storage-class",
+            "gpu-local",
         ])
         .unwrap();
         let c = cli.config().unwrap();
@@ -560,6 +573,10 @@ mod tests {
         );
         assert_eq!(c.hardware.resources, ["nvidia.com/gpu", "example.com/npu"]);
         assert_eq!(c.namespaces, ["ml-a", "ml-b"]);
+        assert_eq!(
+            c.storage_classes.iter().collect::<Vec<_>>(),
+            ["gpu-local", "shared"]
+        );
         assert_eq!(
             c.pull_secrets,
             [

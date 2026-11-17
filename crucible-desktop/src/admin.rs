@@ -99,6 +99,17 @@ pub enum Action {
         secret: String,
         owner: String,
     },
+    /// Fire schedule `id` now instead of at its next window.
+    FireSchedule {
+        id: String,
+        playbook: String,
+    },
+    /// Launch schedule `id` once with `cursor`, leaving the schedule as it is.
+    TestFireSchedule {
+        id: String,
+        playbook: String,
+        cursor: dto::TestCursor,
+    },
     /// Create a schedule, or replace schedule `id` whole.
     SaveSchedule {
         id: Option<String>,
@@ -239,6 +250,8 @@ pub enum Did {
     Answer,
     CreateSecret,
     MoveSecret,
+    FireSchedule,
+    TestFireSchedule,
     SaveSchedule,
     RegisterImport,
     DiscardImport,
@@ -283,6 +296,8 @@ impl Action {
             Action::Answer { .. } => Did::Answer,
             Action::CreateSecret { .. } => Did::CreateSecret,
             Action::MoveSecret { .. } => Did::MoveSecret,
+            Action::FireSchedule { .. } => Did::FireSchedule,
+            Action::TestFireSchedule { .. } => Did::TestFireSchedule,
             Action::SaveSchedule { .. } => Did::SaveSchedule,
             Action::RegisterImport { .. } => Did::RegisterImport,
             Action::DiscardImport { .. } => Did::DiscardImport,
@@ -333,6 +348,8 @@ impl Action {
                     .unwrap_or("the secret")
             ),
             Action::MoveSecret { owner, .. } => format!("Moved to {owner}"),
+            Action::FireSchedule { playbook, .. } => format!("Firing {playbook}"),
+            Action::TestFireSchedule { playbook, .. } => format!("Test-firing {playbook}"),
             Action::SaveSchedule { id: None, .. } => "Scheduled".to_string(),
             Action::SaveSchedule { id: Some(_), .. } => "Saved the schedule".to_string(),
             Action::RegisterImport { id, .. } => format!("Registered {id}"),
@@ -915,6 +932,16 @@ async fn act(c: &Connection, action: &Action, view: &mut AdminView) -> Result<()
                 .await
                 .map(drop)
         }
+        Action::FireSchedule { id, .. } => {
+            within("the firing", client.fire_schedule::<serde_json::Value>(id))
+                .await
+                .map(drop)
+        }
+        Action::TestFireSchedule { id, cursor, .. } => {
+            within("the test firing", client.test_fire_schedule(id, cursor))
+                .await
+                .map(drop)
+        }
         Action::SaveSchedule { id: None, body } => within(
             "the new schedule",
             client.create_schedule::<serde_json::Value>(body),
@@ -1204,6 +1231,8 @@ pub struct Desk {
     pub add_member: crate::teams::MemberForm,
     /// The team's next display name, while its rename form is open.
     pub rename_team: Option<TextEdit>,
+    /// The test-fire form, while open on a schedule.
+    pub test_fire: Option<TestFireForm>,
     /// The mint form on the API keys page.
     pub new_key: crate::apikeys::KeyForm,
     /// The decision requests already announced; `None` until the first queue lands.
@@ -1248,6 +1277,7 @@ impl Default for Desk {
             new_team: None,
             add_member: crate::teams::MemberForm::default(),
             rename_team: None,
+            test_fire: None,
             seen: None,
         }
     }
@@ -1314,6 +1344,54 @@ impl Desk {
         };
         self.seen = Some(ids);
         new
+    }
+}
+
+/// Which cursor a test firing is given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorFrom {
+    Stored,
+    None,
+    Value,
+}
+
+impl CursorFrom {
+    pub const ALL: [CursorFrom; 3] = [CursorFrom::Stored, CursorFrom::None, CursorFrom::Value];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CursorFrom::Stored => "Stored",
+            CursorFrom::None => "None",
+            CursorFrom::Value => "Value",
+        }
+    }
+}
+
+/// The test-fire form open on one schedule: which cursor its firing gets.
+pub struct TestFireForm {
+    pub schedule: String,
+    pub from: CursorFrom,
+    pub value: TextEdit,
+}
+
+impl TestFireForm {
+    pub fn on(schedule: &str) -> Self {
+        TestFireForm {
+            schedule: schedule.to_string(),
+            from: CursorFrom::Stored,
+            value: TextEdit::new(""),
+        }
+    }
+
+    /// The cursor to send, or `None` while a value is asked for and none is typed.
+    pub fn ask(&self) -> Option<dto::TestCursor> {
+        match self.from {
+            CursorFrom::Stored => Some(dto::TestCursor::Stored),
+            CursorFrom::None => Some(dto::TestCursor::None),
+            CursorFrom::Value => (!self.value.text.is_empty()).then(|| dto::TestCursor::Value {
+                value: self.value.text.clone(),
+            }),
+        }
     }
 }
 
@@ -1754,7 +1832,11 @@ impl crate::App {
                         self.remote.launcher = None;
                         self.page = crate::Page::Triggers;
                     }
+                    Did::TestFireSchedule => {
+                        self.remote.desk.test_fire = None;
+                    }
                     Did::Enable
+                    | Did::FireSchedule
                     | Did::Revoke
                     | Did::Unbind
                     | Did::RegisterImport
@@ -2923,6 +3005,24 @@ mod tests {
         assert_eq!(body["provider"], "vertex");
         assert_eq!(body["cursor"]["param"], "since");
         assert_eq!(body["target_kind"], "adopted");
+    }
+
+    #[test]
+    fn a_test_fire_form_sends_the_cursor_it_shows_and_waits_for_a_typed_value() {
+        let mut form = TestFireForm::on("sch-1");
+        assert_eq!(form.ask(), Some(dto::TestCursor::Stored));
+        form.from = CursorFrom::None;
+        assert_eq!(form.ask(), Some(dto::TestCursor::None));
+        form.from = CursorFrom::Value;
+        assert_eq!(form.ask(), None);
+        form.value = TextEdit::new(" {\"seen\": []}\n");
+        assert_eq!(
+            form.ask(),
+            Some(dto::TestCursor::Value {
+                value: " {\"seen\": []}\n".to_string()
+            }),
+            "a file body goes as typed"
+        );
     }
 
     #[test]

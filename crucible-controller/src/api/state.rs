@@ -336,13 +336,13 @@ impl ApiState {
             crate::daemon::autopilot_flag::AutopilotFlag::seeded(db.pool().clone(), true);
         let clusters = Arc::new(crate::runs::clusters::ClusterClients::new(None));
         let queue = WorkQueue::new();
+        let overrides = Arc::new(crate::daemon::overrides::OverrideStore::new(
+            db.pool().clone(),
+        ));
         Self {
             db,
             schedules,
-            sink: QueueOverrideSink::new(
-                Arc::new(crate::daemon::overrides::OverrideStore::new()),
-                queue.clone(),
-            ),
+            sink: QueueOverrideSink::new(overrides, queue.clone()),
             queue,
             caps: None,
             roles: crate::identity::auth::Roles::new(vec![], vec![], vec![]),

@@ -177,6 +177,62 @@ pub struct BuilderPods {
     /// Extra `buildah bud` arguments for every Dockerfile build buildah runs, after buildit's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bud_args: Option<Vec<String>>,
+    /// Where BuildKit builds keep their layers between builder pods.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer_cache: Option<LayerCache>,
+    /// How a BuildKit build compresses the layers it makes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer_compression: Option<LayerCompression>,
+}
+
+/// Where BuildKit builds keep their layers between builder pods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LayerCache {
+    /// Nowhere: every build starts from nothing.
+    Off,
+    /// In the repository builds push to, under `cache-` tags.
+    Registry,
+}
+
+impl LayerCache {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Registry => "registry",
+        }
+    }
+}
+
+impl fmt::Display for LayerCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// How a BuildKit build compresses the layers it makes, in its image and its layer cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LayerCompression {
+    Gzip,
+    Zstd,
+    Uncompressed,
+}
+
+impl LayerCompression {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Gzip => "gzip",
+            Self::Zstd => "zstd",
+            Self::Uncompressed => "uncompressed",
+        }
+    }
+}
+
+impl fmt::Display for LayerCompression {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// What builds a Dockerfile in a builder pod.
@@ -209,11 +265,11 @@ impl fmt::Display for Builder {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageDriver {
-    /// A full copy of the filesystem per layer; works wherever a user namespace does. BuildKit's
-    /// `native` snapshotter.
+    /// A full copy of the filesystem per layer; works wherever a user namespace does. BuildKit
+    /// uses its `overlayfs` snapshotter where that mounts and `native` where it does not.
     Vfs,
     /// Kernel overlayfs mounted in the builder's user namespace; each layer stored once.
-    /// BuildKit's `overlayfs` snapshotter.
+    /// BuildKit's `overlayfs` snapshotter, and a build fails where it does not mount.
     Overlay,
 }
 
@@ -248,6 +304,8 @@ impl BuilderPods {
             builder: self.builder.or(base.builder),
             storage_driver: self.storage_driver.or(base.storage_driver),
             bud_args: self.bud_args.clone().or_else(|| base.bud_args.clone()),
+            layer_cache: self.layer_cache.or(base.layer_cache),
+            layer_compression: self.layer_compression.or(base.layer_compression),
         }
     }
 }
@@ -383,6 +441,8 @@ mod tests {
             builder: Some(Builder::Buildkit),
             storage_driver: Some(StorageDriver::Overlay),
             bud_args: Some(vec!["--retry".into(), "5".into()]),
+            layer_cache: Some(LayerCache::Off),
+            layer_compression: Some(LayerCompression::Gzip),
         });
         let raw = serde_json::to_value(&pinned).unwrap();
         assert_eq!(
@@ -396,11 +456,15 @@ mod tests {
                 "builder": "buildkit",
                 "storage_driver": "overlay",
                 "bud_args": ["--retry", "5"],
+                "layer_cache": "off",
+                "layer_compression": "gzip",
             })
         );
         assert_eq!(serde_json::from_value::<BuilditSite>(raw).unwrap(), pinned);
         assert!(serde_json::from_str::<BuilderPods>(r#"{"storage_driver": "zfs"}"#).is_err());
         assert!(serde_json::from_str::<BuilderPods>(r#"{"builder": "kaniko"}"#).is_err());
+        assert!(serde_json::from_str::<BuilderPods>(r#"{"layer_cache": "s3"}"#).is_err());
+        assert!(serde_json::from_str::<BuilderPods>(r#"{"layer_compression": "lz4"}"#).is_err());
         assert!(serde_json::from_str::<BuilderPods>(r#"{"node_arch": "x86_64"}"#).is_err());
         assert!(serde_json::from_str::<BuilderPods>(r#"{"max_builds": 0}"#).is_err());
         assert!(serde_json::from_str::<BuilderPods>(r#"{"cpu": "8"}"#).is_err());
@@ -425,6 +489,8 @@ mod tests {
             builder: Some(Builder::Buildah),
             storage_driver: Some(StorageDriver::Vfs),
             bud_args: Some(vec!["--retry".into(), "5".into()]),
+            layer_cache: Some(LayerCache::Registry),
+            layer_compression: None,
         };
         let cluster = BuilderPods {
             node_arch: Some(NodeArch::Amd64),
@@ -432,6 +498,8 @@ mod tests {
             limits: Some(BTreeMap::new()),
             builder: Some(Builder::Buildkit),
             storage_driver: Some(StorageDriver::Overlay),
+            layer_cache: Some(LayerCache::Off),
+            layer_compression: Some(LayerCompression::Uncompressed),
             ..BuilderPods::default()
         };
         assert_eq!(
@@ -445,6 +513,8 @@ mod tests {
                 builder: Some(Builder::Buildkit),
                 storage_driver: Some(StorageDriver::Overlay),
                 bud_args: Some(vec!["--retry".into(), "5".into()]),
+                layer_cache: Some(LayerCache::Off),
+                layer_compression: Some(LayerCompression::Uncompressed),
             }
         );
         assert_eq!(BuilderPods::default().over(&base), base);

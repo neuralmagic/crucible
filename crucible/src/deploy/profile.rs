@@ -230,6 +230,11 @@ pub struct KueueCfg {
     /// registry (a host or host/path prefix).
     #[serde(default)]
     pub pull_secrets: Vec<String>,
+    /// The StorageClasses a workload's volume claims may name, by cluster:
+    /// `storage_classes = { east = ["fast-local"] }`. On a cluster with none, a claim names none
+    /// and takes the cluster's default class.
+    #[serde(default)]
+    pub storage_classes: BTreeMap<String, Vec<String>>,
     /// What a pod template may ask for. `strict`, the default, refuses Secrets, volume claims
     /// beyond ephemeral ones, tolerations, priority classes and resource claims; `tenant` admits
     /// them, which GPU workloads that tolerate a node taint or read a model token need.
@@ -442,8 +447,8 @@ pub struct BuilditCfg {
     #[serde(default)]
     pub queue: Option<KubeName>,
     /// Builder pods on every cluster: `node_arch`, `max_builds`, `pod_deadline_secs`, `requests`,
-    /// `limits`, `builder`, `storage_driver` and `bud_args`. Unset, they run on the loop pod's
-    /// architecture with buildit's defaults.
+    /// `limits`, `builder`, `storage_driver`, `bud_args`, `layer_cache` and `layer_compression`.
+    /// Unset, they run on the loop pod's architecture with buildit's defaults.
     #[serde(default)]
     pub builders: BuilderPods,
     /// Builder pods on one cluster, each setting replacing `builders`' there:
@@ -1248,6 +1253,12 @@ pub struct NotSharedNamespace {
     pub namespace: String,
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("kueue.storage_classes names cluster {cluster:?}, which is not one of kueue.clusters")]
+pub struct NotStorageClassCluster {
+    pub cluster: String,
+}
+
 impl DeployProfile {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
@@ -1265,6 +1276,9 @@ impl DeployProfile {
             .with_context(|| format!("validating deploy profile {}", path.display()))?;
         profile
             .check_shared_namespaces()
+            .with_context(|| format!("validating deploy profile {}", path.display()))?;
+        profile
+            .check_storage_classes()
             .with_context(|| format!("validating deploy profile {}", path.display()))?;
         profile
             .agent_servers()
@@ -1349,6 +1363,19 @@ impl DeployProfile {
             }
         }
         Ok(())
+    }
+
+    /// Refuse a `[kueue] storage_classes` entry for a cluster that is not in `clusters`.
+    pub fn check_storage_classes(&self) -> Result<(), NotStorageClassCluster> {
+        let Some(kueue) = &self.kueue else {
+            return Ok(());
+        };
+        match kueue.storage_classes.keys().find(|c| !kueue.serves(c)) {
+            Some(stray) => Err(NotStorageClassCluster {
+                cluster: stray.clone(),
+            }),
+            None => Ok(()),
+        }
     }
 
     /// The platform the profile states for `cluster`: the hub's on `[cluster]`, a spoke's on its

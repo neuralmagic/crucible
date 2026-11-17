@@ -1098,7 +1098,9 @@ fn elapsed(secs: f64) -> String {
     if secs < 60.0 {
         return format!("{secs:.1}s");
     }
-    let whole = secs as u64;
+    let whole = std::time::Duration::try_from_secs_f64(secs)
+        .unwrap_or_default()
+        .as_secs();
     let (h, m, s) = (whole / 3600, whole / 60 % 60, whole % 60);
     match h {
         0 => format!("{m}m{s:02}s"),

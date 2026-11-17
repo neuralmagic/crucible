@@ -57,6 +57,12 @@ enum Command {
     /// Recurrences: what fires when, and whether each is enabled.
     Schedules(ops::launches::Schedules),
 
+    /// Fire a schedule now instead of at its next window. Its run advances the cursor.
+    ScheduleFire(ops::launches::ScheduleFire),
+
+    /// Launch a schedule once without moving it or its cursor. Costs money against its max_cost.
+    ScheduleTestFire(ops::launches::ScheduleTestFire),
+
     /// Tracker watches: what each sweeps, and whether each is enabled.
     Watches(ops::launches::Watches),
 
@@ -442,6 +448,8 @@ pub async fn run() -> Result<()> {
         Command::Runs(op) => op.run(&c).await?,
         Command::Run(op) => op.run(&c).await?,
         Command::Schedules(op) => op.run(&c).await?,
+        Command::ScheduleFire(op) => op.run(&c).await?,
+        Command::ScheduleTestFire(op) => op.run(&c).await?,
         Command::Watches(op) => op.run(&c).await?,
         Command::Watch(op) => op.run(&c).await?,
         Command::Webhooks(op) => op.run(&c).await?,

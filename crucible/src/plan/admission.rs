@@ -621,30 +621,39 @@ mod tests {
 
         let first = command("check[round-1]");
         let second = command("check[round-2]");
-        let nap = |_: &super::Lane<'_>| {
+        let nap = |_: &crate::plan::admission::Lane<'_>| {
             std::thread::sleep(Duration::from_millis(150));
             costing(0.0)
         };
+        let rounds = Instant::now();
         assert!(admission.run(&one(&first), nap).is_ok());
+        let waited = Instant::now();
         std::thread::sleep(Duration::from_millis(300));
+        let waited = waited.elapsed().as_secs_f64();
         assert!(admission.run(&one(&second), nap).is_ok());
+        let rounds = rounds.elapsed().as_secs_f64();
         let check = clock.secs(&crate::plan::ir::TaskName("check".into()));
+        assert!(check >= 0.3, "both rounds count: {check}");
         assert!(
-            (0.29..0.45).contains(&check),
-            "a revise loop's rounds count, the wait between them does not: {check}"
+            check <= rounds - waited,
+            "the wait between a revise loop's rounds does not count: {check} of {rounds}, \
+             {waited} of it waiting"
         );
 
         let a = agent("edit[a]");
         let b = agent("edit[b]");
+        let together = Instant::now();
         let both = admission.run_all(&[one(&a), one(&b)], |_, _| {
             std::thread::sleep(Duration::from_millis(200));
             costing(0.0)
         });
+        let together = together.elapsed().as_secs_f64();
         assert!(both.iter().all(Result::is_ok));
         let edit = clock.secs(&crate::plan::ir::TaskName("edit".into()));
+        assert!(edit >= 0.2, "the node ran as long as its instances: {edit}");
         assert!(
-            (0.19..0.35).contains(&edit),
-            "instances running together count once: {edit}"
+            edit <= together,
+            "instances running together count once: {edit} of {together}"
         );
         assert_eq!(
             clock.ran(&crate::plan::ir::TaskName("editor".into())),

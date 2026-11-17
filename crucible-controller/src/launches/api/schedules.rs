@@ -3,7 +3,8 @@ use crate::dto::dto;
 
 use crate::api::state::*;
 
-use crate::launches::schedules::Schedule;
+use crate::launches::model::TestCursor;
+use crate::launches::schedules::{FireNow, Schedule, TestFireError};
 
 use crate::clock::stamp;
 use crate::launches::schedules::cron::CronSpec;
@@ -706,6 +707,188 @@ pub(crate) async fn delete_schedule(
         )
         .await;
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// Fire a schedule now instead of at its next window. The schedule is made due and the launch
+/// loop fires it as it does a cron window: the stored cursor rides in, and the run advances it.
+#[utoipa::path(
+    post,
+    path = "/api/schedules/{id}/fire",
+    params(("id" = String, Path, description = "Schedule id")),
+    responses(
+        (status = 202, description = "Due now; the launch loop fires it on its next pass", body = ScheduleDto),
+        (status = 403, description = "The active policy denies the caller this action", body = ErrorBody),
+        (status = 404, description = "No schedule with that id", body = ErrorBody),
+        (status = 409, description = "The schedule is disabled, or a launch that may still advance its cursor is in flight", body = ErrorBody)
+    )
+)]
+pub(crate) async fn fire_schedule(
+    State(state): State<ApiState>,
+    identity: crate::identity::session::Identity,
+    caller: crate::authz::Caller,
+    Path(id): Path<String>,
+) -> Response {
+    let missing = format!("no schedule {id:?}");
+    if let Err(refusal) = crate::launches::api::authorize_standing(
+        &state,
+        &caller,
+        &id,
+        crate::authz::action::Verb::Launch,
+        &missing,
+    )
+    .await
+    {
+        return refusal;
+    }
+    match state.schedules.fire_now(&id, jiff::Timestamp::now()).await {
+        Ok(FireNow::Due) => {}
+        Ok(FireNow::Missing) => return not_found(missing),
+        Ok(FireNow::Disabled) => {
+            return conflict(format!(
+                "schedule {id:?} is disabled; enable it to fire it, or test-fire it"
+            ));
+        }
+        Ok(FireNow::InFlight(key)) => {
+            return conflict(format!(
+                "schedule {id:?} still has launch {key} in flight, which may advance its cursor; \
+                 fire it once that finishes, or test-fire it"
+            ));
+        }
+        Err(e) => return ApiError::from(e).into_response(),
+    }
+    let schedule = match state.schedules.get(&id).await {
+        Ok(Some(schedule)) => schedule,
+        Ok(None) => return not_found(missing),
+        Err(e) => return ApiError::from(e).into_response(),
+    };
+    state
+        .audit(
+            crate::event_log::Event::now(
+                &format!("schedule:{id}"),
+                "waiting",
+                "due",
+                Some("fired now, ahead of its window"),
+                None,
+            )
+            .by(identity.as_deref()),
+            "fire_schedule",
+        )
+        .await;
+    state.reconcile_now.notify_one();
+    (StatusCode::ACCEPTED, Json(ScheduleDto::from(schedule))).into_response()
+}
+
+/// A test firing's request.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub(crate) struct TestFireBody {
+    /// What the firing receives as the schedule's cursor. Absent ⇒ the stored value.
+    #[serde(default)]
+    cursor: TestCursor,
+}
+
+/// The launch a test firing minted.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct TestFireAck {
+    /// The launch's issue key.
+    key: String,
+    schedule: String,
+    cursor: TestCursor,
+}
+
+/// Launch a schedule once without moving it: the firing receives the stored cursor, a value given
+/// in its place, or none, and its run never writes the cursor back. The due window and the
+/// failure count stay as they were, and a disabled schedule test-fires like an enabled one.
+#[utoipa::path(
+    post,
+    path = "/api/schedules/{id}/test-fire",
+    params(("id" = String, Path, description = "Schedule id")),
+    request_body = TestFireBody,
+    responses(
+        (status = 201, description = "Launched; the schedule is unchanged", body = TestFireAck),
+        (status = 403, description = "The active policy denies the caller this action", body = ErrorBody),
+        (status = 404, description = "No schedule with that id", body = ErrorBody),
+        (status = 409, description = "The schedule's stored authorization no longer launches", body = ErrorBody),
+        (status = 422, description = "The cursor was refused", body = ValidationErrorBody)
+    )
+)]
+pub(crate) async fn test_fire_schedule(
+    State(state): State<ApiState>,
+    identity: crate::identity::session::Identity,
+    caller: crate::authz::Caller,
+    Path(id): Path<String>,
+    Json(body): Json<TestFireBody>,
+) -> Response {
+    let _policy_operation = match state.config.as_ref() {
+        Some(store) => Some(store.recurring_policy_read().await),
+        None => None,
+    };
+    let missing = format!("no schedule {id:?}");
+    if let Err(refusal) = crate::launches::api::authorize_standing(
+        &state,
+        &caller,
+        &id,
+        crate::authz::action::Verb::Launch,
+        &missing,
+    )
+    .await
+    {
+        return refusal;
+    }
+    let schedule = match state.schedules.get(&id).await {
+        Ok(Some(schedule)) => schedule,
+        Ok(None) => return not_found(missing),
+        Err(e) => return ApiError::from(e).into_response(),
+    };
+    if schedule.target_kind == "draft_head"
+        && !state
+            .config
+            .as_ref()
+            .is_some_and(|store| store.effective().allow_draft_head_schedules)
+    {
+        return conflict("draft-head schedules are disabled by administrator policy");
+    }
+    let refused = |message: String| {
+        invalid_fields(vec![crate::playbooks::registry::FieldError {
+            field: "cursor".to_string(),
+            message,
+        }])
+    };
+    let fired = state
+        .schedules
+        .test_fire(
+            &id,
+            &body.cursor,
+            identity.as_deref(),
+            Some(&state.policy),
+            jiff::Timestamp::now(),
+        )
+        .await;
+    let key = match fired {
+        Ok(key) => key,
+        Err(TestFireError::Missing(_)) => return not_found(missing),
+        Err(e @ (TestFireError::NoCursor(_) | TestFireError::TooLarge { .. })) => {
+            return refused(e.to_string());
+        }
+        Err(TestFireError::Refused(e)) => {
+            return match e.cause {
+                crate::launches::standing::FailureCause::Overlay => refused(e.message),
+                crate::launches::standing::FailureCause::Firing => conflict(e.message),
+            };
+        }
+        Err(TestFireError::Store(e)) => return ApiError::from(e).into_response(),
+    };
+    state
+        .queue
+        .enqueue_urgent(crate::daemon::queue::IssueKey(key.clone()));
+    (
+        StatusCode::CREATED,
+        Json(TestFireAck {
+            key,
+            schedule: id,
+            cursor: body.cursor,
+        }),
+    )
+        .into_response()
 }
 
 /// What an expression fires at next, computed server-side. The launch form's schedule toggle
