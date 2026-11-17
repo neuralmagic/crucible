@@ -36,7 +36,7 @@ function FieldShell({ label, htmlFor, required = false, hint, error, children }:
           {error}
         </p>
       ) : null}
-      {hint !== undefined && <Field.Description className={HINT}>{hint}</Field.Description>}
+      {hint !== undefined && hint !== error && <Field.Description className={HINT}>{hint}</Field.Description>}
     </Field.Root>
   );
 }

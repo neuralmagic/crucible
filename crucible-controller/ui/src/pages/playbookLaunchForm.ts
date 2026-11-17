@@ -464,7 +464,7 @@ export function validateParam(
     return null;
   }
   if (re.test(trimmed)) return null;
-  return spec.description === null ? `${spec.name} must match ${spec.pattern}` : `${spec.name} isn't in the expected form`;
+  return spec.description ?? `${spec.name} must match ${spec.pattern}`;
 }
 
 export interface LaunchCeilings {

@@ -424,8 +424,8 @@ describe('validateParam', () => {
     expect(validateParam(note, '')).toBeNull();
   });
 
-  it('checks the pattern, pointing at the hint where the pack wrote one and naming the pattern where not', () => {
-    expect(validateParam(topic, 'ATTENTION')).toBe("topic isn't in the expected form");
+  it('checks the pattern, stating the hint where the pack wrote one and naming the pattern where not', () => {
+    expect(validateParam(topic, 'ATTENTION')).toBe('What the survey covers.');
     expect(validateParam(topic, 'attention kernels')).toBeNull();
     expect(validateParam(since, '2026-13')).toBe('since must match ^\\d{4}-\\d{2}-\\d{2}$');
   });
