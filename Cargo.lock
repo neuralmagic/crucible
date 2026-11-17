@@ -7106,7 +7106,7 @@ dependencies = [
 [[package]]
 name = "openshell-core"
 version = "0.0.0"
-source = "git+https://github.com/wseaton/OpenShell.git?rev=ae753f2ec44a926d62a1437acbce5c497b98ef56#ae753f2ec44a926d62a1437acbce5c497b98ef56"
+source = "git+https://github.com/wseaton/OpenShell.git?rev=a18f1bba75e997f83321213311d8c55a5df81781#a18f1bba75e997f83321213311d8c55a5df81781"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -7141,7 +7141,7 @@ dependencies = [
 [[package]]
 name = "openshell-crypto"
 version = "0.0.0"
-source = "git+https://github.com/wseaton/OpenShell.git?rev=ae753f2ec44a926d62a1437acbce5c497b98ef56#ae753f2ec44a926d62a1437acbce5c497b98ef56"
+source = "git+https://github.com/wseaton/OpenShell.git?rev=a18f1bba75e997f83321213311d8c55a5df81781#a18f1bba75e997f83321213311d8c55a5df81781"
 dependencies = [
  "aws-lc-rs",
  "jsonwebtoken 10.4.0",
@@ -7159,7 +7159,7 @@ dependencies = [
 [[package]]
 name = "openshell-extension-core"
 version = "0.0.0"
-source = "git+https://github.com/wseaton/OpenShell.git?rev=ae753f2ec44a926d62a1437acbce5c497b98ef56#ae753f2ec44a926d62a1437acbce5c497b98ef56"
+source = "git+https://github.com/wseaton/OpenShell.git?rev=a18f1bba75e997f83321213311d8c55a5df81781#a18f1bba75e997f83321213311d8c55a5df81781"
 dependencies = [
  "hyper-util",
  "serde",
@@ -7172,7 +7172,7 @@ dependencies = [
 [[package]]
 name = "openshell-policy"
 version = "0.0.0"
-source = "git+https://github.com/wseaton/OpenShell.git?rev=ae753f2ec44a926d62a1437acbce5c497b98ef56#ae753f2ec44a926d62a1437acbce5c497b98ef56"
+source = "git+https://github.com/wseaton/OpenShell.git?rev=a18f1bba75e997f83321213311d8c55a5df81781#a18f1bba75e997f83321213311d8c55a5df81781"
 dependencies = [
  "hickory-proto",
  "miette",
@@ -7186,7 +7186,7 @@ dependencies = [
 [[package]]
 name = "openshell-policy-schema"
 version = "0.0.0"
-source = "git+https://github.com/wseaton/OpenShell.git?rev=ae753f2ec44a926d62a1437acbce5c497b98ef56#ae753f2ec44a926d62a1437acbce5c497b98ef56"
+source = "git+https://github.com/wseaton/OpenShell.git?rev=a18f1bba75e997f83321213311d8c55a5df81781#a18f1bba75e997f83321213311d8c55a5df81781"
 dependencies = [
  "miette",
  "noyalib",
