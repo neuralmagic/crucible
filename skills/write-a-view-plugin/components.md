@@ -52,6 +52,14 @@ across refreshes of the same run. A section's `id` is unique in the view, like a
 ]}}
 ```
 
+`meter` is one value against a maximum, drawn as a bar in its tone under its label and both
+figures. `max` is above 0 and at most 1e15, `value` is within 1e15 of zero, and the bar is drawn
+empty at 0 or below and full at `max` or above. Put several in `columns`.
+
+```json
+{"meter": {"label": "Closable", "value": 45, "max": 64, "tone": "good"}}
+```
+
 `grid` is a small table drawn whole, for a pivot. The first column is the label and the rest
 are right-aligned. At most 600 cells, header included.
 
@@ -69,6 +77,8 @@ are right-aligned. At most 600 cells, header included.
 
 `table` holds any number of rows. The reader sorts it by a click on a column header and
 filters it with the box above it, which keeps the rows holding every word typed, in any cell.
+The button beside the box copies the rows as filtered and sorted, as CSV under a line of the
+column titles; a cell that would read as a spreadsheet formula starts with an apostrophe.
 A cell with `href` is a link (see Links), and a double click on a row opens its first link.
 
 A column's `kind` is `text`, `mono`, `badge` (a dot in the cell's tone before the text) or
@@ -81,6 +91,25 @@ shown with a unit, give the cell a `value`: `{"text": "3 min", "value": 180}` so
 any kind of column. Use it for durations, sizes, dates (as a timestamp) and percentages. Cells
 with no number sort after those with one.
 
+Rather than formatting a number by hand, build the cell with a helper that sets both its text
+and its `value`: `Cell.duration(seconds)` in a script or `Cell::duration(seconds)` in Rust, and
+likewise `bytes`, `percent` (from a fraction), `count` and `date` (from Unix seconds). Both give
+the same text:
+
+| Helper | Input | Text |
+| --- | --- | --- |
+| `duration` | `0.25`, `4.5`, `200`, `7500`, `273600` | `250 ms`, `4.5 s`, `3 min 20 s`, `2 h 5 min`, `3 d 4 h` |
+| `bytes` | `512`, `1536`, `3435973837` | `512 B`, `1.5 KiB`, `3.2 GiB` |
+| `percent` | `0.453`, `1` | `45.3%`, `100%` |
+| `count` | `1234567` | `1,234,567` |
+| `date` | `1793491200` | `2026-11-01`, in UTC |
+
+A number that is not finite or is beyond 1e15 of zero, or a date outside the years 1 to 9998,
+gives an empty cell.
+
+A cell's optional `bar`, from 0 to 1, draws a thin bar under its text in the cell's tone, as
+long as that share of the cell: use it for a column of shares or scores.
+
 A row's optional `detail` is Markdown shown in a panel under the table while that row is
 selected. Put there what does not fit a cell: the whole rationale, the evidence, links to the
 task and file it came from. Keep the cells to what a reader scans and sorts by.
@@ -92,13 +121,15 @@ task and file it came from. Keep the cells to what a reader scans and sorts by.
     {"id": "ticket", "title": "Ticket", "kind": "mono", "width": "narrow"},
     {"id": "category", "title": "Category", "kind": "badge"},
     {"id": "open", "title": "Open", "kind": "number", "width": "narrow"},
+    {"id": "cvss", "title": "CVSS", "kind": "number", "width": "narrow"},
     {"id": "why", "title": "Why", "width": "fill"}
   ],
   "rows": [
     {"id": "DEMO-101", "cells": [
       {"text": "DEMO-101", "href": "https://issues.example.com/browse/DEMO-101"},
       {"text": "affected", "tone": "bad"},
-      {"text": "57 d", "value": 57},
+      {"text": "57 d", "value": 4924800},
+      {"text": "9.1", "value": 9.1, "tone": "bad", "bar": 0.91},
       {"text": "The handler is reachable from the public listener."}
     ], "detail": "### DEMO-101\n\nThe handler is reachable from the public listener.\n\nTriaged by [triage-go](run:task/triage-go), from [its verdicts](run:file/triage-go/verdicts.json)."}
   ]
@@ -114,6 +145,7 @@ Rules the app checks:
   since the reader may unfold it.
 - `columns` hold no table.
 - An `href` is one of the addresses under Links.
+- A cell's `value` is within 1e15 of zero, and its `bar` is from 0 to 1.
 - All tables together hold at most 500,000 cells, and a row's `detail` at most 100,000 bytes.
 
 ## Text
@@ -123,6 +155,14 @@ blocks, links, and diagrams in `mermaid` fences. Images are not drawn.
 
 ```json
 {"markdown": {"text": "## Reachability\n\n- **8 affected**, 3 of them on the public listener\n- see [triage-go](run:task/triage-go)\n\n`grpc 1.64.0` is in every image."}}
+```
+
+`note` says there is nothing to show yet, or that what is shown is partial: a `headline`, an
+optional `detail` and a `tone`, drawn in a card like the pane's own notes. Return it in place of
+the body, or above a part, rather than an error, so the reader keeps the controls.
+
+```json
+{"note": {"headline": "No ticket matches.", "detail": "Lower Min CVSS or pick another lane.", "tone": "warn"}}
 ```
 
 `mermaid` is one diagram from its Mermaid source: a flowchart, a sequence, state, class or
@@ -404,8 +444,8 @@ controls, their ids unique among themselves.
 Across the whole view, at most:
 
 - 2,000 components, nested at most 8 deep;
-- 20,000 stats, bars, segments, series, plot categories, grid cells, heatmap cells and labels,
-  table columns, flow stages and links, and canvas hints;
+- 20,000 stats, meters, bars, segments, series, plot categories, grid cells, heatmap cells and
+  labels, table columns, flow stages and links, and canvas hints;
 - 50,000 points, counting plot points, histogram values, the points of each canvas path filled
   or stroked, and 4 for each `fill_rect` or `stroke_rect`;
 - 20,000 canvas commands;

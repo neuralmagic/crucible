@@ -1,5 +1,6 @@
 // What a JavaScript view plugin can use besides the language itself: a canvas that records
-// drawing commands under the browser's 2D context names. The host puts this after the
+// drawing commands under the browser's 2D context names, and `Cell`, which formats numbers
+// into table cells the way `crucible_view::Cell` does in Rust. The host puts this after the
 // plugin's source, so the plugin's line numbers stay its own, and `epilogue.js` after both.
 // A plugin can therefore use it inside its functions, not while its module is first run.
 class CanvasContext2D {
@@ -116,3 +117,70 @@ class Canvas {
     return { canvas: { width: this.width, height: this.height, commands: [...this.#commands] } };
   }
 }
+
+/** Table cells holding a number shown formatted and sorted by the number itself. */
+const Cell = (() => {
+  const MAGNITUDE = 1e15;
+  const TIME_SPAN = [-62135596800, 253370764800];
+  const within = (value) => typeof value === "number" && value >= -MAGNITUDE && value <= MAGNITUDE;
+  const round = (value) => BigInt(Math.round(value));
+  const group = (n) => String(n).replace(/\B(?=(\d{3})+$)/g, ",");
+  const tenths = (n) => (n % 10n === 0n ? group(n / 10n) : `${group(n / 10n)}.${n % 10n}`);
+  const formatted = (value, fine, text) => (fine ? { text: text(value), value } : { text: "" });
+  const signed = (value, size) => {
+    const shown = size(Math.abs(value));
+    return value < 0 && /[1-9]/.test(shown) ? `-${shown}` : shown;
+  };
+  const pair = (big, unit, small, of) =>
+    small === 0n ? `${group(big)} ${unit}` : `${group(big)} ${unit} ${small} ${of}`;
+  const durationText = (seconds) => {
+    const ms = round(seconds * 1000);
+    if (ms < 1000n) return `${ms} ms`;
+    const tenth = round(seconds * 10);
+    if (tenth < 600n) return `${tenths(tenth)} s`;
+    const whole = round(seconds);
+    if (whole < 3600n) return pair(whole / 60n, "min", whole % 60n, "s");
+    const minutes = round(seconds / 60);
+    if (minutes < 1440n) return pair(minutes / 60n, "h", minutes % 60n, "min");
+    const hours = round(seconds / 3600);
+    return pair(hours / 24n, "d", hours % 24n, "h");
+  };
+  const bytesText = (bytes) => {
+    const whole = round(bytes);
+    if (whole < 1024n) return `${group(whole)} B`;
+    let scale = 1;
+    let shown = "";
+    for (const unit of ["KiB", "MiB", "GiB", "TiB"]) {
+      scale *= 1024;
+      const tenth = round((bytes / scale) * 10);
+      shown = `${tenths(tenth)} ${unit}`;
+      if (tenth < 10240n) break;
+    }
+    return shown;
+  };
+  const dateText = (seconds) => {
+    const days = Math.floor(seconds / 86400);
+    const z = days + 719468;
+    const era = Math.floor(z / 146097);
+    const ofEra = z - era * 146097;
+    const yearOfEra = Math.floor(
+      (ofEra - Math.floor(ofEra / 1460) + Math.floor(ofEra / 36524) - Math.floor(ofEra / 146096)) / 365,
+    );
+    const ofYear = ofEra - (365 * yearOfEra + Math.floor(yearOfEra / 4) - Math.floor(yearOfEra / 100));
+    const shifted = Math.floor((5 * ofYear + 2) / 153);
+    const day = ofYear - Math.floor((153 * shifted + 2) / 5) + 1;
+    const month = shifted < 10 ? shifted + 3 : shifted - 9;
+    const year = yearOfEra + era * 400 + (month <= 2 ? 1 : 0);
+    const pad = (n, width) => String(n).padStart(width, "0");
+    return `${pad(year, 4)}-${pad(month, 2)}-${pad(day, 2)}`;
+  };
+  return Object.freeze({
+    duration: (seconds) => formatted(seconds, within(seconds), (v) => signed(v, durationText)),
+    bytes: (bytes) => formatted(bytes, within(bytes), (v) => signed(v, bytesText)),
+    percent: (fraction) =>
+      formatted(fraction, within(fraction), (v) => signed(v, (size) => `${tenths(round(size * 1000))}%`)),
+    count: (count) => formatted(count, within(count), (v) => signed(v, (size) => group(round(size)))),
+    date: (seconds) =>
+      formatted(seconds, typeof seconds === "number" && seconds >= TIME_SPAN[0] && seconds <= TIME_SPAN[1], dateText),
+  });
+})();

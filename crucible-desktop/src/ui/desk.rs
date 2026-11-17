@@ -1,6 +1,6 @@
 //! What the management pages share: their frame, read states, and the last action's outcome.
 
-use rune::{El, ScrollSpec, col, el, row, text};
+use rune::{Color, El, ScrollSpec, col, el, row, text};
 use rune_kit::{Button, ButtonVariant, Spinner};
 
 use crate::App;
@@ -366,6 +366,11 @@ pub(crate) fn now() -> i64 {
 
 /// A pane's empty or failed state: what happened, and the detail to read or copy.
 pub(crate) fn note(key: &str, headline: &str, detail: &str, p: &Paint) -> El {
+    toned_note(key, headline, detail, p.c.text_base, p)
+}
+
+/// A [`note`] whose headline is in `ink`.
+pub(crate) fn toned_note(key: &str, headline: &str, detail: &str, ink: Color, p: &Paint) -> El {
     let mut card = col()
         .key(key.to_string())
         .w_full()
@@ -377,7 +382,7 @@ pub(crate) fn note(key: &str, headline: &str, detail: &str, p: &Paint) -> El {
         .child(
             text(headline.to_string())
                 .font(p.k.ty.ui_medium)
-                .color(p.c.text_base)
+                .color(ink)
                 .wrap(),
         );
     if !detail.is_empty() {

@@ -4,15 +4,17 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crucible_view::{
     Bar, Cell, Column, ColumnKind, Context2d, Control, FlowLink, FlowNode, LineCap, Node, PlotKind,
-    Request,
-    Row, Scale, Segment, Series, Stat, Tab, TextAlign, TextBaseline, Tone, View, Width, file_link,
-    task_link,
+    Request, Row, Scale, Segment, Series, Stat, Tab, TextAlign, TextBaseline, Tone, View, Width,
+    file_link, task_link,
 };
 use serde::Deserialize;
 
 crucible_view::plugin!(inputs = ["verdicts.json"], view = report);
 
 const TICKETS: &str = "https://issues.example.com/browse/";
+
+/// The verdicts are read as of this moment, in Unix seconds: 1 Nov 2026, UTC.
+const AS_OF: f64 = 1_793_491_200.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Category {
@@ -210,6 +212,23 @@ fn report(request: Request) -> Result<View, String> {
             body: Node::Stack {
                 children: vec![
                     by_release(&tickets),
+                    Node::Columns {
+                        children: vec![
+                            meter("Closable", closable, tickets.len(), Tone::Good),
+                            meter(
+                                "Affected",
+                                count(Category::Affected),
+                                tickets.len(),
+                                Tone::Bad,
+                            ),
+                            meter(
+                                "Needs review",
+                                count(Category::NeedsReview),
+                                tickets.len(),
+                                Tone::Warn,
+                            ),
+                        ],
+                    },
                     pivot(&tickets),
                     Node::Section {
                         id: "categorised".into(),
@@ -275,6 +294,15 @@ fn stat(label: &str, value: usize, tone: Tone) -> Stat {
     Stat {
         label: label.into(),
         value: value.to_string(),
+        tone,
+    }
+}
+
+fn meter(label: &str, value: usize, of: usize, tone: Tone) -> Node {
+    Node::Meter {
+        label: label.into(),
+        value: value as f64,
+        max: of.max(1) as f64,
         tone,
     }
 }
@@ -582,18 +610,17 @@ fn pivot(tickets: &[Ticket]) -> Node {
             .iter()
             .filter(|t| category.is_none_or(|c| t.category == c))
             .filter(|t| status.is_none_or(|s| t.status == s))
-            .count()
-            .to_string()
+            .count() as f64
     };
     let line = |label: &str, tone: Tone, category: Option<Category>| {
         let mut cells = vec![
             Cell::text(label).tone(tone),
-            Cell::text(tally(category, None)),
+            Cell::count(tally(category, None)),
         ];
         cells.extend(
             statuses
                 .iter()
-                .map(|status| Cell::text(tally(category, Some(status)))),
+                .map(|status| Cell::count(tally(category, Some(status)))),
         );
         cells
     };
@@ -651,6 +678,17 @@ fn detail(ticket: &Ticket) -> String {
     )
 }
 
+/// The tone of a CVSS score: bad from 9, warn from 7.
+fn severity(score: f64) -> Tone {
+    if score >= 9.0 {
+        Tone::Bad
+    } else if score >= 7.0 {
+        Tone::Warn
+    } else {
+        Tone::Neutral
+    }
+}
+
 fn table<'a>(id: &str, tickets: impl Iterator<Item = &'a Ticket>) -> Node {
     let column = |id: &str, title: &str, kind: ColumnKind, width: Width| Column {
         id: id.into(),
@@ -673,6 +711,7 @@ fn table<'a>(id: &str, tickets: impl Iterator<Item = &'a Ticket>) -> Node {
             column("version", "Version", ColumnKind::Mono, Width::Narrow),
             column("image", "Image", ColumnKind::Mono, Width::Wide),
             column("lane", "Lane", ColumnKind::Text, Width::Narrow),
+            column("opened", "Opened", ColumnKind::Mono, Width::Narrow),
             column("why", "Why", ColumnKind::Text, Width::Fill),
         ],
         rows: tickets
@@ -690,7 +729,9 @@ fn table<'a>(id: &str, tickets: impl Iterator<Item = &'a Ticket>) -> Node {
                         Cell::text(ticket.category.label()).tone(ticket.category.tone()),
                         Cell::text(&v.confidence),
                         match &v.proposed_actions.cvss {
-                            Some(cvss) => Cell::text(format!("{:.1}", cvss.score)),
+                            Some(cvss) => Cell::text(format!("{:.1}", cvss.score))
+                                .tone(severity(cvss.score))
+                                .bar((cvss.score / 10.0).clamp(0.0, 1.0)),
                             None => Cell::text(""),
                         },
                         Cell::text(format!("{} d", ticket.age_days)).value(ticket.age_days),
@@ -700,6 +741,7 @@ fn table<'a>(id: &str, tickets: impl Iterator<Item = &'a Ticket>) -> Node {
                         Cell::text(&v.package.version),
                         Cell::text(&v.artifact.locator),
                         Cell::text(&ticket.source).link(task_link(&ticket.source)),
+                        Cell::date(AS_OF - ticket.age_days * 86_400.0),
                         Cell::text(why),
                     ],
                     detail: Some(detail(ticket)),

@@ -659,6 +659,7 @@ impl Shown {
             Node::Tabs { .. } | Node::Table { .. } => true,
             Node::Columns { .. }
             | Node::Stats { .. }
+            | Node::Meter { .. }
             | Node::Bars { .. }
             | Node::Plot { .. }
             | Node::Histogram { .. }
@@ -667,6 +668,7 @@ impl Shown {
             | Node::Canvas { .. }
             | Node::Grid { .. }
             | Node::Text { .. }
+            | Node::Note { .. }
             | Node::Markdown { .. }
             | Node::Mermaid { .. } => false,
         }
@@ -682,6 +684,7 @@ impl Shown {
             Node::Table { id, columns, rows } => Some(Table { id, columns, rows }),
             Node::Columns { .. }
             | Node::Stats { .. }
+            | Node::Meter { .. }
             | Node::Bars { .. }
             | Node::Plot { .. }
             | Node::Histogram { .. }
@@ -690,6 +693,7 @@ impl Shown {
             | Node::Canvas { .. }
             | Node::Grid { .. }
             | Node::Text { .. }
+            | Node::Note { .. }
             | Node::Markdown { .. }
             | Node::Mermaid { .. } => None,
         }
@@ -730,6 +734,53 @@ impl Shown {
             .map(|(column, dir)| (column.as_str(), *dir));
         self.order = table.and_then(|table| Order::of(table, sort, &self.filter.text));
     }
+}
+
+/// `rows` under a line of the `columns`' titles, as CSV (RFC 4180), the first `cells` cells
+/// at most. A field a spreadsheet would read as a formula starts with an apostrophe.
+pub fn csv<'a>(columns: &[Column], rows: impl Iterator<Item = &'a Row>, cells: usize) -> String {
+    let mut out = String::new();
+    let mut line = |fields: &mut dyn Iterator<Item = &str>| {
+        for (i, text) in fields.enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            field(text, &mut out);
+        }
+        out.push_str("\r\n");
+    };
+    line(&mut columns.iter().map(|column| column.title.as_str()));
+    let width = columns.len().max(1);
+    for row in rows.take(cells / width) {
+        line(&mut row.cells.iter().map(|cell| cell.text.as_str()));
+    }
+    out
+}
+
+fn field(text: &str, out: &mut String) {
+    let quoted = text.contains([',', '"', '\r', '\n']);
+    if quoted {
+        out.push('"');
+    }
+    if text.starts_with(['=', '+', '-', '@', '\t', '\r']) && !plain_number(text) {
+        out.push('\'');
+    }
+    for c in text.chars() {
+        if c == '"' {
+            out.push('"');
+        }
+        out.push(c);
+    }
+    if quoted {
+        out.push('"');
+    }
+}
+
+/// Whether `text` is a finite number in digits, a sign, a point and an exponent alone.
+fn plain_number(text: &str) -> bool {
+    text.bytes()
+        .all(|b| b.is_ascii_digit() || b"+-.eE".contains(&b))
+        && text.parse::<f64>().is_ok_and(f64::is_finite)
 }
 
 #[cfg(test)]
@@ -881,6 +932,7 @@ mod tests {
                 "tabs"
             }
             Node::Stats { .. } => "stats",
+            Node::Meter { .. } => "meter",
             Node::Bars { .. } => "bars",
             Node::Plot { .. } => "plot",
             Node::Histogram { .. } => "histogram",
@@ -890,6 +942,7 @@ mod tests {
             Node::Grid { .. } => "grid",
             Node::Table { .. } => "table",
             Node::Text { .. } => "text",
+            Node::Note { .. } => "note",
             Node::Markdown { .. } => "markdown",
             Node::Mermaid { .. } => "mermaid",
         };
@@ -941,6 +994,8 @@ mod tests {
                 "histogram",
                 "markdown",
                 "mermaid",
+                "meter",
+                "note",
                 "plot",
                 "section",
                 "stack",
@@ -1237,6 +1292,25 @@ mod tests {
         assert!(detail.contains("](run:file/triage-"), "{detail}");
         let lane = row.cells[8].href.as_deref().unwrap();
         assert!(lane.starts_with("run:task/triage-"), "{lane}");
+        let every = shown.table(view).unwrap();
+        assert_eq!(every.columns[11].id, "opened");
+        for row in every.rows {
+            let cvss: f64 = row.cells[2].text.parse().unwrap();
+            assert_eq!(row.cells[2].bar, Some(cvss / 10.0), "{}", row.id);
+            let days = row.cells[3].value.unwrap() / 86_400.0;
+            assert_eq!(row.cells[3], Cell::duration(days * 86_400.0), "{}", row.id);
+            assert_eq!(
+                row.cells[11],
+                Cell::date(1_793_491_200.0 - days * 86_400.0),
+                "{}",
+                row.id
+            );
+        }
+        let old = every.rows.iter().find(|row| row.id == "DEMO-101").unwrap();
+        assert_eq!(
+            (old.cells[3].text.as_str(), old.cells[11].text.as_str()),
+            ("57 d", "2026-09-05")
+        );
 
         let charts = tabs.iter().find(|tab| tab.label == "Charts").unwrap();
         let Node::Stack { children: charts } = &charts.body else {
@@ -1375,9 +1449,10 @@ mod tests {
         let view = reporter.report().unwrap().view.as_ref().unwrap();
         assert_eq!(
             view.body,
-            Node::Text {
-                text: "No ticket matches.".into(),
-                tone: crucible_view::Tone::Muted
+            Node::Note {
+                headline: "No ticket matches.".into(),
+                detail: "Lower Min CVSS or pick another lane.".into(),
+                tone: crucible_view::Tone::Warn
             }
         );
         assert_eq!(view.controls.len(), 2, "the controls stay to undo it");
@@ -2222,5 +2297,118 @@ mod tests {
         );
         shown.set("open", Param::Toggle(true));
         assert_eq!(shown.params(Some(&a))["lane"], Param::Select("all".into()));
+    }
+
+    fn csv_of(columns: &[&str], rows: &[&[&str]], cells: usize) -> String {
+        let columns: Vec<Column> = columns
+            .iter()
+            .map(|title| Column {
+                id: title.to_string(),
+                title: title.to_string(),
+                kind: Default::default(),
+                width: Default::default(),
+            })
+            .collect();
+        let rows: Vec<Row> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, cells)| Row {
+                id: i.to_string(),
+                cells: cells.iter().map(|text| Cell::text(*text)).collect(),
+                detail: None,
+            })
+            .collect();
+        crate::report::csv(&columns, rows.iter(), cells)
+    }
+
+    #[test]
+    fn csv_quotes_a_field_holding_a_comma_quote_or_line_break_and_doubles_its_quotes() {
+        assert_eq!(
+            csv_of(&["Ticket", "Why"], &[&["DEMO-1", "plain"]], 100),
+            "Ticket,Why\r\nDEMO-1,plain\r\n"
+        );
+        assert_eq!(
+            csv_of(
+                &["a,b", "say \"hi\""],
+                &[&["x,y", "line\nbreak"], &["cr\rhere", "\"\""]],
+                100
+            ),
+            "\"a,b\",\"say \"\"hi\"\"\"\r\n\"x,y\",\"line\nbreak\"\r\n\"cr\rhere\",\"\"\"\"\"\"\r\n"
+        );
+        assert_eq!(csv_of(&["a", "b"], &[&["", ""]], 100), "a,b\r\n,\r\n");
+        assert_eq!(csv_of(&[], &[], 100), "\r\n");
+        assert_eq!(
+            csv_of(&["ü"], &[&["naïve \u{1F600}"]], 100),
+            "ü\r\nnaïve \u{1F600}\r\n"
+        );
+    }
+
+    #[test]
+    fn csv_guards_a_field_a_spreadsheet_would_read_as_a_formula() {
+        let one = |text: &str| {
+            csv_of(&["c"], &[&[text]], 100)
+                .trim_start_matches("c\r\n")
+                .to_string()
+        };
+        for (text, written) in [
+            ("=SUM(A1:A9)", "'=SUM(A1:A9)\r\n"),
+            ("+1+1", "'+1+1\r\n"),
+            ("-1+1", "'-1+1\r\n"),
+            ("@cmd", "'@cmd\r\n"),
+            ("\t=1", "'\t=1\r\n"),
+            ("-", "'-\r\n"),
+            ("-inf", "'-inf\r\n"),
+            ("-NaN", "'-NaN\r\n"),
+            ("-1e400", "'-1e400\r\n"),
+            (
+                "=HYPERLINK(\"x\",\"y\")",
+                "\"'=HYPERLINK(\"\"x\"\",\"\"y\"\")\"\r\n",
+            ),
+            ("-3 min", "'-3 min\r\n"),
+            ("-3.5", "-3.5\r\n"),
+            ("+7", "+7\r\n"),
+            ("-1e5", "-1e5\r\n"),
+            ("-.5", "-.5\r\n"),
+            ("1=1", "1=1\r\n"),
+            (" =1", " =1\r\n"),
+            ("a@b", "a@b\r\n"),
+        ] {
+            assert_eq!(one(text), written, "{text:?}");
+        }
+        assert_eq!(
+            csv_of(&["=title"], &[], 100),
+            "'=title\r\n",
+            "a column title is guarded too"
+        );
+    }
+
+    #[test]
+    fn csv_writes_at_most_the_cells_it_is_given_room_for() {
+        let rows: Vec<&[&str]> = vec![&["1", "a"], &["2", "b"], &["3", "c"]];
+        assert_eq!(csv_of(&["n", "s"], &rows, 6).lines().count(), 4);
+        assert_eq!(csv_of(&["n", "s"], &rows, 5).lines().count(), 3);
+        assert_eq!(csv_of(&["n", "s"], &rows, 2).lines().count(), 2);
+        assert_eq!(csv_of(&["n", "s"], &rows, 1), "n,s\r\n");
+        assert_eq!(csv_of(&["n", "s"], &rows, 0), "n,s\r\n");
+        let bare: Vec<&[&str]> = vec![&[]; 3];
+        assert_eq!(csv_of(&[], &bare, 2), "\r\n\r\n\r\n");
+    }
+
+    #[test]
+    fn csv_follows_the_table_as_filtered_and_sorted() {
+        let view = View {
+            title: "T".into(),
+            body: table("t", &["item10", "item2", "other", "item1"]),
+            controls: vec![],
+        };
+        let mut shown = Shown::default();
+        let table = shown.table(&view).unwrap();
+        shown.filter = rune::TextEdit::new("item");
+        shown.sort(&table, "name", SortDir::Descending);
+        let rows = (0..shown.len(&table)).filter_map(|i| shown.row(&table, i));
+        assert_eq!(
+            crate::report::csv(table.columns, rows, 100),
+            "Name\r\nitem10\r\nitem2\r\nitem1\r\n"
+        );
     }
 }

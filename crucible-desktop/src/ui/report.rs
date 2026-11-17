@@ -90,6 +90,7 @@ fn least_width(node: &Node) -> f32 {
         Node::Canvas { width, .. } => *width,
         Node::Flow { .. } => flow::WIDTH + CARD,
         Node::Stats { .. }
+        | Node::Meter { .. }
         | Node::Bars { .. }
         | Node::Plot { .. }
         | Node::Histogram { .. }
@@ -97,6 +98,7 @@ fn least_width(node: &Node) -> f32 {
         | Node::Grid { .. }
         | Node::Table { .. }
         | Node::Text { .. }
+        | Node::Note { .. }
         | Node::Markdown { .. }
         | Node::Mermaid { .. } => 0.0,
     }
@@ -153,6 +155,12 @@ fn node(node_: &Node, fills: bool, at: &str, app: &App, p: &Paint) -> El {
         } => section(id, title, *open, body, fills, app, p),
         Node::Tabs { id, tabs } => tabs_view(id, tabs, fills, app, p),
         Node::Stats { items } => stats(items, p),
+        Node::Meter {
+            label,
+            value,
+            max,
+            tone,
+        } => meter(at, label, *value, *max, *tone, p),
         Node::Bars { bars } => plot::bars(bars, p),
         Node::Plot {
             kind,
@@ -211,6 +219,17 @@ fn node(node_: &Node, fills: bool, at: &str, app: &App, p: &Paint) -> El {
             .selectable(true)
             .selection_color(p.k.selection())
             .wrap(),
+        Node::Note {
+            headline,
+            detail,
+            tone,
+        } => desk::toned_note(
+            &format!("report-note-{at}"),
+            headline,
+            detail,
+            ink(*tone, p.k).unwrap_or(p.c.text_base),
+            p,
+        ),
         Node::Markdown { text: body } => markdown(body.clone(), "report-markdown", p),
         Node::Mermaid { source } => markdown(fenced(source), "report-mermaid", p),
     }
@@ -380,6 +399,81 @@ fn stats(items: &[Stat], p: &Paint) -> El {
     tiles
 }
 
+/// `value` of `max` as a bar, full at `max` and empty at 0 or below.
+fn meter(at: &str, label: &str, value: f64, max: f64, tone: Tone, p: &Paint) -> El {
+    let share = share(value / max);
+    col()
+        .key(format!("report-meter-{at}"))
+        .w_full()
+        .max_w(720.0)
+        .gap(6.0)
+        .child(
+            row()
+                .w_full()
+                .gap(10.0)
+                .center_y()
+                .child(
+                    text(label.to_string())
+                        .font(p.k.ty.small_medium)
+                        .color(p.c.text_muted)
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .truncate(),
+                )
+                .child(
+                    text(format!("{} / {}", axis::figure(value), axis::figure(max)))
+                        .font(p.mono(12.0, 480.0))
+                        .color(ink(tone, p.k).unwrap_or(p.c.text_base)),
+                ),
+        )
+        .child(track(share, 6.0, dot(tone, p.k), p.c.border_muted))
+}
+
+/// `fraction` from 0 to 1, and 0 when it is not a number.
+fn share(fraction: f64) -> f32 {
+    if fraction.is_nan() {
+        0.0
+    } else {
+        fraction.clamp(0.0, 1.0) as f32
+    }
+}
+
+/// A bar `tall` points high on `under`, filled in `color` for `share` of its width.
+fn track(share: f32, tall: f32, color: Color, under: Color) -> El {
+    row()
+        .w_full()
+        .h(tall)
+        .radius(tall / 2.0)
+        .fill(under)
+        .children((share > 0.0).then(|| el().grow(share).h_full().radius(tall / 2.0).fill(color)))
+        .children((share < 1.0).then(|| el().grow(1.0 - share).h_full()))
+}
+
+/// `body` over a thin bar of `cell`'s share in its tone, when it has one.
+fn with_bar(body: El, cell: &Cell, k: &Kit) -> El {
+    match cell.bar {
+        Some(bar) => col().grow(1.0).min_w(0.0).gap(3.0).child(body).child(track(
+            share(bar),
+            3.0,
+            dot(cell.tone, k),
+            k.c.border_muted,
+        )),
+        None => body,
+    }
+}
+
+/// `cell`'s text cut to its width, with the whole text on hover when cut.
+fn cut(cell: &Cell, font: rune::TextStyle, color: Color, align: Align) -> El {
+    text(cell.text.clone())
+        .font(font)
+        .color(color)
+        .align(align)
+        .truncate()
+        .w_full()
+        .min_w(0.0)
+        .help_when_truncated(cell.text.clone())
+}
+
 fn grid(columns: &[String], rows: &[Vec<Cell>], p: &Paint) -> El {
     let cell = |i: usize, body: El| {
         if i == 0 {
@@ -401,11 +495,15 @@ fn grid(columns: &[String], rows: &[Vec<Cell>], p: &Paint) -> El {
     for cells in rows {
         let mut line = row().w_full().h(28.0).px(10.0).center_y();
         for (i, value) in cells.iter().enumerate() {
+            let font = p.mono(12.0, 440.0);
+            let color = ink(value.tone, p.k).unwrap_or(p.c.text_base);
+            let align = if i == 0 { Align::Start } else { Align::End };
             line = line.child(cell(
                 i,
-                text(value.text.clone())
-                    .font(p.mono(12.0, 440.0))
-                    .color(ink(value.tone, p.k).unwrap_or(p.c.text_base)),
+                match value.bar {
+                    Some(_) => with_bar(cut(value, font, color, align), value, p.k),
+                    None => text(value.text.clone()).font(font).color(color),
+                },
             ));
         }
         lines.push(line);
@@ -487,7 +585,8 @@ fn table(columns: &[Column], app: &App, p: &Paint) -> El {
         .children(app.report_detail().map(|shown| detail(shown, p)))
 }
 
-/// The box that filters the shown table, and how many rows pass while it holds something.
+/// The box that filters the shown table, a button that copies the rows it shows, and how many
+/// rows pass while it holds something.
 fn filter(app: &App, p: &Paint) -> El {
     let edit = &app.report_shown.filter;
     let mut input = TextInput::new(edit)
@@ -504,6 +603,19 @@ fn filter(app: &App, p: &Paint) -> El {
         .gap(10.0)
         .center_y()
         .child(input.build(p.k).key("report-filter").w(280.0).min_w(0.0))
+        .child(
+            IconButton::new(&oc::COPY)
+                .variant(IconButtonVariant::GhostMuted)
+                .label("Copy as CSV")
+                .help("Copy as CSV".to_string())
+                .on_press_tx(|app: &mut App, tx: &mut Tx| {
+                    if let Some(csv) = app.report_csv() {
+                        tx.copy(csv);
+                    }
+                })
+                .build(p.k)
+                .key("report-copy-csv"),
+        )
         .children((!edit.text.trim().is_empty()).then(|| {
             text(format!("{} of {total}", app.report_rows()))
                 .key("report-filter-count")
@@ -565,7 +677,7 @@ fn drawn(cell: &Cell, kind: ColumnKind, link: Option<Color>, k: &Kit) -> rune_ki
         } else {
             k.ty.text_small
         };
-        return rune_kit::Cell::el(
+        return rune_kit::Cell::el(with_bar(
             text(cell.text.clone())
                 .font(style)
                 .color(link)
@@ -573,10 +685,12 @@ fn drawn(cell: &Cell, kind: ColumnKind, link: Option<Color>, k: &Kit) -> rune_ki
                 .label(format!("Open {url}"))
                 .help(url.clone())
                 .on_press_tx(move |app: &mut App, tx| app.follow_report_link(&url, tx)),
-        );
+            cell,
+            k,
+        ));
     }
-    match kind {
-        ColumnKind::Badge => rune_kit::Cell::el(
+    match (kind, cell.bar) {
+        (ColumnKind::Badge, _) => rune_kit::Cell::el(with_bar(
             row()
                 .gap(6.0)
                 .center_y()
@@ -586,8 +700,24 @@ fn drawn(cell: &Cell, kind: ColumnKind, link: Option<Color>, k: &Kit) -> rune_ki
                         .font(k.ty.text_small)
                         .color(k.c.text_base),
                 ),
-        ),
-        ColumnKind::Text | ColumnKind::Mono | ColumnKind::Number => {
+            cell,
+            k,
+        )),
+        (ColumnKind::Text | ColumnKind::Mono | ColumnKind::Number, Some(_)) => {
+            let font = if kind == ColumnKind::Text {
+                k.ty.text_small
+            } else {
+                k.ty.mono.features("'tnum' 1")
+            };
+            let align = if kind == ColumnKind::Number {
+                Align::End
+            } else {
+                Align::Start
+            };
+            let color = ink(cell.tone, k).unwrap_or(k.c.text_base);
+            rune_kit::Cell::el(with_bar(cut(cell, font, color, align), cell, k))
+        }
+        (ColumnKind::Text | ColumnKind::Mono | ColumnKind::Number, None) => {
             let body = rune_kit::Cell::text(cell.text.clone());
             let body = if kind == ColumnKind::Text {
                 body
@@ -606,7 +736,26 @@ fn drawn(cell: &Cell, kind: ColumnKind, link: Option<Color>, k: &Kit) -> rune_ki
 mod tests {
     use crucible_view::{Context2d, Node, Tab};
 
-    use crate::ui::report::{CARD, fenced, flow, least_width};
+    use crate::ui::report::{CARD, fenced, flow, least_width, share};
+
+    #[test]
+    fn a_share_is_clamped_to_0_and_1_and_is_0_when_not_a_number() {
+        for (fraction, drawn) in [
+            (0.0, 0.0),
+            (-0.0, 0.0),
+            (0.45, 0.45),
+            (1.0, 1.0),
+            (70.0 / 64.0, 1.0),
+            (-3.0 / 64.0, 0.0),
+            (1e15 / 5e-324, 1.0),
+            (-1e15 / 5e-324, 0.0),
+            (f64::NAN, 0.0),
+        ] {
+            let got = share(fraction);
+            assert!(got.is_finite() && (0.0..=1.0).contains(&got), "{fraction}");
+            assert_eq!(got, drawn, "{fraction}");
+        }
+    }
 
     #[test]
     fn a_column_is_as_wide_as_its_widest_canvas_or_flow() {

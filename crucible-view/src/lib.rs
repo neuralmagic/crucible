@@ -237,6 +237,16 @@ pub enum Node {
     Tabs { id: String, tabs: Vec<Tab> },
     /// A row of headline numbers.
     Stats { items: Vec<Stat> },
+    /// A labelled value against a maximum, drawn as a bar.
+    Meter {
+        label: String,
+        /// Within [`MAGNITUDE`] of zero; drawn clamped to 0 and `max`.
+        value: f64,
+        /// Above 0 and at most [`MAGNITUDE`].
+        max: f64,
+        #[serde(default)]
+        tone: Tone,
+    },
     /// Horizontal bars on one scale, each split into segments.
     Bars { bars: Vec<Bar> },
     /// Points on shared axes, joined into lines or left as marks.
@@ -301,6 +311,14 @@ pub enum Node {
     },
     Text {
         text: String,
+        #[serde(default)]
+        tone: Tone,
+    },
+    /// That there is nothing to show yet, or that what is shown is partial.
+    Note {
+        headline: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        detail: String,
         #[serde(default)]
         tone: Tone,
     },
@@ -484,6 +502,9 @@ pub struct Cell {
     pub href: Option<String>,
     #[serde(default)]
     pub tone: Tone,
+    /// A share from 0 to 1, drawn as a thin bar in the cell's tone under its text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bar: Option<f64>,
 }
 
 impl Cell {
@@ -492,6 +513,40 @@ impl Cell {
             text: text.into(),
             ..Cell::default()
         }
+    }
+
+    /// `seconds` as `250 ms`, `4.5 s`, `3 min 20 s`, `2 h 5 min` or `3 d 4 h`, sorted by the
+    /// seconds.
+    pub fn duration(seconds: f64) -> Cell {
+        formatted(seconds, within(&seconds), |value| {
+            signed(value, duration_text)
+        })
+    }
+
+    /// `bytes` as `512 B`, `1.5 KiB`, `20 MiB`, `3.2 GiB` or `1.1 TiB`, sorted by the bytes.
+    pub fn bytes(bytes: f64) -> Cell {
+        formatted(bytes, within(&bytes), |value| signed(value, bytes_text))
+    }
+
+    /// `fraction` as a percentage to a tenth, `0.453` as `45.3%`, sorted by the fraction.
+    pub fn percent(fraction: f64) -> Cell {
+        formatted(fraction, within(&fraction), |value| {
+            signed(value, |size| format!("{}%", tenths(round(size * 1000.0))))
+        })
+    }
+
+    /// `count` rounded, with thousands separators: `1,234,567`.
+    pub fn count(count: f64) -> Cell {
+        formatted(count, within(&count), |value| {
+            signed(value, |size| group(round(size)))
+        })
+    }
+
+    /// The day in UTC of `seconds` since the Unix epoch, as `2026-11-16`, sorted by the
+    /// seconds.
+    pub fn date(seconds: f64) -> Cell {
+        let dated = (TIME_SPAN[0]..=TIME_SPAN[1]).contains(&seconds);
+        formatted(seconds, dated, date_text)
     }
 
     pub fn link(mut self, href: impl Into<String>) -> Cell {
@@ -508,6 +563,125 @@ impl Cell {
         self.value = Some(value);
         self
     }
+
+    pub fn bar(mut self, fraction: f64) -> Cell {
+        self.bar = Some(fraction);
+        self
+    }
+}
+
+/// A cell showing `text` of `value` and sorted by it; an empty cell when `value` is not
+/// `fine`.
+fn formatted(value: f64, fine: bool, text: impl Fn(f64) -> String) -> Cell {
+    if !fine {
+        return Cell::default();
+    }
+    Cell {
+        text: text(value),
+        value: Some(value),
+        ..Cell::default()
+    }
+}
+
+/// `size` of `value`'s size, after a minus when `value` is negative and it shows a digit
+/// other than 0.
+fn signed(value: f64, size: impl Fn(f64) -> String) -> String {
+    let shown = size(value.abs());
+    if value < 0.0 && shown.bytes().any(|b| (b'1'..=b'9').contains(&b)) {
+        format!("-{shown}")
+    } else {
+        shown
+    }
+}
+
+/// `value`, from 0 to 2^64, to the nearest whole number, halves up.
+fn round(value: f64) -> u64 {
+    value.round() as u64
+}
+
+/// `n` with a comma between each group of three digits.
+fn group(n: u64) -> String {
+    let digits = n.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
+/// `n` tenths as a number with one decimal, left out when it is 0.
+fn tenths(n: u64) -> String {
+    match n % 10 {
+        0 => group(n / 10),
+        tenth => format!("{}.{tenth}", group(n / 10)),
+    }
+}
+
+fn duration_text(seconds: f64) -> String {
+    let ms = round(seconds * 1000.0);
+    if ms < 1000 {
+        return format!("{ms} ms");
+    }
+    let tenth = round(seconds * 10.0);
+    if tenth < 600 {
+        return format!("{} s", tenths(tenth));
+    }
+    let pair = |big: u64, unit: &str, small: u64, of: &str| match small {
+        0 => format!("{} {unit}", group(big)),
+        small => format!("{} {unit} {small} {of}", group(big)),
+    };
+    let whole = round(seconds);
+    if whole < 3600 {
+        return pair(whole / 60, "min", whole % 60, "s");
+    }
+    let minutes = round(seconds / 60.0);
+    if minutes < 1440 {
+        return pair(minutes / 60, "h", minutes % 60, "min");
+    }
+    let hours = round(seconds / 3600.0);
+    pair(hours / 24, "d", hours % 24, "h")
+}
+
+fn bytes_text(bytes: f64) -> String {
+    let whole = round(bytes);
+    if whole < 1024 {
+        return format!("{} B", group(whole));
+    }
+    let mut scale = 1.0;
+    let mut shown = String::new();
+    for unit in ["KiB", "MiB", "GiB", "TiB"] {
+        scale *= 1024.0;
+        let tenth = round(bytes / scale * 10.0);
+        shown = format!("{} {unit}", tenths(tenth));
+        if tenth < 10_240 {
+            break;
+        }
+    }
+    shown
+}
+
+/// The day of `seconds` since the Unix epoch in the proleptic Gregorian calendar, as
+/// `yyyy-mm-dd`.
+fn date_text(seconds: f64) -> String {
+    let days = (seconds / 86_400.0).floor() as i64;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let of_era = z - era * 146_097;
+    let year_of_era =
+        (of_era - of_era / 1_460 + of_era / 36_524 - of_era / 146_096).div_euclid(365);
+    let of_year = of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted = (5 * of_year + 2) / 153;
+    let day = of_year - (153 * shifted + 2) / 5 + 1;
+    let month = if shifted < 10 {
+        shifted + 3
+    } else {
+        shifted - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 /// A colour role from the host's theme.
@@ -543,8 +717,8 @@ pub struct Limits {
     pub cells: usize,
     /// Cells in one grid, its header among them.
     pub grid_cells: usize,
-    /// Stats, bars, segments, series, plot categories, grid cells, heatmap cells and labels,
-    /// table columns, flow stages and ribbons, and canvas hints across the view.
+    /// Stats, meters, bars, segments, series, plot categories, grid cells, heatmap cells and
+    /// labels, table columns, flow stages and ribbons, and canvas hints across the view.
     pub items: usize,
     /// Plot points, histogram values, and the points of every canvas path filled or stroked,
     /// across the view.
@@ -602,8 +776,8 @@ pub enum Problem {
     #[error("a grid holds more than {0} cells")]
     GridCells(usize),
     #[error(
-        "the view holds more than {0} stats, bars, segments, series, categories, grid and \
-         heatmap cells, heatmap labels, columns, stages, ribbons and canvas hints"
+        "the view holds more than {0} stats, meters, bars, segments, series, categories, grid \
+         and heatmap cells, heatmap labels, columns, stages, ribbons and canvas hints"
     )]
     Items(usize),
     #[error("a title, label, cell or address is longer than {0} bytes")]
@@ -650,6 +824,13 @@ pub enum Problem {
     Href(String),
     #[error("the cell {0} has a value that is not a number within 1e15 of zero")]
     CellValue(String),
+    #[error("the cell {0} has a bar that is not a number from 0 to 1")]
+    CellBar(String),
+    #[error(
+        "the meter {0} has a value that is not within 1e15 of zero or a max that is not above 0 \
+         and at most 1e15"
+    )]
+    Meter(String),
     #[error("the view's Markdown and diagrams hold more than {0} bytes")]
     Prose(usize),
     #[error("a row's detail is longer than {0} bytes")]
@@ -870,7 +1051,23 @@ impl Node {
                 }
                 Ok(0)
             }
+            Node::Meter {
+                label, value, max, ..
+            } => {
+                fits(label, limits)?;
+                seen.items(1, limits)?;
+                if !within(value) || !(*max > 0.0 && within(max)) {
+                    return Err(Problem::Meter(label.clone()));
+                }
+                Ok(0)
+            }
             Node::Text { text, .. } => fits(text, limits).map(|()| 0),
+            Node::Note {
+                headline, detail, ..
+            } => {
+                fits(headline, limits)?;
+                fits(detail, limits).map(|()| 0)
+            }
             Node::Markdown { text: source } | Node::Mermaid { source } => {
                 seen.prose = seen.prose.saturating_add(source.len());
                 if seen.prose > limits.prose {
@@ -1112,6 +1309,9 @@ fn cells_fit(cells: &[Cell], limits: &Limits) -> Result<(), Problem> {
         fits(&cell.text, limits)?;
         if cell.value.is_some_and(|value| !within(&value)) {
             return Err(Problem::CellValue(cell.text.clone()));
+        }
+        if cell.bar.is_some_and(|bar| !(0.0..=1.0).contains(&bar)) {
+            return Err(Problem::CellBar(cell.text.clone()));
         }
         if let Some(href) = &cell.href {
             fits(href, limits)?;
@@ -2367,6 +2567,287 @@ mod tests {
                 off,
                 "{min} {max} {step} {value}"
             );
+        }
+    }
+
+    fn meter(value: f64, max: f64) -> View {
+        view(Node::Meter {
+            label: "Closable".into(),
+            value,
+            max,
+            tone: Tone::Good,
+        })
+    }
+
+    #[test]
+    fn a_meter_reads_back_as_written_and_takes_a_bounded_value_below_a_positive_max() {
+        let json = r#"{"meter":{"label":"Closable","value":45,"max":64,"tone":"good"}}"#;
+        let read: Node = serde_json::from_str(json).unwrap();
+        assert_eq!(read, meter(45.0, 64.0).body);
+        assert_eq!(
+            serde_json::to_string(&read).unwrap(),
+            r#"{"meter":{"label":"Closable","value":45.0,"max":64.0,"tone":"good"}}"#
+        );
+        let bare: Node =
+            serde_json::from_str(r#"{"meter":{"label":"a","value":1,"max":2}}"#).unwrap();
+        assert!(matches!(
+            bare,
+            Node::Meter {
+                tone: Tone::Neutral,
+                ..
+            }
+        ));
+        for off in [
+            r#"{"meter":{"label":"a","value":1}}"#,
+            r#"{"meter":{"label":"a","max":1}}"#,
+            r#"{"meter":{"value":1,"max":1}}"#,
+            r#"{"meter":{"label":"a","value":null,"max":1}}"#,
+            r#"{"meter":{"label":"a","value":1,"max":1,"min":0}}"#,
+        ] {
+            assert!(serde_json::from_str::<Node>(off).is_err(), "{off}");
+        }
+        for (value, max) in [
+            (45.0, 64.0),
+            (0.0, 1.0),
+            (-1e15, 1e15),
+            (1e15, 5e-324),
+            (70.0, 64.0),
+            (-3.0, 64.0),
+        ] {
+            assert_eq!(
+                meter(value, max).check(&Limits::DEFAULT),
+                Ok(()),
+                "{value} {max}"
+            );
+        }
+        for (value, max) in [
+            (1.0, 0.0),
+            (1.0, -0.0),
+            (1.0, -1.0),
+            (1.0, 1.1e15),
+            (1.0, f64::NAN),
+            (1.0, f64::INFINITY),
+            (f64::NAN, 1.0),
+            (f64::INFINITY, 1.0),
+            (f64::NEG_INFINITY, 1.0),
+            (1.1e15, 2e15),
+            (-1.1e15, 1.0),
+        ] {
+            assert_eq!(
+                meter(value, max).check(&Limits::DEFAULT),
+                Err(Problem::Meter("Closable".into())),
+                "{value} {max}"
+            );
+        }
+        assert_eq!(
+            Problem::Meter("x".into()).to_string(),
+            "the meter x has a value that is not within 1e15 of zero or a max that is not above \
+             0 and at most 1e15"
+        );
+    }
+
+    #[test]
+    fn meters_count_as_items_and_their_labels_are_bounded() {
+        let meters = |count: usize| {
+            view(Node::Columns {
+                children: vec![meter(1.0, 2.0).body; count],
+            })
+        };
+        assert_eq!(meters(1).check(&TIGHT), Ok(()));
+        let six = Node::Stack {
+            children: vec![
+                Node::Stats {
+                    items: vec![
+                        Stat {
+                            label: "a".into(),
+                            value: "1".into(),
+                            tone: Tone::Neutral,
+                        };
+                        5
+                    ],
+                },
+                meter(1.0, 2.0).body,
+            ],
+        };
+        assert_eq!(view(six.clone()).check(&TIGHT), Ok(()));
+        let Node::Stack { mut children } = six else {
+            panic!("a stack");
+        };
+        children.push(meter(1.0, 2.0).body);
+        let limits = Limits { nodes: 4, ..TIGHT };
+        assert_eq!(
+            view(Node::Stack { children }).check(&limits),
+            Err(Problem::Items(6))
+        );
+        let long = view(Node::Meter {
+            label: "x".repeat(9),
+            value: 1.0,
+            max: 2.0,
+            tone: Tone::Neutral,
+        });
+        assert_eq!(long.check(&TIGHT), Err(Problem::Text(8)));
+    }
+
+    fn note(headline: &str, detail: &str) -> Node {
+        Node::Note {
+            headline: headline.into(),
+            detail: detail.into(),
+            tone: Tone::Warn,
+        }
+    }
+
+    #[test]
+    fn a_note_reads_back_as_written_leaves_out_an_empty_detail_and_is_bounded() {
+        let json =
+            r#"{"note":{"headline":"Partial","detail":"go is still running","tone":"warn"}}"#;
+        let read: Node = serde_json::from_str(json).unwrap();
+        assert_eq!(read, note("Partial", "go is still running"));
+        assert_eq!(serde_json::to_string(&read).unwrap(), json);
+        let bare: Node = serde_json::from_str(r#"{"note":{"headline":"Nothing yet"}}"#).unwrap();
+        assert_eq!(
+            bare,
+            Node::Note {
+                headline: "Nothing yet".into(),
+                detail: String::new(),
+                tone: Tone::Neutral,
+            }
+        );
+        assert_eq!(
+            serde_json::to_string(&bare).unwrap(),
+            r#"{"note":{"headline":"Nothing yet","tone":"neutral"}}"#
+        );
+        for off in [
+            r#"{"note":{}}"#,
+            r#"{"note":{"detail":"x"}}"#,
+            r#"{"note":{"headline":"x","title":"y"}}"#,
+            r#"{"note":{"headline":"x","tone":"loud"}}"#,
+        ] {
+            assert!(serde_json::from_str::<Node>(off).is_err(), "{off}");
+        }
+        assert_eq!(view(note("", "")).check(&TIGHT), Ok(()));
+        assert_eq!(
+            view(note(&"x".repeat(8), &"y".repeat(8))).check(&TIGHT),
+            Ok(())
+        );
+        assert_eq!(
+            view(note(&"x".repeat(9), "")).check(&TIGHT),
+            Err(Problem::Text(8))
+        );
+        assert_eq!(
+            view(note("x", &"y".repeat(9))).check(&TIGHT),
+            Err(Problem::Text(8))
+        );
+    }
+
+    #[test]
+    fn a_cell_s_bar_is_a_share_from_0_to_1_and_is_left_out_when_absent() {
+        let barred = |bar: f64| {
+            table(
+                "t",
+                vec![Row {
+                    id: "1".into(),
+                    cells: vec![Cell::text("45%").bar(bar), Cell::text("y")],
+                    detail: None,
+                }],
+            )
+        };
+        for fine in [0.0, -0.0, 0.45, 1.0, 5e-324] {
+            assert_eq!(view(barred(fine)).check(&Limits::DEFAULT), Ok(()), "{fine}");
+        }
+        for off in [
+            -5e-324,
+            -1.0,
+            1.0000000000000002,
+            2.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            assert_eq!(
+                view(barred(off)).check(&Limits::DEFAULT),
+                Err(Problem::CellBar("45%".into())),
+                "{off}"
+            );
+        }
+        let grid = Node::Grid {
+            columns: vec!["a".into()],
+            rows: vec![vec![Cell::text("x").bar(1.5)]],
+        };
+        assert_eq!(
+            view(grid).check(&Limits::DEFAULT),
+            Err(Problem::CellBar("x".into()))
+        );
+        assert_eq!(
+            serde_json::to_string(&Cell::text("45%").tone(Tone::Good).bar(0.45)).unwrap(),
+            r#"{"text":"45%","tone":"good","bar":0.45}"#
+        );
+        let read: Cell = serde_json::from_str(r#"{"text":"x","bar":1}"#).unwrap();
+        assert_eq!(read.bar, Some(1.0));
+        assert_eq!(
+            serde_json::from_str::<Cell>(r#"{"text":"x"}"#).unwrap().bar,
+            None
+        );
+        assert!(serde_json::from_str::<Cell>(r#"{"text":"x","bar":"half"}"#).is_err());
+    }
+
+    /// Each formatting constructor, an input, and the text it shows: the cases the JavaScript
+    /// prelude's `Cell` is held to as well.
+    const FORMATTED: &str = include_str!("../js/formatted.json");
+
+    fn formatted(helper: &str, input: f64) -> Cell {
+        match helper {
+            "duration" => Cell::duration(input),
+            "bytes" => Cell::bytes(input),
+            "percent" => Cell::percent(input),
+            "count" => Cell::count(input),
+            "date" => Cell::date(input),
+            other => panic!("no helper {other}"),
+        }
+    }
+
+    #[test]
+    fn a_formatted_cell_shows_its_text_and_sorts_by_its_input() {
+        let cases: Vec<(String, f64, String)> = serde_json::from_str(FORMATTED).unwrap();
+        assert!(cases.len() > 60, "{}", cases.len());
+        for (helper, input, text) in cases {
+            let cell = formatted(&helper, input);
+            assert_eq!(cell.text, text, "{helper}({input})");
+            assert_eq!(cell.value, Some(input), "{helper}({input})");
+            assert_eq!(
+                (cell.href, cell.tone, cell.bar),
+                (None, Tone::Neutral, None)
+            );
+        }
+    }
+
+    #[test]
+    fn a_formatted_cell_of_a_number_out_of_bounds_is_empty() {
+        for helper in ["duration", "bytes", "percent", "count", "date"] {
+            for off in [
+                f64::NAN,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                1.1e15,
+                -1.1e15,
+                f64::MAX,
+            ] {
+                assert_eq!(formatted(helper, off), Cell::default(), "{helper}({off})");
+            }
+            for edge in [1e15, -1e15] {
+                if helper == "date" {
+                    continue;
+                }
+                let cell = formatted(helper, edge);
+                assert!(!cell.text.is_empty(), "{helper}({edge})");
+                let shown = view(Node::Grid {
+                    columns: vec!["a".into()],
+                    rows: vec![vec![cell]],
+                });
+                assert_eq!(shown.check(&Limits::DEFAULT), Ok(()), "{helper}({edge})");
+            }
+        }
+        for off in [TIME_SPAN[0] - 1.0, TIME_SPAN[1] + 1.0] {
+            assert_eq!(Cell::date(off), Cell::default(), "{off}");
         }
     }
 

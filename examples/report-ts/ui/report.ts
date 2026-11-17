@@ -248,14 +248,19 @@ function table(id: string, tickets: Ticket[]): ViewNode {
         { id: "lane", title: "Lane", width: "narrow" },
         { id: "cve", title: "CVE", kind: "mono", width: "medium" },
         { id: "status", title: "Jira", width: "narrow" },
+        { id: "opened", title: "Opened", kind: "mono", width: "narrow" },
       ],
       rows: tickets.map((t) => ({
         id: t.key,
         cells: [
           { text: t.key },
           { text: labelOf(t.action), tone: toneOf(t.action) },
-          { text: t.cvss.toFixed(1), tone: t.cvss >= 9 ? "bad" : t.cvss >= 7 ? "warn" : "neutral" },
-          { text: `${t.age} d`, value: t.age },
+          {
+            text: t.cvss.toFixed(1),
+            tone: t.cvss >= 9 ? "bad" : t.cvss >= 7 ? "warn" : "neutral",
+            bar: Math.min(1, Math.max(0, t.cvss / 10)),
+          },
+          Cell.duration(t.age * 86400),
           { text: t.confidence, tone: t.confidence === "high" ? "good" : t.confidence === "low" ? "bad" : "warn" },
           { text: t.why },
           { text: t.pkg },
@@ -263,6 +268,7 @@ function table(id: string, tickets: Ticket[]): ViewNode {
           { text: t.lane, href: `run:task/${t.task}` },
           { text: t.cve },
           { text: t.status },
+          Cell.date(AS_OF - t.age * 86400),
         ],
         detail: detail(t),
       })),
@@ -361,8 +367,11 @@ export function view({ files, params }: ViewRequest): View {
   ];
   const tickets = every.filter((t) => (lane === "all" || t.lane === lane) && t.cvss >= minCvss);
   if (tickets.length === 0) {
-    const why = every.length === 0 ? "No verdicts were captured." : "No ticket matches.";
-    return { title: "Triage", body: { text: { text: why, tone: "muted" } }, controls };
+    const note: ViewNode =
+      every.length === 0
+        ? { note: { headline: "No verdicts were captured." } }
+        : { note: { headline: "No ticket matches.", detail: "Lower Min CVSS or pick another lane.", tone: "warn" } };
+    return { title: "Triage", body: note, controls };
   }
   const of = (action: Action) => tickets.filter((t) => t.action === action);
   const [fix, decide, spot, close] = [of("fix"), of("decide"), of("spot"), of("close")];

@@ -923,9 +923,58 @@ mod tests {
         ] {
             assert!(detail.contains(part), "{part} in {detail}");
         }
-        let [_, _, Node::Section { id, open, body, .. }] = summary.as_slice() else {
-            panic!("Summary ends with how a ticket is categorised");
+        let [
+            _,
+            Node::Columns { children: meters },
+            Node::Grid { rows: pivot, .. },
+            Node::Section { id, open, body, .. },
+        ] = summary.as_slice()
+        else {
+            panic!("Summary is its bars, meters, pivot and how a ticket is categorised");
         };
+        let meters: Vec<(&str, f64, f64, crucible_view::Tone)> = meters
+            .iter()
+            .map(|meter| match meter {
+                Node::Meter {
+                    label,
+                    value,
+                    max,
+                    tone,
+                } => (label.as_str(), *value, *max, *tone),
+                other => panic!("{other:?} is not a meter"),
+            })
+            .collect();
+        assert_eq!(
+            meters,
+            [
+                ("Closable", 45.0, 64.0, crucible_view::Tone::Good),
+                ("Affected", 8.0, 64.0, crucible_view::Tone::Bad),
+                ("Needs review", 11.0, 64.0, crucible_view::Tone::Warn),
+            ]
+        );
+        let total = pivot.last().unwrap();
+        assert_eq!(
+            (total[1].text.as_str(), total[1].value),
+            ("64", Some(64.0)),
+            "the pivot's counts sort as numbers"
+        );
+        let cvss = rows
+            .iter()
+            .filter_map(|row| Some((row.cells[4].text.parse::<f64>().ok()?, &row.cells[4])))
+            .collect::<Vec<_>>();
+        assert!(!cvss.is_empty());
+        for (score, cell) in &cvss {
+            assert_eq!(cell.bar, Some(score / 10.0), "{score}");
+        }
+        assert!(
+            cvss.iter()
+                .any(|(score, cell)| *score >= 9.0 && cell.tone == crucible_view::Tone::Bad)
+        );
+        assert_eq!(columns[12].id, "opened");
+        assert_eq!(
+            (row.cells[12].text.as_str(), row.cells[12].value),
+            ("2026-09-05", Some(1_793_491_200.0 - 57.0 * 86_400.0))
+        );
         assert_eq!((id.as_str(), *open), ("categorised", false));
         let Node::Mermaid { source } = body.as_ref() else {
             panic!("the folded section is a diagram");

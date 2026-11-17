@@ -537,6 +537,18 @@ impl App {
             .map_or(0, |table| self.report_shown.len(&table))
     }
 
+    /// The shown report table as filtered and sorted, as CSV.
+    pub fn report_csv(&self) -> Option<String> {
+        let table = self.report_table()?;
+        let rows =
+            (0..self.report_shown.len(&table)).filter_map(|i| self.report_shown.row(&table, i));
+        Some(report::csv(
+            table.columns,
+            rows,
+            crucible_view::Limits::DEFAULT.cells,
+        ))
+    }
+
     pub fn sort_report(&mut self, column: &str, dir: rune_kit::SortDir) {
         let report = self.shown_report().cloned();
         let view = report.as_ref().and_then(|report| report.view.as_ref().ok());

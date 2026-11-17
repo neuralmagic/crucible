@@ -61,7 +61,26 @@ interface ViewCell {
    */
   href?: string;
   tone?: Tone;
+  /** A share from 0 to 1, drawn as a thin bar in the cell's tone under its text. */
+  bar?: number;
 }
+
+/**
+ * Cells showing a number formatted and sorted by the number, the same as `crucible_view::Cell`
+ * in Rust. A number that is not finite, or beyond 1e15 of zero, gives an empty cell.
+ */
+declare const Cell: {
+  /** `250 ms`, `4.5 s`, `3 min 20 s`, `2 h 5 min` or `3 d 4 h`. */
+  duration(seconds: number): ViewCell;
+  /** `512 B`, `1.5 KiB`, `20 MiB`, `3.2 GiB` or `1.1 TiB`. */
+  bytes(bytes: number): ViewCell;
+  /** A fraction as a percentage to a tenth: `0.453` is `45.3%`. */
+  percent(fraction: number): ViewCell;
+  /** Rounded, with thousands separators: `1,234,567`. */
+  count(count: number): ViewCell;
+  /** The day in UTC as `2026-11-16`, for Unix seconds in the years 1 to 9998. */
+  date(seconds: number): ViewCell;
+};
 
 /** One component: an object with one key, its name. */
 type ViewNode =
@@ -76,6 +95,10 @@ type ViewNode =
     }
   | { tabs: { id: string; tabs: { label: string; count?: number; body: ViewNode }[] } }
   | { stats: { items: { label: string; value: string; tone?: Tone }[] } }
+  | {
+      /** `value` against `max` as a bar, drawn clamped; `max` above 0, both within 1e15 of zero. */
+      meter: { label: string; value: number; max: number; tone?: Tone };
+    }
   | { bars: { bars: { label: string; segments: { label: string; value: number; tone?: Tone }[] }[] } }
   | {
       plot: {
@@ -122,6 +145,10 @@ type ViewNode =
       };
     }
   | { text: { text: string; tone?: Tone } }
+  | {
+      /** That there is nothing to show yet, or that what is shown is partial. */
+      note: { headline: string; detail?: string; tone?: Tone };
+    }
   | {
       /** Markdown. A link takes the addresses a cell's `href` does; a `mermaid` fence is drawn. */
       markdown: { text: string };

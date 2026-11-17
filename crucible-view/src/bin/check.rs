@@ -33,6 +33,7 @@ fn count(node: &Node, counts: &mut BTreeMap<&'static str, usize>) {
             "tabs"
         }
         Node::Stats { .. } => "stats",
+        Node::Meter { .. } => "meter",
         Node::Bars { .. } => "bars",
         Node::Plot { .. } => "plot",
         Node::Histogram { .. } => "histogram",
@@ -42,6 +43,7 @@ fn count(node: &Node, counts: &mut BTreeMap<&'static str, usize>) {
         Node::Grid { .. } => "grid",
         Node::Table { .. } => "table",
         Node::Text { .. } => "text",
+        Node::Note { .. } => "note",
         Node::Markdown { .. } => "markdown",
         Node::Mermaid { .. } => "mermaid",
     };

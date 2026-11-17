@@ -39,8 +39,9 @@ smaller, faster plugin and is worth it for a view that shapes a lot of data.
    fan-out or a set of lanes arrives as several files to merge. Decide the row (one per ticket,
    per finding, per benchmark), dedupe, sort, count. Keep that logic here, not in a script
    someone runs after the run.
-3. **Choose components.** Read `components.md`. Headline numbers are `stats`, a pivot is a
-   `grid`, the rows are a `table`, a category split is `bars`, an ordered x axis is a `line`
+3. **Choose components.** Read `components.md`. Headline numbers are `stats`, a part of a
+   whole is a `meter`, a pivot is a `grid`, the rows are a `table`, a category split is
+   `bars`, an ordered x axis is a `line`
    plot (on a `time` axis for dates, with `categories` for named steps), two measures are a
    `scatter` plot, one measure's spread is a `histogram`, and a count by two categories is a
    `heatmap`. Put alternatives in `tabs`, charts that read
@@ -48,7 +49,8 @@ smaller, faster plugin and is worth it for a view that shapes a lot of data.
    `markdown`, a process or structure is a `mermaid` diagram, and what explains one row is
    that row's `detail`. Link a row to the task and file it came from. Use `canvas` only when nothing else
    can draw it. When the reader should pick the slice (a lane, a threshold), declare
-   `controls` and read `params` instead of building a tab per slice.
+   `controls` and read `params` instead of building a tab per slice. When there is nothing to
+   show yet, or only part of it, say so in a `note` rather than returning an error.
 4. **Build.** See below.
 5. **Look at it.** Run the pack, open the Report pane, and read every tab. See "Checking".
 6. **Stop** when the view draws from a real run's files and says what was asked.
@@ -85,6 +87,10 @@ export function view({ files }: ViewRequest): View {
   `getContext("2d")`, then `fillStyle`, `fillRect`, `beginPath`, `arc`, `fillText` and the rest
   under their usual names. `canvas.node()` is the component. `components.md` says what is
   missing. Use `Canvas` inside `view`, not at the top of the module.
+- `Cell.duration`, `Cell.bytes`, `Cell.percent`, `Cell.count` and `Cell.date` turn a number into
+  a table cell that shows it formatted and sorts by the number, as `Cell::duration` and the rest
+  do in Rust. Like `Canvas`, use them inside `view`, and do not name anything of yours `Cell`
+  or `Canvas` at the top of the module.
 - There is no `fetch`, `require`, `process`, DOM or timer. `console.log` is kept only to show
   beside an error.
 - A thrown error is shown in the pane with its stack, and the line numbers are your file's.

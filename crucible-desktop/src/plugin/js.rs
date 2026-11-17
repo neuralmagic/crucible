@@ -10,7 +10,7 @@ use wasmi::{Engine, Module};
 
 use crate::plugin::{Fault, Limits, asked_for, fault, module, said, start};
 
-/// What the host puts after a script: the canvas it can draw with.
+/// What the host puts after a script: the canvas it can draw with and the `Cell` helpers.
 const PRELUDE: &str = include_str!("../../../crucible-view/js/prelude.js");
 /// What the host puts last: reading what is asked and writing the answer.
 const EPILOGUE: &str = include_str!("../../../crucible-view/js/epilogue.js");
@@ -420,6 +420,58 @@ mod tests {
             capped.view(&Request::default()),
             Err(Fault::Reply("over the 1048576 bytes allowed".into()))
         );
+    }
+
+    #[test]
+    #[ignore = "needs assets/js-engine/plugin.wasm from `just desktop-js-engine`"]
+    fn a_script_s_formatted_cells_match_the_rust_constructors() {
+        use crucible_view::Cell;
+        let cases = include_str!("../../../crucible-view/js/formatted.json");
+        let script = Script::new(
+            engine(),
+            &format!(
+                r#"export const inputs = [];
+                   const CASES = {cases};
+                   const OFF = [NaN, Infinity, -Infinity, 1.1e15, -1.1e15, Number.MAX_VALUE, "5", undefined, null];
+                   export function view() {{
+                       const rows = CASES.map(([helper, input], i) => ({{
+                           id: `case-${{i}}`, cells: [Cell[helper](input)] }}));
+                       for (const helper of ["duration", "bytes", "percent", "count", "date"]) {{
+                           OFF.forEach((input, i) => rows.push({{
+                               id: `off-${{helper}}-${{i}}`, cells: [Cell[helper](input)] }}));
+                       }}
+                       rows.push({{ id: "date-before", cells: [Cell.date(-62135596801)] }});
+                       rows.push({{ id: "date-after", cells: [Cell.date(253370764801)] }});
+                       return {{ title: typeof Cell + Object.isFrozen(Cell), body: {{ table: {{
+                           id: "t", columns: [{{ id: "c", title: "C" }}], rows }} }} }};
+                   }}"#
+            ),
+        );
+        let view = script.view(&Request::default()).unwrap();
+        assert_eq!(view.title, "objecttrue");
+        let Node::Table { rows, .. } = &view.body else {
+            panic!("the view is a table");
+        };
+        let cases: Vec<(String, f64, String)> = serde_json::from_str(cases).unwrap();
+        let rust = |helper: &str, input: f64| match helper {
+            "duration" => Cell::duration(input),
+            "bytes" => Cell::bytes(input),
+            "percent" => Cell::percent(input),
+            "count" => Cell::count(input),
+            "date" => Cell::date(input),
+            other => panic!("no helper {other}"),
+        };
+        for (i, (helper, input, text)) in cases.iter().enumerate() {
+            let row = &rows[i];
+            assert_eq!(row.id, format!("case-{i}"));
+            assert_eq!(row.cells[0].text, *text, "{helper}({input}) in JavaScript");
+            assert_eq!(row.cells[0], rust(helper, *input), "{helper}({input})");
+        }
+        let off = &rows[cases.len()..];
+        assert_eq!(off.len(), 5 * 9 + 2);
+        for row in off {
+            assert_eq!(row.cells[0], Cell::default(), "{}", row.id);
+        }
     }
 
     #[test]
