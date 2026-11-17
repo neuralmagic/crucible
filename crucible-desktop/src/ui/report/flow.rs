@@ -203,6 +203,7 @@ pub(crate) fn drawing(
                     at.x + BAR + 8.0
                 },
                 y: at.top + at.height / 2.0 + 4.0,
+                max_width: Some(GUTTER - 8.0),
             },
         ]);
     }

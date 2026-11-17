@@ -236,6 +236,76 @@ mod tests {
 
     #[test]
     #[ignore = "needs assets/js-engine/plugin.wasm from `just desktop-js-engine`"]
+    fn the_canvas_records_transforms_baselines_widths_and_hints_under_the_browser_s_names() {
+        let script = Script::new(
+            engine(),
+            r#"
+            export const inputs = [];
+            export function view() {
+                const canvas = new Canvas(100, 50);
+                const ctx = canvas.getContext("2d");
+                ctx.save();
+                ctx.translate(10, 20);
+                ctx.scale(2, 3);
+                ctx.rotate(0.5);
+                ctx.transform(1, 0, 0, 1, 4, 5);
+                ctx.setTransform(1, 0, 0, 1, 6, 7);
+                ctx.setTransform();
+                ctx.resetTransform();
+                ctx.textBaseline = "hanging";
+                const hanging = ctx.textBaseline;
+                ctx.textBaseline = "ideographic";
+                ctx.restore();
+                ctx.fillText("plain", 1, 2);
+                ctx.fillText("cut", 1, 2, 30);
+                ctx.hint(0, 0, 10, 10, 42);
+                return { title: `${hanging} ${ctx.textBaseline}`, body: canvas.node() };
+            }
+            "#,
+        );
+        let view = script.view(&Request::default()).unwrap();
+        assert_eq!(
+            view.title, "hanging alphabetic",
+            "restore brings the baseline back"
+        );
+        let Node::Canvas { commands, .. } = &view.body else {
+            panic!("the view is a canvas");
+        };
+        let text = |text: &str, max_width: Option<f32>| Draw::FillText {
+            text: text.into(),
+            x: 1.0,
+            y: 2.0,
+            max_width,
+        };
+        assert_eq!(
+            commands.as_slice(),
+            [
+                Draw::Save,
+                Draw::Translate([10.0, 20.0]),
+                Draw::Scale([2.0, 3.0]),
+                Draw::Rotate(0.5),
+                Draw::Transform([1.0, 0.0, 0.0, 1.0, 4.0, 5.0]),
+                Draw::SetTransform([1.0, 0.0, 0.0, 1.0, 6.0, 7.0]),
+                Draw::ResetTransform,
+                Draw::ResetTransform,
+                Draw::TextBaseline(crucible_view::TextBaseline::Top),
+                Draw::TextBaseline(crucible_view::TextBaseline::Bottom),
+                Draw::Restore,
+                text("plain", None),
+                text("cut", Some(30.0)),
+                Draw::Hint {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 10.0,
+                    height: 10.0,
+                    text: "42".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    #[ignore = "needs assets/js-engine/plugin.wasm from `just desktop-js-engine`"]
     fn a_script_that_does_not_compile_or_throws_says_why() {
         let broken = Script::new(engine(), "export const inputs = [;");
         let Err(Fault::Script(why)) = broken.inputs() else {

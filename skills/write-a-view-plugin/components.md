@@ -309,7 +309,18 @@ the points of the path it draws, so call `begin_path` before each new shape.
   {"fill_style": "neutral"},
   {"font": "bold 16px monospace"},
   {"text_align": "center"},
-  {"fill_text": {"text": "70%", "x": 170, "y": 65}}
+  {"text_baseline": "middle"},
+  {"fill_text": {"text": "70%", "x": 170, "y": 60}},
+  {"hint": {"x": 130, "y": 20, "width": 80, "height": 80, "text": "7 of 10 closable"}},
+  "save",
+  {"translate": [40, 70]},
+  {"rotate": -0.3},
+  {"fill_style": "muted"},
+  {"fill_rect": [-30, -8, 60, 16]},
+  "restore",
+  {"text_align": "left"},
+  {"font": "11px sans-serif"},
+  {"fill_text": {"text": "a label cut to fit", "x": 10, "y": 105, "max_width": 70}}
 ]}}
 ```
 
@@ -320,23 +331,36 @@ the points of the path it draws, so call `begin_path` before each new shape.
 | `line_cap` | `butt` or `round` |
 | `font` | a CSS font string, read for its `px` size and the words `bold` and `monospace` |
 | `text_align` | `start`, `left`, `center`, `right` or `end` |
-| `save`, `restore` | none; they keep and bring back the styles above |
+| `text_baseline` | `top`, `middle`, `alphabetic` or `bottom` |
+| `save`, `restore` | none; they keep and bring back the styles above and the transform |
+| `translate`, `scale` | `[x, y]` |
+| `rotate` | an angle in radians, clockwise |
+| `transform`, `set_transform` | `[a, b, c, d, e, f]`, as the 2D context takes them |
+| `reset_transform` | none |
 | `begin_path`, `close_path`, `fill`, `stroke` | none |
 | `move_to`, `line_to` | `[x, y]` |
 | `quadratic_curve_to` | `[cpx, cpy, x, y]` |
 | `bezier_curve_to` | `[cp1x, cp1y, cp2x, cp2y, x, y]` |
 | `arc` | `x`, `y`, `radius`, `start_angle`, `end_angle`, optional `counterclockwise` |
 | `rect`, `fill_rect`, `stroke_rect` | `[x, y, width, height]` |
-| `fill_text` | `text`, `x`, `y`, with y at the text's baseline |
+| `fill_text` | `text`, `x`, `y`, optional `max_width` |
+| `hint` | `x`, `y`, `width`, `height`, `text`: shown on hover over the rectangle |
+
+A transform applies to every point as it is added to the path, to `fill_rect`, `stroke_rect`
+and `hint` rectangles, to line widths, and to where text is drawn. Text is never rotated or
+skewed: it is drawn upright at its transformed point, its size scaled by the transform. Text
+longer than `max_width` ends in an ellipsis; a `max_width` of 0 or less draws nothing. A `hint`
+is not the 2D context's: its text shows on hover over its rectangle, and each counts as an item.
+Shapes and text are painted in the order of their commands.
 
 In Rust, `crucible_view::Context2d` records the same commands with the method names `web-sys`
-uses (`set_fill_style`, `begin_path`, `fill_rect`, `fill_text`), and `finish()` returns the
-component.
+uses (`set_fill_style`, `begin_path`, `fill_rect`, `fill_text`, `fill_text_with_max_width`,
+`set_transform`), and `finish()` returns the component. In a script, `ctx.hint(x, y, width,
+height, text)` adds a hint.
 
-What a browser's canvas has and this does not: transforms (`translate`, `scale`, `rotate`),
-clipping, images, gradients, patterns, shadows, `stroke_text`, `measure_text`, `clear_rect`.
-Text is always drawn over shapes, whatever the order of the commands. A canvas is drawn at its
-own size and is cut off where the pane is narrower, so keep it under about 600 points wide.
+What a browser's canvas has and this does not: clipping, holes in a fill (the `evenodd` rule;
+each subpath fills on its own), images, gradients, patterns, shadows, `stroke_text`,
+`measure_text`, `clear_rect`. A canvas wider than the pane is shrunk to fit it, text and all.
 Prefer a tone to a hex colour: a hex colour does not follow the theme.
 
 ## Controls
@@ -381,7 +405,7 @@ Across the whole view, at most:
 
 - 2,000 components, nested at most 8 deep;
 - 20,000 stats, bars, segments, series, plot categories, grid cells, heatmap cells and labels,
-  table columns, and flow stages and links;
+  table columns, flow stages and links, and canvas hints;
 - 50,000 points, counting plot points, histogram values, the points of each canvas path filled
   or stroked, and 4 for each `fill_rect` or `stroke_rect`;
 - 20,000 canvas commands;

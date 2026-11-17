@@ -859,6 +859,27 @@ mod tests {
             command,
             crucible_view::Draw::FillText { text, .. } if text == "70%"
         )));
+        let hints: Vec<&str> = commands
+            .iter()
+            .filter_map(|command| match command {
+                crucible_view::Draw::Hint { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(hints.len(), 19, "a hint per cell and one on the ring");
+        assert!(hints.contains(&"45 of 64 closable"), "{hints:?}");
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, crucible_view::Draw::Rotate(_)))
+                .count(),
+            20,
+            "a tick each twentieth of the ring"
+        );
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            crucible_view::Draw::FillText { max_width: Some(width), .. } if *width == 116.0
+        )));
         let Node::Table { rows, columns, .. } = &all.body else {
             panic!("All is a table");
         };

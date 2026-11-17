@@ -66,39 +66,44 @@ function ticketMap(tickets) {
     for (const action of ACTIONS) {
         const group = tickets.filter((t) => t.action === action.id);
         const columns = Math.max(1, Math.ceil(group.length / rows));
+        const wide = columns * (cell.w + cell.gapX) - cell.gapX;
         ctx.globalAlpha = 1;
         ctx.textAlign = "left";
+        ctx.textBaseline = "alphabetic";
         ctx.fillStyle = action.tone;
         ctx.font = "bold 13px sans-serif";
         ctx.fillText(`${action.label} ${group.length}`, left, 13);
         ctx.fillStyle = "muted";
         ctx.font = "10px sans-serif";
-        if (columns > 1)
-            ctx.fillText(action.means, left, 25);
+        ctx.fillText(action.means, left, 25, wide);
         group.forEach((ticket, i) => {
-            const x = left + Math.floor(i / rows) * (cell.w + cell.gapX);
-            const y = top + (i % rows) * cell.pitch;
+            ctx.save();
+            ctx.translate(left + Math.floor(i / rows) * (cell.w + cell.gapX), top + (i % rows) * cell.pitch);
             ctx.fillStyle = action.tone;
             ctx.globalAlpha = 0.16 + 0.74 * Math.min(1, ticket.cvss / 10);
-            ctx.fillRect(x, y, cell.w, cell.h);
+            ctx.fillRect(0, 0, cell.w, cell.h);
             ctx.globalAlpha = 0.9;
-            ctx.fillRect(x, y + cell.h + 1, (cell.w * ticket.age) / oldest, 2);
+            ctx.fillRect(0, cell.h + 1, (cell.w * ticket.age) / oldest, 2);
             ctx.globalAlpha = 1;
             ctx.fillStyle = "neutral";
+            ctx.textBaseline = "middle";
             ctx.font = "bold 10px monospace";
             ctx.textAlign = "left";
-            ctx.fillText(ticket.short + (ticket.confidence === "low" ? "?" : ""), x + 5, y + 14);
+            ctx.fillText(ticket.short + (ticket.confidence === "low" ? "?" : ""), 5, cell.h / 2, cell.w - 30);
             ctx.font = "10px monospace";
             ctx.textAlign = "right";
-            ctx.fillText(ticket.cvss.toFixed(1), x + cell.w - 5, y + 14);
+            ctx.fillText(ticket.cvss.toFixed(1), cell.w - 5, cell.h / 2);
+            ctx.hint(0, 0, cell.w, cell.h + 3, `${ticket.key} ${ticket.cve} ${ticket.pkg}, ${ticket.age} days`);
+            ctx.restore();
         });
-        left += columns * (cell.w + cell.gapX) - cell.gapX + 14;
+        left += wide + 14;
     }
     ctx.globalAlpha = 1;
     ctx.textAlign = "left";
+    ctx.textBaseline = "alphabetic";
     ctx.fillStyle = "muted";
     ctx.font = "10px sans-serif";
-    ctx.fillText(`One cell per ticket: number and CVSS. Deeper fill is higher CVSS, the underline is days open (longest ${oldest}), ? is low confidence.`, 0, top + rows * cell.pitch + 16);
+    ctx.fillText(`One cell per ticket: number and CVSS. Deeper fill is higher CVSS, the underline is days open (longest ${oldest}), ? is low confidence.`, 0, top + rows * cell.pitch + 16, canvas.width);
     return canvas.node();
 }
 /** The tickets to act on along a CVSS axis, labels stacked so none overlap. */

@@ -68,9 +68,9 @@ pub(crate) fn report_view(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
         )
         .children(controls)
         .child(if app.report_shown.fills(&view.body) {
-            node(&view.body, true, app, p)
+            node(&view.body, true, "0", app, p)
         } else {
-            desk::scrolled("report-scroll", node(&view.body, false, app, p), p)
+            desk::scrolled("report-scroll", node(&view.body, false, "0", app, p), p)
         })
 }
 
@@ -79,7 +79,7 @@ const COLUMN: f32 = 320.0;
 /// What a card adds to the width of what it holds: its padding on both sides.
 const CARD: f32 = 24.0;
 
-/// The width `node` draws at whatever room it is given: its widest canvas or flow.
+/// The width `node` draws at when it has the room: its widest canvas or flow.
 fn least_width(node: &Node) -> f32 {
     let widest =
         |nodes: &mut dyn Iterator<Item = &Node>| nodes.map(least_width).fold(0.0, f32::max);
@@ -103,8 +103,9 @@ fn least_width(node: &Node) -> f32 {
 }
 
 /// `fills` when the node takes the height its parent has left, as a table's ancestors do;
-/// otherwise it is as tall as its content, inside a scroll area.
-fn node(node_: &Node, fills: bool, app: &App, p: &Paint) -> El {
+/// otherwise it is as tall as its content, inside a scroll area. `at` is the node's place in
+/// the view, unique among the nodes drawn.
+fn node(node_: &Node, fills: bool, at: &str, app: &App, p: &Paint) -> El {
     match node_ {
         Node::Stack { children } => {
             let mut stack = col().w_full().gap(12.0);
@@ -112,7 +113,14 @@ fn node(node_: &Node, fills: bool, app: &App, p: &Paint) -> El {
                 stack = stack.grow(1.0).min_h(0.0);
             }
             for (i, child) in children.iter().enumerate() {
-                let drawn = node(child, fills && app.report_shown.fills(child), app, p);
+                let place = format!("{at}-{i}");
+                let drawn = node(
+                    child,
+                    fills && app.report_shown.fills(child),
+                    &place,
+                    app,
+                    p,
+                );
                 stack = stack.child(match child {
                     Node::Tabs { .. } | Node::Table { .. } | Node::Section { .. } => drawn,
                     _ => drawn.key(format!("report-part-{i}")),
@@ -121,17 +129,21 @@ fn node(node_: &Node, fills: bool, app: &App, p: &Paint) -> El {
             stack
         }
         Node::Columns { children } => {
-            let mut line = row().w_full().gap(12.0).flex_wrap().items_start();
+            let key = format!("report-columns-{at}");
+            let widest = least_width(node_).max(COLUMN);
+            let room = rune::memo::layout_with(&key, move |rect| rect[2].min(widest).floor())
+                .unwrap_or(widest);
+            let mut line = row().key(key).w_full().gap(12.0).flex_wrap().items_start();
             for (i, child) in children.iter().enumerate() {
                 line = line.child(
                     col()
                         .key(format!("report-column-{i}"))
                         .grow(1.0)
-                        .min_w(COLUMN.max(least_width(child)))
-                        .child(node(child, false, app, p)),
+                        .min_w(COLUMN.max(least_width(child)).min(room))
+                        .child(node(child, false, &format!("{at}-{i}"), app, p)),
                 );
             }
-            line
+            col().w_full().child(line)
         }
         Node::Section {
             id,
@@ -177,14 +189,20 @@ fn node(node_: &Node, fills: bool, app: &App, p: &Paint) -> El {
                 .radius(p.k.radius.lg)
                 .fill(p.c.layer_01)
                 .border(p.hair, p.c.border_muted)
-                .child(canvas::canvas_view(flow::WIDTH, height, &commands, p)),
+                .child(canvas::fitted(
+                    format!("report-canvas-{at}"),
+                    flow::WIDTH,
+                    height,
+                    &commands,
+                    p,
+                )),
             None => el(),
         },
         Node::Canvas {
             width,
             height,
             commands,
-        } => canvas::canvas_view(*width, *height, commands, p),
+        } => canvas::fitted(format!("report-canvas-{at}"), *width, *height, commands, p),
         Node::Grid { columns, rows } => grid(columns, rows, p),
         Node::Table { columns, .. } => table(columns, app, p),
         Node::Text { text: body, tone } => text(body.clone())
@@ -279,7 +297,7 @@ fn section(
         shown = shown.grow(1.0).min_h(0.0);
     }
     if unfolded {
-        shown = shown.child(node(body, fills, app, p));
+        shown = shown.child(node(body, fills, &format!("s{}:{id}", id.len()), app, p));
     }
     shown
 }
@@ -319,7 +337,13 @@ fn tabs_view(id: &str, tabs: &[Tab], fills: bool, app: &App, p: &Paint) -> El {
     }
     if let Some(tab) = tabs.get(picked) {
         let filled = app.report_shown.fills(&tab.body);
-        let body = node(&tab.body, fills && filled, app, p);
+        let body = node(
+            &tab.body,
+            fills && filled,
+            &format!("t{}:{id}", id.len()),
+            app,
+            p,
+        );
         shown = shown.child(if !fills || filled {
             body
         } else {

@@ -5,7 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crucible_view::{
     Bar, Cell, Column, ColumnKind, Context2d, Control, FlowLink, FlowNode, LineCap, Node, PlotKind,
     Request,
-    Row, Scale, Segment, Series, Stat, Tab, TextAlign, Tone, View, Width, file_link, task_link,
+    Row, Scale, Segment, Series, Stat, Tab, TextAlign, TextBaseline, Tone, View, Width, file_link,
+    task_link,
 };
 use serde::Deserialize;
 
@@ -494,14 +495,16 @@ fn drawing(tickets: &[Ticket]) -> Node {
     ctx.set_text_align(TextAlign::Center);
     ctx.set_fill_style(Tone::Muted);
     for (column, release) in releases.iter().enumerate() {
-        ctx.fill_text(release, left + wide * (column as f32 + 0.5), 16.0);
+        let x = left + wide * (column as f32 + 0.5);
+        ctx.fill_text_with_max_width(release, x, 16.0, wide - 4.0);
     }
     for (row, category) in Category::ALL.into_iter().enumerate() {
         let y = top + tall * row as f32;
         ctx.set_text_align(TextAlign::Right);
         ctx.set_fill_style(category.tone());
-        ctx.fill_text(category.label(), left - 10.0, y + 17.0);
+        ctx.fill_text_with_max_width(category.label(), left - 10.0, y + 17.0, left - 14.0);
         ctx.set_text_align(TextAlign::Center);
+        ctx.set_text_baseline(TextBaseline::Middle);
         for (column, release) in releases.iter().enumerate() {
             let n = count(category, release);
             let x = left + wide * column as f32;
@@ -510,8 +513,16 @@ fn drawing(tickets: &[Ticket]) -> Node {
             ctx.fill_rect(x + 1.0, y + 1.0, wide - 2.0, tall - 2.0);
             ctx.set_global_alpha(1.0);
             ctx.set_fill_style(Tone::Neutral);
-            ctx.fill_text(&n.to_string(), x + wide / 2.0, y + 17.0);
+            ctx.fill_text(&n.to_string(), x + wide / 2.0, y + tall / 2.0);
+            ctx.hint(
+                x,
+                y,
+                wide,
+                tall,
+                &format!("{} on {release}: {n}", category.label()),
+            );
         }
+        ctx.set_text_baseline(TextBaseline::Alphabetic);
     }
 
     let open = tickets
@@ -530,6 +541,18 @@ fn drawing(tickets: &[Ticket]) -> Node {
     ctx.begin_path();
     ctx.arc(cx, cy, radius, 0.0, TAU);
     ctx.stroke();
+    ctx.set_line_width(1.5);
+    ctx.save();
+    ctx.translate(cx, cy);
+    for _ in 0..20 {
+        ctx.rotate(TAU / 20.0);
+        ctx.begin_path();
+        ctx.move_to(radius + 9.0, 0.0);
+        ctx.line_to(radius + 13.0, 0.0);
+        ctx.stroke();
+    }
+    ctx.restore();
+    ctx.set_line_width(12.0);
     ctx.set_global_alpha(1.0);
     ctx.set_stroke_style(Tone::Good);
     ctx.set_line_cap(LineCap::Round);
@@ -542,6 +565,13 @@ fn drawing(tickets: &[Ticket]) -> Node {
     ctx.set_fill_style(Tone::Muted);
     ctx.set_font("11px sans-serif");
     ctx.fill_text("closable", cx, cy + 22.0);
+    ctx.hint(
+        cx - radius,
+        cy - radius,
+        radius * 2.0,
+        radius * 2.0,
+        &format!("{} of {} closable", tickets.len() - open, tickets.len()),
+    );
     ctx.finish()
 }
 

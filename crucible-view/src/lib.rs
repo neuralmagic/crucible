@@ -15,6 +15,7 @@ pub mod guest;
 
 pub use crate::canvas::{
     ARC_STEPS, CANVAS_REACH, CURVE_STEPS, Context2d, Draw, LineCap, NotAStyle, Style, TextAlign,
+    TextBaseline,
 };
 pub use crate::flow::{FlowLink, FlowNode, flow_columns};
 
@@ -543,7 +544,7 @@ pub struct Limits {
     /// Cells in one grid, its header among them.
     pub grid_cells: usize,
     /// Stats, bars, segments, series, plot categories, grid cells, heatmap cells and labels,
-    /// table columns, and flow stages and ribbons across the view.
+    /// table columns, flow stages and ribbons, and canvas hints across the view.
     pub items: usize,
     /// Plot points, histogram values, and the points of every canvas path filled or stroked,
     /// across the view.
@@ -602,7 +603,7 @@ pub enum Problem {
     GridCells(usize),
     #[error(
         "the view holds more than {0} stats, bars, segments, series, categories, grid and \
-         heatmap cells, heatmap labels, columns, stages and ribbons"
+         heatmap cells, heatmap labels, columns, stages, ribbons and canvas hints"
     )]
     Items(usize),
     #[error("a title, label, cell or address is longer than {0} bytes")]
@@ -928,6 +929,10 @@ impl Node {
                         Draw::Fill | Draw::Stroke => seen.points(path, limits)?,
                         Draw::FillRect(_) | Draw::StrokeRect(_) => seen.points(4, limits)?,
                         Draw::Font(text) | Draw::FillText { text, .. } => fits(text, limits)?,
+                        Draw::Hint { text, .. } => {
+                            fits(text, limits)?;
+                            seen.items(1, limits)?;
+                        }
                         Draw::MoveTo(_) => (path, stretch) = (path + 1, 1),
                         Draw::ClosePath | Draw::Rect(_) => {
                             path += command.path_points();

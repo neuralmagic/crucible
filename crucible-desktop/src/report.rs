@@ -1175,10 +1175,52 @@ mod tests {
         let Node::Stack { children: overview } = &tabs[0].body else {
             panic!("Overview is a stack");
         };
-        assert!(matches!(
-            overview.as_slice(),
-            [Node::Columns { .. }, Node::Section { open: true, .. }]
-        ));
+        let [
+            Node::Columns { .. },
+            Node::Section {
+                open: true, body, ..
+            },
+        ] = overview.as_slice()
+        else {
+            panic!("Overview is columns over an open section");
+        };
+        let Node::Canvas {
+            width, commands, ..
+        } = body.as_ref()
+        else {
+            panic!("the ticket map is a canvas");
+        };
+        assert_eq!(*width, 600.0);
+        let count = |pick: fn(&crucible_view::Draw) -> bool| {
+            commands.iter().filter(|command| pick(command)).count()
+        };
+        assert_eq!(
+            count(|command| matches!(command, crucible_view::Draw::Hint { .. })),
+            64,
+            "a hint per ticket"
+        );
+        assert_eq!(
+            count(|command| matches!(command, crucible_view::Draw::Translate(_))),
+            64,
+            "each cell is drawn from its own origin"
+        );
+        assert_eq!(
+            count(|command| matches!(command, crucible_view::Draw::Save)),
+            count(|command| matches!(command, crucible_view::Draw::Restore)),
+        );
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            crucible_view::Draw::TextBaseline(crucible_view::TextBaseline::Middle)
+        )));
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            crucible_view::Draw::FillText { text, max_width: Some(600.0), .. }
+                if text.starts_with("One cell per ticket")
+        )));
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            crucible_view::Draw::Hint { text, width: 58.0, .. } if text.starts_with("DEMO-")
+        )));
         shown.pick("queue", 1);
         assert_eq!(shown.table(view).unwrap().id, "act");
         shown.toggle(view, "ruler", true);

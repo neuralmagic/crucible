@@ -139,7 +139,7 @@ interface CanvasNode {
 
 /**
  * The browser's 2D context, as far as the app draws it. A style is a tone or a hex colour.
- * There are no transforms, clips, images or gradients, and text is drawn over every shape.
+ * There are no clips, images or gradients. Text is drawn upright at its transformed anchor.
  */
 declare class CanvasContext2D {
   fillStyle: Tone | `#${string}`;
@@ -150,8 +150,19 @@ declare class CanvasContext2D {
   /** Read for its `px` size and the words `bold` and `monospace`. */
   font: string;
   textAlign: "start" | "left" | "center" | "right" | "end";
+  /** `hanging` is drawn as `top` and `ideographic` as `bottom`. */
+  textBaseline: "top" | "hanging" | "middle" | "alphabetic" | "ideographic" | "bottom";
+  /** Keep and bring back the styles and the transform. */
   save(): void;
   restore(): void;
+  translate(x: number, y: number): void;
+  scale(x: number, y: number): void;
+  /** Clockwise, in radians. */
+  rotate(angle: number): void;
+  transform(a: number, b: number, c: number, d: number, e: number, f: number): void;
+  setTransform(a: number, b: number, c: number, d: number, e: number, f: number): void;
+  setTransform(): void;
+  resetTransform(): void;
   beginPath(): void;
   closePath(): void;
   moveTo(x: number, y: number): void;
@@ -165,8 +176,10 @@ declare class CanvasContext2D {
   stroke(): void;
   fillRect(x: number, y: number, width: number, height: number): void;
   strokeRect(x: number, y: number, width: number, height: number): void;
-  /** `y` is the text's baseline. */
-  fillText(text: string, x: number, y: number): void;
+  /** Longer than `maxWidth`, the text ends in an ellipsis. */
+  fillText(text: string, x: number, y: number, maxWidth?: number): void;
+  /** Not the browser's: shows `text` on hover over the rectangle, under the current transform. */
+  hint(x: number, y: number, width: number, height: number, text: string): void;
 }
 
 /** A drawing surface in points, 1 to 4,000 on each side. Use it inside `view`. */

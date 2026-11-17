@@ -12,6 +12,7 @@ class CanvasContext2D {
     lineCap: "butt",
     font: "10px sans-serif",
     textAlign: "start",
+    textBaseline: "alphabetic",
   };
   #saved = [];
 
@@ -38,6 +39,13 @@ class CanvasContext2D {
   set font(value) { this.#set("font", "font", String(value)); }
   get textAlign() { return this.#state.textAlign; }
   set textAlign(value) { this.#set("textAlign", "text_align", String(value)); }
+  get textBaseline() { return this.#state.textBaseline; }
+  set textBaseline(value) {
+    const named = String(value);
+    this.#state.textBaseline = named;
+    const drawn = named === "hanging" ? "top" : named === "ideographic" ? "bottom" : named;
+    this.#commands.push({ text_baseline: drawn });
+  }
 
   save() {
     this.#saved.push({ ...this.#state });
@@ -48,6 +56,15 @@ class CanvasContext2D {
     if (earlier) this.#state = earlier;
     this.#commands.push("restore");
   }
+  translate(x, y) { this.#commands.push({ translate: [x, y] }); }
+  scale(x, y) { this.#commands.push({ scale: [x, y] }); }
+  rotate(angle) { this.#commands.push({ rotate: angle }); }
+  transform(a, b, c, d, e, f) { this.#commands.push({ transform: [a, b, c, d, e, f] }); }
+  setTransform(a, b, c, d, e, f) {
+    if (a === undefined) this.resetTransform();
+    else this.#commands.push({ set_transform: [a, b, c, d, e, f] });
+  }
+  resetTransform() { this.#commands.push("reset_transform"); }
   beginPath() { this.#commands.push("begin_path"); }
   closePath() { this.#commands.push("close_path"); }
   fill() { this.#commands.push("fill"); }
@@ -68,7 +85,15 @@ class CanvasContext2D {
   rect(x, y, width, height) { this.#commands.push({ rect: [x, y, width, height] }); }
   fillRect(x, y, width, height) { this.#commands.push({ fill_rect: [x, y, width, height] }); }
   strokeRect(x, y, width, height) { this.#commands.push({ stroke_rect: [x, y, width, height] }); }
-  fillText(text, x, y) { this.#commands.push({ fill_text: { text: String(text), x, y } }); }
+  fillText(text, x, y, maxWidth) {
+    const drawn = { text: String(text), x, y };
+    if (maxWidth !== undefined) drawn.max_width = maxWidth;
+    this.#commands.push({ fill_text: drawn });
+  }
+  /** Not the browser's: shows `text` on hover over the rectangle. */
+  hint(x, y, width, height, text) {
+    this.#commands.push({ hint: { x, y, width, height, text: String(text) } });
+  }
 }
 
 class Canvas {

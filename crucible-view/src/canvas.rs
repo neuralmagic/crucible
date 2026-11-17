@@ -15,8 +15,9 @@
 //! ```
 //!
 //! What differs from a browser's canvas: styles are a theme tone or a hex colour, with no
-//! gradients or patterns; there are no transforms, clips or images; text is drawn over every
-//! shape; and a font is read only for its `px` size and the words `bold` and `monospace`.
+//! gradients or patterns; there are no clips or images; text is drawn upright at its
+//! transformed anchor; and a font is read only for its `px` size and the words `bold` and
+//! `monospace`. [`Draw::Hint`] is not the 2D context's: a text shown on hover over a rectangle.
 
 use std::fmt;
 use std::str::FromStr;
@@ -123,6 +124,17 @@ pub enum TextAlign {
     End,
 }
 
+/// Where `y` falls on a line of text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextBaseline {
+    Top,
+    Middle,
+    #[default]
+    Alphabetic,
+    Bottom,
+}
+
 /// One canvas command. A setter holds the new value; a path or drawing command its arguments in
 /// the order the 2D context takes them.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -135,8 +147,16 @@ pub enum Draw {
     LineCap(LineCap),
     Font(String),
     TextAlign(TextAlign),
+    TextBaseline(TextBaseline),
     Save,
     Restore,
+    Translate([f32; 2]),
+    Scale([f32; 2]),
+    Rotate(f32),
+    /// Multiplies the current transform by `[a, b, c, d, e, f]`.
+    Transform([f32; 6]),
+    SetTransform([f32; 6]),
+    ResetTransform,
     BeginPath,
     MoveTo([f32; 2]),
     LineTo([f32; 2]),
@@ -161,6 +181,17 @@ pub enum Draw {
         text: String,
         x: f32,
         y: f32,
+        /// The widest the text is drawn; longer text ends in an ellipsis.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_width: Option<f32>,
+    },
+    /// A text shown on hover over a rectangle.
+    Hint {
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        text: String,
     },
 }
 
@@ -176,12 +207,16 @@ impl Draw {
     pub(crate) fn in_reach(&self) -> bool {
         let near = |n: &f32| n.abs() <= CANVAS_REACH;
         match self {
-            Draw::GlobalAlpha(n) | Draw::LineWidth(n) => near(n),
-            Draw::MoveTo(n) | Draw::LineTo(n) => n.iter().all(near),
+            Draw::GlobalAlpha(n) | Draw::LineWidth(n) | Draw::Rotate(n) => near(n),
+            Draw::MoveTo(n) | Draw::LineTo(n) | Draw::Translate(n) | Draw::Scale(n) => {
+                n.iter().all(near)
+            }
             Draw::QuadraticCurveTo(n) | Draw::Rect(n) | Draw::FillRect(n) | Draw::StrokeRect(n) => {
                 n.iter().all(near)
             }
-            Draw::BezierCurveTo(n) => n.iter().all(near),
+            Draw::BezierCurveTo(n) | Draw::Transform(n) | Draw::SetTransform(n) => {
+                n.iter().all(near)
+            }
             Draw::Arc {
                 x,
                 y,
@@ -190,14 +225,25 @@ impl Draw {
                 end_angle,
                 ..
             } => [x, y, radius, start_angle, end_angle].into_iter().all(near),
-            Draw::FillText { x, y, .. } => near(x) && near(y),
+            Draw::FillText {
+                x, y, max_width, ..
+            } => near(x) && near(y) && max_width.as_ref().is_none_or(near),
+            Draw::Hint {
+                x,
+                y,
+                width,
+                height,
+                ..
+            } => [x, y, width, height].into_iter().all(near),
             Draw::FillStyle(_)
             | Draw::StrokeStyle(_)
             | Draw::LineCap(_)
             | Draw::Font(_)
             | Draw::TextAlign(_)
+            | Draw::TextBaseline(_)
             | Draw::Save
             | Draw::Restore
+            | Draw::ResetTransform
             | Draw::BeginPath
             | Draw::ClosePath
             | Draw::Fill
@@ -271,12 +317,41 @@ impl Context2d {
         self.commands.push(Draw::TextAlign(align));
     }
 
+    pub fn set_text_baseline(&mut self, baseline: TextBaseline) {
+        self.commands.push(Draw::TextBaseline(baseline));
+    }
+
     pub fn save(&mut self) {
         self.commands.push(Draw::Save);
     }
 
     pub fn restore(&mut self) {
         self.commands.push(Draw::Restore);
+    }
+
+    pub fn translate(&mut self, x: f32, y: f32) {
+        self.commands.push(Draw::Translate([x, y]));
+    }
+
+    pub fn scale(&mut self, x: f32, y: f32) {
+        self.commands.push(Draw::Scale([x, y]));
+    }
+
+    /// Clockwise by `angle` radians.
+    pub fn rotate(&mut self, angle: f32) {
+        self.commands.push(Draw::Rotate(angle));
+    }
+
+    pub fn transform(&mut self, a: f32, b: f32, c: f32, d: f32, e: f32, f: f32) {
+        self.commands.push(Draw::Transform([a, b, c, d, e, f]));
+    }
+
+    pub fn set_transform(&mut self, a: f32, b: f32, c: f32, d: f32, e: f32, f: f32) {
+        self.commands.push(Draw::SetTransform([a, b, c, d, e, f]));
+    }
+
+    pub fn reset_transform(&mut self) {
+        self.commands.push(Draw::ResetTransform);
     }
 
     pub fn begin_path(&mut self) {
@@ -341,13 +416,36 @@ impl Context2d {
             text: text.to_string(),
             x,
             y,
+            max_width: None,
+        });
+    }
+
+    pub fn fill_text_with_max_width(&mut self, text: &str, x: f32, y: f32, max_width: f32) {
+        self.commands.push(Draw::FillText {
+            text: text.to_string(),
+            x,
+            y,
+            max_width: Some(max_width),
+        });
+    }
+
+    /// Shows `text` on hover over the rectangle, under the current transform.
+    pub fn hint(&mut self, x: f32, y: f32, width: f32, height: f32, text: &str) {
+        self.commands.push(Draw::Hint {
+            x,
+            y,
+            width,
+            height,
+            text: text.to_string(),
         });
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{Context2d, Draw, Limits, Node, Problem, Style, TextAlign, Tone, View};
+    use crate::{
+        Context2d, Draw, Limits, Node, Problem, Style, TextAlign, TextBaseline, Tone, View,
+    };
 
     fn view(body: Node) -> View {
         View {
@@ -558,5 +656,171 @@ mod tests {
         assert_eq!(arc.path_points(), 49);
         assert_eq!(Draw::Rect([0.0; 4]).path_points(), 5);
         assert_eq!(Draw::Fill.path_points(), 0);
+    }
+
+    #[test]
+    fn transforms_baselines_widths_and_hints_go_under_the_2d_context_s_names() {
+        let mut ctx = Context2d::new(200.0, 80.0);
+        ctx.save();
+        ctx.translate(10.0, 20.0);
+        ctx.scale(2.0, 0.5);
+        ctx.rotate(1.5);
+        ctx.transform(1.0, 0.0, 0.0, 1.0, 3.0, 4.0);
+        ctx.set_transform(1.0, 0.5, -0.5, 1.0, 0.0, 0.0);
+        ctx.reset_transform();
+        ctx.set_text_baseline(TextBaseline::Middle);
+        ctx.fill_text("plain", 1.0, 2.0);
+        ctx.fill_text_with_max_width("long", 1.0, 2.0, 40.0);
+        ctx.hint(0.0, 0.0, 20.0, 10.0, "CVE-1");
+        ctx.restore();
+        let node = ctx.finish();
+        let json = serde_json::to_string(&node).unwrap();
+        for part in [
+            r#"{"translate":[10.0,20.0]}"#,
+            r#"{"scale":[2.0,0.5]}"#,
+            r#"{"rotate":1.5}"#,
+            r#"{"transform":[1.0,0.0,0.0,1.0,3.0,4.0]}"#,
+            r#"{"set_transform":[1.0,0.5,-0.5,1.0,0.0,0.0]}"#,
+            r#""reset_transform""#,
+            r#"{"text_baseline":"middle"}"#,
+            r#"{"fill_text":{"text":"plain","x":1.0,"y":2.0}}"#,
+            r#"{"fill_text":{"text":"long","x":1.0,"y":2.0,"max_width":40.0}}"#,
+            r#"{"hint":{"x":0.0,"y":0.0,"width":20.0,"height":10.0,"text":"CVE-1"}}"#,
+        ] {
+            assert!(json.contains(part), "{part} in {json}");
+        }
+        assert_eq!(serde_json::from_str::<Node>(&json).unwrap(), node);
+        assert_eq!(view(node).check(&Limits::DEFAULT), Ok(()));
+        for baseline in ["top", "middle", "alphabetic", "bottom"] {
+            let json = format!(r#"{{"text_baseline":"{baseline}"}}"#);
+            assert!(serde_json::from_str::<Draw>(&json).is_ok(), "{json}");
+        }
+        for off in [
+            r#"{"text_baseline":"hanging"}"#,
+            r#"{"rotate":[1.0]}"#,
+            r#"{"translate":[1.0]}"#,
+            r#"{"transform":[1.0,0.0,0.0,1.0,0.0]}"#,
+            r#"{"hint":{"x":0,"y":0,"width":1,"height":1}}"#,
+            r#"{"fill_text":{"text":"a","x":0,"y":0,"max_width":"wide"}}"#,
+        ] {
+            assert!(serde_json::from_str::<Draw>(off).is_err(), "{off}");
+        }
+    }
+
+    #[test]
+    fn every_transform_entry_text_width_and_hint_is_within_reach() {
+        assert_eq!(
+            canvas(
+                100.0,
+                vec![
+                    Draw::Transform([1e6, -1e6, 1e6, -1e6, 1e6, -1e6]),
+                    Draw::Rotate(-1e6),
+                    Draw::FillText {
+                        text: "a".into(),
+                        x: 0.0,
+                        y: 0.0,
+                        max_width: Some(0.0),
+                    },
+                ]
+            )
+            .check(&Limits::DEFAULT),
+            Ok(())
+        );
+        for off in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN, 1.1e6, f32::MAX] {
+            for command in [
+                Draw::Translate([0.0, off]),
+                Draw::Scale([off, 1.0]),
+                Draw::Rotate(off),
+                Draw::Transform([1.0, 0.0, 0.0, 1.0, 0.0, off]),
+                Draw::SetTransform([off, 0.0, 0.0, 1.0, 0.0, 0.0]),
+                Draw::FillText {
+                    text: "a".into(),
+                    x: 0.0,
+                    y: 0.0,
+                    max_width: Some(off),
+                },
+                Draw::Hint {
+                    x: 0.0,
+                    y: 0.0,
+                    width: off,
+                    height: 1.0,
+                    text: "a".into(),
+                },
+            ] {
+                assert_eq!(
+                    canvas(100.0, vec![Draw::ResetTransform, command.clone()])
+                        .check(&Limits::DEFAULT),
+                    Err(Problem::CanvasNumber(1)),
+                    "{command:?}"
+                );
+            }
+        }
+        for command in [
+            Draw::Translate([0.0; 2]),
+            Draw::Scale([0.0; 2]),
+            Draw::Rotate(0.0),
+            Draw::Transform([0.0; 6]),
+            Draw::SetTransform([0.0; 6]),
+            Draw::ResetTransform,
+            Draw::TextBaseline(TextBaseline::Top),
+            Draw::Hint {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+                text: String::new(),
+            },
+        ] {
+            assert_eq!(command.path_points(), 0, "{command:?}");
+        }
+    }
+
+    #[test]
+    fn hints_are_items_across_the_view_and_their_text_is_bounded() {
+        let limits = Limits {
+            items: 3,
+            text: 8,
+            ..Limits::DEFAULT
+        };
+        let hint = |text: &str| Draw::Hint {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+            text: text.into(),
+        };
+        assert_eq!(canvas(100.0, vec![]).check(&limits), Ok(()));
+        assert_eq!(canvas(100.0, vec![hint(""); 3]).check(&limits), Ok(()));
+        assert_eq!(
+            canvas(100.0, vec![hint("same"); 4]).check(&limits),
+            Err(Problem::Items(3)),
+            "duplicates count"
+        );
+        let two = Node::Stack {
+            children: vec![
+                Node::Canvas {
+                    width: 1.0,
+                    height: 1.0,
+                    commands: vec![hint("a"); 2],
+                };
+                2
+            ],
+        };
+        assert_eq!(view(two).check(&limits), Err(Problem::Items(3)));
+        assert_eq!(canvas(100.0, vec![hint("12345678")]).check(&limits), Ok(()));
+        assert_eq!(
+            canvas(100.0, vec![hint("123456789")]).check(&limits),
+            Err(Problem::Text(8))
+        );
+        let long_text = Draw::FillText {
+            text: "123456789".into(),
+            x: 0.0,
+            y: 0.0,
+            max_width: Some(5.0),
+        };
+        assert_eq!(
+            canvas(100.0, vec![long_text]).check(&limits),
+            Err(Problem::Text(8))
+        );
     }
 }
