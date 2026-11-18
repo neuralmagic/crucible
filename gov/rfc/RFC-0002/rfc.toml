@@ -58,6 +58,11 @@ changed = [
     "C-PLAYBOOK-BUDGET admits each fan-out lane against settled and in-flight spend under a bounded width, and the cost ceiling blocks only tasks that can spend, so commands after it still run; C-SETTLED-JOIN and C-PLAYBOOK-LANE follow",
     "C-PLAYBOOK-PARAMS: a supplied dotted name is a launch setting (<task>.<setting>, *.<setting>, repo.ref), checked before dispatch and written onto the compiled tasks; a declared parameter name cannot contain a dot",
     "C-PLAYBOOK-PARAMS: a string parameter may carry a multiline flag for launch forms; it does not change binding",
+    "C-PLAYBOOK-PARAMS: a string parameter may take its choices from a task output (choices_from), offered and enforced by the controller from the latest passing run and recorded per launch; allow_other makes any choice list suggestions",
+    "C-PLAYBOOK-PARAMS: a choices_from producer and its dependencies must not depend on parameter values; the launch value choices.refresh = true compiles and runs only them, with no parameters",
+    "C-PLAYBOOK-PARAMS: choices_from may be keyed_by another string parameter, offering the list for that parameter's value; placeholder_from shows a keyed string in an empty input without submitting it",
+    "C-PLAYBOOK-PARAMS: an optional bool may declare confirm_from, a keyed object of messages; a launch whose key value has a message is refused unless the bool is true",
+    "C-PLAYBOOK-PARAMS: an optional parameter may be enabled_by a declared boolean; supplying it while the boolean is false is rejected before compilation, and a launch form disables it",
     "C-SETTLED-JOIN: a failing task's own note, from a self-declared failure or a command's nonzero exit, is the note the engine records",
     "C-SETTLED-JOIN: an all-join task gets no entry for an optional dependency that settled not taken (RFC-0001:C-ROUTE)",
     "C-PLAYBOOK-RESUME: a resume reads the manifest variant the interrupted run read",
@@ -65,5 +70,6 @@ changed = [
     "C-PLAYBOOK-LANE: only a command or evaluate task may declare early completion; any other task's declaration is refused on its session row and the run continues",
     '''C-TASK-FILES: a mapped instance's key may hold a separator or a dot; its captured and staged directory escapes %, /, \, NUL, and a leading . as %25, %2F, %5C, %00, and %2E, and the key stays raw in names, rows, inputs, and resume''',
     "C-SETTLED-JOIN: an instance is staged under its own name with its key escaped",
+    "C-PLAYBOOK-RERUN: a run on a partial clone keeps the identities of the file contents it fetched, and a rerun fetches those its clone lacks before restoring its workspace",
 ]
 fixed = ["C-PLAYBOOK-LANE no longer claims git memory survives a resume; C-PLAYBOOK-RESUME governs the rebuilt workspace"]

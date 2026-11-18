@@ -809,7 +809,7 @@ pub(crate) async fn dispatch_run(
                     cost_tag: WorkKind::Run.cost_tag().to_string(),
                     cluster: cluster.clone(),
                 }),
-                stamp_dispatcher: cfg.issues_agent_tokens(),
+                stamp_dispatcher: cfg.issues_run_tokens(),
             },
         )
         .await?;
@@ -818,6 +818,7 @@ pub(crate) async fn dispatch_run(
     }
 
     let created: Result<()> = async {
+        let mut minted_at = jiff::Timestamp::now();
         // The bound values, read from Vault here so a run that cannot get them fails before it
         // costs a pod. They reach the pod as one mounted Secret; the spec names it and carries
         // nothing else.
@@ -829,6 +830,7 @@ pub(crate) async fn dispatch_run(
                     .context("this scope binds a secret and this deployment can read no values")?;
                 let mut rows = Vec::with_capacity(mints.len());
                 let mut values = Vec::with_capacity(mints.len());
+                minted_at = jiff::Timestamp::now();
                 for mint in &mints {
                     let row = crate::secrets::store::get(db.pool(), &mint.item.secret_id)
                         .await?
@@ -886,6 +888,17 @@ pub(crate) async fn dispatch_run(
             )
                 .await
                 .context("recording the run's agent tools")?;
+        }
+        if let Some(endpoint) = crate::runs::workpod::agent_servers::task_endpoint(cfg)?
+            && let Some(access) = crate::runs::workpod::agent_servers::task_access(
+                &agent_servers,
+                &cluster,
+                &endpoint,
+            )?
+        {
+            delivery.merge(access).map_err(|e| {
+                anyhow::anyhow!("folding the task servers' access into the run's: {e}")
+            })?;
         }
         if crate::runs::workpod::git_sidecar::granted(&delivery)?.is_some() {
             for var in delivery.absorb_github()? {
@@ -1039,8 +1052,15 @@ pub(crate) async fn dispatch_run(
                 .await
                 .context("creating the run Secret")?;
             if let Some(token) = delivery.git_token.as_ref().filter(|t| t.minted) {
-                crate::secrets::refresh::record(db.pool(), &pod_name, &cluster, &namespace, token)
-                    .await
+                crate::secrets::refresh::record(
+                    db.pool(),
+                    &pod_name,
+                    &cluster,
+                    &namespace,
+                    token,
+                    minted_at,
+                )
+                .await
                     .context("recording the run's GitHub token for refresh")?;
             }
         }
@@ -1162,11 +1182,30 @@ pub async fn collect_run_pod(
     if let Some(ns) = ns.as_deref() {
         let _ = dispatcher.delete(&row.cluster, ns, pod_name).await;
     }
+    if let Some(ns) = ns.as_deref() {
+        teardown_run_gateway(dispatcher, &row.cluster, profile, pod_name, ns).await;
+    }
+    Ok(())
+}
+
+/// Delete the gateway of the run on `pod_name` when `profile` isolates gateways. A failure is
+/// logged and left to the gateway sweep.
+pub(crate) async fn teardown_run_gateway(
+    dispatcher: &dyn PodDispatcher,
+    cluster: &str,
+    profile: Option<&crucible::deploy::DeployProfile>,
+    pod_name: &str,
+    loop_namespace: &str,
+) {
     if let Some(profile) = profile.filter(|p| crucible::deploy::render::gateway::isolated(p))
-        && let Some(ns) = ns.as_deref()
-        && let Err(e) =
-            crate::runs::workpod::gateway::teardown(dispatcher, &row.cluster, profile, pod_name, ns)
-                .await
+        && let Err(e) = crate::runs::workpod::gateway::teardown(
+            dispatcher,
+            cluster,
+            profile,
+            pod_name,
+            loop_namespace,
+        )
+        .await
     {
         tracing::warn!(
             error = format!("{e:#}"),
@@ -1174,7 +1213,6 @@ pub async fn collect_run_pod(
             "deleting the run's gateway failed; the gateway sweep removes it"
         );
     }
-    Ok(())
 }
 
 /// Prefer the kubelet-captured termination-message envelope, falling back to the marker log scrape

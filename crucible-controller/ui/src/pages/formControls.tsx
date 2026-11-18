@@ -55,6 +55,7 @@ export interface TextFieldProps {
   /** A refusal to render against this input: a client check, or a server field-level rejection. */
   error?: string | null;
   onBlur?: () => void;
+  disabled?: boolean;
 }
 
 export function TextField({
@@ -69,6 +70,7 @@ export function TextField({
   autoFocus,
   error,
   onBlur,
+  disabled,
 }: TextFieldProps) {
   return (
     <FieldShell label={label} htmlFor={id} required={required} hint={hint} error={error}>
@@ -79,8 +81,9 @@ export function TextField({
         onBlur={onBlur}
         placeholder={placeholder}
         autoFocus={autoFocus}
+        disabled={disabled}
         aria-invalid={Boolean(error)}
-        className={cn(CONTROL, mono && MONO_CONTROL, Boolean(error) && 'border-red')}
+        className={cn(CONTROL, mono && MONO_CONTROL, Boolean(error) && 'border-red', disabled && 'cursor-not-allowed opacity-50')}
       />
     </FieldShell>
   );
@@ -137,6 +140,7 @@ export interface TextAreaFieldProps {
   mono?: boolean;
   error?: string | null;
   onBlur?: () => void;
+  disabled?: boolean;
 }
 
 export function TextAreaField({
@@ -152,6 +156,7 @@ export function TextAreaField({
   mono = false,
   error,
   onBlur,
+  disabled,
 }: TextAreaFieldProps) {
   return (
     <FieldShell label={label} htmlFor={id} required={required} hint={hint} error={error}>
@@ -161,6 +166,7 @@ export function TextAreaField({
         rows={rows}
         placeholder={placeholder}
         autoFocus={autoFocus}
+        disabled={disabled}
         onChange={(event) => {
           onChange(event.target.value);
         }}
@@ -258,6 +264,9 @@ export interface SelectFieldProps {
   options: readonly SelectOption[];
   hint?: ReactNode;
   required?: boolean;
+  error?: string | null;
+  onBlur?: () => void;
+  disabled?: boolean;
 }
 
 export function SelectField({
@@ -268,16 +277,21 @@ export function SelectField({
   options,
   hint,
   required,
+  error,
+  onBlur,
+  disabled,
 }: SelectFieldProps) {
   return (
-    <FieldShell label={label} htmlFor={id} required={required} hint={hint}>
+    <FieldShell label={label} htmlFor={id} required={required} hint={hint} error={error}>
       <select
         id={id}
         value={value}
         onChange={(event) => {
           onChange(event.target.value);
         }}
-        className={cn(CONTROL, MONO_CONTROL, 'cursor-pointer')}
+        onBlur={onBlur}
+        disabled={disabled}
+        className={cn(CONTROL, MONO_CONTROL, 'cursor-pointer', disabled && 'cursor-not-allowed opacity-50')}
       >
         {options.map((option) => (
           <option key={option.value} value={option.value}>
@@ -483,6 +497,8 @@ export interface CheckFieldProps {
   checked: boolean;
   onChange: (checked: boolean) => void;
   description?: ReactNode;
+  required?: boolean;
+  error?: string | null;
 }
 
 interface CheckProps {
@@ -506,15 +522,21 @@ export function Check({ id, checked, onChange, label }: CheckProps) {
   );
 }
 
-export function CheckField({ id, label, checked, onChange, description }: CheckFieldProps) {
+export function CheckField({ id, label, checked, onChange, description, required = false, error }: CheckFieldProps) {
   return (
     <div className="grid gap-1.5">
       <div className="flex items-center gap-2">
         <Check id={id} checked={checked} onChange={onChange} />
         <label htmlFor={id} className="cursor-pointer text-ink">
           {label}
+          {required && <span className="ml-1 text-red">*</span>}
         </label>
       </div>
+      {error ? (
+        <p role="alert" className="m-0 max-w-[66ch] pl-5.5 text-data-lg text-red">
+          {error}
+        </p>
+      ) : null}
       {description !== undefined && <p className={cn('m-0 pl-5.5', HINT)}>{description}</p>}
     </div>
   );

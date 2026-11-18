@@ -92,6 +92,8 @@ pub(crate) mod tests;
         crate::playbooks::api::drafts::get_playbook_draft_files,
         crate::playbooks::api::drafts::get_playbook_draft_preview,
         crate::playbooks::api::drafts::get_playbook_draft_origin_files,
+        crate::playbooks::api::drafts::get_playbook_draft_history,
+        crate::playbooks::api::drafts::get_playbook_draft_diff,
         crate::playbooks::api::drafts::get_playbook_draft_tarball,
         crate::playbooks::api::drafts::save_playbook_draft,
         crate::playbooks::api::drafts::delete_playbook_draft,
@@ -112,6 +114,7 @@ pub(crate) mod tests;
         crate::playbooks::api::registry::launch_playbook,
         crate::launches::api::playbook_runs::list_playbook_runs,
         crate::launches::api::playbook_runs::get_playbook_run,
+        crate::launches::api::playbook_runs::cancel_playbook_run,
         crate::launches::api::playbook_runs::create_one_shot,
         crate::launches::api::playbook_runs::list_one_shots,
         crate::launches::api::playbook_runs::cancel_one_shot,
@@ -120,6 +123,8 @@ pub(crate) mod tests;
         crate::launches::api::schedules::get_schedule,
         crate::launches::api::schedules::update_schedule,
         crate::launches::api::schedules::delete_schedule,
+        crate::launches::api::schedules::fire_schedule,
+        crate::launches::api::schedules::test_fire_schedule,
         crate::launches::api::schedules::preview_schedule,
         crate::launches::api::watches::create_watch,
         crate::launches::api::watches::list_watches,
@@ -296,6 +301,11 @@ pub(crate) mod tests;
         crate::playbooks::api::drafts::DraftVersionDto,
         crate::playbooks::api::drafts::DraftCompileDto,
         crate::playbooks::api::drafts::DraftFilesDto,
+        crate::playbooks::api::drafts::DraftHistoryEntryDto,
+        crate::playbooks::api::drafts::DraftChangedFileDto,
+        crate::playbooks::api::drafts::DraftDiffDto,
+        crate::playbooks::api::drafts::DraftFileDiffDto,
+        crate::playbooks::draft_history::FileChange,
         crate::playbooks::api::drafts::StaleBaseBody,
         crate::playbooks::api::drafts::CoDraftDto,
         crate::playbooks::api::drafts::CoDraftStepDto,
@@ -327,6 +337,9 @@ pub(crate) mod tests;
         crate::launches::api::schedules::ScheduleBody,
         crate::launches::api::schedules::SchedulePreviewBody,
         crate::launches::api::schedules::SchedulePreviewDto,
+        crate::launches::api::schedules::TestFireBody,
+        crate::launches::api::schedules::TestFireAck,
+        crate::launches::model::TestCursor,
         crate::launches::api::watches::WatchDto,
         crate::launches::api::watches::WatchBody,
         crate::launches::api::watches::WatchHitDto,
@@ -514,6 +527,12 @@ pub fn router(state: ApiState) -> Router {
             crate::playbooks::api::drafts::get_playbook_draft_origin_files
         ))
         .routes(routes!(
+            crate::playbooks::api::drafts::get_playbook_draft_history
+        ))
+        .routes(routes!(
+            crate::playbooks::api::drafts::get_playbook_draft_diff
+        ))
+        .routes(routes!(
             crate::playbooks::api::drafts::get_playbook_draft_tarball
         ))
         .routes(
@@ -561,6 +580,9 @@ pub fn router(state: ApiState) -> Router {
             crate::launches::api::playbook_runs::get_playbook_run
         ))
         .routes(routes!(
+            crate::launches::api::playbook_runs::cancel_playbook_run
+        ))
+        .routes(routes!(
             crate::launches::api::playbook_runs::create_one_shot
         ))
         .routes(routes!(crate::launches::api::playbook_runs::list_one_shots))
@@ -577,6 +599,8 @@ pub fn router(state: ApiState) -> Router {
             crate::launches::api::schedules::update_schedule,
             crate::launches::api::schedules::delete_schedule
         ))
+        .routes(routes!(crate::launches::api::schedules::fire_schedule))
+        .routes(routes!(crate::launches::api::schedules::test_fire_schedule))
         .routes(routes!(
             crate::launches::api::watches::create_watch,
             crate::launches::api::watches::list_watches
@@ -762,6 +786,7 @@ pub fn router(state: ApiState) -> Router {
             crate::authz::bindings::enforce,
         ))
         .layer(axum::middleware::from_fn(trace_requests))
+        .layer(tower_http::compression::CompressionLayer::new())
         .with_state(state)
 }
 

@@ -52,9 +52,19 @@ impl FromRequestParts<ApiState> for OperatorGuard {
         state: &ApiState,
     ) -> Result<Self, Self::Rejection> {
         let caller = Caller::from_request_parts(parts, state).await?;
-        match caller.role() {
-            Role::Admin | Role::Operator => Ok(OperatorGuard),
-            Role::Viewer => Err(forbidden(&caller, "a platform operator")),
+        match is_operator(&caller) {
+            true => Ok(OperatorGuard),
+            false => Err(not_operator(&caller)),
         }
     }
+}
+
+/// Whether `caller` is a platform operator or administrator.
+pub(crate) fn is_operator(caller: &Caller) -> bool {
+    matches!(caller.role(), Role::Admin | Role::Operator)
+}
+
+/// The 403 a caller who is not a platform operator gets.
+pub(crate) fn not_operator(caller: &Caller) -> Response {
+    forbidden(caller, "a platform operator")
 }

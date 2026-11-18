@@ -266,6 +266,13 @@ pub struct BuildArgs {
     /// Point ccache in every RUN step at the server's shared cache; needs ccache 4.4 or later
     #[arg(long, requires = "server", conflicts_with = "image")]
     pub ccache: bool,
+    /// What builds the Dockerfile on the server (default the server's); buildkit is experimental
+    #[arg(long, value_enum, requires = "server", conflicts_with_all = ["image", "base"])]
+    pub builder: Option<jobs::Builder>,
+    /// How the layers the build adds are compressed (default gzip); zstd needs --builder buildkit
+    /// or a server that defaults to it
+    #[arg(long, value_enum, requires = "server", conflicts_with_all = ["image", "base"])]
+    pub compression: Option<jobs::Compression>,
     /// Run --script in this image instead of building the Dockerfile; the build is the image plus
     /// --path as one new layer
     #[arg(long, requires_all = ["server", "script", "path"], conflicts_with = "image")]
@@ -378,6 +385,8 @@ impl BuildArgs {
             timeout_s: self.timeout,
             caches,
             ccache: self.ccache,
+            builder: self.builder,
+            compression: self.compression,
             base: self.base.clone(),
             script: self.script.clone(),
             path: self.path.clone(),
@@ -443,7 +452,7 @@ async fn main() -> Result<ExitCode> {
         .with_target(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,rmcp=warn")),
         )
         .init();
     let cli = Cli::parse();
@@ -497,7 +506,10 @@ async fn main() -> Result<ExitCode> {
             }
         }
         Cmd::Status { build_id, server } => {
-            let call = Call::Status(StatusParams { build_id });
+            let call = Call::Status(StatusParams {
+                build_id,
+                wait_seconds: None,
+            });
             return Ok(remote(&server.server, Ok(call)).await);
         }
         Cmd::Run(args) => {
@@ -572,6 +584,73 @@ mod tests {
             Ok(_) => panic!("{argv:?} parsed"),
             Err(e) => e.to_string(),
         }
+    }
+
+    #[test]
+    fn the_server_takes_bud_arguments_that_start_with_a_dash() {
+        let args = match parse(&[
+            "mcp",
+            "--tokens-file",
+            "/t",
+            "--bud-arg=--retry",
+            "--bud-arg=5",
+        ]) {
+            Ok(Cmd::Mcp(args)) => args,
+            Ok(_) => panic!("not the server"),
+            Err(e) => panic!("{e}"),
+        };
+        assert_eq!(args.bud_args, ["--retry", "5"]);
+    }
+
+    #[test]
+    fn the_server_caches_buildkit_layers_in_the_registry_as_zstd_unless_told_otherwise() {
+        let server = |extra: &[&str]| {
+            let argv = [&["mcp", "--tokens-file", "/t"], extra].concat();
+            match parse(&argv) {
+                Ok(Cmd::Mcp(args)) => (args.layer_cache, args.layer_compression),
+                Ok(_) => panic!("not the server"),
+                Err(e) => panic!("{e}"),
+            }
+        };
+        use crate::jobs::{Compression, LayerCache};
+        assert_eq!(server(&[]), (LayerCache::Registry, Compression::Zstd));
+        assert_eq!(
+            server(&["--layer-cache", "off", "--layer-compression", "gzip"]),
+            (LayerCache::Off, Compression::Gzip)
+        );
+        assert_eq!(
+            server(&["--layer-compression", "uncompressed"]).1,
+            Compression::Uncompressed
+        );
+        assert!(refused(&["mcp", "--tokens-file", "/t", "--layer-cache", "s3"]).contains("s3"));
+    }
+
+    #[test]
+    fn a_server_build_may_ask_for_zstd_layers() {
+        use crate::jobs::Compression;
+        let build = |extra: &[&str]| {
+            let argv = [&["build", "--server", "/s", "-c", "."], extra].concat();
+            match parse(&argv) {
+                Ok(Cmd::Build(args)) => args.params().unwrap().compression,
+                _ => panic!("{argv:?} is a server build"),
+            }
+        };
+        assert_eq!(build(&[]), None);
+        assert_eq!(build(&["--compression", "zstd"]), Some(Compression::Zstd));
+        assert_eq!(build(&["--compression", "gzip"]), Some(Compression::Gzip));
+        assert!(refused(&["build", "--server", "/s", "--compression", "lz4"]).contains("lz4"));
+        assert!(refused(&["build", "img:t", "--compression", "zstd"]).contains("--compression"));
+        let layer = ["--base", "b:1", "--script", "make", "--path", "/src"];
+        assert!(
+            refused(
+                &[
+                    &["build", "--server", "/s", "--compression", "zstd"],
+                    &layer[..]
+                ]
+                .concat()
+            )
+            .contains("--base")
+        );
     }
 
     #[test]

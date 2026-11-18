@@ -54,6 +54,12 @@ describe('ansiPlain', () => {
     expect(ansiPlain(TRACING)).toBe('2026-11-04T20:04:14.524641Z  INFO serve_inner: task cancelled');
     expect(ansiPlain('')).toBe('');
   });
+
+  it('keeps every line of a log and its line breaks', () => {
+    expect(ansiPlain('\x1b[31merror\x1b[0m: no such file\n\n[2/3] \x1b[1mBuilding\x1b[0m\n')).toBe(
+      'error: no such file\n\n[2/3] Building\n',
+    );
+  });
 });
 
 describe('ansiClasses', () => {

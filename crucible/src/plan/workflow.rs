@@ -278,6 +278,10 @@ pub struct WorkflowCfg {
         skip_serializing_if = "crate::host_env::DeclaredEnv::is_empty"
     )]
     pub env: crate::host_env::DeclaredEnv,
+    /// The run's MCP servers `command` and `evaluate` tasks reach, by the name the controller
+    /// grants each under. Manifest-only: a compiled source carries the manifest's across.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub servers: Vec<crucible_contract::agent_servers::ServerName>,
     #[serde(rename = "task", default)]
     pub tasks: Vec<Task>,
 }

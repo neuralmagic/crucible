@@ -14,9 +14,8 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::manifest::{
-    AgentOverridesCfg, GitRef, GitRefError, Harness, ReasoningEffort, RepoOverridesCfg,
-};
+use crate::knobs::{Harness, ReasoningEffort};
+use crate::manifest::{AgentOverridesCfg, GitRef, GitRefError, RepoOverridesCfg};
 use crate::plan::diag;
 use crate::plan::ir::{Task, TaskKind, TaskName};
 
@@ -102,6 +101,17 @@ impl AgentSettings {
 /// The address of the checkout's ref.
 pub const REPO_REF: &str = "repo.ref";
 
+/// The address that makes a launch a choices refresh ([ADR-0074]): it compiles only the tasks
+/// that produce launch-form choices, and takes no parameters.
+///
+/// [ADR-0074]: ../../../docs/adr/ADR-0074.md
+pub const CHOICES_REFRESH: &str = "choices.refresh";
+
+/// Whether the supplied launch values ask for a choices refresh.
+pub fn is_refresh(supplied: &BTreeMap<String, String>) -> bool {
+    supplied.get(CHOICES_REFRESH).map(String::as_str) == Some("true")
+}
+
 /// What one launch set: agent settings by target, and the ref to check out.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct LaunchSettings {
@@ -109,6 +119,8 @@ pub struct LaunchSettings {
     agents: BTreeMap<Target, AgentSettings>,
     #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
     repo_ref: Option<GitRef>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    refresh: bool,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -197,44 +209,32 @@ pub fn parse_effort(raw: &str) -> Option<ReasoningEffort> {
 const HARNESS_NAMES: &str = "claude, codex, opencode or pi";
 const EFFORT_NAMES: &str = "low, medium, high, xhigh or max";
 
-/// A harness or effort an agent task sets that no turn could read.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-#[error("task {task:?} sets {knob} {got:?}, which is not {expected}")]
-pub struct UnknownAgentKnob {
-    task: String,
-    knob: &'static str,
-    got: String,
-    expected: &'static str,
+/// An agent task's `harness`, read the way a turn reads it.
+pub fn harness_knob<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Harness>, D::Error> {
+    use serde::Deserialize;
+    use serde::de::Error;
+    Option::<String>::deserialize(d)?
+        .map(|raw| {
+            parse_harness(&raw)
+                .ok_or_else(|| D::Error::custom(format!("harness {raw:?} is not {HARNESS_NAMES}")))
+        })
+        .transpose()
 }
 
-/// Refuse a harness or effort no turn could read, before anything runs.
-pub fn check_agent_knobs(tasks: &[Task]) -> Result<(), UnknownAgentKnob> {
-    for task in tasks {
-        let TaskKind::Agent {
-            harness, effort, ..
-        } = &task.task
-        else {
-            continue;
-        };
-        let unknown = |knob, got: &String, expected| UnknownAgentKnob {
-            task: task.name.0.clone(),
-            knob,
-            got: got.clone(),
-            expected,
-        };
-        if let Some(h) = harness
-            && parse_harness(h).is_none()
-        {
-            return Err(unknown("harness", h, HARNESS_NAMES));
-        }
-        if let Some(e) = effort
-            && parse_effort(e).is_none()
-        {
-            return Err(unknown("effort", e, EFFORT_NAMES));
-        }
-    }
-    Ok(())
+/// An agent task's `effort`, read the way a turn reads it.
+pub fn effort_knob<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<ReasoningEffort>, D::Error> {
+    use serde::Deserialize;
+    use serde::de::Error;
+    Option::<String>::deserialize(d)?
+        .map(|raw| {
+            parse_effort(&raw)
+                .ok_or_else(|| D::Error::custom(format!("effort {raw:?} is not {EFFORT_NAMES}")))
+        })
+        .transpose()
 }
+
 const MODEL_SHAPE: &str = "a model name: letters, digits and . _ - : / @ [ ], not starting with -";
 
 /// A model name that reaches a harness as exactly one argument.
@@ -253,7 +253,19 @@ impl LaunchSettings {
     pub fn parse(addressed: &BTreeMap<String, String>) -> Result<Self, SettingsError> {
         let mut settings: BTreeMap<Target, AgentSettings> = BTreeMap::new();
         let mut repo_ref = None;
+        let mut refresh = false;
         for (address, raw) in addressed {
+            if address == CHOICES_REFRESH {
+                if raw != "true" {
+                    return Err(SettingsError::BadValue {
+                        address: address.clone(),
+                        got: raw.clone(),
+                        expected: "true",
+                    });
+                }
+                refresh = true;
+                continue;
+            }
             if address == REPO_REF {
                 repo_ref =
                     Some(GitRef::parse(raw).map_err(|source| SettingsError::BadRef { source })?);
@@ -311,11 +323,17 @@ impl LaunchSettings {
         Ok(Self {
             agents: settings,
             repo_ref,
+            refresh,
         })
     }
 
     pub fn is_empty(&self) -> bool {
-        self.agents.is_empty() && self.repo_ref.is_none()
+        self.agents.is_empty() && self.repo_ref.is_none() && !self.refresh
+    }
+
+    /// Whether this launch is a choices refresh.
+    pub fn refresh(&self) -> bool {
+        self.refresh
     }
 
     /// The `*.<setting>` values.
@@ -378,17 +396,18 @@ impl LaunchSettings {
                 ..
             } = &mut task.task
             {
-                let pick = |field: fn(&AgentSettings) -> Option<String>,
-                            current: &mut Option<String>| {
-                    if let Some(value) = own.and_then(field) {
-                        *current = Some(value);
-                    } else if current.is_none() {
-                        *current = all.and_then(field);
-                    }
-                };
-                pick(|s| s.harness.map(|h| h.as_str().to_owned()), harness);
-                pick(|s| s.model.clone(), model);
-                pick(|s| s.effort.map(|e| e.as_flag().to_owned()), effort);
+                *harness = own
+                    .and_then(|s| s.harness)
+                    .or(*harness)
+                    .or_else(|| all.and_then(|s| s.harness));
+                *model = own
+                    .and_then(|s| s.model.clone())
+                    .or_else(|| model.take())
+                    .or_else(|| all.and_then(|s| s.model.clone()));
+                *effort = own
+                    .and_then(|s| s.effort)
+                    .or(*effort)
+                    .or_else(|| all.and_then(|s| s.effort));
             }
         }
         Ok(())
@@ -436,10 +455,9 @@ fn check_target(
 mod tests {
     use std::collections::BTreeMap;
 
-    use crate::manifest::launch::{
-        LaunchSettings, Setting, SettingsError, check_agent_knobs, split,
-    };
-    use crate::manifest::{AgentOverridesCfg, GitRef, Harness, ReasoningEffort, RepoOverridesCfg};
+    use crate::knobs::{Harness, ReasoningEffort};
+    use crate::manifest::launch::{LaunchSettings, Setting, SettingsError, split};
+    use crate::manifest::{AgentOverridesCfg, GitRef, RepoOverridesCfg};
     use crate::plan::ir::{Task, TaskKind};
     use crate::plan::workflow::WorkflowCfg;
 
@@ -480,7 +498,10 @@ mod tests {
         .tasks
     }
 
-    fn knobs(tasks: &[Task], name: &str) -> (Option<String>, Option<String>, Option<String>) {
+    fn knobs(
+        tasks: &[Task],
+        name: &str,
+    ) -> (Option<Harness>, Option<String>, Option<ReasoningEffort>) {
         let task = tasks
             .iter()
             .find(|t| t.name.0 == name)
@@ -491,7 +512,7 @@ mod tests {
                 model,
                 effort,
                 ..
-            } => (harness.clone(), model.clone(), effort.clone()),
+            } => (*harness, model.clone(), *effort),
             other => panic!("{name} is not an agent task: {other:?}"),
         }
     }
@@ -596,22 +617,26 @@ mod tests {
 
         assert_eq!(
             knobs(&tasks, "plan"),
-            (None, s("launched-all"), s("high")),
+            (None, s("launched-all"), Some(ReasoningEffort::High)),
             "a task that sets nothing takes *.<setting>"
         );
         assert_eq!(
             knobs(&tasks, "review"),
-            (None, s("launched-review"), s("low")),
+            (None, s("launched-review"), Some(ReasoningEffort::Low)),
             "<task>.<setting> replaces the task's own value; *.<setting> does not"
         );
         assert_eq!(
             knobs(&tasks, "write"),
-            (None, s("authored-write"), s("high")),
+            (None, s("authored-write"), Some(ReasoningEffort::High)),
             "the task's own value beats *.<setting>"
         );
         assert_eq!(
             knobs(&tasks, "pair-a"),
-            (s("codex"), s("launched-all"), s("high")),
+            (
+                Some(Harness::Codex),
+                s("launched-all"),
+                Some(ReasoningEffort::High)
+            ),
             "a session's tasks take *.<setting> alike"
         );
         assert_eq!(knobs(&tasks, "pair-a"), knobs(&tasks, "pair-b"));
@@ -805,33 +830,37 @@ mod tests {
     }
 
     #[test]
-    fn check_agent_knobs_names_the_task_the_setting_and_the_choices() {
+    fn a_task_harness_or_effort_no_turn_could_read_does_not_parse() {
         let tasks = |knobs: &str| {
             toml::from_str::<WorkflowCfg>(&format!(
                 "[[task]]\nname = \"a\"\nkind = \"agent\"\nprompt = \"p\"\n{knobs}\n\
                  [[task]]\nname = \"b\"\nkind = \"command\"\ncommand = \"true\"\n"
             ))
-            .expect("parses")
-            .tasks
+            .map(|workflow| workflow.tasks)
+            .map_err(|e| e.to_string())
         };
+        let refused = |knobs: &str| tasks(knobs).expect_err("refused");
+        assert!(
+            refused("harness = \"gpt\"")
+                .contains("harness \"gpt\" is not claude, codex, opencode or pi")
+        );
+        assert!(
+            refused("effort = \"extreme\"")
+                .contains("effort \"extreme\" is not low, medium, high, xhigh or max")
+        );
+        let read = tasks("harness = \"OpenCode\"\neffort = \"XHigh\"\nmodel = \"anything\"")
+            .expect("read case-insensitively; a model is not checked here");
         assert_eq!(
-            check_agent_knobs(&tasks("harness = \"gpt\"")).map_err(|e| e.to_string()),
-            Err(
-                "task \"a\" sets harness \"gpt\", which is not claude, codex, opencode or pi"
-                    .into()
+            knobs(&read, "a"),
+            (
+                Some(Harness::OpenCode),
+                s("anything"),
+                Some(ReasoningEffort::Xhigh)
             )
         );
         assert_eq!(
-            check_agent_knobs(&tasks("effort = \"extreme\"")).map_err(|e| e.to_string()),
-            Err(
-                "task \"a\" sets effort \"extreme\", which is not low, medium, high, xhigh or max"
-                    .into()
-            )
+            knobs(&tasks("").expect("nothing set"), "a"),
+            (None, None, None)
         );
-        check_agent_knobs(&tasks(
-            "harness = \"OpenCode\"\neffort = \"XHigh\"\nmodel = \"anything\"",
-        ))
-        .expect("read case-insensitively; a model is not checked here");
-        check_agent_knobs(&tasks("")).expect("nothing set");
     }
 }

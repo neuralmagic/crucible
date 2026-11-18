@@ -1,0 +1,11 @@
+# crucible-kueue for the kind e2e: the binary built from this checkout on a slim base.
+ARG BASE=debian:bookworm-slim
+FROM ${BASE}
+RUN apt-get update -qq \
+    && apt-get install -y -qq --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY crucible-kueue /usr/local/bin/crucible-kueue
+RUN crucible-kueue --help >/dev/null
+USER 65532
+EXPOSE 8850
+ENTRYPOINT ["crucible-kueue"]

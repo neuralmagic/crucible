@@ -61,6 +61,27 @@ impl PodDispatcher for KubePodDispatcher {
         Ok(())
     }
 
+    async fn set_secret_value(
+        &self,
+        cluster: &str,
+        namespace: &str,
+        secret: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<()> {
+        let client = self.clusters.client(cluster).await?;
+        let api: kube::Api<Secret> = kube::Api::namespaced(client, namespace);
+        let patch = serde_json::json!({ "stringData": { key: value } });
+        api.patch(
+            secret,
+            &kube::api::PatchParams::default(),
+            &kube::api::Patch::Merge(&patch),
+        )
+        .await
+        .with_context(|| format!("patching Secret {namespace}/{secret}"))?;
+        Ok(())
+    }
+
     async fn create_service(
         &self,
         cluster: &str,
@@ -325,4 +346,65 @@ pub(crate) fn terminated_message(status: Option<&PodStatus>) -> Option<String> {
         .iter()
         .find_map(|cs| cs.state.as_ref()?.terminated.as_ref()?.message.clone())
         .filter(|m| !m.trim().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct ApiCall {
+        resource: &'static str,
+        verb: &'static str,
+    }
+
+    const LOOP_NAMESPACE_CALLS: [ApiCall; 7] = [
+        ApiCall {
+            resource: "pods",
+            verb: "create",
+        },
+        ApiCall {
+            resource: "pods",
+            verb: "get",
+        },
+        ApiCall {
+            resource: "pods",
+            verb: "delete",
+        },
+        ApiCall {
+            resource: "pods/log",
+            verb: "get",
+        },
+        ApiCall {
+            resource: "configmaps",
+            verb: "create",
+        },
+        ApiCall {
+            resource: "secrets",
+            verb: "create",
+        },
+        ApiCall {
+            resource: "secrets",
+            verb: "patch",
+        },
+    ];
+
+    #[test]
+    fn the_rendered_dispatch_role_grants_every_call_the_dispatcher_makes() {
+        let rules = crucible::deploy::render::dispatch::rules();
+        for call in LOOP_NAMESPACE_CALLS {
+            assert!(
+                crucible::deploy::render::dispatch::grants(&rules, call.resource, call.verb),
+                "the dispatch Role does not grant {} on {}",
+                call.verb,
+                call.resource
+            );
+        }
+    }
+
+    #[test]
+    fn rewriting_a_run_secret_is_among_the_calls_the_role_must_grant() {
+        assert!(LOOP_NAMESPACE_CALLS.contains(&ApiCall {
+            resource: "secrets",
+            verb: "patch",
+        }));
+    }
 }

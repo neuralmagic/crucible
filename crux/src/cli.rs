@@ -57,6 +57,12 @@ enum Command {
     /// Recurrences: what fires when, and whether each is enabled.
     Schedules(ops::launches::Schedules),
 
+    /// Fire a schedule now instead of at its next window. Its run advances the cursor.
+    ScheduleFire(ops::launches::ScheduleFire),
+
+    /// Launch a schedule once without moving it or its cursor. Costs money against its max_cost.
+    ScheduleTestFire(ops::launches::ScheduleTestFire),
+
     /// Tracker watches: what each sweeps, and whether each is enabled.
     Watches(ops::launches::Watches),
 
@@ -124,6 +130,8 @@ enum Command {
     /// Adopt a scenario: a controller issue with no upstream.
     Adopt(AdoptArgs),
 
+    /// Cancel a playbook launch: park it and delete its running pods.
+    Cancel(ops::playbooks::Cancel),
     /// Park an issue: stop working it, and record why.
     Park(ops::issues::Park),
 
@@ -184,6 +192,14 @@ enum Command {
 
     /// A draft pack's files at one save, with the version a save must be based on.
     DraftFiles(ops::drafts::DraftFiles),
+
+    /// A draft's saves as a changelog, newest first: who saved each, whether it compiled, and
+    /// which files it changed.
+    DraftLog(ops::drafts::DraftLog),
+
+    /// The unified diff between two saves of a draft. Defaults to the newest save against the one
+    /// before it; any two versions compare, in either order.
+    DraftDiff(ops::drafts::DraftDiff),
 
     /// Create a draft pack in the authoring studio, from a template or a skeleton.
     DraftCreate(ops::drafts::DraftCreate),
@@ -432,6 +448,8 @@ pub async fn run() -> Result<()> {
         Command::Runs(op) => op.run(&c).await?,
         Command::Run(op) => op.run(&c).await?,
         Command::Schedules(op) => op.run(&c).await?,
+        Command::ScheduleFire(op) => op.run(&c).await?,
+        Command::ScheduleTestFire(op) => op.run(&c).await?,
         Command::Watches(op) => op.run(&c).await?,
         Command::Watch(op) => op.run(&c).await?,
         Command::Webhooks(op) => op.run(&c).await?,
@@ -454,6 +472,7 @@ pub async fn run() -> Result<()> {
         Command::Issues(op) => op.run(&c).await?,
         Command::Issue(op) => op.run(&c).await?,
         Command::Adopt(args) => args.into_op()?.run(&c).await?,
+        Command::Cancel(op) => op.run(&c).await?,
         Command::Park(op) => op.run(&c).await?,
         Command::Unpark(op) => op.run(&c).await?,
         Command::Bump(op) => op.run(&c).await?,
@@ -482,6 +501,8 @@ pub async fn run() -> Result<()> {
         Command::Approvals(op) => op.run(&c).await?,
         Command::PlaybookImport(op) => op.run(&c).await?,
         Command::DraftFiles(op) => op.run(&c).await?,
+        Command::DraftLog(op) => op.run(&c).await?,
+        Command::DraftDiff(op) => op.run(&c).await?,
         Command::DraftCreate(op) => op.run(&c).await?,
         Command::DraftSave(args) => args.into_op()?.run(&c).await?,
         Command::DraftPull(op) => op.run(&c).await?,

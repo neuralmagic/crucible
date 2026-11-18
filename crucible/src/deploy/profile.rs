@@ -158,6 +158,24 @@ impl TryFrom<String> for ServiceAccountRef {
     }
 }
 
+/// The allowlist profile crucible-kueue checks pod templates against.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KueueAllowlist {
+    #[default]
+    Strict,
+    Tenant,
+}
+
+impl KueueAllowlist {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Tenant => "tenant",
+        }
+    }
+}
+
 /// The `[kueue]` table. The server on each of `clusters` accepts runs' tokens from the controller's
 /// agent issuer and acts for each as its `kube_user`, as Kubernetes RBAC decides.
 #[derive(Debug, Deserialize)]
@@ -212,6 +230,20 @@ pub struct KueueCfg {
     /// registry (a host or host/path prefix).
     #[serde(default)]
     pub pull_secrets: Vec<String>,
+    /// The StorageClasses a workload's volume claims may name, by cluster:
+    /// `storage_classes = { east = ["fast-local"] }`. On a cluster with none, a claim names none
+    /// and takes the cluster's default class.
+    #[serde(default)]
+    pub storage_classes: BTreeMap<String, Vec<String>>,
+    /// What a pod template may ask for. `strict`, the default, refuses Secrets, volume claims
+    /// beyond ephemeral ones, tolerations, priority classes and resource claims; `tenant` admits
+    /// them, which GPU workloads that tolerate a node taint or read a model token need.
+    #[serde(default)]
+    pub allowlist_profile: KueueAllowlist,
+    /// Secrets in the shared namespaces a run's pod templates may read, besides the pull
+    /// secrets. Under `tenant` only: `strict` refuses every Secret reference.
+    #[serde(default)]
+    pub secrets: Vec<KubeName>,
     /// Also serve people's MCP clients, with tokens from the same issuer: each cluster's server is
     /// then a resource people may get tokens for.
     #[serde(default)]
@@ -414,8 +446,9 @@ pub struct BuilditCfg {
     /// manages the namespace and holds pods that name no queue.
     #[serde(default)]
     pub queue: Option<KubeName>,
-    /// Builder pods on every cluster: `node_arch`, `max_builds`, `pod_deadline_secs`, `requests`
-    /// and `limits`. Unset, they run on the loop pod's architecture with buildit's defaults.
+    /// Builder pods on every cluster: `node_arch`, `max_builds`, `pod_deadline_secs`, `requests`,
+    /// `limits`, `builder`, `storage_driver`, `bud_args`, `layer_cache` and `layer_compression`.
+    /// Unset, they run on the loop pod's architecture with buildit's defaults.
     #[serde(default)]
     pub builders: BuilderPods,
     /// Builder pods on one cluster, each setting replacing `builders`' there:
@@ -428,7 +461,8 @@ pub struct BuilditCfg {
     #[serde(default)]
     pub cache: Option<BuilditCacheCfg>,
     /// The image the loop pod takes its `buildit` from, at `/usr/local/bin/buildit`, ahead of the
-    /// loop image's own on the loop container's PATH. Default the loop image's.
+    /// loop image's own on the loop container's PATH. Default the loop image's. A digest pins
+    /// it; a tag such as `:stable` is pulled for every loop pod and follows the tag.
     #[serde(default)]
     pub image: Option<String>,
 }
@@ -792,7 +826,7 @@ pub struct Cluster {
     /// Identities (`namespace/name`) granted get/list on OpenShell `Sandbox` resources in
     /// `sandbox_namespace`: the controller's own identity on this cluster, which reads a bound
     /// sandbox's name from them and, under isolated gateways, starts and tears down each run's
-    /// gateway there.
+    /// gateway there. They are also granted what dispatching run pods into `loop_namespace` takes.
     #[serde(default)]
     pub sandbox_readers: Vec<ServiceAccountRef>,
     /// The SPIFFE Workload API socket path the OpenShell driver mounts (`csi.spiffe.io`) into
@@ -800,6 +834,12 @@ pub struct Cluster {
     /// they exchange for agent tokens. Default [`DEFAULT_SPIFFE_SOCKET`].
     #[serde(default)]
     pub sandbox_spiffe_socket: Option<String>,
+    /// Whether the cluster's SPIRE issues loop pods an SVID
+    /// `spiffe://<trust domain>/crucible/run/<pod name>`. The loop pod then mounts the Workload
+    /// API socket (`csi.spiffe.io`) at [`ClusterCfg::spiffe_socket`], and the controller issues a
+    /// run's task tokens only with that SVID beside its pod token.
+    #[serde(default)]
+    pub loop_svid: bool,
     /// The in-cluster kubeconfig configmap mounted at `/etc/kube` (points kubectl at the API server +
     /// the projected token).
     #[serde(default = "default_kubeconfig_configmap")]
@@ -1213,6 +1253,12 @@ pub struct NotSharedNamespace {
     pub namespace: String,
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("kueue.storage_classes names cluster {cluster:?}, which is not one of kueue.clusters")]
+pub struct NotStorageClassCluster {
+    pub cluster: String,
+}
+
 impl DeployProfile {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
@@ -1230,6 +1276,9 @@ impl DeployProfile {
             .with_context(|| format!("validating deploy profile {}", path.display()))?;
         profile
             .check_shared_namespaces()
+            .with_context(|| format!("validating deploy profile {}", path.display()))?;
+        profile
+            .check_storage_classes()
             .with_context(|| format!("validating deploy profile {}", path.display()))?;
         profile
             .agent_servers()
@@ -1314,6 +1363,19 @@ impl DeployProfile {
             }
         }
         Ok(())
+    }
+
+    /// Refuse a `[kueue] storage_classes` entry for a cluster that is not in `clusters`.
+    pub fn check_storage_classes(&self) -> Result<(), NotStorageClassCluster> {
+        let Some(kueue) = &self.kueue else {
+            return Ok(());
+        };
+        match kueue.storage_classes.keys().find(|c| !kueue.serves(c)) {
+            Some(stray) => Err(NotStorageClassCluster {
+                cluster: stray.clone(),
+            }),
+            None => Ok(()),
+        }
     }
 
     /// The platform the profile states for `cluster`: the hub's on `[cluster]`, a spoke's on its

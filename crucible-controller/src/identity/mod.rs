@@ -8,6 +8,7 @@ pub mod cluster_identity;
 pub mod cluster_link;
 pub mod kube_identity;
 pub mod kube_links;
+pub mod native_sign_in;
 pub mod oidc;
 pub mod people_directory;
 pub mod session;

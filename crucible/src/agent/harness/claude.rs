@@ -4,7 +4,7 @@
 use crate::agent::harness::{Backend, McpServer, TurnArtifacts, json_servers};
 use crate::agent::inference::InferenceEnv;
 use crate::args::TurnAgent;
-use crate::manifest::Harness;
+use crate::knobs::Harness;
 use crate::stream_json::StreamJsonParser;
 use crate::turn_trace::GenAiRecord;
 use crucible::harness::HarnessSpec;
@@ -128,6 +128,16 @@ impl Backend for Claude {
         let mut a = self.sandbox_argv(agent, mcp_seeded);
         insert_session_flags(&mut a, session);
         Ok(a)
+    }
+
+    fn is_session_transcript(
+        &self,
+        file_name: &str,
+        session: &crate::agent::agent_session::SessionTurn,
+    ) -> bool {
+        file_name
+            .strip_suffix(".jsonl")
+            .is_some_and(|id| id == session.provider_id)
     }
 
     /// The `.mcp.json` listing the turn's MCP servers, only when it reaches any.

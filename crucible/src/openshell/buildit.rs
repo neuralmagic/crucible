@@ -108,8 +108,20 @@ impl Buildit<'_> {
                 args.extend([flag.to_string(), format!("{key}={qty}")]);
             }
         }
+        if let Some(builder) = pods.builder {
+            args.extend(["--builder".to_string(), builder.to_string()]);
+        }
         if let Some(driver) = pods.storage_driver {
             args.extend(["--storage-driver".to_string(), driver.to_string()]);
+        }
+        for arg in pods.bud_args.iter().flatten() {
+            args.push(format!("--bud-arg={arg}"));
+        }
+        if let Some(cache) = pods.layer_cache {
+            args.extend(["--layer-cache".to_string(), cache.to_string()]);
+        }
+        if let Some(compression) = pods.layer_compression {
+            args.extend(["--layer-compression".to_string(), compression.to_string()]);
         }
         if let Some(cache) = &self.site.cache {
             args.extend(["--cache-url", &cache.url].map(String::from));
@@ -198,7 +210,9 @@ fn accepts(socket: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::openshell::buildit::*;
-    use crucible_contract::agent_servers::{BuilderPods, SharedCache, StorageDriver};
+    use crucible_contract::agent_servers::{
+        Builder, BuilderPods, LayerCache, LayerCompression, SharedCache, StorageDriver,
+    };
     use std::collections::BTreeMap;
     use std::num::NonZeroU32;
 
@@ -450,7 +464,11 @@ mod tests {
                 ("memory".into(), "16Gi".into()),
             ])),
             limits: Some(BTreeMap::from([("cpu".into(), "32".into())])),
+            builder: Some(Builder::Buildah),
             storage_driver: Some(StorageDriver::Overlay),
+            bud_args: Some(vec!["--retry".into(), "5".into()]),
+            layer_cache: Some(LayerCache::Off),
+            layer_compression: Some(LayerCompression::Gzip),
         };
         let on_arm = RunSite {
             run_id: "r",
@@ -473,8 +491,16 @@ mod tests {
                 "memory=16Gi",
                 "--limit",
                 "cpu=32",
+                "--builder",
+                "buildah",
                 "--storage-driver",
                 "overlay",
+                "--bud-arg=--retry",
+                "--bud-arg=5",
+                "--layer-cache",
+                "off",
+                "--layer-compression",
+                "gzip",
             ],
             "the site's arch wins over the loop pod's"
         );

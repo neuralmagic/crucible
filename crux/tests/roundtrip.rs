@@ -288,6 +288,20 @@ fn draft_files() {
 }
 
 #[test]
+fn draft_log() {
+    same::<ops::drafts::DraftLog>(&["cal"], json!({"draft_id": "cal"}));
+}
+
+#[test]
+fn draft_diff() {
+    same::<ops::drafts::DraftDiff>(
+        &["cal", "--from", "2", "--to", "5", "--stat"],
+        json!({"draft_id": "cal", "from": 2, "to": 5, "stat": true}),
+    );
+    same::<ops::drafts::DraftDiff>(&["cal"], json!({"draft_id": "cal"}));
+}
+
+#[test]
 fn draft_create() {
     same::<ops::drafts::DraftCreate>(
         &["cal", "--description", "d", "--template", "survey"],
@@ -400,6 +414,26 @@ fn secrets() {
 #[test]
 fn schedules() {
     same::<ops::launches::Schedules>(&[], json!({}));
+}
+
+#[test]
+fn schedule_fire() {
+    same::<ops::launches::ScheduleFire>(&["s1", "--json"], json!({"id": "s1", "json": true}));
+}
+
+#[test]
+fn schedule_test_fire() {
+    same::<ops::launches::ScheduleTestFire>(&["s1"], json!({"id": "s1"}));
+    let given = same::<ops::launches::ScheduleTestFire>(
+        &["s1", "--cursor", "2026-01-01T00:00:00Z"],
+        json!({"id": "s1", "cursor": "2026-01-01T00:00:00Z"}),
+    );
+    assert_eq!(given.cursor.as_deref(), Some("2026-01-01T00:00:00Z"));
+    let none = same::<ops::launches::ScheduleTestFire>(
+        &["s1", "--no-cursor"],
+        json!({"id": "s1", "no_cursor": true}),
+    );
+    assert!(none.no_cursor);
 }
 
 #[test]

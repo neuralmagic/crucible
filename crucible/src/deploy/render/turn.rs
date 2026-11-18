@@ -31,7 +31,7 @@ fn strs<'a>(args: impl IntoIterator<Item = &'a str>) -> Vec<String> {
 
 /// `--harness <h>` as argv. The value is clap's own `ValueEnum` name, so the string the pod passes
 /// is by construction the one the in-pod CLI parses back.
-fn harness_arg(harness: Option<crate::manifest::Harness>) -> Vec<String> {
+fn harness_arg(harness: Option<crate::knobs::Harness>) -> Vec<String> {
     use clap::ValueEnum as _;
     harness
         .and_then(|h| h.to_possible_value())
@@ -123,7 +123,7 @@ pub struct TurnOpts {
     /// `crucible scope --propose --authoritative`. Ignored by a rank turn.
     pub authoritative: bool,
     /// The agent harness the in-pod turn runs, passed as `--harness <h>` to both turn kinds. `None` emits no flag, the in-pod engine keeps its manifest/default harness.
-    pub harness: Option<crate::manifest::Harness>,
+    pub harness: Option<crate::knobs::Harness>,
     /// The model the in-pod turn runs, passed as `--model <m>` to both turn kinds.
     /// `None` emits no flag, the in-pod engine derives the model from the resolved harness.
     pub model: Option<String>,
@@ -1251,7 +1251,7 @@ mod tests {
 
     fn opts_with_run_config(
         kind: TurnKind,
-        harness: Option<crate::manifest::Harness>,
+        harness: Option<crate::knobs::Harness>,
         model: Option<&str>,
     ) -> TurnOpts {
         TurnOpts {
@@ -1284,7 +1284,7 @@ mod tests {
                 &profile,
                 &opts_with_run_config(
                     kind,
-                    Some(crate::manifest::Harness::OpenCode),
+                    Some(crate::knobs::Harness::OpenCode),
                     Some("qwen-3-8-27b"),
                 ),
             )

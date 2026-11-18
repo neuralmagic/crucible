@@ -10,6 +10,7 @@ use crucible_mcp_auth::kube::{GROUPS_CLAIM, USER_CLAIM};
 use crucible_mcp_auth::principal::Principal;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 
 pub const DEFAULT_LABEL_DOMAIN: &str = "crucible.dev";
 pub const QUEUE_LABEL: &str = "kueue.x-k8s.io/queue-name";
@@ -35,7 +36,15 @@ pub struct Config {
     /// The image pull secrets a pod template may name, and the ones the server adds itself to a
     /// pod whose image is on their registries; none when empty.
     pub pull_secrets: Vec<PullSecret>,
+    /// The StorageClasses a volume claim template may name. With none, a claim names none and
+    /// takes the cluster's default class.
+    pub storage_classes: BTreeSet<String>,
+    /// The cluster's DNS domain, for the host an exposed workload's Service is reached at.
+    pub cluster_domain: String,
 }
+
+/// The DNS domain of a cluster that names none.
+pub const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
 
 /// An image pull secret in the served namespaces and the registries it pulls from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +143,8 @@ impl Default for Config {
             hardware: Hardware::default(),
             namespaces: Vec::new(),
             pull_secrets: Vec::new(),
+            storage_classes: BTreeSet::new(),
+            cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
         }
     }
 }

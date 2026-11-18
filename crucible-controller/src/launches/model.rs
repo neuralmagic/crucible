@@ -42,6 +42,8 @@ pub(crate) struct NewPlaybookLaunch<'a> {
     pub rerun: Option<&'a RerunOf>,
     /// Where the launch dispatches and with which model, written with the launch row.
     pub dispatch: DispatchPin<'a>,
+    /// The `{param: {run_id, digest}}` choice snapshots admission validated against (ADR-0074).
+    pub choice_snapshots: Option<&'a serde_json::Value>,
 }
 
 /// The cluster and the provider/model a launch dispatches with. Written in the transaction that
@@ -298,6 +300,33 @@ impl LaunchFilter {
         LaunchFilter {
             key: Some(key.to_string()),
             ..LaunchFilter::default()
+        }
+    }
+}
+
+/// What a schedule's test firing receives as its cursor. Stored on the launch, which is what
+/// marks it a test firing.
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+#[serde(tag = "from", rename_all = "snake_case")]
+pub(crate) enum TestCursor {
+    /// The value the schedule holds now.
+    #[default]
+    Stored,
+    /// Nothing, as on the schedule's first firing.
+    None,
+    /// This value in place of the stored one.
+    Value { value: String },
+}
+
+impl TestCursor {
+    /// The cursor the firing receives, given what the schedule holds.
+    pub(crate) fn resolve(&self, stored: Option<String>) -> Option<String> {
+        match self {
+            TestCursor::Stored => stored,
+            TestCursor::None => None,
+            TestCursor::Value { value } => Some(value.clone()),
         }
     }
 }

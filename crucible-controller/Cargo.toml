@@ -17,6 +17,7 @@ strum.workspace = true
 # source of truth, no cross-crate "keep in sync" drift.
 crucible-contract = { path = "../crucible-contract", features = ["openapi"] }
 crucible = { path = "../crucible", default-features = false }
+crucible-vcs = { path = "../crucible-vcs" }
 # The cluster-boundary traits (PodDispatcher, ConfigMapApi) are async + used as `dyn`, which
 # native async-fn-in-trait can't do; async-trait boxes the futures.
 async-trait = "0.1"
@@ -113,6 +114,8 @@ oauth2 = { version = "5", default-features = false }
 # The HTTP API (lane F): default features give the Json/Form extractors the frozen routes need
 # (API clients POST JSON).
 axum = "0.8"
+# zstd for API responses, for clients that ask for it.
+tower-http = { version = "0.6", features = ["compression-gzip", "compression-zstd"] }
 # Server-side HTTP sessions (cookie id -> Postgres row) on the human surface. The store is pinned
 # to its sqlx 0.9 main by git until a release carries it; bump tower-sessions with it.
 tower-sessions = { version = "0.15", default-features = false, features = ["axum-core"] }
@@ -120,6 +123,8 @@ tower-sessions-sqlx-store = { git = "https://github.com/wseaton/tower-sessions-s
 # The tier-ranking cache key (stage 2, lane J): sha256 of an issue's title+body+labels, and the
 # digest an api key's secret half is stored as.
 sha2 = "0.10"
+# Line diffs between two saves of a draft.
+similar = "2"
 # The CSPRNG an api key's secret half comes out of. Already in the tree; named here because the
 # secret's unpredictability is the whole security property.
 rand = "0.10"
@@ -203,6 +208,8 @@ embedded-db = ["dep:postgresql_embedded"]
 
 [dev-dependencies]
 tempfile = "3"
+# Decoding a compressed response in the API tests; already in the tree via tower-http.
+zstd = "0.14"
 # The kueue e2e suites: crucible-kueue served against this controller's agent token endpoint.
 crucible-kueue = { path = "../crucible-kueue" }
 crucible-mcp-auth = { path = "../crucible-mcp-auth", features = ["e2e"] }

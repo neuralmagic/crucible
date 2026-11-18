@@ -317,76 +317,50 @@ pub fn deployed(endpoint: &str, v: &dto::Version, expected: Option<&str>) -> Str
     out
 }
 
-/// A log window's shape: the lines it carries and where to resume. `next` is `None` at the end of
-/// what the controller served, which is the only signal a caller has that it is caught up.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LogWindow {
-    lines: Vec<String>,
-    next: Option<usize>,
-    remaining: usize,
-}
-
 /// The default line ceiling on one window. A run log is unbounded and a tool result is not, so a
 /// window is a handle to a position rather than the log itself.
 pub const LOG_WINDOW_LINES: usize = 200;
 
 /// The byte ceiling on one window, applied before the line ceiling: a run that prints one enormous
 /// line must not blow the result cap just because it is a single line.
-const LOG_WINDOW_BYTES: usize = 16 * 1024;
+pub const LOG_WINDOW_BYTES: usize = 16 * 1024;
 
-/// One window of `text` from line `cursor`, bounded by both ceilings. A cursor past the end yields
-/// an empty window rather than an error, so polling a finished run is not a failure case.
-fn log_window(text: &str, cursor: usize, limit: usize) -> LogWindow {
-    let all: Vec<&str> = text.lines().collect();
-    let start = cursor.min(all.len());
-    let mut lines = Vec::new();
-    let mut bytes = 0;
-    for line in &all[start..] {
-        if lines.len() >= limit || (!lines.is_empty() && bytes + line.len() > LOG_WINDOW_BYTES) {
-            break;
-        }
-        bytes += line.len() + 1;
-        lines.push((*line).to_string());
-    }
-    let end = start + lines.len();
-    LogWindow {
-        lines,
-        next: (end < all.len()).then_some(end),
-        remaining: all.len() - end,
-    }
-}
-
-/// One window of a run's log, headed by where it came from and how to resume.
-pub fn run_log(run_id: &str, log: &dto::RunLog, cursor: usize, limit: usize) -> String {
-    let Some(text) = log.text.as_deref().filter(|t| !t.is_empty()) else {
+/// One window of a run's log read from byte `cursor`, with the cursor to resume from.
+pub fn run_log(run_id: &str, log: &dto::RunLog, cursor: u64) -> anyhow::Result<String> {
+    let Some(text) = log.text.as_deref() else {
         let where_it_is = log
             .location
             .as_deref()
             .unwrap_or("no output recorded for this run");
-        return format!("run {run_id} [{}]: {where_it_is}\n", log.dispatch);
+        return Ok(format!("run {run_id} [{}]: {where_it_is}\n", log.dispatch));
     };
-    let w = log_window(text, cursor, limit);
-    let mut out = format!("run {run_id} [{}]", log.dispatch);
-    if log.truncated {
-        out.push_str(" (head dropped by the controller's cap)");
-    }
-    let _ = writeln!(
-        out,
-        " lines {}..{}, {} remaining",
-        cursor,
-        cursor + w.lines.len(),
-        w.remaining
+    let end = log.resume()?;
+    let mut out = format!(
+        "run {run_id} [{}]",
+        log.source.as_deref().unwrap_or(&log.dispatch)
     );
-    for line in &w.lines {
-        let _ = writeln!(out, "{line}");
+    if log.total_bytes < cursor {
+        let _ = writeln!(
+            out,
+            ": the log is {} bytes, shorter than cursor={cursor}\n-- read it again with cursor=0",
+            log.total_bytes
+        );
+        return Ok(out);
     }
-    match w.next {
+    let _ = writeln!(out, " bytes {}..{end} of {}", log.start, log.total_bytes);
+    out.push_str(text);
+    if !text.is_empty() && !text.ends_with('\n') {
+        out.push('\n');
+    }
+    match log.next {
         Some(next) => {
             let _ = writeln!(out, "-- resume with cursor={next}");
         }
-        None => out.push_str("-- end of log\n"),
+        None => {
+            let _ = writeln!(out, "-- end of log; later output starts at cursor={end}");
+        }
     }
-    out
+    Ok(out)
 }
 
 pub fn run_files(run_id: &str, listing: &dto::RunFiles) -> String {
@@ -705,6 +679,30 @@ pub fn approvals(d: &dto::Approvals) -> String {
             table(&["KEY", "SCOPE", "STALE", "APPROVAL PR"], &rows)
         ));
     }
+    if !d.pending_imports.is_empty() {
+        let rows: Vec<Vec<String>> = d
+            .pending_imports
+            .iter()
+            .map(|i| {
+                vec![
+                    i.id.clone(),
+                    format!("{}/{}", i.repo, i.path),
+                    i.rev.chars().take(12).collect(),
+                    i.proposed_by.clone().unwrap_or_else(|| "-".into()),
+                    if i.compiles {
+                        "yes".into()
+                    } else {
+                        "no".into()
+                    },
+                ]
+            })
+            .collect();
+        out.push_str(&format!(
+            "\n{} pending imports\n{}",
+            d.pending_imports.len(),
+            table(&["ID", "PACK", "REV", "BY", "COMPILES"], &rows)
+        ));
+    }
     if !d.kept_prs.is_empty() {
         out.push_str(&format!("\n{} kept PRs\n", d.kept_prs.len()));
         for p in &d.kept_prs {
@@ -816,6 +814,79 @@ pub fn draft_files(id: &str, f: &dto::DraftFiles) -> String {
         out.push_str(&format!("\n--- {path}\n{content}"));
         if !content.ends_with('\n') {
             out.push('\n');
+        }
+    }
+    out
+}
+
+fn change_letter(change: dto::FileChange) -> char {
+    match change {
+        dto::FileChange::Added => 'A',
+        dto::FileChange::Removed => 'D',
+        dto::FileChange::Modified => 'M',
+    }
+}
+
+pub fn draft_log(id: &str, history: &[dto::DraftHistoryEntry]) -> String {
+    let mut out = format!("draft {id}: {} saves\n", history.len());
+    for entry in history {
+        let compiled = match (&entry.schema_digest, entry.diagnostics) {
+            (Some(_), _) => "compiles".to_string(),
+            (None, n) => format!("does not compile, {n} diagnostics"),
+        };
+        out.push_str(&format!(
+            "v{}  {}  {}  {compiled}\n",
+            entry.version,
+            blank_as_dash(&entry.created_at),
+            or_dash(entry.created_by.as_deref()),
+        ));
+        match entry.changes.as_deref() {
+            None => out.push_str("  changes unknown: no stored tree to compare\n"),
+            Some([]) => out.push_str("  no file changes\n"),
+            Some(changes) => {
+                for file in changes {
+                    out.push_str(&format!("  {} {}\n", change_letter(file.change), file.path));
+                }
+            }
+        }
+    }
+    out
+}
+
+pub fn draft_diff(id: &str, diff: &dto::DraftDiff, stat: bool) -> String {
+    let from = diff
+        .from
+        .map_or_else(|| "empty".to_string(), |v| format!("v{v}"));
+    let mut out = format!("draft {id} {from} -> v{}: ", diff.to);
+    if diff.files.is_empty() {
+        out.push_str("no changes\n");
+        return out;
+    }
+    let additions: u64 = diff.files.iter().map(|f| f.additions).sum();
+    let deletions: u64 = diff.files.iter().map(|f| f.deletions).sum();
+    out.push_str(&format!(
+        "{} files changed, +{additions} -{deletions}\n",
+        diff.files.len()
+    ));
+    for file in &diff.files {
+        let counts = match file.unified {
+            Some(_) => format!("+{} -{}", file.additions, file.deletions),
+            None => "not text".to_string(),
+        };
+        out.push_str(&format!(
+            "{} {}  {counts}\n",
+            change_letter(file.change),
+            file.path
+        ));
+    }
+    if stat {
+        return out;
+    }
+    for file in &diff.files {
+        out.push('\n');
+        match &file.unified {
+            Some(unified) => out.push_str(unified),
+            None => out.push_str(&format!("Binary file {} differs\n", file.path)),
         }
     }
     out
@@ -1126,6 +1197,15 @@ fn price(p: Option<&dto::ProviderPrice>) -> String {
     }
 }
 
+/// The default model's limits as `context window/max output`, or `-` when the registration
+/// names none for it and the harness decides.
+fn limits(p: &dto::Provider) -> String {
+    match p.model_limits.get(&p.default_model) {
+        Some(l) => format!("{}/{}", l.context_window, l.max_output_tokens),
+        None => "-".to_string(),
+    }
+}
+
 pub fn providers(list: &[dto::Provider]) -> String {
     if list.is_empty() {
         return "no providers registered\n".to_string();
@@ -1139,17 +1219,19 @@ pub fn providers(list: &[dto::Provider]) -> String {
                 p.default_model.clone(),
                 p.harness.clone().unwrap_or_else(|| "-".to_string()),
                 price(p.price.as_ref()),
+                limits(p),
                 if p.enabled { "yes" } else { "no" }.to_string(),
                 p.owner.clone(),
             ]
         })
         .collect();
     format!(
-        "{} providers (price: USD per million tokens, input/output/cache read/cache write)\n{}",
+        "{} providers (price: USD per million tokens, input/output/cache read/cache write; \
+         limits: the default model's context window/max output, in tokens)\n{}",
         list.len(),
         table(
             &[
-                "ID", "KIND", "MODEL", "HARNESS", "PRICE", "ENABLED", "OWNER"
+                "ID", "KIND", "MODEL", "HARNESS", "PRICE", "LIMITS", "ENABLED", "OWNER"
             ],
             &rows
         )
@@ -1537,6 +1619,12 @@ pub fn launched(ack: &dto::LaunchAck, run_url: &str) -> String {
         }
     }
     out.push_str(&format!("  {run_url}\n"));
+    if !ack.playbook.is_empty() {
+        out.push_str(&format!(
+            "  {}\n",
+            crate::client::tracker_url(&ack.playbook, &ack.key)
+        ));
+    }
     out
 }
 
@@ -1596,12 +1684,18 @@ mod tests {
     use crate::config::Auth;
     use crate::render::*;
 
-    fn log_of(text: Option<&str>, location: Option<&str>) -> dto::RunLog {
+    /// The controller's answer for the window `start..end` of a log `total` bytes long.
+    fn log_of(text: &str, start: u64, total: u64) -> dto::RunLog {
+        let end = start + text.len() as u64;
         dto::RunLog {
             dispatch: "pod".to_string(),
-            text: text.map(str::to_string),
-            truncated: false,
-            location: location.map(str::to_string),
+            text: Some(text.to_string()),
+            truncated: start > 0 || end < total,
+            start,
+            next: (end < total).then_some(end),
+            total_bytes: total,
+            source: Some("live_pod".to_string()),
+            location: None,
         }
     }
 
@@ -1645,59 +1739,58 @@ mod tests {
         );
     }
 
-    /// A window ends where the caller can resume, and the last one says so instead of handing back
-    /// a cursor that would read nothing.
     #[test]
-    fn a_log_window_reports_where_to_resume_and_where_it_ends() {
-        let text = (0..5)
-            .map(|i| format!("line {i}\n"))
-            .collect::<Vec<_>>()
-            .concat();
+    fn a_log_window_always_reports_where_to_resume() {
+        let mid = run_log("run-1", &log_of("line 0\nline 1\n", 0, 35), 0).unwrap();
+        assert_eq!(
+            mid,
+            "run run-1 [live_pod] bytes 0..14 of 35\nline 0\nline 1\n-- resume with cursor=14\n"
+        );
 
-        let first = log_window(&text, 0, 2);
-        assert_eq!(first.lines, vec!["line 0", "line 1"]);
-        assert_eq!(first.next, Some(2));
-        assert_eq!(first.remaining, 3);
+        let last = run_log("run-1", &log_of("line 4\n", 28, 35), 28).unwrap();
+        assert_eq!(
+            last,
+            "run run-1 [live_pod] bytes 28..35 of 35\nline 4\n\
+             -- end of log; later output starts at cursor=35\n"
+        );
 
-        let last = log_window(&text, 4, 2);
-        assert_eq!(last.lines, vec!["line 4"]);
-        assert_eq!(last.next, None, "the final window resumes nowhere");
-        assert_eq!(last.remaining, 0);
+        let caught_up = run_log("run-1", &log_of("", 35, 35), 35).unwrap();
+        assert_eq!(
+            caught_up,
+            "run run-1 [live_pod] bytes 35..35 of 35\n-- end of log; later output starts at cursor=35\n"
+        );
     }
 
-    /// Polling past the end of a finished run is an empty window, not an error.
     #[test]
-    fn a_cursor_past_the_end_reads_empty() {
-        let w = log_window("only\n", 99, 10);
-        assert!(w.lines.is_empty());
-        assert_eq!(w.next, None);
-        assert_eq!(w.remaining, 0);
+    fn a_cursor_past_a_shorter_log_says_to_start_over() {
+        let out = run_log("run-1", &log_of("", 20, 20), 500).unwrap();
+        assert_eq!(
+            out,
+            "run run-1 [live_pod]: the log is 20 bytes, shorter than cursor=500\n\
+             -- read it again with cursor=0\n"
+        );
     }
 
-    /// One enormous line still comes back — the byte ceiling only stops a window growing past it,
-    /// so a log that never breaks a line cannot stall on an empty window forever.
     #[test]
-    fn one_oversize_line_is_served_rather_than_stalling() {
-        let text = format!("{}\nnext\n", "x".repeat(LOG_WINDOW_BYTES * 2));
-        let w = log_window(&text, 0, LOG_WINDOW_LINES);
-        assert_eq!(w.lines.len(), 1);
-        assert_eq!(w.next, Some(1));
+    fn a_tail_only_controller_is_refused_rather_than_misread() {
+        let mut log = log_of("line\n", 0, 5);
+        log.source = None;
+        let error = run_log("run-1", &log, 0).unwrap_err();
+        assert!(error.to_string().contains("needs upgrading"), "{error}");
     }
 
     /// A run with no output says where to look instead of printing an empty window.
     #[test]
     fn no_output_names_where_it_lives() {
-        let out = run_log(
-            "run-1",
-            &log_of(
-                None,
-                Some("pod loop-abc in namespace crucible-system on cluster wharf"),
-            ),
-            0,
-            10,
-        );
+        let log = dto::RunLog {
+            text: None,
+            source: None,
+            location: Some("pod loop-abc in namespace crucible-system on cluster wharf".into()),
+            ..log_of("", 0, 0)
+        };
+        let out = run_log("run-1", &log, 0).unwrap();
         assert!(out.contains("on cluster wharf"), "{out}");
-        assert!(!out.contains("resume with cursor"), "{out}");
+        assert!(!out.contains("cursor"), "{out}");
     }
 
     /// Every whoami test reads the same controller answer, serialized the way
@@ -1966,6 +2059,10 @@ mod tests {
         assert!(out.contains("agent plat-openai · gpt-5.6-luna"), "{out}");
         assert!(
             out.contains("https://crucible.example.com/playbook-runs/pb-9"),
+            "{out}"
+        );
+        assert!(
+            out.contains("crucible-playbooks://playbook/report/launch/pb-9"),
             "{out}"
         );
         assert!(
@@ -2539,11 +2636,20 @@ mod tests {
         let d: dto::Approvals = serde_json::from_str(
             r#"{"awaiting_approval":[{"key":"owner/repo#12","repo":"owner/repo","scope_id":7,
                  "approval_pr":"https://github.com/owner/repo/pull/9","stale":true}],
+                "pending_imports":[{"id":"01a1a85b","repo":"o/domains","path":"domains/backport",
+                 "rev":"9866066da67cc9c461eeeadaa7122b91de06bf03","proposed_by":"weaton",
+                 "created_at":"2026-11-04T20:58:28Z","compiles":true,"diagnostics":1,"draft_id":null}],
                 "kept_prs":[{"issue":"owner/repo#3","pr_url":"https://github.com/owner/repo/pull/4"}]}"#,
         )
         .expect("parse");
+        assert_eq!(d.waiting(), 2, "a scope to approve and an import to settle");
         let out = approvals(&d);
         assert!(out.starts_with("1 awaiting approval\n"), "{out}");
+        assert!(out.contains("1 pending imports\n"), "{out}");
+        assert!(
+            out.contains("01a1a85b") && out.contains("o/domains/domains/backport  9866066da67c"),
+            "{out}"
+        );
         assert!(
             out.contains("STALE"),
             "a stale pack must not look approvable: {out}"
@@ -2748,6 +2854,63 @@ mod tests {
             "a file without a trailing newline still ends one: {out}"
         );
         assert!(out.contains("\n--- crucible.toml\n[workflow]\n"), "{out}");
+    }
+
+    #[test]
+    fn a_draft_log_reads_as_a_changelog_newest_first() {
+        let history: Vec<dto::DraftHistoryEntry> = serde_json::from_str(
+            r#"[{"version":4,"created_by":"wynn","created_at":"2026-08-23T12:00:00Z",
+                 "schema_digest":null,"diagnostics":2,"previous_version":3,"changes":null},
+                {"version":3,"created_by":"agent-7","created_at":"2026-08-23T11:00:00Z",
+                 "schema_digest":"sha256:cc","diagnostics":0,"previous_version":2,"changes":[]},
+                {"version":2,"created_by":"wynn","created_at":"2026-08-23T10:00:00Z",
+                 "schema_digest":"sha256:bb","diagnostics":0,"previous_version":1,
+                 "changes":[{"path":"old.md","change":"removed"},
+                            {"path":"skills/review.md","change":"added"},
+                            {"path":"wf.crux","change":"modified"}]}]"#,
+        )
+        .expect("the history fixture parses");
+        assert_eq!(
+            draft_log("calibrate", &history),
+            "draft calibrate: 3 saves\n\
+             v4  2026-08-23T12:00:00Z  wynn  does not compile, 2 diagnostics\n\
+             \x20 changes unknown: no stored tree to compare\n\
+             v3  2026-08-23T11:00:00Z  agent-7  compiles\n\
+             \x20 no file changes\n\
+             v2  2026-08-23T10:00:00Z  wynn  compiles\n\
+             \x20 D old.md\n\
+             \x20 A skills/review.md\n\
+             \x20 M wf.crux\n"
+        );
+    }
+
+    #[test]
+    fn a_draft_diff_summarizes_then_prints_each_unified_diff() {
+        let diff: dto::DraftDiff = serde_json::from_str(
+            r#"{"from":2,"to":4,"files":[
+                 {"path":"logo.png","change":"modified","additions":0,"deletions":0,"unified":null},
+                 {"path":"wf.crux","change":"modified","additions":1,"deletions":1,
+                  "unified":"--- a/wf.crux\n+++ b/wf.crux\n@@ -1 +1 @@\n-task a {}\n+task b {}\n"}]}"#,
+        )
+        .expect("the diff fixture parses");
+        let summary = "draft calibrate v2 -> v4: 2 files changed, +1 -1\n\
+                       M logo.png  not text\n\
+                       M wf.crux  +1 -1\n";
+        assert_eq!(draft_diff("calibrate", &diff, true), summary);
+        assert_eq!(
+            draft_diff("calibrate", &diff, false),
+            format!(
+                "{summary}\nBinary file logo.png differs\n\
+                 \n--- a/wf.crux\n+++ b/wf.crux\n@@ -1 +1 @@\n-task a {{}}\n+task b {{}}\n"
+            )
+        );
+
+        let first: dto::DraftDiff =
+            serde_json::from_str(r#"{"from":null,"to":1,"files":[]}"#).expect("parses");
+        assert_eq!(
+            draft_diff("calibrate", &first, false),
+            "draft calibrate empty -> v1: no changes\n"
+        );
     }
 
     #[test]
@@ -2957,6 +3120,7 @@ mod tests {
                 last_delivery_at: Some("2026-09-29T12:00:00Z".to_string()),
                 consecutive_failures: 0,
                 owner_principal: Some("user:wren".to_string()),
+                ..dto::Webhook::default()
             },
             dto::Webhook {
                 id: "w2".to_string(),
@@ -2967,6 +3131,7 @@ mod tests {
                 last_delivery_at: None,
                 consecutive_failures: 2,
                 owner_principal: None,
+                ..dto::Webhook::default()
             },
         ];
         let out = webhooks(&list);
@@ -3062,6 +3227,8 @@ mod tests {
               {"id":"selfhosted","display_name":"Self-hosted","kind":"custom","models":[],
                "default_model":"zai-org/glm-5","harness":"claude","roles":["agent"],
                "price":{"input":0.6,"output":2.2,"cache_read":0.11,"cache_write":0.6},
+               "model_limits":{"zai-org/glm-5":{"context_window":200000,"max_output_tokens":64000},
+                               "small":{"context_window":32768,"max_output_tokens":4096}},
                "enabled":true,"owner":"platform","created_by":"wren",
                "created_at":"2026-10-22T00:00:00Z","updated_at":"2026-10-22T00:00:00Z",
                "actions":[]},
@@ -3082,6 +3249,11 @@ mod tests {
             .find(|l| l.starts_with("selfhosted"))
             .expect("row");
         assert!(row.contains("0.6/2.2/0.11/0.6"), "{row}");
+        assert!(row.contains("200000/64000"), "{row}");
+        assert!(
+            !row.contains("32768"),
+            "only the default model's limits: {row}"
+        );
         assert!(row.contains("yes"), "{row}");
         let openai = rows
             .iter()

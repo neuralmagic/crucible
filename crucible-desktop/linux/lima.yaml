@@ -1,0 +1,33 @@
+# A Fedora 45 GNOME desktop for trying the app's RPM: `just desktop-linux-vm`. The recipe mounts
+# crucible-desktop/target/linux read-only at the same path inside.
+minimumLimaVersion: 2.0.0
+base:
+- template:_images/fedora-45
+vmType: vz
+cpus: 4
+memory: 8GiB
+disk: 40GiB
+video:
+  display: vz
+provision:
+- mode: system
+  script: |
+    #!/bin/sh
+    set -eux
+    if ! rpm -q gnome-shell >/dev/null 2>&1; then
+      dnf -y install @workstation-product-environment mesa-vulkan-drivers vulkan-loader
+    fi
+    mkdir -p /etc/gdm
+    cat > /etc/gdm/custom.conf <<CONF
+    [daemon]
+    AutomaticLoginEnable=True
+    AutomaticLogin={{.User}}
+    CONF
+    systemctl set-default graphical.target
+    systemctl isolate graphical.target
+- mode: user
+  script: |
+    #!/bin/sh
+    set -eux
+    dbus-run-session -- gsettings set org.gnome.desktop.session idle-delay 0
+    dbus-run-session -- gsettings set org.gnome.desktop.screensaver lock-enabled false

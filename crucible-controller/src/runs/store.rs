@@ -511,6 +511,22 @@ pub(crate) async fn running_local_runs(ex: impl PgExecutor<'_>) -> Result<Vec<(S
     Ok(rows.into_iter().map(|r| (r.key, r.run_id)).collect())
 }
 
+/// The issues of runs still `running` on a pod, each once, oldest run first.
+#[tracing::instrument(name = "db.running_pod_run_issues", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
+pub(crate) async fn running_pod_run_issues(ex: impl PgExecutor<'_>) -> Result<Vec<String>> {
+    sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT issue FROM runs
+        WHERE status = 'running' AND pod IS NOT NULL AND issue IS NOT NULL
+        GROUP BY issue
+        ORDER BY min(seq)
+        "#,
+    )
+    .fetch_all(ex)
+    .await
+    .context("running_pod_run_issues")
+}
+
 /// Flip a run row's status without touching the ingest-owned columns — the completion edge's
 /// terminal stamp for a run whose pod finished but published no session log (nothing to fold, but
 /// the row must stop reading `running`).
@@ -770,6 +786,7 @@ mod tests {
                 &pool,
                 launch_key,
                 &NewPlaybookLaunch {
+                    choice_snapshots: None,
                     playbook: "survey",
                     repo: "owner/packs",
                     title: "reads a paper",
@@ -912,6 +929,7 @@ mod tests {
             &pool,
             key,
             &NewPlaybookLaunch {
+                choice_snapshots: None,
                 playbook: "survey",
                 repo: "owner/packs",
                 title: "reads a paper",

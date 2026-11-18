@@ -5,13 +5,15 @@
 //! can't depend on a workspace crate), so change both together if the lockfile shape moves.
 //! `modgraph` prints one crate's module dependency graph; `--check` fails on cycles.
 //! `images` expands the sandbox image feedstock.
+//! `ci` picks the CI jobs a change needs.
 
+mod ci;
 mod generate;
 mod model;
 mod modgraph;
 mod plan;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -50,6 +52,21 @@ enum Cmd {
         /// Print the raw graph as JSON instead of the report.
         #[arg(long)]
         json: bool,
+    },
+    /// CI job selection from changed paths.
+    Ci {
+        #[command(subcommand)]
+        cmd: CiCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum CiCmd {
+    /// Print the jobs a change needs and the packages they build, as GitHub outputs.
+    Plan {
+        /// File of newline-separated changed paths ("-" reads stdin); omit for every job.
+        #[arg(long)]
+        changed: Option<PathBuf>,
     },
 }
 
@@ -100,6 +117,20 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Ci { cmd } => {
+            let planner = crate::ci::Planner::load()?;
+            match cmd {
+                CiCmd::Plan { changed } => {
+                    let changed = changed.as_deref().map(changed_paths).transpose()?;
+                    let (jobs, why) = planner.plan(changed.as_deref());
+                    for line in why {
+                        eprintln!("{line}");
+                    }
+                    print!("{jobs}");
+                    Ok(())
+                }
+            }
+        }
         Cmd::Images { root, cmd } => {
             let feedstock = crate::model::Feedstock::load(&root)?;
             match cmd {
@@ -125,23 +156,7 @@ fn main() -> Result<()> {
                     changed,
                     skip_heavy,
                 } => {
-                    let changed = match changed {
-                        None => None,
-                        Some(path) => {
-                            let raw = if path.as_os_str() == "-" {
-                                std::io::read_to_string(std::io::stdin())?
-                            } else {
-                                std::fs::read_to_string(&path)?
-                            };
-                            Some(
-                                raw.lines()
-                                    .map(str::trim)
-                                    .filter(|l| !l.is_empty())
-                                    .map(String::from)
-                                    .collect::<Vec<_>>(),
-                            )
-                        }
-                    };
+                    let changed = changed.as_deref().map(changed_paths).transpose()?;
                     let matrix =
                         crate::plan::ci_matrix(&feedstock, changed.as_deref(), skip_heavy)?;
                     println!("{}", serde_json::to_string(&matrix)?);
@@ -159,6 +174,21 @@ fn main() -> Result<()> {
             }
         }
     }
+}
+
+/// Changed paths, one per line, from a file or ("-") stdin.
+fn changed_paths(path: &Path) -> Result<Vec<String>> {
+    let raw = if path.as_os_str() == "-" {
+        std::io::read_to_string(std::io::stdin())?
+    } else {
+        std::fs::read_to_string(path)?
+    };
+    Ok(raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(String::from)
+        .collect())
 }
 
 /// Read the workspace `Cargo.lock` (one level above this crate) and extract the rev.

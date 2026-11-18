@@ -93,7 +93,7 @@ similar system. The differences are in the loop around the graph and the state u
 Starlark control flow unrolls into tasks at compile time, which means that task level dynamacism interior
 to a workflow run is not supported. Execution over that fixed task set can repeat. 
 A `revise` pair dispatches a settled task again with the reviewer's verdict under `revision`. This continues until the task stops
-failing or `max_rounds` is spent. A scored run repeats the whole graph in each iteration and
+failing or its `rounds` are spent. A scored run repeats the whole graph in each iteration and
 carries the accepted state, the best score, and the remaining budget forward.
 
 A workflow engine would have to host both cycles. Tekton has no loop construct: a pipeline
@@ -133,6 +133,46 @@ Other tools depend on what you run:
 - Deployment commands that use Kubernetes need `kubectl` and cluster access.
 
 ## Installation
+
+### The desktop app
+
+Crucible Playbooks, the desktop app, tracks what each playbook did and is doing, read from a
+controller or local packs. Each [release](https://github.com/neuralmagic/crucible/releases)
+carries it for Apple silicon Macs and for Fedora, with `crucible-lsp` included. To install the
+newest release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/neuralmagic/crucible/main/scripts/install-desktop.sh | sh
+```
+
+The script takes a version (`| sh -s 0.7.2`), checks the download against its published
+checksum, and on macOS unpacks the app into `/Applications` (`| APPS=~/Applications sh` puts it
+in yours). By hand, on macOS:
+
+```bash
+v=0.7.2
+curl -LO "https://github.com/neuralmagic/crucible/releases/download/v$v/Crucible-Playbooks-v$v-aarch64-apple-darwin.zip"
+ditto -x -k "Crucible-Playbooks-v$v-aarch64-apple-darwin.zip" /Applications
+xattr -d com.apple.quarantine "/Applications/Crucible Playbooks.app"
+open "/Applications/Crucible Playbooks.app"
+```
+
+The app is signed ad hoc, so without the `xattr` step macOS blocks its first launch; System
+Settings, Privacy & Security, Open Anyway allows it too.
+
+And on Fedora (x86_64 or aarch64):
+
+```bash
+v=0.7.2
+sudo dnf install "https://github.com/neuralmagic/crucible/releases/download/v$v/crucible-playbooks-$v-1.fc45.$(uname -m).rpm"
+```
+
+From a checkout, `just desktop-install` builds and installs the macOS app into `~/Applications`,
+and `just desktop-linux` builds the RPM in a Fedora container. The app signs in to a controller
+from its sidebar. [crucible-desktop/README.md](crucible-desktop/README.md) covers profiles,
+tunnels and the rest.
+
+### The crucible binary
 
 Build and install from source:
 
@@ -312,7 +352,7 @@ read = command(name = "read", run = "./read.sh", emits = ["ticket"])
 gate = route(
     name = "gate",
     depends_on = [read],
-    min_confidence = 0.8,
+    decider = model(min_confidence = 0.8),
     questions = {
         "bucket": choice(
             ask = "Which queue owns this ticket?",
@@ -326,9 +366,9 @@ gate = route(
 )
 
 oncall = command(name = "oncall", run = "./act.sh oncall", depends_on = [gate],
-                 when = gate.bucket, answers = "outage")
+                 when = gate.bucket.any_of("outage"))
 backlog = command(name = "backlog", run = "./act.sh backlog", depends_on = [gate],
-                  when = gate.bucket, otherwise = True)
+                  when = gate.bucket.otherwise())
 
 filed = command(name = "filed", run = "./act.sh filed",
                 depends_on = [oncall, backlog], join = "passed")
@@ -346,7 +386,7 @@ under `revision` until `review` stops failing or the rounds are spent:
 ```python
 author = agent(name = "author", prompt = "Write PROBE.md.", emits_files = ["PROBE.md"])
 review = command(name = "review", run = "./check.sh", depends_on = [author],
-                 revise = author, max_rounds = 3)
+                 revise = send_back(author, rounds = 3))
 
 workflow(type = "playbook", tasks = [author, review])
 ```

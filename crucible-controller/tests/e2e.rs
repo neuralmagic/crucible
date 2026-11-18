@@ -526,6 +526,7 @@ async fn register_ranker(db: &Db, url: &str) -> Result<()> {
     reg::upsert(
         db.pool(),
         &reg::NewProvider {
+            model_limits: Default::default(),
             owner: crucible_controller::authz::model::Principal::platform(),
             id: "e2e-ranker",
             display_name: "e2e ranker",
@@ -828,7 +829,7 @@ async fn full_chain_new_to_done_with_once_idempotence() -> Result<()> {
 
     // The assembled daemon — the same `assemble` the binary calls.
     let queue = WorkQueue::new();
-    let overrides = Arc::new(OverrideStore::new());
+    let overrides = Arc::new(OverrideStore::new(db.pool().clone()));
     let wiring = daemon::assemble(
         &db,
         &cfg,
@@ -1091,13 +1092,13 @@ async fn crash_recovery_reconciles_a_missed_completion() -> Result<()> {
     std::fs::write(pack.join("crucible.toml"), LOOP_PACK_MANIFEST)?;
     crucible_controller::playbooks::packs::store_pack_tree(db.pool(), KEY, &pack).await?;
 
-    // Daemon #1: launches the run (the fake writes the session log) but the completion is NEVER
-    // delivered — the pod "finishes" while the controller is down.
+    // Daemon #1: launches the run and dies with the pod still running. The pod "finishes" (its
+    // session log lands) while the controller is down, so the completion is NEVER delivered.
     let (tx1, completions1) = channel_completions();
     let launcher1 = Arc::new(FakePodDispatcher {
         pool: db.pool().clone(),
         deliver: false,
-        held: false,
+        held: true,
         tx: tx1,
         session: SESSION_LOG,
         launches: Mutex::new(Vec::new()),
@@ -1113,7 +1114,7 @@ async fn crash_recovery_reconciles_a_missed_completion() -> Result<()> {
             &db,
             &cfg,
             WorkQueue::new(),
-            Arc::new(OverrideStore::new()),
+            Arc::new(OverrideStore::new(db.pool().clone())),
             completions1,
             crucible_controller::authz::policy::ActivePolicy::default_set()
                 .expect("the shipped default policy set loads"),
@@ -1136,6 +1137,13 @@ async fn crash_recovery_reconciles_a_missed_completion() -> Result<()> {
         Status::Running,
         "the crash left the row mid-flight"
     );
+    let run_id = launcher1.launches.lock().expect("launches")[0].clone();
+    crucible_controller::runs::blob_store::put_run_session(
+        db.pool(),
+        &run_id,
+        SESSION_LOG.as_bytes(),
+    )
+    .await?;
 
     // Daemon #2, fresh over the same DB: the startup re-enqueue reconciles the missed completion
     // from evidence. Its launcher must never fire — recovery is ingest, not relaunch.
@@ -1160,7 +1168,7 @@ async fn crash_recovery_reconciles_a_missed_completion() -> Result<()> {
             &db,
             &cfg,
             WorkQueue::new(),
-            Arc::new(OverrideStore::new()),
+            Arc::new(OverrideStore::new(db.pool().clone())),
             completions2,
             crucible_controller::authz::policy::ActivePolicy::default_set()
                 .expect("the shipped default policy set loads"),
@@ -1447,7 +1455,7 @@ async fn a_pinned_pack_dispatches_every_launch_to_its_cluster() -> Result<()> {
     cfg.runtime.dispatcher = launcher.clone();
 
     let queue = WorkQueue::new();
-    let overrides = Arc::new(OverrideStore::new());
+    let overrides = Arc::new(OverrideStore::new(db.pool().clone()));
     let wiring = daemon::assemble(
         &db,
         &cfg,
@@ -1786,7 +1794,7 @@ async fn standing_launches_fire_through_one_sweep() -> Result<()> {
     // The assembled daemon and the API it shares its queue and override store with — the same
     // wiring the binary does.
     let queue = WorkQueue::new();
-    let overrides = Arc::new(OverrideStore::new());
+    let overrides = Arc::new(OverrideStore::new(db.pool().clone()));
     let wiring = daemon::assemble(
         &db,
         &cfg,
@@ -2064,7 +2072,7 @@ async fn launch_rig(opts: RigOpts) -> Result<LaunchRig> {
     } else {
         queue.clone()
     };
-    let overrides = Arc::new(OverrideStore::new());
+    let overrides = Arc::new(OverrideStore::new(db.pool().clone()));
     let wiring = daemon::assemble(
         &db,
         &cfg,

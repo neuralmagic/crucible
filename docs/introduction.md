@@ -70,7 +70,7 @@ read = command(name = "read", run = "./classify.sh", emits = ["bucket"])
 gate = route(
     name = "gate",
     depends_on = [read],
-    source = read,
+    decider = output(read),
     questions = {
         "bucket": choice(
             ask = "Which queue owns this ticket?",
@@ -80,11 +80,11 @@ gate = route(
 )
 
 oncall = command(name = "oncall", run = "./file.sh oncall", depends_on = [gate],
-                 when = gate.bucket, answers = "outage")
+                 when = gate.bucket.any_of("outage"))
 finance = command(name = "finance", run = "./file.sh finance", depends_on = [gate],
-                  when = gate.bucket, answers = "billing")
+                  when = gate.bucket.any_of("billing"))
 backlog = command(name = "backlog", run = "./file.sh backlog", depends_on = [gate],
-                  when = gate.bucket, otherwise = True)
+                  when = gate.bucket.otherwise())
 
 filed = command(name = "filed", run = "./file.sh filed",
                 depends_on = [oncall, finance, backlog], join = "passed")
@@ -94,18 +94,18 @@ workflow(type = "playbook", tasks = [read, gate, oncall, finance, backlog, filed
 
 ```text
 $ crucible plan run --manifest crucible.toml --max-cost 1 --max-time 5m
-  read                 pass       attempts=1 cost=$0.0000  out={"bucket":"billing"}
-  gate                 pass       attempts=1 cost=$0.0000  out={"bucket":{"confidence":1.0,"label":"billing",...}}
+  read                 pass       attempts=1 cost=$0.0000 elapsed=0.1s  out={"bucket":"billing"}
+  gate                 pass       attempts=1 cost=$0.0000 elapsed=0.1s  out={"bucket":{"confidence":1.0,"label":"billing",...}}
   oncall               not_taken  attempts=0 cost=$0.0000  (gate.bucket resolved to billing)
-  finance              pass       attempts=1 cost=$0.0000  out={}
+  finance              pass       attempts=1 cost=$0.0000 elapsed=0.1s  out={}
   backlog              not_taken  attempts=0 cost=$0.0000  (gate.bucket resolved to billing)
-  filed                pass       attempts=1 cost=$0.0000  out={}
+  filed                pass       attempts=1 cost=$0.0000 elapsed=0.1s  out={}
 plan v1: completed — spent $0.0000 of $1
 verdict: valid
 ```
 
 The branches that no answer selects settle `not_taken`. They do not dispatch and do not
-spend. If you replace `source = read` with `min_confidence = 0.8`, a decision model answers
+spend. If you replace `output(read)` with `model(min_confidence = 0.8)`, a decision model answers
 the question. The engine records a low-confidence answer as `uncertain`, and the `otherwise`
 task takes it.
 

@@ -23,7 +23,7 @@
 //! is thread-per-accept); when the SSE client disconnects, the relay task observes the dropped
 //! receiver and drops the TCP connection promptly, so no dial leaks to a pod.
 
-use crate::api::state::{ApiState, ErrorBody};
+use crate::api::state::{ApiError, ApiState, ErrorBody};
 use anyhow::{Context, Result};
 use axum::Json;
 use axum::http::StatusCode;
@@ -311,6 +311,12 @@ const SPOKE_STREAM_DEADLINE: Duration = Duration::from_secs(60 * 60);
 /// How often the spoke relay re-polls the pod for a phase change.
 const SPOKE_PHASE_POLL: Duration = Duration::from_secs(3);
 
+/// Pause before re-opening a pod log stream that ended while the pod still runs.
+const SPOKE_REOPEN_PAUSE: Duration = Duration::from_secs(1);
+
+/// A followed pod log with no line for this long is re-opened.
+const SPOKE_QUIET: Duration = Duration::from_secs(60);
+
 /// Defensive cap on a single forwarded log line (a loop pod's agent can print anything).
 const LOG_LINE_CAP: usize = 4096;
 
@@ -346,6 +352,19 @@ struct SpokeRelay {
     tx: mpsc::Sender<RelayEvent>,
     deadline: tokio::time::Instant,
     last_phase: Option<String>,
+    quiet: Duration,
+}
+
+/// How one read of the pod log stream stopped.
+enum Followed {
+    /// The stream closed cleanly.
+    Eof,
+    /// The stream failed mid-read.
+    Broken,
+    /// No line for the quiet period.
+    Quiet,
+    /// The viewer left or the relay timed out.
+    Stop,
 }
 
 /// What one phase poll saw.
@@ -436,64 +455,158 @@ impl SpokeRelay {
         }
     }
 
-    /// Follow the pod's log stream, interleaving phase polls, until it ends. Log EOF is what ends
-    /// the stream, not the phase poll, so the last lines are never cut off by a racing read.
+    /// Whether the last phase seen is terminal.
+    fn settled(&self) -> bool {
+        matches!(self.last_phase.as_deref(), Some("Succeeded" | "Failed"))
+    }
+
+    /// Follow the pod's log until a stream opened after the pod finished reads to its end. A
+    /// stream that ends, breaks or goes quiet before that is re-opened from the last line read.
     async fn pump(&mut self, resume: StreamCursor, metrics: Option<&crate::metrics::Metrics>) {
+        let mut cursor = PodCursor::default();
+        let mut tail = LogTail::default();
+        loop {
+            let settled = self.settled();
+            let stream = match self.api.log_stream(&self.pod_name, &tail.params()).await {
+                Ok(s) => s,
+                Err(e) => {
+                    if let Some(m) = metrics {
+                        m.record_live_error("logs");
+                    }
+                    self.end(EndReason::Error(format!("{e:#}"))).await;
+                    return;
+                }
+            };
+            match self.follow(stream, &mut cursor, &mut tail, resume).await {
+                Followed::Stop => return,
+                Followed::Eof if settled => {
+                    self.end(EndReason::Completed(self.final_phase().await))
+                        .await;
+                    return;
+                }
+                Followed::Quiet => {}
+                Followed::Eof | Followed::Broken => {
+                    tokio::select! {
+                        _ = self.tx.closed() => return,
+                        _ = tokio::time::sleep(SPOKE_REOPEN_PAUSE) => {}
+                    }
+                }
+            }
+            match self.observe_phase().await {
+                PhaseStep::Stop(Some(EndReason::PodGone)) => {
+                    let phase = self
+                        .last_phase
+                        .clone()
+                        .unwrap_or_else(|| "Unknown".to_string());
+                    self.end(EndReason::Completed(phase)).await;
+                    return;
+                }
+                PhaseStep::Stop(None) => return,
+                PhaseStep::Stop(Some(_)) | PhaseStep::Attachable | PhaseStep::Waiting => {}
+            }
+        }
+    }
+
+    /// Forward one log stream's lines, interleaving phase polls, until it stops.
+    async fn follow(
+        &mut self,
+        stream: impl futures_util::AsyncBufRead + Unpin,
+        cursor: &mut PodCursor,
+        tail: &mut LogTail,
+        resume: StreamCursor,
+    ) -> Followed {
         use futures_util::{AsyncBufReadExt as _, StreamExt as _};
 
-        let params = kube::api::LogParams {
-            follow: true,
-            ..Default::default()
-        };
-        let stream = match self.api.log_stream(&self.pod_name, &params).await {
-            Ok(s) => s,
-            Err(e) => {
-                if let Some(m) = metrics {
-                    m.record_live_error("logs");
-                }
-                self.end(EndReason::Error(format!("{e:#}"))).await;
-                return;
-            }
-        };
         let mut lines = stream.lines();
         let mut ticker = tokio::time::interval(SPOKE_PHASE_POLL);
         ticker.tick().await;
-
-        let mut cursor = PodCursor::default();
+        let quiet = tokio::time::sleep(self.quiet);
+        tokio::pin!(quiet);
         loop {
             tokio::select! {
-                _ = self.tx.closed() => return,
+                _ = self.tx.closed() => return Followed::Stop,
                 _ = tokio::time::sleep_until(self.deadline) => {
                     self.end(EndReason::Timeout).await;
-                    return;
+                    return Followed::Stop;
                 }
+                _ = &mut quiet => return Followed::Quiet,
                 // A transient kube error mid-poll is not terminal; the log stream is the anchor.
                 _ = ticker.tick() => {
                     if let PhaseStep::Stop(reason) = self.observe_phase().await {
                         if let Some(EndReason::PodGone) = &reason {
                             self.end(EndReason::PodGone).await;
-                            return;
+                            return Followed::Stop;
                         }
                         if reason.is_none() {
-                            return;
+                            return Followed::Stop;
                         }
                     }
                 }
                 line = lines.next() => match line {
                     Some(Ok(l)) => {
-                        if let Some(ev) = classify_pod_line(&l, &mut cursor, resume)
+                        quiet.as_mut().reset(tokio::time::Instant::now() + self.quiet);
+                        if let Some(text) = tail.take(&l)
+                            && let Some(ev) = classify_pod_line(text, cursor, resume)
                             && !self.send(ev).await
                         {
-                            return;
+                            return Followed::Stop;
                         }
                     }
-                    Some(Err(_)) | None => {
-                        self.end(EndReason::Completed(self.final_phase().await)).await;
-                        return;
-                    }
+                    Some(Err(_)) => return Followed::Broken,
+                    None => return Followed::Eof,
                 },
             }
         }
+    }
+}
+
+/// How far into the pod log the relay has read, by the kubelet's stamp on each line.
+#[derive(Debug, Default)]
+struct LogTail {
+    /// The newest stamp read and how many lines carried it.
+    newest: Option<(jiff::Timestamp, u32)>,
+    /// Lines stamped `newest` that the current stream will replay.
+    replayed: u32,
+}
+
+impl LogTail {
+    /// The request for the next stream: stamped lines, from the second of the newest one read.
+    fn params(&mut self) -> kube::api::LogParams {
+        self.replayed = self.newest.map_or(0, |(_, lines)| lines);
+        kube::api::LogParams {
+            follow: true,
+            timestamps: true,
+            since_time: self
+                .newest
+                .and_then(|(at, _)| jiff::Timestamp::from_second(at.as_second()).ok()),
+            ..Default::default()
+        }
+    }
+
+    /// A stream line without its stamp, or `None` for one already read. An unstamped line
+    /// passes whole.
+    fn take<'a>(&mut self, line: &'a str) -> Option<&'a str> {
+        let Some((at, text)) = line
+            .split_once(' ')
+            .and_then(|(stamp, text)| Some((stamp.parse::<jiff::Timestamp>().ok()?, text)))
+        else {
+            return Some(line);
+        };
+        match &mut self.newest {
+            Some((newest, _)) if at < *newest => return None,
+            Some((newest, lines)) if at == *newest => {
+                if self.replayed > 0 {
+                    self.replayed -= 1;
+                    return None;
+                }
+                *lines = lines.saturating_add(1);
+            }
+            _ => {
+                self.newest = Some((at, 1));
+                self.replayed = 0;
+            }
+        }
+        Some(text)
     }
 }
 
@@ -532,6 +645,7 @@ async fn spoke_relay_task(
         tx,
         deadline: tokio::time::Instant::now() + SPOKE_STREAM_DEADLINE,
         last_phase: None,
+        quiet: SPOKE_QUIET,
     };
     if relay.wait_until_attachable(metrics.as_ref()).await {
         relay.pump(resume, metrics.as_ref()).await;
@@ -738,11 +852,7 @@ pub(crate) async fn live_response(
                 .into_response();
         }
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("reading run {run_id}: {e:#}"),
-            )
-                .into_response();
+            return ApiError::Internal(e.context(format!("reading run {run_id}"))).into_response();
         }
     };
 
@@ -1439,6 +1549,270 @@ mod tests {
             SessionSeq::new(7),
             "the session half is what a resume feeds the bridge"
         );
+    }
+
+    /// A localhost HTTP server answering the relay's pod read and pod log read. A log read
+    /// returns the stamped lines from its `sinceTime` second on, as the kubelet does.
+    #[derive(Clone, Default)]
+    struct FakeSpoke(Arc<Mutex<SpokeState>>);
+
+    #[derive(Default)]
+    struct SpokeState {
+        phase: String,
+        log: Vec<String>,
+        /// What each log read does after sending the log, oldest first. Past the list, it closes.
+        reads: std::collections::VecDeque<AfterRead>,
+        /// The `sinceTime` of every log read, in order.
+        asked: Vec<Option<String>>,
+    }
+
+    #[derive(Clone)]
+    enum AfterRead {
+        /// Close the stream, then append these lines and move to this phase.
+        Close {
+            then_log: Vec<&'static str>,
+            then_phase: &'static str,
+        },
+        /// Append these lines, then keep the stream open and silent.
+        Stall { then_log: Vec<&'static str> },
+    }
+
+    impl FakeSpoke {
+        async fn start(self) -> kube::Api<k8s_openapi::api::core::v1::Pod> {
+            use axum::extract::{Query, State};
+            use axum::routing::get;
+
+            async fn pod(State(spoke): State<FakeSpoke>) -> Json<Value> {
+                let phase = spoke.0.lock().expect("lock").phase.clone();
+                Json(serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {"name": "loop", "namespace": "runs"},
+                    "status": {"phase": phase},
+                }))
+            }
+
+            async fn log(
+                State(spoke): State<FakeSpoke>,
+                Query(query): Query<std::collections::HashMap<String, String>>,
+            ) -> axum::body::Body {
+                use futures_util::StreamExt as _;
+
+                let mut state = spoke.0.lock().expect("lock");
+                assert_eq!(query.get("follow").map(String::as_str), Some("true"));
+                assert_eq!(query.get("timestamps").map(String::as_str), Some("true"));
+                let since = query.get("sinceTime").cloned();
+                state.asked.push(since.clone());
+                let since: Option<jiff::Timestamp> =
+                    since.map(|since| since.parse().expect("an RFC 3339 sinceTime"));
+                let body: String = state
+                    .log
+                    .iter()
+                    .filter(|line| {
+                        let stamp: jiff::Timestamp = line
+                            .split_once(' ')
+                            .expect("a stamped line")
+                            .0
+                            .parse()
+                            .expect("a stamp");
+                        since.is_none_or(|since| stamp >= since)
+                    })
+                    .map(|line| format!("{line}\n"))
+                    .collect();
+                let sent = futures_util::stream::iter([Ok::<_, Infallible>(body)]);
+                match state.reads.pop_front() {
+                    Some(AfterRead::Stall { then_log }) => {
+                        state.log.extend(then_log.iter().map(|l| l.to_string()));
+                        axum::body::Body::from_stream(sent.chain(futures_util::stream::pending()))
+                    }
+                    Some(AfterRead::Close {
+                        then_log,
+                        then_phase,
+                    }) => {
+                        state.log.extend(then_log.iter().map(|l| l.to_string()));
+                        state.phase = then_phase.to_string();
+                        axum::body::Body::from_stream(sent)
+                    }
+                    None => axum::body::Body::from_stream(sent),
+                }
+            }
+
+            let app = axum::Router::new()
+                .route("/api/v1/namespaces/runs/pods/loop", get(pod))
+                .route("/api/v1/namespaces/runs/pods/loop/log", get(log))
+                .with_state(self);
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let url = format!("http://{}", listener.local_addr().expect("addr"));
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("serve");
+            });
+            crate::install_crypto_provider();
+            let config = kube::Config::new(url.parse().expect("uri"));
+            kube::Api::namespaced(kube::Client::try_from(config).expect("client"), "runs")
+        }
+    }
+
+    /// Run the spoke relay against `spoke` and collect everything it sends, up to its end event.
+    async fn relayed(spoke: FakeSpoke, quiet: Duration) -> Vec<RelayEvent> {
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAP);
+        let mut relay = SpokeRelay {
+            api: spoke.start().await,
+            pod_name: "loop".to_string(),
+            tx,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(30),
+            last_phase: None,
+            quiet,
+        };
+        tokio::spawn(async move {
+            if relay.wait_until_attachable(None).await {
+                relay.pump(StreamCursor::default(), None).await;
+            }
+        });
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        events
+    }
+
+    fn log(ord: u64, line: &str) -> RelayEvent {
+        RelayEvent::Log {
+            ord: LogOrdinal::new(ord),
+            line: line.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_log_stream_that_ends_under_a_running_pod_is_read_on_not_reported_as_the_end() {
+        let spoke = FakeSpoke::default();
+        {
+            let mut state = spoke.0.lock().expect("lock");
+            state.phase = "Running".to_string();
+            state.log = vec![
+                "2026-11-16T20:00:00.100000000Z cloning the workspace".to_string(),
+                "2026-11-16T20:00:01.500000000Z [pin] first".to_string(),
+                "2026-11-16T20:00:01.500000000Z [pin] second".to_string(),
+            ];
+            state.reads = [
+                AfterRead::Close {
+                    then_log: vec![
+                        "2026-11-16T20:00:01.500000000Z [pin] third",
+                        "2026-11-16T20:00:01.900000000Z CRUCIBLE_SESSION_LINE 1 {\"kind\":\"a\"}",
+                    ],
+                    then_phase: "Running",
+                },
+                AfterRead::Close {
+                    then_log: vec!["2026-11-16T20:15:00.000000000Z [survey] last"],
+                    then_phase: "Succeeded",
+                },
+            ]
+            .into();
+        }
+
+        let events = relayed(spoke.clone(), SPOKE_QUIET).await;
+        assert_eq!(
+            events,
+            [
+                RelayEvent::Phase("Running".to_string()),
+                log(1, "cloning the workspace"),
+                log(2, "[pin] first"),
+                log(3, "[pin] second"),
+                log(4, "[pin] third"),
+                RelayEvent::Session {
+                    seq: SessionSeq::new(1),
+                    line: r#"{"kind":"a"}"#.to_string(),
+                },
+                RelayEvent::Phase("Succeeded".to_string()),
+                log(5, "[survey] last"),
+                RelayEvent::End(EndReason::Completed("Succeeded".to_string())),
+            ]
+        );
+        assert_eq!(
+            spoke.0.lock().expect("lock").asked,
+            [
+                None,
+                Some("2026-11-16T20:00:01Z".to_string()),
+                Some("2026-11-16T20:00:01Z".to_string()),
+            ],
+            "each re-read starts at the second of the last line read, never the top"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_log_stream_that_goes_silent_is_reopened_and_what_it_missed_arrives() {
+        let spoke = FakeSpoke::default();
+        {
+            let mut state = spoke.0.lock().expect("lock");
+            state.phase = "Running".to_string();
+            state.log = vec!["2026-11-16T20:00:00.100000000Z before the stall".to_string()];
+            state.reads = [
+                AfterRead::Stall {
+                    then_log: vec!["2026-11-16T20:00:45.000000000Z printed during the stall"],
+                },
+                AfterRead::Close {
+                    then_log: vec![],
+                    then_phase: "Succeeded",
+                },
+            ]
+            .into();
+        }
+
+        let events = relayed(spoke, Duration::from_millis(200)).await;
+        assert_eq!(
+            events,
+            [
+                RelayEvent::Phase("Running".to_string()),
+                log(1, "before the stall"),
+                log(2, "printed during the stall"),
+                RelayEvent::Phase("Succeeded".to_string()),
+                RelayEvent::End(EndReason::Completed("Succeeded".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_reopened_log_drops_exactly_the_lines_already_read() {
+        let mut tail = LogTail::default();
+        assert_eq!(
+            tail.params().since_time,
+            None,
+            "the first read is the whole log"
+        );
+        let first = [
+            "2026-11-16T20:00:01.200000000Z a",
+            "2026-11-16T20:00:01.900000000Z b",
+            "2026-11-16T20:00:01.900000000Z c",
+        ];
+        let read: Vec<_> = first.iter().filter_map(|line| tail.take(line)).collect();
+        assert_eq!(read, ["a", "b", "c"]);
+
+        let params = tail.params();
+        assert!(params.follow && params.timestamps);
+        assert_eq!(
+            params.since_time,
+            Some("2026-11-16T20:00:01Z".parse().expect("a stamp")),
+            "rounded down: a later second would skip lines"
+        );
+        let replayed = [
+            "2026-11-16T20:00:01.200000000Z a",
+            "2026-11-16T20:00:01.900000000Z b",
+            "2026-11-16T20:00:01.900000000Z c",
+            "2026-11-16T20:00:01.900000000Z d",
+            "2026-11-16T20:00:02.000000000Z e",
+            "not a stamped line",
+            "2026-11-16T20:00:02.000000000Z ",
+        ];
+        let read: Vec<_> = replayed.iter().filter_map(|line| tail.take(line)).collect();
+        assert_eq!(read, ["d", "e", "not a stamped line", ""]);
+
+        tail.params();
+        let again = [
+            "2026-11-16T20:00:02.000000000Z e",
+            "2026-11-16T20:00:02.000000000Z ",
+            "2026-11-16T20:00:02.000000000Z f",
+        ];
+        let read: Vec<_> = again.iter().filter_map(|line| tail.take(line)).collect();
+        assert_eq!(read, ["f"]);
     }
 
     /// The end reasons are a wire contract the UI branches on.

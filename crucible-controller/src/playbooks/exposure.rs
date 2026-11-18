@@ -125,6 +125,10 @@ pub enum KnownCapability {
     ExternalCommands {
         present: bool,
     },
+    /// The run's MCP servers the pack's command and evaluate tasks reach as the run.
+    TaskServers {
+        names: Vec<String>,
+    },
     Sandbox {
         name: String,
         image: String,
@@ -185,6 +189,9 @@ impl Capability {
             KnownCapability::ExternalCommands { present } => {
                 format!("external-commands present:{present}")
             }
+            KnownCapability::TaskServers { names } => {
+                format!("task-servers [{}]", names.join(", "))
+            }
             KnownCapability::Sandbox {
                 name,
                 image,
@@ -199,6 +206,14 @@ impl Capability {
                 egress.join(", ")
             ),
         }
+    }
+
+    /// Whether this discloses that the pack's tasks reach the run's server `name`.
+    pub fn grants_task_server(&self, name: &str) -> bool {
+        matches!(
+            self,
+            Capability::Known(KnownCapability::TaskServers { names }) if names.iter().any(|n| n == name)
+        )
     }
 
     /// The credential's name, when this is a credential the agent itself can read.

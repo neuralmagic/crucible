@@ -182,10 +182,10 @@ fn turn_opts_scope_carries_the_resolved_harness_and_model() {
     assert_eq!(unresolved.model, None);
 
     let resolved = scope_with(AgentSelection {
-        harness: Some(crucible::manifest::Harness::Codex),
+        harness: Some(crucible::knobs::Harness::Codex),
         model: Some("gpt-5.6-luna".to_string()),
     });
-    assert_eq!(resolved.harness, Some(crucible::manifest::Harness::Codex));
+    assert_eq!(resolved.harness, Some(crucible::knobs::Harness::Codex));
     assert_eq!(resolved.model.as_deref(), Some("gpt-5.6-luna"));
 }
 
@@ -3263,6 +3263,7 @@ async fn a_resolved_provider_reaches_the_loop_wrapper(pool: sqlx::PgPool) -> Res
     crate::playbooks::providers::upsert(
         &pool,
         &crate::playbooks::providers::NewProvider {
+            model_limits: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "openai-plat",
             display_name: "OpenAI",
@@ -3337,6 +3338,7 @@ async fn a_resolved_provider_reaches_the_playbook_wrapper(pool: sqlx::PgPool) ->
     crate::playbooks::providers::upsert(
         &pool,
         &crate::playbooks::providers::NewProvider {
+            model_limits: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "openai-plat",
             display_name: "OpenAI",
@@ -5035,6 +5037,7 @@ async fn the_resolved_providers_key_is_delivered_with_the_scopes_bindings(
     crate::playbooks::providers::upsert(
         &pool,
         &crate::playbooks::providers::NewProvider {
+            model_limits: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "openai-plat",
             display_name: "OpenAI",
@@ -5159,6 +5162,7 @@ async fn the_resolved_providers_key_is_delivered_with_the_scopes_bindings(
         inference_document(pod).bindings,
         vec![
             InferenceBinding {
+                limits: None,
                 role: InferenceRole::Agent,
                 protocol: WireProtocol::Responses,
                 url: None,
@@ -5167,6 +5171,7 @@ async fn the_resolved_providers_key_is_delivered_with_the_scopes_bindings(
                 price: None,
             },
             InferenceBinding {
+                limits: None,
                 role: InferenceRole::Decision,
                 protocol: WireProtocol::Decisions,
                 url: None,
@@ -5211,6 +5216,7 @@ async fn a_grounded_rank_runs_under_its_resolved_provider(pool: sqlx::PgPool) ->
     crate::playbooks::providers::upsert(
         &pool,
         &crate::playbooks::providers::NewProvider {
+            model_limits: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "gateway",
             display_name: "Gateway",
@@ -5321,6 +5327,7 @@ async fn a_custom_provider_delivers_its_endpoint_and_price_beside_its_key(
     crate::playbooks::providers::upsert(
         &pool,
         &crate::playbooks::providers::NewProvider {
+            model_limits: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "onprem",
             display_name: "On-prem vLLM",
@@ -5404,6 +5411,7 @@ async fn a_custom_provider_delivers_its_endpoint_and_price_beside_its_key(
     assert_eq!(
         inference_document(pod).bindings,
         vec![InferenceBinding {
+            limits: None,
             role: InferenceRole::Agent,
             protocol: WireProtocol::Responses,
             url: Some("http://vllm.internal:8000/v1".to_string()),
@@ -5460,6 +5468,7 @@ async fn a_provider_key_the_dispatch_cannot_resolve_refuses_the_run(
     let admin = crate::authz::model::Principal::parse("user:platform-admin").expect("a principal");
     // Registered nowhere: `register_inference_key` is deliberately not called.
     let missing = crate::playbooks::providers::ModelProvider {
+        model_limits: Default::default(),
         owner: crate::authz::model::Principal::platform(),
         id: "openai-plat".to_string(),
         display_name: "OpenAI".to_string(),
@@ -6613,6 +6622,91 @@ async fn collecting_an_isolated_run_deletes_its_gateway(pool: sqlx::PgPool) -> R
             |e| matches!(e, GatewayEvent::DeleteSandboxes { namespace, .. } if namespace == "sandboxes")
         ),
         "the isolated run's Sandboxes go with it"
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn cancelling_an_isolated_run_deletes_its_gateway(pool: sqlx::PgPool) -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let db = Db::new(pool);
+    seed_running_issue(&db, "owner/repo#7").await?;
+    insert_run_pod(&db, "crucible-run-iso", WorkPodState::Running).await?;
+    crate::runs::store::insert_run(
+        db.pool(),
+        &crate::NewRun {
+            run_id: "run-iso".into(),
+            scope: None,
+            issue: Some("owner/repo#7".into()),
+            identity_digest: None,
+            status: "running".into(),
+            pod: Some("crucible-run-iso".into()),
+            session_uri: None,
+            best_score: None,
+            cost_usd: None,
+        },
+    )
+    .await?;
+    let dispatcher = Arc::new(GatewayDispatcher::default());
+    let mut cfg = crate::testing::cfg_from_args(["ctl", "--pod-namespace", "autoresearch"]);
+    cfg.deploy_profile = Some(isolated_profile(tmp.path()));
+    cfg.runtime.dispatcher = dispatcher.clone();
+
+    let cancelled =
+        crate::runs::cancel::cancel_runs(&db, &cfg, "owner/repo#7", Some("wren")).await?;
+
+    assert_eq!(cancelled, 1);
+    let deleted: Vec<(String, String)> = dispatcher
+        .events()
+        .into_iter()
+        .filter_map(|e| match e {
+            GatewayEvent::DeleteSelected {
+                namespace,
+                selector,
+            }
+            | GatewayEvent::DeleteServices {
+                namespace,
+                selector,
+            } => Some((namespace, selector)),
+            _ => None,
+        })
+        .collect();
+    let own = crucible::deploy::render::gateway::run_gateway_selector("crucible-run-iso");
+    let created = crucible::deploy::render::gateway::gateway_created_selector(
+        &crucible::deploy::render::gateway::GatewayNames::for_run_pod("crucible-run-iso"),
+    );
+    assert_eq!(
+        deleted,
+        [
+            ("sandboxes".to_string(), created),
+            ("autoresearch".to_string(), own.clone()),
+            ("sandboxes".to_string(), own),
+        ]
+    );
+    assert!(
+        dispatcher.events().iter().any(
+            |e| matches!(e, GatewayEvent::DeleteSandboxes { namespace, .. } if namespace == "sandboxes")
+        ),
+        "the cancelled run's Sandboxes go with it"
+    );
+
+    let shared = Arc::new(GatewayDispatcher::default());
+    insert_run_pod(&db, "crucible-run-shared", WorkPodState::Running).await?;
+    sqlx::query(
+        "UPDATE runs SET status = 'running', pod = 'crucible-run-shared' WHERE run_id = 'run-iso'",
+    )
+    .execute(db.pool())
+    .await?;
+    let mut cfg = crate::testing::cfg_from_args(["ctl", "--pod-namespace", "autoresearch"]);
+    cfg.deploy_profile = Some(shared_profile(tmp.path()));
+    cfg.runtime.dispatcher = shared.clone();
+    assert_eq!(
+        crate::runs::cancel::cancel_runs(&db, &cfg, "owner/repo#7", Some("wren")).await?,
+        1
+    );
+    assert!(
+        shared.events().is_empty(),
+        "a profile without isolation has no gateway to delete"
     );
     Ok(())
 }

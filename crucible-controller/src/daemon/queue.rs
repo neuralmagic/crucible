@@ -332,6 +332,9 @@ pub struct Override {
 #[derive(Debug, Clone, PartialEq)]
 pub enum OverrideKind {
     Park,
+    /// Stop a launch: park it as a human would, then delete its running runs' pods and mark the
+    /// runs `cancelled`.
+    Cancel,
     Unpark,
     Bump,
     /// Trigger an immediate scope-propose for an issue, bypassing ALL autopilot gates (rank horizon,

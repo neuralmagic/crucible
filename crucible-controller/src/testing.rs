@@ -219,6 +219,7 @@ pub(crate) async fn launch_playbook(
         &mut tx,
         key,
         &crate::launches::model::NewPlaybookLaunch {
+            choice_snapshots: None,
             playbook: "survey",
             repo: "owner/repo",
             title: "survey",
@@ -283,6 +284,7 @@ pub(crate) async fn register_ranker_as(
     crate::playbooks::providers::upsert(
         pool,
         &crate::playbooks::providers::NewProvider {
+            model_limits: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id,
             display_name: id,

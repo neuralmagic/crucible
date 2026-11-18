@@ -17,6 +17,7 @@
 use crate::playbooks::pack_trees::PACK_COLS;
 use crate::playbooks::packs::{Deliverable, MaterializedPack};
 use anyhow::{Context, Result};
+use crucible::manifest::launch::{CHOICES_REFRESH, is_refresh};
 use crucible::manifest::variant::VariantName;
 use crucible::plan::starlark::declared_params;
 use crucible::plan::starlark::params::ParamType;
@@ -25,7 +26,6 @@ use crucible_contract::pack_tree::{PackTree, ReadPack, TreeDigest};
 use serde::Deserialize;
 use sqlx::{PgPool, Row};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 
 /// Upper bound on a registry id. It rides a launch key and a pod label hint, so it stays short.
 const ID_MAX_LEN: usize = 64;
@@ -382,19 +382,11 @@ pub(crate) fn pack_root(checkout: &Path, path: &str) -> Result<PathBuf, Register
 
 /// `git` with the given args, mapping a nonzero exit (or a missing `git`) to [`RegisterError::Fetch`]
 /// with the command's own stderr.
-fn git(args: &[&str]) -> Result<String, RegisterError> {
-    let out = Command::new("git")
-        .args(args)
-        .output()
-        .map_err(|e| RegisterError::Fetch(format!("running `git` (is it on PATH?): {e}")))?;
-    if !out.status.success() {
-        return Err(RegisterError::Fetch(format!(
-            "git {} failed: {}",
-            args.first().unwrap_or(&""),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, RegisterError> {
+    crucible_vcs::cli::git(dir, args)
+        .read()
+        .map(|out| out.trim().to_string())
+        .map_err(|e| RegisterError::Fetch(format!("{:#}", anyhow::Error::new(e))))
 }
 
 /// A scratch clone of a pack repo at a ref: the commit it resolved to, and the tree it landed in.
@@ -468,8 +460,8 @@ impl PackGit {
             args.extend_from_slice(&["--branch", r]);
         }
         args.extend_from_slice(&["--", url.as_str(), checkout_arg.as_str()]);
-        git(&args).map_err(|e| self.scrub(e))?;
-        let rev = git(&["-C", &checkout_arg, "rev-parse", "HEAD"])?;
+        git(None, &args).map_err(|e| self.scrub(e))?;
+        let rev = git(Some(&checkout), &["rev-parse", "HEAD"])?;
         Ok(Checkout { rev, scratch })
     }
 }
@@ -667,8 +659,15 @@ fn extract_params_schema(
     let text = std::fs::read_to_string(&source)
         .with_context(|| format!("reading {}", source.display()))
         .map_err(RegisterError::Internal)?;
-    let schema = declared_params(&text, &source)
-        .map_err(|e| RegisterError::Compile(crucible::errors::report(&e)))?;
+    let compile_error = |e| RegisterError::Compile(crucible::errors::report(&e));
+    let schema = declared_params(&text, &source).map_err(compile_error)?;
+    if refreshable(&schema) {
+        crucible::plan::starlark::compile_refresh_file(
+            &source,
+            crucible::plan::starlark::parent_or_cwd(&source),
+        )
+        .map_err(compile_error)?;
+    }
     let digest = schema_digest(&schema).map_err(RegisterError::Internal)?;
     Ok((schema, digest))
 }
@@ -681,11 +680,12 @@ pub(crate) fn compiled_plan(
     variant: Option<&VariantName>,
 ) -> Result<crucible::plan::ir::ValidPlan, String> {
     let source = workflow_source(root, variant).map_err(|e| e.to_string())?;
-    let compiled = crucible::plan::starlark::compile_file_with(
-        &source,
-        crucible::plan::starlark::parent_or_cwd(&source),
-        params,
-    )
+    let pack_dir = crucible::plan::starlark::parent_or_cwd(&source);
+    let compiled = if is_refresh(params) {
+        crucible::plan::starlark::compile_refresh_file(&source, pack_dir)
+    } else {
+        crucible::plan::starlark::compile_launch_file(&source, pack_dir, params)
+    }
     .map_err(|e| crucible::errors::report(&e))?;
     compiled
         .workflow
@@ -1356,12 +1356,36 @@ pub fn validate_params(
     schema: &serde_json::Value,
     params: &std::collections::BTreeMap<String, String>,
 ) -> Result<serde_json::Value, Vec<FieldError>> {
+    if params.contains_key(CHOICES_REFRESH) {
+        return validate_refresh(schema, params);
+    }
     let mut errors = Vec::new();
     let typed = serde_json::Value::Object(
         params
             .iter()
             .map(|(k, v)| {
                 let value = match schema.pointer(&format!("/properties/{}", pointer_token(k))) {
+                    Some(property)
+                        if crate::playbooks::choices::outside_snapshot(
+                            property,
+                            v,
+                            crate::playbooks::choices::key_value(
+                                schema,
+                                property,
+                                "x-choices-from",
+                                params,
+                            ),
+                        ) =>
+                    {
+                        errors.push(FieldError {
+                            field: k.clone(),
+                            message: format!(
+                                "{v:?} is not among the current choices; pick one from the form or \
+                                 refresh its producer task"
+                            ),
+                        });
+                        serde_json::Value::Null
+                    }
                     Some(property) => match ParamType::from_schema(property).read(v) {
                         Ok(read) => read.json(),
                         Err(expected) => {
@@ -1384,6 +1408,33 @@ pub fn validate_params(
             message: format!("the stored params schema is not a usable JSON Schema: {e}"),
         }]
     })?;
+    for name in params.keys() {
+        let gate = schema
+            .pointer(&format!("/properties/{}/x-enabled-by", pointer_token(name)))
+            .and_then(serde_json::Value::as_str);
+        if let Some(gate) = gate
+            && typed.get(gate) != Some(&serde_json::Value::Bool(true))
+        {
+            errors.push(FieldError {
+                field: name.clone(),
+                message: format!("set {gate} to true to supply {name}"),
+            });
+        }
+    }
+    let properties = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object);
+    for (name, property) in properties.into_iter().flatten() {
+        if let Some(message) =
+            crate::playbooks::choices::confirmation_needed(schema, property, params)
+            && typed.get(name) != Some(&serde_json::Value::Bool(true))
+        {
+            errors.push(FieldError {
+                field: name.clone(),
+                message: format!("set {name} to true to launch with this value: {message}"),
+            });
+        }
+    }
     let unread: Vec<String> = errors.iter().map(|e| e.field.clone()).collect();
     errors.extend(
         validator
@@ -1404,6 +1455,52 @@ pub fn validate_params(
     } else {
         Err(errors)
     }
+}
+
+/// A choices refresh carries `choices.refresh = true` alone, and only a playbook that declares
+/// choices_from, placeholder_from, or confirm_from has anything to refresh. The declared params' schema does not apply: a refresh
+/// compiles without them.
+fn validate_refresh(
+    schema: &serde_json::Value,
+    params: &std::collections::BTreeMap<String, String>,
+) -> Result<serde_json::Value, Vec<FieldError>> {
+    let refuse = |field: &str, message: &str| {
+        Err(vec![FieldError {
+            field: field.to_owned(),
+            message: message.to_owned(),
+        }])
+    };
+    if let Some(other) = params.keys().find(|k| *k != CHOICES_REFRESH) {
+        return refuse(other, "a choices refresh takes no other values");
+    }
+    if !is_refresh(params) {
+        return refuse(
+            CHOICES_REFRESH,
+            "a choices refresh is launched with the value true",
+        );
+    }
+    if !refreshable(schema) {
+        return refuse(
+            CHOICES_REFRESH,
+            "this playbook declares no choices_from, placeholder_from, or confirm_from \
+             parameter, so there is nothing to refresh",
+        );
+    }
+    Ok(serde_json::json!({ CHOICES_REFRESH: "true" }))
+}
+
+/// Whether a params schema names a task output for a form's choices or placeholder.
+fn refreshable(schema: &serde_json::Value) -> bool {
+    schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|p| {
+            p.values().any(|v| {
+                ["x-choices-from", "x-placeholder-from", "x-confirm-from"]
+                    .iter()
+                    .any(|from| v.get(from).is_some())
+            })
+        })
 }
 
 /// A param name as one JSON Pointer reference token.
@@ -1496,6 +1593,7 @@ mod tests {
         PLAYBOOK_REPO_MANIFEST, WORKFLOW_TOPIC, WORKFLOW_TOPIC_DEPTH, WORKFLOW_UNPARSABLE,
         git_pack_repo, run_git, schema_of,
     };
+    use std::process::Command;
 
     /// The schema is the pack's declaration; a launcher's values are checked against it field by
     /// field, so the form can pin each message to the input that produced it.
@@ -1588,6 +1686,34 @@ mod tests {
             assert!(
                 validate_params(&typed_schema(), &params(&[(key, spelling)])).is_ok(),
                 "{key}={spelling} is a spelling the engine binds"
+            );
+        }
+    }
+
+    #[test]
+    fn a_gated_param_is_refused_while_its_switch_is_off() {
+        let schema = declared_params(
+            "params = {\"override_branch\": {\"type\": \"bool\", \"default\": False}, \
+             \"branch\": {\"type\": \"string\", \"default\": \"\", \"enabled_by\": \"override_branch\"}}\n\
+             workflow(type = \"playbook\", tasks = [])\n",
+            Path::new("workflow.star"),
+        )
+        .expect("schema");
+        assert!(
+            validate_params(
+                &schema,
+                &params(&[("override_branch", "true"), ("branch", "main")])
+            )
+            .is_ok()
+        );
+        for off in [
+            params(&[("branch", "main")]),
+            params(&[("override_branch", "false"), ("branch", "main")]),
+        ] {
+            let errors = validate_params(&schema, &off).expect_err("refused");
+            assert_eq!(
+                errors.iter().map(|e| e.field.as_str()).collect::<Vec<_>>(),
+                ["branch"]
             );
         }
     }
@@ -2220,6 +2346,35 @@ mod tests {
             list(&pool).await.expect("list").is_empty(),
             "nothing half-registers"
         );
+    }
+
+    /// Registration compiles the choices refresh, so a producer that reads a parameter is refused
+    /// there and a launch does not check it again.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_producer_that_reads_a_parameter_fails_registration(pool: PgPool) {
+        let source = r#"params = {
+    "topic": {"type": "string", "default": "x"},
+    "release": {"type": "string", "default": "", "choices_from": {"task": "options", "field": "releases"}},
+}
+seed = agent(name = "seed", prompt = "List releases about " + param("topic"))
+options = command(name = "options", run = "./o.sh", depends_on = [seed], emits = {"releases": "list"})
+workflow(type = "playbook", tasks = [seed, options])
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = git_pack_repo(dir.path(), PLAYBOOK_REPO_MANIFEST, source);
+
+        let err = register(&pool, &PackGit::default(), request("survey", &repo), None)
+            .await
+            .expect_err("the refresh does not compile");
+        assert!(
+            matches!(err, RegisterError::Compile(ref e) if e.contains("\"seed\"") && e.contains("choices refresh")),
+            "{err:#}"
+        );
+
+        let launch = tempfile::tempdir().expect("tempdir");
+        let root = crate::testing::fixtures::write_playbook_pack(launch.path(), source);
+        compiled_plan(&root, &std::collections::BTreeMap::new(), None)
+            .expect("a launch compile leaves the probe to registration");
     }
 
     /// Drafts and the registry share the launch-key namespace in both directions: a live draft

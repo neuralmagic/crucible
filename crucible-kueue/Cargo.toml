@@ -18,7 +18,9 @@ anyhow.workspace = true
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 clap.workspace = true
 crucible-mcp-auth = { path = "../crucible-mcp-auth", features = ["kube"] }
+futures-util = { version = "0.3", features = ["io"] }
 hex = "0.4"
+jiff.workspace = true
 http = "1"
 k8s-openapi.workspace = true
 kube = { workspace = true, features = ["client", "rustls-tls"] }

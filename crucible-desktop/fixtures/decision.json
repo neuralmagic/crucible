@@ -1,0 +1,43 @@
+{
+  "id": "01a2fixture",
+  "run_id": "run-fixture",
+  "task": "review_bumps",
+  "launch_key": "playbook:cve-triage-llm-d:01a2fixture",
+  "state": "open",
+  "opened_at": "2026-11-08T10:00:00Z",
+  "expires_at": "2026-11-09T10:00:00Z",
+  "questions": [
+    {
+      "id": "ship",
+      "instructions": "Open PRs for the bumps that build and pass their tests?",
+      "kind": "choice",
+      "multiple": false,
+      "options": ["yes", "no"]
+    },
+    {
+      "id": "repos",
+      "instructions": "Which repositories get a PR.",
+      "kind": "pick",
+      "multiple": true,
+      "options": ["llm-d/llm-d", "llm-d/llm-d-inference-scheduler", "llm-d/llm-d-kv-cache-manager"]
+    }
+  ],
+  "inputs": [
+    {
+      "task": "triage",
+      "status": "passed",
+      "output": {"fixable": 3, "cves": ["CVE-2026-1001", "CVE-2026-1002", "CVE-2026-1007"]}
+    }
+  ],
+  "spent_usd": 1.42,
+  "elapsed_secs": 1260,
+  "max_cost_usd": 50.0,
+  "max_time_secs": 10800,
+  "gated": [
+    {"name": "open_prs", "kind": "agent", "question": "ship", "labels": ["yes"]}
+  ],
+  "review": "## Bumps\n\n| Package | From | To | Fixes |\n| --- | --- | --- | --- |\n| `grpcio` | 1.66.0 | 1.68.1 | CVE-2026-1001 |\n| `urllib3` | 2.2.2 | 2.2.3 | CVE-2026-1002 |\n\nAll three builds passed.",
+  "evidence_digest": "sha256:fixture",
+  "answer": null,
+  "can_answer": true
+}

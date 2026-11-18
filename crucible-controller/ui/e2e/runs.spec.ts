@@ -99,6 +99,69 @@ test.describe('the playbook runs list', () => {
     await expect(run(page, 'playbook:survey:0199')).toBeVisible();
   });
 
+  test('an enabled schedule fires now from its row and a disabled one cannot', async ({ page }) => {
+    await stubApi(page);
+    await page.route('**/api/schedules/sch-0001/fire', (route) => route.fulfill({ status: 202, json: {} }));
+    await ready(page, '/schedules');
+
+    const rows = table(page).locator('tbody tr');
+    const fired = page.waitForRequest(
+      (request) => request.method() === 'POST' && new URL(request.url()).pathname === '/api/schedules/sch-0001/fire',
+    );
+    await rows.filter({ hasText: 'survey' }).getByRole('button', { name: 'Fire now' }).click();
+    await fired;
+
+    await expect(rows.filter({ hasText: 'nightly-rank' }).getByRole('button', { name: 'Fire now' })).toBeDisabled();
+  });
+
+  test('a disabled schedule test-fires from its row and opens the launch it made', async ({ page }) => {
+    await stubApi(page);
+    await page.route('**/api/schedules/sch-0003/test-fire', (route) =>
+      route.fulfill({
+        status: 201,
+        json: { key: 'playbook:survey:0198', schedule: 'sch-0003', cursor: { from: 'stored' } },
+      }),
+    );
+    await ready(page, '/schedules');
+
+    const fired = page.waitForRequest(
+      (request) => request.method() === 'POST' && new URL(request.url()).pathname === '/api/schedules/sch-0003/test-fire',
+    );
+    await table(page)
+      .locator('tbody tr')
+      .filter({ hasText: 'nightly-rank' })
+      .getByRole('button', { name: 'Test fire' })
+      .click();
+    expect((await fired).postDataJSON()).toEqual({});
+
+    await expect(page).toHaveURL(/\/playbook-runs\/playbook%3Asurvey%3A0198$/);
+  });
+
+  test('a schedule with a cursor test-fires with the value typed into its dialog', async ({ page }) => {
+    await stubApi(page);
+    await page.route('**/api/schedules/sch-0002/test-fire', (route) =>
+      route.fulfill({
+        status: 201,
+        json: { key: 'playbook:survey:0198', schedule: 'sch-0002', cursor: { from: 'value', value: '2026-01-01' } },
+      }),
+    );
+    await ready(page, '/schedules');
+
+    await table(page).locator('tbody tr').filter({ hasText: 'triage' }).getByRole('button', { name: 'Test fire' }).click();
+    const dialog = page.getByTestId('schedule-test-fire');
+    await dialog.getByLabel('Cursor').selectOption('value');
+    await expect(dialog.getByRole('button', { name: 'Launch' })).toBeDisabled();
+    await dialog.getByLabel('Value').fill('2026-01-01');
+
+    const fired = page.waitForRequest(
+      (request) => request.method() === 'POST' && new URL(request.url()).pathname === '/api/schedules/sch-0002/test-fire',
+    );
+    await dialog.getByRole('button', { name: 'Launch' }).click();
+    expect((await fired).postDataJSON()).toEqual({ cursor: { from: 'value', value: '2026-01-01' } });
+
+    await expect(page).toHaveURL(/\/playbook-runs\/playbook%3Asurvey%3A0198$/);
+  });
+
   test('the personal view shows only what the user launched', async ({ page }) => {
     await stubApi(page);
     await page.addInitScript(() => {

@@ -313,7 +313,8 @@ pub(crate) fn run_pod_resync_keys(rows: &[WorkPodRow]) -> Vec<String> {
 }
 
 /// A [`crate::daemon::queue::DiscoverySource`] that re-drives the issue of every `running` run pod
-/// row on the discovery tick, whatever the issue's status, so the completion edge
+/// row, and of every `running` run on a pod whatever its pod row says, on the discovery tick,
+/// whatever the issue's status, so the completion edge
 /// ([`crate::runs::completion::ingest_completion`]) collects a finished pod, fails a vanished or
 /// overrun one, and never depends on the pod watch having delivered an event.
 pub struct RunPodResync {
@@ -337,7 +338,16 @@ impl crate::daemon::queue::DiscoverySource for RunPodResync {
                 crate::runs::work_pods::work_pods_in_states(db.pool(), &[WorkPodState::Running])
                     .await
                     .context("reading running work pods for the run pod resync")?;
-            for key in run_pod_resync_keys(&rows) {
+            let runs = crate::runs::store::running_pod_run_issues(db.pool())
+                .await
+                .context("reading running pod runs for the run pod resync")?;
+            let mut keys = run_pod_resync_keys(&rows);
+            for key in runs {
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            }
+            for key in keys {
                 queue.enqueue(crate::daemon::queue::IssueKey(key));
             }
             Ok(())

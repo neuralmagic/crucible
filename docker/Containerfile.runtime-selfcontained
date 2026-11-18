@@ -59,7 +59,8 @@ RUN cargo build --release --locked -p crucible -p crucible-broker -p forge -p bu
     --features crucible/autoresearch \
     && mkdir -p /prebuilt/bin \
     && find target/release -maxdepth 1 -type f -executable -exec cp {} /prebuilt/bin/ \; \
-    && ls -la /prebuilt/bin/
+    && ls -la /prebuilt/bin/ \
+    && scripts/crucible-kueue-py-stage.sh /prebuilt/python
 
 FROM ghcr.io/neuralmagic/openshell-gateway:sha-${OPENSHELL_REV} AS openshell-dist
 
@@ -144,6 +145,13 @@ RUN curl -fsSL "https://github.com/nushell/nushell/releases/download/${NU_VERSIO
 
 # crucible (engine) + crucible-broker + forge + buildit bins on PATH (compiled by the `bins` stage above).
 COPY --from=bins /prebuilt/bin/ /usr/local/bin/
+# crucible_kueue, the client a pack's command and evaluate tasks import to reach crucible-kueue.
+COPY --from=bins /prebuilt/python/ /opt/crucible/python/
+RUN site="$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" \
+    && mkdir -p "$site" \
+    && cp -r /opt/crucible/python/crucible_kueue "$site/" \
+    && rm -rf /opt/crucible/python \
+    && python3 -c 'import crucible_kueue'
 RUN test "$(crucible --contract-version)" = "${CONTRACT_VERSION}" \
     || { echo "io.crucible.contract-version=${CONTRACT_VERSION} does not match the shipped binary ($(crucible --contract-version))" >&2; exit 1; }
 

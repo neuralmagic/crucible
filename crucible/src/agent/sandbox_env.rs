@@ -197,7 +197,7 @@ pub(crate) fn sh_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use crate::agent::sandbox_env::*;
-    use crate::manifest::Harness;
+    use crate::knobs::Harness;
 
     fn lookup<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         move |key| {
@@ -301,6 +301,7 @@ mod tests {
             )
         );
         assert!(script.contains("export DISABLE_AUTOUPDATER=1\n"));
+        assert!(script.contains("export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\n"));
         assert!(script.contains("export K='v w'\n"));
         assert!(script.ends_with("export OTEL_X='a'\\''b'\n"));
     }

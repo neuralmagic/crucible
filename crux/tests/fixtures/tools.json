@@ -260,6 +260,49 @@
     "name": "crucible_draft_delete"
   },
   {
+    "description": "The unified diff between two saves of a draft pack. With no versions, the newest save against the one before it. Any two versions from crucible_draft_log compare, so a save that broke the pack is found by halving the range between a good one and a bad one.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "draft_id": {
+          "type": "string"
+        },
+        "from": {
+          "default": null,
+          "description": "The older save. Omit for the save before `to`.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "json": {
+          "default": false,
+          "type": "boolean"
+        },
+        "stat": {
+          "default": false,
+          "description": "List the changed files and line counts without the diff text.",
+          "type": "boolean"
+        },
+        "to": {
+          "default": null,
+          "description": "The newer save. Omit for the newest.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "draft_id"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_draft_diff"
+  },
+  {
     "description": "Read a draft pack's files at one save inline: the whole `{path: content}` map, the version, who saved it, and its diagnostics. Use crucible_draft_pull instead for anything bigger than a one-file look — it puts the same files on disk. The version this returns is the base_version a save needs.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -322,7 +365,7 @@
     "name": "crucible_draft_graduate"
   },
   {
-    "description": "Test-fire a draft pack. Runs the newest save, validated against its stored schema and held to the same admin cost ceiling a registered launch is. Costs money against max_cost. Returns the issue key to watch it by with crucible_playbook_run. Pass schema_digest to be refused rather than launched if a save landed since you read it. Pass provider (and optionally model) to run the pack's agent tasks on a registered inference provider instead of the crucible.toml [agent] harness and model.",
+    "description": "Test-fire a draft pack. Runs the newest save, validated against its stored schema and held to the same admin cost ceiling a registered launch is. Costs money against max_cost. Returns the issue key to watch it by with crucible_playbook_run, and a crucible-playbooks:// link that opens it in the user's desktop tracker. Pass schema_digest to be refused rather than launched if a save landed since you read it. Pass provider (and optionally model) to run the pack's agent tasks on a registered inference provider instead of the crucible.toml [agent] harness and model.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -407,6 +450,26 @@
       "type": "object"
     },
     "name": "crucible_draft_launch"
+  },
+  {
+    "description": "A draft pack's saves as a changelog, newest first: who saved each, whether it compiled, and which files it added, removed or modified from the save before it. Read the text of a change with crucible_draft_diff.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "draft_id": {
+          "type": "string"
+        },
+        "json": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "draft_id"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_draft_log"
   },
   {
     "description": "What a draft version compiled to, without launching it: the schema digest its params are validated against and the engine's diagnostics. Read this before crucible_draft_launch — a version with no schema digest never compiled and cannot be launched.",
@@ -658,7 +721,7 @@
     "name": "crucible_issues"
   },
   {
-    "description": "Launch a playbook. Costs money against max_cost, which the controller caps at the admin ceiling. Returns the issue key to watch it by with crucible_playbook_run. Pass provider (and optionally model) to run the pack's agent tasks on a registered inference provider instead of the crucible.toml [agent] harness and model.",
+    "description": "Launch a playbook. Costs money against max_cost, which the controller caps at the admin ceiling. Returns the issue key to watch it by with crucible_playbook_run, and a crucible-playbooks:// link that opens it in the user's desktop tracker. Pass provider (and optionally model) to run the pack's agent tasks on a registered inference provider instead of the crucible.toml [agent] harness and model.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -834,7 +897,7 @@
     "name": "crucible_playbook_import"
   },
   {
-    "description": "One playbook launch whole: its params, caps, and any refusal, as JSON.",
+    "description": "One playbook launch whole: its params, caps, any refusal, and its crucible-playbooks:// tracker link, as JSON.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -972,14 +1035,14 @@
     "name": "crucible_run"
   },
   {
-    "description": "One window of a run's engine output, resumable by cursor. A running pod is read live; once it finishes its ingested session is served, which is the only copy that outlives the pod. Returns at most 200 lines and reports the cursor to resume from, so read it in windows rather than expecting the whole log.",
+    "description": "One window of a run's engine output, resumable by cursor. A running pod is read live; once it finishes its ingested session is served, which is the only copy that outlives the pod. Returns at most 200 lines and always reports the cursor to resume from, so read it in windows rather than expecting the whole log, and poll a running run with the cursor the last window gave.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "cursor": {
           "default": null,
-          "description": "Line to resume from, as a previous window's `cursor=` line reported it. Omit to start at\nthe first line the controller served.",
-          "format": "uint",
+          "description": "Byte offset to resume from, as a previous window's `cursor=` line reported it. Omit to\nstart at the first line of the log.",
+          "format": "uint64",
           "minimum": 0,
           "type": [
             "integer",
@@ -1057,6 +1120,61 @@
       "type": "object"
     },
     "name": "crucible_runs"
+  },
+  {
+    "description": "Fire a schedule now instead of at its next window. A real firing: the run gets the stored cursor and advances it. Refused while the schedule is disabled or a launch that may still advance its cursor is in flight.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "id": {
+          "description": "The schedule's id, as schedules lists it.",
+          "type": "string"
+        },
+        "json": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_schedule_fire"
+  },
+  {
+    "description": "Launch a schedule once without moving it: the run gets the stored cursor, the cursor given here, or none, and never writes it back. Works on a disabled schedule. Costs money against the schedule's max_cost. Returns the issue key to watch it by with crucible_playbook_run.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "cursor": {
+          "default": null,
+          "description": "A cursor value to give the firing in place of the stored one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "The schedule's id, as schedules lists it.",
+          "type": "string"
+        },
+        "json": {
+          "default": false,
+          "type": "boolean"
+        },
+        "no_cursor": {
+          "default": false,
+          "description": "Give the firing no cursor, as on the schedule's first firing.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_schedule_test_fire"
   },
   {
     "description": "Recurrences: ID PLAYBOOK CRON STATE NEXT LAST FAILS OWNER.",

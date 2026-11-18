@@ -42,9 +42,10 @@ pub const RUN_SESSION_DELIMITER: &str = "SESSION (rc=";
 /// index in the file, the same seq the post-delimiter dump and the control bridge give it.
 pub const RUN_SESSION_ECHO_MARKER: &str = "CRUCIBLE_SESSION_LINE ";
 
-/// The longest session line the wrapper echoes live, in bytes. A longer one keeps its index and
+/// The longest session line the wrapper echoes live, in bytes: room for a large plan's
+/// `plan_admitted`, which a viewer needs to show any task. A longer line keeps its index and
 /// reaches the viewer with the stored session instead.
-pub const RUN_SESSION_ECHO_MAX: usize = 16 * 1024;
+pub const RUN_SESSION_ECHO_MAX: usize = 1024 * 1024;
 
 /// A [`RUN_SESSION_ECHO_MARKER`] line's index and session line.
 pub fn parse_session_echo(line: &str) -> Option<(u64, &str)> {

@@ -50,7 +50,7 @@ just route-serving-forward               # the endpoint on localhost:8011
 
 ## Without a model
 
-Swap `min_confidence = 0.8` for `source = read` in `workflow.star` and have `read.sh` emit the
+Swap `model(min_confidence = 0.8)` for `output(read)` in `workflow.star` and have `read.sh` emit the
 labels itself: the same branches, decided deterministically and for free.
 
 See [Let a decision model answer](../../docs/playbook-patterns.md#let-a-decision-model-answer).

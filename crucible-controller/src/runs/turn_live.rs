@@ -18,7 +18,7 @@
 //! ends when the pod goes terminal (log EOF) or vanishes, a hard wall-clock deadline covers a pod
 //! that never finishes, and each line is capped at [`LOG_LINE_CAP`] bytes.
 
-use crate::api::state::{ApiState, ErrorBody};
+use crate::api::state::{ApiError, ApiState, ErrorBody};
 use crate::runs::workpod::{SCOPE_ACTIVITY_MARKER, SCOPE_PROGRESS_MARKER};
 use anyhow::{Context, Result};
 use axum::Json;
@@ -345,10 +345,7 @@ pub(crate) async fn live_response(state: &ApiState, pod_name: &str) -> Response 
                 .into_response();
         }
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("reading turn {pod_name}: {e:#}"),
-            )
+            return ApiError::Internal(e.context(format!("reading turn {pod_name}")))
                 .into_response();
         }
     };

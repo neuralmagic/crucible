@@ -130,3 +130,8 @@ export function phaseColor(phase: string): PhaseColor {
       return 'grey';
   }
 }
+
+/** The buffered lines as one text, a line each. */
+export function logText(lines: LogLine[]): string {
+  return lines.map((line) => line.text).join('\n');
+}

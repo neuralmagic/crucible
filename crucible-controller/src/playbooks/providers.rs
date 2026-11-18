@@ -22,12 +22,13 @@
 
 use crate::wire_enum::wire_enum;
 use anyhow::{Context, Result, bail};
-use crucible::manifest::Harness;
+use crucible::knobs::Harness;
 use crucible_contract::inference::{
-    EnvName, InferenceBinding, InferenceProtocol as WireProtocol, InferenceRole, ResolvedInference,
-    TokenPrice, UsdPerMtok,
+    EnvName, InferenceBinding, InferenceProtocol as WireProtocol, InferenceRole, ModelLimits,
+    ResolvedInference, TokenPrice, UsdPerMtok,
 };
 use sqlx::{PgExecutor, PgPool, Row};
+use std::collections::BTreeMap;
 
 /// Which service a provider talks to. The kind, not the display name, decides behaviour: it picks
 /// the harness the pod renders with and how a credential is projected.
@@ -413,6 +414,9 @@ pub struct ModelProvider {
     pub harness: Option<Harness>,
     /// What this provider's agent tokens cost; `None` leaves pricing to the engine's vendor table.
     pub price: Option<TokenPrice>,
+    /// What each model can take and give, by model id; a model with no entry leaves its limits
+    /// to the harness.
+    pub model_limits: BTreeMap<String, ModelLimits>,
     /// A disabled provider may not be chosen at launch, but a launch that already pinned it still
     /// resolves: turning a provider off must not strand the work already committed to it.
     pub enabled: bool,
@@ -474,7 +478,7 @@ impl ModelProvider {
 
     /// This provider as the engine's binding for `role`, asking `model`. A provider that spends a
     /// secret names the role's key variable; one that does not authenticates ambiently. Only the
-    /// agent binding carries the price.
+    /// agent binding carries the price and the model's limits.
     pub fn binding(&self, role: ModelRole, model: &str) -> Result<InferenceBinding> {
         let Some(protocol) = self.protocol_for(role) else {
             bail!(
@@ -495,6 +499,10 @@ impl ModelProvider {
             key_env,
             price: match role {
                 ModelRole::Agent => self.price,
+                ModelRole::Decision => None,
+            },
+            limits: match role {
+                ModelRole::Agent => self.model_limits.get(model).copied(),
                 ModelRole::Decision => None,
             },
         })
@@ -529,6 +537,8 @@ pub struct NewProvider<'a> {
     pub harness: Option<Harness>,
     /// Refused on a provider that serves no agent.
     pub price: Option<TokenPrice>,
+    /// Refused on a provider that serves no agent.
+    pub model_limits: BTreeMap<String, ModelLimits>,
     pub enabled: bool,
     pub created_by: &'a str,
     pub owner: crate::authz::model::Principal,
@@ -672,7 +682,7 @@ impl From<ResolvedModel> for ResolvedDispatch {
 
 const PROVIDER_COLS: &str = "id, display_name, kind, models, default_model, secret_name, \
      secret_owner, endpoint, protocol, harness, price_input, price_output, price_cache_read, \
-     price_cache_write, enabled, owner, created_by, created_at, updated_at";
+     price_cache_write, model_limits, enabled, owner, created_by, created_at, updated_at";
 
 fn price_from_row(row: &sqlx::postgres::PgRow) -> Result<Option<TokenPrice>> {
     let cols: [Option<f64>; 4] = [
@@ -741,6 +751,9 @@ fn provider_from_row(row: &sqlx::postgres::PgRow) -> Result<ModelProvider> {
         endpoint,
         harness,
         price: price_from_row(row)?,
+        model_limits: row
+            .try_get::<sqlx::types::Json<BTreeMap<String, ModelLimits>>, _>("model_limits")?
+            .0,
         enabled: row.try_get("enabled")?,
         owner: crate::authz::model::Principal::parse(&row.try_get::<String, _>("owner")?)?,
         created_by: row.try_get("created_by")?,
@@ -775,6 +788,7 @@ struct ProviderBinds {
     protocol: Option<&'static str>,
     harness: Option<&'static str>,
     price: [Option<f64>; 4],
+    model_limits: sqlx::types::Json<BTreeMap<String, ModelLimits>>,
 }
 
 fn provider_binds(new: &NewProvider<'_>) -> Result<ProviderBinds> {
@@ -828,6 +842,25 @@ fn provider_binds(new: &NewProvider<'_>) -> Result<ProviderBinds> {
             protocol.map_or(String::new(), |p| format!(" speaking {}", p.as_str())),
         );
     }
+    if !new.model_limits.is_empty() && allowed_harnesses(new.kind, protocol).is_empty() {
+        bail!(
+            "a {} provider{} serves no agent, so it takes no model limits",
+            new.kind.as_str(),
+            protocol.map_or(String::new(), |p| format!(" speaking {}", p.as_str())),
+        );
+    }
+    for (model, limits) in &new.model_limits {
+        if model.trim().is_empty() || model.chars().any(char::is_whitespace) {
+            bail!("model limits name the model {model:?}, which is not a model id");
+        }
+        if limits.max_output_tokens > limits.context_window {
+            bail!(
+                "model {model:?} has max_output_tokens {} over its context_window {}",
+                limits.max_output_tokens,
+                limits.context_window
+            );
+        }
+    }
     Ok(ProviderBinds {
         models,
         default_model,
@@ -845,6 +878,7 @@ fn provider_binds(new: &NewProvider<'_>) -> Result<ProviderBinds> {
                 Some(p.cache_write.get()),
             ],
         },
+        model_limits: sqlx::types::Json(new.model_limits.clone()),
     })
 }
 
@@ -860,8 +894,9 @@ pub fn harness_list(harnesses: impl AsRef<[Harness]>) -> String {
 
 const PROVIDER_INSERT: &str = "INSERT INTO model_providers (id, display_name, kind, models, default_model, secret_name, \
      secret_owner, endpoint, protocol, enabled, created_by, created_at, updated_at, owner, harness, \
-     price_input, price_output, price_cache_read, price_cache_write) \
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $13, $14, $15, $16, $17, $18)";
+     price_input, price_output, price_cache_read, price_cache_write, model_limits) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $13, $14, $15, $16, $17, $18, \
+     $19)";
 
 const PROVIDER_INSERT_OR_IGNORE: &str =
     const_format::concatcp!(PROVIDER_INSERT, " ON CONFLICT (id) DO NOTHING");
@@ -876,6 +911,7 @@ const PROVIDER_UPSERT: &str = const_format::concatcp!(
          price_input = EXCLUDED.price_input, price_output = EXCLUDED.price_output, \
          price_cache_read = EXCLUDED.price_cache_read, \
          price_cache_write = EXCLUDED.price_cache_write, \
+         model_limits = EXCLUDED.model_limits, \
          enabled = EXCLUDED.enabled, updated_at = EXCLUDED.updated_at"
 );
 
@@ -905,6 +941,7 @@ async fn write_provider(
         .bind(binds.price[1])
         .bind(binds.price[2])
         .bind(binds.price[3])
+        .bind(&binds.model_limits)
         .execute(ex)
         .await
         .context(context)?;
@@ -1397,7 +1434,7 @@ pub async fn chain_for_issue(
 #[cfg(test)]
 mod tests {
     use crate::playbooks::providers::*;
-    use crucible::manifest::Harness;
+    use crucible::knobs::Harness;
     use sqlx::PgPool;
 
     #[test]
@@ -1541,6 +1578,7 @@ mod tests {
             protocol: ChatCompletions,
         };
         let new = |harness| NewProvider {
+            model_limits: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "chat",
             display_name: "chat",
@@ -1581,6 +1619,7 @@ mod tests {
             upsert(
                 &pool,
                 &NewProvider {
+                    model_limits: Default::default(),
                     owner: crate::authz::model::Principal::platform(),
                     id,
                     display_name: id,
@@ -1603,6 +1642,7 @@ mod tests {
         assert_eq!(
             defaulted.binding(ModelRole::Agent, "qwen-3-8-27b")?,
             InferenceBinding {
+                limits: None,
                 role: InferenceRole::Agent,
                 protocol: WireProtocol::ChatCompletions,
                 url: Some("https://inference.example.com/llm/qwen/v1".to_string()),
@@ -1643,6 +1683,7 @@ mod tests {
         upsert(
             &pool,
             &NewProvider {
+                model_limits: Default::default(),
                 owner: crate::authz::model::Principal::platform(),
                 id: "onprem",
                 display_name: "On-prem vLLM",
@@ -1665,6 +1706,7 @@ mod tests {
         assert_eq!(
             stored.binding(ModelRole::Agent, "gpt-oss-120b")?,
             InferenceBinding {
+                limits: None,
                 role: InferenceRole::Agent,
                 protocol: WireProtocol::Responses,
                 url: Some("http://vllm.internal:8000/v1".to_string()),
@@ -1691,6 +1733,7 @@ mod tests {
         let no_default = upsert(
             &pool,
             &NewProvider {
+                model_limits: Default::default(),
                 owner: crate::authz::model::Principal::platform(),
                 id: "onprem-2",
                 display_name: "no default",
@@ -1714,6 +1757,7 @@ mod tests {
         let misplaced = upsert(
             &pool,
             &NewProvider {
+                model_limits: Default::default(),
                 owner: crate::authz::model::Principal::platform(),
                 id: "oa",
                 display_name: "OpenAI",
@@ -1739,6 +1783,7 @@ mod tests {
 
     fn new_provider<'a>(id: &'a str, kind: ProviderKind) -> NewProvider<'a> {
         NewProvider {
+            model_limits: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id,
             display_name: "Some Provider",
@@ -1756,6 +1801,7 @@ mod tests {
 
     fn registered(kind: ProviderKind, endpoint: Option<Endpoint>, keyed: bool) -> ModelProvider {
         ModelProvider {
+            model_limits: Default::default(),
             id: "p".to_string(),
             display_name: "P".to_string(),
             kind,
@@ -1836,6 +1882,7 @@ mod tests {
         assert_eq!(
             keyed.binding(ModelRole::Decision, "gpt-6-luna")?,
             InferenceBinding {
+                limits: None,
                 role: InferenceRole::Decision,
                 protocol: WireProtocol::Decisions,
                 url: None,
@@ -2795,6 +2842,7 @@ mod tests {
 
     fn selfhosted(endpoint: &Endpoint, price: Option<TokenPrice>) -> NewProvider<'_> {
         NewProvider {
+            model_limits: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "selfhosted",
             display_name: "Self-hosted",
@@ -2886,6 +2934,7 @@ mod tests {
         assert!(err.contains("takes no price"), "{err}");
 
         let mut openai = ModelProvider {
+            model_limits: Default::default(),
             id: "plat-openai".to_string(),
             display_name: "OpenAI".to_string(),
             kind: ProviderKind::OpenAi,
@@ -2921,6 +2970,148 @@ mod tests {
                 .binding(ModelRole::Agent, "gpt-5.6-luna")
                 .expect("agent")
                 .price,
+            None
+        );
+    }
+
+    fn limits(context_window: u32, max_output_tokens: u32) -> ModelLimits {
+        let tokens = |n| std::num::NonZeroU32::new(n).expect("a positive count");
+        ModelLimits {
+            context_window: tokens(context_window),
+            max_output_tokens: tokens(max_output_tokens),
+        }
+    }
+
+    /// Limits round-trip the registry by model, ride the agent binding of the model they name and
+    /// of no other, and are cleared by a re-registration without them.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn model_limits_are_stored_and_rendered_into_the_agent_binding_of_their_model(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let endpoint = Endpoint {
+            url: "https://selfhosted.example/v1".to_string(),
+            protocol: InferenceProtocol::Messages,
+        };
+        let mut new = selfhosted(&endpoint, None);
+        new.model_limits = BTreeMap::from([
+            ("zai-org/glm-5".to_string(), limits(200_000, 64_000)),
+            ("small".to_string(), limits(32_768, 4_096)),
+        ]);
+        upsert(&pool, &new).await?;
+        let stored = get(&pool, "selfhosted").await?.expect("the row");
+        assert_eq!(stored.model_limits, new.model_limits);
+
+        let resolved = resolve_dispatch(
+            &pool,
+            Some(DispatchOverride {
+                provider_id: "selfhosted",
+                model: None,
+            }),
+            None,
+            WorkloadClass::Playbook,
+        )
+        .await?
+        .expect("the pinned provider");
+        let document = inference_document(&[resolved.inference()])?;
+        let agent = document
+            .binding(InferenceRole::Agent)
+            .expect("the agent binding");
+        assert_eq!(agent.model, "zai-org/glm-5");
+        assert_eq!(agent.limits, Some(limits(200_000, 64_000)));
+        assert_eq!(
+            stored.binding(ModelRole::Agent, "small")?.limits,
+            Some(limits(32_768, 4_096))
+        );
+        assert_eq!(stored.binding(ModelRole::Agent, "unlisted")?.limits, None);
+
+        upsert(&pool, &selfhosted(&endpoint, None)).await?;
+        let cleared = get(&pool, "selfhosted").await?.expect("the row");
+        assert!(cleared.model_limits.is_empty());
+        assert_eq!(
+            cleared.binding(ModelRole::Agent, "zai-org/glm-5")?.limits,
+            None
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn the_table_refuses_model_limits_that_are_not_an_object(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let endpoint = Endpoint {
+            url: "https://selfhosted.example/v1".to_string(),
+            protocol: InferenceProtocol::Messages,
+        };
+        upsert(&pool, &selfhosted(&endpoint, None)).await?;
+        for sql in [
+            "UPDATE model_providers SET model_limits = '[]' WHERE id = 'selfhosted'",
+            "UPDATE model_providers SET model_limits = '3' WHERE id = 'selfhosted'",
+            "UPDATE model_providers SET model_limits = NULL WHERE id = 'selfhosted'",
+        ] {
+            let refused = sqlx::query(sql).execute(&pool).await;
+            assert!(refused.is_err(), "{sql}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn model_limits_need_an_agent_a_model_id_and_an_output_within_the_window() {
+        let refusal = |endpoint: &Endpoint, model: &str, limits: ModelLimits| {
+            let mut new = selfhosted(endpoint, None);
+            new.model_limits = BTreeMap::from([(model.to_string(), limits)]);
+            match provider_binds(&new) {
+                Err(e) => e.to_string(),
+                Ok(_) => String::new(),
+            }
+        };
+        let decide = Endpoint {
+            url: "http://dgemma.internal:8011/v1/systemone".to_string(),
+            protocol: InferenceProtocol::SystemOne,
+        };
+        let agent = Endpoint {
+            url: "https://selfhosted.example/v1".to_string(),
+            protocol: InferenceProtocol::Messages,
+        };
+        let err = refusal(&decide, "m", limits(8_000, 1_000));
+        assert!(err.contains("takes no model limits"), "{err}");
+        let err = refusal(&agent, "m", limits(8_000, 16_000));
+        assert!(err.contains("max_output_tokens 16000 over"), "{err}");
+        let err = refusal(&agent, "two words", limits(8_000, 1_000));
+        assert!(err.contains("is not a model id"), "{err}");
+        assert_eq!(refusal(&agent, "m", limits(8_000, 8_000)), "");
+    }
+
+    #[test]
+    fn only_the_agent_binding_carries_the_models_limits() {
+        let openai = ModelProvider {
+            model_limits: BTreeMap::from([("gpt-6-luna".to_string(), limits(400_000, 128_000))]),
+            id: "plat-openai".to_string(),
+            display_name: "OpenAI".to_string(),
+            kind: ProviderKind::OpenAi,
+            models: Vec::new(),
+            default_model: "gpt-6-luna".to_string(),
+            secret: None,
+            endpoint: None,
+            harness: None,
+            price: None,
+            enabled: true,
+            owner: crate::authz::model::Principal::platform(),
+            created_by: "alice".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        assert_eq!(
+            openai
+                .binding(ModelRole::Agent, "gpt-6-luna")
+                .expect("agent")
+                .limits,
+            Some(limits(400_000, 128_000))
+        );
+        assert_eq!(
+            openai
+                .binding(ModelRole::Decision, "gpt-6-luna")
+                .expect("decision")
+                .limits,
             None
         );
     }

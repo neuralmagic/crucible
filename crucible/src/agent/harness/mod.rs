@@ -17,7 +17,7 @@ use crate::agent::event::AgentEvent;
 use crate::agent::inference::{InferenceEnv, WireApi};
 use crate::agent::sandbox_env::sh_quote;
 use crate::args::TurnAgent;
-use crate::manifest::Harness;
+use crate::knobs::Harness;
 use crate::openshell::provider::CodexAuth;
 use crate::turn_trace::{GenAiRecord, ToolInvocation};
 use crucible::harness::{AuthProvider, HarnessSpec};
@@ -243,7 +243,7 @@ pub(crate) trait Backend: Sync {
     /// The sandbox exec argv (program name first, no prompt, it arrives over stdin).
     /// `mcp_seeded` says whether the turn reaches any MCP server, and so whether
     /// [`Backend::seed_files`] delivered an MCP config, so a harness that takes it on argv
-    /// (claude's `--mcp-config`, pi's `-e` for the adapter) can point at it.
+    /// (claude's `--mcp-config`, pi's `--tools +codemode`) can act on it.
     fn sandbox_argv(&self, agent: &TurnAgent<'_>, mcp_seeded: bool) -> Vec<String>;
 
     /// Start or resume a Crucible-managed session locally.
@@ -266,6 +266,15 @@ pub(crate) trait Backend: Sync {
         Err(no_sessions(self.spec()))
     }
 
+    /// Whether `file_name` is the transcript this harness writes for `session`.
+    fn is_session_transcript(
+        &self,
+        _file_name: &str,
+        _session: &crate::agent::agent_session::SessionTurn,
+    ) -> bool {
+        false
+    }
+
     /// The config file seeded at [`HarnessSpec::config`] before the agent execs, rendered
     /// host-side; `None` seeds nothing this turn.
     fn config(
@@ -277,7 +286,12 @@ pub(crate) trait Backend: Sync {
 
     /// The credential file a harness seeds when its credential cannot ride the gateway as-is:
     /// codex's `auth.json`, pi's Vertex extension.
-    fn credential(&self, _agent: &TurnAgent<'_>, _auth: &SandboxAuth) -> Option<SeedFile> {
+    fn credential(
+        &self,
+        _agent: &TurnAgent<'_>,
+        _auth: &SandboxAuth,
+        _inference: &InferenceEnv,
+    ) -> Option<SeedFile> {
         None
     }
 
@@ -346,7 +360,7 @@ pub(crate) trait Backend: Sync {
             })
             .into_iter()
             .collect();
-        seeds.extend(self.credential(agent, auth));
+        seeds.extend(self.credential(agent, auth, inference));
         if !servers.is_empty() {
             seeds.extend(self.mcp_config(servers));
         }

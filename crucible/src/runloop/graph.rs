@@ -733,6 +733,10 @@ impl<'a> LoopTaskRunner<'a> {
 }
 
 impl TaskRunner for LoopTaskRunner<'_> {
+    fn prepare(&mut self) {
+        self.workflow_runner.prepare();
+    }
+
     fn run(
         &mut self,
         task: &Task,
@@ -1267,6 +1271,10 @@ impl WideRunner<'_> {
 }
 
 impl TaskRunner for WideRunner<'_> {
+    fn prepare(&mut self) {
+        self.args.compile_secret_rules();
+    }
+
     fn run(
         &mut self,
         task: &Task,

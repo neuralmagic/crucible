@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { scheduleView, type ScheduleRow } from './schedulesView';
+import { isCursorFrom, scheduleView, testCursor, type ScheduleRow } from './schedulesView';
 
 function row(over: Partial<ScheduleRow> = {}): ScheduleRow {
   return {
@@ -36,5 +36,22 @@ describe('scheduleView', () => {
 
   it('says so when an enabled schedule has no occurrence ahead', () => {
     expect(scheduleView(row({ next_due_at: null })).detail).toBe('No further occurrence ahead.');
+  });
+});
+
+describe('testCursor', () => {
+  it('sends the stored cursor or none as chosen', () => {
+    expect(testCursor('stored', 'ignored')).toEqual({ from: 'stored' });
+    expect(testCursor('none', 'ignored')).toEqual({ from: 'none' });
+  });
+
+  it('waits for a typed value and sends a file body as typed', () => {
+    expect(testCursor('value', '')).toBeNull();
+    expect(testCursor('value', ' {"seen": []}\n')).toEqual({ from: 'value', value: ' {"seen": []}\n' });
+  });
+
+  it('recognizes only the three sources', () => {
+    expect(isCursorFrom('value')).toBe(true);
+    expect(isCursorFrom('latest')).toBe(false);
   });
 });

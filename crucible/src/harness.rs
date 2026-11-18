@@ -2,7 +2,7 @@
 //! makes reads this one table through [`Harness::spec`]; the argv grammar, config file, stream
 //! decoder, and transcript parser that genuinely differ per CLI live in the binary's backends.
 
-use crate::manifest::Harness;
+use crate::knobs::Harness;
 use crate::openshell::policy::{CLAUDE_ENDPOINTS, CODEX_ENDPOINTS, OPENAI_API_ENDPOINTS};
 use crucible_contract::inference::InferenceProtocol;
 use std::time::Duration;
@@ -143,6 +143,7 @@ static CLAUDE: HarnessSpec = HarnessSpec {
         ("CLAUDE_CODE_SYNC_PLUGIN_INSTALL", "1"),
         ("DISABLE_AUTOUPDATER", "1"),
         ("CLAUDE_CODE_MAX_RETRIES", "20"),
+        ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
     ],
     local_env: &[
         ("DISABLE_AUTOUPDATER", "1"),
@@ -266,12 +267,17 @@ static PI: HarnessSpec = HarnessSpec {
     ],
     model_endpoints: OPENAI_API_ENDPOINTS,
     sandbox_capability: Some("agent.pi"),
-    persistent_sessions: false,
+    persistent_sessions: true,
     otel_capable: false,
     backfill_required: false,
 };
 
 impl Harness {
+    /// The default model when neither the CLI nor the manifest names one.
+    pub const fn default_model(self) -> &'static str {
+        self.spec().default_model
+    }
+
     /// This harness's table entry.
     pub const fn spec(self) -> &'static HarnessSpec {
         match self {
@@ -345,10 +351,14 @@ mod tests {
     }
 
     #[test]
-    fn only_claude_resumes_sessions_and_only_vertex_harnesses_are_key_free() {
+    fn claude_and_pi_resume_sessions_and_only_vertex_harnesses_are_key_free() {
         for harness in Harness::all() {
             let spec = harness.spec();
-            assert_eq!(spec.persistent_sessions, *harness == Harness::Claude);
+            assert_eq!(
+                spec.persistent_sessions,
+                matches!(harness, Harness::Claude | Harness::Pi),
+                "{harness:?}"
+            );
             let key_free = matches!(spec.auth, AuthProvider::Vertex);
             assert_eq!(key_free, *harness == Harness::Claude, "{harness:?}");
         }

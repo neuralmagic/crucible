@@ -3,7 +3,10 @@
 use crate::args::Paths;
 use crate::errors::FileError;
 use crate::manifest::{self, GitRef};
+use crucible_vcs::cli::{GitError, git};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::RecvTimeoutError;
+use std::time::{Duration, Instant};
 
 /// What preparing a workspace can fail on: the setup command, the clone, the toolbox copy.
 #[derive(Debug, thiserror::Error)]
@@ -25,14 +28,39 @@ pub(crate) enum WorkspaceError {
         #[source]
         source: std::io::Error,
     },
-    #[error("running git")]
-    SpawnGit(#[source] std::io::Error),
     #[error("git clone {src} -> {} failed", .dest.display())]
-    GitCloneFailed { src: String, dest: PathBuf },
+    GitCloneFailed {
+        src: String,
+        dest: PathBuf,
+        #[source]
+        source: GitError,
+    },
     #[error("fetching {git_ref} from {src} failed: it names no branch, tag or commit there")]
-    GitFetchFailed { src: String, git_ref: GitRef },
+    GitFetchFailed {
+        src: String,
+        git_ref: GitRef,
+        #[source]
+        source: GitError,
+    },
     #[error("checking out {git_ref} in {} failed", .dest.display())]
-    GitCheckoutFailed { git_ref: GitRef, dest: PathBuf },
+    GitCheckoutFailed {
+        git_ref: GitRef,
+        dest: PathBuf,
+        #[source]
+        source: GitError,
+    },
+    #[error("in {}", .dir.display())]
+    Git {
+        dir: PathBuf,
+        #[source]
+        source: GitError,
+    },
+    #[error("reading the packs of {}", .dir.display())]
+    ReadPacks {
+        dir: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("reading the refs of {}", .dest.display())]
     ReadRefs {
         dest: PathBuf,
@@ -88,7 +116,7 @@ pub(crate) fn manifest_setup(
             }
         });
     };
-    clone_repo(src, m.repo.git_ref.as_ref(), workspace)
+    clone_repo(src, m.repo.git_ref.as_ref(), m.repo.filter, workspace)
 }
 
 /// `git clone <src> <dest>`, then `git_ref` fetched and checked out detached. A clone whose
@@ -96,15 +124,25 @@ pub(crate) fn manifest_setup(
 pub(crate) fn clone_repo(
     src: &str,
     git_ref: Option<&GitRef>,
+    filter: Option<crate::manifest::CloneFilter>,
     dest: &Path,
 ) -> Result<(), WorkspaceError> {
-    let dest_arg = dest.to_string_lossy();
-    if !git(None, &["clone", "--quiet", src, &dest_arg])? {
-        return Err(WorkspaceError::GitCloneFailed {
-            src: src.to_owned(),
-            dest: dest.to_path_buf(),
-        });
-    }
+    let filter_arg = filter.map(|f| format!("--filter={}", f.as_str()));
+    let mut args: Vec<&std::ffi::OsStr> = vec!["clone".as_ref(), "--quiet".as_ref()];
+    args.extend(filter_arg.as_deref().map(std::ffi::OsStr::new));
+    args.extend([src.as_ref(), dest.as_os_str()]);
+    let shown = crate::turn_trace::redact(src);
+    eprintln!("[crucible] cloning {shown}");
+    with_heartbeat(
+        CLONE_HEARTBEAT,
+        |elapsed| eprintln!("{}", clone_progress(&shown, dest, elapsed)),
+        || git(None, args).run(),
+    )
+    .map_err(|source| WorkspaceError::GitCloneFailed {
+        src: src.to_owned(),
+        dest: dest.to_path_buf(),
+        source,
+    })?;
     let Some(r) = git_ref else {
         return Ok(());
     };
@@ -117,41 +155,218 @@ pub(crate) fn clone_repo(
     checked_out
 }
 
+/// How often a clone still running says how far it has got.
+const CLONE_HEARTBEAT: Duration = Duration::from_secs(30);
+
+/// Run `work`, calling `beat` with the time elapsed every `every` until it returns.
+fn with_heartbeat<T>(
+    every: Duration,
+    beat: impl Fn(Duration) + Send,
+    work: impl FnOnce() -> T,
+) -> T {
+    let started = Instant::now();
+    std::thread::scope(|scope| {
+        let (done, running) = std::sync::mpsc::channel::<()>();
+        scope.spawn(move || {
+            while running.recv_timeout(every) == Err(RecvTimeoutError::Timeout) {
+                beat(started.elapsed());
+            }
+        });
+        let out = work();
+        drop(done);
+        out
+    })
+}
+
+/// One heartbeat line of a clone of `src` into `dest`.
+fn clone_progress(src: &str, dest: &Path, elapsed: Duration) -> String {
+    format!(
+        "[crucible] cloning {src}: {} MiB received after {}",
+        pack_bytes(dest) / (1024 * 1024),
+        crate::duration::Shown(Duration::from_secs(elapsed.as_secs())),
+    )
+}
+
+/// The bytes in the packs `dest` holds, the one a clone is still receiving included.
+fn pack_bytes(dest: &Path) -> u64 {
+    let Ok(packs) = std::fs::read_dir(dest.join(".git/objects/pack")) else {
+        return 0;
+    };
+    packs
+        .filter_map(|entry| entry.ok()?.metadata().ok())
+        .map(|meta| meta.len())
+        .sum()
+}
+
 /// Fetch `r` from origin and check it out detached. A commit the clone already holds is checked
 /// out without a fetch, since a server need not serve a commit by id.
 fn checkout(src: &str, dest: &Path, r: &GitRef) -> Result<(), WorkspaceError> {
-    let held = r.is_commit() && git(Some(dest), &["cat-file", "-e", &format!("{r}^{{commit}}")])?;
+    let held = r.is_commit()
+        && git(dest, ["cat-file", "-e", &format!("{r}^{{commit}}")])
+            .succeeds()
+            .map_err(in_dir(dest))?;
     let target = if held {
         r.as_str()
     } else {
-        if !git(Some(dest), &["fetch", "--quiet", "origin", r.as_str()])? {
-            return Err(WorkspaceError::GitFetchFailed {
+        git(dest, ["fetch", "--quiet", "origin", r.as_str()])
+            .run()
+            .map_err(|source| WorkspaceError::GitFetchFailed {
                 src: src.to_owned(),
                 git_ref: r.clone(),
-            });
-        }
+                source,
+            })?;
         "FETCH_HEAD"
     };
-    if !git(Some(dest), &["checkout", "--quiet", "--detach", target])? {
-        return Err(WorkspaceError::GitCheckoutFailed {
+    git(dest, ["checkout", "--quiet", "--detach", target])
+        .run()
+        .map_err(|source| WorkspaceError::GitCheckoutFailed {
             git_ref: r.clone(),
             dest: dest.to_path_buf(),
-        });
-    }
-    Ok(())
+            source,
+        })
 }
 
-/// Run git, in `dir` when given; `Ok(false)` is a git that ran and failed.
-fn git(dir: Option<&Path>, args: &[&str]) -> Result<bool, WorkspaceError> {
-    let mut command = std::process::Command::new("git");
-    if let Some(dir) = dir {
-        command.arg("-C").arg(dir);
+/// A `map_err` argument naming the repository a git failed in.
+fn in_dir(dir: &Path) -> impl Fn(GitError) -> WorkspaceError {
+    let dir = dir.to_path_buf();
+    move |source| WorkspaceError::Git {
+        dir: dir.clone(),
+        source,
     }
-    Ok(command
-        .args(args)
-        .status()
-        .map_err(WorkspaceError::SpawnGit)?
-        .success())
+}
+
+/// The remote a partial clone fetches missing objects from; `None` for a full clone.
+fn promisor_remote(workspace: &Path) -> Result<Option<String>, WorkspaceError> {
+    let remotes = git(workspace, ["remote"])
+        .read()
+        .map_err(in_dir(workspace))?;
+    for remote in remotes.lines() {
+        let key = format!("remote.{remote}.promisor");
+        let promisor = git(
+            workspace,
+            [
+                "config",
+                "--get",
+                "--type",
+                "bool",
+                "--default",
+                "false",
+                &key,
+            ],
+        )
+        .read()
+        .map_err(in_dir(workspace))?;
+        if promisor.trim() == "true" {
+            return Ok(Some(remote.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
+/// The blobs a partial clone has fetched from origin, by id, sorted: those its checkout needed
+/// and those anything since read. None for a full clone, which holds every blob from the start.
+pub(crate) fn fetched_blobs(workspace: &Path) -> Result<Vec<String>, WorkspaceError> {
+    if promisor_remote(workspace)?.is_none() {
+        return Ok(Vec::new());
+    }
+    let packs = git(
+        workspace,
+        [
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects/pack",
+        ],
+    )
+    .read()
+    .map_err(in_dir(workspace))?;
+    let packs = PathBuf::from(packs.trim_end_matches('\n'));
+    let read = |source| WorkspaceError::ReadPacks {
+        dir: packs.clone(),
+        source,
+    };
+    let mut fetched = Vec::new();
+    for entry in std::fs::read_dir(&packs).map_err(read)? {
+        let marker = entry.map_err(read)?.path();
+        if marker.extension().is_none_or(|ext| ext != "promisor") {
+            continue;
+        }
+        let index = std::fs::File::open(marker.with_extension("idx")).map_err(read)?;
+        let listed = git(workspace, ["show-index"])
+            .stdin_file(index)
+            .read()
+            .map_err(in_dir(workspace))?;
+        fetched.extend(
+            listed
+                .lines()
+                .filter_map(|line| line.split_whitespace().nth(1))
+                .map(str::to_owned),
+        );
+    }
+    let typed = git(
+        workspace,
+        ["cat-file", "--batch-check=%(objecttype) %(objectname)"],
+    )
+    .stdin_bytes(fetched.join("\n"))
+    .read()
+    .map_err(in_dir(workspace))?;
+    let mut blobs: Vec<String> = typed
+        .lines()
+        .filter_map(|line| line.strip_prefix("blob "))
+        .map(str::to_owned)
+        .collect();
+    blobs.sort();
+    blobs.dedup();
+    Ok(blobs)
+}
+
+/// Fetch those of `blobs` a partial clone does not hold from the remote it was cloned from. A
+/// full clone holds every blob its remote serves, so there is nothing to fetch.
+pub(crate) fn fetch_blobs(workspace: &Path, blobs: &[String]) -> Result<(), WorkspaceError> {
+    if blobs.is_empty() {
+        return Ok(());
+    }
+    let Some(remote) = promisor_remote(workspace)? else {
+        return Ok(());
+    };
+    let held = git(
+        workspace,
+        [
+            "cat-file",
+            "--batch-all-objects",
+            "--unordered",
+            "--batch-check=%(objectname)",
+        ],
+    )
+    .read()
+    .map_err(in_dir(workspace))?;
+    let held: std::collections::HashSet<&str> = held.lines().collect();
+    let missing: Vec<&str> = blobs
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !held.contains(id))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    git(
+        workspace,
+        [
+            "-c",
+            "fetch.negotiationAlgorithm=noop",
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--recurse-submodules=no",
+            "--stdin",
+            &remote,
+        ],
+    )
+    .stdin_bytes(missing.join("\n"))
+    .read()
+    .map_err(in_dir(workspace))?;
+    Ok(())
 }
 
 /// The branches and tags of a fresh clone whose history holds `commit`, by short name.
@@ -189,7 +404,7 @@ pub(crate) fn refs_containing(dest: &Path, commit: &GitRef) -> Result<Vec<String
 }
 
 /// Copy every non-excluded skill under `p.skills` into the workspace's `skills_dir` (the
-/// harness's discovery path, see [`crate::manifest::Harness::skills_dir`]).
+/// harness's discovery path, see [`crate::knobs::Harness::skills_dir`]).
 /// `exclude` names setup-only skills (deployment config, workload capture) that the loop agent must
 /// never see, see [`manifest::AgentCfg::toolbox_exclude`]. A name in `exclude` that doesn't
 /// exist under the toolbox dir is a manifest bug (the exclusion is silently doing nothing), so
@@ -254,7 +469,7 @@ mod tests {
         let clone = |name: &str, r: Option<&str>| {
             let dest = origin.path.with_extension(name);
             let _ = fs::remove_dir_all(&dest);
-            clone_repo(&src, r.map(at).as_ref(), &dest).map(|()| dest)
+            clone_repo(&src, r.map(at).as_ref(), None, &dest).map(|()| dest)
         };
 
         let plain = clone("plain", None).expect("clones");
@@ -290,10 +505,196 @@ mod tests {
     }
 
     #[test]
+    fn a_filtered_clone_is_partial_and_keeps_every_commit() {
+        let origin = crate::testing::git_origin("clone-filter");
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .expect("git runs")
+        };
+        assert!(
+            git(&origin.path, &["config", "uploadpack.allowFilter", "true"])
+                .status
+                .success()
+        );
+        let src = format!("file://{}", origin.path.display());
+        let dest = origin.path.with_extension("partial");
+        clone_repo(
+            &src,
+            Some(&at("feature/x")),
+            Some(crate::manifest::CloneFilter::BlobNone),
+            &dest,
+        )
+        .expect("clones");
+        assert_eq!(
+            crate::testing::checked_out(&dest),
+            (origin.feature.clone(), true)
+        );
+        let filter = git(&dest, &["config", "remote.origin.partialclonefilter"]);
+        assert_eq!(String::from_utf8_lossy(&filter.stdout).trim(), "blob:none");
+        assert!(
+            git(
+                &dest,
+                &["merge-base", "--is-ancestor", &origin.main, "HEAD"]
+            )
+            .status
+            .success(),
+            "the partial clone holds the history merge-base walks"
+        );
+    }
+
+    #[test]
+    fn a_partial_clone_lists_the_blobs_it_fetched_and_another_fetches_them() {
+        let origin = crate::testing::git_origin("clone-fetched");
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .expect("git runs");
+            (
+                out.status.success(),
+                String::from_utf8_lossy(&out.stdout).trim().to_owned(),
+            )
+        };
+        for key in ["uploadpack.allowFilter", "uploadpack.allowAnySHA1InWant"] {
+            assert!(git(&origin.path, &["config", key, "true"]).0);
+        }
+        let src = format!("file://{}", origin.path.display());
+        let partial = |name: &str| {
+            let dest = origin.path.with_extension(name);
+            clone_repo(
+                &src,
+                None,
+                Some(crate::manifest::CloneFilter::BlobNone),
+                &dest,
+            )
+            .expect("clones");
+            dest
+        };
+        let on_main = git(&origin.path, &["rev-parse", "main:a.txt"]).1;
+        let on_feature = git(&origin.path, &["rev-parse", "feature/x:a.txt"]).1;
+        let feature_blob = format!("{}:a.txt", origin.feature);
+        let offline = |dir: &std::path::Path| {
+            git(
+                dir,
+                &[
+                    "-c",
+                    "url./nonexistent/.insteadOf=file://",
+                    "cat-file",
+                    "-p",
+                    &feature_blob,
+                ],
+            )
+        };
+
+        let first = partial("first");
+        assert_eq!(
+            fetched_blobs(&first).expect("lists"),
+            std::slice::from_ref(&on_main)
+        );
+        assert_eq!(git(&first, &["cat-file", "-p", &feature_blob]).1, "feature");
+        let mut both = vec![on_main.clone(), on_feature];
+        both.sort();
+        assert_eq!(fetched_blobs(&first).expect("lists"), both);
+
+        let second = partial("second");
+        assert!(!offline(&second).0, "a fresh clone lacks the blob");
+        fetch_blobs(&second, &both).expect("fetches the one it lacks");
+        assert_eq!(offline(&second), (true, "feature".to_owned()));
+        assert_eq!(fetched_blobs(&second).expect("lists"), both);
+        fetch_blobs(&second, &both).expect("nothing left to fetch");
+
+        let unknown = vec!["0".repeat(40)];
+        assert!(
+            matches!(
+                fetch_blobs(&second, &unknown),
+                Err(WorkspaceError::Git { .. })
+            ),
+            "a blob origin does not serve fails the fetch"
+        );
+
+        let full = origin.path.with_extension("full");
+        clone_repo(&src, None, None, &full).expect("clones");
+        assert_eq!(fetched_blobs(&full).expect("lists"), Vec::<String>::new());
+        fetch_blobs(&full, &both).expect("a full clone holds them already");
+        for dir in [first, second, full] {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn listing_and_fetching_carry_more_blobs_than_a_pipe_buffers() {
+        let origin = crate::testing::git_origin("clone-many");
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.email=c@l", "-c", "user.name=c"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        const FILES: usize = 4000;
+        git(&origin.path, &["checkout", "-q", "-b", "many"]);
+        fs::create_dir(origin.path.join("many")).expect("mkdir");
+        for i in 0..FILES {
+            fs::write(origin.path.join(format!("many/{i}.txt")), format!("{i}\n")).expect("write");
+        }
+        git(&origin.path, &["add", "-A"]);
+        git(&origin.path, &["commit", "-q", "-m", "many"]);
+        git(&origin.path, &["checkout", "-q", "main"]);
+        for key in ["uploadpack.allowFilter", "uploadpack.allowAnySHA1InWant"] {
+            git(&origin.path, &["config", key, "true"]);
+        }
+        let src = format!("file://{}", origin.path.display());
+        let filter = Some(crate::manifest::CloneFilter::BlobNone);
+
+        let wide = origin.path.with_extension("wide");
+        clone_repo(&src, Some(&at("many")), filter, &wide).expect("clones");
+        let blobs = fetched_blobs(&wide).expect("lists");
+        assert_eq!(
+            blobs.len(),
+            FILES + 1,
+            "every file of the checkout, a.txt included"
+        );
+        assert!(
+            blobs.iter().map(|id| id.len() + 1).sum::<usize>() > 2 * 65536,
+            "the list outgrows a pipe's buffer"
+        );
+
+        let narrow = origin.path.with_extension("narrow");
+        clone_repo(&src, None, filter, &narrow).expect("clones");
+        assert_eq!(fetched_blobs(&narrow).expect("lists").len(), 1);
+        fetch_blobs(&narrow, &blobs).expect("fetches");
+        assert_eq!(fetched_blobs(&narrow).expect("lists"), blobs);
+        git(
+            &narrow,
+            &[
+                "-c",
+                "url./nonexistent/.insteadOf=file://",
+                "checkout",
+                "-q",
+                "origin/many",
+            ],
+        );
+        for dir in [wide, narrow] {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
     fn a_commit_is_held_by_the_branches_and_tags_whose_history_has_it() {
         let origin = crate::testing::git_origin("clone-contains");
         let dest = origin.path.with_extension("clone");
-        clone_repo(&origin.path.to_string_lossy(), None, &dest).expect("clones");
+        clone_repo(&origin.path.to_string_lossy(), None, None, &dest).expect("clones");
         let held = |commit: &str| refs_containing(&dest, &at(commit)).expect("reads refs");
         assert_eq!(held(&origin.main), ["feature/x", "main", "v1"]);
         assert_eq!(held(&origin.feature), ["feature/x"]);
@@ -351,6 +752,74 @@ mod tests {
         let err =
             install_toolbox(&p, &["rig-cofnig-typo".to_string()], ".claude/skills").unwrap_err();
         assert!(err.to_string().contains("rig-cofnig-typo"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_heartbeat_beats_while_the_work_runs_and_not_after() {
+        let beats = std::sync::Mutex::new(Vec::new());
+        let out = with_heartbeat(
+            Duration::from_millis(20),
+            |elapsed| beats.lock().unwrap().push(elapsed),
+            || {
+                std::thread::sleep(Duration::from_millis(300));
+                7
+            },
+        );
+        assert_eq!(out, 7);
+        let seen = beats.lock().unwrap().clone();
+        assert!(seen.len() >= 3, "{seen:?}");
+        assert!(seen.is_sorted(), "{seen:?}");
+        assert!(seen[0] >= Duration::from_millis(20), "{seen:?}");
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(beats.lock().unwrap().len(), seen.len());
+    }
+
+    #[test]
+    fn work_that_ends_before_the_first_beat_returns_at_once_with_none() {
+        let beats = std::sync::atomic::AtomicU32::new(0);
+        let started = Instant::now();
+        with_heartbeat(
+            Duration::from_secs(60),
+            |_| {
+                beats.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            },
+            || (),
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(beats.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn clone_progress_counts_the_pack_being_received() {
+        let dir = tempdir("clone-progress");
+        let dest = dir.join("workspace");
+        let line = |secs| {
+            clone_progress(
+                "https://example.com/r.git",
+                &dest,
+                Duration::from_secs(secs),
+            )
+        };
+        assert_eq!(
+            line(30),
+            "[crucible] cloning https://example.com/r.git: 0 MiB received after 30s"
+        );
+
+        let packs = dest.join(".git/objects/pack");
+        fs::create_dir_all(&packs).unwrap();
+        fs::write(packs.join("tmp_pack_a1b2c3"), vec![0u8; 3 * 1024 * 1024]).unwrap();
+        fs::write(packs.join("pack-1.pack"), vec![0u8; 2 * 1024 * 1024 + 5]).unwrap();
+        assert_eq!(pack_bytes(&dest), 5 * 1024 * 1024 + 5);
+        assert_eq!(
+            clone_progress(
+                "https://example.com/r.git",
+                &dest,
+                Duration::from_millis(90_400)
+            ),
+            "[crucible] cloning https://example.com/r.git: 5 MiB received after 90s"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

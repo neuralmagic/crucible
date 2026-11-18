@@ -26,7 +26,7 @@ RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-
 WORKDIR /src
 COPY . .
 ARG CRUCIBLE_GIT_SHA
-ENV SQLX_OFFLINE=true CRUCIBLE_GIT_SHA=${CRUCIBLE_GIT_SHA}
+ENV SQLX_OFFLINE=true CRUCIBLE_GIT_SHA=${CRUCIBLE_GIT_SHA} CRUCIBLE_CONTROLLER_NO_UI=1
 RUN cargo build --release --locked -p crucible-controller -p crux \
         --bin crucible-controller --bin crux \
     && mkdir -p /prebuilt/bin \

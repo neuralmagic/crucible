@@ -6,7 +6,7 @@ use crucible::deploy::{
     TurnOpts, render_turn, render_yaml,
 };
 use crucible::flow::{FlowFormat, FlowInput, render};
-use crucible::manifest::Harness;
+use crucible::knobs::Harness;
 use crucible::plan::starlark::{compile_file_with, declared_params, parent_or_cwd};
 use crucible_contract::Tier;
 use std::collections::BTreeMap;

@@ -12,54 +12,133 @@
 //! authority). A human *unpark* is always honoured — it's the operator explicitly taking it back.
 
 use crate::client::Db;
-use crate::daemon::queue::{Override, OverrideKind, WorkQueue};
+use crate::daemon::queue::{
+    BoxFuture, DueSource, IssueKey, Override, OverrideKind, Pass, WorkQueue,
+};
 use crate::event_log::Event;
 use crate::model::{ParkedBy, Status};
-use anyhow::Result;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use anyhow::{Context, Result, bail};
+use sqlx::PgPool;
+use std::sync::Arc;
 
-/// The pending-override store: at most one intent per key (a later submit for the same key wins —
-/// the human's latest instruction is the one that matters). Shared (`Arc`) between the sink that
-/// fills it and the worker step that drains it.
-#[derive(Default)]
+/// The pending-override table: at most one intent per key (a later submit for the same key wins —
+/// the human's latest instruction is the one that matters). Any replica may stash; only the
+/// leader's worker takes.
+#[derive(Clone)]
 pub struct OverrideStore {
-    pending: Mutex<HashMap<String, Override>>,
+    pool: PgPool,
+}
+
+type PendingRow = (
+    String,
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<f64>,
+);
+
+fn pending_override(row: PendingRow) -> Result<Override> {
+    let (key, kind, reason, priority, actor, justification, max_cost) = row;
+    let justified = |kind: &str| {
+        justification
+            .clone()
+            .with_context(|| format!("the pending {kind} override for {key} has no justification"))
+    };
+    let kind = match kind.as_str() {
+        "park" => OverrideKind::Park,
+        "cancel" => OverrideKind::Cancel,
+        "unpark" => OverrideKind::Unpark,
+        "bump" => OverrideKind::Bump,
+        "scope_now" => OverrideKind::ScopeNow {
+            justification: justified("scope_now")?,
+            max_cost,
+        },
+        "redispatch" => OverrideKind::Redispatch {
+            justification: justified("redispatch")?,
+        },
+        other => bail!("the pending override for {key} has unknown kind {other:?}"),
+    };
+    Ok(Override {
+        key: IssueKey(key),
+        kind,
+        reason,
+        priority,
+        actor,
+    })
 }
 
 impl OverrideStore {
-    pub fn new() -> Self {
-        OverrideStore::default()
+    pub fn new(pool: PgPool) -> Self {
+        OverrideStore { pool }
     }
 
-    fn pending(&self) -> std::sync::MutexGuard<'_, HashMap<String, Override>> {
-        self.pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    async fn stash(&self, ov: Override) -> Result<()> {
+        let (kind, justification, max_cost) = match &ov.kind {
+            OverrideKind::Park => ("park", None, None),
+            OverrideKind::Cancel => ("cancel", None, None),
+            OverrideKind::Unpark => ("unpark", None, None),
+            OverrideKind::Bump => ("bump", None, None),
+            OverrideKind::ScopeNow {
+                justification,
+                max_cost,
+            } => ("scope_now", Some(justification.as_str()), *max_cost),
+            OverrideKind::Redispatch { justification } => {
+                ("redispatch", Some(justification.as_str()), None)
+            }
+        };
+        sqlx::query(
+            "INSERT INTO pending_overrides \
+             (key, kind, reason, priority, actor, justification, max_cost, submitted_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+             ON CONFLICT (key) DO UPDATE SET kind = EXCLUDED.kind, reason = EXCLUDED.reason, \
+             priority = EXCLUDED.priority, actor = EXCLUDED.actor, \
+             justification = EXCLUDED.justification, max_cost = EXCLUDED.max_cost, \
+             submitted_at = EXCLUDED.submitted_at",
+        )
+        .bind(&ov.key.0)
+        .bind(kind)
+        .bind(&ov.reason)
+        .bind(ov.priority)
+        .bind(&ov.actor)
+        .bind(justification)
+        .bind(max_cost)
+        .bind(crate::clock::now_rfc3339())
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("stashing the {kind} override for {}", ov.key.0))?;
+        Ok(())
     }
 
-    fn stash(&self, ov: Override) {
-        self.pending().insert(ov.key.0.clone(), ov);
-    }
-
-    fn take(&self, key: &str) -> Option<Override> {
-        self.pending().remove(key)
+    async fn take(&self, key: &str) -> Result<Option<Override>> {
+        let row: Option<PendingRow> = sqlx::query_as(
+            "DELETE FROM pending_overrides WHERE key = $1 \
+             RETURNING key, kind, reason, priority, actor, justification, max_cost",
+        )
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| format!("taking the pending override for {key}"))?;
+        row.map(pending_override).transpose()
     }
 
     /// Every intent waiting to be applied, in key order.
     #[cfg(all(test, feature = "autoresearch"))]
-    pub(crate) fn submitted(&self) -> Vec<Override> {
-        let pending = self.pending();
-        let mut keys: Vec<&String> = pending.keys().collect();
-        keys.sort();
-        keys.into_iter()
-            .filter_map(|k| pending.get(k).cloned())
-            .collect()
+    pub(crate) async fn submitted(&self) -> Result<Vec<Override>> {
+        let rows: Vec<PendingRow> = sqlx::query_as(
+            "SELECT key, kind, reason, priority, actor, justification, max_cost \
+             FROM pending_overrides ORDER BY key",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("reading the pending overrides")?;
+        rows.into_iter().map(pending_override).collect()
     }
 }
 
-/// Where the API/UI hands an [`Override`] off: stash the intent, enqueue the key. Reconcile is the
-/// only writer of `parked_by = human` stickiness; the sink never touches the database.
+/// Where the API/UI hands an [`Override`] off: stash the intent durably, enqueue the key. Reconcile
+/// is the only writer of `parked_by = human` stickiness; the sink writes only the pending table.
 #[derive(Clone)]
 pub struct QueueOverrideSink {
     store: Arc<OverrideStore>,
@@ -71,36 +150,97 @@ impl QueueOverrideSink {
         QueueOverrideSink { store, queue }
     }
 
-    pub fn submit(&self, ov: Override) {
+    pub async fn submit(&self, ov: Override) -> Result<()> {
         let key = ov.key.clone();
-        self.store.stash(ov);
+        self.store.stash(ov).await?;
         self.queue.enqueue_urgent(key);
+        Ok(())
     }
 
     /// Every intent submitted and not yet applied.
     #[cfg(all(test, feature = "autoresearch"))]
-    pub(crate) fn pending(&self) -> Vec<Override> {
-        self.store.submitted()
+    pub(crate) async fn pending(&self) -> Result<Vec<Override>> {
+        self.store.submitted().await
+    }
+}
+
+/// Feeds the leader's queue the keys a standby stashed an override for: the standby's own queue
+/// has no worker.
+pub struct PendingOverrides {
+    pool: PgPool,
+}
+
+impl PendingOverrides {
+    pub fn new(pool: PgPool) -> Self {
+        PendingOverrides { pool }
+    }
+}
+
+impl DueSource for PendingOverrides {
+    fn next_due(&self, held: Vec<String>) -> BoxFuture<Result<Option<jiff::Timestamp>>> {
+        let pool = self.pool.clone();
+        Box::pin(async move {
+            let earliest: Option<String> = sqlx::query_scalar(
+                "SELECT MIN(submitted_at) FROM pending_overrides WHERE key <> ALL($1)",
+            )
+            .bind(&held)
+            .fetch_one(&pool)
+            .await
+            .context("the oldest pending override")?;
+            crate::launches::standing::due_at(earliest)
+        })
+    }
+
+    fn pass(&self, queue: WorkQueue, held: Vec<String>) -> BoxFuture<Result<Pass>> {
+        let pool = self.pool.clone();
+        Box::pin(async move {
+            let keys: Vec<String> = sqlx::query_scalar(
+                "SELECT key FROM pending_overrides WHERE key <> ALL($1) ORDER BY submitted_at",
+            )
+            .bind(&held)
+            .fetch_all(&pool)
+            .await
+            .context("pending override keys")?;
+            for key in &keys {
+                queue.enqueue_urgent(IssueKey(key.clone()));
+            }
+            Ok(Pass {
+                claimed: 0,
+                held: keys,
+            })
+        })
     }
 }
 
 /// Drain and apply any pending override for `key` before reconcile runs (called by the daemon's
 /// reconcile step). A no-op when nothing is pending, so it's cheap on every dequeue. With
 /// `records_dispatchers`, an override that dispatches records its actor as who the dispatch acts
-/// for.
+/// for. Returns the override it applied.
 pub async fn apply_pending(
     db: &Db,
     store: &OverrideStore,
     key: &str,
     records_dispatchers: bool,
-) -> Result<()> {
-    let Some(ov) = store.take(key) else {
-        return Ok(());
+) -> Result<Option<Override>> {
+    let Some(ov) = store.take(key).await? else {
+        return Ok(None);
     };
+    apply(db, key, &ov, records_dispatchers).await?;
+    Ok(Some(ov))
+}
+
+async fn apply(db: &Db, key: &str, ov: &Override, records_dispatchers: bool) -> Result<()> {
     let actor = ov.actor.as_deref();
     let requester = actor.filter(|_| records_dispatchers);
     match ov.kind {
         OverrideKind::Park => apply_park(db, key, ov.reason.as_deref(), actor).await,
+        OverrideKind::Cancel => {
+            let reason = ov
+                .reason
+                .clone()
+                .unwrap_or_else(|| format!("cancelled by {}", actor.unwrap_or("an operator")));
+            apply_park(db, key, Some(&reason), actor).await
+        }
         OverrideKind::Unpark => {
             let unparked = crate::issues::transitions::unpark(
                 db.pool(),
@@ -365,34 +505,117 @@ mod tests {
         }
     }
 
-    #[test]
-    fn submit_stashes_and_enqueues() {
-        let store = Arc::new(OverrideStore::new());
-        let queue = WorkQueue::new();
-        let sink = QueueOverrideSink::new(store.clone(), queue.clone());
-        sink.submit(Override {
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn an_override_submitted_on_a_standby_is_applied_by_the_leader(
+        pool: PgPool,
+    ) -> Result<()> {
+        let (db, _d) = db_with(pool);
+        crate::issues::store::upsert_issue(db.pool(), &issue("owner/repo#1")).await?;
+        let standby_queue = WorkQueue::new();
+        let standby = QueueOverrideSink::new(
+            Arc::new(OverrideStore::new(db.pool().clone())),
+            standby_queue.clone(),
+        );
+        standby
+            .submit(Override {
+                key: IssueKey("owner/repo#1".into()),
+                kind: OverrideKind::Cancel,
+                reason: Some("cancelled by wren".into()),
+                priority: None,
+                actor: Some("wren".into()),
+            })
+            .await?;
+        assert_eq!(
+            standby_queue.pending().urgent,
+            vec!["owner/repo#1".to_string()]
+        );
+
+        let leader_queue = WorkQueue::new();
+        let source = PendingOverrides::new(db.pool().clone());
+        assert!(source.next_due(vec![]).await?.is_some());
+        let pass = source.pass(leader_queue.clone(), vec![]).await?;
+        assert_eq!(pass.held, vec!["owner/repo#1".to_string()]);
+        assert_eq!(
+            leader_queue.pending().urgent,
+            vec!["owner/repo#1".to_string()]
+        );
+
+        let leader_store = OverrideStore::new(db.pool().clone());
+        let applied = apply_pending(&db, &leader_store, "owner/repo#1", false)
+            .await?
+            .expect("the standby's cancel is pending");
+        assert_eq!(applied.kind, OverrideKind::Cancel);
+        let got = crate::issues::store::get_issue(db.pool(), "owner/repo#1")
+            .await?
+            .expect("issue");
+        assert_eq!(got.status, Status::Parked);
+        assert_eq!(got.parked_reason.as_deref(), Some("cancelled by wren"));
+        assert!(
+            source.next_due(vec![]).await?.is_none(),
+            "applying consumes it"
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_pending_override_round_trips_every_kind_and_the_latest_submit_wins(
+        pool: PgPool,
+    ) -> Result<()> {
+        let (db, _d) = db_with(pool);
+        let store = OverrideStore::new(db.pool().clone());
+        let kinds = [
+            OverrideKind::Park,
+            OverrideKind::Cancel,
+            OverrideKind::Unpark,
+            OverrideKind::Bump,
+            OverrideKind::ScopeNow {
+                justification: "customer down".into(),
+                max_cost: Some(12.5),
+            },
+            OverrideKind::Redispatch {
+                justification: "flaky node".into(),
+            },
+        ];
+        for kind in kinds {
+            let ov = Override {
+                key: IssueKey("owner/repo#1".into()),
+                kind,
+                reason: Some("why".into()),
+                priority: Some(3),
+                actor: Some("wren".into()),
+            };
+            store.stash(ov.clone()).await?;
+            assert_eq!(store.take("owner/repo#1").await?, Some(ov));
+        }
+
+        let bump = |priority| Override {
             key: IssueKey("owner/repo#1".into()),
             kind: OverrideKind::Bump,
             reason: None,
-            priority: Some(9),
+            priority: Some(priority),
             actor: None,
-        });
-        // The key is dirty in the queue, and the intent is stashed for the worker to drain.
-        assert!(store.take("owner/repo#1").is_some());
+        };
+        store.stash(bump(1)).await?;
+        store.stash(bump(2)).await?;
+        assert_eq!(store.take("owner/repo#1").await?, Some(bump(2)));
+        assert_eq!(store.take("owner/repo#1").await?, None);
+        Ok(())
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn park_override_sets_human_authority_and_logs(pool: PgPool) -> Result<()> {
         let (db, _d) = db_with(pool);
         crate::issues::store::upsert_issue(db.pool(), &issue("owner/repo#1")).await?;
-        let store = OverrideStore::new();
-        store.stash(Override {
-            key: IssueKey("owner/repo#1".into()),
-            kind: OverrideKind::Park,
-            reason: Some("don't touch this".into()),
-            priority: None,
-            actor: None,
-        });
+        let store = OverrideStore::new(db.pool().clone());
+        store
+            .stash(Override {
+                key: IssueKey("owner/repo#1".into()),
+                kind: OverrideKind::Park,
+                reason: Some("don't touch this".into()),
+                priority: None,
+                actor: None,
+            })
+            .await?;
 
         apply_pending(&db, &store, "owner/repo#1", false).await?;
 
@@ -420,14 +643,16 @@ mod tests {
     async fn park_override_attributes_the_event_to_the_actor(pool: PgPool) -> Result<()> {
         let (db, _d) = db_with(pool);
         crate::issues::store::upsert_issue(db.pool(), &issue("owner/repo#1")).await?;
-        let store = OverrideStore::new();
-        store.stash(Override {
-            key: IssueKey("owner/repo#1".into()),
-            kind: OverrideKind::Park,
-            reason: Some("not worth a run".into()),
-            priority: None,
-            actor: Some("wren".into()),
-        });
+        let store = OverrideStore::new(db.pool().clone());
+        store
+            .stash(Override {
+                key: IssueKey("owner/repo#1".into()),
+                kind: OverrideKind::Park,
+                reason: Some("not worth a run".into()),
+                priority: None,
+                actor: Some("wren".into()),
+            })
+            .await?;
 
         apply_pending(&db, &store, "owner/repo#1", false).await?;
 
@@ -441,14 +666,16 @@ mod tests {
     async fn bump_override_logs_an_attributed_audit_event(pool: PgPool) -> Result<()> {
         let (db, _d) = db_with(pool);
         crate::issues::store::upsert_issue(db.pool(), &issue("owner/repo#1")).await?;
-        let store = OverrideStore::new();
-        store.stash(Override {
-            key: IssueKey("owner/repo#1".into()),
-            kind: OverrideKind::Bump,
-            reason: Some("customer escalation".into()),
-            priority: Some(42),
-            actor: Some("wren".into()),
-        });
+        let store = OverrideStore::new(db.pool().clone());
+        store
+            .stash(Override {
+                key: IssueKey("owner/repo#1".into()),
+                kind: OverrideKind::Bump,
+                reason: Some("customer escalation".into()),
+                priority: Some(42),
+                actor: Some("wren".into()),
+            })
+            .await?;
 
         apply_pending(&db, &store, "owner/repo#1", false).await?;
 
@@ -482,7 +709,7 @@ mod tests {
     async fn an_applied_override_records_who_asked_for_the_dispatch(pool: PgPool) -> Result<()> {
         let (db, _d) = db_with(pool);
         crate::issues::store::upsert_issue(db.pool(), &issue("owner/repo#1")).await?;
-        let store = OverrideStore::new();
+        let store = OverrideStore::new(db.pool().clone());
         let unpark = |actor: &str| Override {
             key: IssueKey("owner/repo#1".into()),
             kind: OverrideKind::Unpark,
@@ -490,7 +717,7 @@ mod tests {
             priority: None,
             actor: Some(actor.into()),
         };
-        store.stash(unpark("mallory"));
+        store.stash(unpark("mallory")).await?;
         apply_pending(&db, &store, "owner/repo#1", true).await?;
         assert_eq!(
             requested_by(&db, "owner/repo#1").await,
@@ -505,20 +732,22 @@ mod tests {
             ParkedBy::Human,
         )
         .await?;
-        store.stash(unpark(" Bob "));
+        store.stash(unpark(" Bob ")).await?;
         apply_pending(&db, &store, "owner/repo#1", true).await?;
         assert_eq!(
             requested_by(&db, "owner/repo#1").await.as_deref(),
             Some("user:bob")
         );
 
-        store.stash(Override {
-            key: IssueKey("owner/repo#1".into()),
-            kind: OverrideKind::Bump,
-            reason: None,
-            priority: Some(5),
-            actor: Some("carol".into()),
-        });
+        store
+            .stash(Override {
+                key: IssueKey("owner/repo#1".into()),
+                kind: OverrideKind::Bump,
+                reason: None,
+                priority: Some(5),
+                actor: Some("carol".into()),
+            })
+            .await?;
         apply_pending(&db, &store, "owner/repo#1", true).await?;
         assert_eq!(
             requested_by(&db, "owner/repo#1").await.as_deref(),
@@ -533,7 +762,9 @@ mod tests {
             ParkedBy::Human,
         )
         .await?;
-        store.stash(unpark("system:serviceaccount:ops:release-bot"));
+        store
+            .stash(unpark("system:serviceaccount:ops:release-bot"))
+            .await?;
         apply_pending(&db, &store, "owner/repo#1", true).await?;
         assert_eq!(
             requested_by(&db, "owner/repo#1").await,
@@ -556,14 +787,16 @@ mod tests {
             ParkedBy::Human,
         )
         .await?;
-        let store = OverrideStore::new();
-        store.stash(Override {
-            key: IssueKey("owner/repo#1".into()),
-            kind: OverrideKind::Unpark,
-            reason: None,
-            priority: None,
-            actor: Some("bob".into()),
-        });
+        let store = OverrideStore::new(db.pool().clone());
+        store
+            .stash(Override {
+                key: IssueKey("owner/repo#1".into()),
+                kind: OverrideKind::Unpark,
+                reason: None,
+                priority: None,
+                actor: Some("bob".into()),
+            })
+            .await?;
         apply_pending(&db, &store, "owner/repo#1", false).await?;
         assert_eq!(requested_by(&db, "owner/repo#1").await, None);
         Ok(())
@@ -640,16 +873,18 @@ mod tests {
     async fn a_redispatch_acts_for_whoever_asked_for_it(pool: PgPool) -> Result<()> {
         let (db, _d) = db_with(pool);
         seed_finished_with_approval(&db, "owner/repo#1", Status::Done).await?;
-        let store = OverrideStore::new();
-        store.stash(Override {
-            key: IssueKey("owner/repo#1".into()),
-            kind: OverrideKind::Redispatch {
-                justification: "another pass".into(),
-            },
-            reason: None,
-            priority: None,
-            actor: Some("Dana".into()),
-        });
+        let store = OverrideStore::new(db.pool().clone());
+        store
+            .stash(Override {
+                key: IssueKey("owner/repo#1".into()),
+                kind: OverrideKind::Redispatch {
+                    justification: "another pass".into(),
+                },
+                reason: None,
+                priority: None,
+                actor: Some("Dana".into()),
+            })
+            .await?;
         apply_pending(&db, &store, "owner/repo#1", true).await?;
         assert_eq!(
             requested_by(&db, "owner/repo#1").await.as_deref(),
@@ -668,16 +903,18 @@ mod tests {
     async fn a_declined_redispatch_records_nobody(pool: PgPool) -> Result<()> {
         let (db, _d) = db_with(pool);
         crate::issues::store::upsert_issue(db.pool(), &issue("owner/repo#1")).await?;
-        let store = OverrideStore::new();
-        store.stash(Override {
-            key: IssueKey("owner/repo#1".into()),
-            kind: OverrideKind::Redispatch {
-                justification: "not finished".into(),
-            },
-            reason: None,
-            priority: None,
-            actor: Some("dana".into()),
-        });
+        let store = OverrideStore::new(db.pool().clone());
+        store
+            .stash(Override {
+                key: IssueKey("owner/repo#1".into()),
+                kind: OverrideKind::Redispatch {
+                    justification: "not finished".into(),
+                },
+                reason: None,
+                priority: None,
+                actor: Some("dana".into()),
+            })
+            .await?;
         apply_pending(&db, &store, "owner/repo#1", true).await?;
         assert_eq!(requested_by(&db, "owner/repo#1").await, None);
         Ok(())
@@ -694,17 +931,19 @@ mod tests {
             ParkedBy::Human,
         )
         .await?;
-        let store = OverrideStore::new();
-        store.stash(Override {
-            key: IssueKey("owner/repo#1".into()),
-            kind: OverrideKind::ScopeNow {
-                justification: "customer escalation".into(),
-                max_cost: None,
-            },
-            reason: None,
-            priority: None,
-            actor: Some("erin".into()),
-        });
+        let store = OverrideStore::new(db.pool().clone());
+        store
+            .stash(Override {
+                key: IssueKey("owner/repo#1".into()),
+                kind: OverrideKind::ScopeNow {
+                    justification: "customer escalation".into(),
+                    max_cost: None,
+                },
+                reason: None,
+                priority: None,
+                actor: Some("erin".into()),
+            })
+            .await?;
         apply_pending(&db, &store, "owner/repo#1", true).await?;
         assert_eq!(
             requested_by(&db, "owner/repo#1").await.as_deref(),
@@ -731,14 +970,16 @@ mod tests {
         )
         .await?;
 
-        let store = OverrideStore::new();
-        store.stash(Override {
-            key: IssueKey("owner/repo#1".into()),
-            kind: OverrideKind::Unpark,
-            reason: Some("operator revived it".into()),
-            priority: None,
-            actor: None,
-        });
+        let store = OverrideStore::new(db.pool().clone());
+        store
+            .stash(Override {
+                key: IssueKey("owner/repo#1".into()),
+                kind: OverrideKind::Unpark,
+                reason: Some("operator revived it".into()),
+                priority: None,
+                actor: None,
+            })
+            .await?;
         apply_pending(&db, &store, "owner/repo#1", false).await?;
 
         let got = crate::issues::store::get_issue(db.pool(), "owner/repo#1")
@@ -880,14 +1121,16 @@ mod tests {
             )
             .await?
         );
-        let store = OverrideStore::new();
-        store.stash(Override {
-            key: IssueKey("owner/repo#1".into()),
-            kind: OverrideKind::Bump,
-            reason: None,
-            priority: Some(42),
-            actor: None,
-        });
+        let store = OverrideStore::new(db.pool().clone());
+        store
+            .stash(Override {
+                key: IssueKey("owner/repo#1".into()),
+                kind: OverrideKind::Bump,
+                reason: None,
+                priority: Some(42),
+                actor: None,
+            })
+            .await?;
         apply_pending(&db, &store, "owner/repo#1", false).await?;
 
         let got = crate::issues::store::get_issue(db.pool(), "owner/repo#1")
@@ -924,17 +1167,19 @@ mod tests {
         )
         .await?;
 
-        let store = OverrideStore::new();
-        store.stash(Override {
-            key: IssueKey("owner/repo#1".into()),
-            kind: OverrideKind::ScopeNow {
-                justification: "customer escalation".into(),
-                max_cost: None,
-            },
-            reason: None,
-            priority: None,
-            actor: Some("wren".into()),
-        });
+        let store = OverrideStore::new(db.pool().clone());
+        store
+            .stash(Override {
+                key: IssueKey("owner/repo#1".into()),
+                kind: OverrideKind::ScopeNow {
+                    justification: "customer escalation".into(),
+                    max_cost: None,
+                },
+                reason: None,
+                priority: None,
+                actor: Some("wren".into()),
+            })
+            .await?;
         apply_pending(&db, &store, "owner/repo#1", false).await?;
 
         let got = crate::issues::store::get_issue(db.pool(), "owner/repo#1")
@@ -985,16 +1230,18 @@ mod tests {
     async fn redispatch_reopens_the_approval_approval_from_done(pool: PgPool) -> Result<()> {
         let (db, _d) = db_with(pool);
         seed_finished_with_approval(&db, "owner/repo#1", Status::Done).await?;
-        let store = OverrideStore::new();
-        store.stash(Override {
-            key: IssueKey("owner/repo#1".into()),
-            kind: OverrideKind::Redispatch {
-                justification: "re-run: prior run was degenerate".into(),
-            },
-            reason: Some("re-run: prior run was degenerate".into()),
-            priority: None,
-            actor: Some("wren".into()),
-        });
+        let store = OverrideStore::new(db.pool().clone());
+        store
+            .stash(Override {
+                key: IssueKey("owner/repo#1".into()),
+                kind: OverrideKind::Redispatch {
+                    justification: "re-run: prior run was degenerate".into(),
+                },
+                reason: Some("re-run: prior run was degenerate".into()),
+                priority: None,
+                actor: Some("wren".into()),
+            })
+            .await?;
 
         apply_pending(&db, &store, "owner/repo#1", false).await?;
 
@@ -1023,16 +1270,18 @@ mod tests {
     async fn redispatch_reopens_the_approval_from_pr_open(pool: PgPool) -> Result<()> {
         let (db, _d) = db_with(pool);
         seed_finished_with_approval(&db, "owner/repo#2", Status::PrOpen).await?;
-        let store = OverrideStore::new();
-        store.stash(Override {
-            key: IssueKey("owner/repo#2".into()),
-            kind: OverrideKind::Redispatch {
-                justification: "another pass".into(),
-            },
-            reason: None,
-            priority: None,
-            actor: None,
-        });
+        let store = OverrideStore::new(db.pool().clone());
+        store
+            .stash(Override {
+                key: IssueKey("owner/repo#2".into()),
+                kind: OverrideKind::Redispatch {
+                    justification: "another pass".into(),
+                },
+                reason: None,
+                priority: None,
+                actor: None,
+            })
+            .await?;
 
         apply_pending(&db, &store, "owner/repo#2", false).await?;
 
@@ -1052,16 +1301,18 @@ mod tests {
             crate::issues::store::claim_issue(db.pool(), "owner/repo#3", Status::New, Status::Done)
                 .await?
         );
-        let store = OverrideStore::new();
-        store.stash(Override {
-            key: IssueKey("owner/repo#3".into()),
-            kind: OverrideKind::Redispatch {
-                justification: "no pack exists".into(),
-            },
-            reason: None,
-            priority: None,
-            actor: Some("wren".into()),
-        });
+        let store = OverrideStore::new(db.pool().clone());
+        store
+            .stash(Override {
+                key: IssueKey("owner/repo#3".into()),
+                kind: OverrideKind::Redispatch {
+                    justification: "no pack exists".into(),
+                },
+                reason: None,
+                priority: None,
+                actor: Some("wren".into()),
+            })
+            .await?;
 
         apply_pending(&db, &store, "owner/repo#3", false).await?;
 
@@ -1092,16 +1343,18 @@ mod tests {
         let (db, _d) = db_with(pool);
         // Approved but still running: redispatch must not race the in-flight run.
         seed_finished_with_approval(&db, "owner/repo#4", Status::Running).await?;
-        let store = OverrideStore::new();
-        store.stash(Override {
-            key: IssueKey("owner/repo#4".into()),
-            kind: OverrideKind::Redispatch {
-                justification: "too eager".into(),
-            },
-            reason: None,
-            priority: None,
-            actor: None,
-        });
+        let store = OverrideStore::new(db.pool().clone());
+        store
+            .stash(Override {
+                key: IssueKey("owner/repo#4".into()),
+                kind: OverrideKind::Redispatch {
+                    justification: "too eager".into(),
+                },
+                reason: None,
+                priority: None,
+                actor: None,
+            })
+            .await?;
 
         apply_pending(&db, &store, "owner/repo#4", false).await?;
 

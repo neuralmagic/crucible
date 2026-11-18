@@ -35,7 +35,7 @@ read = command(name = "read", run = "./read.sh", emits = ["bucket"])
 gate = route(
     name = "gate",
     depends_on = [read],
-    source = read,
+    decider = output(read),
     questions = {
         "bucket": choice(
             ask = "Which queue owns this ticket?",
@@ -45,11 +45,11 @@ gate = route(
 )
 
 oncall = command(name = "oncall", run = "./act.sh oncall", depends_on = [gate],
-                 when = gate.bucket, answers = "outage")
+                 when = gate.bucket.any_of("outage"))
 finance = command(name = "finance", run = "./act.sh finance", depends_on = [gate],
-                  when = gate.bucket, answers = "billing")
+                  when = gate.bucket.any_of("billing"))
 backlog = command(name = "backlog", run = "./act.sh backlog", depends_on = [gate],
-                  when = gate.bucket, otherwise = True)
+                  when = gate.bucket.otherwise())
 
 filed = command(name = "filed", run = "./act.sh filed",
                 depends_on = [oncall, finance, backlog], join = "passed")
@@ -71,12 +71,12 @@ summary = command(name = "summary", run = "./summarize.sh",
 in the second case. If `oncall` failed, `summary` is blocked as before. Every other dependency
 keeps the `all` rule.
 
-**Source of the answer.** Set exactly one of these two:
+**Source of the answer.** `decider` takes one of these:
 
 | | Answered by | Cost |
 | --- | --- | --- |
-| `source = read` | A dependency's own output: `read` emits `{"bucket": "billing"}`. | Free and deterministic. |
-| `min_confidence = 0.8` | A decision model, through the broker's `decision` capability. An answer below the threshold is recorded as `"uncertain"`. | One model call per route, for all its questions. |
+| `output(read)` | A dependency's own output: `read` emits `{"bucket": "billing"}`. | Free and deterministic. |
+| `model(min_confidence = 0.8)` | A decision model, through the broker's `decision` capability. An answer below the threshold is recorded as `"uncertain"`. | One model call per route, for all its questions. |
 
 If a source emits a label that the question does not declare, the route fails and the run
 stops at that route. If a model-backed route has no decision binding, the engine truncates
@@ -104,7 +104,7 @@ type, so the engine asks a model-backed score as a choice over the levels and re
 `"asked_as": "choice"`.
 
 **Each answer must have a task.** The compiler rejects a route if an answer that a `when` can
-see does not reach a task. This includes `"uncertain"`. Use `otherwise = True` to cover the
+see does not reach a task. This includes `"uncertain"`. Use `.otherwise()` to cover the
 remaining answers, or use `drop` to declare that an answer goes to no task:
 
 ```python
@@ -114,6 +114,23 @@ remaining answers, or use `drop` to declare that an answer goes to no task:
 If you add an option to a question, `otherwise` takes the new answer, or the pack does not
 compile until a task takes the new label. `examples/route` is the full pack. It has a
 model-backed gate and instructions to serve the decision model.
+
+**A field can be the question.** When a task already emits the answer, `when` reads the field
+and no `route()` is written. The field is typed `"boolean"` or as a list of labels:
+
+```python
+check = command(name = "check", run = "./check.sh",
+                emits = {"ok": "boolean", "verdict": ["ship", "hold"]})
+
+build = command(name = "build", run = "./build.sh", when = check.ok)
+ship = command(name = "ship", run = "./ship.sh", when = check.verdict.any_of("ship"))
+```
+
+The compiled graph holds a route named `check-ok` that `check` answers. An answer no `when`
+reads leads to no task.
+
+**Named tasks are dependencies.** A task that `when`, `over`, or `keyed` names is a dependency
+of the task that names it. List it in `depends_on` only to say so again.
 
 ## Let a decision model answer
 
@@ -135,7 +152,7 @@ read = command(name = "read", run = "./read.sh", emits = ["ticket"])
 gate = route(
     name = "gate",
     depends_on = [read],
-    min_confidence = 0.8,
+    decider = model(min_confidence = 0.8),
     questions = {
         "bucket": choice(
             ask = "Which queue owns this ticket?",
@@ -261,8 +278,7 @@ review = command(
     run = "./check.sh",
     depends_on = [author],
     emits_files = ["evidence/review.json"],
-    revise = author,
-    max_rounds = 3,
+    revise = send_back(author, rounds = 3),
 )
 ```
 
@@ -276,15 +292,15 @@ under `revision`. The engine stages the declared files of the reviewer under
             "output": {"accepted": false, "why": "the probe hit an unrelated 400"}}}
 ```
 
-- **Rounds have a limit.** `max_rounds` is 2 to 5. It has no default.
+- **Rounds have a limit.** `rounds` is 2 to 5. It has no default.
 - **Each round settles.** A passing round makes a commit. The engine discards a failing
   round. The session log records `author[round-1]`, `review[round-1]`, and so on. The verdict
   uses the rows of the last round.
 - **Sessions continue.** An author with a `session` continues the same conversation in each
   round, so it knows what it already tried.
-- **Chains.** `revise = [pick, build]` sends back a chain. Every listed task runs again in
-  dependency order, and then the reviewer runs. You must list every task between a target and
-  the reviewer, so that no task in a round reads a stale result.
+- **Chains.** `send_back(pick, rounds = 3)` sends back `pick` and every task between it and
+  the reviewer, so that no task in a round reads a stale result. They run again in dependency
+  order, and then the reviewer runs.
 - **One loop per task.** A loop cannot contain a fan-out. A task cannot be in two loops.
   Loops cannot be nested or chained.
 
@@ -306,8 +322,7 @@ triage = skill(
     name = "triage",
     skill = "skills/triage-issue",
     depends_on = [scan],
-    over = scan.issues,
-    max_fanout = 12,
+    over = each(scan.issues, max = 12),
     isolated = True,
     required = False,
     emits = ["classification", "severity"],
@@ -324,7 +339,7 @@ roundup = command(
 ```
 
 The item is the key of each instance. `triage[123]` is issue 123 in every retry and in every
-report row. An instance reads its own key from the reserved `item` input. `max_fanout` sets
+report row. An instance reads its own key from the reserved `item` input. `max` sets
 the maximum count, and the engine limit is 256. `isolated = True` runs the instances at the
 same time in private worktrees, at most eight at a time, and each one starts only while the run
 is under `--max-cost`. `required = False` lets the sweep finish when some instances fail.
@@ -363,10 +378,9 @@ prepare = command(name = "prepare", run = "./stage.sh",
 gate = route(
     name = "gate",
     depends_on = [prepare],
-    over = prepare.members,
-    max_fanout = 120,
+    over = each(prepare.members, max = 120),
     keyed = [prepare.facts],
-    min_confidence = 0.8,
+    decider = model(min_confidence = 0.8),
     questions = {"depth": choice(
         ask = "How much work does this ticket need?",
         options = {"settled": "the staged facts already answer it",
@@ -376,11 +390,11 @@ gate = route(
 )
 
 quick = agent(name = "quick", prompt = prompt_file("analyze.md"), effort = "low",
-              depends_on = [prepare, gate], over = prepare.members, max_fanout = 120,
-              keyed = [prepare.facts], when = gate.depth, answers = "quick")
+              depends_on = [prepare, gate], over = each(prepare.members, max = 120),
+              keyed = [prepare.facts], when = gate.depth.any_of("quick"))
 deep = agent(name = "deep", prompt = prompt_file("analyze.md"), effort = "high",
-             depends_on = [prepare, gate], over = prepare.members, max_fanout = 120,
-             keyed = [prepare.facts], when = gate.depth, otherwise = True)
+             depends_on = [prepare, gate], over = each(prepare.members, max = 120),
+             keyed = [prepare.facts], when = gate.depth.otherwise())
 ```
 
 - **Items pair by key.** Tasks mapped over the same `producer.field` are aligned.
@@ -389,7 +403,7 @@ deep = agent(name = "deep", prompt = prompt_file("analyze.md"), effort = "high",
 - **Items that are not taken stay visible.** `quick[T-2]` settles `not_taken`, with the
   answer in its note. It does not fail the fan-out. The fan-out output counts it under
   `not_taken`. An aligned task that joins `all` on it is also not taken.
-- **One request for each item.** `max_fanout` limits the number of requests. A resumed run
+- **One request for each item.** `max` limits the number of requests. A resumed run
   keeps the decisions that it has and asks only for the others.
 - **`keyed` limits the input.** `prepare.facts` is an object keyed by item. Each instance,
   route or task, gets only its own entry under `facts`. A fan-out of one hundred items does not
@@ -412,18 +426,17 @@ reads the field at each decision: the list itself on an unmapped route, or, on a
 match = route(
     name = "match",
     depends_on = [prepare],
-    over = prepare.members,
-    max_fanout = 120,
-    min_confidence = 0.7,
+    over = each(prepare.members, max = 120),
+    decider = model(min_confidence = 0.7),
     questions = {"package": choice(ask = "Which shipped package does the flaw affect?",
                                    options = prepare.packages)},
 )
 analyze = agent(name = "analyze", prompt = prompt_file("analyze.md"),
-                depends_on = [prepare, match], over = prepare.members, max_fanout = 120,
-                when = match.package, otherwise = True)
+                depends_on = [prepare, match], over = each(prepare.members, max = 120),
+                when = match.package.otherwise())
 review = agent(name = "review", prompt = prompt_file("review.md"),
-               depends_on = [prepare, match], over = prepare.members, max_fanout = 120,
-               when = match.package, answers = "uncertain")
+               depends_on = [prepare, match], over = each(prepare.members, max = 120),
+               when = match.package.any_of("uncertain"))
 ```
 
 `prepare` emits `{"packages": {"T-1": [{"value": "p3", "description": "golang.org/x/net 0.17.0"},
@@ -434,7 +447,7 @@ review = agent(name = "review", prompt = prompt_file("review.md"),
 - **Bounded.** At most 64 options; a repeated label keeps its first entry. An item whose list is
   malformed or holds fewer than two options fails without a request, and the rest decide.
 - **Branch on uncertain, read the pick.** The labels are unknown when the pack compiles, so a
-  `when` lists only `"uncertain"`, and `otherwise = True` covers every option. The task it gates
+  `when` lists only `"uncertain"`, and `.otherwise()` covers every option. The task it gates
   reads which option was chosen, and the options it was chosen among, from the route's output.
 
 ## Keep a conversation
@@ -470,11 +483,27 @@ The `join` of a task sets what it needs from its dependencies before it runs:
 Use `passed` to join branches and to collect fan-outs. Use `settled` for a task that must
 see failures, for example a summary that reports which tasks failed.
 
+A task that judges the whole run lists `others()` in place of every task before it:
+
+```python
+verdict = evaluate(name = "verdict", run = "./adjudicate.py",
+                   depends_on = [others()], join = "settled")
+```
+
+`others()` is every main-graph task that no `others()` task feeds, so a task that depends on
+`verdict` is not one of them.
+
 ## Advisory tasks
 
 `required = False` makes a task advisory. If it fails, its dependents are blocked, but the
 run can still be valid. Use it for useful checks that must not fail the result: a freshness
 audit, a slow benchmark, one instance of a sweep.
+
+A pack whose tasks are mostly advisory says so once, and marks the exceptions:
+
+```python
+workflow(type = "playbook", tasks = [...], defaults = task_defaults(required = False))
+```
 
 A `required` task can be unable to run on the substrate, because the substrate does not
 declare its `needs` capability. In that case, the engine truncates the whole plan before it
