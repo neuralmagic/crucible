@@ -1862,6 +1862,7 @@ impl Broker {
             }
         };
         seen.context_digest = context_digest;
+        seen.stuck = pod.as_ref().and_then(jobs::stuck);
         seen.builder = annotation(&job.metadata, ANNOTATION_BUILDER).and_then(jobs::Builder::parse);
         let archived = matches!(log, LogName::Run(_))
             || is_layer(&job)
@@ -2321,11 +2322,12 @@ impl Broker {
         id: &BuildId,
         seen: &Seen,
     ) -> Result<StatusReply> {
-        let log_tail = match seen.working {
-            Some(Working::Queued) => format!(
+        let log_tail = match (seen.working, &seen.stuck) {
+            (Some(Working::Queued), _) => format!(
                 "queued in {}: waiting for Kueue to admit the build",
                 self.site.queue.as_deref().unwrap_or("the build namespace")
             ),
+            (Some(Working::Running), Some(stuck)) => stuck.clone(),
             _ => summary(
                 &self
                     .read_log(sandbox, id, LogName::Build, SUMMARY_WINDOW)
@@ -2728,6 +2730,7 @@ struct Seen {
     digest: Option<String>,
     context_digest: Option<ContextDigest>,
     builder: Option<jobs::Builder>,
+    stuck: Option<String>,
 }
 
 impl Seen {
@@ -2744,6 +2747,7 @@ impl Seen {
             digest: None,
             context_digest: None,
             builder: None,
+            stuck: None,
         }
     }
 
@@ -2762,6 +2766,7 @@ impl Seen {
             digest,
             context_digest: None,
             builder: None,
+            stuck: None,
         }
     }
 }

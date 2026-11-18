@@ -1131,6 +1131,28 @@ pub fn observe(job: &Job, pod: Option<&core::Pod>, main: &str) -> Observed {
     Observed::Running
 }
 
+/// Why a pod's container cannot start, once the kubelet says more than that it is on its way.
+pub fn stuck(pod: &core::Pod) -> Option<String> {
+    let status = pod.status.as_ref()?;
+    status
+        .init_container_statuses
+        .iter()
+        .chain(&status.container_statuses)
+        .flatten()
+        .find_map(|c| {
+            let waiting = c.state.as_ref()?.waiting.as_ref()?;
+            let reason = waiting.reason.as_deref()?;
+            if matches!(reason, "PodInitializing" | "ContainerCreating") {
+                return None;
+            }
+            let message = waiting.message.as_deref().unwrap_or_default();
+            Some(format!(
+                "container {} cannot start: {reason}: {message}",
+                c.name
+            ))
+        })
+}
+
 fn job(
     site: &Site,
     id: &Ident<'_>,
@@ -1355,7 +1377,7 @@ mod tests {
     use crate::jobs::{
         BuildJob, Builder, Compression, Engine, Ident, LayerCache, LayerCacheRefs,
         LayerCacheWriter, LayerJob, Observed, PodUsers, PushJob, Registry, RunJob, RunMount, Site,
-        build_job, layer_cache_refs, layer_job, observe, push_job, run_job,
+        build_job, layer_cache_refs, layer_job, observe, push_job, run_job, stuck,
     };
     use crate::step::State;
 
@@ -2180,6 +2202,62 @@ mod tests {
             }]}
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn a_pod_that_cannot_start_says_why() {
+        let waiting = |init: serde_json::Value, main: serde_json::Value| -> Pod {
+            let status = |name: &str, state: serde_json::Value| {
+                serde_json::json!({
+                    "name": name, "image": "b", "imageID": "", "ready": false,
+                    "restartCount": 0, "state": state
+                })
+            };
+            serde_json::from_value(serde_json::json!({
+                "metadata": { "name": "buildit-1-x" },
+                "status": {
+                    "initContainerStatuses": [status("context", init)],
+                    "containerStatuses": [status("layer", main)]
+                }
+            }))
+            .unwrap()
+        };
+        let done = serde_json::json!({ "terminated": { "exitCode": 0 } });
+        let on_its_way = |reason: &str| serde_json::json!({ "waiting": { "reason": reason } });
+        assert_eq!(stuck(&pod(None)), None);
+        assert_eq!(
+            stuck(&waiting(
+                on_its_way("PodInitializing"),
+                on_its_way("PodInitializing")
+            )),
+            None
+        );
+        assert_eq!(
+            stuck(&waiting(done.clone(), on_its_way("ContainerCreating"))),
+            None
+        );
+        assert_eq!(
+            stuck(&waiting(
+                done.clone(),
+                serde_json::json!({ "waiting": {
+                    "reason": "ImagePullBackOff",
+                    "message": "Back-off pulling image r/b@sha256:ab"
+                }})
+            ))
+            .as_deref(),
+            Some(
+                "container layer cannot start: ImagePullBackOff: Back-off pulling image r/b@sha256:ab"
+            )
+        );
+        assert_eq!(
+            stuck(&waiting(
+                serde_json::json!({ "waiting": { "reason": "ErrImagePull", "message": "denied" } }),
+                on_its_way("PodInitializing")
+            ))
+            .as_deref(),
+            Some("container context cannot start: ErrImagePull: denied")
+        );
+        assert_eq!(stuck(&waiting(done.clone(), done)), None);
     }
 
     #[test]
