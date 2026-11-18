@@ -91,7 +91,14 @@ fn workspace() -> tempfile::TempDir {
     std::fs::write(src.join("csrc/moe/topk_softmax_kernels.cu"), "// v0\n").unwrap();
     std::fs::write(src.join("setup.py"), "\n").unwrap();
     let git = |args: &[&str]| {
-        let mut all = vec!["-C", "build/vllm", "-c", "user.name=t", "-c", "user.email=t@t"];
+        let mut all = vec![
+            "-C",
+            "build/vllm",
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+        ];
         all.extend_from_slice(args);
         ok(dir, "git", &all);
     };
@@ -107,7 +114,11 @@ fn workspace() -> tempfile::TempDir {
 }
 
 fn stage(dir: &Path, label: &str) -> serde_json::Value {
-    let out = ok(dir, "python3", &["hc.py", "stage", label, "reg/vllm@sha256:seed"]);
+    let out = ok(
+        dir,
+        "python3",
+        &["hc.py", "stage", label, "reg/vllm@sha256:seed"],
+    );
     serde_json::from_str(out.trim()).unwrap()
 }
 
@@ -146,7 +157,10 @@ fn a_python_edit_stages_as_a_layer_of_only_the_edited_files_over_the_seed() {
     );
 
     ok(dir, "python3", &["hc.py", "reset"]);
-    assert_eq!(std::fs::read_to_string(dir.join(MOE)).unwrap(), "BLOCK = 64\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.join(MOE)).unwrap(),
+        "BLOCK = 64\n"
+    );
     assert!(!dir.join("build/vllm").join(CONFIG).exists());
 }
 
@@ -155,7 +169,11 @@ fn a_cuda_edit_stages_as_a_dockerfile_build_of_the_whole_tree() {
     let work = workspace();
     let dir = work.path();
     std::fs::write(dir.join(MOE), "BLOCK = 32\n").unwrap();
-    std::fs::write(dir.join("build/vllm/csrc/moe/topk_softmax_kernels.cu"), "// v1\n").unwrap();
+    std::fs::write(
+        dir.join("build/vllm/csrc/moe/topk_softmax_kernels.cu"),
+        "// v1\n",
+    )
+    .unwrap();
 
     let staged = stage(dir, "topk");
     assert_eq!(staged["recipe"], "dockerfile");
@@ -177,7 +195,10 @@ fn keeping_a_candidate_makes_it_the_tree_every_later_candidate_starts_from() {
     ok(dir, "python3", &["hc.py", "reset"]);
 
     ok(dir, "python3", &["hc.py", "keep", "blocks"]);
-    assert_eq!(std::fs::read_to_string(dir.join(MOE)).unwrap(), "BLOCK = 128\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.join(MOE)).unwrap(),
+        "BLOCK = 128\n"
+    );
     let best = std::fs::read_to_string(dir.join("best.patch")).unwrap();
     assert!(best.contains("+BLOCK = 128"), "{best}");
 
@@ -289,9 +310,8 @@ fn climb_inputs(dir: &Path, best: &str) {
         .into_iter()
         .filter(|(_, t)| *t >= 0.0)
         {
-            timeline.push_str(
-                &serde_json::json!({"label": label, "event": event, "t": t}).to_string(),
-            );
+            timeline
+                .push_str(&serde_json::json!({"label": label, "event": event, "t": t}).to_string());
             timeline.push('\n');
         }
     }
@@ -352,7 +372,10 @@ fn the_report_computes_the_speedup_iteration_times_and_build_reuse() {
         serde_json::from_str(stdout.lines().last().unwrap_or_default()).unwrap();
     assert_eq!(emitted["best"], "config");
     assert_eq!(emitted["speedup"], 1.25);
-    assert_eq!(emitted["builds"], 3, "a build that never pushed is not counted");
+    assert_eq!(
+        emitted["builds"], 3,
+        "a build that never pushed is not counted"
+    );
     assert_eq!(emitted["layer_builds"], 2);
     assert_eq!(emitted["failed_builds"], 1);
     assert_eq!(
@@ -362,15 +385,27 @@ fn the_report_computes_the_speedup_iteration_times_and_build_reuse() {
     assert_eq!(emitted["median_queue_run_s"], 105.0);
 
     let summary = std::fs::read_to_string(dir.join("summary.md")).unwrap();
-    assert!(summary.starts_with("# vLLM fused MoE hill climb: 1.25x"), "{summary}");
-    assert!(summary.contains("| 1 | wrong | layer | no | 90.0 |  |"), "{summary}");
-    assert!(summary.contains("| output_throughput | 1000.0 | 1100.0 |"), "{summary}");
+    assert!(
+        summary.starts_with("# vLLM fused MoE hill climb: 1.25x"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("| 1 | wrong | layer | no | 90.0 |  |"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("| output_throughput | 1000.0 | 1100.0 |"),
+        "{summary}"
+    );
     assert!(summary.contains("'remote_hit': 570"), "{summary}");
     assert!(
         summary.contains("| 0 | baseline | seed | yes | 200.0 | 1.0 | 0.0 | 120.0 | None |"),
         "the seed's row times no iteration: {summary}"
     );
-    assert!(summary.contains("Builds: 3 succeeded, 2 of them layers"), "{summary}");
+    assert!(
+        summary.contains("Builds: 3 succeeded, 2 of them layers"),
+        "{summary}"
+    );
 }
 
 #[test]
