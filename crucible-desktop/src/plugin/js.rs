@@ -749,4 +749,25 @@ mod tests {
             )))
         );
     }
+
+    #[test]
+    fn the_notices_name_the_engine_release_that_is_fetched() {
+        let release = include_str!("../../js-engine.sh")
+            .lines()
+            .find_map(|line| line.strip_prefix("RELEASE="))
+            .unwrap();
+        let notices = include_str!("../../THIRD-PARTY-NOTICES");
+        assert!(
+            notices.contains(&format!("(plugin.wasm), release {release}\n")),
+            "{release}"
+        );
+        for license in [
+            "Apache License",
+            "LLVM Exceptions",
+            "Mees Delzenne",
+            "Fabrice Bellard",
+        ] {
+            assert!(notices.contains(license), "{license}");
+        }
+    }
 }

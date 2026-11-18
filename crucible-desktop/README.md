@@ -140,6 +140,9 @@ dev rev the engine workspace must not inherit.
 just desktop-run       # or `cargo run` here, after rune-patches.sh and js-engine.sh
 ```
 
+`js-engine.sh` fetches the engine JavaScript view plugins run in, and the build embeds it.
+`THIRD-PARTY-NOTICES` carries its licenses and goes into the app bundle, the RPM and the web build.
+
 The **Local** backend lists every pack under `<repo>/examples` whose manifest says
 `[workflow] type = "playbook"`. The search field filters those by name, goal, workflow or verdict.
 Pick one to see its graph, each task's status, the spend against the plan's budget, and the last line

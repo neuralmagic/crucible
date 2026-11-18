@@ -19,8 +19,10 @@ install -Dm755 %{_sourcedir}/crucible-playbooks %{buildroot}%{_bindir}/crucible-
 install -Dm755 %{_sourcedir}/crucible-lsp %{buildroot}%{_bindir}/crucible-lsp
 install -Dm644 %{_sourcedir}/dev.crucible.playbooks.desktop %{buildroot}%{_datadir}/applications/dev.crucible.playbooks.desktop
 install -Dm644 %{_sourcedir}/icon.png %{buildroot}%{_datadir}/icons/hicolor/512x512/apps/dev.crucible.playbooks.png
+install -Dm644 %{_sourcedir}/THIRD-PARTY-NOTICES %{buildroot}%{_licensedir}/%{name}/THIRD-PARTY-NOTICES
 
 %files
+%license %{_licensedir}/%{name}/THIRD-PARTY-NOTICES
 %{_bindir}/crucible-playbooks
 %{_bindir}/crucible-lsp
 %{_datadir}/applications/dev.crucible.playbooks.desktop

@@ -17,7 +17,7 @@ lsp="${CARGO_TARGET_DIR:-../target}/release/crucible-lsp"
 top="$(pwd)/target/linux/rpmbuild"
 rm -rf "$top"
 mkdir -p "$top/SOURCES" "$top/SPECS"
-cp "$app" "$lsp" linux/dev.crucible.playbooks.desktop "$top/SOURCES/"
+cp "$app" "$lsp" linux/dev.crucible.playbooks.desktop THIRD-PARTY-NOTICES "$top/SOURCES/"
 cp assets/icon.png "$top/SOURCES/icon.png"
 desktop-file-validate linux/dev.crucible.playbooks.desktop
 rpmbuild -bb --define "_topdir $top" --define "version $VERSION" linux/crucible-playbooks.spec

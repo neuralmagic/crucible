@@ -146,6 +146,7 @@ jobs:
           plutil -lint "$app/Contents/Info.plist"
           test -x "$app/Contents/MacOS/crucible-playbooks"
           test -x "$app/Contents/MacOS/crucible-lsp"
+          test -s "$app/Contents/Resources/THIRD-PARTY-NOTICES"
           codesign --verify --deep "$app"
           # The binary starts: as a tunnel supervisor with no command it refuses with code 2.
           code=0
@@ -230,6 +231,7 @@ jobs:
           crucible-playbooks --keep </dev/null || code=$?
           test "$code" -eq 2
           test -x /usr/bin/crucible-lsp
+          test -s /usr/share/licenses/crucible-playbooks/THIRD-PARTY-NOTICES
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:

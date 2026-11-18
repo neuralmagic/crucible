@@ -79,6 +79,7 @@ jobs:
           rustup target add wasm32-unknown-unknown
           cd crucible-desktop
           RUSTFLAGS= CARGO="$(command -v cargo)" bash ../vendor/rune/scripts/web-build.sh crucible-playbooks --no-html --out ../crucible-controller/next-dist
+          cp THIRD-PARTY-NOTICES ../crucible-controller/next-dist/
 
       - name: Build release binaries
         env:

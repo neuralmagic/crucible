@@ -43,6 +43,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/crucible-playbooks "$APP/Contents/MacOS/crucible-playbooks"
 cp ../target/release/crucible-lsp "$APP/Contents/MacOS/crucible-lsp"
 cp "$ICON" "$APP/Contents/Resources/AppIcon.icns"
+cp THIRD-PARTY-NOTICES "$APP/Contents/Resources/THIRD-PARTY-NOTICES"
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

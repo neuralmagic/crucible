@@ -233,6 +233,7 @@ jobs:
           rustup target add wasm32-unknown-unknown
           cd crucible-desktop
           CARGO="$(command -v cargo)" bash ../vendor/rune/scripts/web-build.sh crucible-playbooks --no-html --out ../crucible-controller/next-dist
+          cp THIRD-PARTY-NOTICES ../crucible-controller/next-dist/
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:

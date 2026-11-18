@@ -397,6 +397,7 @@ controller-next *args:
     sh crucible-desktop/js-engine.sh
     rustup target add wasm32-unknown-unknown
     cd crucible-desktop && CARGO="$(command -v cargo)" bash ../vendor/rune/scripts/web-build.sh crucible-playbooks --no-html --out ../crucible-controller/next-dist {{ args }}
+    cp crucible-desktop/THIRD-PARTY-NOTICES crucible-controller/next-dist/
 
 # Run a command in the Fedora builder (crucible-desktop/linux/Containerfile) with the repo at /src,
 # for the host's architecture. Cargo's registry and target directory persist in podman volumes.
