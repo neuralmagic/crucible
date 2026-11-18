@@ -223,6 +223,13 @@ kueue-e2e-cluster name loop_image kueue_image controller_image pack="e2e/kueue/p
         PACK={{pack}} LOOP_IMAGE={{loop_image}} KUEUE_IMAGE={{kueue_image}} \
         CONTROLLER_IMAGE={{controller_image}} scripts/kueue-e2e.sh
 
+# The kueue e2e's pi session pack on <name>: two pi turns share one conversation across two fresh
+# sandboxes and a third task takes a repair turn (e2e/kueue/pi-session-pack). Its verify task
+# passes only when the second turn reports a codeword only the first was told.
+pi-session-e2e name loop_image kueue_image controller_image:
+    PARAMS="{\"codeword\": \"cw-$(openssl rand -hex 12)\"}" \
+        just kueue-e2e-cluster {{name}} {{loop_image}} {{kueue_image}} {{controller_image}} e2e/kueue/pi-session-pack
+
 # The kueue e2e's task pack on <name>: a command task with no agent runs GPU Jobs on two queues
 # and serves a LeaderWorkerSet through crucible-kueue with its task token, on loop pods that carry
 # an SVID of their own (scripts/kueue-e2e.sh, TASKS=1).
