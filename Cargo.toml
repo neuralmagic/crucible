@@ -2,6 +2,7 @@
 members = [
     "crucible",
     "crucible-contract",
+    "crucible-view",
     "crucible-vcs",
     "crucible-harness",
     "crucible-broker",

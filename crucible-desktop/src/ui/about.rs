@@ -3,7 +3,8 @@
 use rune::{El, row, text};
 use rune_kit::{Button, ButtonVariant, Switch};
 
-use crate::ui::{Paint, rule, setting_row, tag};
+use crate::ui::settings::setting_row;
+use crate::ui::{Paint, rule, tag};
 use crate::{App, Backend, version};
 
 fn value(key: &str, shown: String, note: Option<&str>, action: Option<El>, p: &Paint) -> El {

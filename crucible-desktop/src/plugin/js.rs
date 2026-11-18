@@ -1,0 +1,773 @@
+//! Runs a view plugin written in JavaScript. The source is compiled and run by Javy's QuickJS
+//! engine, a WebAssembly module the host instantiates under the same limits as any plugin, so
+//! the script gets nothing the engine module does not: no files, network or real clock.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use crucible_view::{Reply, View};
+use serde::{Deserialize, Serialize};
+
+use crate::plugin::{Fault, Limits, Module, fault, said};
+
+/// What the host puts after a script: the canvas it can draw with and the `Cell` helpers.
+const PRELUDE: &str = include_str!("../../../crucible-view/js/prelude.js");
+/// What the host puts last: reading what is asked and writing the answer.
+const EPILOGUE: &str = include_str!("../../../crucible-view/js/epilogue.js");
+
+/// The byte the epilogue writes before the script's answer, after anything the script printed.
+const ANSWER: u8 = 0x1e;
+
+/// A JavaScript view plugin: a module that defines `inputs` and `view`, and may define
+/// `runsInputs` and `runs`, run in Javy's QuickJS engine module.
+pub struct Script {
+    engine: Arc<Module>,
+    source: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Answer {
+    Inputs(Vec<String>),
+    /// `None` when the script defines no `runs` and `runsInputs`.
+    RunsInputs(Option<Vec<String>>),
+    View(View),
+    Error(String),
+}
+
+/// Javy's QuickJS module, which `just desktop-js-engine` fetches.
+const ENGINE: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/js-engine/plugin.wasm"
+));
+
+impl Script {
+    /// The engine scripts run in.
+    pub fn engine() -> Result<Arc<Module>, String> {
+        Module::engine(ENGINE, Limits::DEFAULT)
+            .map(Arc::new)
+            .map_err(|fault| fault.to_string())
+    }
+
+    pub fn new(engine: Arc<Module>, source: &str) -> Script {
+        Script {
+            engine,
+            source: format!("{source}\n{PRELUDE}\n{EPILOGUE}"),
+        }
+    }
+
+    pub(in crate::plugin) fn limits(&self) -> &Limits {
+        &self.engine.limits
+    }
+
+    /// The paths the script's `inputs` names.
+    pub(in crate::plugin) fn inputs(&self) -> Result<Vec<String>, Fault> {
+        match self.ask(b"{}".to_vec())? {
+            Answer::Inputs(paths) => Ok(paths),
+            Answer::Error(error) => Err(Fault::Refused(error)),
+            Answer::View(_) | Answer::RunsInputs(_) => {
+                Err(Fault::Reply("not inputs, when asked for inputs".into()))
+            }
+        }
+    }
+
+    /// The paths the script's `runsInputs` names; `None` when it defines no `runs`.
+    pub(in crate::plugin) fn runs_inputs(&self) -> Result<Option<Vec<String>>, Fault> {
+        match self.ask(br#"{"runs_inputs":null}"#.to_vec())? {
+            Answer::RunsInputs(paths) => Ok(paths),
+            Answer::Error(error) => Err(Fault::Refused(error)),
+            Answer::View(_) | Answer::Inputs(_) => {
+                Err(Fault::Reply("not inputs, when asked for inputs".into()))
+            }
+        }
+    }
+
+    /// What the script answers to `request`, asked under `key`.
+    pub(in crate::plugin) fn answer(
+        &self,
+        key: &str,
+        request: &impl Serialize,
+    ) -> Result<Reply, Fault> {
+        let asked = serde_json::to_vec(&HashMap::from([(key, request)]))
+            .map_err(|e| Fault::Reply(e.to_string()))?;
+        match self.ask(asked)? {
+            Answer::View(view) => Ok(Reply::View(view)),
+            Answer::Error(error) => Ok(Reply::Error(error)),
+            Answer::Inputs(_) | Answer::RunsInputs(_) => {
+                Err(Fault::Reply("inputs, when asked for a view".into()))
+            }
+        }
+    }
+
+    /// Compiles the script in a fresh engine, runs it with `asked` on its standard input, and
+    /// reads its answer from its standard output.
+    fn ask(&self, asked: Vec<u8>) -> Result<Answer, Fault> {
+        let mut call = self.engine.start()?;
+        let initialize = call.typed_export::<(), ()>("initialize-runtime")?;
+        let allocate = call.typed_export::<(u32, u32, u32, u32), u32>("cabi_realloc")?;
+        let compile = call.typed_export::<(u32, u32), u32>("compile-src")?;
+        let invoke = call.typed_export::<(u32, u32, u32, u32, u32), ()>("invoke")?;
+
+        initialize
+            .call(&mut call.store, ())
+            .map_err(|e| said(fault(e), &call.store))?;
+
+        let (at, len) = call.write(&allocate, self.source.as_bytes())?;
+        let result = compile
+            .call(&mut call.store, (at, len))
+            .map_err(|e| said(fault(e), &call.store))?;
+        let (failed, code, code_len) = call.read_triple(result)?;
+        if failed {
+            return Err(Fault::Script(call.read_string(code, code_len)?));
+        }
+
+        call.store.data_mut().hand(asked);
+        invoke
+            .call(&mut call.store, (code, code_len, 0, 0, 0))
+            .map_err(|e| said(fault(e), &call.store))?;
+        let held = call.store.data();
+        if held.overflowed {
+            return Err(Fault::Reply(format!(
+                "over the {} bytes allowed",
+                self.engine.limits.reply_bytes
+            )));
+        }
+        let Some(at) = held.output.iter().rposition(|byte| *byte == ANSWER) else {
+            return Err(Fault::Reply("the script wrote no answer".into()));
+        };
+        serde_json::from_slice(&held.output[at + 1..]).map_err(|e| Fault::Reply(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crucible_view::{Draw, File, Node, Request};
+
+    use crate::plugin::js::ENGINE;
+    use crate::plugin::{Fault, Limits, Loaded, Module, Script};
+
+    fn engine() -> Arc<Module> {
+        Script::engine().unwrap()
+    }
+
+    fn loaded(engine: Arc<Module>, source: &str) -> Loaded {
+        Loaded::Js(Script::new(engine, source))
+    }
+
+    const COUNTS: &str = r#"
+        export const inputs = ["verdicts.json"];
+        export function view({ files }) {
+            const rows = files.flatMap((file) => JSON.parse(file.text));
+            const canvas = new Canvas(120, 40);
+            const ctx = canvas.getContext("2d");
+            ctx.fillStyle = "bad";
+            ctx.globalAlpha = 0.5;
+            ctx.fillRect(0, 0, rows.length, 10);
+            ctx.textAlign = "center";
+            ctx.fillText(`${rows.length} rows`, 60, 30);
+            return {
+                title: "Counts",
+                body: { stack: { children: [
+                    { stats: { items: [{ label: "Rows", value: String(rows.length), tone: "good" }] } },
+                    canvas.node(),
+                ] } },
+            };
+        }
+    "#;
+
+    const HISTORY: &str = r#"
+        export const inputs = ["verdicts.json"];
+        export function view() {
+            return { title: "One", body: { stats: { items: [] } } };
+        }
+        export const runsInputs = ["verdicts.json", "notes/summary.json"];
+        export function runs({ runs, total, params }) {
+            const rows = runs.map((run) => ({
+                id: run.id,
+                cells: [
+                    { text: run.id, href: `launch:${run.id}` },
+                    { text: run.status },
+                    { text: String(run.files.length) },
+                    { text: String(run.params?.profile ?? "") },
+                ],
+            }));
+            return {
+                title: `${runs.length} of ${total}, lane ${params.lane ?? "all"}`,
+                body: { table: { id: "runs", columns: [
+                    { id: "launch", title: "Launch" },
+                    { id: "status", title: "Status" },
+                    { id: "files", title: "Files" },
+                    { id: "profile", title: "Profile" },
+                ], rows } },
+            };
+        }
+    "#;
+
+    #[test]
+    fn a_script_with_runs_draws_the_launches_and_one_without_draws_none() {
+        use crucible_view::{Param, Run, RunsRequest, Status};
+        let with = loaded(engine(), HISTORY);
+        assert_eq!(
+            with.runs_inputs().unwrap(),
+            Some(vec![
+                "verdicts.json".to_string(),
+                "notes/summary.json".to_string()
+            ])
+        );
+        let run = |id: &str, status: Status, files: usize| Run {
+            id: id.into(),
+            status,
+            started: 1_790_000_000.0,
+            cost_usd: None,
+            origin: "manual".into(),
+            pack_version: Some(4),
+            params: [("profile".to_string(), serde_json::json!("demo"))].into(),
+            files: vec![
+                File {
+                    path: "verdicts.json".into(),
+                    task: "triage".into(),
+                    text: "[]".into(),
+                };
+                files
+            ],
+        };
+        let view = with
+            .runs_view(&RunsRequest {
+                runs: vec![
+                    run("PB-2", Status::Running, 0),
+                    run("PB-1", Status::Done, 2),
+                ],
+                total: 7,
+                params: [("lane".to_string(), Param::Select("go".into()))].into(),
+                ..RunsRequest::default()
+            })
+            .unwrap();
+        assert_eq!(view.title, "2 of 7, lane go");
+        let Node::Table { rows, .. } = &view.body else {
+            panic!("a table");
+        };
+        let texts: Vec<Vec<&str>> = rows
+            .iter()
+            .map(|row| row.cells.iter().map(|cell| cell.text.as_str()).collect())
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                ["PB-2", "running", "0", "demo"],
+                ["PB-1", "done", "2", "demo"]
+            ]
+        );
+        assert_eq!(rows[0].cells[0].href.as_deref(), Some("launch:PB-2"));
+        assert_eq!(with.view(&Request::default()).unwrap().title, "One");
+
+        let without = loaded(engine(), COUNTS);
+        assert_eq!(without.runs_inputs().unwrap(), None);
+        let Err(Fault::Refused(why)) = without.runs_view(&RunsRequest::default()) else {
+            panic!("a script with no runs function cannot answer");
+        };
+        assert!(why.contains("runs"), "{why}");
+        assert_eq!(without.inputs().unwrap(), ["verdicts.json"]);
+        let half = loaded(
+            engine(),
+            "export const inputs = []; export function view() {} \
+             export function runs() {}",
+        );
+        assert_eq!(half.runs_inputs().unwrap(), None, "runs with no runsInputs");
+
+        let outside = loaded(
+            engine(),
+            "export const inputs = []; export function view() {} \
+             export const runsInputs = [\"../secrets\"]; export function runs() {}",
+        );
+        assert_eq!(
+            outside.runs_inputs(),
+            Err(Fault::Input("../secrets".into()))
+        );
+        let into_one = loaded(
+            engine(),
+            r#"export const inputs = []; export function view() {}
+               export const runsInputs = [];
+               export function runs() {
+                   return { title: "T", body: { markdown: { text: "[x](run:task/a)" } },
+                            controls: [], };
+               }"#,
+        );
+        assert_eq!(
+            into_one.runs_view(&RunsRequest::default()).unwrap().title,
+            "T"
+        );
+        let cell_into_one = loaded(
+            engine(),
+            r#"export const inputs = []; export function view() {}
+               export const runsInputs = [];
+               export function runs() {
+                   return { title: "T", body: { grid: { columns: ["a"],
+                       rows: [[{ text: "x", href: "run:task/a" }]] } } };
+               }"#,
+        );
+        assert_eq!(
+            cell_into_one.runs_view(&RunsRequest::default()),
+            Err(Fault::View(crucible_view::Problem::RunLink(
+                "run:task/a".into()
+            )))
+        );
+    }
+
+    const COUNTER: &str = r#"
+        export const inputs = [];
+        const read = (state, event) => {
+            let count = Number(state ?? "0");
+            if (event === "tick") count += 10;
+            else if (event?.hit === "add") count += 1;
+            else if (event?.key === "down") count -= 1;
+            return count;
+        };
+        export function view({ state, event }) {
+            const count = read(state, event);
+            const canvas = new Canvas(100, 40);
+            const ctx = canvas.getContext("2d");
+            ctx.translate(10, 5);
+            ctx.hit(0, 0, 30, 20, "add");
+            return {
+                title: `${count} after ${JSON.stringify(event)} from ${JSON.stringify(state)}`,
+                body: canvas.node(),
+                live: { state: String(count), tick_ms: 250, keys: ["down", "space"] },
+            };
+        }
+        export const runsInputs = [];
+        export function runs({ state, event }) {
+            const count = read(state, event);
+            return {
+                title: `runs ${count}`,
+                body: { stats: { items: [] } },
+                live: { state: String(count) },
+            };
+        }
+    "#;
+
+    #[test]
+    fn a_script_reads_the_state_and_the_event_and_returns_live() {
+        use crucible_view::{Event, Key, RunsRequest};
+        let script = loaded(engine(), COUNTER);
+        let first = script.view(&Request::default()).unwrap();
+        assert_eq!(first.title, "0 after null from null");
+        assert_eq!(first.live.state.as_deref(), Some("0"));
+        assert_eq!(first.live.tick_ms, Some(250));
+        assert_eq!(first.live.keys, [Key::Down, Key::Space]);
+        let Node::Canvas { commands, .. } = &first.body else {
+            panic!("a canvas");
+        };
+        assert_eq!(
+            commands[1],
+            Draw::Hit {
+                id: "add".into(),
+                x: 0.0,
+                y: 0.0,
+                width: 30.0,
+                height: 20.0,
+            }
+        );
+        let asked = |state: &str, event: Event| Request {
+            state: Some(state.into()),
+            event: Some(event),
+            ..Request::default()
+        };
+        let title = |request: Request| script.view(&request).unwrap().title;
+        assert_eq!(
+            title(asked("4", Event::Hit("add".into()))),
+            r#"5 after {"hit":"add"} from "4""#
+        );
+        assert_eq!(
+            title(asked("4", Event::Key(Key::Down))),
+            r#"3 after {"key":"down"} from "4""#
+        );
+        assert_eq!(
+            title(asked("4", Event::Tick)),
+            r#"14 after "tick" from "4""#
+        );
+        let runs = script
+            .runs_view(&RunsRequest {
+                state: Some("7".into()),
+                event: Some(Event::Hit("add".into())),
+                ..RunsRequest::default()
+            })
+            .unwrap();
+        assert_eq!(runs.title, "runs 8");
+        assert_eq!(runs.live.state.as_deref(), Some("8"));
+
+        let over = loaded(
+            engine(),
+            r#"export const inputs = [];
+               export function view() {
+                   return { title: "T", body: { stats: { items: [] } }, live: { tick_ms: 10 } };
+               }"#,
+        );
+        assert_eq!(
+            over.view(&Request::default()),
+            Err(Fault::View(crucible_view::Problem::Tick))
+        );
+        let unknown = loaded(
+            engine(),
+            r#"export const inputs = [];
+               export function view() {
+                   return { title: "T", body: { stats: { items: [] } }, live: { keys: ["tab"] } };
+               }"#,
+        );
+        assert!(unknown.view(&Request::default()).is_err());
+    }
+
+    fn request(text: &str) -> Request {
+        Request {
+            files: vec![File {
+                path: "verdicts.json".into(),
+                task: "triage".into(),
+                text: text.into(),
+            }],
+            ..Request::default()
+        }
+    }
+
+    #[test]
+    fn a_script_names_its_inputs_and_draws_a_view_with_the_canvas() {
+        let script = loaded(engine(), COUNTS);
+        let started = std::time::Instant::now();
+        assert_eq!(script.inputs().unwrap(), ["verdicts.json"]);
+        let view = script.view(&request("[1, 2, 3]")).unwrap();
+        eprintln!("two calls took {:?}", started.elapsed());
+        assert_eq!(view.title, "Counts");
+        let Node::Stack { children } = &view.body else {
+            panic!("the view is a stack");
+        };
+        let [
+            Node::Stats { items },
+            Node::Canvas {
+                width, commands, ..
+            },
+        ] = children.as_slice()
+        else {
+            panic!("the view is its stats over its canvas");
+        };
+        assert_eq!(items[0].value, "3");
+        assert_eq!(*width, 120.0);
+        assert_eq!(commands.len(), 5);
+        assert_eq!(commands[2], Draw::FillRect([0.0, 0.0, 3.0, 10.0]));
+        assert!(matches!(&commands[4], Draw::FillText { text, .. } if text == "3 rows"));
+    }
+
+    #[test]
+    fn the_canvas_records_transforms_baselines_widths_and_hints_under_the_browser_s_names() {
+        let script = loaded(
+            engine(),
+            r#"
+            export const inputs = [];
+            export function view() {
+                const canvas = new Canvas(100, 50);
+                const ctx = canvas.getContext("2d");
+                ctx.save();
+                ctx.translate(10, 20);
+                ctx.scale(2, 3);
+                ctx.rotate(0.5);
+                ctx.transform(1, 0, 0, 1, 4, 5);
+                ctx.setTransform(1, 0, 0, 1, 6, 7);
+                ctx.setTransform();
+                ctx.resetTransform();
+                ctx.textBaseline = "hanging";
+                const hanging = ctx.textBaseline;
+                ctx.textBaseline = "ideographic";
+                ctx.restore();
+                ctx.fillText("plain", 1, 2);
+                ctx.fillText("cut", 1, 2, 30);
+                ctx.hint(0, 0, 10, 10, 42);
+                return { title: `${hanging} ${ctx.textBaseline}`, body: canvas.node() };
+            }
+            "#,
+        );
+        let view = script.view(&Request::default()).unwrap();
+        assert_eq!(
+            view.title, "hanging alphabetic",
+            "restore brings the baseline back"
+        );
+        let Node::Canvas { commands, .. } = &view.body else {
+            panic!("the view is a canvas");
+        };
+        let text = |text: &str, max_width: Option<f32>| Draw::FillText {
+            text: text.into(),
+            x: 1.0,
+            y: 2.0,
+            max_width,
+        };
+        assert_eq!(
+            commands.as_slice(),
+            [
+                Draw::Save,
+                Draw::Translate([10.0, 20.0]),
+                Draw::Scale([2.0, 3.0]),
+                Draw::Rotate(0.5),
+                Draw::Transform([1.0, 0.0, 0.0, 1.0, 4.0, 5.0]),
+                Draw::SetTransform([1.0, 0.0, 0.0, 1.0, 6.0, 7.0]),
+                Draw::ResetTransform,
+                Draw::ResetTransform,
+                Draw::TextBaseline(crucible_view::TextBaseline::Top),
+                Draw::TextBaseline(crucible_view::TextBaseline::Bottom),
+                Draw::Restore,
+                text("plain", None),
+                text("cut", Some(30.0)),
+                Draw::Hint {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 10.0,
+                    height: 10.0,
+                    text: "42".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_script_that_does_not_compile_or_throws_says_why() {
+        let broken = loaded(engine(), "export const inputs = [;");
+        let Err(Fault::Script(why)) = broken.inputs() else {
+            panic!("a syntax error is a compile failure");
+        };
+        assert!(
+            why.contains("SyntaxError") || why.contains("unexpected"),
+            "{why}"
+        );
+
+        let throws = loaded(engine(), COUNTS);
+        let Err(Fault::Refused(why)) = throws.view(&request("not json")) else {
+            panic!("a thrown error is the script's answer");
+        };
+        assert!(why.starts_with("SyntaxError"), "{why}");
+        assert!(why.contains("at view (function.mjs:4:"), "{why}");
+
+        let missing = loaded(engine(), "export const inputs = [];");
+        let Err(Fault::Refused(why)) = missing.view(&Request::default()) else {
+            panic!("a script with no view function cannot answer");
+        };
+        assert!(why.contains("view"), "{why}");
+    }
+
+    #[test]
+    fn a_script_is_held_to_the_same_limits_and_rules() {
+        let tight = Limits {
+            fuel: 400_000_000,
+            ..Limits::DEFAULT
+        };
+        let spins = loaded(
+            Arc::new(Module::engine(ENGINE, tight).unwrap()),
+            "export const inputs = []; export function view() { for (;;) {} }",
+        );
+        assert_eq!(spins.view(&Request::default()), Err(Fault::Fuel));
+
+        let outside = loaded(engine(), r#"export const inputs = ["../session.jsonl"];"#);
+        assert_eq!(
+            outside.inputs(),
+            Err(Fault::Input("../session.jsonl".into()))
+        );
+
+        let unknown = loaded(
+            engine(),
+            r#"export const inputs = [];
+               export function view() { return { title: "T", body: { script: { src: "x.js" } } }; }"#,
+        );
+        assert!(matches!(
+            unknown.view(&Request::default()),
+            Err(Fault::Reply(_))
+        ));
+
+        let chatty = loaded(
+            engine(),
+            r#"console.log("starting");
+               export const inputs = ["a.json"];
+               export function view() {
+                   console.log("drawing");
+                   return { title: "T", body: { text: { text: "hi" } } };
+               }"#,
+        );
+        assert_eq!(chatty.inputs().unwrap(), ["a.json"]);
+        assert_eq!(chatty.view(&Request::default()).unwrap().title, "T");
+
+        let reaches = loaded(
+            engine(),
+            r#"export const inputs = [];
+               export function view() {
+                   return { title: String(typeof fetch) + typeof require + typeof process,
+                            body: { text: { text: String(Date.now()) } } };
+               }"#,
+        );
+        let view = reaches.view(&Request::default()).unwrap();
+        assert_eq!(view.title, "undefinedundefinedundefined");
+    }
+
+    #[test]
+    fn a_reply_over_a_mebibyte_arrives_whole() {
+        let source = r#"export const inputs = [];
+            export function view() {
+                const rows = [];
+                for (let i = 0; i < 70; i++) {
+                    rows.push({ id: String(i), cells: [{ text: "x".repeat(20000) }] });
+                }
+                return { title: "T", body: { table: {
+                    id: "t", columns: [{ id: "c", title: "C" }], rows } } };
+            }"#;
+        let script = loaded(engine(), source);
+        let view = script.view(&Request::default()).unwrap();
+        let Node::Table { rows, .. } = &view.body else {
+            panic!("the view is a table");
+        };
+        assert_eq!(rows.len(), 70);
+        assert_eq!(rows[69].cells[0].text.len(), 20_000);
+
+        let small = Limits {
+            reply_bytes: 1 << 20,
+            ..Limits::DEFAULT
+        };
+        let capped = loaded(Arc::new(Module::engine(ENGINE, small).unwrap()), source);
+        assert_eq!(
+            capped.view(&Request::default()),
+            Err(Fault::Reply("over the 1048576 bytes allowed".into()))
+        );
+    }
+
+    #[test]
+    fn a_script_s_formatted_cells_match_the_rust_constructors() {
+        use crucible_view::Cell;
+        let cases = include_str!("../../../crucible-view/js/formatted.json");
+        let script = loaded(
+            engine(),
+            &format!(
+                r#"export const inputs = [];
+                   const CASES = {cases};
+                   const OFF = [NaN, Infinity, -Infinity, 1.1e15, -1.1e15, Number.MAX_VALUE, "5", undefined, null];
+                   export function view() {{
+                       const rows = CASES.map(([helper, input], i) => ({{
+                           id: `case-${{i}}`, cells: [Cell[helper](input)] }}));
+                       for (const helper of ["duration", "bytes", "percent", "count", "date"]) {{
+                           OFF.forEach((input, i) => rows.push({{
+                               id: `off-${{helper}}-${{i}}`, cells: [Cell[helper](input)] }}));
+                       }}
+                       rows.push({{ id: "date-before", cells: [Cell.date(-62135596801)] }});
+                       rows.push({{ id: "date-after", cells: [Cell.date(253370764801)] }});
+                       return {{ title: typeof Cell + Object.isFrozen(Cell), body: {{ table: {{
+                           id: "t", columns: [{{ id: "c", title: "C" }}], rows }} }} }};
+                   }}"#
+            ),
+        );
+        let view = script.view(&Request::default()).unwrap();
+        assert_eq!(view.title, "objecttrue");
+        let Node::Table { rows, .. } = &view.body else {
+            panic!("the view is a table");
+        };
+        let cases: Vec<(String, f64, String)> = serde_json::from_str(cases).unwrap();
+        let rust = |helper: &str, input: f64| match helper {
+            "duration" => Cell::duration(input),
+            "bytes" => Cell::bytes(input),
+            "percent" => Cell::percent(input),
+            "count" => Cell::count(input),
+            "date" => Cell::date(input),
+            other => panic!("no helper {other}"),
+        };
+        for (i, (helper, input, text)) in cases.iter().enumerate() {
+            let row = &rows[i];
+            assert_eq!(row.id, format!("case-{i}"));
+            assert_eq!(row.cells[0].text, *text, "{helper}({input}) in JavaScript");
+            assert_eq!(row.cells[0], rust(helper, *input), "{helper}({input})");
+        }
+        let off = &rows[cases.len()..];
+        assert_eq!(off.len(), 5 * 9 + 2);
+        for row in off {
+            assert_eq!(row.cells[0], Cell::default(), "{}", row.id);
+        }
+    }
+
+    #[test]
+    fn a_script_reads_params_as_plain_values_and_declares_controls() {
+        use crucible_view::{Control, Param};
+        let script = loaded(
+            engine(),
+            r#"export const inputs = [];
+               export function view({ files, params }) {
+                   return {
+                       title: JSON.stringify(params) + typeof params.min + files.length,
+                       body: { text: { text: "hi" } },
+                       controls: [
+                           { select: { id: "lane", label: "Lane", value: params.lane ?? "all",
+                               options: [{ value: "all", label: "All" }, { value: "go", label: "Go" }] } },
+                           { toggle: { id: "open", label: "Open", on: params.open ?? false } },
+                           { range: { id: "min", label: "Min", min: 0, max: 10, step: 0.5,
+                               value: params.min ?? 0 } },
+                       ],
+                   };
+               }"#,
+        );
+        let bare = script.view(&Request::default()).unwrap();
+        assert_eq!(bare.title, "{}undefined0");
+        assert_eq!(
+            bare.controls,
+            [
+                Control::select("lane", "Lane", &[("all", "All"), ("go", "Go")], "all"),
+                Control::toggle("open", "Open", false),
+                Control::range("min", "Min", [0.0, 10.0], 0.5, 0.0),
+            ]
+        );
+        let asked = Request {
+            params: [
+                ("lane".to_string(), Param::Select("go".into())),
+                ("open".to_string(), Param::Toggle(true)),
+                ("min".to_string(), Param::Range(7.5)),
+            ]
+            .into(),
+            ..request("[]")
+        };
+        let view = script.view(&asked).unwrap();
+        assert_eq!(view.title, r#"{"lane":"go","min":7.5,"open":true}number1"#);
+        assert_eq!(
+            view.controls[0],
+            Control::select("lane", "Lane", &[("all", "All"), ("go", "Go")], "go")
+        );
+        assert_eq!(
+            view.controls[2],
+            Control::range("min", "Min", [0.0, 10.0], 0.5, 7.5)
+        );
+
+        let twice = loaded(
+            engine(),
+            r#"export const inputs = [];
+               export function view() {
+                   return { title: "T", body: { text: { text: "hi" } }, controls: [
+                       { toggle: { id: "a", label: "A", on: true } },
+                       { toggle: { id: "a", label: "B", on: false } } ] };
+               }"#,
+        );
+        assert_eq!(
+            twice.view(&Request::default()),
+            Err(Fault::View(crucible_view::Problem::DuplicateControl(
+                "a".into()
+            )))
+        );
+    }
+
+    #[test]
+    fn the_notices_name_the_engine_release_that_is_fetched() {
+        let release = include_str!("../../js-engine.sh")
+            .lines()
+            .find_map(|line| line.strip_prefix("RELEASE="))
+            .unwrap();
+        let notices = include_str!("../../THIRD-PARTY-NOTICES");
+        assert!(
+            notices.contains(&format!("(plugin.wasm), release {release}\n")),
+            "{release}"
+        );
+        for license in [
+            "Apache License",
+            "LLVM Exceptions",
+            "Mees Delzenne",
+            "Fabrice Bellard",
+        ] {
+            assert!(notices.contains(license), "{license}");
+        }
+    }
+}

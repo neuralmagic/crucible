@@ -1,0 +1,18 @@
+# report-ts: a playbook whose pack ships a view of its own results, written in TypeScript. Two
+# command tasks stand in for triage lanes and each captures a `verdicts.json`; `ui/report.js`
+# (built from `ui/report.ts` by `just example-report-ts-view`) turns them into the view the
+# desktop app's Report pane draws. `examples/report` is the same idea in Rust.
+#
+#   crucible plan run --manifest examples/report-ts/crucible.toml --max-cost 1 --max-time 5m
+
+[workspace]
+inject = ["triage.sh", "inbox"]
+
+[agent]
+backend   = "command"
+agent_cmd = "./triage.sh"
+goal      = "Triage the inbox by lane and report the verdicts."
+
+[workflow]
+type = "playbook"
+file = "workflow.star"

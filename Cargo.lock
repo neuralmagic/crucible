@@ -2355,6 +2355,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crucible-view"
+version = "0.7.2"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "crunchy"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

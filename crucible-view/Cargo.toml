@@ -1,0 +1,15 @@
+[package]
+name = "crucible-view"
+description = "The components a pack's view may use, and the documents a view plugin exchanges with its host. Serde only."
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[[bin]]
+name = "crucible-view-check"
+path = "src/bin/check.rs"

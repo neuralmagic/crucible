@@ -500,7 +500,8 @@ fn when(app: &App, p: &Paint) -> El {
         .on_pick(|app: &mut App, i: usize, _: &mut Tx| {
             let owner = app.owners().into_iter().next().unwrap_or_default();
             if let Some(launcher) = &mut app.remote.launcher {
-                launcher.schedule = (i == 1).then(|| crate::admin::ScheduleForm::new(&owner));
+                launcher.schedule =
+                    (i == 1).then(|| crate::admin::forms::ScheduleForm::new(&owner));
                 launcher.refusal = None;
             }
         })
@@ -509,7 +510,7 @@ fn when(app: &App, p: &Paint) -> El {
 }
 
 /// The cron, its zone and the owner of a schedule.
-fn schedule_fields(form: &crate::admin::ScheduleForm, app: &App, p: &Paint) -> El {
+fn schedule_fields(form: &crate::admin::forms::ScheduleForm, app: &App, p: &Paint) -> El {
     let mut owners = app.owners();
     if !form.owner.is_empty() && !owners.contains(&form.owner) {
         owners.insert(0, form.owner.clone());

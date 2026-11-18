@@ -200,6 +200,8 @@ pub struct Settings {
     pub keys: BTreeMap<String, Vec<String>>,
     /// Check the shown pack file with crucible-lsp.
     pub checks: bool,
+    /// Draw the views packs ship, which runs their plugins.
+    pub view_plugins: bool,
     /// The profiles as written, each read on its own so one bad profile spoils only itself.
     profiles: BTreeMap<String, toml::Value>,
     /// The profile in use, by name.
@@ -249,6 +251,7 @@ struct Config {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     keys: BTreeMap<String, Vec<String>>,
     checks: Option<bool>,
+    view_plugins: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -278,13 +281,16 @@ impl Settings {
         if unreadable.is_none()
             && config.profiles.is_empty()
             && let Some(dir) = path.parent().and_then(Path::parent)
-            && let Ok(text) = fs::read_to_string(crate::profile::tauri_config(dir))
+            && let Ok(text) = fs::read_to_string(crate::profile::tauri::tauri_config(dir))
         {
             let crux_url = crux::config::ConnectArgs::from_env()
                 .resolve()
                 .map(|c| c.url)
                 .unwrap_or_default();
-            adopt_tauri(&mut config, crate::profile::from_tauri(&text, &crux_url));
+            adopt_tauri(
+                &mut config,
+                crate::profile::tauri::from_tauri(&text, &crux_url),
+            );
         }
         let tx02 = config
             .tx02_path
@@ -320,6 +326,7 @@ impl Settings {
             editor_command: config.editor_command.unwrap_or_default(),
             keys: config.keys,
             checks: config.checks.unwrap_or(true),
+            view_plugins: config.view_plugins.unwrap_or(false),
             profiles: config.profiles,
             profile: config.profile,
             act_as: config.act_as,
@@ -509,6 +516,11 @@ impl Settings {
         self.save();
     }
 
+    pub fn set_view_plugins(&mut self, on: bool) {
+        self.view_plugins = on;
+        self.save();
+    }
+
     pub fn set_filters(&mut self, filters: crate::filter::Filters) {
         self.filters = filters;
         self.save();
@@ -590,6 +602,7 @@ impl Settings {
             editor_command: (!self.editor_command.is_empty()).then(|| self.editor_command.clone()),
             keys: self.keys.clone(),
             checks: Some(self.checks),
+            view_plugins: Some(self.view_plugins),
             profile: self.profile.clone(),
             act_as: self.act_as.clone(),
             profiles: self.profiles.clone(),
@@ -645,7 +658,7 @@ pub fn families() -> (&'static str, &'static str) {
 
 /// Take the retired Tauri app's profiles, the one it opened by default and its drop ceilings,
 /// where `config` sets none of its own.
-fn adopt_tauri(config: &mut Config, old: crate::profile::Tauri) {
+fn adopt_tauri(config: &mut Config, old: crate::profile::tauri::Tauri) {
     config.profiles = old
         .profiles
         .iter()
@@ -771,6 +784,23 @@ mod tests {
     }
 
     #[test]
+    fn pack_views_are_off_until_turned_on_and_stay_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crucible-playbooks").join("config.toml");
+        let mut settings = Settings::load_from(path.clone());
+        assert!(!settings.view_plugins);
+        settings.set_theme(Theme::Moss);
+        assert!(!Settings::load_from(path.clone()).view_plugins);
+        settings.set_view_plugins(true);
+        assert!(Settings::load_from(path.clone()).view_plugins);
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("view_plugins = true")
+        );
+    }
+
+    #[test]
     fn graphs_draw_compact_until_turned_roomy_and_stay_roomy() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("crucible-playbooks").join("config.toml");
@@ -789,7 +819,7 @@ mod tests {
     fn with_no_profiles_of_its_own_the_app_takes_the_tauri_apps() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("crucible-playbooks").join("config.toml");
-        let tauri = crate::profile::tauri_config(dir.path());
+        let tauri = crate::profile::tauri::tauri_config(dir.path());
         fs::create_dir_all(tauri.parent().unwrap()).unwrap();
         fs::write(
             &tauri,
@@ -904,7 +934,7 @@ proxxy = "socks5://127.0.0.1:1080"
     fn a_file_that_does_not_read_is_reported_and_never_saved_over() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("crucible-playbooks").join("config.toml");
-        let tauri = crate::profile::tauri_config(dir.path());
+        let tauri = crate::profile::tauri::tauri_config(dir.path());
         fs::create_dir_all(tauri.parent().unwrap()).unwrap();
         fs::write(&tauri, "[profiles.old]\nurl = \"http://127.0.0.1:8870\"\n").unwrap();
         fs::create_dir_all(path.parent().unwrap()).unwrap();

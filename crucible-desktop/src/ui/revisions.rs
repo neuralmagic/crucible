@@ -10,7 +10,8 @@ use rune_theme_opencode::icons as oc;
 
 use crate::live::LiveView;
 use crate::revisions::{self, Fire, Landed, Placement, Range, Read};
-use crate::ui::{Paint, Tone, age, flag, rail};
+use crate::ui::sidebar::age;
+use crate::ui::{Paint, Tone, desk, flag, rail};
 use crate::workspace::PaneKind;
 use crate::{App, Selection};
 
@@ -19,7 +20,12 @@ const LISTED: usize = 6;
 
 pub(crate) fn history_view(app: &App, p: &Paint) -> El {
     let Some((draft, template)) = app.draft_target() else {
-        return note("No draft", "Draft this playbook from the Pack pane.", p);
+        return desk::note(
+            "history-note",
+            "No draft",
+            "Draft this playbook from the Pack pane.",
+            p,
+        );
     };
     let read = app
         .remote
@@ -37,9 +43,16 @@ pub(crate) fn history_view(app: &App, p: &Paint) -> El {
                 .child(Spinner::new().size(16.0).build(p.k));
         }
         Some(Err(_)) if template.is_some() => {
-            return note("No draft", "Draft this playbook from the Pack pane.", p);
+            return desk::note(
+                "history-note",
+                "No draft",
+                "Draft this playbook from the Pack pane.",
+                p,
+            );
         }
-        Some(Err(error)) => return note("Could not read the draft", error, p),
+        Some(Err(error)) => {
+            return desk::note("history-note", "Could not read the draft", error, p);
+        }
         Some(Ok(read)) => read,
     };
     let ran = app
@@ -494,10 +507,12 @@ fn changes(changes: Option<&[DraftChangedFile]>, p: &Paint) -> El {
 
 fn diff(read: &Read, app: &App, p: &Paint) -> El {
     if read.diff.files.is_empty() {
-        return col()
-            .grow(1.0)
-            .min_w(0.0)
-            .child(note("No file changes", "", p));
+        return col().grow(1.0).min_w(0.0).child(desk::note(
+            "history-note",
+            "No file changes",
+            "",
+            p,
+        ));
     }
     col()
         .key("history-diff-frame")
@@ -517,32 +532,4 @@ fn diff(read: &Read, app: &App, p: &Paint) -> El {
             .key("history-diff")
             .build(app, p.k),
         )
-}
-
-fn note(headline: &str, detail: &str, p: &Paint) -> El {
-    let mut card = col()
-        .key("history-note")
-        .w_full()
-        .padding(24.0)
-        .gap(6.0)
-        .radius(p.k.radius.lg)
-        .fill(p.c.layer_01)
-        .border(p.hair, p.c.border_muted)
-        .child(
-            text(headline.to_string())
-                .font(p.k.ty.ui_medium)
-                .color(p.c.text_base)
-                .wrap(),
-        );
-    if !detail.is_empty() {
-        card = card.child(
-            text(detail.to_string())
-                .font(p.mono(11.0, 400.0))
-                .color(p.c.text_muted)
-                .selectable(true)
-                .selection_color(p.k.selection())
-                .wrap(),
-        );
-    }
-    card
 }

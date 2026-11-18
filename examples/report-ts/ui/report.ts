@@ -1,0 +1,622 @@
+export const inputs = ["verdicts.json"];
+
+type Action = "fix" | "decide" | "spot" | "close";
+
+interface Ticket {
+  key: string;
+  short: string;
+  lane: string;
+  status: string;
+  age: number;
+  verdict: string;
+  confidence: string;
+  cvss: number;
+  cve: string;
+  pkg: string;
+  release: string;
+  basis: string;
+  why: string;
+  rationale: string;
+  /** The task that triaged it, and the address of the file its verdict is in. */
+  task: string;
+  file: string;
+  action: Action;
+}
+
+const ACTIONS: { id: Action; label: string; tone: Tone; means: string }[] = [
+  { id: "fix", label: "Fix", tone: "bad", means: "affected" },
+  { id: "decide", label: "Decide", tone: "warn", means: "triage could not tell" },
+  { id: "spot", label: "Spot-check", tone: "info", means: "cleared on low or medium confidence" },
+  { id: "close", label: "Close", tone: "good", means: "cleared on high confidence" },
+];
+
+const toneOf = (action: Action): Tone => ACTIONS.find((a) => a.id === action)?.tone ?? "neutral";
+const labelOf = (action: Action): string => ACTIONS.find((a) => a.id === action)?.label ?? action;
+
+function noted(text: string, label: string): string {
+  const line = text.split("\n").find((l) => l.startsWith(label));
+  return line ? line.slice(label.length).trim() : "";
+}
+
+function read(files: CapturedFile[]): Ticket[] {
+  const byKey = new Map<string, Ticket>();
+  for (const file of files) {
+    const records: unknown = JSON.parse(file.text);
+    if (!Array.isArray(records)) throw new Error(`${file.path} from ${file.task} is not a list`);
+    for (const record of records) {
+      const v = record?.verdict_property ?? {};
+      const verdict = String(v.verdict ?? "");
+      const confidence = String(v.confidence ?? "");
+      const rationale = String(v.rationale ?? "");
+      const action: Action =
+        verdict === "affected" ? "fix"
+        : verdict !== "not_affected" ? "decide"
+        : confidence === "high" ? "close"
+        : "spot";
+      const key = String(record?.ticket_key ?? "");
+      byKey.set(key, {
+        key,
+        short: key.replace(/^.*-/, ""),
+        lane: file.task.replace(/^triage-/, ""),
+        status: String(record?.jira_status ?? ""),
+        age: Number(record?.age_days ?? 0) || 0,
+        verdict,
+        confidence,
+        cvss: Number(v.proposed_actions?.cvss?.score ?? 0) || 0,
+        cve: (Array.isArray(v.cve_ids) ? v.cve_ids : []).join(", "),
+        pkg: [v.package?.name, v.package?.version].filter(Boolean).join(" "),
+        release: String(v.release?.name ?? ""),
+        basis: String(v.proposed_actions?.lane ?? ""),
+        why: noted(rationale, "Why review:") || rationale.split("\n")[0] || "",
+        rationale,
+        task: file.task,
+        file: `run:file/${file.task}/${file.path}`,
+        action,
+      });
+    }
+  }
+  const order = ACTIONS.map((a) => a.id);
+  return [...byKey.values()].sort(
+    (a, b) =>
+      order.indexOf(a.action) - order.indexOf(b.action) ||
+      b.cvss - a.cvss ||
+      b.age - a.age ||
+      a.key.localeCompare(b.key),
+  );
+}
+
+/** Every ticket as one cell, in a block per action, most severe first. */
+function ticketMap(tickets: Ticket[]): ViewNode {
+  const rows = 8;
+  const cell = { w: 58, h: 20, gapX: 4, pitch: 28 };
+  const top = 30;
+  const oldest = Math.max(1, ...tickets.map((t) => t.age));
+  const canvas = new Canvas(600, top + rows * cell.pitch + 26);
+  const ctx = canvas.getContext("2d");
+  let left = 0;
+  for (const action of ACTIONS) {
+    const group = tickets.filter((t) => t.action === action.id);
+    const columns = Math.max(1, Math.ceil(group.length / rows));
+    const wide = columns * (cell.w + cell.gapX) - cell.gapX;
+    ctx.globalAlpha = 1;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "alphabetic";
+    ctx.fillStyle = action.tone;
+    ctx.font = "bold 13px sans-serif";
+    ctx.fillText(`${action.label} ${group.length}`, left, 13);
+    ctx.fillStyle = "muted";
+    ctx.font = "10px sans-serif";
+    ctx.fillText(action.means, left, 25, wide);
+    group.forEach((ticket, i) => {
+      ctx.save();
+      ctx.translate(left + Math.floor(i / rows) * (cell.w + cell.gapX), top + (i % rows) * cell.pitch);
+      ctx.fillStyle = action.tone;
+      ctx.globalAlpha = 0.16 + 0.74 * Math.min(1, ticket.cvss / 10);
+      ctx.fillRect(0, 0, cell.w, cell.h);
+      ctx.globalAlpha = 0.9;
+      ctx.fillRect(0, cell.h + 1, (cell.w * ticket.age) / oldest, 2);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = "neutral";
+      ctx.textBaseline = "middle";
+      ctx.font = "bold 10px monospace";
+      ctx.textAlign = "left";
+      ctx.fillText(ticket.short + (ticket.confidence === "low" ? "?" : ""), 5, cell.h / 2, cell.w - 30);
+      ctx.font = "10px monospace";
+      ctx.textAlign = "right";
+      ctx.fillText(ticket.cvss.toFixed(1), cell.w - 5, cell.h / 2);
+      ctx.hint(0, 0, cell.w, cell.h + 3, `${ticket.key} ${ticket.cve} ${ticket.pkg}, ${ticket.age} days`);
+      ctx.restore();
+    });
+    left += wide + 14;
+  }
+  ctx.globalAlpha = 1;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+  ctx.fillStyle = "muted";
+  ctx.font = "10px sans-serif";
+  ctx.fillText(
+    `One cell per ticket: number and CVSS. Deeper fill is higher CVSS, the underline is days open (longest ${oldest}), ? is low confidence.`,
+    0,
+    top + rows * cell.pitch + 16,
+    canvas.width,
+  );
+  return canvas.node();
+}
+
+/** The tickets to act on along a CVSS axis, labels stacked so none overlap. */
+function severityRuler(tickets: Ticket[]): ViewNode {
+  const marks = tickets
+    .filter((t) => t.action === "fix" || t.action === "decide")
+    .sort((a, b) => a.cvss - b.cvss);
+  const span = { left: 24, right: 576 };
+  const at = (cvss: number) => span.left + ((span.right - span.left) * Math.min(10, Math.max(0, cvss))) / 10;
+  const labelWidth = 30;
+  const ends: number[] = [];
+  const placed = marks.map((ticket) => {
+    const x = at(ticket.cvss);
+    let row = ends.findIndex((end) => end + 3 <= x - labelWidth / 2);
+    if (row < 0) row = ends.push(0) - 1;
+    ends[row] = x + labelWidth / 2;
+    return { ticket, x, row };
+  });
+  const rowHeight = 13;
+  const axis = 30 + ends.length * rowHeight + 14;
+  const canvas = new Canvas(600, axis + 30);
+  const ctx = canvas.getContext("2d");
+
+  for (const band of [{ from: 7, tone: "warn" as Tone, name: "high" }, { from: 9, tone: "bad" as Tone, name: "critical" }]) {
+    ctx.globalAlpha = 0.09;
+    ctx.fillStyle = band.tone;
+    ctx.fillRect(at(band.from), 18, span.right - at(band.from), axis - 18);
+    ctx.globalAlpha = 1;
+    ctx.font = "10px sans-serif";
+    ctx.textAlign = "left";
+    ctx.fillText(band.name, at(band.from) + 4, 13);
+  }
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = "muted";
+  ctx.font = "bold 11px sans-serif";
+  ctx.textAlign = "left";
+  ctx.fillText("Fix and decide, by CVSS", 0, 13);
+
+  ctx.strokeStyle = "muted";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(span.left, axis);
+  ctx.lineTo(span.right, axis);
+  for (let score = 0; score <= 10; score++) {
+    ctx.moveTo(at(score), axis);
+    ctx.lineTo(at(score), axis + 4);
+  }
+  ctx.stroke();
+  ctx.font = "10px monospace";
+  ctx.textAlign = "center";
+  for (let score = 0; score <= 10; score += 2) ctx.fillText(String(score), at(score), axis + 16);
+
+  for (const { ticket, x, row } of placed) {
+    const labelY = axis - 16 - row * rowHeight;
+    const tone = toneOf(ticket.action);
+    ctx.globalAlpha = 0.45;
+    ctx.strokeStyle = tone;
+    ctx.beginPath();
+    ctx.moveTo(x, axis - 5);
+    ctx.lineTo(x, labelY + 3);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = tone;
+    ctx.beginPath();
+    ctx.arc(x, axis - 5, ticket.action === "fix" ? 4.5 : 3.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.font = ticket.action === "fix" ? "bold 10px monospace" : "10px monospace";
+    ctx.textAlign = "center";
+    ctx.fillText(ticket.short, x, labelY);
+  }
+  return canvas.node();
+}
+
+/** What a selected row shows under the table. */
+function detail(t: Ticket): string {
+  return [
+    `### ${t.key}: ${labelOf(t.action)}`,
+    "",
+    t.rationale.replaceAll("\n", "\n\n"),
+    "",
+    "| Field | Value |",
+    "|---|---|",
+    `| Package | \`${t.pkg}\` |`,
+    `| CVE | ${t.cve} |`,
+    `| CVSS | ${t.cvss.toFixed(1)} |`,
+    `| Decided by | ${t.basis} |`,
+    "",
+    `Triaged by [${t.task}](run:task/${t.task}), from [its verdicts](${t.file}).`,
+  ].join("\n");
+}
+
+function table(id: string, tickets: Ticket[]): ViewNode {
+  return {
+    table: {
+      id,
+      columns: [
+        { id: "ticket", title: "Ticket", kind: "mono", width: "narrow" },
+        { id: "action", title: "Action", kind: "badge", width: "narrow" },
+        { id: "cvss", title: "CVSS", kind: "number", width: "narrow" },
+        { id: "age", title: "Open", kind: "number", width: "narrow" },
+        { id: "confidence", title: "Confidence", kind: "badge", width: "narrow" },
+        { id: "why", title: "Why", width: "fill" },
+        { id: "package", title: "Package", width: "wide" },
+        { id: "release", title: "Release", kind: "mono", width: "narrow" },
+        { id: "lane", title: "Lane", width: "narrow" },
+        { id: "cve", title: "CVE", kind: "mono", width: "medium" },
+        { id: "status", title: "Jira", width: "narrow" },
+        { id: "opened", title: "Opened", kind: "mono", width: "narrow" },
+      ],
+      rows: tickets.map((t) => ({
+        id: t.key,
+        cells: [
+          { text: t.key },
+          { text: labelOf(t.action), tone: toneOf(t.action) },
+          {
+            text: t.cvss.toFixed(1),
+            tone: t.cvss >= 9 ? "bad" : t.cvss >= 7 ? "warn" : "neutral",
+            bar: Math.min(1, Math.max(0, t.cvss / 10)),
+          },
+          Cell.duration(t.age * 86400),
+          { text: t.confidence, tone: t.confidence === "high" ? "good" : t.confidence === "low" ? "bad" : "warn" },
+          { text: t.why },
+          { text: t.pkg },
+          { text: t.release },
+          { text: t.lane, href: `run:task/${t.task}` },
+          { text: t.cve },
+          { text: t.status },
+          Cell.date(AS_OF - t.age * 86400),
+        ],
+        detail: detail(t),
+      })),
+    },
+  };
+}
+
+/** Tickets flowing from their lane, through what the decision rested on, to what to do. */
+function howDecided(tickets: Ticket[]): ViewNode {
+  const lanes = [...new Set(tickets.map((t) => t.lane))].sort();
+  const bases = [...new Set(tickets.map((t) => t.basis))].sort();
+  const count = (keep: (t: Ticket) => boolean) => tickets.filter(keep).length;
+  const links: { from: string; to: string; value: number }[] = [];
+  for (const basis of bases) {
+    for (const lane of lanes) {
+      links.push({ from: `lane:${lane}`, to: `basis:${basis}`, value: count((t) => t.lane === lane && t.basis === basis) });
+    }
+    for (const action of ACTIONS) {
+      links.push({ from: `basis:${basis}`, to: `action:${action.id}`, value: count((t) => t.basis === basis && t.action === action.id) });
+    }
+  }
+  return {
+    flow: {
+      nodes: [
+        ...lanes.map((lane) => ({ id: `lane:${lane}`, label: lane, tone: "muted" as Tone })),
+        ...bases.map((basis) => ({ id: `basis:${basis}`, label: basis })),
+        ...ACTIONS.filter((a) => tickets.some((t) => t.action === a.id)).map((a) => ({
+          id: `action:${a.id}`,
+          label: a.label,
+          tone: a.tone,
+        })),
+      ],
+      links: links.filter((link) => link.value > 0),
+    },
+  };
+}
+
+/** The verdicts are read as of this moment, in Unix seconds: 1 Nov 2026, UTC. */
+const AS_OF = Date.UTC(2026, 10, 1) / 1000;
+
+/** Tickets opened so far, per lane, over the days they were opened. */
+function openedOverTime(tickets: Ticket[]): ViewNode {
+  const lanes = [...new Set(tickets.map((t) => t.lane))].sort();
+  return {
+    plot: {
+      kind: "line",
+      x: "opened",
+      y: "tickets",
+      x_scale: "time",
+      series: lanes.map((lane) => ({
+        label: lane,
+        points: tickets
+          .filter((t) => t.lane === lane)
+          .map((t) => AS_OF - t.age * 86400)
+          .sort((a, b) => a - b)
+          .map((opened, i): [number, number] => [opened, i + 1]),
+      })),
+    },
+  };
+}
+
+/** Days open against CVSS, a series per package, on a log scale of days. */
+function ageByPackage(tickets: Ticket[]): ViewNode {
+  const packages = [...new Set(tickets.map((t) => t.pkg.split(" ")[0]))].sort();
+  return {
+    plot: {
+      kind: "scatter",
+      x: "CVSS",
+      y: "days open",
+      y_scale: "log",
+      series: packages.map((pkg) => ({
+        label: pkg,
+        points: tickets
+          .filter((t) => t.pkg.split(" ")[0] === pkg)
+          .map((t): [number, number] => [t.cvss, Math.max(1, t.age)]),
+      })),
+    },
+  };
+}
+
+export function view({ files, params }: ViewRequest): View {
+  const every = read(files);
+  const allLanes = [...new Set(every.map((t) => t.lane))].sort();
+  const lane = typeof params.lane === "string" && allLanes.includes(params.lane) ? params.lane : "all";
+  const minCvss = typeof params.cvss === "number" ? params.cvss : 0;
+  const controls: ViewControl[] = [
+    {
+      select: {
+        id: "lane",
+        label: "Lane",
+        options: [{ value: "all", label: "All" }, ...allLanes.map((l) => ({ value: l, label: l }))],
+        value: lane,
+      },
+    },
+    { range: { id: "cvss", label: "Min CVSS", min: 0, max: 10, step: 0.5, value: minCvss } },
+  ];
+  const tickets = every.filter((t) => (lane === "all" || t.lane === lane) && t.cvss >= minCvss);
+  if (tickets.length === 0) {
+    const note: ViewNode =
+      every.length === 0
+        ? { note: { headline: "No verdicts were captured." } }
+        : { note: { headline: "No ticket matches.", detail: "Lower Min CVSS or pick another lane.", tone: "warn" } };
+    return { title: "Triage", body: note, controls };
+  }
+  const of = (action: Action) => tickets.filter((t) => t.action === action);
+  const [fix, decide, spot, close] = [of("fix"), of("decide"), of("spot"), of("close")];
+  const high = (list: Ticket[]) => list.filter((t) => t.cvss >= 7).length;
+  const lanes = [...new Set(tickets.map((t) => t.lane))].sort();
+  const act = [...fix, ...decide];
+  const first = fix[0];
+
+  const summary =
+    `**${tickets.length} tickets** from the ${lanes.join(" and ")} ${lanes.length === 1 ? "lane" : "lanes"}.\n\n` +
+    `- **${fix.length} are affected** and need a fix, ${high(fix)} of them CVSS 7 or higher` +
+    (first ? `; start with \`${first.key}\` (${first.cvss.toFixed(1)}, open ${first.age} days).\n` : ".\n") +
+    `- **${decide.length} could not be decided** and need a person.\n` +
+    `- **${spot.length} were cleared on low or medium confidence**, ${high(spot)} of those CVSS 7 or higher, so check them before closing.\n` +
+    `- **${close.length} can be closed.**`;
+
+  return {
+    title: `Triage: ${act.length} to act on, ${spot.length} to spot-check, ${close.length} to close`,
+    body: {
+      stack: {
+        children: [
+          {
+            stats: {
+              items: [
+                { label: "Triaged", value: String(tickets.length) },
+                ...ACTIONS.map((a) => ({ label: a.label, value: String(of(a.id).length), tone: a.tone })),
+              ],
+            },
+          },
+          {
+            tabs: {
+              id: "queue",
+              tabs: [
+                {
+                  label: "Overview",
+                  body: {
+                    stack: {
+                      children: [
+                        { columns: { children: [{ markdown: { text: summary } }, howDecided(tickets)] } },
+                        { section: { id: "map", title: "Ticket map", body: ticketMap(tickets) } },
+                      ],
+                    },
+                  },
+                },
+                {
+                  label: "Act first",
+                  count: act.length,
+                  body: {
+                    stack: {
+                      children: [
+                        { section: { id: "ruler", title: "By CVSS", body: severityRuler(tickets) } },
+                        table("act", act),
+                      ],
+                    },
+                  },
+                },
+                {
+                  label: "Spot-check",
+                  count: spot.length,
+                  body: {
+                    stack: {
+                      children: [
+                        {
+                          text: {
+                            text: "Cleared, but not on high confidence. Highest CVSS first: a wrong dismissal costs most at the top.",
+                            tone: "muted",
+                          },
+                        },
+                        table("spot", spot),
+                      ],
+                    },
+                  },
+                },
+                { label: "All", count: tickets.length, body: table("all", tickets) },
+                {
+                  label: "Charts",
+                  body: {
+                    stack: {
+                      children: [
+                        {
+                          columns: {
+                            children: [
+                              openedOverTime(tickets),
+                              { histogram: { x: "CVSS", values: tickets.map((t) => t.cvss), bins: 10, tone: "warn" } },
+                            ],
+                          },
+                        },
+                        ageByPackage(tickets),
+                      ],
+                    },
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    },
+    controls,
+  };
+}
+
+export const runsInputs = ["verdicts.json"];
+
+const STATUS_TONE: Record<LaunchedRun["status"], Tone> = {
+  done: "good",
+  error: "bad",
+  running: "info",
+  cancelled: "muted",
+  unfinished: "muted",
+};
+
+/** How each ticket's action moved across the launches of the playbook. */
+export function runs({ runs: launches, total }: RunsRequest): View {
+  const triaged = [...launches].reverse().map((run) => {
+    let tickets: Ticket[];
+    try {
+      tickets = read(run.files);
+    } catch (error) {
+      throw new Error(`${error instanceof Error ? error.message : error}, in ${run.id}`);
+    }
+    return { run, actions: new Map(tickets.map((t) => [t.key, t.action])) };
+  });
+  const withVerdicts = triaged.filter((one) => one.actions.size > 0);
+  if (withVerdicts.length === 0) {
+    return { title: "Triage history", body: { note: { headline: "No launch has captured verdicts.json yet.", tone: "muted" } } };
+  }
+  const paths = new Map<string, { run: LaunchedRun; action: Action }[]>();
+  for (const { run, actions } of withVerdicts) {
+    for (const [key, action] of actions) {
+      paths.set(key, [...(paths.get(key) ?? []), { run, action }]);
+    }
+  }
+  const changes = (path: { action: Action }[]) =>
+    path.slice(1).filter((step, i) => step.action !== path[i].action).length;
+  const moved = [...paths.entries()].filter(([, path]) => changes(path) > 0).sort(([a], [b]) => a.localeCompare(b));
+  const newest = withVerdicts[withVerdicts.length - 1];
+  const count = (actions: Map<string, Action>, action: Action) => [...actions.values()].filter((a) => a === action).length;
+
+  const movedRows = moved.map(([key, path]) => {
+    let last = 1;
+    for (let i = 1; i < path.length; i++) if (path[i].action !== path[i - 1].action) last = i;
+    const [was, now] = [path[last - 1].action, path[last].action];
+    const steps = path.map((step) => labelOf(step.action)).filter((label, i, all) => i === 0 || label !== all[i - 1]);
+    return {
+      id: key,
+      cells: [
+        { text: key },
+        { text: labelOf(now), tone: toneOf(now) },
+        { text: labelOf(was), tone: toneOf(was) },
+        { text: path[last].run.id, href: `launch:${path[last].run.id}` },
+        Cell.count(changes(path)),
+        { text: steps.join(" → ") },
+      ],
+    };
+  });
+
+  const launchRows = triaged
+    .map((one, at) => {
+      const before = one.actions.size === 0 ? undefined : triaged.slice(0, at).reverse().find((earlier) => earlier.actions.size > 0);
+      const shifted = before
+        ? Cell.count([...one.actions].filter(([key, action]) => before.actions.has(key) && before.actions.get(key) !== action).length)
+        : { text: "" };
+      return {
+        id: one.run.id,
+        cells: [
+          { text: one.run.id, href: `launch:${one.run.id}` },
+          { text: one.run.status, tone: STATUS_TONE[one.run.status] },
+          Cell.date(one.run.started),
+          Cell.count(one.actions.size),
+          Cell.count(count(one.actions, "fix")),
+          shifted,
+        ],
+      };
+    })
+    .reverse();
+
+  return {
+    title: "Triage history",
+    body: {
+      stack: {
+        children: [
+          {
+            stats: {
+              items: [
+                { label: "Launches", value: `${launches.length} of ${total}` },
+                { label: "Tickets", value: String(paths.size) },
+                { label: "Moved", value: String(moved.length), tone: "warn" },
+                { label: "Fix now", value: String(count(newest.actions, "fix")), tone: "bad" },
+              ],
+            },
+          },
+          {
+            bars: {
+              bars: withVerdicts.map((one) => ({
+                label: one.run.id,
+                segments: ACTIONS.map((a) => ({ label: a.label, value: count(one.actions, a.id), tone: a.tone })),
+              })),
+            },
+          },
+          {
+            tabs: {
+              id: "history",
+              tabs: [
+                {
+                  label: "Moved",
+                  count: moved.length,
+                  body: {
+                    table: {
+                      id: "moved",
+                      columns: [
+                        { id: "ticket", title: "Ticket", kind: "mono", width: "narrow" },
+                        { id: "now", title: "Now", kind: "badge" },
+                        { id: "was", title: "Was", kind: "badge" },
+                        { id: "since", title: "Since", kind: "mono" },
+                        { id: "moves", title: "Moves", kind: "number", width: "narrow" },
+                        { id: "path", title: "Path", width: "fill" },
+                      ],
+                      rows: movedRows,
+                    },
+                  },
+                },
+                {
+                  label: "Launches",
+                  count: launches.length,
+                  body: {
+                    table: {
+                      id: "launches",
+                      columns: [
+                        { id: "launch", title: "Launch", kind: "mono" },
+                        { id: "status", title: "Status", kind: "badge", width: "narrow" },
+                        { id: "started", title: "Started", kind: "mono", width: "narrow" },
+                        { id: "tickets", title: "Tickets", kind: "number", width: "narrow" },
+                        { id: "fix", title: "Fix", kind: "number", width: "narrow" },
+                        { id: "moved", title: "Moved", kind: "number", width: "fill" },
+                      ],
+                      rows: launchRows,
+                    },
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  };
+}

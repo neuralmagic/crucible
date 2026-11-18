@@ -2,8 +2,9 @@ name: Desktop
 
 # Format, lint and test the desktop app (crucible-desktop, its own Cargo workspace on Rune, so
 # ci.yml never builds it) on macOS and Fedora, and assemble its .app bundle and RPM. Runs only when the app, the crates it
-# builds from (crux, crucible-contract, crucible-lsp, and the root Cargo.toml whose workspace
-# dependencies they inherit) or this workflow change: macOS runner minutes are billed.
+# builds from (crux, crucible-contract, crucible-lsp, crucible-view, and the root Cargo.toml whose
+# workspace dependencies they inherit), the example packs its view tests load, or this
+# workflow change: macOS runner minutes are billed.
 on:
   push:
     branches: [main]
@@ -12,6 +13,10 @@ on:
       - 'crux/**'
       - 'crucible-contract/**'
       - 'crucible-lsp/**'
+      - 'crucible-view/**'
+      - 'examples/report/**'
+      - 'examples/report-ts/**'
+      - 'examples/stack/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/desktop.yml'
@@ -21,6 +26,10 @@ on:
       - 'crux/**'
       - 'crucible-contract/**'
       - 'crucible-lsp/**'
+      - 'crucible-view/**'
+      - 'examples/report/**'
+      - 'examples/report-ts/**'
+      - 'examples/stack/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/desktop.yml'
@@ -58,6 +67,10 @@ jobs:
       - name: Rune
         run: sh crucible-desktop/rune-patches.sh
 
+      # The engine JavaScript view plugins run in, which the app is built with.
+      - name: JavaScript engine
+        run: sh crucible-desktop/js-engine.sh
+
       - name: fmt
         working-directory: crucible-desktop
         run: cargo fmt --check
@@ -75,6 +88,12 @@ jobs:
       - name: test
         working-directory: crucible-desktop
         run: CRUCIBLE_LSP="$GITHUB_WORKSPACE/target/debug/crucible-lsp" cargo test --locked
+
+      - name: report example
+        run: cargo test --locked --manifest-path examples/report/ui/report/Cargo.toml --target-dir target/view-plugins
+
+      - name: stack example
+        run: cargo test --locked --manifest-path examples/stack/ui/stack/Cargo.toml --target-dir target/view-plugins
 
       # The browser build: the library, and the crux client under it, linted for wasm32.
       - name: web
@@ -107,6 +126,10 @@ jobs:
       - name: Rune
         run: sh crucible-desktop/rune-patches.sh
 
+      # The engine JavaScript view plugins run in, which the app is built with.
+      - name: JavaScript engine
+        run: sh crucible-desktop/js-engine.sh
+
       - name: Build
         env:
           SQLX_OFFLINE: "true"
@@ -123,6 +146,7 @@ jobs:
           plutil -lint "$app/Contents/Info.plist"
           test -x "$app/Contents/MacOS/crucible-playbooks"
           test -x "$app/Contents/MacOS/crucible-lsp"
+          test -s "$app/Contents/Resources/THIRD-PARTY-NOTICES"
           codesign --verify --deep "$app"
           # The binary starts: as a tunnel supervisor with no command it refuses with code 2.
           code=0
@@ -170,6 +194,10 @@ jobs:
       - name: Rune
         run: sh crucible-desktop/rune-patches.sh
 
+      # The engine JavaScript view plugins run in, which the app is built with.
+      - name: JavaScript engine
+        run: sh crucible-desktop/js-engine.sh
+
       - name: clippy
         working-directory: crucible-desktop
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
@@ -203,6 +231,7 @@ jobs:
           crucible-playbooks --keep </dev/null || code=$?
           test "$code" -eq 2
           test -x /usr/bin/crucible-lsp
+          test -s /usr/share/licenses/crucible-playbooks/THIRD-PARTY-NOTICES
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:

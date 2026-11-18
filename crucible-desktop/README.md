@@ -147,8 +147,11 @@ dev rev the engine workspace must not inherit.
 ## Run
 
 ```sh
-just desktop-run       # or `cargo run` here, after rune-patches.sh
+just desktop-run       # or `cargo run` here, after rune-patches.sh and js-engine.sh
 ```
+
+`js-engine.sh` fetches the engine JavaScript view plugins run in, and the build embeds it.
+`THIRD-PARTY-NOTICES` carries its licenses and goes into the app bundle, the RPM and the web build.
 
 The **Local** backend lists every pack under `<repo>/examples` whose manifest says
 `[workflow] type = "playbook"`. The search field filters those by name, goal, workflow or verdict.
@@ -176,6 +179,11 @@ tab onto another group's tab bar or middle to join it, or onto an edge to split 
 bar too narrow for its labels draws every tab but the active one as its icon. `Panes` in the
 header lists every pane with its shortcut: a pick shows it, reopening it if it was closed, and the
 checked ones are on screen.
+
+A pack can ship a view of its runs (`skills/write-a-view-plugin`). Drawing one runs the pack's
+plugin, so it is off by default: `Draw pack views` in Settings, or `view_plugins = true` in the
+config, adds the Report pane and the runs page's Report tab. A headless scene that names the
+report tab, or `CRUCIBLE_VIEW_PLUGIN`, turns it on for that run.
 
 ![the Panes menu](docs/panes.png)
 

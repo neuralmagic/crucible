@@ -3,45 +3,27 @@
 //!
 //! The controller and its key come from the profile in use; see [`crate::profile`].
 
+mod action;
+pub mod client;
+mod fetcher;
+mod reports;
+mod shape;
+
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::Arc;
 
-use crucible_contract::session::SessionEvent;
-use jiff::Timestamp;
-use jiff::tz::TimeZone;
 use serde_json::Value;
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use tokio::sync::oneshot;
 
-use rune::Waker;
-use rune::time::Instant;
-
-use crate::captured::{Body, Captured, Opened};
+use crate::captured::{Captured, Opened};
 use crate::draft::Working;
 use crate::filter::LaunchFilter;
 use crate::logline::LogLine;
 use crate::model::Verdict;
-use crate::net::{Connection, Connector, Down, Task, reaching, within};
+use crate::net::Down;
 use crate::pack::PackFiles;
-use crate::revisions::{self, Revisions, Wanted};
+use crate::report::{Built, WantedRuns};
+use crate::revisions::Revisions;
 use crate::session::RunFold;
-
-/// How long streamed session lines gather before they are folded and shown, so a burst of agent
-/// output is one redraw rather than dozens.
-const STREAM_BATCH: Duration = Duration::from_millis(40);
-/// Console lines kept per run.
-const LOG_LINES: usize = 4000;
-/// Finished launches kept for the window to notify about.
-const FINISHED: usize = 32;
-/// How long a live session follow that failed waits before it is tried again.
-const FOLLOW_RETRY: Duration = Duration::from_secs(15);
-/// How long a follow that ended cleanly, while the list still says running, waits before the
-/// next one: the list catches up in that time.
-const FOLLOW_REST: Duration = Duration::from_secs(4);
-/// How long a replay that stopped short of what it replaces waits before it is shown anyway.
-const REPLAY_QUIET: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Default, PartialEq)]
 pub enum LiveView {
@@ -387,469 +369,6 @@ impl std::fmt::Display for LaunchStatus {
     }
 }
 
-/// What the window, the session streams and finished actions tell the worker.
-enum Msg {
-    /// Which launch to keep current; `None` stops reading details.
-    Select(Option<String>),
-    /// A session stream delivered lines.
-    Streamed,
-    /// Read the launch list now.
-    Refresh,
-    /// Drop the connection and who it named, and read crux's config afresh.
-    Reconnect,
-    /// Which launch to read as the base of a comparison; `None` stops.
-    Compare(Option<String>),
-    /// Which draft save to read the pack of; `None` stops.
-    Draft(Option<(String, i64)>),
-}
-
-/// What the window asks for that runs as a task of its own.
-enum Action {
-    /// Read a target's params schema and the admin caps, for a launch form.
-    Prepare(Target),
-    /// Launch a target with this body (`params`, `max_cost`, `max_time`, maybe `rerun`).
-    Launch {
-        target: Target,
-        body: Value,
-    },
-    /// What rerunning a finished run from these tasks would reuse.
-    Rerun {
-        run: String,
-        from: Vec<String>,
-    },
-    /// Pull a draft's newest save into its working copy, creating the draft from `template`
-    /// first when it does not exist.
-    Pull {
-        draft: String,
-        template: Option<String>,
-    },
-    /// Save a working copy as its draft's next version.
-    Save(Working),
-    /// Push a pack folder as the next version of the draft named after it, creating the draft on
-    /// first drop, and test-fire it under these ceilings.
-    Drop {
-        dir: PathBuf,
-        max_cost: f64,
-        max_time: String,
-    },
-    /// Fetch one file a run captured, by its key. `size` is what the listing says it holds, and
-    /// `settled` that its run has stopped, so its copy on disk can stand in for it.
-    File {
-        run: String,
-        key: String,
-        size: u64,
-        settled: bool,
-    },
-    Revisions(Wanted),
-}
-
-/// What an [`Action`] came to.
-enum Reply {
-    Prepared {
-        target: Target,
-        result: Result<Form, String>,
-    },
-    Launched {
-        playbook: String,
-        result: Result<String, String>,
-    },
-    Reran {
-        run: String,
-        from: Vec<String>,
-        result: Result<crux::dto::RerunPreview, String>,
-    },
-    Synced {
-        draft: String,
-        result: Result<(Working, Option<String>), String>,
-    },
-    Dropped {
-        dir: PathBuf,
-        draft: String,
-        result: Result<DropOutcome, String>,
-    },
-    File(Opened),
-    Revisions(Revisions),
-}
-
-impl Action {
-    /// Whether the launch list changes when this lands.
-    fn launches(&self) -> bool {
-        matches!(self, Action::Launch { .. } | Action::Drop { .. })
-    }
-
-    async fn run(self, c: Connection, dirs: &Dirs) -> Reply {
-        match self {
-            Action::Prepare(target) => {
-                let result = prepare(&c, &target).await;
-                Reply::Prepared { target, result }
-            }
-            Action::Launch { target, body } => {
-                let result = send_launch(&c, &target, &body).await;
-                Reply::Launched {
-                    playbook: target.id().to_string(),
-                    result,
-                }
-            }
-            Action::Rerun { run, from } => {
-                let result = within("the rerun preview", c.client.rerun_preview(&run, &from)).await;
-                Reply::Reran { run, from, result }
-            }
-            Action::Pull { draft, template } => {
-                let result = pull(&c, dirs.drafts.as_deref(), &draft, template.as_deref()).await;
-                Reply::Synced { draft, result }
-            }
-            Action::Save(working) => {
-                let draft = working.draft.clone();
-                let result = save(&c, dirs.drafts.as_deref(), working).await;
-                Reply::Synced { draft, result }
-            }
-            Action::Drop {
-                dir,
-                max_cost,
-                max_time,
-            } => {
-                let draft = draft_id(&dir).unwrap_or_default();
-                let result = drop_pack(&c, &dir, &draft, max_cost, &max_time).await;
-                Reply::Dropped { dir, draft, result }
-            }
-            Action::File {
-                run,
-                key,
-                size,
-                settled,
-            } => {
-                let files = dirs.files.as_deref();
-                let kept =
-                    file_on_disk(files, &run, &key).filter(|(_, bytes)| settled && *bytes == size);
-                Reply::File(match kept {
-                    Some((opened, _)) => opened,
-                    None => fetch_file(&c, files, run, key).await,
-                })
-            }
-            Action::Revisions(wanted) => Reply::Revisions(Revisions {
-                result: read_revisions(&c, &wanted).await,
-                wanted,
-            }),
-        }
-    }
-
-    /// The reply when there is no connection to run on.
-    fn failed(self, why: String, dirs: &Dirs) -> Reply {
-        match self {
-            Action::Prepare(target) => Reply::Prepared {
-                target,
-                result: Err(why),
-            },
-            Action::Launch { target, .. } => Reply::Launched {
-                playbook: target.id().to_string(),
-                result: Err(why),
-            },
-            Action::Rerun { run, from } => Reply::Reran {
-                run,
-                from,
-                result: Err(why),
-            },
-            Action::Pull { draft, .. } => Reply::Synced {
-                draft,
-                result: Err(why),
-            },
-            Action::Save(working) => Reply::Synced {
-                draft: working.draft,
-                result: Err(why),
-            },
-            Action::Drop { dir, .. } => Reply::Dropped {
-                draft: draft_id(&dir).unwrap_or_default(),
-                dir,
-                result: Err(why),
-            },
-            Action::File { run, key, .. } => {
-                Reply::File(match file_on_disk(dirs.files.as_deref(), &run, &key) {
-                    Some((opened, _)) => opened,
-                    None => Opened {
-                        body: Err(why),
-                        run,
-                        key,
-                        disk: None,
-                    },
-                })
-            }
-            Action::Revisions(wanted) => Reply::Revisions(Revisions {
-                wanted,
-                result: Err(why),
-            }),
-        }
-    }
-}
-
-/// A draft's saves and test-fires, and the diff of the range asked for, or of the one the pane
-/// opens on when none was picked or the picked one names a save the draft no longer holds.
-async fn read_revisions(c: &Connection, wanted: &Wanted) -> Result<revisions::Read, String> {
-    let draft = wanted.draft.as_str();
-    let (history, runs) = tokio::join!(
-        within("the draft's history", c.client.draft_history(draft)),
-        within(
-            "the draft's test-fires",
-            c.client.playbook_runs(None, Some(draft))
-        ),
-    );
-    let history: Vec<crux::dto::DraftHistoryEntry> = history?;
-    let fires = revisions::fires(runs.unwrap_or_default());
-    let range = wanted
-        .range
-        .and_then(|range| revisions::held(&history, range))
-        .or_else(|| revisions::opening(&history, &fires, wanted.ran))
-        .ok_or_else(|| format!("draft {draft} has no saves"))?;
-    let diff = within(
-        "the diff",
-        c.client.draft_diff(draft, range.from, Some(range.to)),
-    )
-    .await?;
-    let zone = TimeZone::system();
-    let landed = history
-        .iter()
-        .map(|entry| revisions::Landed {
-            at: epoch(&entry.created_at),
-            label: landed_label(&entry.created_at, &zone),
-        })
-        .collect();
-    Ok(revisions::Read {
-        history,
-        landed,
-        fires,
-        range,
-        diff,
-    })
-}
-
-async fn prepare(c: &Connection, target: &Target) -> Result<Form, String> {
-    let client = &c.client;
-    let registered = match target {
-        Target::Playbook(id) => Some(id.as_str()),
-        Target::Draft(_) => None,
-    };
-    let schema = async {
-        match target {
-            Target::Playbook(id) => {
-                let schema =
-                    within("the params schema", client.playbook_schema::<Value>(id)).await?;
-                Ok::<_, String>((schema, None))
-            }
-            Target::Draft(id) => {
-                let head: crux::dto::DraftCompile =
-                    within("the draft's schema", client.draft_preview(id, None)).await?;
-                Ok((
-                    head.params_schema.unwrap_or(Value::Null),
-                    head.schema_digest,
-                ))
-            }
-        }
-    };
-    let (schema, caps, targets, providers) = tokio::join!(
-        schema,
-        within("the launch caps", client.playbook_caps()),
-        within("the dispatch targets", client.dispatch_targets(registered)),
-        within("the providers", client.providers()),
-    );
-    let (schema, digest) = schema?;
-    let caps: crux::dto::PlaybookCaps = caps?;
-    Ok(Form {
-        schema,
-        digest,
-        max_cost: caps.max_cost,
-        max_time: caps.max_time,
-        targets: targets?,
-        providers: providers?,
-    })
-}
-
-/// Launch `target` with `body`, for the new launch's key.
-async fn send_launch(c: &Connection, target: &Target, body: &Value) -> Result<String, String> {
-    let ack: crux::dto::LaunchAck = match target {
-        Target::Playbook(id) => within("the launch", c.client.launch(id, body)).await?,
-        Target::Draft(id) => within("the launch", c.client.launch_draft(id, body)).await?,
-    };
-    Ok(ack.key)
-}
-
-/// Pull `draft`'s newest save into its working copy under `drafts`, creating it from `template`
-/// first when the controller has no such draft.
-async fn pull(
-    c: &Connection,
-    drafts: Option<&Path>,
-    draft: &str,
-    template: Option<&str>,
-) -> Result<(Working, Option<String>), String> {
-    let root = drafts.ok_or("no home directory for working copies")?;
-    let newest = within(
-        "the draft",
-        c.client.draft_files::<crux::dto::DraftFiles>(draft, None),
-    )
-    .await;
-    let (files, note) = match (newest, template) {
-        (Ok(files), _) => (files, None),
-        (Err(_), Some(template)) => {
-            let _: crux::dto::DraftCompile = within(
-                "creating the draft",
-                c.client
-                    .create_draft(draft, &format!("Drafted from {template}"), Some(template)),
-            )
-            .await?;
-            let files: crux::dto::DraftFiles =
-                within("the new draft", c.client.draft_files(draft, None)).await?;
-            (
-                files,
-                Some(format!("Created draft {draft} from {template}")),
-            )
-        }
-        (Err(error), None) => return Err(error),
-    };
-    let working = Working::write(root, draft, files.version, &files.files)?;
-    Ok((working, note))
-}
-
-/// Push pack folder `dir` as the next version of `draft`, creating the draft on first drop, and
-/// test-fire that version under `max_cost` and `max_time` where the draft's newest run went.
-async fn drop_pack(
-    c: &Connection,
-    dir: &Path,
-    draft: &str,
-    max_cost: f64,
-    max_time: &str,
-) -> Result<DropOutcome, String> {
-    if draft.is_empty() {
-        return Err(format!(
-            "{} names no draft: its name has no letters or digits",
-            dir.display()
-        ));
-    }
-    let (files, _) = crate::draft::read(dir)?;
-    if files.is_empty() {
-        return Err(format!("{} holds no pack files", dir.display()));
-    }
-    let newest = within(
-        "the draft",
-        c.client.draft_files::<crux::dto::DraftFiles>(draft, None),
-    )
-    .await;
-    let base = match newest {
-        Ok(newest) => newest.version,
-        Err(_) => {
-            let created: crux::dto::DraftCompile = within(
-                "creating the draft",
-                c.client.create_draft(
-                    draft,
-                    &format!("Dropped on Crucible Playbooks from {}", dir.display()),
-                    None,
-                ),
-            )
-            .await?;
-            created.version
-        }
-    };
-    match within("the save", c.client.save_draft(draft, &files, base)).await? {
-        crux::client::DraftSave::Saved(_) => {}
-        crux::client::DraftSave::Stale(stale) => return Err(stale.error),
-    }
-    let launches: Vec<crux::dto::PlaybookRun> = within(
-        "the draft's launches",
-        c.client.playbook_runs(None, Some(draft)),
-    )
-    .await?;
-    let Some(newest) = crate::runs_on::newest_dispatched(&launches) else {
-        return Ok(DropOutcome::Saved);
-    };
-    let newest: crux::dto::PlaybookLaunch =
-        within("the draft's newest launch", c.client.playbook_run(newest)).await?;
-    let Ok(runs_on) = crate::runs_on::RunsOn::try_from(&newest) else {
-        return Ok(DropOutcome::Saved);
-    };
-    let mut body = serde_json::json!({
-        "params": {},
-        "max_cost": max_cost,
-        "max_time": max_time,
-    });
-    runs_on.pin(&mut body);
-    let ack: crux::dto::LaunchAck =
-        within("the launch", c.client.launch_draft(draft, &body)).await?;
-    Ok(DropOutcome::Launched(ack.key))
-}
-
-/// Save a working copy as its draft's next version.
-async fn save(
-    c: &Connection,
-    drafts: Option<&Path>,
-    mut working: Working,
-) -> Result<(Working, Option<String>), String> {
-    let root = drafts.ok_or("no home directory for working copies")?;
-    let (files, digest) = crate::draft::read(&working.dir)?;
-    if files.is_empty() {
-        return Err("The working copy holds no files".to_string());
-    }
-    let saved = within(
-        "the save",
-        c.client.save_draft(&working.draft, &files, working.base),
-    )
-    .await?;
-    match saved {
-        crux::client::DraftSave::Saved(raw) => {
-            let saved: crux::dto::DraftCompile =
-                serde_json::from_value(raw).map_err(|e| format!("reading the save: {e}"))?;
-            working.saved(root, saved.version, digest)?;
-            let errors: Vec<&str> = saved
-                .diagnostics
-                .iter()
-                .map(|d| d.message.as_str())
-                .collect();
-            let note = if saved.schema_digest.is_none() || !errors.is_empty() {
-                format!(
-                    "Saved version {}, which does not compile: {}",
-                    saved.version,
-                    errors.join("; ")
-                )
-            } else {
-                format!("Saved version {}", saved.version)
-            };
-            Ok((working, Some(note)))
-        }
-        crux::client::DraftSave::Stale(stale) => Err(stale.error),
-    }
-}
-
-/// A captured file's copy on disk and its length, when it has been fetched before.
-fn file_on_disk(files: Option<&Path>, run: &str, key: &str) -> Option<(Opened, u64)> {
-    let disk = crate::captured::cache_path(files?, run, key);
-    let bytes = std::fs::read(&disk).ok()?;
-    let length = bytes.len() as u64;
-    let opened = Opened {
-        body: Ok(Body::from_bytes(bytes)),
-        run: run.to_string(),
-        key: key.to_string(),
-        disk: Some(disk),
-    };
-    Some((opened, length))
-}
-
-/// Fetch one captured file and keep a copy under `files`.
-async fn fetch_file(c: &Connection, files: Option<&Path>, run: String, key: String) -> Opened {
-    let bytes = within("the file", c.client.run_file(&run, &key)).await;
-    let path = files.map(|files| crate::captured::cache_path(files, &run, &key));
-    let disk = match (&bytes, path) {
-        (Ok(bytes), Some(path)) => path
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::write(&path, bytes))
-            .ok()
-            .map(|()| path),
-        _ => None,
-    };
-    Opened {
-        body: bytes.map(Body::from_bytes),
-        run,
-        key,
-        disk,
-    }
-}
-
 /// What a launch form starts: a registered playbook, or a draft's newest save.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
@@ -958,1009 +477,6 @@ pub fn draft_id(dir: &std::path::Path) -> Option<String> {
     (!id.is_empty()).then_some(id)
 }
 
-/// The controller fetcher. One instance lives on its own worker thread, so a slow controller
-/// query never delays local log tracking.
-struct Fetcher {
-    connector: Connector,
-    identity: Option<(String, Identity)>,
-    view: LiveView,
-    detail: Option<Arc<LiveDetail>>,
-    base: Option<Base>,
-    /// The viewer's drafts, as last listed.
-    drafts: Vec<LiveDraft>,
-    draft: Option<Arc<DraftPack>>,
-    launches: HashMap<String, CachedLaunch>,
-    packs: HashMap<String, PackFiles>,
-    runs: HashMap<String, CachedRun>,
-    finished: Vec<Finished>,
-    finished_seq: u64,
-    /// Handed to each session stream, so new lines wake the worker.
-    wake: UnboundedSender<Msg>,
-    /// Registered playbook ids, the ones a launch form can start.
-    registered: Vec<String>,
-    shareable: Vec<crux::client::Shared>,
-    catalog_at: Option<Instant>,
-}
-
-/// One launch's detail, as of the run count and status the launch list showed when it was read:
-/// a dispatch or a status change is what invalidates it.
-struct CachedLaunch {
-    runs: i64,
-    status: LaunchStatus,
-    detail: crux::dto::PlaybookLaunch,
-}
-
-/// One run's session fold and console output, keyed by run id. A settled run never changes, so
-/// switching back to it costs no API call.
-#[derive(Default)]
-struct CachedRun {
-    fold: RunFold,
-    /// Session lines a stream has folded into `fold`.
-    lines: usize,
-    log: Vec<LogLine>,
-    settled: bool,
-    source: &'static str,
-    error: Option<String>,
-    follow: Option<SessionFollow>,
-    retry_at: Option<Instant>,
-    /// A new stream replays the session and the log from their starts; what each replaces stays
-    /// on screen until its replay has caught up.
-    replay: Option<Replay<RunFold>>,
-    log_replay: Option<Replay<Vec<LogLine>>>,
-    /// Its captured files, and how many results had settled when they were listed.
-    files: Option<Result<Vec<Captured>, String>>,
-    files_at: usize,
-}
-
-/// What a restarted stream has replayed so far, held off screen.
-struct Replay<T> {
-    held: T,
-    lines: usize,
-    landed: Instant,
-}
-
-impl<T: Default> Replay<T> {
-    fn starting(now: Instant) -> Self {
-        Replay {
-            held: T::default(),
-            lines: 0,
-            landed: now,
-        }
-    }
-
-    /// Whether the replay replaces `shown` lines yet: it has reached them, its stream finished,
-    /// or it went quiet short of them. A stream that failed part way replaces nothing.
-    fn caught_up(&self, shown: usize, ended: Option<bool>, now: Instant) -> bool {
-        if self.lines == 0 {
-            return false;
-        }
-        self.lines >= shown
-            || match ended {
-                Some(finished) => finished,
-                None => now.saturating_duration_since(self.landed) >= REPLAY_QUIET,
-            }
-    }
-}
-
-impl CachedRun {
-    fn restart(&mut self, now: Instant) {
-        self.replay = Some(Replay::starting(now));
-        self.log_replay = Some(Replay::starting(now));
-    }
-
-    /// Fold what a stream delivered. `ended` is whether it finished cleanly, once it has ended.
-    fn take(&mut self, lines: &[String], logs: &[String], ended: Option<bool>, now: Instant) {
-        match self.replay.take() {
-            Some(mut replay) => {
-                for line in lines {
-                    replay.held.apply_line(line);
-                }
-                if !lines.is_empty() {
-                    replay.lines += lines.len();
-                    replay.landed = now;
-                }
-                if replay.caught_up(self.lines, ended, now) {
-                    self.fold = replay.held;
-                    self.lines = replay.lines;
-                } else {
-                    self.replay = Some(replay);
-                }
-            }
-            None => {
-                for line in lines {
-                    self.fold.apply_line(line);
-                }
-                self.lines += lines.len();
-            }
-        }
-        let parsed = logs.iter().map(|raw| LogLine::parse(raw));
-        match self.log_replay.take() {
-            Some(mut replay) => {
-                replay.held.extend(parsed);
-                trim_log(&mut replay.held);
-                if !logs.is_empty() {
-                    replay.lines += logs.len();
-                    replay.landed = now;
-                }
-                if replay.caught_up(self.log.len(), ended, now) {
-                    self.log = replay.held;
-                } else {
-                    self.log_replay = Some(replay);
-                }
-            }
-            None => {
-                self.log.extend(parsed);
-                trim_log(&mut self.log);
-            }
-        }
-    }
-}
-
-fn trim_log(log: &mut Vec<LogLine>) {
-    let excess = log.len().saturating_sub(LOG_LINES);
-    log.drain(..excess);
-}
-
-/// A running run's session and pod log, streamed by [`crux::Client::follow_run`] on its own
-/// thread and collected for the worker to fold. Dropping it ends the stream.
-struct SessionFollow {
-    lines: Arc<Mutex<Vec<String>>>,
-    logs: Arc<Mutex<Vec<String>>>,
-    ended: Arc<Mutex<Option<Result<(), String>>>>,
-    stop: Option<oneshot::Sender<()>>,
-}
-
-impl SessionFollow {
-    /// Start the stream as a task on the connection's runtime.
-    fn spawn(connection: &Connection, run_id: &str, wake: UnboundedSender<Msg>) -> Self {
-        let lines = Arc::new(Mutex::new(Vec::new()));
-        let logs = Arc::new(Mutex::new(Vec::new()));
-        let ended = Arc::new(Mutex::new(None));
-        let (stop, stopped) = oneshot::channel::<()>();
-        let (sink, outcome) = (Arc::clone(&lines), Arc::clone(&ended));
-        let log_sink = Arc::clone(&logs);
-        let log_wake = wake.clone();
-        let (client, run_id) = (connection.client.clone(), run_id.to_string());
-        connection.spawn(async move {
-            let mut collect = move |line: &str| {
-                if let Ok(mut lines) = sink.lock() {
-                    if lines.is_empty() {
-                        let _ = wake.send(Msg::Streamed);
-                    }
-                    lines.push(line.to_string());
-                }
-                Ok(())
-            };
-            let mut collect_log = move |line: &str| {
-                if let Ok(mut logs) = log_sink.lock() {
-                    if logs.is_empty() {
-                        let _ = log_wake.send(Msg::Streamed);
-                    }
-                    logs.push(line.to_string());
-                }
-                Ok(())
-            };
-            let result = tokio::select! {
-                followed = client.follow_run(&run_id, &mut collect, &mut collect_log) => {
-                    followed.map_err(|error| format!("{error:#}"))
-                }
-                _ = stopped => Ok(()),
-            };
-            if let Ok(mut ended) = outcome.lock() {
-                *ended = Some(result);
-            }
-        });
-        SessionFollow {
-            lines,
-            logs,
-            ended,
-            stop: Some(stop),
-        }
-    }
-
-    fn drain(&self) -> Vec<String> {
-        self.lines
-            .lock()
-            .map(|mut lines| std::mem::take(&mut *lines))
-            .unwrap_or_default()
-    }
-
-    fn drain_logs(&self) -> Vec<String> {
-        self.logs
-            .lock()
-            .map(|mut logs| std::mem::take(&mut *logs))
-            .unwrap_or_default()
-    }
-
-    fn ended(&self) -> Option<Result<(), String>> {
-        self.ended.lock().ok().and_then(|ended| ended.clone())
-    }
-}
-
-impl Drop for SessionFollow {
-    fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-    }
-}
-
-impl Fetcher {
-    fn new(connector: Connector, wake: UnboundedSender<Msg>) -> Self {
-        Fetcher {
-            connector,
-            identity: None,
-            view: LiveView::Loading,
-            detail: None,
-            base: None,
-            drafts: Vec::new(),
-            draft: None,
-            launches: HashMap::new(),
-            packs: HashMap::new(),
-            runs: HashMap::new(),
-            finished: Vec::new(),
-            finished_seq: 0,
-            wake,
-            registered: Vec::new(),
-            shareable: Vec::new(),
-            catalog_at: None,
-        }
-    }
-
-    /// Re-reads the playbook and draft catalogs at most once a minute.
-    async fn refresh_catalog(&mut self) -> bool {
-        if self
-            .catalog_at
-            .is_some_and(|at| at.elapsed() < Duration::from_secs(60))
-        {
-            return false;
-        }
-        self.catalog_at = Some(Instant::now());
-        let Ok(connection) = self.connection().await else {
-            return false;
-        };
-        let Ok(playbooks) = within(
-            "the playbooks",
-            connection.client.playbooks::<Vec<crux::dto::Playbook>>(),
-        )
-        .await
-        else {
-            return false;
-        };
-        let mut ids: Vec<String> = playbooks.into_iter().map(|p| p.id).collect();
-        ids.sort();
-        #[derive(serde::Deserialize)]
-        struct Draft {
-            id: String,
-        }
-        let drafts = within(
-            "the drafts",
-            connection.client.get::<Vec<Draft>>("/api/playbook-drafts"),
-        )
-        .await;
-        let mut shareable: Vec<_> = ids
-            .iter()
-            .cloned()
-            .map(crux::client::Shared::Playbook)
-            .collect();
-        if let Ok(mut drafts) = drafts {
-            drafts.sort_by(|a, b| a.id.cmp(&b.id));
-            shareable.extend(
-                drafts
-                    .into_iter()
-                    .map(|d| crux::client::Shared::Draft(d.id)),
-            );
-        }
-        let changed = ids != self.registered || shareable != self.shareable;
-        self.registered = ids;
-        self.shareable = shareable;
-        changed
-    }
-
-    /// Records each launch the new list shows stopped that the old list showed running.
-    fn note_finished(&mut self, next: &[LivePlaybook]) {
-        let was_running: HashSet<&str> = self
-            .view
-            .launches()
-            .iter()
-            .filter(|launch| launch.status.is_running())
-            .map(|launch| launch.key.as_str())
-            .collect();
-        for launch in next {
-            if !launch.status.is_running() && was_running.contains(launch.key.as_str()) {
-                self.finished_seq += 1;
-                self.finished.push(Finished {
-                    seq: self.finished_seq,
-                    key: launch.key.clone(),
-                    playbook: launch.id.clone(),
-                    status: launch.status.clone(),
-                    by: launch.by.clone(),
-                    why: launch.why.clone(),
-                    cost: launch.cost,
-                });
-            }
-        }
-        let excess = self.finished.len().saturating_sub(FINISHED);
-        self.finished.drain(..excess);
-    }
-
-    fn view(&self) -> &LiveView {
-        &self.view
-    }
-
-    /// Read launch `key`'s run as the comparison base, once: a stopped run never changes, so a
-    /// base already read stays. A launch the list does not show yet is tried again later.
-    async fn refresh_base(&mut self, key: Option<&str>) -> bool {
-        let Some(key) = key else {
-            let changed = self.base.is_some();
-            self.base = None;
-            return changed;
-        };
-        if self
-            .base
-            .as_ref()
-            .is_some_and(|base| base.key == key && base.error.is_none())
-        {
-            return false;
-        }
-        let Some(launch) = self.view.launch(key).cloned() else {
-            return false;
-        };
-        let run_id = self
-            .launch_detail(&launch)
-            .await
-            .and_then(|record| record.runs.first().map(|run| run.run_id.clone()));
-        let connection = self.connection().await.ok();
-        let next = match (&run_id, &connection) {
-            (Some(run_id), Some(connection)) => {
-                let run = self.runs.entry(run_id.clone()).or_default();
-                if !run.settled {
-                    let session =
-                        within("the session", connection.client.run_session(run_id)).await;
-                    settle(run, connection, run_id, session).await;
-                }
-                Base {
-                    key: key.to_string(),
-                    fold: run.fold.clone(),
-                    error: run.error.clone(),
-                }
-            }
-            (None, _) => Base {
-                key: key.to_string(),
-                fold: RunFold::default(),
-                error: Some("that launch never dispatched a run".to_string()),
-            },
-            (Some(_), None) => return false,
-        };
-        let changed = self.base.as_ref() != Some(&next);
-        self.base = Some(next);
-        changed
-    }
-
-    fn any_running(&self) -> bool {
-        self.view
-            .launches()
-            .iter()
-            .any(|launch| launch.status.is_running())
-    }
-
-    /// Whether the selected launch's run can still change: it is running, or it stopped and its
-    /// stored session has not been read yet.
-    fn selected_live(&self, selected: Option<&str>) -> bool {
-        let Some(launch) = self.launch(selected) else {
-            return false;
-        };
-        launch.status.is_running()
-            || self
-                .launches
-                .get(&launch.key)
-                .and_then(|cached| cached.detail.runs.first())
-                .and_then(|newest| self.runs.get(&newest.run_id))
-                .is_some_and(|run| !run.settled && run.error.is_none())
-    }
-
-    fn launch(&self, selected: Option<&str>) -> Option<&LivePlaybook> {
-        selected.and_then(|key| self.view.launch(key))
-    }
-
-    /// A failed refresh keeps the last list it had and says so; with no list yet, the failure
-    /// is all there is to show.
-    fn unavailable(&mut self, error: Down) -> bool {
-        match &mut self.view {
-            LiveView::Ready { stale, .. } => {
-                let said = format!("Refresh failed; showing the last list. {}", error.why());
-                let changed = stale.as_deref() != Some(said.as_str());
-                *stale = Some(said);
-                changed
-            }
-            view => {
-                *view = LiveView::Unavailable(error);
-                self.detail = None;
-                true
-            }
-        }
-    }
-
-    async fn connection(&self) -> Result<Connection, String> {
-        self.connector.connect().await
-    }
-
-    async fn refresh_list(&mut self) -> Result<bool, Down> {
-        if self.identity.is_none() {
-            let connection = self.connection().await?;
-            let whoami = reaching("whoami", connection.client.whoami()).await?;
-            let endpoint = connection.client.base().to_string();
-            self.identity = Some((endpoint, identity(whoami)));
-        }
-        let (endpoint, identity) = self.identity.clone().unwrap_or_default();
-
-        let connection = self.connection().await?;
-        let (launches, drafts) = tokio::join!(
-            reaching(
-                "the launch list",
-                connection.client.playbook_runs(None, None),
-            ),
-            within("the drafts", connection.client.playbook_drafts()),
-        );
-        let launches: Vec<crux::dto::PlaybookRun> = launches?;
-        if let Ok(drafts) = drafts {
-            self.drafts = owned(drafts, &identity);
-        }
-        let zone = TimeZone::system();
-        let mut launches: Vec<LivePlaybook> = launches
-            .into_iter()
-            .map(|launch| {
-                let agent = agent_label(&launch);
-                LivePlaybook {
-                    id: launch.playbook,
-                    key: launch.key,
-                    status: LaunchStatus::parse(&launch.status, launch.parked_reason.as_deref()),
-                    cost: launch.cost_usd,
-                    cap: launch.max_cost,
-                    by: launch.created_by.unwrap_or_default(),
-                    agent,
-                    why: launch
-                        .parked_reason
-                        .or(launch.secrets_refusal)
-                        .filter(|why| !why.is_empty()),
-                    created: clock(&launch.created_at, &zone),
-                    landed: epoch(&launch.created_at).unwrap_or_default(),
-                    landed_at: landed_label(&launch.created_at, &zone),
-                    origin: launch.origin,
-                    max_time: launch.max_time,
-                    runs: launch.runs,
-                    description: launch.description.filter(|text| !text.is_empty()),
-                }
-            })
-            .collect();
-        launches.sort_by_key(|launch| std::cmp::Reverse(launch.landed));
-
-        self.note_finished(&launches);
-        let now = unix_now();
-        let drafts = unlaunched(&self.drafts, &launches);
-        let next = LiveView::Ready {
-            endpoint,
-            identity,
-            now: now - now % 60,
-            launches,
-            drafts,
-            stale: self
-                .connector
-                .offline()
-                .then(|| "Offline; showing what the controller last answered".to_string()),
-        };
-        let changed = next != self.view;
-        self.view = next;
-        Ok(changed)
-    }
-
-    /// Read `shown`'s pack, once: a draft save never changes. A read that failed is tried again.
-    async fn refresh_draft(&mut self, shown: Option<&(String, i64)>) -> bool {
-        let Some((draft, version)) = shown else {
-            return self.draft.take().is_some();
-        };
-        if self.draft.as_ref().is_some_and(|read| {
-            read.draft == *draft && read.version == *version && read.pack.is_ok()
-        }) {
-            return false;
-        }
-        let next = DraftPack {
-            draft: draft.clone(),
-            version: *version,
-            pack: self.pack(draft, Some(*version)).await,
-        };
-        let changed = self.draft.as_deref() != Some(&next);
-        self.draft = Some(Arc::new(next));
-        changed
-    }
-
-    /// The launch's own record, re-read when its run count or status moved.
-    async fn launch_detail(&mut self, launch: &LivePlaybook) -> Option<crux::dto::PlaybookLaunch> {
-        if let Some(cached) = self.launches.get(&launch.key)
-            && cached.runs == launch.runs
-            && cached.status == launch.status
-        {
-            return Some(cached.detail.clone());
-        }
-        let connection = self.connection().await.ok()?;
-        let detail: crux::dto::PlaybookLaunch =
-            within("the launch", connection.client.playbook_run(&launch.key))
-                .await
-                .ok()?;
-        self.launches.insert(
-            launch.key.clone(),
-            CachedLaunch {
-                runs: launch.runs,
-                status: launch.status.clone(),
-                detail: detail.clone(),
-            },
-        );
-        Some(detail)
-    }
-
-    /// The pack a launch ran: the draft version it was launched from, or the registered pin. A
-    /// draft version never changes; a pin is read once per session.
-    async fn pack(
-        &mut self,
-        playbook: &str,
-        draft_version: Option<i64>,
-    ) -> Result<PackFiles, String> {
-        let key = match draft_version {
-            Some(version) => format!("{playbook}@draft-{version}"),
-            None => format!("{playbook}@pin"),
-        };
-        if let Some(pack) = self.packs.get(&key) {
-            return Ok(pack.clone());
-        }
-        let connection = self.connection().await?;
-        let mut pack = match draft_version {
-            Some(version) => {
-                let draft: crux::dto::DraftFiles = within(
-                    "the draft",
-                    connection.client.draft_files(playbook, Some(version)),
-                )
-                .await?;
-                let by = draft
-                    .saved_by
-                    .map(|by| format!(", saved by {by}"))
-                    .unwrap_or_default();
-                PackFiles::new(
-                    format!("draft {playbook} v{version}{by}"),
-                    draft
-                        .files
-                        .into_iter()
-                        .map(|(path, text)| (path, Some(text))),
-                )
-            }
-            None => {
-                let registered: crux::dto::PlaybookDetail =
-                    within("the playbook", connection.client.playbook(playbook)).await?;
-                let mut pack = PackFiles::new(
-                    pin_label(&registered.playbook),
-                    registered
-                        .files
-                        .into_iter()
-                        .map(|(path, text)| (path, Some(text))),
-                );
-                if let crux::dto::PlaybookSource::Git { repo, path, .. } =
-                    &registered.playbook.source
-                {
-                    pack.on_git(repo, &registered.playbook.rev, path);
-                }
-                pack
-            }
-        };
-        if let Some(dir) = crate::pack::cache_dir(&key) {
-            let copied = crate::net::blocking(move || {
-                let _ = pack.copy_to(&dir);
-                pack
-            });
-            pack = copied
-                .await
-                .ok_or_else(|| "copying the pack stopped early".to_string())?;
-        }
-        self.packs.insert(key, pack.clone());
-        Ok(pack)
-    }
-
-    /// Rebuild the detail pane for the selected launch. A running run streams its session and
-    /// re-reads its console; a stopped one reads its stored session once and is then settled.
-    /// `poll` also re-reads the console; a streamed batch only folds the new session lines.
-    async fn refresh_detail(&mut self, selected: Option<&str>, poll: bool) -> bool {
-        let Some(launch) = self.launch(selected).cloned() else {
-            let changed = self.detail.is_some();
-            self.detail = None;
-            return changed;
-        };
-        let running = launch.status.is_running();
-        let record = match (poll, &self.detail) {
-            (false, Some(detail)) if detail.key == launch.key => detail.launch.clone(),
-            _ => self.launch_detail(&launch).await,
-        };
-        let run_id = record
-            .as_ref()
-            .and_then(|record| record.runs.first())
-            .map(|run| run.run_id.clone());
-        let pack = match (poll, &self.detail) {
-            (false, Some(detail)) if detail.key == launch.key => detail.pack.clone(),
-            _ => {
-                let version = record
-                    .as_ref()
-                    .and_then(|record| record.launch.draft_version);
-                self.pack(&launch.id, version).await
-            }
-        };
-        for (id, run) in &mut self.runs {
-            if Some(id) != run_id.as_ref() {
-                run.follow = None;
-            }
-        }
-
-        let Ok(connection) = self.connection().await else {
-            return false;
-        };
-        let connection = &connection;
-        let wake = self.wake.clone();
-        let (fold, log, source, error, streaming, files) = match &run_id {
-            Some(run_id) => {
-                let run = self.runs.entry(run_id.clone()).or_default();
-                let mut read_files = false;
-                if running {
-                    follow_session(run, connection, run_id, wake);
-                    if poll
-                        && run.log_replay.is_some()
-                        && let Ok(log) = console(connection, run_id).await
-                        && log.len() >= run.log.len().min(1)
-                    {
-                        run.log = log;
-                    }
-                } else if !run.settled {
-                    run.follow = None;
-                    let client = &connection.client;
-                    let (session, log, files) = tokio::join!(
-                        within("the session", client.run_session(run_id)),
-                        within("the console", client.run_log(run_id)),
-                        within("the captured files", client.run_files(run_id)),
-                    );
-                    settle(run, connection, run_id, session).await;
-                    if let Ok(log) = log.map(typed_log)
-                        && log.len() >= run.log.len().min(1)
-                    {
-                        run.log = log;
-                    }
-                    run.files = Some(files.map(captured));
-                    run.files_at = settled_results(&run.fold);
-                    read_files = true;
-                }
-                let results = settled_results(&run.fold);
-                let retry = poll && matches!(run.files, Some(Err(_)));
-                if !read_files && (run.files.is_none() || run.files_at != results || retry) {
-                    run.files = Some(captured_files(connection, run_id).await);
-                    run.files_at = results;
-                }
-                (
-                    run.fold.clone(),
-                    run.log.clone(),
-                    run.source,
-                    run.error.clone(),
-                    run.follow.is_some(),
-                    run.files.clone(),
-                )
-            }
-            None => (RunFold::default(), Vec::new(), "", None, false, None),
-        };
-        let mut next = build_detail(&launch, fold, log);
-        next.source = source;
-        next.error = error;
-        next.launch = record;
-        next.pack = pack;
-        next.streaming = streaming;
-        next.run_id = run_id;
-        next.files = files;
-        let changed = self.detail.as_deref() != Some(&next);
-        self.detail = Some(Arc::new(next));
-        changed
-    }
-}
-
-/// Keep a session stream on a running run and fold what it has delivered. A stream that ended
-/// cleanly is started again on the next read; one that failed waits [`FOLLOW_RETRY`].
-fn follow_session(
-    run: &mut CachedRun,
-    connection: &Connection,
-    run_id: &str,
-    wake: UnboundedSender<Msg>,
-) {
-    if let Some(follow) = &run.follow {
-        let ended = follow.ended();
-        let (lines, logs) = (follow.drain(), follow.drain_logs());
-        let finished = ended.as_ref().map(Result::is_ok);
-        run.take(&lines, &logs, finished, Instant::now());
-        match ended {
-            None => return,
-            Some(Ok(())) => run.retry_at = Some(Instant::now() + FOLLOW_REST),
-            Some(Err(error)) => {
-                run.error = Some(error);
-                run.retry_at = Some(Instant::now() + FOLLOW_RETRY);
-            }
-        }
-        run.follow = None;
-        return;
-    }
-    if run.retry_at.is_some_and(|at| Instant::now() < at) {
-        return;
-    }
-    run.restart(Instant::now());
-    run.source = "session";
-    run.error = None;
-    run.follow = Some(SessionFollow::spawn(connection, run_id, wake));
-}
-
-/// Fold a stopped run once from its stored `session`, or from the graph the controller keeps
-/// when no session was stored.
-async fn settle(
-    run: &mut CachedRun,
-    connection: &Connection,
-    run_id: &str,
-    session: Result<String, String>,
-) {
-    match session {
-        Ok(text) => {
-            let mut fold = RunFold::default();
-            for line in text.lines() {
-                fold.apply_line(line);
-            }
-            run.fold = fold;
-            run.source = "session";
-            run.settled = true;
-            run.error = None;
-        }
-        Err(session) => match within("the graph", connection.client.graph::<Value>(run_id)).await {
-            Ok(graph) => {
-                run.fold = graph_fold(&graph);
-                run.source = "graph";
-                run.settled = true;
-                run.error = None;
-            }
-            Err(_) => run.error = Some(session),
-        },
-    }
-}
-
-/// Results settled so far, tasks and fan-out instances: each can add captured files.
-fn settled_results(fold: &RunFold) -> usize {
-    fold.tasks
-        .iter()
-        .map(|task| {
-            usize::from(task.result.is_some())
-                + task
-                    .instances
-                    .iter()
-                    .filter(|instance| instance.result.is_some())
-                    .count()
-        })
-        .sum()
-}
-
-async fn captured_files(connection: &Connection, run_id: &str) -> Result<Vec<Captured>, String> {
-    within("the captured files", connection.client.run_files(run_id))
-        .await
-        .map(captured)
-}
-
-fn captured(listing: crux::dto::RunFiles) -> Vec<Captured> {
-    listing.files.into_iter().map(Captured::from).collect()
-}
-
-/// A run's graph read as the session it was built from: its plan, then each result. The
-/// controller writes absent numbers as `null`, which the session's wire types do not take.
-fn graph_fold(graph: &Value) -> RunFold {
-    let mut fold = RunFold::default();
-    if graph
-        .get("tasks")
-        .and_then(Value::as_array)
-        .is_none_or(Vec::is_empty)
-    {
-        return fold;
-    }
-    let mut plan = serde_json::json!({
-        "kind": "plan_admitted",
-        "plan_version": graph.get("plan_version").and_then(Value::as_u64).unwrap_or(1),
-        "budget_usd": 0.0,
-        "tasks": graph.get("tasks").cloned().unwrap_or(Value::Array(Vec::new())),
-    });
-    strip_nulls(&mut plan);
-    if let Ok(event) = serde_json::from_value::<SessionEvent>(plan) {
-        fold.apply(event);
-    }
-    for result in graph
-        .get("results")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let mut result = result.clone();
-        strip_nulls(&mut result);
-        if let Value::Object(fields) = &mut result {
-            fields.insert("kind".into(), Value::String("task_result".into()));
-        }
-        if let Ok(event) = serde_json::from_value::<SessionEvent>(result) {
-            fold.apply(event);
-        }
-    }
-    fold
-}
-
-fn strip_nulls(value: &mut Value) {
-    match value {
-        Value::Object(fields) => {
-            fields.retain(|_, field| !field.is_null());
-            fields.values_mut().for_each(strip_nulls);
-        }
-        Value::Array(items) => items.iter_mut().for_each(strip_nulls),
-        _ => {}
-    }
-}
-
-/// `repo@rev path`, or the draft a registered playbook was published from.
-fn pin_label(playbook: &crux::dto::Playbook) -> String {
-    let rev: String = playbook.rev.chars().take(12).collect();
-    match &playbook.source {
-        crux::dto::PlaybookSource::Git { repo, path, .. } => {
-            let path = if path.is_empty() {
-                String::new()
-            } else {
-                format!(" {path}")
-            };
-            format!("{repo}@{rev}{path}")
-        }
-        crux::dto::PlaybookSource::Draft { draft, version } => {
-            format!("published from draft {draft} v{version}")
-        }
-    }
-}
-
-fn identity(whoami: crux::dto::Whoami) -> Identity {
-    let user = whoami.user.unwrap_or_default();
-    let owners = (!user.is_empty())
-        .then(|| format!("user:{user}"))
-        .into_iter()
-        .chain(whoami.teams.iter().map(|t| format!("team:{}", t.team)))
-        .collect();
-    Identity {
-        user,
-        role: whoami.role,
-        owners,
-        autoresearch: whoami.entitlements.iter().any(|e| e == "autoresearch"),
-    }
-}
-
-/// The listed drafts `identity` owns, as themself or as a team, that are not retired, newest
-/// save first.
-fn owned(drafts: Vec<crux::dto::PlaybookDraft>, identity: &Identity) -> Vec<LiveDraft> {
-    let mut drafts: Vec<LiveDraft> = drafts
-        .into_iter()
-        .filter(|draft| draft.retired_at.is_none())
-        .filter(|draft| {
-            identity
-                .owners
-                .iter()
-                .any(|owner| owner.eq_ignore_ascii_case(&draft.owner))
-        })
-        .map(|draft| LiveDraft {
-            by: draft.created_by.unwrap_or_else(|| draft.owner.clone()),
-            id: draft.id,
-            description: Some(draft.description).filter(|text| !text.is_empty()),
-            owner: draft.owner,
-            version: draft.latest_version,
-            compiles: draft.compiles,
-            saved: epoch(&draft.updated_at).unwrap_or_default(),
-        })
-        .collect();
-    drafts.sort_by_key(|draft| std::cmp::Reverse(draft.saved));
-    drafts
-}
-
-/// The drafts none of `launches` ran.
-fn unlaunched(drafts: &[LiveDraft], launches: &[LivePlaybook]) -> Vec<LiveDraft> {
-    let launched: HashSet<&str> = launches.iter().map(|launch| launch.id.as_str()).collect();
-    drafts
-        .iter()
-        .filter(|draft| !launched.contains(draft.id.as_str()))
-        .cloned()
-        .collect()
-}
-
-fn agent_label(launch: &crux::dto::PlaybookRun) -> String {
-    match (
-        launch.agent_provider.as_deref(),
-        launch.agent_model.as_deref(),
-    ) {
-        (Some(provider), Some(model)) => format!("{provider} · {model}"),
-        (None, Some(model)) => model.to_string(),
-        (Some(provider), None) => provider.to_string(),
-        (None, None) => String::new(),
-    }
-}
-
-/// The run's whole console output as the controller serves it, typed.
-async fn console(connection: &Connection, run_id: &str) -> Result<Vec<LogLine>, String> {
-    within("the console", connection.client.run_log(run_id))
-        .await
-        .map(typed_log)
-}
-
-fn typed_log(log: crux::dto::RunLog) -> Vec<LogLine> {
-    log.text
-        .map(|text| text.lines().map(LogLine::parse).collect())
-        .unwrap_or_default()
-}
-
-fn build_detail(launch: &LivePlaybook, fold: RunFold, log: Vec<LogLine>) -> LiveDetail {
-    let settled = !fold.tasks.is_empty() && fold.required_settled();
-    let verdict = match launch.status {
-        LaunchStatus::Running => Verdict::Running,
-        LaunchStatus::Done if !settled => Verdict::Unfinished,
-        LaunchStatus::Done if fold.required_passed() => Verdict::Valid,
-        LaunchStatus::Done => Verdict::Invalid,
-        LaunchStatus::Error => Verdict::Error,
-        LaunchStatus::Cancelled => Verdict::Cancelled,
-        LaunchStatus::New => Verdict::Unfinished,
-        LaunchStatus::Other(_) if settled && fold.required_passed() => Verdict::Valid,
-        LaunchStatus::Other(_) => Verdict::Unfinished,
-    };
-    let spent = if fold.tasks.iter().all(|task| task.result.is_none()) {
-        launch.cost.unwrap_or(0.0)
-    } else {
-        fold.spent()
-    };
-    LiveDetail {
-        streaming: false,
-        key: launch.key.clone(),
-        spent,
-        verdict,
-        passed: fold.passed(),
-        failed: fold.failed(),
-        fold,
-        log,
-        source: "",
-        error: None,
-        launch: None,
-        pack: Ok(PackFiles::default()),
-        run_id: None,
-        files: None,
-    }
-}
-
-/// `18:00`, the time of day of an RFC 3339 stamp in `zone`; empty when it does not parse.
-fn clock(stamp: &str, zone: &TimeZone) -> String {
-    stamp
-        .parse::<Timestamp>()
-        .map(|at| at.to_zoned(zone.clone()).strftime("%H:%M").to_string())
-        .unwrap_or_default()
-}
-
-fn unix_now() -> i64 {
-    Timestamp::now().as_second()
-}
-
-/// Whole Unix seconds from an RFC 3339 stamp.
-fn epoch(stamp: &str) -> Option<i64> {
-    stamp.parse::<Timestamp>().ok().map(|at| at.as_second())
-}
-
-/// `Nov 6 18:00` in `zone`; the raw stamp when it does not parse.
-fn landed_label(stamp: &str, zone: &TimeZone) -> String {
-    stamp.parse::<Timestamp>().map_or_else(
-        |_| stamp.to_string(),
-        |at| {
-            at.to_zoned(zone.clone())
-                .strftime("%b %-d %H:%M")
-                .to_string()
-        },
-    )
-}
-
 /// What the live worker last read and what the window's actions last came to.
 #[derive(Clone, Default)]
 pub struct Snapshot {
@@ -1983,377 +499,42 @@ pub struct Snapshot {
     /// The captured file last fetched for the Files pane.
     pub file: Option<Opened>,
     pub revisions: Option<Arc<Revisions>>,
-}
-
-/// What one pass of the poll loop read.
-struct Polled {
-    view: Arc<LiveView>,
-    detail: Option<Arc<LiveDetail>>,
-    base: Option<Base>,
-    draft: Option<Arc<DraftPack>>,
-    finished: Vec<Finished>,
-    registered: Vec<String>,
-    shareable: Vec<crux::client::Shared>,
-}
-
-/// The UI-side handle to the live worker. Dropping it ends the poll loop and its streams.
-///
-/// ```text
-/// window ── select, compare ──▶ poll loop ──── list, detail ──▶ ┐
-///        ── launch, save, … ──▶ a task each ── its reply ─────▶ ┴ snapshot ──▶ window
-/// ```
-pub struct Client {
-    tx: UnboundedSender<Msg>,
-    shared: Arc<Mutex<Shared>>,
-    connector: Connector,
-    dirs: Dirs,
-    /// The poll loop.
-    _poll: Option<Task>,
-}
-
-/// Where the worker's actions keep files.
-#[derive(Clone)]
-struct Dirs {
-    /// Draft working copies.
-    drafts: Option<PathBuf>,
-    /// Copies of fetched captured files.
-    files: Option<PathBuf>,
-}
-
-struct Shared {
-    snapshot: Snapshot,
-    version: u64,
-    waker: Option<Waker>,
-    /// Replies answered so far; each takes the next number as its `seq`.
-    replies: u64,
-}
-
-impl Shared {
-    fn polled(&mut self, polled: Polled) {
-        self.snapshot.view = polled.view;
-        self.snapshot.detail = polled.detail;
-        self.snapshot.base = polled.base;
-        self.snapshot.draft = polled.draft;
-        self.snapshot.finished = polled.finished;
-        self.snapshot.registered = polled.registered;
-        self.snapshot.shareable = polled.shareable;
-    }
-
-    fn answered(&mut self, reply: Reply) {
-        self.replies += 1;
-        let seq = self.replies;
-        match reply {
-            Reply::Prepared { target, result } => {
-                self.snapshot.prepared = Some(Prepared {
-                    seq,
-                    target,
-                    result,
-                });
-            }
-            Reply::Launched { playbook, result } => {
-                self.snapshot.launched = Some(Launched {
-                    seq,
-                    playbook,
-                    result,
-                });
-            }
-            Reply::Reran { run, from, result } => {
-                self.snapshot.reran = Some(Reran {
-                    seq,
-                    run,
-                    from,
-                    result,
-                });
-            }
-            Reply::Synced { draft, result } => {
-                self.snapshot.synced = Some(Synced { seq, draft, result });
-            }
-            Reply::Dropped { dir, draft, result } => {
-                self.snapshot.dropped = Some(Dropped {
-                    seq,
-                    dir,
-                    draft,
-                    result,
-                });
-            }
-            Reply::File(opened) => self.snapshot.file = Some(opened),
-            Reply::Revisions(revisions) => self.snapshot.revisions = Some(Arc::new(revisions)),
-        }
-    }
-}
-
-impl Client {
-    pub fn spawn(connector: Connector, drafts: Option<PathBuf>) -> Self {
-        let dirs = Dirs {
-            drafts,
-            files: crate::captured::cache_dir(),
-        };
-        Client::spawn_with(connector, dirs)
-    }
-
-    /// Keep working copies under `drafts` from the next pull or save on.
-    pub fn set_drafts(&mut self, drafts: Option<PathBuf>) {
-        self.dirs.drafts = drafts;
-    }
-
-    fn spawn_with(connector: Connector, dirs: Dirs) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let shared = Arc::new(Mutex::new(Shared {
-            snapshot: Snapshot::default(),
-            version: 0,
-            waker: None,
-            replies: 0,
-        }));
-        let poll = match connector.runtime() {
-            Ok(runtime) => Some(Task::spawn(
-                &runtime,
-                run_client(connector.clone(), rx, tx.clone(), Arc::clone(&shared)),
-            )),
-            Err(why) => {
-                publish(&shared, |shared| {
-                    shared.snapshot.view = Arc::new(LiveView::Unavailable(Down::Unreached(why)));
-                });
-                None
-            }
-        };
-        Client {
-            tx,
-            shared,
-            connector,
-            dirs,
-            _poll: poll,
-        }
-    }
-
-    pub fn set_waker(&self, waker: Waker) {
-        if let Ok(mut shared) = self.shared.lock() {
-            shared.waker = Some(waker);
-        }
-    }
-
-    /// Run `action` as a task of its own and publish its reply when it lands.
-    fn start(&self, action: Action) {
-        let runtime = match self.connector.runtime() {
-            Ok(runtime) => runtime,
-            Err(why) => {
-                let reply = action.failed(why, &self.dirs);
-                publish(&self.shared, |shared| shared.answered(reply));
-                return;
-            }
-        };
-        let (connector, dirs) = (self.connector.clone(), self.dirs.clone());
-        let (shared, tx) = (Arc::clone(&self.shared), self.tx.clone());
-        runtime.spawn(async move {
-            let launches = action.launches();
-            let reply = match connector.connect().await {
-                Ok(connection) => action.run(connection, &dirs).await,
-                Err(why) => action.failed(why, &dirs),
-            };
-            publish(&shared, |shared| shared.answered(reply));
-            if launches {
-                let _ = tx.send(Msg::Refresh);
-            }
-        });
-    }
-
-    /// Read `target`'s params schema and the caps, for a launch form.
-    pub fn prepare(&self, target: Target) {
-        self.start(Action::Prepare(target));
-    }
-
-    /// Launch `target`; the result comes back in a snapshot.
-    pub fn launch(&self, target: Target, body: Value) {
-        self.start(Action::Launch { target, body });
-    }
-
-    pub fn drop_pack(&self, dir: PathBuf, max_cost: f64, max_time: String) {
-        self.start(Action::Drop {
-            dir,
-            max_cost,
-            max_time,
-        });
-    }
-
-    /// Ask what rerunning `run` from `from` would reuse.
-    pub fn preview_rerun(&self, run: &str, from: Vec<String>) {
-        self.start(Action::Rerun {
-            run: run.to_string(),
-            from,
-        });
-    }
-
-    /// Pull `draft` into its working copy, creating it from `template` when it is missing.
-    pub fn pull(&self, draft: &str, template: Option<&str>) {
-        self.start(Action::Pull {
-            draft: draft.to_string(),
-            template: template.map(ToString::to_string),
-        });
-    }
-
-    /// Save `working` as its draft's next version.
-    pub fn save(&self, working: Working) {
-        self.start(Action::Save(working));
-    }
-
-    /// Connect again with whatever crux's config now holds.
-    pub fn reconnect(&self) {
-        let _ = self.tx.send(Msg::Reconnect);
-    }
-
-    /// Which live playbook's graph to keep current; `None` stops fetching graphs.
-    pub fn select(&self, playbook: Option<&str>) {
-        let _ = self.tx.send(Msg::Select(playbook.map(ToString::to_string)));
-    }
-
-    pub fn compare(&self, base: Option<&str>) {
-        let _ = self.tx.send(Msg::Compare(base.map(ToString::to_string)));
-    }
-
-    /// Which draft save's pack to read; `None` stops.
-    pub fn draft(&self, shown: Option<(String, i64)>) {
-        let _ = self.tx.send(Msg::Draft(shown));
-    }
-
-    /// Fetch the file `run` captured under `key`. Its copy on disk is used only when the run
-    /// has `settled` and the copy is the `size` the listing gives.
-    pub fn file(&self, run: &str, key: &str, size: u64, settled: bool) {
-        self.start(Action::File {
-            run: run.to_string(),
-            key: key.to_string(),
-            size,
-            settled,
-        });
-    }
-
-    pub fn revisions(&self, wanted: Wanted) {
-        self.start(Action::Revisions(wanted));
-    }
-
-    pub fn take(&self, seen: u64) -> Option<(u64, Snapshot)> {
-        let shared = self.shared.lock().ok()?;
-        (shared.version > seen).then(|| (shared.version, shared.snapshot.clone()))
-    }
-}
-
-fn publish(shared: &Mutex<Shared>, change: impl FnOnce(&mut Shared)) {
-    let waker = match shared.lock() {
-        Ok(mut shared) => {
-            change(&mut shared);
-            shared.version += 1;
-            shared.waker.clone()
-        }
-        Err(_) => return,
-    };
-    if let Some(waker) = waker {
-        waker();
-    }
-}
-
-async fn run_client(
-    connector: Connector,
-    mut rx: UnboundedReceiver<Msg>,
-    wake: UnboundedSender<Msg>,
-    shared: Arc<Mutex<Shared>>,
-) {
-    let mut fetcher = Fetcher::new(connector, wake);
-    let mut selected: Option<String> = None;
-    let mut view = Arc::new(LiveView::default());
-    let mut compare: Option<String> = None;
-    let mut draft: Option<(String, i64)> = None;
-    let mut next_list = Instant::now();
-    let mut next_detail = Instant::now();
-    let mut next_stream: Option<Instant> = None;
-    loop {
-        let mut force = false;
-        let due = next_stream.map_or(next_list.min(next_detail), |at| {
-            at.min(next_list).min(next_detail)
-        });
-        let wait = due
-            .saturating_duration_since(Instant::now())
-            .min(Duration::from_millis(500));
-        match crate::net::timeout(wait, rx.recv()).await {
-            Ok(Some(Msg::Select(playbook))) => {
-                selected = playbook;
-                next_detail = Instant::now();
-            }
-            Ok(Some(Msg::Streamed)) => {
-                next_stream.get_or_insert_with(|| Instant::now() + STREAM_BATCH);
-            }
-            Ok(Some(Msg::Refresh)) => next_list = Instant::now(),
-            Ok(Some(Msg::Compare(base))) => {
-                compare = base;
-                force = fetcher.refresh_base(compare.as_deref()).await;
-            }
-            Ok(Some(Msg::Draft(shown))) => {
-                draft = shown;
-                force = fetcher.refresh_draft(draft.as_ref()).await;
-            }
-            Ok(Some(Msg::Reconnect)) => {
-                fetcher.connector.reset();
-                fetcher.identity = None;
-                fetcher.drafts.clear();
-                fetcher.catalog_at = None;
-                fetcher.view = LiveView::Loading;
-                next_list = Instant::now();
-                force = true;
-            }
-            Ok(None) => return,
-            Err(_) => {}
-        }
-
-        let now = Instant::now();
-        let mut changed = force;
-        if now >= next_list {
-            match fetcher.refresh_list().await {
-                Ok(list_changed) => changed |= list_changed,
-                Err(error) => changed |= fetcher.unavailable(error),
-            }
-            changed |= fetcher.refresh_catalog().await;
-            changed |= fetcher.refresh_base(compare.as_deref()).await;
-            changed |= fetcher.refresh_draft(draft.as_ref()).await;
-            next_list = now
-                + if fetcher.any_running() || !matches!(fetcher.view, LiveView::Ready { .. }) {
-                    Duration::from_secs(2)
-                } else {
-                    Duration::from_secs(8)
-                };
-            next_detail = now;
-        }
-        if now >= next_detail {
-            changed |= fetcher.refresh_detail(selected.as_deref(), true).await;
-            next_detail = now
-                + if fetcher.selected_live(selected.as_deref()) {
-                    Duration::from_secs(2)
-                } else {
-                    Duration::from_secs(60)
-                };
-            next_stream = None;
-        } else if next_stream.is_some_and(|at| now >= at) {
-            changed |= fetcher.refresh_detail(selected.as_deref(), false).await;
-            next_stream = None;
-        }
-        if changed {
-            if *view != *fetcher.view() {
-                view = Arc::new(fetcher.view().clone());
-            }
-            let polled = Polled {
-                view: Arc::clone(&view),
-                detail: fetcher.detail.clone(),
-                base: fetcher.base.clone(),
-                draft: fetcher.draft.clone(),
-                finished: fetcher.finished.clone(),
-                registered: fetcher.registered.clone(),
-                shareable: fetcher.shareable.clone(),
-            };
-            publish(&shared, |shared| shared.polled(polled));
-        }
-    }
+    /// The report last built for the Report pane.
+    pub report: Option<Arc<Built<crate::report::Wanted>>>,
+    /// The runs view last built for the runs page.
+    pub runs_report: Option<Arc<Built<WantedRuns>>>,
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::captured::Body;
     use crate::filter::{LandedFilter, LaunchFilter, OriginFilter, OwnerFilter};
+    use crate::live::action::prepare;
+    use crate::live::action::pull;
+    use crate::live::client::Client;
+    use crate::live::client::Dirs;
+    use crate::live::fetcher::CachedRun;
+    use crate::live::fetcher::FINISHED;
+    use crate::live::fetcher::Fetcher;
+    use crate::live::fetcher::REPLAY_QUIET;
+    use crate::live::shape::build_detail;
+    use crate::live::shape::clock;
+    use crate::live::shape::epoch;
+    use crate::live::shape::graph_fold;
+    use crate::live::shape::identity;
+    use crate::live::shape::landed_label;
+    use crate::live::shape::owned;
+    use crate::live::shape::unlaunched;
     use crate::live::*;
+    use crate::net::within;
+    use crate::revisions;
+    use crate::revisions::Wanted;
+    use jiff::tz::TimeZone;
+    use std::path::Path;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use std::time::Instant;
+    use tokio::sync::mpsc;
 
     #[test]
     fn historical_runs_do_not_make_missing_drafts_shareable() {
@@ -3234,6 +1415,566 @@ mod tests {
         client.file("r1", "report/out.md", 5, true);
         shows("third");
         assert_eq!(count(), 3, "a copy of another size is stale");
+    }
+
+    #[test]
+    fn a_report_is_built_from_the_plugin_and_the_captured_files_it_asks_for() {
+        use base64::Engine;
+        let pack = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/report");
+        let wasm = std::fs::read(pack.join("ui/report.wasm"))
+            .expect("build it with `just example-report-view`");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&wasm);
+        let plugin: String = encoded
+            .as_bytes()
+            .chunks(76)
+            .map(|line| format!("{}\n", String::from_utf8_lossy(line)))
+            .collect();
+        let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (seen, lanes) = (Arc::clone(&asked), pack.clone());
+        let (url, _) = crate::testserver::serve(move |line| {
+            if !line.contains("/files/") {
+                return "[]".into();
+            }
+            seen.lock().unwrap().push(line.to_string());
+            let lane = if line.contains("triage-go") {
+                "go"
+            } else {
+                "python"
+            };
+            std::fs::read_to_string(lanes.join(format!("inbox/{lane}.json"))).unwrap()
+        });
+        let (keys, files) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let net = crate::net::Net::uncached_for_tests();
+        let client = Client::spawn_with(
+            net.connector(crate::testserver::target("t", &url, keys.path())),
+            Dirs {
+                drafts: None,
+                files: Some(files.path().to_path_buf()),
+            },
+        );
+        let captured = |task: &str, path: &str, size: u64| Captured {
+            task: task.into(),
+            instance: None,
+            path: path.into(),
+            size,
+            key: format!("{task}/{path}"),
+        };
+        let size = |lane: &str| {
+            std::fs::metadata(pack.join(format!("inbox/{lane}.json")))
+                .unwrap()
+                .len()
+        };
+        let listed = vec![
+            captured("triage-go", "verdicts.json", size("go")),
+            captured("triage-go", "notes.md", 3),
+            captured("triage-python", "verdicts.json", size("python")),
+        ];
+        let wanted = |run: &str, settled: bool| crate::report::Wanted {
+            asked: Default::default(),
+            run: run.into(),
+            plugin: "ui/report.wasm.b64".into(),
+            listed: listed.iter().map(|f| (f.key.clone(), f.size)).collect(),
+            settled,
+        };
+        let built = |wanted: &crate::report::Wanted| {
+            let snapshot = snapshot_when(&client, Duration::from_secs(30), |s| {
+                s.report.as_ref().is_some_and(|b| &b.wanted == wanted)
+            });
+            snapshot.report.unwrap()
+        };
+        let triaged = |built: &Built<crate::report::Wanted>| {
+            let view = built.report.as_ref().unwrap().view.as_ref().unwrap();
+            let crucible_view::Node::Stack { children } = &view.body else {
+                panic!("the report is a stack");
+            };
+            let crucible_view::Node::Stats { items } = &children[0] else {
+                panic!("the report starts with its stats");
+            };
+            items[0].value.clone()
+        };
+
+        client.report(wanted("r1", false), plugin.clone(), listed.clone());
+        let first = built(&wanted("r1", false));
+        assert_eq!(triaged(&first), "64");
+        let held = |client: &Client| client.reporting.plugins.lock().unwrap().held().cloned();
+        let loaded = held(&client).expect("the worker keeps the plugin it loaded");
+        let fetched = asked.lock().unwrap().clone();
+        assert_eq!(fetched.len(), 2, "{fetched:?}");
+        assert!(fetched.iter().all(|line| line.contains("verdicts.json")));
+
+        client.report(wanted("r1", true), plugin.clone(), listed.clone());
+        assert_eq!(triaged(&built(&wanted("r1", true))), "64");
+        assert_eq!(
+            asked.lock().unwrap().len(),
+            2,
+            "a settled run's copies stand in"
+        );
+
+        client.report(wanted("r2", true), "not base64!".into(), listed.clone());
+        let refused = built(&wanted("r2", true));
+        let error = refused.report.as_ref().unwrap().view.clone().unwrap_err();
+        assert!(error.starts_with("the plugin is not base64"), "{error}");
+        assert_eq!(asked.lock().unwrap().len(), 2, "nothing is fetched for it");
+
+        client.report(wanted("r3", false), plugin.clone(), Vec::new());
+        assert_eq!(
+            built(&wanted("r3", false)).report.as_ref().unwrap().view,
+            Err("No task has captured verdicts.json yet.".into())
+        );
+
+        let laned = crate::report::Wanted {
+            asked: crate::report::Asked {
+                params: [(
+                    "task".to_string(),
+                    crucible_view::Param::Select("triage-go".into()),
+                )]
+                .into(),
+                ..Default::default()
+            },
+            ..wanted("r1", true)
+        };
+        assert_ne!(
+            laned,
+            wanted("r1", true),
+            "params tell one report from another"
+        );
+        client.report(laned.clone(), plugin.clone(), listed.clone());
+        let built_laned = built(&laned);
+        assert_eq!(triaged(&built_laned), "34");
+        assert_eq!(built_laned.report.as_ref().unwrap().asked, laned.asked);
+        assert!(
+            held(&client).is_some_and(|held| Arc::ptr_eq(&loaded, &held)),
+            "the plugin is loaded once while its text stays the same"
+        );
+
+        let fetches = || asked.lock().unwrap().len();
+        client.report(wanted("r1", false), plugin.clone(), listed.clone());
+        built(&wanted("r1", false));
+        assert_eq!(fetches(), 4, "a running run's files are fetched again");
+        let event = |turn: u64, wanted: crate::report::Wanted| crate::report::Wanted {
+            asked: crate::report::Asked {
+                turn,
+                state: Some("s".into()),
+                event: Some(crucible_view::Event::Tick),
+                ..Default::default()
+            },
+            ..wanted
+        };
+        let ticked = event(1, wanted("r1", false));
+        client.report(ticked.clone(), plugin.clone(), listed.clone());
+        let answered = built(&ticked);
+        assert_eq!(triaged(&answered), "64");
+        assert_eq!(
+            answered.report.as_ref().unwrap().asked.event,
+            Some(crucible_view::Event::Tick)
+        );
+        assert_eq!(fetches(), 4, "an event reads nothing again");
+
+        let mut grown = listed.clone();
+        grown[1].size = 4;
+        let moved = crate::report::Wanted {
+            listed: grown.iter().map(|f| (f.key.clone(), f.size)).collect(),
+            ..event(2, wanted("r1", false))
+        };
+        client.report(moved.clone(), plugin.clone(), grown);
+        assert_eq!(triaged(&built(&moved)), "64");
+        assert_eq!(fetches(), 6, "but an event for other files reads them");
+    }
+
+    #[test]
+    fn a_runs_view_is_built_from_what_each_launch_captured() {
+        const PLUGIN: &str = r#"
+            export const inputs = ["verdicts.json"];
+            export function view() { return { title: "One", body: { stats: { items: [] } } }; }
+            export const runsInputs = ["verdicts.json"];
+            export function runs({ runs, total, params }) {
+                const items = runs.map((run) => ({
+                    label: `${run.id} ${run.status} ${run.params?.profile} v${run.pack_version} ${run.cost_usd ?? "-"}`,
+                    value: run.files.map((file) => `${file.task}:${file.text}`).join(","),
+                }));
+                items.push({ label: "total", value: `${total} ${params.lane ?? "all"}` });
+                return { title: "History", body: { stats: { items } } };
+            }
+        "#;
+        let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&asked);
+        let (url, _) = crate::testserver::serve(move |line| {
+            seen.lock().unwrap().push(line.to_string());
+            let launch = ["PB-0", "PB-1", "PB-2", "PB-3"]
+                .into_iter()
+                .find(|key| line.contains(key))
+                .unwrap_or("none");
+            if line.contains("/files/") {
+                format!("[\"{launch}\"]")
+            } else if line.contains("/files") && launch == "PB-0" {
+                let part = |at: usize| {
+                    serde_json::json!({ "task": format!("part-{at}"), "path": "verdicts.json",
+                        "size_bytes": crate::report::FILE_BYTES,
+                        "key": format!("part-{at}/verdicts.json") })
+                };
+                serde_json::json!({ "files": (0..5).map(part).collect::<Vec<_>>() }).to_string()
+            } else if line.contains("/files") {
+                serde_json::json!({ "files": [
+                    { "task": "apply", "path": "verdicts.json", "size_bytes": 8,
+                      "key": "apply/verdicts.json" },
+                    { "task": "triage", "instance": "go", "path": "verdicts.json",
+                      "size_bytes": 8, "key": "triage-0/verdicts.json" },
+                    { "task": "apply", "path": "notes.md", "size_bytes": 3,
+                      "key": "apply/notes.md" },
+                    { "task": "huge", "path": "verdicts.json",
+                      "size_bytes": crate::report::FILE_BYTES + 1, "key": "huge/verdicts.json" },
+                ] })
+                .to_string()
+            } else {
+                let runs = if launch == "PB-3" {
+                    serde_json::json!([])
+                } else {
+                    serde_json::json!([{ "run_id": format!("run-{launch}") }])
+                };
+                serde_json::json!({
+                    "launch": { "params": { "profile": "demo" }, "draft_version": 4 },
+                    "dispatch": { "state": "dispatched" },
+                    "runs": runs,
+                })
+                .to_string()
+            }
+        });
+        let (keys, files) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let net = crate::net::Net::uncached_for_tests();
+        let client = Client::spawn_with(
+            net.connector(crate::testserver::target("t", &url, keys.path())),
+            Dirs {
+                drafts: None,
+                files: Some(files.path().to_path_buf()),
+            },
+        );
+        let launched = |key: &str, status: crucible_view::Status| crate::report::Launched {
+            key: key.into(),
+            status,
+            runs: 1,
+            started: 1_790_000_000,
+            cost: (status == crucible_view::Status::Done).then_some(0.5),
+            origin: "manual".into(),
+        };
+        let wanted = |lane: Option<&str>| WantedRuns {
+            playbook: "triage".into(),
+            plugin: "ui/report.js".into(),
+            launches: vec![
+                launched("PB-3", crucible_view::Status::Unfinished),
+                launched("PB-2", crucible_view::Status::Running),
+                launched("PB-1", crucible_view::Status::Done),
+            ],
+            total: 9,
+            asked: crate::report::Asked {
+                params: lane
+                    .map(|lane| {
+                        (
+                            "lane".to_string(),
+                            crucible_view::Param::Select(lane.into()),
+                        )
+                    })
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+        };
+        let built = |wanted: &WantedRuns| {
+            let snapshot = snapshot_when(&client, Duration::from_secs(60), |s| {
+                s.runs_report.as_ref().is_some_and(|b| &b.wanted == wanted)
+            });
+            snapshot.runs_report.unwrap()
+        };
+        let stats = |built: &Built<WantedRuns>| {
+            let view = built.report.as_ref().unwrap().view.clone().unwrap();
+            let crucible_view::Node::Stats { items } = view.body else {
+                panic!("the view is its stats");
+            };
+            items
+                .into_iter()
+                .map(|item| (item.label, item.value))
+                .collect::<Vec<_>>()
+        };
+        let pair = |label: &str, value: &str| (label.to_string(), value.to_string());
+
+        client.runs_report(wanted(None), PLUGIN.into());
+        let first = built(&wanted(None));
+        assert_eq!(
+            stats(&first),
+            [
+                pair("PB-3 unfinished demo v4 -", ""),
+                pair(
+                    "PB-2 running demo v4 -",
+                    r#"apply:["PB-2"],triage[go]:["PB-2"]"#
+                ),
+                pair(
+                    "PB-1 done demo v4 0.5",
+                    r#"apply:["PB-1"],triage[go]:["PB-1"]"#
+                ),
+                pair("total", "9 all"),
+            ]
+        );
+        assert_eq!(first.report.as_ref().unwrap().asked, wanted(None).asked);
+        let fetched = |from: usize| {
+            let lines = asked.lock().unwrap();
+            lines[from..]
+                .iter()
+                .filter(|line| line.contains("/api/playbook-runs/") || line.contains("/api/runs/"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let once = fetched(0);
+        assert_eq!(
+            once.iter().filter(|line| line.contains("/files/")).count(),
+            4,
+            "the two named files of each launch with a run: {once:?}"
+        );
+        assert!(
+            once.iter().all(|line| !line.contains("notes.md")),
+            "{once:?}"
+        );
+        assert!(
+            once.iter().all(|line| !line.contains("huge")),
+            "a file over the bytes a view reads is not fetched: {once:?}"
+        );
+        let so_far = asked.lock().unwrap().len();
+
+        client.runs_report(wanted(Some("go")), PLUGIN.into());
+        let again = built(&wanted(Some("go")));
+        assert_eq!(stats(&again)[3], pair("total", "9 go"));
+        let more = fetched(so_far);
+        assert!(!more.is_empty());
+        assert!(
+            more.iter().all(|line| line.contains("PB-2")),
+            "only the running launch is read again: {more:?}"
+        );
+
+        let event = |turn: u64, wanted: WantedRuns| WantedRuns {
+            asked: crate::report::Asked {
+                turn,
+                state: Some("s".into()),
+                event: Some(crucible_view::Event::Tick),
+                ..wanted.asked.clone()
+            },
+            ..wanted
+        };
+        let so_far = asked.lock().unwrap().len();
+        let ticked = event(1, wanted(Some("go")));
+        client.runs_report(ticked.clone(), PLUGIN.into());
+        assert_eq!(stats(&built(&ticked)), stats(&again));
+        assert!(
+            fetched(so_far).is_empty(),
+            "an event reads no launch again, running or not"
+        );
+        let fewer = WantedRuns {
+            launches: wanted(None).launches[1..].to_vec(),
+            ..event(2, wanted(Some("go")))
+        };
+        client.runs_report(fewer.clone(), PLUGIN.into());
+        assert_eq!(stats(&built(&fewer)), stats(&again)[1..]);
+        let more = fetched(so_far);
+        assert!(!more.is_empty());
+        assert!(
+            more.iter().all(|line| line.contains("PB-2")),
+            "an event for other launches reads the running one: {more:?}"
+        );
+
+        let other = WantedRuns {
+            plugin: "ui/other.js".into(),
+            ..wanted(None)
+        };
+        let so_far = asked.lock().unwrap().len();
+        client.runs_report(
+            other.clone(),
+            "export const inputs = []; export function view() {}".into(),
+        );
+        assert_eq!(built(&other).report, None, "the plugin draws no runs view");
+        assert!(fetched(so_far).is_empty(), "nothing is read for it");
+
+        let broken = WantedRuns {
+            plugin: "ui/broken.js".into(),
+            ..wanted(None)
+        };
+        client.runs_report(broken.clone(), "export const inputs = [;".into());
+        let error = built(&broken)
+            .report
+            .as_ref()
+            .unwrap()
+            .view
+            .clone()
+            .unwrap_err();
+        assert!(error.starts_with("the script does not compile"), "{error}");
+
+        let cut = WantedRuns {
+            launches: vec![
+                launched("PB-2", crucible_view::Status::Running),
+                launched("PB-0", crucible_view::Status::Done),
+                launched("PB-1", crucible_view::Status::Done),
+            ],
+            ..wanted(None)
+        };
+        let so_far = asked.lock().unwrap().len();
+        client.runs_report(cut.clone(), PLUGIN.into());
+        assert_eq!(
+            stats(&built(&cut)),
+            [
+                pair(
+                    "PB-2 running demo v4 -",
+                    r#"apply:["PB-2"],triage[go]:["PB-2"]"#
+                ),
+                pair("total", "9 all"),
+            ],
+            "a launch listed as holding more than a view reads ends the launches read"
+        );
+        let more = fetched(so_far);
+        assert!(
+            more.iter()
+                .all(|line| !(line.contains("PB-0") && line.contains("/files/"))),
+            "none of its files is fetched: {more:?}"
+        );
+    }
+
+    #[test]
+    fn a_launch_that_cannot_be_read_is_left_out_of_the_runs_view_with_why() {
+        use base64::Engine;
+        let pack = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/report");
+        let wasm = std::fs::read(pack.join("ui/report.wasm"))
+            .expect("build it with `just example-report-view`");
+        let plugin = base64::engine::general_purpose::STANDARD.encode(&wasm);
+        let verdicts = std::fs::read_to_string(pack.join("inbox/go.json")).unwrap();
+        let size = verdicts.len();
+        let down = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (failing, seen) = (Arc::clone(&down), Arc::clone(&asked));
+        let (url, _) = crate::testserver::serve_replies(move |request| {
+            let line = &request.line;
+            seen.lock().unwrap().push(line.clone());
+            let lost = line.contains("PB-8")
+                || (line.contains("PB-9") && failing.load(std::sync::atomic::Ordering::SeqCst));
+            if lost {
+                return crate::testserver::Reply {
+                    status: 500,
+                    headers: Vec::new(),
+                    body: r#"{"error":"the launch is gone"}"#.into(),
+                };
+            }
+            let launch = ["PB-1", "PB-2", "PB-9"]
+                .into_iter()
+                .find(|key| line.contains(key))
+                .unwrap_or("none");
+            crate::testserver::Reply::ok(if line.contains("/files/") {
+                verdicts.clone()
+            } else if line.contains("/files") {
+                serde_json::json!({ "files": [
+                    { "task": "triage-go", "path": "verdicts.json", "size_bytes": size,
+                      "key": "triage-go/verdicts.json" },
+                ] })
+                .to_string()
+            } else {
+                serde_json::json!({
+                    "launch": { "params": {}, "draft_version": 1 },
+                    "dispatch": { "state": "dispatched" },
+                    "runs": [{ "run_id": format!("run-{launch}") }],
+                })
+                .to_string()
+            })
+        });
+        let (keys, files) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let net = crate::net::Net::uncached_for_tests();
+        let client = Client::spawn_with(
+            net.connector(crate::testserver::target("t", &url, keys.path())),
+            Dirs {
+                drafts: None,
+                files: Some(files.path().to_path_buf()),
+            },
+        );
+        let launched = |key: &str| crate::report::Launched {
+            key: key.into(),
+            status: crucible_view::Status::Done,
+            runs: 1,
+            started: 1_790_000_000,
+            cost: Some(0.5),
+            origin: "manual".into(),
+        };
+        let wanted = |turn: u64, keys: &[&str]| WantedRuns {
+            playbook: "triage".into(),
+            plugin: "ui/report.wasm.b64".into(),
+            launches: keys.iter().map(|key| launched(key)).collect(),
+            total: keys.len(),
+            asked: crate::report::Asked {
+                turn,
+                event: (turn > 0).then_some(crucible_view::Event::Tick),
+                ..Default::default()
+            },
+        };
+        let built = |wanted: &WantedRuns| {
+            let snapshot = snapshot_when(&client, Duration::from_secs(60), |s| {
+                s.runs_report.as_ref().is_some_and(|b| &b.wanted == wanted)
+            });
+            snapshot.runs_report.unwrap().report.clone().unwrap()
+        };
+        let read = |report: &crate::report::Report| {
+            let view = report.view.as_ref().unwrap();
+            let crucible_view::Node::Stack { children } = &view.body else {
+                panic!("the runs view is a stack");
+            };
+            let crucible_view::Node::Stats { items } = &children[0] else {
+                panic!("the runs view starts with its stats");
+            };
+            items[0].value.clone()
+        };
+        let details = |key: &str| {
+            let lines = asked.lock().unwrap();
+            lines
+                .iter()
+                .filter(|line| line.contains(&format!("/api/playbook-runs/{key} ")))
+                .count()
+        };
+
+        let holed = wanted(0, &["PB-2", "PB-9", "PB-1"]);
+        client.runs_report(holed.clone(), plugin.clone());
+        let first = built(&holed);
+        assert_eq!(read(&first), "2 of 3");
+        let [unread] = first.unread.as_slice() else {
+            panic!("one launch is unread: {:?}", first.unread);
+        };
+        assert_eq!(unread.launch, "PB-9");
+        assert!(unread.why.contains("the launch"), "{}", unread.why);
+
+        let ticked = wanted(1, &["PB-2", "PB-9", "PB-1"]);
+        client.runs_report(ticked.clone(), plugin.clone());
+        let again = built(&ticked);
+        assert_eq!(read(&again), "2 of 3");
+        assert_eq!(again.unread, first.unread, "an event keeps what was unread");
+        assert_eq!(details("PB-9"), 1, "and reads no launch again");
+
+        down.store(false, std::sync::atomic::Ordering::SeqCst);
+        let grown = wanted(0, &["PB-2", "PB-9", "PB-1", "PB-8"]);
+        client.runs_report(grown.clone(), plugin.clone());
+        let healed = built(&grown);
+        assert_eq!(read(&healed), "3 of 4");
+        assert_eq!(
+            healed
+                .unread
+                .iter()
+                .map(|unread| unread.launch.as_str())
+                .collect::<Vec<_>>(),
+            ["PB-8"],
+            "a launch that was unread is read again"
+        );
+        assert_eq!(details("PB-9"), 2);
+        assert_eq!(details("PB-2"), 1, "a stopped launch that was read is not");
+
+        let lost = wanted(0, &["PB-8"]);
+        client.runs_report(lost.clone(), plugin.clone());
+        let none = built(&lost);
+        assert!(none.unread.is_empty());
+        assert!(
+            none.view
+                .as_ref()
+                .is_err_and(|why| why.contains("the launch")),
+            "with no launch read the view is why: {:?}",
+            none.view
+        );
     }
 
     #[test]

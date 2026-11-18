@@ -2,7 +2,10 @@
 # Assemble the release .app bundle with the blue-shaded icon and the workspace's crucible-lsp
 # beside the executable. Run after `cargo build --release` here and `cargo build --release -p
 # crucible-lsp` at the repo root. VERSION (default 0.0.0) is the bundle's version. ICON (default
-# icon) names the icon in assets: icon-feature is the green one nightly builds carry.
+# icon) names the icon in assets: icon-feature is the green one nightly builds carry. FEATURE
+# names a build of an unmerged feature: "Crucible Playbooks (<FEATURE>)" with the green icon, its
+# own bundle id and no URL schemes, so it sits beside an installed release and takes none of its
+# links.
 set -eu
 cd "$(dirname "$0")"
 
@@ -12,25 +15,49 @@ case "$VERSION" in
     *) VERSION=0.0.0 ;;
 esac
 
-APP="target/release/Crucible Playbooks.app"
+FEATURE="${FEATURE:-}"
+NAME="Crucible Playbooks"
+ID=dev.crucible.playbooks
+ICON="${ICON:-icon}"
+SCHEMES='    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>dev.crucible.playbooks</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>crucible-playbooks</string>
+                <string>crucible</string>
+            </array>
+        </dict>
+    </array>'
+if [ -n "$FEATURE" ]; then
+    NAME="Crucible Playbooks ($FEATURE)"
+    ID="dev.crucible.playbooks.feature.$(printf '%s' "$FEATURE" | tr -c 'A-Za-z0-9-' '-')"
+    ICON=icon-feature
+    SCHEMES=""
+fi
+
+APP="target/release/$NAME.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/crucible-playbooks "$APP/Contents/MacOS/crucible-playbooks"
 cp ../target/release/crucible-lsp "$APP/Contents/MacOS/crucible-lsp"
-cp "assets/${ICON:-icon}.icns" "$APP/Contents/Resources/AppIcon.icns"
+cp "assets/$ICON.icns" "$APP/Contents/Resources/AppIcon.icns"
+cp THIRD-PARTY-NOTICES "$APP/Contents/Resources/THIRD-PARTY-NOTICES"
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>Crucible Playbooks</string>
+    <string>$NAME</string>
     <key>CFBundleDisplayName</key>
-    <string>Crucible Playbooks</string>
+    <string>$NAME</string>
     <key>CFBundleExecutable</key>
     <string>crucible-playbooks</string>
     <key>CFBundleIdentifier</key>
-    <string>dev.crucible.playbooks</string>
+    <string>$ID</string>
     <key>CFBundleVersion</key>
     <string>$VERSION</string>
     <key>CFBundleShortVersionString</key>
@@ -45,18 +72,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
     <true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key>
     <true/>
-    <key>CFBundleURLTypes</key>
-    <array>
-        <dict>
-            <key>CFBundleURLName</key>
-            <string>dev.crucible.playbooks</string>
-            <key>CFBundleURLSchemes</key>
-            <array>
-                <string>crucible-playbooks</string>
-                <string>crucible</string>
-            </array>
-        </dict>
-    </array>
+$SCHEMES
     <key>CFBundleDocumentTypes</key>
     <array>
         <dict>

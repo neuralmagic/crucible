@@ -7,9 +7,11 @@ use rune_kit::{Button, ButtonVariant, ControlSize, Menu, MenuItem, Placement};
 use rune_theme_opencode::icons as oc;
 
 use crate::keymap::Command;
+use crate::ui::detail::empty_run;
+use crate::ui::sidebar::tube;
 use crate::ui::{
-    Paint, Pane, agent, compare, data, empty_run, files, fx, graph, launch, log, pack, revisions,
-    tasks, timeline, transcript, tube,
+    Paint, Pane, agent, compare, data, files, fx, graph, launch, log, pack, report, revisions,
+    tasks, timeline, transcript,
 };
 use crate::workspace::{At, Divider, Dock, Edge, Group, PaneDrag, PaneKind, hit};
 use crate::{App, gfx};
@@ -18,7 +20,7 @@ const TAB_BAR: f32 = 36.0;
 const GUTTER: f32 = 8.0;
 const DRAG_START: f32 = 4.0;
 
-pub(crate) fn workspace(pane: &Pane, app: &App, p: &Paint) -> El {
+pub(crate) fn workspace(pane: &Pane, app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
     let ws = app.workspace();
     let mut area = row()
         .key("workspace")
@@ -47,7 +49,7 @@ pub(crate) fn workspace(pane: &Pane, app: &App, p: &Paint) -> El {
             if g > 0 {
                 stack = stack.child(divider(Divider::Groups(c, g - 1), app, p));
             }
-            stack = stack.child(group_view((c, g), group, pane, app, p));
+            stack = stack.child(group_view((c, g), group, pane, app, p, layer));
         }
         area = area.child(stack);
     }
@@ -72,6 +74,7 @@ pub(crate) fn tools(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
     for kind in PaneKind::ALL
         .into_iter()
         .filter(|kind| *kind != PaneKind::Agent || app.agent_available())
+        .filter(|kind| *kind != PaneKind::Report || app.views_on())
     {
         let mut item = MenuItem::new(kind.label())
             .icon(glyph(kind))
@@ -116,10 +119,11 @@ pub(crate) fn glyph(kind: PaneKind) -> &'static Icon {
         PaneKind::Log => &oc::CONSOLE,
         PaneKind::Agent => &oc::SPEECH_BUBBLE,
         PaneKind::History => &oc::OUTLINE_LIST_CHANGELOG,
+        PaneKind::Report => &oc::CHECKLIST,
     }
 }
 
-fn group_view(at: At, group: &Group, pane: &Pane, app: &App, p: &Paint) -> El {
+fn group_view(at: At, group: &Group, pane: &Pane, app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
     let closable = app.workspace().closed().count() + 1 < PaneKind::ALL.len();
     let mut bar = row()
         .key("tabs")
@@ -172,7 +176,7 @@ fn group_view(at: At, group: &Group, pane: &Pane, app: &App, p: &Paint) -> El {
                 .grow(1.0)
                 .min_h(0.0)
                 .padding(10.0)
-                .child(content(group.active, pane, app, p)),
+                .child(content(group.active, pane, app, p, layer)),
         );
     if let Some(preview) = drop_preview(at, group, app, p) {
         frame = frame.child(preview);
@@ -180,7 +184,7 @@ fn group_view(at: At, group: &Group, pane: &Pane, app: &App, p: &Paint) -> El {
     frame
 }
 
-fn content(kind: PaneKind, pane: &Pane, app: &App, p: &Paint) -> El {
+fn content(kind: PaneKind, pane: &Pane, app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
     match kind {
         PaneKind::Tasks => tasks::task_list(
             app,
@@ -232,6 +236,7 @@ fn content(kind: PaneKind, pane: &Pane, app: &App, p: &Paint) -> El {
         }
         PaneKind::Agent => agent::panel(pane.log_font, app, p),
         PaneKind::History => revisions::history_view(app, p),
+        PaneKind::Report => report::report_view(app, p, layer),
     }
 }
 

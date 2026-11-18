@@ -1,6 +1,6 @@
 //! What the management pages share: their frame, read states, and the last action's outcome.
 
-use rune::{El, ScrollSpec, col, el, row, text};
+use rune::{Color, El, ScrollSpec, col, el, row, text};
 use rune_kit::{Button, ButtonVariant, Spinner};
 
 use crate::App;
@@ -143,16 +143,21 @@ pub(crate) fn none(key: &str, label: &str, p: &Paint) -> El {
 
 /// A bordered card holding `body`.
 pub(crate) fn card(key: &str, body: El, p: &Paint) -> El {
-    col()
+    surface(p)
         .key(key.to_string())
         .w_full()
         .min_h(0.0)
         .padding(14.0)
         .gap(10.0)
+        .child(body)
+}
+
+/// A column on the raised layer, rounded and edged in a hairline.
+pub(crate) fn surface(p: &Paint) -> El {
+    col()
         .radius(p.k.radius.lg)
         .fill(p.c.layer_01)
         .border(p.hair, p.c.border_muted)
-        .child(body)
 }
 
 /// `rows` in a scrolling column, divided by hairlines.
@@ -362,4 +367,35 @@ pub(crate) fn heading(label: &str, p: &Paint) -> El {
 
 pub(crate) fn now() -> i64 {
     jiff::Timestamp::now().as_second()
+}
+
+/// A pane's empty or failed state: what happened, and the detail to read or copy.
+pub(crate) fn note(key: &str, headline: &str, detail: &str, p: &Paint) -> El {
+    toned_note(key, headline, detail, p.c.text_base, p)
+}
+
+/// A [`note`] whose headline is in `ink`.
+pub(crate) fn toned_note(key: &str, headline: &str, detail: &str, ink: Color, p: &Paint) -> El {
+    let mut card = surface(p)
+        .key(key.to_string())
+        .w_full()
+        .padding(24.0)
+        .gap(6.0)
+        .child(
+            text(headline.to_string())
+                .font(p.k.ty.ui_medium)
+                .color(ink)
+                .wrap(),
+        );
+    if !detail.is_empty() {
+        card = card.child(
+            text(detail.to_string())
+                .font(p.mono(11.0, 400.0))
+                .color(p.c.text_muted)
+                .selectable(true)
+                .selection_color(p.k.selection())
+                .wrap(),
+        );
+    }
+    card
 }

@@ -11,6 +11,8 @@ target/
 examples/*/workspace/
 e2e/*/pack/workspace/
 examples/*/state/
+# Fetched by `just desktop-js-engine`.
+crucible-desktop/assets/js-engine/
 # Python noise.
 __pycache__/
 *.pyc

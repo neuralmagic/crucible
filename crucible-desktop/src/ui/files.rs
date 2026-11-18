@@ -9,7 +9,7 @@ use rune_theme_opencode::icons as oc;
 use crate::App;
 use crate::captured::{self, Body, Captured, Kind};
 use crate::syntax;
-use crate::ui::{Paint, Pane, rail};
+use crate::ui::{Paint, Pane, desk, rail};
 use crate::workspace::PaneKind;
 
 /// Lines drawn per file; a longer file says how much it left out.
@@ -17,10 +17,12 @@ const LINES: usize = 4000;
 
 pub(crate) fn files_view(pane: &Pane, app: &App, p: &Paint) -> El {
     let files = match &pane.files {
-        None => return note("Listing the captured files\u{2026}", "", p),
-        Some(Err(error)) => return note("Could not list the captured files.", error, p),
+        None => return desk::note("files-note", "Listing the captured files\u{2026}", "", p),
+        Some(Err(error)) => {
+            return desk::note("files-note", "Could not list the captured files.", error, p);
+        }
         Some(Ok([])) => {
-            return note("No task in this run captured files.", "", p);
+            return desk::note("files-note", "No task in this run captured files.", "", p);
         }
         Some(Ok(files)) => files,
     };
@@ -115,7 +117,8 @@ fn viewer(file: &Captured, run: Option<&str>, app: &App, p: &Paint) -> El {
         .as_ref()
         .filter(|opened| opened.key == file.key && Some(opened.run.as_str()) == run);
     let body = match (file.shown(), opened.map(|opened| &opened.body)) {
-        (false, _) => note(
+        (false, _) => desk::note(
+            "files-note",
             &format!(
                 "{} is {}, more than the pane draws.",
                 file.key,
@@ -134,8 +137,9 @@ fn viewer(file: &Captured, run: Option<&str>, app: &App, p: &Paint) -> El {
             .grow(1.0)
             .center()
             .child(Spinner::new().size(16.0).build(p.k)),
-        (true, Some(Err(error))) => note("Could not read the file.", error, p),
-        (true, Some(Ok(Body::Binary(len)))) => note(
+        (true, Some(Err(error))) => desk::note("files-note", "Could not read the file.", error, p),
+        (true, Some(Ok(Body::Binary(len)))) => desk::note(
+            "files-note",
             &format!("{} is {len} bytes that are not text.", file.key),
             "",
             p,
@@ -228,7 +232,8 @@ fn content(kind: Kind, key: &str, body: &str, app: &App, p: &Paint) -> El {
     };
     match kind {
         Kind::Html if crate::html_preview::SUPPORTED && !app.files_html_source => {
-            frame().key(crate::html_preview::ELEMENT).child(note(
+            frame().key(crate::html_preview::ELEMENT).child(desk::note(
+                "files-note",
                 app.html_preview_error.as_deref().unwrap_or("HTML preview"),
                 "",
                 p,
@@ -318,32 +323,4 @@ fn code(source: &str, language: Option<&str>, app: &App, p: &Paint) -> El {
         .scroll_xy()
         .scroll_edge_fade(8.0)
         .child(body)
-}
-
-fn note(headline: &str, detail: &str, p: &Paint) -> El {
-    let mut card = col()
-        .key("files-note")
-        .w_full()
-        .padding(24.0)
-        .gap(6.0)
-        .radius(p.k.radius.lg)
-        .fill(p.c.layer_01)
-        .border(p.hair, p.c.border_muted)
-        .child(
-            text(headline.to_string())
-                .font(p.k.ty.ui_medium)
-                .color(p.c.text_base)
-                .wrap(),
-        );
-    if !detail.is_empty() {
-        card = card.child(
-            text(detail.to_string())
-                .font(p.mono(11.0, 400.0))
-                .color(p.c.text_muted)
-                .selectable(true)
-                .selection_color(p.k.selection())
-                .wrap(),
-        );
-    }
-    card
 }
