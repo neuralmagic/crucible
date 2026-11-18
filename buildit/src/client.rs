@@ -204,6 +204,7 @@ async fn build(server: &Server, params: &BuildParams, wait: bool) -> Result<Outc
     let poll = Duration::from_millis(crate::task::POLL_INTERVAL_MS);
     let status = StatusParams {
         build_id: built.build_id,
+        wait_seconds: None,
     };
     let mut failed = 0;
     loop {
