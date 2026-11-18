@@ -286,7 +286,12 @@ pub(crate) trait Backend: Sync {
 
     /// The credential file a harness seeds when its credential cannot ride the gateway as-is:
     /// codex's `auth.json`, pi's Vertex extension.
-    fn credential(&self, _agent: &TurnAgent<'_>, _auth: &SandboxAuth) -> Option<SeedFile> {
+    fn credential(
+        &self,
+        _agent: &TurnAgent<'_>,
+        _auth: &SandboxAuth,
+        _inference: &InferenceEnv,
+    ) -> Option<SeedFile> {
         None
     }
 
@@ -355,7 +360,7 @@ pub(crate) trait Backend: Sync {
             })
             .into_iter()
             .collect();
-        seeds.extend(self.credential(agent, auth));
+        seeds.extend(self.credential(agent, auth, inference));
         if !servers.is_empty() {
             seeds.extend(self.mcp_config(servers));
         }

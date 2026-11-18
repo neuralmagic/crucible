@@ -1275,6 +1275,9 @@ pub struct Provider {
     pub harness: Option<String>,
     #[serde(default)]
     pub price: Option<ProviderPrice>,
+    /// What each model can take and give, in tokens, by model id.
+    #[serde(default)]
+    pub model_limits: std::collections::BTreeMap<String, ModelLimits>,
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
@@ -1383,6 +1386,13 @@ pub struct ProviderPrice {
     pub output: f64,
     pub cache_read: f64,
     pub cache_write: f64,
+}
+
+/// One model's context window and output limit, in tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct ModelLimits {
+    pub context_window: u32,
+    pub max_output_tokens: u32,
 }
 
 /// A registry secret's metadata. The value never leaves the controller.

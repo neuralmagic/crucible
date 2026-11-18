@@ -12103,6 +12103,7 @@ async fn seed_provider(
     crate::playbooks::providers::upsert(
         pool,
         &crate::playbooks::providers::NewProvider {
+            model_limits: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id,
             display_name: "Platform OpenAI",
@@ -12191,6 +12192,7 @@ async fn config_providers_lists_enabled_providers_and_the_defaults(pool: PgPool)
     crate::playbooks::providers::upsert(
         db.pool(),
         &crate::playbooks::providers::NewProvider {
+            model_limits: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "plat-openai",
             display_name: "Platform OpenAI",
@@ -12286,6 +12288,7 @@ async fn an_owned_provider_is_offered_and_pinned_only_by_those_who_may_read_it(
         crate::playbooks::providers::upsert(
             db.pool(),
             &crate::playbooks::providers::NewProvider {
+                model_limits: Default::default(),
                 owner: crate::authz::model::Principal::parse("user:reed").expect("a principal"),
                 id,
                 display_name: "Reed's",
@@ -13797,6 +13800,107 @@ async fn a_custom_provider_needs_an_endpoint_a_protocol_and_a_default_model(
         "http://vllm.internal:8000/v1"
     );
     assert_eq!(picker["providers"][0]["protocol"], "responses");
+    Ok(())
+}
+
+/// A provider's model limits are per model: registered, shown to the picker and the admin list,
+/// replaced or cleared by a PUT, and refused when a count is zero, the output exceeds the window,
+/// or the provider serves no agent.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_provider_carries_limits_per_model(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool);
+    let app = app_with_admins(db.clone(), vec!["wren".to_string()]);
+    let glm = |limits: serde_json::Value| {
+        serde_json::json!({
+            "id": "selfhosted", "display_name": "Self-hosted", "kind": "custom",
+            "default_model": "zai-org/glm-5", "protocol": "messages",
+            "endpoint": "https://selfhosted.example/v1", "model_limits": limits,
+        })
+    };
+
+    for (body, expected) in [
+        (
+            glm(
+                serde_json::json!({"zai-org/glm-5": {"context_window": 0, "max_output_tokens": 1}}),
+            ),
+            "model_limits.zai-org/glm-5.context_window must be a positive",
+        ),
+        (
+            glm(
+                serde_json::json!({"zai-org/glm-5": {"context_window": 8000, "max_output_tokens": 16000}}),
+            ),
+            "max_output_tokens 16000 exceeds its context_window 8000",
+        ),
+        (
+            serde_json::json!({"id": "dgemma", "display_name": "dgemma", "kind": "custom",
+                "default_model": "dgemma", "protocol": "system_one",
+                "endpoint": "http://dgemma.internal:8011/v1/systemone",
+                "model_limits": {"dgemma": {"context_window": 8000, "max_output_tokens": 1000}}}),
+            "take no limits",
+        ),
+    ] {
+        let (status, refused) = post_admin(&app, "/api/providers", body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(expected),
+            "{expected}: {refused}"
+        );
+    }
+    let res = app
+        .clone()
+        .oneshot(admin_json(
+            "POST",
+            "/api/providers",
+            glm(serde_json::json!({"zai-org/glm-5": {"context_window": 200000}})),
+        )?)
+        .await?;
+    assert!(
+        res.status().is_client_error(),
+        "limits name both counts: {}",
+        res.status()
+    );
+
+    let limits = serde_json::json!({
+        "zai-org/glm-5": {"context_window": 200000, "max_output_tokens": 64000},
+        "small": {"context_window": 32768, "max_output_tokens": 4096},
+    });
+    let (status, created) = post_admin(&app, "/api/providers", glm(limits.clone())).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["model_limits"], limits);
+    let stored = crate::playbooks::providers::get(db.pool(), "selfhosted")
+        .await?
+        .expect("the row");
+    assert_eq!(
+        stored
+            .model_limits
+            .get("small")
+            .map(|l| l.context_window.get()),
+        Some(32_768),
+        "the registry holds what the API took"
+    );
+
+    let (status, picker) = get_json_object(&app, "/api/config/providers").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(picker["providers"][0]["model_limits"], limits);
+
+    let mut body = glm(serde_json::json!({}));
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("id");
+        obj.remove("model_limits");
+    }
+    let res = app
+        .clone()
+        .oneshot(admin_json("PUT", "/api/providers/selfhosted", body)?)
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        json_of(res).await?["model_limits"],
+        serde_json::json!({}),
+        "a PUT without limits clears them"
+    );
     Ok(())
 }
 
