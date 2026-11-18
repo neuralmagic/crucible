@@ -35,7 +35,7 @@ impl Limits {
         memory_bytes: 256 << 20,
         table_elements: 1 << 20,
         reply_bytes: 64 << 20,
-        inputs: 16,
+        inputs: 64,
     };
 }
 

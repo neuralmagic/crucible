@@ -25,7 +25,7 @@ smaller, faster plugin and is worth it for a view that shapes a lot of data.
 - It has no network, filesystem, arguments or environment. Its clock counts its own readings
   and its random bytes never change, so the view must depend on the files alone, and for a
   live view on the state and event the app hands it.
-- It runs under limits: about two seconds of work, 256 MiB of memory, a 64 MiB reply, 16 input
+- It runs under limits: about two seconds of work, 256 MiB of memory, a 64 MiB reply, 64 input
   paths. Past one, the pane shows the error instead of the view.
 - A view the app cannot check is refused whole: an unknown component or field, a row whose
   cells do not match its columns, a number out of range, more than one table on screen.
