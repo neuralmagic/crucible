@@ -31,6 +31,7 @@ struct Polled {
     draft: Option<Arc<DraftPack>>,
     finished: Vec<Finished>,
     registered: Vec<String>,
+    shareable: Vec<crux::client::Shared>,
 }
 
 /// The UI-side handle to the live worker. Dropping it ends the poll loop and its streams.
@@ -74,6 +75,7 @@ impl Shared {
         self.snapshot.draft = polled.draft;
         self.snapshot.finished = polled.finished;
         self.snapshot.registered = polled.registered;
+        self.snapshot.shareable = polled.shareable;
     }
 
     fn answered(&mut self, reply: Reply) {
@@ -348,7 +350,7 @@ async fn run_client(
                 fetcher.connector.reset();
                 fetcher.identity = None;
                 fetcher.drafts.clear();
-                fetcher.registered_at = None;
+                fetcher.catalog_at = None;
                 fetcher.view = LiveView::Loading;
                 next_list = Instant::now();
                 force = true;
@@ -364,7 +366,7 @@ async fn run_client(
                 Ok(list_changed) => changed |= list_changed,
                 Err(error) => changed |= fetcher.unavailable(error),
             }
-            changed |= fetcher.refresh_registered().await;
+            changed |= fetcher.refresh_catalog().await;
             changed |= fetcher.refresh_base(compare.as_deref()).await;
             changed |= fetcher.refresh_draft(draft.as_ref()).await;
             next_list = now
@@ -399,6 +401,7 @@ async fn run_client(
                 draft: fetcher.draft.clone(),
                 finished: fetcher.finished.clone(),
                 registered: fetcher.registered.clone(),
+                shareable: fetcher.shareable.clone(),
             };
             publish(&shared, |shared| shared.polled(polled));
         }

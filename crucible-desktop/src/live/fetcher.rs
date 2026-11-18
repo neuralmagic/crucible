@@ -54,9 +54,10 @@ pub(in crate::live) struct Fetcher {
     finished_seq: u64,
     /// Handed to each session stream, so new lines wake the worker.
     wake: UnboundedSender<Msg>,
-    /// Registered playbook ids, the ones a launch form can start, and when they were read.
+    /// Registered playbook ids, the ones a launch form can start.
     pub(in crate::live) registered: Vec<String>,
-    pub(in crate::live) registered_at: Option<Instant>,
+    pub(in crate::live) shareable: Vec<crux::client::Shared>,
+    pub(in crate::live) catalog_at: Option<Instant>,
 }
 
 /// One launch's detail, as of the run count and status the launch list showed when it was read:
@@ -285,19 +286,20 @@ impl Fetcher {
             finished_seq: 0,
             wake,
             registered: Vec::new(),
-            registered_at: None,
+            shareable: Vec::new(),
+            catalog_at: None,
         }
     }
 
-    /// Re-reads the registered playbooks at most once a minute.
-    pub(in crate::live) async fn refresh_registered(&mut self) -> bool {
+    /// Re-reads the playbook and draft catalogs at most once a minute.
+    pub(in crate::live) async fn refresh_catalog(&mut self) -> bool {
         if self
-            .registered_at
+            .catalog_at
             .is_some_and(|at| at.elapsed() < Duration::from_secs(60))
         {
             return false;
         }
-        self.registered_at = Some(Instant::now());
+        self.catalog_at = Some(Instant::now());
         let Ok(connection) = self.connection().await else {
             return false;
         };
@@ -311,8 +313,31 @@ impl Fetcher {
         };
         let mut ids: Vec<String> = playbooks.into_iter().map(|p| p.id).collect();
         ids.sort();
-        let changed = ids != self.registered;
+        #[derive(serde::Deserialize)]
+        struct Draft {
+            id: String,
+        }
+        let drafts = within(
+            "the drafts",
+            connection.client.get::<Vec<Draft>>("/api/playbook-drafts"),
+        )
+        .await;
+        let mut shareable: Vec<_> = ids
+            .iter()
+            .cloned()
+            .map(crux::client::Shared::Playbook)
+            .collect();
+        if let Ok(mut drafts) = drafts {
+            drafts.sort_by(|a, b| a.id.cmp(&b.id));
+            shareable.extend(
+                drafts
+                    .into_iter()
+                    .map(|d| crux::client::Shared::Draft(d.id)),
+            );
+        }
+        let changed = ids != self.registered || shareable != self.shareable;
         self.registered = ids;
+        self.shareable = shareable;
         changed
     }
 

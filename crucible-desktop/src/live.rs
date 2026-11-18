@@ -490,6 +490,7 @@ pub struct Snapshot {
     pub finished: Vec<Finished>,
     /// Registered playbook ids: the ones the app can launch.
     pub registered: Vec<String>,
+    pub shareable: Vec<crux::client::Shared>,
     pub prepared: Option<Prepared>,
     pub launched: Option<Launched>,
     pub reran: Option<Reran>,
@@ -534,6 +535,87 @@ mod tests {
     use std::time::Duration;
     use std::time::Instant;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn historical_runs_do_not_make_missing_drafts_shareable() {
+        let (url, _) =
+            crate::testserver::serve(|request| match request.split_whitespace().nth(1) {
+                Some("/api/whoami") => r#"{"user":"wren","role":"user"}"#.into(),
+                Some("/api/playbooks") => serde_json::json!([{
+                    "id": "registered",
+                    "source": {"kind": "git", "repo": "owner/repo"},
+                }])
+                .to_string(),
+                Some("/api/playbook-drafts") => r#"[{"id":"current"}]"#.into(),
+                Some("/api/playbook-runs") => serde_json::json!([{
+                    "key": "playbook:removed:1", "playbook": "removed",
+                    "origin": "draft", "draft_version": 1, "status": "done",
+                }])
+                .to_string(),
+                _ => "[]".into(),
+            });
+        let keys = tempfile::tempdir().unwrap();
+        let net = crate::net::Net::uncached_for_tests();
+        let client = Client::spawn_with(
+            net.connector(crate::testserver::target("t", &url, keys.path())),
+            no_dirs(),
+        );
+        let snapshot = snapshot_when(&client, Duration::from_secs(5), |s| {
+            !s.shareable.is_empty() && !s.view.launches().is_empty()
+        });
+        assert_eq!(snapshot.view.launches()[0].id, "removed");
+        assert_eq!(
+            snapshot.shareable,
+            vec![
+                crux::client::Shared::Playbook("registered".into()),
+                crux::client::Shared::Draft("current".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_private_source_becomes_shareable_when_the_readable_catalog_grants_access() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let readable = Arc::new(AtomicBool::new(false));
+        let granted = Arc::clone(&readable);
+        let (url, _) =
+            crate::testserver::serve(move |request| match request.split_whitespace().nth(1) {
+                Some("/api/whoami") => r#"{"user":"wren","role":"operator"}"#.into(),
+                Some("/api/playbook-runs") => serde_json::json!([{
+                    "key": "playbook:private:1", "playbook": "private",
+                    "origin": "draft", "draft_version": 1, "status": "done",
+                    "created_by": "finch",
+                }])
+                .to_string(),
+                Some("/api/playbook-drafts") if granted.load(Ordering::SeqCst) => {
+                    r#"[{"id":"private","owner":"user:finch","actions":["read"]}]"#.into()
+                }
+                _ => "[]".into(),
+            });
+        let keys = tempfile::tempdir().unwrap();
+        let net = crate::net::Net::uncached_for_tests();
+        let (wake, _rx) = mpsc::unbounded_channel();
+        let mut fetcher = Fetcher::new(
+            net.connector(crate::testserver::target("t", &url, keys.path())),
+            wake,
+        );
+        net.handle().unwrap().block_on(async {
+            fetcher.refresh_list().await.unwrap();
+            fetcher.refresh_catalog().await;
+            assert_eq!(fetcher.view.launches()[0].id, "private");
+            assert!(fetcher.shareable.is_empty());
+
+            readable.store(true, Ordering::SeqCst);
+            fetcher.catalog_at = None;
+            assert!(fetcher.refresh_catalog().await);
+            assert_eq!(fetcher.view.launches()[0].id, "private");
+            assert_eq!(
+                fetcher.shareable,
+                vec![crux::client::Shared::Draft("private".into())]
+            );
+        });
+    }
 
     fn launch(status: &str) -> LivePlaybook {
         LivePlaybook {
