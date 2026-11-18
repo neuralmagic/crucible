@@ -118,6 +118,7 @@ const PROJECT = __PROJECT__;
 const REGION = __REGION__;
 const HOST = __HOST__;
 const MODEL = __MODEL__;
+const REASONING = __REASONING__;
 const PREFIX = `/v1/projects/${PROJECT}/locations/${REGION}/publishers/anthropic/models/`;
 const ANTHROPIC_VERSION = "vertex-2023-10-16";
 
@@ -169,7 +170,7 @@ export default function (pi: any) {
       {
         id: MODEL,
         name: MODEL,
-        reasoning: false,
+        reasoning: REASONING,
         input: ["text"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 200000,
@@ -183,19 +184,20 @@ export default function (pi: any) {
 "#;
 
 /// Render the Vertex extension for a project, region, and model.
-fn vertex_extension(model: &str, vertex: &VertexConfig) -> String {
+fn vertex_extension(model: &str, vertex: &VertexConfig, reasoning: bool) -> String {
     let literal = |s: &str| serde_json::Value::String(s.to_string()).to_string();
     VERTEX_EXTENSION_TEMPLATE
         .replace("__PROJECT__", &literal(&vertex.project))
         .replace("__REGION__", &literal(&vertex.region))
         .replace("__HOST__", &literal(&format!("https://{}", vertex.host())))
         .replace("__MODEL__", &literal(model))
+        .replace("__REASONING__", &reasoning.to_string())
 }
 
 /// Render `models.json`: a keyed endpoint as the `crucible` provider (its API family, base URL,
 /// and the env var the key is read from) carrying the one model the turn runs. A Vertex turn
 /// seeds none: its provider comes from the extension.
-fn models_json(model: &str, endpoint: &ApiEndpoint) -> Option<String> {
+fn models_json(model: &str, endpoint: &ApiEndpoint, reasoning: bool) -> Option<String> {
     let (api, base_url, key_env) = match endpoint {
         ApiEndpoint::OpenAi { base_url, wire_api } => (
             match wire_api {
@@ -221,7 +223,7 @@ fn models_json(model: &str, endpoint: &ApiEndpoint) -> Option<String> {
                 "models": [{
                     "id": model,
                     "name": model,
-                    "reasoning": false,
+                    "reasoning": reasoning,
                     "input": ["text"],
                     "contextWindow": 128_000,
                     "maxTokens": 16_384,
@@ -312,6 +314,7 @@ impl Backend for Pi {
         models_json(
             agent.model,
             &api_endpoint(agent.model, inference, agent.env),
+            agent.reasoning_effort.is_some(),
         )
     }
 
@@ -327,7 +330,11 @@ impl Backend for Pi {
     fn credential(&self, agent: &TurnAgent<'_>, auth: &SandboxAuth) -> Option<SeedFile> {
         match auth {
             SandboxAuth::Gateway => Some(SeedFile {
-                content: vertex_extension(agent.model, &VertexConfig::from_env(agent.env)),
+                content: vertex_extension(
+                    agent.model,
+                    &VertexConfig::from_env(agent.env),
+                    agent.reasoning_effort.is_some(),
+                ),
                 dest: VERTEX_EXTENSION,
             }),
             SandboxAuth::AnthropicKey | SandboxAuth::ApiKey | SandboxAuth::Codex(_) => None,
@@ -767,6 +774,35 @@ mod tests {
         assert_eq!(p["baseUrl"], "https://claude.corp");
         assert_eq!(p["apiKey"], "$ANTHROPIC_API_KEY");
         assert_eq!(p["models"][0]["id"], a.model());
+    }
+
+    #[test]
+    fn a_turn_with_a_reasoning_effort_declares_its_model_as_reasoning() {
+        let inference = InferenceEnv {
+            anthropic_key: Some("sk-ant".into()),
+            ..Default::default()
+        };
+        let reasoning = |a: &Args| {
+            let seeds = seed_files(&a.turn_agent(), &[], &inference);
+            let v: Value = serde_json::from_str(&seeds[0].content).expect("valid json");
+            v["providers"]["crucible"]["models"][0]["reasoning"].clone()
+        };
+        let vertex = |a: &Args| {
+            Pi.seed_files(
+                &a.turn_agent(),
+                &[],
+                &SandboxAuth::Gateway,
+                &InferenceEnv::default(),
+            )[0]
+            .content
+            .clone()
+        };
+        let mut a = args();
+        assert_eq!(reasoning(&a), false);
+        assert!(vertex(&a).contains("const REASONING = false;"));
+        a.reasoning_effort = Some(ReasoningEffort::High);
+        assert_eq!(reasoning(&a), true);
+        assert!(vertex(&a).contains("const REASONING = true;"));
     }
 
     /// No key and no base URL is the ambient Vertex credential: no `models.json`, and the
