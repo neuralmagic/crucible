@@ -14,6 +14,7 @@ pub mod line;
 pub mod opencode_json;
 pub mod otel;
 pub mod pi_json;
+pub mod provider_error;
 pub mod redact;
 pub mod stream_json;
 pub mod tool_summary;

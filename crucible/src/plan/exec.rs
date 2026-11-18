@@ -2256,8 +2256,8 @@ fn settle_attempt(
     ))
 }
 
-/// A task that died on transport and will not be retried: the retries ran out, or a ceiling
-/// refused the next attempt with retries still allowed.
+/// A task that died on transport and will not be retried: the retries ran out, a retry could not
+/// have fixed the failure, or a ceiling refused the next attempt with retries still allowed.
 fn transport_result(
     attempts: u32,
     max_attempts: u32,
@@ -2275,6 +2275,10 @@ fn transport_result(
                 Refusal::CostCeiling => TaskEvent::TransportCutByBudget,
                 Refusal::WallClockCeiling => TaskEvent::TransportExhausted,
             },
+        ),
+        None if failure.permanent => (
+            format!("transport failure a retry cannot fix: {failure}"),
+            TaskEvent::TransportExhausted,
         ),
         None => (
             format!("transport retries exhausted ({max_attempts} attempts): {failure}"),
@@ -2404,7 +2408,8 @@ fn run_batch_with_retries<'a>(
                 }
                 Err(failure) => {
                     let cut_by_budget = item.task.task.spends() && retry_budget_blocked;
-                    if item.attempt < max_attempts && !cut_by_budget {
+                    let retryable = item.attempt < max_attempts && !failure.permanent;
+                    if retryable && !cut_by_budget {
                         next.push((
                             idx,
                             BatchItem {
@@ -2415,7 +2420,7 @@ fn run_batch_with_retries<'a>(
                             Some(failure),
                         ));
                     } else {
-                        let cut = (item.attempt < max_attempts).then_some(Refusal::CostCeiling);
+                        let cut = retryable.then_some(Refusal::CostCeiling);
                         overrun.budget |= cut.is_some();
                         done.insert(
                             idx,
@@ -4011,6 +4016,40 @@ mod tests {
         );
         assert!(!out.valid);
         assert_eq!(out.exit, PlanExit::ShortCircuit { task: "t".into() });
+    }
+
+    #[test]
+    fn a_permanent_transport_failure_is_not_retried() {
+        let plan = valid(vec![task("t", &[], "any", false)], 10.0);
+        let mut r = ScriptRunner::new();
+        r.on(
+            "t",
+            1,
+            || {
+                AttemptOutcome::Transport(TransportFailure::permanent(
+                    TransportCause::Provider,
+                    "pi: 403 refused",
+                ))
+            },
+            0.1,
+        );
+        r.on("t", 2, || AttemptOutcome::Pass(serde_json::json!({})), 0.1);
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        let t = &out.results[&"t".into()];
+        assert_eq!(t.status, TaskStatus::Transport);
+        assert_eq!(t.attempts, 1);
+        assert_eq!(t.transport, Some(TransportCause::Provider));
+        assert_eq!(
+            t.note.as_deref(),
+            Some("transport failure a retry cannot fix: pi: 403 refused")
+        );
+        assert_eq!(r.dispatched, [("t".to_string(), 1)]);
     }
 
     #[test]

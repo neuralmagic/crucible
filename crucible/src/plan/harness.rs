@@ -1328,16 +1328,23 @@ fn repair_prompt(round: u32, of: u32, notes: &[String]) -> String {
 }
 
 /// An agent-stream error the turn cannot recover from. A typed `Error` event is the provider or
-/// the CLI refusing the turn; an errored `Result` is the agent itself ending badly.
+/// the CLI refusing the turn, permanent when the provider refused the request itself; an errored
+/// `Result` is the agent itself ending badly.
 fn agent_transport_error(event: &AgentEvent) -> Option<TransportFailure> {
     match event {
         AgentEvent::Error {
             error_type,
             message,
-        } => Some(TransportFailure::new(
-            TransportCause::Provider,
-            format!("{error_type}: {message}"),
-        )),
+        } => {
+            let note = format!("{error_type}: {message}");
+            Some(
+                if crucible_harness::provider_error::is_refusal(error_type, message) {
+                    TransportFailure::permanent(TransportCause::Provider, note)
+                } else {
+                    TransportFailure::new(TransportCause::Provider, note)
+                },
+            )
+        }
         AgentEvent::Result {
             is_error: true,
             error,
@@ -2575,6 +2582,17 @@ workflow(type = "playbook", tasks = [prod, cons, serial_stranger, isolated_stran
             Some(TransportFailure::new(
                 TransportCause::Provider,
                 "overloaded: try later"
+            ))
+        );
+        let refused = AgentEvent::Error {
+            error_type: "pi".into(),
+            message: r#"403 {"error":{"code":"denied"}}"#.into(),
+        };
+        assert_eq!(
+            agent_transport_error(&refused),
+            Some(TransportFailure::permanent(
+                TransportCause::Provider,
+                r#"pi: 403 {"error":{"code":"denied"}}"#
             ))
         );
         let failed_result = AgentEvent::Result {
