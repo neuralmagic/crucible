@@ -170,6 +170,11 @@ bar too narrow for its labels draws every tab but the active one as its icon. `P
 header lists every pane with its shortcut: a pick shows it, reopening it if it was closed, and the
 checked ones are on screen.
 
+A pack can ship a view of its runs (`skills/write-a-view-plugin`). Drawing one runs the pack's
+plugin, so it is off by default: `Draw pack views` in Settings, or `view_plugins = true` in the
+config, adds the Report pane and the runs page's Report tab. A headless scene that names the
+report tab, or `CRUCIBLE_VIEW_PLUGIN`, turns it on for that run.
+
 ![the Panes menu](docs/panes.png)
 
 The list beside the content of the Pack, Files and History panes drags by the handle between

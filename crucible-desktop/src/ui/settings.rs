@@ -186,6 +186,24 @@ pub(crate) fn settings_pane(app: &App, p: &Paint) -> El {
             p,
         ))
         .child(settings_section(
+            "views",
+            "Views",
+            vec![setting_row(
+                "Draw pack views",
+                Switch::new(app.settings.view_plugins)
+                    .label("Draw pack views")
+                    .hide_label()
+                    .on_toggle(|app: &mut App| {
+                        let on = !app.settings.view_plugins;
+                        app.settings.set_view_plugins(on);
+                    })
+                    .build(p.k)
+                    .key("views-switch"),
+                p,
+            )],
+            p,
+        ))
+        .child(settings_section(
             "notifications",
             "Notifications",
             vec![

@@ -329,8 +329,9 @@ A live view's request after a click on its `add` rectangle, and its reply:
 
 ## Checking
 
-Run the pack so its tasks capture files, then open it in the desktop app and show the Report
-pane from `Panes`. A local pack keeps captured files in `state/files/<task>/<path>`, and the
+Views are off until `Draw pack views` is switched on in the app's Settings (`view_plugins = true`
+in its config). Run the pack so its tasks capture files, then open it in the desktop app and show
+the Report pane from `Panes`. A local pack keeps captured files in `state/files/<task>/<path>`, and the
 view redraws when the plugin or those files change.
 
 Headless, from `crucible-desktop/`, for a pack under the repo's `examples/`:

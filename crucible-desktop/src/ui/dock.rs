@@ -74,6 +74,7 @@ pub(crate) fn tools(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
     for kind in PaneKind::ALL
         .into_iter()
         .filter(|kind| *kind != PaneKind::Agent || app.agent_available())
+        .filter(|kind| *kind != PaneKind::Report || app.views_on())
     {
         let mut item = MenuItem::new(kind.label())
             .icon(glyph(kind))

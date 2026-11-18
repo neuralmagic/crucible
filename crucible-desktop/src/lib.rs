@@ -667,6 +667,7 @@ pub fn run() {
                 scene_tab(app);
                 if std::env::var("CRUCIBLE_RUNS_TAB").is_ok_and(|tab| tab == "report") {
                     app.runs_tab = RunsTab::Report;
+                    app.settings.view_plugins = true;
                 }
                 if let Ok(id) = std::env::var("CRUCIBLE_LIVE_SCENE") {
                     app.select(Selection::playbook(&id));

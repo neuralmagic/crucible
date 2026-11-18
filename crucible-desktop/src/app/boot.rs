@@ -280,6 +280,7 @@ pub(crate) fn scene_tab(app: &mut App) {
         .into_iter()
         .find(|kind| kind.label().eq_ignore_ascii_case(&tab))
     {
+        app.settings.view_plugins |= kind == PaneKind::Report;
         match &mut app.layout {
             Some(layout) => layout.activate(kind),
             None => app.shown.push(kind),

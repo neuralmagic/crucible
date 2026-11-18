@@ -200,6 +200,8 @@ pub struct Settings {
     pub keys: BTreeMap<String, Vec<String>>,
     /// Check the shown pack file with crucible-lsp.
     pub checks: bool,
+    /// Draw the views packs ship, which runs their plugins.
+    pub view_plugins: bool,
     /// The profiles as written, each read on its own so one bad profile spoils only itself.
     profiles: BTreeMap<String, toml::Value>,
     /// The profile in use, by name.
@@ -249,6 +251,7 @@ struct Config {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     keys: BTreeMap<String, Vec<String>>,
     checks: Option<bool>,
+    view_plugins: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -323,6 +326,7 @@ impl Settings {
             editor_command: config.editor_command.unwrap_or_default(),
             keys: config.keys,
             checks: config.checks.unwrap_or(true),
+            view_plugins: config.view_plugins.unwrap_or(false),
             profiles: config.profiles,
             profile: config.profile,
             act_as: config.act_as,
@@ -512,6 +516,11 @@ impl Settings {
         self.save();
     }
 
+    pub fn set_view_plugins(&mut self, on: bool) {
+        self.view_plugins = on;
+        self.save();
+    }
+
     pub fn set_filters(&mut self, filters: crate::filter::Filters) {
         self.filters = filters;
         self.save();
@@ -593,6 +602,7 @@ impl Settings {
             editor_command: (!self.editor_command.is_empty()).then(|| self.editor_command.clone()),
             keys: self.keys.clone(),
             checks: Some(self.checks),
+            view_plugins: Some(self.view_plugins),
             profile: self.profile.clone(),
             act_as: self.act_as.clone(),
             profiles: self.profiles.clone(),
@@ -770,6 +780,23 @@ mod tests {
             fs::read_to_string(&path)
                 .unwrap()
                 .contains("check_updates = false")
+        );
+    }
+
+    #[test]
+    fn pack_views_are_off_until_turned_on_and_stay_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crucible-playbooks").join("config.toml");
+        let mut settings = Settings::load_from(path.clone());
+        assert!(!settings.view_plugins);
+        settings.set_theme(Theme::Moss);
+        assert!(!Settings::load_from(path.clone()).view_plugins);
+        settings.set_view_plugins(true);
+        assert!(Settings::load_from(path.clone()).view_plugins);
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("view_plugins = true")
         );
     }
 

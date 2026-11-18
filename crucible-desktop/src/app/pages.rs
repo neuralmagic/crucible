@@ -7,6 +7,15 @@ use crate::{App, Backend, Group, Page, SESSION_AUTH, workspace};
 impl App {
     /// The workspace to draw: the user's own, or one fitted to the graph on screen.
     pub fn workspace(&self) -> Workspace {
+        let mut workspace = self.arranged();
+        if !self.views_on() {
+            workspace.close(PaneKind::Report);
+        }
+        workspace
+    }
+
+    /// The layout as arranged, with every pane it holds.
+    fn arranged(&self) -> Workspace {
         self.layout.clone().unwrap_or_else(|| {
             let tasks = self.shown_tasks();
             let mut fitted = Workspace::for_depth(workspace::depth(

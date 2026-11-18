@@ -8,6 +8,11 @@ use crate::{App, Backend, Open, Page, ReportAsk, RunsTab, Selection, captured, l
 use rune::Tx;
 
 impl App {
+    /// Whether packs' views are drawn: the setting, or a plugin file named at start.
+    pub fn views_on(&self) -> bool {
+        self.settings.view_plugins || self.view_plugin.is_some()
+    }
+
     /// The task a report names, or the fan-out and instance key for `task[key]`.
     fn report_task<'a>(&self, named: &'a str) -> Option<(&'a str, Option<&'a str>)> {
         let tasks = self.run_tasks();
@@ -135,7 +140,10 @@ impl App {
     /// The report the Report pane shows while it is open: the selected local pack's, or the
     /// selected live run's when its pack carries a plugin and its captured files are listed.
     fn wanted_report(&self) -> Option<ReportAsk> {
-        if !self.workspace().showing(PaneKind::Report) || self.runs_page().is_some() {
+        if !self.views_on()
+            || !self.workspace().showing(PaneKind::Report)
+            || self.runs_page().is_some()
+        {
             return None;
         }
         let asked = self.report_shown.shown.asked();
@@ -188,6 +196,9 @@ impl App {
     /// The report the Report tab shows: the selected local pack's, or the one built for the
     /// selected live run.
     pub fn shown_report(&self) -> Option<&std::sync::Arc<report::Report>> {
+        if !self.views_on() {
+            return None;
+        }
         if let Some(pack) = self.selected_pack() {
             return self
                 .local_report
@@ -252,6 +263,9 @@ impl App {
     /// The runs view of the playbook the runs page shows, while its newest launch's pack carries
     /// a plugin: the newest [`report::RUNS`] launches the filters keep.
     fn wanted_runs_report(&self) -> Option<report::WantedRuns> {
+        if !self.views_on() {
+            return None;
+        }
         let (playbook, launches) = self.runs_page()?;
         let (plugin, _) = self.live_plugin()?;
         Some(report::WantedRuns::of(
@@ -264,6 +278,9 @@ impl App {
 
     /// The runs view built for the playbook the runs page shows, when its plugin draws one.
     pub fn runs_view(&self) -> Option<&std::sync::Arc<report::Report>> {
+        if !self.views_on() {
+            return None;
+        }
         let (playbook, _) = self.runs_page()?;
         self.remote.runs_ask.view(playbook)
     }
