@@ -207,6 +207,15 @@ kueue-e2e context loop_image kueue_image controller_image pull_secret push_repo 
         ANTHROPIC_BASE_URL={{anthropic_base_url}} ANTHROPIC_KEY_SECRET={{anthropic_key_secret}} \
         SANDBOX_SCC_ROLE={{sandbox_scc_role}} LOOP_SCC_ROLE={{loop_scc_role}} scripts/kueue-e2e.sh
 
+# A loop image for the kueue e2e of an engine-only change: this checkout's `crucible` over <base>,
+# a published runtime image whose Cargo.lock matches (docker/Containerfile.runtime-overlay). Builds
+# on <context> with the buildit CLI and prints the digest-pinned ref last. Further arguments go to
+# buildit, e.g. `--cache-hostpath <path> --node <node>` to keep the cargo cache between builds.
+runtime-overlay context namespace base tag *args:
+    buildit build {{tag}} --kubecontext {{context}} -n {{namespace}} \
+        -f docker/Containerfile.runtime-overlay -c . --build-arg BASE={{base}} \
+        --request cpu=32 --request memory=64Gi {{args}}
+
 # kueue-e2e with a cluster's values from e2e/kueue/clusters/<name>.env (git-ignored; copy
 # openshift.env.example or kubernetes.env.example). Pass pack= to launch another pack.
 kueue-e2e-cluster name loop_image kueue_image controller_image pack="e2e/kueue/pack":

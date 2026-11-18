@@ -1,0 +1,30 @@
+# produces: a runtime image for e2e runs of an engine-only change
+# BASE is a published ghcr.io/neuralmagic/crucible image whose Cargo.lock matches this checkout.
+# Only `crucible` is compiled and laid over it; every other binary is BASE's. amd64 only.
+
+ARG BASE=unset--pass-build-arg-BASE
+
+FROM registry.access.redhat.com/ubi10/ubi:10.2 AS bins
+RUN dnf install -y --nodocs \
+        gcc gcc-c++ make cmake \
+        openssl-devel pkgconfig zlib-devel \
+        git curl tar gzip findutils unzip \
+    && dnf clean all \
+    && curl -fsSL -o /tmp/protoc.zip \
+        https://github.com/protocolbuffers/protobuf/releases/download/v28.3/protoc-28.3-linux-x86_64.zip \
+    && unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*' \
+    && rm /tmp/protoc.zip \
+    && protoc --version
+ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
+RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path \
+    && cargo --version
+WORKDIR /src
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/target \
+    cargo build --release --locked -p crucible --bin crucible --features crucible/autoresearch \
+    && cp target/release/crucible /crucible
+
+FROM ${BASE}
+COPY --from=bins /crucible /usr/local/bin/crucible
