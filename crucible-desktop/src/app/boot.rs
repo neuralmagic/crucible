@@ -1,5 +1,7 @@
 //! Starting the app: its first state, its workers, and the poll that folds their answers in.
 
+#[cfg(target_os = "linux")]
+use crate::instance;
 use crate::link::Link;
 use crate::logline::LogView;
 use crate::model::Client;
