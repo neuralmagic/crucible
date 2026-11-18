@@ -5,7 +5,8 @@
 use rune::{El, col, row, text};
 use rune_kit::{Button, ButtonVariant, Switch, TextArea};
 
-use crate::admin::{Action, CursorFrom, TestFireForm, relative};
+use crate::admin::forms::{CursorFrom, TestFireForm};
+use crate::admin::{Action, relative};
 use crate::ui::desk::{card, heading, landed, none, now, pills, stacked};
 use crate::ui::{Paint, Tone, flag, tag};
 use crate::{App, Selection};

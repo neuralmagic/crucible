@@ -16,7 +16,7 @@ use crate::{GraphSource, Launcher, admin, captured, finder, live, preview};
 
 pub struct Remote {
     pub target: Target,
-    pub live_client: live::Client,
+    pub live_client: live::client::Client,
     pub live_seen: u64,
     pub live: Arc<LiveView>,
     pub live_detail: Option<Arc<LiveDetail>>,
@@ -39,13 +39,13 @@ pub struct Remote {
     /// The newest drop reply taken.
     pub dropped_seen: u64,
 
-    pub admin_client: admin::Client,
+    pub admin_client: admin::client::Client,
     pub admin_seen: u64,
     pub admin_sent: Option<admin::Watch>,
     /// Schedules, secrets, shares and decision requests as last read.
     pub admin: admin::AdminView,
     /// The management pages' picks and half-filled forms.
-    pub desk: admin::Desk,
+    pub desk: admin::desk::Desk,
 
     /// The run finder, while open.
     pub finder: Option<finder::Finder>,
@@ -107,7 +107,7 @@ impl Remote {
         let connector = net.connector(target.clone());
         let remote = Remote {
             target,
-            live_client: live::Client::spawn(connector.clone(), drafts.clone()),
+            live_client: live::client::Client::spawn(connector.clone(), drafts.clone()),
             live_seen: 0,
             live: Arc::default(),
             live_detail: None,
@@ -120,11 +120,11 @@ impl Remote {
             notified: 0,
             pinned: None,
             dropped_seen: 0,
-            admin_client: admin::Client::spawn(connector.clone()),
+            admin_client: admin::client::Client::spawn(connector.clone()),
             admin_seen: 0,
             admin_sent: None,
             admin: admin::AdminView::default(),
-            desk: admin::Desk::default(),
+            desk: admin::desk::Desk::default(),
             finder: None,
             finder_client: finder::Client::spawn(connector),
             finder_seen: 0,

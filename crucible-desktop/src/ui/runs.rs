@@ -11,9 +11,9 @@ use crate::runs::{
 };
 use crate::ui::Flight;
 use crate::ui::desk;
-use crate::ui::{
-    Paint, SECTION, TITLE, age, meter, pulsing, runs_note, stat, verdict_color, verdict_icon,
-};
+use crate::ui::detail::{runs_note, stat};
+use crate::ui::sidebar::{age, verdict_color, verdict_icon};
+use crate::ui::{Paint, SECTION, TITLE, meter, pulsing};
 use crate::{App, RunsTab, Selection};
 use jiff::tz::TimeZone;
 use rune_kit::Spinner;

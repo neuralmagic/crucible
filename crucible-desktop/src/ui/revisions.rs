@@ -10,7 +10,8 @@ use rune_theme_opencode::icons as oc;
 
 use crate::live::LiveView;
 use crate::revisions::{self, Fire, Landed, Placement, Range, Read};
-use crate::ui::{Paint, Tone, age, desk, flag, rail};
+use crate::ui::sidebar::age;
+use crate::ui::{Paint, Tone, desk, flag, rail};
 use crate::workspace::PaneKind;
 use crate::{App, Selection};
 

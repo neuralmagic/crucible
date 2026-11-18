@@ -7,9 +7,11 @@ use rune_kit::{Button, ButtonVariant, ControlSize, Menu, MenuItem, Placement};
 use rune_theme_opencode::icons as oc;
 
 use crate::keymap::Command;
+use crate::ui::detail::empty_run;
+use crate::ui::sidebar::tube;
 use crate::ui::{
-    Paint, Pane, agent, compare, data, empty_run, files, fx, graph, launch, log, pack, report,
-    revisions, tasks, timeline, transcript, tube,
+    Paint, Pane, agent, compare, data, files, fx, graph, launch, log, pack, report, revisions,
+    tasks, timeline, transcript,
 };
 use crate::workspace::{At, Divider, Dock, Edge, Group, PaneDrag, PaneKind, hit};
 use crate::{App, gfx};

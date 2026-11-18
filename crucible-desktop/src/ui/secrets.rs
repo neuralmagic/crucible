@@ -5,7 +5,8 @@ use rune::{El, Tx, col, row, text};
 use rune_kit::{Button, ButtonVariant, SidebarRow, Switch, TextArea, TextInput};
 
 use crate::App;
-use crate::admin::{Action, SECRET_KINDS, SecretForm, SecretView, relative};
+use crate::admin::forms::{SECRET_KINDS, SecretForm};
+use crate::admin::{Action, SecretView, relative};
 use crate::ui::desk::{
     card, confirm, field, frame, heading, landed, list, none, now, pills, reading,
 };

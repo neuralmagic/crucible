@@ -14,7 +14,8 @@ use rune_theme_opencode::icons as oc;
 
 use crate::camera;
 use crate::session::{Instance, TaskState, TaskView};
-use crate::ui::{Paint, Pane, empty_run};
+use crate::ui::detail::empty_run;
+use crate::ui::{Paint, Pane};
 use crate::{App, GraphSource};
 
 pub(crate) fn graph_view(pane: &Pane, app: &App, p: &Paint) -> El {

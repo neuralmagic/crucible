@@ -6,7 +6,8 @@ use rune_kit::{Button, ButtonVariant, ControlSize, SegmentedControl, Switch, Tex
 
 use crate::App;
 use crate::profile::{Auth, Form, Readiness};
-use crate::ui::{Paint, rule, setting_row};
+use crate::ui::settings::setting_row;
+use crate::ui::{Paint, rule};
 
 const FIELD: f32 = 400.0;
 

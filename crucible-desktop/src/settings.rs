@@ -274,13 +274,16 @@ impl Settings {
         if unreadable.is_none()
             && config.profiles.is_empty()
             && let Some(dir) = path.parent().and_then(Path::parent)
-            && let Ok(text) = fs::read_to_string(crate::profile::tauri_config(dir))
+            && let Ok(text) = fs::read_to_string(crate::profile::tauri::tauri_config(dir))
         {
             let crux_url = crux::config::ConnectArgs::from_env()
                 .resolve()
                 .map(|c| c.url)
                 .unwrap_or_default();
-            adopt_tauri(&mut config, crate::profile::from_tauri(&text, &crux_url));
+            adopt_tauri(
+                &mut config,
+                crate::profile::tauri::from_tauri(&text, &crux_url),
+            );
         }
         let tx02 = config
             .tx02_path
@@ -634,7 +637,7 @@ pub fn families() -> (&'static str, &'static str) {
 
 /// Take the retired Tauri app's profiles, the one it opened by default and its drop ceilings,
 /// where `config` sets none of its own.
-fn adopt_tauri(config: &mut Config, old: crate::profile::Tauri) {
+fn adopt_tauri(config: &mut Config, old: crate::profile::tauri::Tauri) {
     config.profiles = old
         .profiles
         .iter()
@@ -778,7 +781,7 @@ mod tests {
     fn with_no_profiles_of_its_own_the_app_takes_the_tauri_apps() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("crucible-playbooks").join("config.toml");
-        let tauri = crate::profile::tauri_config(dir.path());
+        let tauri = crate::profile::tauri::tauri_config(dir.path());
         fs::create_dir_all(tauri.parent().unwrap()).unwrap();
         fs::write(
             &tauri,
@@ -893,7 +896,7 @@ proxxy = "socks5://127.0.0.1:1080"
     fn a_file_that_does_not_read_is_reported_and_never_saved_over() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("crucible-playbooks").join("config.toml");
-        let tauri = crate::profile::tauri_config(dir.path());
+        let tauri = crate::profile::tauri::tauri_config(dir.path());
         fs::create_dir_all(tauri.parent().unwrap()).unwrap();
         fs::write(&tauri, "[profiles.old]\nurl = \"http://127.0.0.1:8870\"\n").unwrap();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
