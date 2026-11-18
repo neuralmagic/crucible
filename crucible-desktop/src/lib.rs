@@ -35,6 +35,8 @@ mod keymap;
 mod keys;
 mod link;
 mod live;
+#[cfg(not(target_arch = "wasm32"))]
+mod local_controller;
 mod logline;
 mod lsp;
 mod model;
@@ -1980,6 +1982,14 @@ pub fn start() {
 }
 
 pub fn run() {
+    #[cfg(not(target_arch = "wasm32"))]
+    if std::env::args().nth(1).as_deref() == Some(local_controller::FLAG) {
+        if let Err(error) = local_controller::run() {
+            eprintln!("{error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     #[cfg(not(target_arch = "wasm32"))]
     if std::env::args().nth(1).as_deref() == Some(profile::KEEP_FLAG) {
         std::process::exit(profile::keep());

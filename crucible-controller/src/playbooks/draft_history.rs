@@ -246,7 +246,7 @@ mod tests {
         files.insert("skills/review.md".to_string(), "review\n".to_string());
         files.insert(
             "workflow.star".to_string(),
-            SKELETON_WORKFLOW.replace("echo hello", "echo hi"),
+            SKELETON_WORKFLOW.replace("message", "greeting"),
         );
         save_version(&pool, "studio", files.clone(), Some("ada"), Some(1))
             .await
@@ -334,7 +334,7 @@ mod tests {
         let mut files = skeleton();
         files.insert(
             "workflow.star".to_string(),
-            SKELETON_WORKFLOW.replace("echo hello", "echo hi"),
+            SKELETON_WORKFLOW.replace("message", "greeting"),
         );
         files.insert("skills/review.md".to_string(), "review\n".to_string());
         save_version(&pool, "studio", files, None, Some(1))
@@ -371,11 +371,13 @@ mod tests {
             unified.starts_with("--- a/workflow.star\n+++ b/workflow.star\n@@ "),
             "{unified}"
         );
+        let before = SKELETON_WORKFLOW
+            .lines()
+            .find(|line| line.starts_with("hello ="))
+            .unwrap();
+        let after = before.replace("message", "greeting");
         assert!(
-            unified.contains(
-                "\n-hello = command(name = \"hello\", run = \"echo hello\")\n\
-                 +hello = command(name = \"hello\", run = \"echo hi\")\n"
-            ),
+            unified.contains(&format!("\n-{before}\n+{after}\n")),
             "{unified}"
         );
     }

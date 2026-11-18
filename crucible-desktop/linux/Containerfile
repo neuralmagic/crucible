@@ -1,4 +1,6 @@
+FROM oven/bun:1.4.4 AS bun
 FROM registry.fedoraproject.org/fedora:45
+COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
 COPY deps.sh /tmp/deps.sh
 RUN sh /tmp/deps.sh
 ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH

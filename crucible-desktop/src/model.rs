@@ -667,10 +667,17 @@ fn read_start(dir: &Path) -> String {
     time
 }
 
-/// The binary the Run button spawns: an override beats the checkout's build, which beats `$PATH`.
+/// An explicit engine override takes precedence over the bundled engine and development builds.
 pub fn crucible_binary(repo: &Path) -> PathBuf {
     if let Ok(bin) = std::env::var("CRUCIBLE_BIN") {
         return PathBuf::from(bin);
+    }
+    if let Some(bundled) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.join("crucible")))
+        .filter(|path| path.is_file())
+    {
+        return bundled;
     }
     for candidate in ["target/debug/crucible", "target/release/crucible"] {
         let path = repo.join(candidate);

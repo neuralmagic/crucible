@@ -17,11 +17,17 @@ controller or local packs.
 %install
 install -Dm755 %{_sourcedir}/crucible-playbooks %{buildroot}%{_bindir}/crucible-playbooks
 install -Dm755 %{_sourcedir}/crucible-lsp %{buildroot}%{_bindir}/crucible-lsp
+install -Dm755 %{_sourcedir}/crucible-controller %{buildroot}%{_bindir}/crucible-controller
+install -Dm755 %{_sourcedir}/crucible %{buildroot}%{_bindir}/crucible
+install -Dm755 %{_sourcedir}/crux %{buildroot}%{_bindir}/crux
 install -Dm644 %{_sourcedir}/dev.crucible.playbooks.desktop %{buildroot}%{_datadir}/applications/dev.crucible.playbooks.desktop
 install -Dm644 %{_sourcedir}/icon.png %{buildroot}%{_datadir}/icons/hicolor/512x512/apps/dev.crucible.playbooks.png
 
 %files
 %{_bindir}/crucible-playbooks
 %{_bindir}/crucible-lsp
+%{_bindir}/crucible-controller
+%{_bindir}/crucible
+%{_bindir}/crux
 %{_datadir}/applications/dev.crucible.playbooks.desktop
 %{_datadir}/icons/hicolor/512x512/apps/dev.crucible.playbooks.png

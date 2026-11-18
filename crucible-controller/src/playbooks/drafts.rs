@@ -35,12 +35,12 @@ pub(crate) const MAX_DRAFT_SAVE_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const SKELETON_MANIFEST: &str =
     "[agent]\n\n[workflow]\ntype = \"playbook\"\nfile = \"workflow.star\"\n";
 
-/// The workflow a draft starts from: the smallest graph that compiles, so the studio opens on a
-/// green preview rather than on a diagnostic.
+/// The initial workflow compiles and runs without agent credentials or external services.
 pub(crate) const SKELETON_WORKFLOW: &str = concat!(
     "params = {}\n",
     "\n",
-    "hello = command(name = \"hello\", run = \"echo hello\")\n",
+    r#"hello = command(name = "hello", run = "echo '{\"ok\": true, \"message\": \"hello\"}'")"#,
+    "\n",
     "\n",
     "workflow(type = \"playbook\", tasks = [hello], result = hello)\n",
 );
@@ -1708,6 +1708,45 @@ mod tests {
             ("crucible.toml".to_string(), SKELETON_MANIFEST.to_string()),
             ("workflow.star".to_string(), SKELETON_WORKFLOW.to_string()),
         ])
+    }
+
+    #[test]
+    fn the_skeleton_draft_runs_successfully_without_edits() {
+        use crucible::plan::exec::{ExecCfg, Substrate, execute};
+        use crucible::plan::runner::ShellRunner;
+
+        let pack = tempfile::tempdir().unwrap();
+        for (name, contents) in skeleton() {
+            std::fs::write(pack.path().join(name), contents).unwrap();
+        }
+        let mut manifest =
+            crucible::manifest::Manifest::load(&pack.path().join("crucible.toml")).unwrap();
+        manifest.resolve_workflow(pack.path()).unwrap();
+        let plan = manifest.workflow.as_ref().unwrap().playbook_plan().unwrap();
+        let mut runner = ShellRunner {
+            workdir: pack.path().to_path_buf(),
+            agent_cmd: None,
+            env: Default::default(),
+            buildit_socket: None,
+            github: false,
+            task_servers: Vec::new(),
+        };
+        let outcome = execute(
+            &plan,
+            &Substrate::default(),
+            ExecCfg {
+                wall_clock: Some(std::time::Duration::from_secs(5)),
+                ..Default::default()
+            },
+            &mut runner,
+            |_, _| {},
+        )
+        .unwrap();
+        assert!(outcome.valid, "{:?}", outcome.results);
+        assert_eq!(
+            outcome.results[&"hello".into()].output,
+            Some(serde_json::json!({"ok": true, "message": "hello"})),
+        );
     }
 
     /// A save whose files each fit the per-file cap, but whose delivered tarball is over the

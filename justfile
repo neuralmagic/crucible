@@ -310,7 +310,7 @@ desktop-run:
 
 # Build the release binary and open it as a bundled .app with the dock icon, crucible-lsp inside.
 desktop-release *args:
-    cargo build --release -p crucible-lsp
+    sh crucible-desktop/build-runtime.sh
     sh crucible-desktop/rune-patches.sh
     cd crucible-desktop && cargo build --release
     sh crucible-desktop/macos-bundle.sh
@@ -318,7 +318,7 @@ desktop-release *args:
 
 # Build and install the release .app, crucible-lsp inside, into ~/Applications.
 desktop-install:
-    cargo build --release -p crucible-lsp
+    sh crucible-desktop/build-runtime.sh
     sh crucible-desktop/rune-patches.sh
     cd crucible-desktop && cargo build --release
     sh crucible-desktop/macos-bundle.sh
@@ -408,7 +408,7 @@ desktop-linux-vm:
 # Build the desktop app's Fedora RPM, in a container, into crucible-desktop/target/linux.
 desktop-linux version="0.0.0":
     VERSION={{ version }} just desktop-fedora 'sh crucible-desktop/rune-patches.sh \
-        && cargo build --release --locked -p crucible-lsp \
+        && sh crucible-desktop/build-runtime.sh \
         && (cd crucible-desktop && cargo build --release --locked) \
         && sh crucible-desktop/linux-bundle.sh'
 

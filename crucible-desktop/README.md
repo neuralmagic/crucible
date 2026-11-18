@@ -74,11 +74,16 @@ tunnel = "ssh -N -D 1080 jumpbox"      # kept running while the app is
 shell = "/bin/bash"                    # runs it as `<shell> -l -c`; `$SHELL` when unset
 
 [profiles.local]
-url = "http://127.0.0.1:8870"          # starts `just controller-local 8870` in the repo
+url = "http://127.0.0.1:8870"          # starts the bundled local controller
 ```
 
 A tunnel (or, for a loopback profile, the local controller) starts the first time its profile is
 used, unless something already answers at its proxy or URL, and the profile waits until it does.
+The installed app includes `crucible-controller`, `crucible`, and `crux`; it needs no source
+checkout, Rust toolchain, Bun, or `just`. The local controller stores its database and run state
+under `${XDG_STATE_HOME:-$HOME/.local/state}/crucible-controller`. On first use it downloads
+Postgres into `~/.theseus/postgresql`. Source builds can prepare the runtime with
+`sh crucible-desktop/build-runtime.sh` before `just desktop-run`.
 It runs under the app's own binary (`crucible-playbooks --keep`) as a supervisor, which kills the
 tunnel's process group when the app's end of a pipe closes, so it stops with the app however the
 app stops, crash included. A tunnel that stops after it has answered is started again, after 2s
@@ -94,6 +99,9 @@ controller's `/auth/native` page, you sign in and approve, and the controller ha
 `config.toml` with `auth = "crux"`, so the `crux` CLI is signed in too. For a controller the
 browser cannot reach, paste a `crk_` key instead. Keys can be revoked in the controller's Settings
 like any other key.
+
+Browser sign-in needs a profile URL that serves `/auth/native` and `/auth/native/token`.
+An API-only hostname exposing `/api` and `/mcp` needs a pasted key instead.
 
 Settings' `Keys in keychain` switch (`keychain = true` in the config) keeps those keys in the
 system credential store instead: the macOS Keychain, or the Secret Service on Linux, under the
