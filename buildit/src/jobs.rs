@@ -26,6 +26,7 @@ use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1 as core;
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
+use k8s_openapi::jiff::{SignedDuration, Timestamp};
 use rmcp::schemars;
 
 use crate::backend::{Resources, StorageDriver};
@@ -39,6 +40,8 @@ pub const LABEL_RECIPE: &str = "buildit.dev/recipe";
 pub const LABEL_KIND: &str = "buildit.dev/kind";
 pub const LABEL_RUN: &str = "buildit.dev/run";
 pub const ANNOTATION_CANCELLED: &str = "buildit.dev/cancelled";
+/// On a Job buildit ended because its pod could not start; the value is why.
+pub const ANNOTATION_UNSTARTABLE: &str = "buildit.dev/unstartable";
 const LABEL_QUEUE: &str = "kueue.x-k8s.io/queue-name";
 
 const BUILDAH_IMAGE: &str = "quay.io/buildah/stable:latest";
@@ -1104,6 +1107,17 @@ pub fn observe(job: &Job, pod: Option<&core::Pod>, main: &str) -> Observed {
             digest: None,
         };
     }
+    let unstartable = job
+        .metadata
+        .annotations
+        .as_ref()
+        .is_some_and(|a| a.contains_key(ANNOTATION_UNSTARTABLE));
+    if unstartable {
+        return Observed::Ended {
+            state: State::Lost,
+            digest: None,
+        };
+    }
     if failed.is_some_and(|f| f.reason.as_deref() == Some("DeadlineExceeded")) {
         return Observed::Ended {
             state: State::Expired,
@@ -1131,25 +1145,58 @@ pub fn observe(job: &Job, pod: Option<&core::Pod>, main: &str) -> Observed {
     Observed::Running
 }
 
+/// How long a pod's container may fail to start before buildit ends its step.
+pub const UNSTARTABLE_AFTER: SignedDuration = SignedDuration::from_secs(120);
+
+/// A pod with a container the kubelet cannot start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stuck {
+    pub why: String,
+    /// When the kubelet first could have started the container: the pod's scheduling for an
+    /// init container, the end of its init containers for the others.
+    pub since: Option<Timestamp>,
+}
+
+impl Stuck {
+    pub fn for_good(&self, now: Timestamp) -> bool {
+        self.since
+            .is_some_and(|since| now.duration_since(since) >= UNSTARTABLE_AFTER)
+    }
+}
+
 /// Why a pod's container cannot start, once the kubelet says more than that it is on its way.
-pub fn stuck(pod: &core::Pod) -> Option<String> {
+pub fn stuck(pod: &core::Pod) -> Option<Stuck> {
     let status = pod.status.as_ref()?;
-    status
-        .init_container_statuses
-        .iter()
-        .chain(&status.container_statuses)
-        .flatten()
-        .find_map(|c| {
-            let waiting = c.state.as_ref()?.waiting.as_ref()?;
-            let reason = waiting.reason.as_deref()?;
-            if matches!(reason, "PodInitializing" | "ContainerCreating") {
-                return None;
-            }
-            let message = waiting.message.as_deref().unwrap_or_default();
-            Some(format!(
-                "container {} cannot start: {reason}: {message}",
-                c.name
-            ))
+    let since = |condition: &str| {
+        status
+            .conditions
+            .iter()
+            .flatten()
+            .find(|c| c.type_ == condition && c.status == "True")
+            .and_then(|c| c.last_transition_time.as_ref())
+            .map(|t| t.0)
+    };
+    let why = |c: &core::ContainerStatus| {
+        let waiting = c.state.as_ref()?.waiting.as_ref()?;
+        let reason = waiting.reason.as_deref()?;
+        if matches!(reason, "PodInitializing" | "ContainerCreating") {
+            return None;
+        }
+        let message = waiting.message.as_deref().unwrap_or_default();
+        Some(format!(
+            "container {} cannot start: {reason}: {message}",
+            c.name
+        ))
+    };
+    let init = status.init_container_statuses.iter().flatten();
+    let main = status.container_statuses.iter().flatten();
+    init.map(|c| (c, "PodScheduled"))
+        .chain(main.map(|c| (c, "Initialized")))
+        .find_map(|(c, condition)| {
+            Some(Stuck {
+                why: why(c)?,
+                since: since(condition),
+            })
         })
 }
 
@@ -1377,7 +1424,8 @@ mod tests {
     use crate::jobs::{
         BuildJob, Builder, Compression, Engine, Ident, LayerCache, LayerCacheRefs,
         LayerCacheWriter, LayerJob, Observed, PodUsers, PushJob, Registry, RunJob, RunMount, Site,
-        build_job, layer_cache_refs, layer_job, observe, push_job, run_job, stuck,
+        UNSTARTABLE_AFTER, build_job, layer_cache_refs, layer_job, observe, push_job, run_job,
+        stuck,
     };
     use crate::step::State;
 
@@ -2213,15 +2261,21 @@ mod tests {
                     "restartCount": 0, "state": state
                 })
             };
+            let condition = |kind: &str, at: &str| serde_json::json!({ "type": kind, "status": "True", "lastTransitionTime": at });
             serde_json::from_value(serde_json::json!({
                 "metadata": { "name": "buildit-1-x" },
                 "status": {
+                    "conditions": [
+                        condition("PodScheduled", "2026-01-01T00:00:00Z"),
+                        condition("Initialized", "2026-01-01T00:05:00Z"),
+                    ],
                     "initContainerStatuses": [status("context", init)],
                     "containerStatuses": [status("layer", main)]
                 }
             }))
             .unwrap()
         };
+        let at = |t: &str| t.parse::<k8s_openapi::jiff::Timestamp>().unwrap();
         let done = serde_json::json!({ "terminated": { "exitCode": 0 } });
         let on_its_way = |reason: &str| serde_json::json!({ "waiting": { "reason": reason } });
         assert_eq!(stuck(&pod(None)), None);
@@ -2236,28 +2290,79 @@ mod tests {
             stuck(&waiting(done.clone(), on_its_way("ContainerCreating"))),
             None
         );
+        let main = stuck(&waiting(
+            done.clone(),
+            serde_json::json!({ "waiting": {
+                "reason": "ImagePullBackOff",
+                "message": "Back-off pulling image r/b@sha256:ab"
+            }}),
+        ))
+        .unwrap();
         assert_eq!(
-            stuck(&waiting(
-                done.clone(),
-                serde_json::json!({ "waiting": {
-                    "reason": "ImagePullBackOff",
-                    "message": "Back-off pulling image r/b@sha256:ab"
-                }})
-            ))
-            .as_deref(),
-            Some(
-                "container layer cannot start: ImagePullBackOff: Back-off pulling image r/b@sha256:ab"
-            )
+            main.why,
+            "container layer cannot start: ImagePullBackOff: Back-off pulling image r/b@sha256:ab"
         );
+        assert_eq!(main.since, Some(at("2026-01-01T00:05:00Z")));
+        assert!(!main.for_good(at("2026-01-01T00:06:59Z")));
+        assert!(main.for_good(at("2026-01-01T00:05:00Z") + UNSTARTABLE_AFTER));
+        let init = stuck(&waiting(
+            serde_json::json!({ "waiting": { "reason": "ErrImagePull", "message": "denied" } }),
+            on_its_way("PodInitializing"),
+        ))
+        .unwrap();
         assert_eq!(
-            stuck(&waiting(
-                serde_json::json!({ "waiting": { "reason": "ErrImagePull", "message": "denied" } }),
-                on_its_way("PodInitializing")
-            ))
-            .as_deref(),
-            Some("container context cannot start: ErrImagePull: denied")
+            init.why,
+            "container context cannot start: ErrImagePull: denied"
         );
+        assert_eq!(init.since, Some(at("2026-01-01T00:00:00Z")));
+        assert!(init.for_good(at("2026-01-01T00:02:00Z")));
         assert_eq!(stuck(&waiting(done.clone(), done)), None);
+
+        let mut undated = waiting(
+            serde_json::json!({ "terminated": { "exitCode": 0 } }),
+            serde_json::json!({ "waiting": { "reason": "InvalidImageName" } }),
+        );
+        undated.status.as_mut().unwrap().conditions = None;
+        let undated = stuck(&undated).unwrap();
+        assert_eq!(
+            undated.why,
+            "container layer cannot start: InvalidImageName: "
+        );
+        assert!(!undated.for_good(at("2030-01-01T00:00:00Z")));
+    }
+
+    #[test]
+    fn a_job_buildit_gave_up_on_ended_lost() {
+        let template = serde_json::json!({ "spec": { "containers": [] } });
+        let spec = serde_json::json!({ "suspend": false, "template": template });
+        let gave_up = |status: serde_json::Value| {
+            let mut job = job(spec.clone(), status, false);
+            job.metadata.annotations = Some(BTreeMap::from([(
+                "buildit.dev/unstartable".to_string(),
+                "container layer cannot start: ErrImagePull: denied".to_string(),
+            )]));
+            job
+        };
+        let lost = Observed::Ended {
+            state: State::Lost,
+            digest: None,
+        };
+        let pending = pod(None);
+        assert_eq!(
+            observe(&gave_up(serde_json::json!({})), Some(&pending), "builder"),
+            lost
+        );
+        let deadline = serde_json::json!({ "conditions": [{
+            "type": "Failed", "status": "True", "reason": "DeadlineExceeded"
+        }]});
+        assert_eq!(observe(&gave_up(deadline.clone()), None, "builder"), lost);
+        assert_eq!(
+            observe(&job(spec.clone(), deadline, false), None, "builder"),
+            Observed::Ended {
+                state: State::Expired,
+                digest: None,
+            }
+        );
     }
 
     #[test]

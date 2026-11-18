@@ -1706,6 +1706,20 @@ impl Broker {
             .await
     }
 
+    /// Ends a Job whose pod cannot start, keeping `why` on it.
+    async fn give_up(&self, job: &str, why: &str) -> Result<()> {
+        let patch = serde_json::json!({
+            "metadata": { "annotations": { (jobs::ANNOTATION_UNSTARTABLE): why } },
+            "spec": { "activeDeadlineSeconds": 1 },
+        });
+        self.jobs_api()
+            .patch(job, &PatchParams::default(), &Patch::Merge(&patch))
+            .await
+            .with_context(|| format!("ending unstartable job {job}"))?;
+        tracing::info!("job {job} ended: {why}");
+        Ok(())
+    }
+
     /// Archives an ended step's exit record when its pod left none, as one killed before it
     /// wrote it does, so the step's end outlives its Job.
     async fn record_end(
@@ -1861,8 +1875,18 @@ impl Broker {
                 Seen::ended(state, digest, Some((created.clone(), ended)))
             }
         };
-        seen.context_digest = context_digest;
-        seen.stuck = pod.as_ref().and_then(jobs::stuck);
+        seen.context_digest = context_digest.clone();
+        seen.stuck = annotation(&job.metadata, jobs::ANNOTATION_UNSTARTABLE).map(str::to_string);
+        if seen.working == Some(Working::Running)
+            && let Some(stuck) = pod.as_ref().and_then(jobs::stuck)
+        {
+            if stuck.for_good(k8s_openapi::jiff::Timestamp::now()) {
+                self.give_up(&name, &stuck.why).await?;
+                seen = Seen::ended(step::State::Lost, None, Some((created, now_string())));
+                seen.context_digest = context_digest;
+            }
+            seen.stuck = Some(stuck.why);
+        }
         seen.builder = annotation(&job.metadata, ANNOTATION_BUILDER).and_then(jobs::Builder::parse);
         let archived = matches!(log, LogName::Run(_))
             || is_layer(&job)
@@ -2327,7 +2351,7 @@ impl Broker {
                 "queued in {}: waiting for Kueue to admit the build",
                 self.site.queue.as_deref().unwrap_or("the build namespace")
             ),
-            (Some(Working::Running), Some(stuck)) => stuck.clone(),
+            (Some(Working::Running) | None, Some(stuck)) => stuck.clone(),
             _ => summary(
                 &self
                     .read_log(sandbox, id, LogName::Build, SUMMARY_WINDOW)
