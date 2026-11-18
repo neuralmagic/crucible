@@ -191,6 +191,11 @@ pub(crate) fn run_from_manifest(mut args: Args) -> Result<()> {
         .map(crate::plan::workflow::WorkflowCfg::host_env)
         .transpose()?
         .unwrap_or_default();
+    args.workflow_servers = m
+        .workflow
+        .as_ref()
+        .map(|w| w.servers.clone())
+        .unwrap_or_default();
     args.buildit_socket = Some(p.buildit_socket());
     let world = m.build_world(workspace.clone())?;
     let judge = m.build_judge(workspace, frozen_injects)?;
@@ -244,8 +249,13 @@ fn run_composite(mut args: Args, manifest_path: PathBuf) -> Result<()> {
                 .clone()
                 .or_else(|| repo.path.clone())
                 .with_context(|| format!("component `{}` [repo] needs url or path", c.name))?;
-            crate::cli::workspace::clone_repo(&src, repo.git_ref.as_ref(), &c.workspace)
-                .with_context(|| format!("cloning component `{}`", c.name))?;
+            crate::cli::workspace::clone_repo(
+                &src,
+                repo.git_ref.as_ref(),
+                repo.filter,
+                &c.workspace,
+            )
+            .with_context(|| format!("cloning component `{}`", c.name))?;
         }
         vcs::ensure_repo(&c.workspace)
             .with_context(|| format!("ensuring component `{}` is a git repo", c.name))?;
@@ -317,6 +327,11 @@ fn run_composite(mut args: Args, manifest_path: PathBuf) -> Result<()> {
         .as_ref()
         .map(crate::plan::workflow::WorkflowCfg::host_env)
         .transpose()?
+        .unwrap_or_default();
+    args.workflow_servers = m
+        .workflow
+        .as_ref()
+        .map(|w| w.servers.clone())
         .unwrap_or_default();
     args.buildit_socket = Some(p.buildit_socket());
     let world = m.build_world(&manifest_dir)?;

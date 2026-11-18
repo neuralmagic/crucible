@@ -845,6 +845,14 @@ impl ControllerCfg {
         set(&self.agent_issuer) && (set(&self.agent_spire) || self.spire.enabled())
     }
 
+    /// Whether the issuer mints tokens that name who a run acts for: an issuer is configured. A
+    /// run's tasks get tokens with no SPIRE; its sandboxes need [`Self::issues_agent_tokens`].
+    pub fn issues_run_tokens(&self) -> bool {
+        self.agent_issuer
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty())
+    }
+
     /// How a pod render pins its image tags: the registry, unless `render_no_pin` is set.
     pub fn digest_resolver(&self) -> Option<std::sync::Arc<dyn crucible::deploy::DigestResolver>> {
         match self.render_no_pin {

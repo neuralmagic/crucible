@@ -91,7 +91,7 @@ A minimal set of objects:
   OpenShift's owner-reference admission checks); `configmaps` and `secrets` create/delete (the
   pack ConfigMap and the run Secret, which holds the pod token and the delivered secrets, both
   owner-referenced to the pod); `secrets` list/patch, with which the leader re-mints a running
-  run's GitHub App token into its Secret every 25 minutes; and `leases` get/create/update/patch
+  run's GitHub App token into its Secret once it has less than 30 minutes left; and `leases` get/create/update/patch
   for leader election;
 - a **Secret** for `CONTROLLER_API_TOKEN` and one for `GITHUB_TOKEN`, referenced by env;
 - a **Service** on the API port;
@@ -131,6 +131,15 @@ If the controller runs loops in other clusters (spokes):
   `CONTROLLER_CLUSTER_POLICY`: a caller fenced off the pinned cluster cannot launch the pack.
   A draft-head schedule saved before its draft added a pin fails its firing until it is saved
   again.
+- The identity in each spoke's kubeconfig needs the Role above in that spoke's loop namespace,
+  without `leases`. Name it in the spoke profile's `[cluster] sandbox_readers` and the loop render
+  emits that grant as the Role `crucible-dispatch`, so it is not written by hand. It includes
+  `secrets` patch. With create and delete alone the hub delivers each run's Secret but every
+  re-mint of its GitHub App token is refused, and the run's GitHub calls answer 401 an hour after
+  dispatch. The verb cannot be limited to run Secrets by `resourceNames`, because each is named
+  after its pod (`<pod>-secrets`) and a Role lists exact names.
+  `kubectl --kubeconfig <spoke kubeconfig> auth can-i patch secrets -n <loop namespace>` answers
+  whether a spoke has it.
 - If the hub cannot reach a spoke, the spoke sends reports to the hub.
   `crucible-controller cluster-snapshot` runs on the spoke as a CronJob and posts to the push
   endpoint of the hub with a bearer token that the hub lists in `CONTROLLER_PUSH_TOKENS`.
@@ -222,6 +231,11 @@ For the controller's identity, `sandbox_readers` is granted: `sandboxes` get/lis
 pod's deletion); `services`, `secrets` and `networkpolicies` list/create/delete in the sandbox
 namespace; and `services` list/create/delete in the loop namespace.
 
+Whatever the gateway mode, `sandbox_readers` is also granted the Role `crucible-dispatch` in the
+loop namespace, which is what the controller dispatches and collects run pods with: `pods`
+create/get/list/watch/delete, `pods/log` get, `pods/finalizers` update, `configmaps`
+create/delete, and `secrets` create/delete/list/patch. It has no `get` on Secrets.
+
 Grounded-rank and scope turns get a gateway of their own the same way, with certificates valid for
 the turn's deadline; a failed launch tears it down, and the gateway sweep removes it once the
 turn's row closes. Turn sandboxes are never bound, so they get no agent tokens.
@@ -229,6 +243,31 @@ turn's row closes. Turn sandboxes are never bound, so they get no agent tokens.
 Supervisors of runs that get agent servers mount the SPIFFE Workload API (the `csi.spiffe.io`
 driver) at `/spiffe-workload-api/spire-agent.sock`; `[cluster] sandbox_spiffe_socket` names another
 path. Runs without agent servers mount none, so a cluster without SPIRE still starts sandboxes.
+
+Task tokens (the tokens a pack's `command` and `evaluate` tasks get for `[workflow] servers`) need
+no SPIRE: the engine exchanges the run's pod token for them. Where the cluster has SPIRE, set
+`[cluster] loop_svid = true` to also require the loop pod's own JWT-SVID, so a pod token copied
+out of the pod mints nothing. The loop pod then mounts the Workload API socket through
+`csi.spiffe.io` at the same path, which the loop namespace's pod security must admit, and the
+cluster needs a ClusterSPIFFEID for loop pods:
+
+```yaml
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: crucible-loop
+spec:
+  jwtTtl: 5m
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: <loop namespace>
+  podSelector:
+    matchLabels:
+      crucible.io/work-kind: run
+  spiffeIDTemplate: 'spiffe://{{ .TrustDomain }}/crucible/run/{{ .PodMeta.Name }}'
+```
+
+The controller refuses a task token whose SVID names another pod or another cluster's SPIRE.
 
 With `[cluster] aws_sandbox_role_arn`, the gateway pod assumes that role with an STS-audienced
 token for its own service account, as the in-pod gateway does with the loop pod's, so the role's
@@ -324,13 +363,22 @@ pod's `[secrets] push_authfile`; without either, buildit pushes nothing. `queue`
 pods to that Kueue LocalQueue in `namespace`; set it where Kueue manages the namespace and holds
 pods that name no queue (`manageJobsWithoutQueueName`), or builds wait 10 minutes and fail.
 `[buildit.builders]` sizes builder pods on every cluster: `node_arch` (their `kubernetes.io/arch`),
-`max_builds` live per sandbox, `pod_deadline_secs`, `requests`/`limits`, and `storage_driver`.
+`max_builds` live per sandbox, `pod_deadline_secs`, `requests`/`limits`, `builder`,
+`storage_driver`, `bud_args`, `layer_cache`, and `layer_compression`.
 `[buildit.cluster_builders.<cluster>]` replaces any of those on one cluster, so a mixed-architecture cluster can pin its builds. Without
 `node_arch`, builder pods run on the loop pod's architecture; unset limits are buildit's defaults
-(4 builds, 7200 s, no requests or limits). `storage_driver` is `vfs` (the default), a full copy
+(4 builds, 7200 s, no requests or limits). `builder` is what builds a Dockerfile when the
+build names no builder: `buildah` (the default) or `buildkit` (experimental), which builds as
+`docker build` does; `buildit/README.md` lists what differs. Apply the builder admission policy of the same release, which admits the BuildKit image. `storage_driver` is `vfs` (the default), a full copy
 of the filesystem per image layer, or `overlay`, each layer stored once with kernel overlayfs in
-buildah's user namespace; `overlay` needs a kernel that allows that (5.13 and later, such as RHEL
-9's).
+the builder's user namespace; `overlay` needs a kernel that allows that (5.13 and later, such as
+RHEL 9's). BuildKit builds use overlayfs either way: with `overlay` a build fails where it does
+not mount, with `vfs` it falls back to copying and says so in its log and `status`. `bud_args` are extra `buildah bud` arguments for every Dockerfile build, placed after
+buildit's own. `layer_cache` is where BuildKit builds keep their layers between builder pods:
+`registry` (the default), `cache-` tags of the repository builds push to, which a registry that
+is never garbage-collected grows with, or `off`. `layer_compression` is how a BuildKit build
+compresses the layers it makes: `zstd` (the default), `gzip` for runtimes older than containerd
+1.5 or Docker 23, or `uncompressed`, which keeps the layers' full size in the registry.
 
 ```toml
 [buildit]
@@ -348,9 +396,13 @@ pod_deadline_secs = 3600
 requests          = { cpu = "8" }
 limits            = { cpu = "32" }
 storage_driver    = "overlay"
+bud_args          = ["--retry", "5"]
 
 [buildit.cluster_builders.spoke-b]                  # optional, per cluster
-node_arch = "amd64"
+node_arch         = "amd64"
+builder           = "buildkit"
+layer_cache       = "registry"
+layer_compression = "gzip"                          # nodes that cannot pull zstd layers
 
 [buildit.cache]                                     # optional, a cache builds share
 clusters     = ["spoke-a"]                          # default the hub; deploy it on each
@@ -365,6 +417,9 @@ with an init container and run it ahead of their own, and the cache runs it unle
 `ghcr.io/neuralmagic/crucible-buildit`, so a buildit-only change rolls by moving this pin; the
 controller reads the profile at each dispatch, and the cache needs `crucible deploy
 --buildit-cache` applied again.
+A tag instead of a digest floats: loop pods pull it every time, so
+`ghcr.io/neuralmagic/crucible-buildit:stable`, which each release moves, follows releases with no
+profile change. The cache is a Deployment and keeps the image it started with until it restarts.
 
 `[buildit.cache]` adds a `buildit cache` in the loop namespace that every build may use: ccache
 objects and stored build outputs shared across runs. `crucible deploy --buildit-cache --profile
@@ -397,8 +452,10 @@ binding projected as `GH_TOKEN` or `GITHUB_TOKEN` (a personal access token, say)
 container and mounts
 it into the sidecar alone, by directory. A variable the binding was projected as still exists in the
 loop container, holding the placeholder `crucible-git`, so a pack's tools find it set and its
-scripts need no change. A minted token is re-minted into the run's Secret by the leader every 25
-minutes, so a long run never pushes with a lapsed one; a personal access token does not expire
+scripts need no change. A minted token is re-minted into the run's Secret by the leader once it has
+less than 30 minutes left, so a long run never pushes with a lapsed one. The leader checks every
+minute and retries a failed re-mint at the next check, logging `GitHub token refresh failed` with
+the run's id; a personal access token does not expire
 hourly and is not refreshed. A run binding two GitHub credentials is refused. An agent-visible
 binding projected as `GH_TOKEN` or `GITHUB_TOKEN` stays as bound, with a warning at dispatch: the
 sandbox reaches GitHub directly, outside `crucible-git`. A minted token under any other variable

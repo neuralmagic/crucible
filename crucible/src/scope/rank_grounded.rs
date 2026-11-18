@@ -24,6 +24,7 @@ use crate::manifest::AgentBackend;
 use anyhow::{Context, Result};
 use crucible_contract::verdict::{Failed, Ruled};
 use crucible_contract::{Disposition, GroundedErrorKind, GroundedVerdict};
+use crucible_vcs::cli::git;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -63,7 +64,7 @@ pub struct RankGroundedArgs {
     pub agent_cmd: Option<String>,
     /// The harness that runs the turn; the claude default when unset.
     #[arg(long, value_enum)]
-    pub harness: Option<crate::manifest::Harness>,
+    pub harness: Option<crate::knobs::Harness>,
     /// Override the turn's model (env fallback: `CRUCIBLE_RANK_MODEL`).
     #[arg(long)]
     pub model: Option<String>,
@@ -196,30 +197,6 @@ fn worktree_path() -> PathBuf {
             .map(|d| d.as_nanos())
             .unwrap_or_default()
     ))
-}
-
-fn git(workspace: &Path, args: &[&str]) -> Result<()> {
-    let status = std::process::Command::new("git")
-        .arg("-C")
-        .arg(workspace)
-        .args(args)
-        .status()
-        .context("running git")?;
-    if !status.success() {
-        return Err(GitFailed {
-            subcommand: args.first().unwrap_or(&"").to_string(),
-            status,
-        }
-        .into());
-    }
-    Ok(())
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("git {subcommand:?} failed ({status})")]
-struct GitFailed {
-    subcommand: String,
-    status: std::process::ExitStatus,
 }
 
 /// Accumulate the agent's textual output so the verdict can be scraped from its last line: streamed
@@ -358,7 +335,7 @@ fn grounded_paths(scratch: &Path) -> Paths {
 fn turn_args(a: &RankGroundedArgs) -> Result<crate::args::Args> {
     let mut args = crate::args::Args::defaults().context("constructing default args")?;
     args.harness = a.harness;
-    args.reasoning_effort = Some(crate::manifest::ReasoningEffort::Low);
+    args.reasoning_effort = Some(crate::knobs::ReasoningEffort::Low);
     match &a.agent_cmd {
         Some(cmd) => {
             args.agent_backend = AgentBackend::Command;
@@ -409,14 +386,15 @@ fn run_grounded_turn(
     let scratch = worktree_path();
     git(
         workspace,
-        &[
-            "worktree",
-            "add",
-            "--detach",
-            &scratch.to_string_lossy(),
-            "HEAD",
+        [
+            "worktree".as_ref(),
+            "add".as_ref(),
+            "--detach".as_ref(),
+            scratch.as_os_str(),
+            "HEAD".as_ref(),
         ],
     )
+    .run()
     .context("creating the read-only worktree for the grounded turn")?;
 
     let mut args = turn_args(a)?;
@@ -441,8 +419,14 @@ fn run_grounded_turn(
     // pristine. Best-effort: a leaked worktree is pruned by the next `worktree add`/`prune`.
     let _ = git(
         workspace,
-        &["worktree", "remove", "--force", &scratch.to_string_lossy()],
-    );
+        [
+            "worktree".as_ref(),
+            "remove".as_ref(),
+            "--force".as_ref(),
+            scratch.as_os_str(),
+        ],
+    )
+    .run();
     let _ = std::fs::remove_dir_all(&scratch);
     Ok((outcome, buf))
 }
@@ -893,7 +877,7 @@ mod tests {
         let Some(crate::cli::Cmd::RankGrounded(a)) = cli.command else {
             panic!("rank-grounded parses as its subcommand");
         };
-        assert_eq!(a.harness, Some(crate::manifest::Harness::Claude));
+        assert_eq!(a.harness, Some(crate::knobs::Harness::Claude));
         assert_eq!(a.model.as_deref(), Some("rits/zai-org/glm-5-3"));
     }
 
@@ -902,14 +886,14 @@ mod tests {
         let mut a = args(Path::new("/checkout"), Path::new("/agent.sh"), 1.0);
         a.agent_cmd = None;
         a.agent_backend = AgentBackend::Openshell;
-        a.harness = Some(crate::manifest::Harness::OpenCode);
+        a.harness = Some(crate::knobs::Harness::OpenCode);
         a.model = Some("qwen-3-8-27b".to_string());
         let turn = turn_args(&a).unwrap();
         assert_eq!(
             turn.reasoning_effort,
-            Some(crate::manifest::ReasoningEffort::Low)
+            Some(crate::knobs::ReasoningEffort::Low)
         );
-        assert_eq!(turn.harness(), crate::manifest::Harness::OpenCode);
+        assert_eq!(turn.harness(), crate::knobs::Harness::OpenCode);
         assert_eq!(turn.model(), "qwen-3-8-27b");
         assert_eq!(turn.agent_backend, AgentBackend::Openshell);
     }
@@ -917,10 +901,10 @@ mod tests {
     #[test]
     fn the_grounded_turn_defaults_to_claude_at_low_effort() {
         let turn = turn_args(&args(Path::new("/checkout"), Path::new("/agent.sh"), 1.0)).unwrap();
-        assert_eq!(turn.harness(), crate::manifest::Harness::Claude);
+        assert_eq!(turn.harness(), crate::knobs::Harness::Claude);
         assert_eq!(
             turn.reasoning_effort,
-            Some(crate::manifest::ReasoningEffort::Low)
+            Some(crate::knobs::ReasoningEffort::Low)
         );
         assert_eq!(turn.agent_backend, AgentBackend::Command);
     }

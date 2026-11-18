@@ -60,6 +60,25 @@ jobs:
           bun install --frozen-lockfile
           bun run build
 
+      # The controller embeds the desktop app's browser build under /next.
+      - name: wasm-bindgen version
+        id: bindgen
+        run: |
+          version=$(awk '/^name = "wasm-bindgen"$/ { found = 1; next } found && /^version = / { gsub(/"/, "", $3); print $3; exit }' crucible-desktop/Cargo.lock)
+          [ -n "$version" ]
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2
+        with:
+          tool: wasm-bindgen@${{ steps.bindgen.outputs.version }}
+
+      - name: Build /next
+        run: |
+          sh crucible-desktop/rune-patches.sh
+          rustup target add wasm32-unknown-unknown
+          cd crucible-desktop
+          RUSTFLAGS= CARGO="$(command -v cargo)" bash ../vendor/rune/scripts/web-build.sh crucible-playbooks --no-html --out ../crucible-controller/next-dist
+
       - name: Build release binaries
         env:
           CRUCIBLE_GIT_SHA: ${{ github.sha }}
@@ -110,6 +129,60 @@ jobs:
           gh release create "$tag" \
             --title "$tag" --generate-notes --verify-tag 2>/dev/null || true
           gh release upload "$tag" dist/* --clobber
+
+  # The desktop app as a Fedora RPM, crucible-lsp beside it, for x86_64 and aarch64.
+  desktop-linux:
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    container: registry.fedoraproject.org/fedora:45
+    steps:
+      - name: git
+        run: dnf -y install git
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Fedora packages
+        run: sh crucible-desktop/linux/deps.sh
+
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          rustflags: ""
+          cache-workspaces: |
+            . -> target
+            crucible-desktop -> target
+
+      - name: Rune
+        run: sh crucible-desktop/rune-patches.sh
+
+      - name: Build the RPM
+        env:
+          SQLX_OFFLINE: "true"
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          cargo build --release --locked -p crucible-lsp
+          ( cd crucible-desktop && cargo build --release --locked )
+          VERSION="${tag#v}" sh crucible-desktop/linux-bundle.sh
+          mkdir -p dist
+          cp crucible-desktop/target/linux/*.rpm dist/
+          ( cd dist && for f in *.rpm; do sha256sum "$f" > "$f.sha256"; done )
+          ls -la dist/
+
+      - name: Upload to release
+        if: ${{ github.ref_type == 'tag' || inputs.tag != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          dnf -y install gh
+          tag="${{ inputs.tag || github.ref_name }}"
+          gh release create "$tag" -R "$GITHUB_REPOSITORY" \
+            --title "$tag" --generate-notes --verify-tag 2>/dev/null || true
+          gh release upload "$tag" -R "$GITHUB_REPOSITORY" dist/* --clobber
 
   # The macOS desktop app (Crucible Playbooks.app, crucible-lsp inside), signed ad hoc: a
   # downloaded copy needs Open Anyway (or `xattr -d com.apple.quarantine`) on first launch.

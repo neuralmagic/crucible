@@ -24,6 +24,7 @@ const SCHEMA_OPEN: usize = 1;
 
 pub(crate) fn data_view(pane: &Pane, app: &App, p: &Paint) -> El {
     let task = app
+        .run
         .expanded
         .as_deref()
         .and_then(|name| pane.tasks.iter().find(|task| task.name == name));
@@ -40,20 +41,20 @@ pub(crate) fn data_view(pane: &Pane, app: &App, p: &Paint) -> El {
         .gap(12.0)
         .padding(14.0)
         .child(header(task, p));
-    let flows = inspect::flows(&pane.tasks, task);
+    let flows = inspect::flows(pane.tasks, task);
     if !flows.is_empty() {
         let mut list = col().w_full().gap(8.0);
         for flow in &flows {
-            list = list.child(flow_card(flow, &app.inspect, p));
+            list = list.child(flow_card(flow, &app.run.inspect, p));
         }
         body = body.child(section("Inputs", p)).child(list);
     }
-    let shown = inspect::output(task, app.inspect.pick.as_ref());
+    let shown = inspect::output(task, app.run.inspect.pick.as_ref());
     let output = shown.as_ref().map(|(_, value)| *value);
     if !task.emits.is_empty() || !task.files.is_empty() {
-        body = body
-            .child(section("Declared", p))
-            .child(declared(task, output, &app.inspect, p));
+        body =
+            body.child(section("Declared", p))
+                .child(declared(task, output, &app.run.inspect, p));
     }
     body = body.child(section("Output", p));
     if !task.instances.is_empty() {
@@ -68,7 +69,7 @@ pub(crate) fn data_view(pane: &Pane, app: &App, p: &Paint) -> El {
                     value,
                     &format!("out:{}", task.name),
                     DATA_OPEN,
-                    &app.inspect,
+                    &app.run.inspect,
                     p,
                 ),
                 p,
@@ -255,7 +256,7 @@ fn pick_chips(task: &TaskView, shown: Option<&Pick>, p: &Paint) -> El {
             .border(p.hair, p.c.border_muted)
             .hover(p.c.hover)
             .focusable(true)
-            .on_press(move |app: &mut App| app.inspect.pick = Some(pick.clone()))
+            .on_press(move |app: &mut App| app.run.inspect.pick = Some(pick.clone()))
             .child(text(label).font(p.mono(10.0, 500.0)).color(if on {
                 p.c.text_base
             } else {
@@ -380,7 +381,7 @@ impl Walk<'_> {
                 .label(format!("{} {path}", if open { "Fold" } else { "Unfold" }))
                 .radius(p.k.radius.sm)
                 .hover(p.c.hover)
-                .on_press(move |app: &mut App| app.inspect.flip(&toggle))
+                .on_press(move |app: &mut App| app.run.inspect.flip(&toggle))
                 .child(
                     icon(
                         if open {

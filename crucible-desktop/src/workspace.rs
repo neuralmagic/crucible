@@ -3,7 +3,7 @@
 //! ```text
 //!   column 0 (share .55)        column 1 (share .45)
 //!  +---------------------------+----------------------+
-//!  | [Graph]                   | [Log] Data           |  group 0 of each column
+//!  | [Graph]                   | [Log] Data Files ... |  group 0 of each column
 //!  |                           |                      |
 //!  +---------------------------+                      |
 //!  | [Tasks] Pack  Launch      |                      |  group 1 of column 0
@@ -26,24 +26,30 @@ pub enum PaneKind {
     Timeline,
     Graph,
     Data,
+    Files,
     Transcript,
     Compare,
     Pack,
     Launch,
     Log,
+    Agent,
+    History,
 }
 
 impl PaneKind {
-    pub const ALL: [PaneKind; 9] = [
+    pub const ALL: [PaneKind; 12] = [
         PaneKind::Tasks,
         PaneKind::Timeline,
         PaneKind::Graph,
         PaneKind::Data,
+        PaneKind::Files,
         PaneKind::Transcript,
         PaneKind::Compare,
         PaneKind::Pack,
         PaneKind::Launch,
         PaneKind::Log,
+        PaneKind::Agent,
+        PaneKind::History,
     ];
 
     pub fn label(self) -> &'static str {
@@ -52,13 +58,67 @@ impl PaneKind {
             PaneKind::Timeline => "Timeline",
             PaneKind::Graph => "Graph",
             PaneKind::Data => "Data",
+            PaneKind::Files => "Files",
             PaneKind::Transcript => "Transcript",
             PaneKind::Compare => "Compare",
             PaneKind::Pack => "Pack",
             PaneKind::Launch => "Launch",
             PaneKind::Log => "Log",
+            PaneKind::Agent => "Agent",
+            PaneKind::History => "History",
         }
     }
+}
+
+/// How wide each pane's list is beside its content, once dragged; `None` is the pane's own width.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Rails {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    history: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pack: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    files: Option<f32>,
+}
+
+impl Rails {
+    pub const MIN: f32 = 140.0;
+
+    fn slot(&mut self, kind: PaneKind) -> Option<&mut Option<f32>> {
+        match kind {
+            PaneKind::History => Some(&mut self.history),
+            PaneKind::Pack => Some(&mut self.pack),
+            PaneKind::Files => Some(&mut self.files),
+            _ => None,
+        }
+    }
+
+    pub fn width(mut self, kind: PaneKind) -> f32 {
+        let fitted = match kind {
+            PaneKind::History => 236.0,
+            PaneKind::Files => 210.0,
+            _ => 190.0,
+        };
+        self.slot(kind).and_then(|slot| *slot).unwrap_or(fitted)
+    }
+
+    pub fn set(&mut self, kind: PaneKind, width: Option<f32>) {
+        if let Some(slot) = self.slot(kind) {
+            *slot = width.map(|width| width.max(Rails::MIN));
+        }
+    }
+
+    pub fn is_fitted(&self) -> bool {
+        *self == Rails::default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RailDrag {
+    pub kind: PaneKind,
+    pub from: f32,
+    pub now: f32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -141,6 +201,7 @@ impl Workspace {
                                 PaneKind::Tasks,
                                 PaneKind::Compare,
                                 PaneKind::Pack,
+                                PaneKind::History,
                                 PaneKind::Launch,
                             ],
                             1.0 - graph,
@@ -150,7 +211,12 @@ impl Workspace {
                 },
                 Column {
                     groups: vec![group(
-                        &[PaneKind::Log, PaneKind::Data, PaneKind::Transcript],
+                        &[
+                            PaneKind::Log,
+                            PaneKind::Data,
+                            PaneKind::Files,
+                            PaneKind::Transcript,
+                        ],
                         1.0,
                     )],
                     share: 0.44,
@@ -187,10 +253,14 @@ impl Workspace {
     }
 
     /// Shows `kind`: brings it to the front of its group, or reopens it when it was closed,
-    /// beside a pane it shares a group with by default, else in the first group.
+    /// beside a pane it shares a group with by default, else in the first group. The agent
+    /// reopens in a group of its own under the pack.
     pub fn activate(&mut self, kind: PaneKind) {
         let at = match self.locate(kind) {
             Some(at) => at,
+            None if kind == PaneKind::Agent && self.locate(PaneKind::Pack).is_some() => {
+                return self.place(kind, PaneKind::Pack, Some(Edge::Bottom));
+            }
             None => {
                 let default = Workspace::for_depth(0);
                 let home = default
@@ -245,6 +315,11 @@ impl Workspace {
             return;
         };
         self.remove(kind);
+        self.place(kind, anchor, edge);
+    }
+
+    /// Puts `kind`, which is in no group, in `anchor`'s group or on one of its edges.
+    fn place(&mut self, kind: PaneKind, anchor: PaneKind, edge: Option<Edge>) {
         let Some((c, g)) = self.locate(anchor) else {
             return;
         };
@@ -485,7 +560,7 @@ fn split(start: f32, next: f32, delta: f32) -> (f32, f32) {
 
 fn normalize<'a>(shares: impl Iterator<Item = &'a mut f32>) {
     let mut shares: Vec<&mut f32> = shares.collect();
-    for share in shares.iter_mut() {
+    for share in &mut shares {
         if !share.is_finite() || **share <= 0.0 {
             **share = MIN_SHARE;
         }
@@ -498,9 +573,13 @@ fn normalize<'a>(shares: impl Iterator<Item = &'a mut f32>) {
 
 #[cfg(test)]
 mod tests {
-    use crate::workspace::{Dock, Edge, MIN_SHARE, PaneKind, Workspace, depth, hit, neighbour};
+    use crate::workspace::{
+        Dock, Edge, MIN_SHARE, PaneKind, Rails, Workspace, depth, hit, neighbour,
+    };
 
-    use PaneKind::{Compare, Data, Graph, Launch, Log, Pack, Tasks, Timeline, Transcript};
+    use PaneKind::{
+        Agent, Compare, Data, Files, Graph, History, Launch, Log, Pack, Tasks, Timeline, Transcript,
+    };
 
     #[test]
     fn a_neighbour_is_the_nearest_group_on_that_side_lined_up_first() {
@@ -556,12 +635,47 @@ mod tests {
         assert_eq!(
             tabs(&w),
             vec![
-                vec![vec![Graph, Timeline], vec![Tasks, Compare, Pack, Launch]],
-                vec![vec![Log, Data, Transcript]]
+                vec![
+                    vec![Graph, Timeline],
+                    vec![Tasks, Compare, Pack, History, Launch]
+                ],
+                vec![vec![Log, Data, Files, Transcript]]
             ]
         );
         sums_to_one(&w);
-        assert_eq!(w.closed().count(), 0);
+        assert_eq!(w.closed().collect::<Vec<_>>(), vec![Agent]);
+    }
+
+    #[test]
+    fn a_dragged_list_keeps_its_width_and_a_reset_goes_back_to_the_fitted_one() {
+        let mut rails = Rails::default();
+        assert!(rails.is_fitted());
+        let fitted = rails.width(History);
+        assert!(fitted > rails.width(Pack), "the saves list is the widest");
+
+        rails.set(History, Some(320.0));
+        assert_eq!(rails.width(History), 320.0);
+        assert_eq!(rails.width(Pack), Rails::default().width(Pack));
+        assert!(!rails.is_fitted());
+
+        rails.set(Files, Some(12.0));
+        assert_eq!(rails.width(Files), Rails::MIN, "no narrower than the least");
+
+        rails.set(Tasks, Some(400.0));
+        assert_eq!(
+            rails.width(Tasks),
+            Rails::default().width(Tasks),
+            "a pane without a list keeps none"
+        );
+
+        let stored = toml::to_string(&rails).unwrap();
+        assert_eq!(stored, "history = 320.0\nfiles = 140.0\n");
+        assert_eq!(toml::from_str::<Rails>(&stored).unwrap(), rails);
+
+        rails.set(History, None);
+        rails.set(Files, None);
+        assert_eq!(rails.width(History), fitted);
+        assert!(rails.is_fitted());
     }
 
     #[test]
@@ -601,9 +715,9 @@ mod tests {
             vec![
                 vec![
                     vec![Graph, Timeline],
-                    vec![Tasks, Compare, Pack, Launch, Log]
+                    vec![Tasks, Compare, Pack, History, Launch, Log]
                 ],
-                vec![vec![Data, Transcript]]
+                vec![vec![Data, Files, Transcript]]
             ]
         );
         assert_eq!(w.columns[0].groups[1].active, Log);
@@ -619,7 +733,7 @@ mod tests {
             tabs(&w)[0],
             vec![
                 vec![Graph, Timeline],
-                vec![Tasks, Compare, Launch],
+                vec![Tasks, Compare, History, Launch],
                 vec![Pack]
             ]
         );
@@ -630,8 +744,12 @@ mod tests {
         assert_eq!(
             tabs(&w),
             vec![
-                vec![vec![Timeline], vec![Tasks, Compare, Launch], vec![Pack]],
-                vec![vec![Log, Data, Transcript]],
+                vec![
+                    vec![Timeline],
+                    vec![Tasks, Compare, History, Launch],
+                    vec![Pack]
+                ],
+                vec![vec![Log, Data, Files, Transcript]],
                 vec![vec![Graph]]
             ]
         );
@@ -651,7 +769,7 @@ mod tests {
             vec![
                 vec![Graph, Timeline],
                 vec![Pack],
-                vec![Tasks, Compare, Launch]
+                vec![Tasks, Compare, History, Launch]
             ]
         );
         let before = w.clone();
@@ -667,6 +785,7 @@ mod tests {
         let mut w = Workspace::for_depth(2);
         w.close(Log);
         w.close(Data);
+        w.close(Files);
         w.close(Transcript);
         assert_eq!(w.columns.len(), 1);
         sums_to_one(&w);
@@ -675,9 +794,10 @@ mod tests {
         w.close(Pack);
         w.close(Launch);
         w.close(Compare);
+        w.close(History);
         w.close(Tasks);
         assert_eq!(tabs(&w), vec![vec![vec![Tasks]]]);
-        assert_eq!(w.closed().count(), 8);
+        assert_eq!(w.closed().count(), 11);
         w.activate(Log);
         assert_eq!(tabs(&w), vec![vec![vec![Tasks, Log]]]);
         assert_eq!(w.columns[0].groups[0].active, Log);
@@ -689,9 +809,10 @@ mod tests {
         w.close(Data);
         assert!(!w.showing(Data));
         w.activate(Data);
-        assert_eq!(tabs(&w)[1], vec![vec![Log, Transcript, Data]]);
+        assert_eq!(tabs(&w)[1], vec![vec![Log, Files, Transcript, Data]]);
         assert!(w.showing(Data) && !w.showing(Log));
         w.close(Data);
+        w.close(Files);
         w.close(Log);
         w.close(Transcript);
         w.activate(Data);
@@ -699,9 +820,41 @@ mod tests {
             tabs(&w),
             vec![vec![
                 vec![Graph, Timeline, Data],
-                vec![Tasks, Compare, Pack, Launch]
+                vec![Tasks, Compare, Pack, History, Launch]
             ]]
         );
+    }
+
+    #[test]
+    fn the_agent_opens_under_the_pack_and_docks_like_any_pane() {
+        let mut w = Workspace::for_depth(2);
+        let pack = w.columns[0].groups[1].share;
+        w.activate(Agent);
+        assert_eq!(
+            tabs(&w)[0],
+            vec![
+                vec![Graph, Timeline],
+                vec![Tasks, Compare, Pack, History, Launch],
+                vec![Agent]
+            ]
+        );
+        assert!(w.showing(Agent));
+        assert_eq!(w.columns[0].groups[2].share, pack / 2.0);
+        sums_to_one(&w);
+        w.activate(Agent);
+        assert_eq!(tabs(&w)[0].len(), 3);
+        w.dock(Agent, Dock::Split(Log, Edge::Right));
+        assert_eq!(tabs(&w)[2], vec![vec![Agent]]);
+        assert_eq!(tabs(&w)[0].len(), 2);
+        sums_to_one(&w);
+        w.close(Agent);
+        assert_eq!(tabs(&w), tabs(&Workspace::for_depth(2)));
+        sums_to_one(&w);
+
+        let mut w = Workspace::for_depth(2);
+        w.close(Pack);
+        w.activate(Agent);
+        assert_eq!(tabs(&w)[0][0], vec![Graph, Timeline, Agent]);
     }
 
     #[test]

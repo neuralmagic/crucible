@@ -413,7 +413,6 @@ pub(crate) async fn fire(
     firing: &Firing<'_>,
     exposure: &crate::playbooks::exposure::Extraction,
     key: &str,
-    now: Timestamp,
 ) -> Result<(), FireError> {
     let core = &row.core;
     let noun = format!("standing launch {}", core.id);
@@ -451,6 +450,7 @@ pub(crate) async fn fire(
         MaxTime::parse(&core.max_time).map_err(|e| format!("{noun} stored max_time: {e}"))?;
     let params = overlaid_params(core, schema, firing.overlay)?;
     let launch = NewPlaybookLaunch {
+        choice_snapshots: None,
         playbook: &core.playbook,
         repo: &row.repo,
         title: firing.title.unwrap_or(description),
@@ -523,14 +523,6 @@ pub(crate) async fn fire(
         .await
         .map_err(|e| format!("{noun} adopted pack exposure: {e}"))?;
     }
-    sqlx::query(
-        "UPDATE playbook_standing_launches SET consecutive_failures = 0, updated_at = $2 WHERE id = $1",
-    )
-    .bind(&core.id)
-    .bind(now.to_string())
-    .execute(&mut **tx)
-    .await
-    .map_err(|e| format!("{noun} reset failures: {e}"))?;
     Ok(())
 }
 
@@ -702,6 +694,8 @@ pub struct Claim {
     /// The event-log note and reference recorded on the launch key.
     pub note: String,
     pub reference: Option<String>,
+    /// Who the launch's event names; `None` names the core row's creator.
+    pub actor: Option<String>,
     /// Trigger-private state carried from `due` through `claim` to `settle`.
     pub payload: serde_json::Value,
 }
@@ -716,6 +710,7 @@ impl Claim {
             subject: None,
             note,
             reference: Some(id.to_string()),
+            actor: None,
             payload: serde_json::Value::Null,
         }
     }
@@ -923,13 +918,14 @@ pub(crate) struct Swept {
     pub skipped: Vec<String>,
 }
 
-struct Fired {
-    key: String,
-    events: Vec<Recorded>,
+/// A minted launch: its key and the events to record beside it.
+pub(crate) struct Fired {
+    pub key: String,
+    pub events: Vec<Recorded>,
 }
 
-/// One claimed firing on its transaction: lock the core row, mint the launch, let the trigger
-/// settle its sidecar, and record the events. `Err` is what the failure is recorded under.
+/// One claimed firing on its transaction: mint the launch, clear the row's failure count, let the
+/// trigger settle its sidecar, and record the events. `Err` is what the failure is recorded under.
 async fn fire_claim(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     pool: &PgPool,
@@ -939,6 +935,41 @@ async fn fire_claim(
     policy: Option<&crate::authz::policy::ActivePolicy>,
 ) -> Result<Fired, FireError> {
     let kind = trigger.trigger();
+    let noun = format!("{} {}", kind.as_str(), claim.id);
+    let mut fired = mint(tx, pool, kind, claim, now, policy).await?;
+    sqlx::query(
+        "UPDATE playbook_standing_launches SET consecutive_failures = 0, updated_at = $2 WHERE id = $1",
+    )
+    .bind(&claim.id)
+    .bind(now.to_string())
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| format!("{noun} reset failures: {e}"))?;
+    fired.events.extend(
+        trigger
+            .settle(tx, claim, &fired.key, now)
+            .await
+            .map_err(|e| format!("{noun} settle: {e:#}"))?,
+    );
+    for event in &fired.events {
+        crate::event_log::insert(&mut **tx, &event.event())
+            .await
+            .map_err(|e| format!("{noun} event: {e:#}"))?;
+    }
+    Ok(fired)
+}
+
+/// Mint one launch of a core row on the caller's transaction: lock the row, decide the firing for
+/// its owner, and insert the launch. The returned event is the launch's own and is not yet
+/// recorded; neither the row's failure count nor any sidecar is touched.
+pub(crate) async fn mint(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    pool: &PgPool,
+    kind: Trigger,
+    claim: &Claim,
+    now: Timestamp,
+    policy: Option<&crate::authz::policy::ActivePolicy>,
+) -> Result<Fired, FireError> {
     let noun = format!("{} {}", kind.as_str(), claim.id);
     let authorized = authorized(tx, &claim.id)
         .await
@@ -998,26 +1029,18 @@ async fn fire_claim(
         }
         None => crate::playbooks::exposure::Extraction::Absent,
     };
-    fire(tx, &authorized, &firing, &exposure, &key, now).await?;
-    let mut events = vec![Recorded {
+    fire(tx, &authorized, &firing, &exposure, &key).await?;
+    let events = vec![Recorded {
         key: key.clone(),
         from: "new",
         to: "new",
         reason: Some(claim.note.clone()),
         evidence: claim.reference.clone(),
-        actor: authorized.core.created_by.clone(),
+        actor: claim
+            .actor
+            .clone()
+            .or_else(|| authorized.core.created_by.clone()),
     }];
-    events.extend(
-        trigger
-            .settle(tx, claim, &key, now)
-            .await
-            .map_err(|e| format!("{noun} settle: {e:#}"))?,
-    );
-    for event in &events {
-        crate::event_log::insert(&mut **tx, &event.event())
-            .await
-            .map_err(|e| format!("{noun} event: {e:#}"))?;
-    }
     Ok(Fired { key, events })
 }
 

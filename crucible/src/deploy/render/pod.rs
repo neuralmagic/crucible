@@ -128,8 +128,8 @@ pub(in crate::deploy) fn downward(name: &str, field_path: &str) -> core::EnvVar 
 /// The profile's node avoid-list as a required nodeAffinity `NotIn` on `kubernetes.io/hostname`
 /// (nodes the operator marked bad, e.g. broken CNI). `None` when the list is empty, so a profile
 /// without one renders byte-identically to before. Shared by every pod the profile renders: the
-/// loop pod, the turn pods, and the controller Deployment's template.
-fn node_avoid_affinity(profile: &DeployProfile) -> Option<core::Affinity> {
+/// loop pod, the turn pods, and the controller and crucible-kueue Deployments' templates.
+pub(in crate::deploy) fn node_avoid_affinity(profile: &DeployProfile) -> Option<core::Affinity> {
     let avoid = &profile.cluster.avoid_nodes;
     if avoid.is_empty() {
         return None;

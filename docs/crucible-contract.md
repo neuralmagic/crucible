@@ -27,6 +27,7 @@ edition = 2                                   # pack contract edition; absent = 
 url  = "https://github.com/owner/name.git"   # OR
 path = "."                                    # local path, relative to manifest dir
 ref  = "main"                                 # optional; default: clone default branch
+filter = "blob:none"                          # optional: a partial clone, every commit, file contents on demand
 
 [workspace]
 dir       = "workspace"                       # checkout dir, relative to manifest dir. default "workspace"
@@ -888,7 +889,7 @@ a chain, and stays a single name, or empty, otherwise. A reader should accept bo
 
 An orchestrator tells the engine where models are reached through one JSON document in
 `CRUCIBLE_INFERENCE` (contract 1.7.0), typed as `crucible_contract::inference::ResolvedInference`:
-`{"version":1,"bindings":[{"role","protocol","url"?,"model","key_env"?,"price"?}]}`. `role` is `agent` or
+`{"version":1,"bindings":[{"role","protocol","url"?,"model","key_env"?,"price"?,"limits"?}]}`. `role` is `agent` or
 `decision`; `protocol` is `messages`, `chat_completions`, `responses`, `system_one`, or
 `decisions` (contract 1.15.0, the OpenAI Decisions API, at `https://api.openai.com/v1/decisions`
 when `url` is absent). A `decision` binding speaks `system_one` or `decisions`. `key_env`
@@ -909,6 +910,13 @@ vendor-billed model (an Anthropic or OpenAI name) costs what the harness reports
 table estimate when it reports nothing, and any other model costs nothing whatever the harness
 reports. A `price` on a `decision` binding fails the run. An engine older than 1.19.0 refuses a
 document that carries a price as an unknown field.
+
+An `agent` binding may carry `limits` (contract 1.25.0):
+`{"context_window","max_output_tokens"}`, each a positive whole number of tokens, the second no
+larger than the first. The engine gives them to a harness that sets a model's limits in its own
+configuration, which today is pi. Without them that harness keeps its defaults. They do not change
+what a turn costs. `limits` on a `decision` binding fails the run. An engine older than 1.25.0
+refuses a document that carries limits as an unknown field.
 
 An orchestrator that starts a run of a launch series supplies the series' earlier terminal runs
 as one JSON document in `CRUCIBLE_HISTORY` (contract 1.9.0), typed as
@@ -934,6 +942,9 @@ bound a playbook's run will apply, and refuses a malformed one.
 A `plan_admitted` event carries an additive `history_record`, the task a playbook records for
 its series or empty when it names none, and each task an additive `history_depth`, zero when it
 reads no history (contract 1.9.0).
+
+A `plan_admitted` task carries an additive `command` (contract 1.24.0): what a `command` or
+`evaluate` task runs, as the pack wrote it. It is omitted for other kinds.
 
 Additive event kinds beyond the compat set include:
 

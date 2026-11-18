@@ -1,5 +1,6 @@
 //! `crucible plan run` over a playbook whose tasks take known time: every `task_started` and
-//! `task_result` carries when it happened, and each result says how long its task ran.
+//! `task_result` carries when it happened, each result says how long its task ran, and the run's
+//! summary prints that time beside each task.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -33,7 +34,7 @@ file = "workflow.star"
     dir
 }
 
-fn run(dir: &Path) -> Vec<Value> {
+fn run(dir: &Path) -> (Vec<Value>, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_crucible"))
         .args([
             "plan",
@@ -56,11 +57,24 @@ fn run(dir: &Path) -> Vec<Value> {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    std::fs::read_to_string(dir.join("state/session.jsonl"))
+    let log = std::fs::read_to_string(dir.join("state/session.jsonl"))
         .unwrap()
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
-        .collect()
+        .collect();
+    (log, String::from_utf8(out.stdout).unwrap())
+}
+
+fn summary_secs(stdout: &str, task: &str) -> f64 {
+    let line = stdout
+        .lines()
+        .find(|l| l.split_whitespace().next() == Some(task))
+        .unwrap_or_else(|| panic!("no summary line for {task}: {stdout}"));
+    line.split_whitespace()
+        .find_map(|field| field.strip_prefix("elapsed="))
+        .and_then(|v| v.strip_suffix('s'))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("no elapsed seconds on {line:?}"))
 }
 
 fn event<'a>(log: &'a [Value], kind: &str, task: &str) -> &'a Value {
@@ -80,7 +94,7 @@ fn at(event: &Value) -> jiff::Timestamp {
 #[test]
 fn task_events_carry_when_they_happened_and_results_how_long_their_task_ran() {
     let dir = pack();
-    let log = run(&dir);
+    let (log, stdout) = run(&dir);
 
     let slow_started = at(event(&log, "task_started", "slow"));
     let slow = event(&log, "task_result", "slow");
@@ -100,6 +114,13 @@ fn task_events_carry_when_they_happened_and_results_how_long_their_task_ran() {
     );
     assert!(quick["secs"].as_f64().unwrap() < 1.0, "{quick}");
     assert!(at(quick) >= quick_started);
+
+    let printed = summary_secs(&stdout, "slow");
+    assert!(
+        (printed - secs).abs() < 0.2,
+        "summary says {printed}s, result {secs}s"
+    );
+    assert!(summary_secs(&stdout, "quick") < 1.0, "{stdout}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

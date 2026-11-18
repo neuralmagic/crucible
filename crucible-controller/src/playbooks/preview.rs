@@ -59,8 +59,22 @@ fn effective(
     let properties = schema
         .and_then(|s| s.get("properties"))
         .and_then(|p| p.as_object());
+    let gate_on = |gate: &str| match params.get(gate) {
+        Some(raw) => matches!(raw.as_str(), "true" | "True"),
+        None => properties
+            .and_then(|p| p.get(gate))
+            .and_then(|g| g.get("default"))
+            .is_some_and(|d| d == true),
+    };
     if let Some(properties) = properties {
         for (name, property) in properties {
+            if property
+                .get("x-enabled-by")
+                .and_then(|g| g.as_str())
+                .is_some_and(|gate| !gate_on(gate))
+            {
+                continue;
+            }
             if let Some(default) = property.get("default").and_then(|d| d.as_str()) {
                 out.insert(name.clone(), default.to_string());
             }
@@ -409,6 +423,37 @@ mod tests {
             ],
             "the dependency edge is drawn"
         );
+    }
+
+    /// A gated param's default is not a supplied value while its gate is off, so the engine does
+    /// not refuse a preview the launch form would have compiled.
+    #[test]
+    fn a_gated_default_is_supplied_only_while_its_gate_is_on() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = write_playbook_pack(
+            dir.path(),
+            concat!(
+                "params = {\n",
+                "    \"override_branch\": {\"type\": \"bool\", \"default\": False},\n",
+                "    \"target_branch\": {\"type\": \"string\", \"default\": \"\", \"enabled_by\": \"override_branch\"},\n",
+                "}\n",
+                "s = command(name = \"s\", run = \"true\")\n",
+                "workflow(type = \"playbook\", tasks = [s])\n",
+            ),
+        );
+
+        for values in [
+            BTreeMap::new(),
+            BTreeMap::from([("override_branch".to_string(), "true".to_string())]),
+        ] {
+            let preview = preview_pack(&root, &values, Unvalued::Refuse, None).expect("previews");
+            assert!(
+                preview.diagnostics.is_empty(),
+                "{values:?}: {:?}",
+                preview.diagnostics
+            );
+            assert!(preview.graph.is_some(), "{values:?}");
+        }
     }
 
     /// A pack with no parameters compiles with nothing supplied.

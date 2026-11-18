@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Crucible Playbooks
+Comment=Track what each Crucible playbook did and is doing
+Exec=crucible-playbooks %u
+Icon=dev.crucible.playbooks
+Terminal=false
+Categories=Development;
+MimeType=x-scheme-handler/crucible-playbooks;x-scheme-handler/crucible;
+StartupWMClass=dev.crucible.playbooks

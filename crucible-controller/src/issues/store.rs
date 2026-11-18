@@ -2079,6 +2079,7 @@ pub(crate) mod tests {
         let max_time = crate::model::MaxTime::parse("30m").expect("duration");
         let params = serde_json::json!({});
         let launch = NewPlaybookLaunch {
+            choice_snapshots: None,
             playbook: "survey",
             repo: "owner/packs",
             title: "reads a paper",
@@ -2111,6 +2112,7 @@ pub(crate) mod tests {
                 "playbook:gone:0199c0de-7c2c-71a5-8000-3",
                 &{
                     NewPlaybookLaunch {
+                        choice_snapshots: None,
                         playbook: "gone",
                         ..launch
                     }
@@ -2149,6 +2151,7 @@ pub(crate) mod tests {
                 &pool,
                 key,
                 &NewPlaybookLaunch {
+                    choice_snapshots: None,
                     playbook: "survey",
                     repo: "owner/packs",
                     title: "reads a paper",
@@ -2269,6 +2272,7 @@ pub(crate) mod tests {
                 &pool,
                 playbook_key,
                 &NewPlaybookLaunch {
+                    choice_snapshots: None,
                     playbook: "survey",
                     repo: "owner/packs",
                     title: "reads a paper",

@@ -42,7 +42,11 @@ pub(crate) fn compare_view(pane: &Pane, app: &App, p: &Paint) -> El {
         .w_full()
         .gap(12.0)
         .child(picker(&candidates, &base.key, p));
-    let read = app.live_base.as_ref().filter(|read| read.key == base.key);
+    let read = app
+        .remote
+        .live_base
+        .as_ref()
+        .filter(|read| read.key == base.key);
     let Some(read) = read else {
         return shell(body.child(faint(&format!("Reading {}", base.created), p)));
     };
@@ -56,7 +60,7 @@ pub(crate) fn compare_view(pane: &Pane, app: &App, p: &Paint) -> El {
             ),
         );
     }
-    let diffs = diff::diff(&read.fold.tasks, &pane.tasks);
+    let diffs = diff::diff(&read.fold.tasks, pane.tasks);
     let (changed, same): (Vec<&TaskDiff>, Vec<&TaskDiff>) =
         diffs.iter().partition(|diff| !diff.is_same());
     body = body.child(summary(&changed, same.len(), p));
@@ -89,7 +93,7 @@ fn picker(candidates: &[&crate::live::LivePlaybook], base: &str, p: &Paint) -> E
                 .border(p.hair, p.c.border_muted)
                 .hover(p.c.hover)
                 .focusable(true)
-                .on_press(move |app: &mut App| app.compare_to = Some(key.clone()))
+                .on_press(move |app: &mut App| app.run.compare_to = Some(key.clone()))
                 .child(
                     text(launch.landed_at.clone())
                         .font(p.mono(10.0, 500.0))

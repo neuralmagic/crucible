@@ -2,15 +2,24 @@ import { describe, expect, it } from 'vitest';
 import {
   clampCeiling,
   initialValues,
+  isEnabled,
   launchBody,
+  paramBlocks,
   mapServerRejection,
+  confirmation,
+  offeredChoices,
+  optionSources,
   parseParamsSchema,
+  placeholderFor,
+  refreshBody,
+  refreshable,
   parseMaxTime,
   previewMatches,
   runSnapshot,
   scheduleBody,
   validateCronExpr,
   validateMaxTime,
+  trimmedParams,
   validateParam,
   type ParamFieldSpec,
 } from './playbookLaunchForm';
@@ -46,8 +55,15 @@ describe('parseParamsSchema', () => {
         pattern: '^[a-z ]+$',
         description: 'What the survey covers.',
         multiline: false,
+        choices: null,
+        enabledBy: null,
+        choicesFrom: null,
+        choicesSnapshot: null,
+        allowOther: false,
+        placeholderFrom: null,
+        placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null,
       },
-      { name: 'depth', valueType: 'string', required: false, defaultValue: 'shallow', pattern: null, description: null, multiline: false },
+      { name: 'depth', valueType: 'string', required: false, defaultValue: 'shallow', pattern: null, description: null, multiline: false, choices: null, enabledBy: null, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null },
       {
         name: 'since',
         valueType: 'string',
@@ -56,8 +72,15 @@ describe('parseParamsSchema', () => {
         pattern: '^\\d{4}-\\d{2}-\\d{2}$',
         description: null,
         multiline: false,
+        choices: null,
+        enabledBy: null,
+        choicesFrom: null,
+        choicesSnapshot: null,
+        allowOther: false,
+        placeholderFrom: null,
+        placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null,
       },
-      { name: 'note', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null, multiline: false },
+      { name: 'note', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null, multiline: false, choices: null, enabledBy: null, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null },
     ]);
   });
 
@@ -69,7 +92,7 @@ describe('parseParamsSchema', () => {
       additionalProperties: false,
     });
     expect(specs).toEqual([
-      { name: 'topic', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null, multiline: false },
+      { name: 'topic', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null, multiline: false, choices: null, enabledBy: null, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null },
     ]);
   });
 
@@ -107,6 +130,205 @@ describe('parseParamsSchema', () => {
 
   it('refuses an x-order that is not a list of names', () => {
     expect(parseParamsSchema({ type: 'object', properties: {}, 'x-order': 'pr' }).kind).toBe('unrenderable');
+  });
+
+  it('offers a declared choice set, and true or false for a bool, as picks', () => {
+    const [release, accept, note] = specsOf({
+      type: 'object',
+      properties: {
+        release: { type: 'string', enum: ['3.6.0 GA', '3.7 Fast-1'] },
+        accept: { type: 'boolean', default: false },
+        note: { type: 'string' },
+      },
+      required: ['release'],
+    });
+    if (!release || !accept || !note) throw new Error('three specs');
+    expect([release.choices, accept.choices, note.choices]).toEqual([['3.6.0 GA', '3.7 Fast-1'], ['true', 'false'], null]);
+    expect(validateParam(release, '3.7 Fast-1')).toBeNull();
+    expect(validateParam(release, '3.7 EA')).toBe('release must be one of 3.6.0 GA, 3.7 Fast-1');
+  });
+
+  it('refuses choices that are not a nonempty list of the param type', () => {
+    for (const choices of [[], [1, 2], 'a', ['a', null]]) {
+      expect(parseParamsSchema({ type: 'object', properties: { p: { type: 'string', enum: choices } } }).kind).toBe('unrenderable');
+    }
+  });
+
+  it('offers a task-sourced list from its snapshot, per key value when keyed', () => {
+    const [release, component, branch, untouched] = specsOf({
+      type: 'object',
+      properties: {
+        release: {
+          type: 'string',
+          'x-choices-from': { task: 'options', field: 'releases' },
+          'x-choices-snapshot': { value: ['3.6', '3.7'], captured_at: '2026-11-09T10:00:00Z' },
+        },
+        component: {
+          type: 'string',
+          'x-choices-from': { task: 'options', field: 'components', keyed_by: 'release' },
+          'x-choices-snapshot': { value: { '3.7': ['vllm', 'flashinfer'] } },
+        },
+        branch: {
+          type: 'string',
+          'x-placeholder-from': { task: 'options', field: 'branches', keyed_by: 'release' },
+          'x-placeholder-snapshot': { value: { '3.7': 'sync-v0.33.0' } },
+        },
+        untouched: { type: 'string', 'x-choices-from': { task: 'options', field: 'never' } },
+      },
+    });
+    if (!release || !component || !branch || !untouched) throw new Error('four specs');
+    const values = { release: '3.7', component: '', branch: '', untouched: '' };
+    expect(offeredChoices(release, values)).toEqual(['3.6', '3.7']);
+    expect(offeredChoices(component, values)).toEqual(['vllm', 'flashinfer']);
+    expect(offeredChoices(component, { ...values, release: '3.6' })).toEqual([]);
+    expect(offeredChoices(untouched, values)).toBeNull();
+    expect(validateParam(release, '3.8', values)).toBe('release must be one of 3.6, 3.7');
+    expect(validateParam(component, 'vllm', values)).toBeNull();
+    expect(validateParam(component, 'vllm', { ...values, release: '3.6' })).toBe('component has no options for this release');
+    expect(validateParam(untouched, 'anything', values)).toBeNull();
+    expect(placeholderFor(branch, values)).toBe('sync-v0.33.0');
+    expect(placeholderFor(branch, { ...values, release: '3.6' })).toBeNull();
+  });
+
+  it('accepts a value outside the offered list when the choices are open', () => {
+    const [component] = specsOf({
+      type: 'object',
+      properties: {
+        component: {
+          type: 'string',
+          'x-allow-other': true,
+          'x-choices-from': { task: 'options', field: 'components' },
+          'x-choices-snapshot': { value: ['vllm'] },
+        },
+      },
+    });
+    if (!component) throw new Error('one spec');
+    expect(offeredChoices(component, {})).toEqual(['vllm']);
+    expect(validateParam(component, 'triton', {})).toBeNull();
+  });
+
+  it('offers a written list that is open as suggestions', () => {
+    const [size] = specsOf({
+      type: 'object',
+      properties: { size: { type: 'string', default: 's', 'x-allow-other': true, 'x-choices': ['s', 'm'] } },
+    });
+    if (!size) throw new Error('one spec');
+    expect(size.choices).toEqual(['s', 'm']);
+    expect(size.allowOther).toBe(true);
+    expect(validateParam(size, 'xl', {})).toBeNull();
+  });
+
+  it('drops a snapshot of the wrong shape and refuses a key that is not a declared string', () => {
+    const [flat] = specsOf({
+      type: 'object',
+      properties: {
+        flat: {
+          type: 'string',
+          'x-choices-from': { task: 'options', field: 'f' },
+          'x-choices-snapshot': { value: { '3.7': ['a'] } },
+        },
+      },
+    });
+    expect(flat?.choicesSnapshot).toBeNull();
+    const keyedByBool = parseParamsSchema({
+      type: 'object',
+      properties: {
+        gate: { type: 'boolean' },
+        p: { type: 'string', 'x-choices-from': { task: 'o', field: 'f', keyed_by: 'gate' } },
+      },
+    });
+    expect(keyedByBool.kind).toBe('unrenderable');
+  });
+
+  it('lists each options task once with its snapshot time', () => {
+    const specs = specsOf({
+      type: 'object',
+      properties: {
+        release: {
+          type: 'string',
+          'x-choices-from': { task: 'options', field: 'releases' },
+          'x-choices-snapshot': { value: ['3.7'], captured_at: '2026-11-09T12:00:00Z' },
+        },
+        component: { type: 'string', 'x-choices-from': { task: 'options', field: 'components', keyed_by: 'release' } },
+        branch: { type: 'string', 'x-placeholder-from': { task: 'branches', field: 'branch', keyed_by: 'release' } },
+        pr: { type: 'string' },
+      },
+    });
+    expect(optionSources(specs)).toEqual([
+      { task: 'options', passed: true, capturedAt: '2026-11-09T12:00:00Z' },
+      { task: 'branches', passed: false, capturedAt: null },
+    ]);
+  });
+
+  it('asks for a confirmation only for a flagged key value, and requires it then', () => {
+    const tentative = { task: 'options', field: 'tentative', keyed_by: 'release' };
+    const specs = specsOf({
+      type: 'object',
+      properties: {
+        release: { type: 'string' },
+        accept: {
+          type: 'boolean',
+          default: false,
+          'x-confirm-from': tentative,
+          'x-confirm-snapshot': { value: { '3.7': 'vLLM "0.33.0?" is tentative.', '3.6': '' } },
+        },
+        unrun: { type: 'boolean', default: false, 'x-confirm-from': tentative },
+      },
+    });
+    const [, accept, unrun] = specs;
+    if (!accept || !unrun) throw new Error('three specs');
+    const values = { release: '3.7', accept: 'false', unrun: 'false' };
+    expect(confirmation(accept, values)).toEqual({ kind: 'needed', message: 'vLLM "0.33.0?" is tentative.' });
+    expect(validateParam(accept, 'false', values)).toBe('Check this box to launch');
+    expect(validateParam(accept, 'true', values)).toBeNull();
+    const settled = { ...values, release: '3.6', accept: 'true' };
+    expect(confirmation(accept, settled)).toEqual({ kind: 'hidden' });
+    expect(confirmation(accept, { ...settled, release: '3.9' })).toEqual({ kind: 'hidden' });
+    expect(trimmedParams(specs, settled)).toEqual({ release: '3.6', unrun: 'false' });
+    expect(confirmation(unrun, values)).toEqual({ kind: 'optional' });
+    expect(validateParam(unrun, 'false', values)).toBeNull();
+    expect(refreshable([unrun])).toBe(true);
+
+    const unkeyed = parseParamsSchema({
+      type: 'object',
+      properties: { accept: { type: 'boolean', default: false, 'x-confirm-from': { task: 'o', field: 'f' } } },
+    });
+    expect(unkeyed.kind).toBe('unrenderable');
+  });
+
+  it('refreshes with the refresh setting alone', () => {
+    expect(refreshBody({ maxCost: 1, maxTime: ' 10m ', schemaDigest: 'sha256:x' })).toEqual({
+      params: { 'choices.refresh': 'true' },
+      max_cost: 1,
+      max_time: '10m',
+      schema_digest: 'sha256:x',
+    });
+  });
+
+  it('takes a gated param only while its switch is on', () => {
+    const [override, branch] = specsOf({
+      type: 'object',
+      properties: {
+        override_branch: { type: 'boolean', default: false },
+        branch: { type: 'string', default: '', pattern: '^[a-z/.0-9-]+$', 'x-enabled-by': 'override_branch' },
+      },
+    });
+    if (!override || !branch) throw new Error('two specs');
+    expect(branch.enabledBy).toBe('override_branch');
+    const off = { override_branch: 'false', branch: 'NOT A BRANCH' };
+    const on = { override_branch: 'True', branch: 'main' };
+    expect([isEnabled(branch, off), isEnabled(branch, on), isEnabled(override, off)]).toEqual([false, true, true]);
+    expect(validateParam(branch, off.branch, off)).toBeNull();
+    expect(validateParam(branch, 'NOT A BRANCH', { override_branch: 'true' })).not.toBeNull();
+    expect(trimmedParams([override, branch], off)).toEqual({ override_branch: 'false' });
+    expect(trimmedParams([override, branch], on)).toEqual({ override_branch: 'True', branch: 'main' });
+  });
+
+  it('refuses a gate that is not a declared bool', () => {
+    for (const gate of ['missing', 'note', 7]) {
+      const schema = { type: 'object', properties: { note: { type: 'string' }, branch: { type: 'string', 'x-enabled-by': gate } } };
+      expect(parseParamsSchema(schema).kind).toBe('unrenderable');
+    }
   });
 
   it('renders an empty form for a pack that declares no params', () => {
@@ -217,6 +439,13 @@ describe('validateParam', () => {
       pattern: '(?P<year>\\d{4})',
       description: null,
       multiline: false,
+      choices: null,
+      enabledBy: null,
+      choicesFrom: null,
+      choicesSnapshot: null,
+      allowOther: false,
+      placeholderFrom: null,
+      placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null,
     };
     expect(validateParam(rustOnly, 'whatever')).toBeNull();
   });
@@ -444,5 +673,27 @@ describe('runSnapshot', () => {
       max_time: '2h',
       schema_digest: 'sha256:beef',
     });
+  });
+});
+
+describe('paramBlocks', () => {
+  const spec = (name: string, valueType: ParamFieldSpec['valueType'], enabledBy: string | null = null): ParamFieldSpec => ({
+    name, valueType, required: false, defaultValue: null, pattern: null, description: null, multiline: false,
+    choices: valueType === 'boolean' ? ['true', 'false'] : null, enabledBy, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null,
+  });
+
+  it('moves a gate to the head of a group at its first gated field and leaves other booleans alone', () => {
+    const specs = [
+      spec('release', 'string'),
+      spec('override', 'boolean'),
+      spec('branch', 'string', 'override'),
+      spec('tentative', 'boolean'),
+      spec('remote', 'string', 'override'),
+    ];
+    expect(paramBlocks(specs).map((b) => (b.kind === 'field' ? b.spec.name : `${b.gate.name}[${b.fields.map((f) => f.name).join(',')}]`))).toEqual([
+      'release',
+      'override[branch,remote]',
+      'tentative',
+    ]);
   });
 });

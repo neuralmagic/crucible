@@ -41,7 +41,7 @@ pub(crate) fn kit(theme: Theme, dark: bool, size: TextSize) -> &'static Kit {
     KITS[slot][dark as usize][sized].get_or_init(|| {
         let mut kit = rune_theme_opencode::kit(dark).clone();
         if let Some(seeds) = seeds(theme) {
-            let (bg, fg, accent) = seeds[if dark { 0 } else { 1 }];
+            let (bg, fg, accent) = seeds[usize::from(!dark)];
             kit.c = Kit::from_palette(PaletteSeed {
                 bg: hex(bg),
                 fg: hex(fg),

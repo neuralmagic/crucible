@@ -22,7 +22,7 @@ pub(crate) fn page(app: &App, p: &Paint) -> El {
         String::new()
     };
     let page = frame("decisions", "Decisions", note, None, app, p);
-    let open = match landed(&app.admin.decisions, "the decision queue", p) {
+    let open = match landed(&app.remote.admin.decisions, "the decision queue", p) {
         Err(standin) => return page.child(*standin),
         Ok(open) => open,
     };
@@ -36,8 +36,8 @@ pub(crate) fn page(app: &App, p: &Paint) -> El {
             SidebarRow::new(decision.task.clone())
                 .subtitle(about.join(" \u{b7} "))
                 .height(46.0)
-                .selected(app.desk.decision.as_deref() == Some(decision.id.as_str()))
-                .on_select(move |app: &mut App, _: &mut Tx| app.desk.pick_decision(&id))
+                .selected(app.remote.desk.decision.as_deref() == Some(decision.id.as_str()))
+                .on_select(move |app: &mut App, _: &mut Tx| app.remote.desk.pick_decision(&id))
                 .build(p.k)
                 .key(format!("decision-{}", decision.id))
         })
@@ -47,7 +47,7 @@ pub(crate) fn page(app: &App, p: &Paint) -> El {
     } else {
         list("decisions-list", rows, p)
     };
-    let picked = match (&app.desk.decision, &app.admin.decision) {
+    let picked = match (&app.remote.desk.decision, &app.remote.admin.decision) {
         (Some(id), Some((read, loaded))) if id == read => match landed(loaded, "the request", p) {
             Ok(decision) => detail(decision, app, p),
             Err(standin) => *standin,
@@ -290,12 +290,13 @@ fn answer(decision: &crux::dto::Decision, app: &App, p: &Paint) -> El {
             p,
         ));
     }
-    let missing = app.desk.unanswered(decision);
-    let ready = missing.is_empty() && !app.desk.busy();
+    let missing = app.remote.desk.unanswered(decision);
+    let ready = missing.is_empty() && !app.remote.desk.busy();
     let (id, digest) = (decision.id.clone(), decision.evidence_digest.clone());
     let send = move |app: &mut App| {
-        let note = app.desk.note.text.trim().to_string();
+        let note = app.remote.desk.note.text.trim().to_string();
         let labels = app
+            .remote
             .desk
             .picks
             .iter()
@@ -311,9 +312,9 @@ fn answer(decision: &crux::dto::Decision, app: &App, p: &Paint) -> El {
     };
     column
         .child(
-            TextInput::new(&app.desk.note)
+            TextInput::new(&app.remote.desk.note)
                 .placeholder("Note")
-                .on_edit(|app: &mut App| &mut app.desk.note)
+                .on_edit(|app: &mut App| &mut app.remote.desk.note)
                 .build(p.k)
                 .key("decision-note"),
         )
@@ -344,7 +345,7 @@ fn answer(decision: &crux::dto::Decision, app: &App, p: &Paint) -> El {
 }
 
 fn question_row(question: &crux::dto::DecisionQuestion, open: bool, app: &App, p: &Paint) -> El {
-    let picked = app.desk.picks.get(&question.id);
+    let picked = app.remote.desk.picks.get(&question.id);
     let mut options = row().gap(6.0).flex_wrap();
     for label in &question.options {
         let on = picked.is_some_and(|picked| picked.contains(label));
@@ -357,7 +358,7 @@ fn question_row(question: &crux::dto::DecisionQuestion, open: bool, app: &App, p
                     ButtonVariant::Outline
                 })
                 .disabled(!open)
-                .on_press(move |app: &mut App| app.desk.toggle_pick(&q, &l, multiple))
+                .on_press(move |app: &mut App| app.remote.desk.toggle_pick(&q, &l, multiple))
                 .build(p.k)
                 .key(format!("pick-{}-{label}", question.id)),
         );

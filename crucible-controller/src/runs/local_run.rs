@@ -703,7 +703,7 @@ mod tests {
             max_cost: 4.5,
             max_time: MaxTime::parse("30m").expect("duration"),
             agent: crate::playbooks::providers::AgentSelection {
-                harness: Some(crucible::manifest::Harness::Codex),
+                harness: Some(crucible::knobs::Harness::Codex),
                 model: Some("gpt-5.6-luna".to_string()),
             },
             rerun: None,

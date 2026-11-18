@@ -20,7 +20,9 @@ use serde::{Deserialize, Serialize};
 
 use utoipa::ToSchema;
 
-use crucible_contract::inference::{TokenPrice, UsdPerMtok};
+use crucible_contract::inference::{ModelLimits, TokenPrice, UsdPerMtok};
+use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 
 dto! {
     // --- what a launch picker reads (any authenticated caller) --------------------
@@ -46,6 +48,9 @@ dto! {
         /// What an agent run on this provider is charged per million tokens; null charges the
         /// vendor's list price, or nothing for a model no vendor sells.
         pub price: Option<ProviderPriceDto> = p.price.as_ref().map(ProviderPriceDto::from),
+        /// What each model can take and give, in tokens, by model id. A model with no entry
+        /// leaves its limits to the harness.
+        pub model_limits: BTreeMap<String, ModelLimitsDto> = model_limits_dto(&p.model_limits),
         /// `user:<login>` or `team:<slug>`.
         pub owner: String = p.owner.to_string(),
     }
@@ -108,6 +113,63 @@ fn check_price(price: &ProviderPriceDto) -> Result<TokenPrice, String> {
         cache_read: rate("cache_read", price.cache_read)?,
         cache_write: rate("cache_write", price.cache_write)?,
     })
+}
+
+/// One model's limits in tokens: what a request may hold and what a response may produce. A
+/// harness that sets a model's limits in its own configuration is given these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModelLimitsDto {
+    pub context_window: u32,
+    pub max_output_tokens: u32,
+}
+
+fn model_limits_dto(limits: &BTreeMap<String, ModelLimits>) -> BTreeMap<String, ModelLimitsDto> {
+    limits
+        .iter()
+        .map(|(model, l)| {
+            (
+                model.clone(),
+                ModelLimitsDto {
+                    context_window: l.context_window.get(),
+                    max_output_tokens: l.max_output_tokens.get(),
+                },
+            )
+        })
+        .collect()
+}
+
+/// Check a registration's model limits: each a model id with a positive context window and an
+/// output limit no larger than it.
+fn check_model_limits(
+    limits: &BTreeMap<String, ModelLimitsDto>,
+) -> Result<BTreeMap<String, ModelLimits>, String> {
+    limits
+        .iter()
+        .map(|(model, l)| {
+            if model.trim().is_empty() || model.chars().any(char::is_whitespace) {
+                return Err(format!(
+                    "model_limits names {model:?}, which is not a model id"
+                ));
+            }
+            let positive = |field: &str, tokens: u32| {
+                NonZeroU32::new(tokens).ok_or_else(|| {
+                    format!("model_limits.{model}.{field} must be a positive number of tokens")
+                })
+            };
+            let checked = ModelLimits {
+                context_window: positive("context_window", l.context_window)?,
+                max_output_tokens: positive("max_output_tokens", l.max_output_tokens)?,
+            };
+            if checked.max_output_tokens > checked.context_window {
+                return Err(format!(
+                    "model_limits.{model}.max_output_tokens {} exceeds its context_window {}",
+                    l.max_output_tokens, l.context_window
+                ));
+            }
+            Ok((model.clone(), checked))
+        })
+        .collect()
 }
 
 /// What the launch forms render their provider/model pickers from: the providers a launch may
@@ -246,6 +308,9 @@ dto! {
         /// What an agent run on this provider is charged per million tokens; null charges the
         /// vendor's list price, or nothing for a model no vendor sells.
         pub price: Option<ProviderPriceDto> = p.price.as_ref().map(ProviderPriceDto::from),
+        /// What each model can take and give, in tokens, by model id. A model with no entry
+        /// leaves its limits to the harness.
+        pub model_limits: BTreeMap<String, ModelLimitsDto> = model_limits_dto(&p.model_limits),
         pub enabled: bool,
         pub owner: String = p.owner.to_string(),
         pub created_by: String,
@@ -322,6 +387,10 @@ pub(crate) struct ProviderBody {
     /// for a model no vendor sells. Refused on a provider that serves no agent.
     #[serde(default)]
     price: Option<ProviderPriceDto>,
+    /// What each model can take and give, in tokens, by model id. A model with no entry leaves
+    /// its limits to the harness. Refused on a provider that serves no agent.
+    #[serde(default)]
+    model_limits: BTreeMap<String, ModelLimitsDto>,
     #[serde(default = "enabled_by_default")]
     enabled: bool,
 }
@@ -374,8 +443,9 @@ struct CheckedProvider {
     default_model: Option<String>,
     secret: Option<ProviderSecretRef>,
     endpoint: Option<Endpoint>,
-    harness: Option<crucible::manifest::Harness>,
+    harness: Option<crucible::knobs::Harness>,
     price: Option<TokenPrice>,
+    model_limits: BTreeMap<String, ModelLimits>,
     enabled: bool,
 }
 
@@ -386,7 +456,7 @@ fn check_harness(
     kind: ProviderKind,
     protocol: Option<InferenceProtocol>,
     raw: Option<&str>,
-) -> Result<Option<crucible::manifest::Harness>, String> {
+) -> Result<Option<crucible::knobs::Harness>, String> {
     let Some(raw) = raw.map(str::trim).filter(|h| !h.is_empty()) else {
         return Ok(None);
     };
@@ -504,6 +574,23 @@ async fn check_provider(
             body.kind.as_str()
         )));
     }
+    let model_limits = match check_model_limits(&body.model_limits) {
+        Ok(limits) => limits,
+        Err(msg) => return Ok(Err(msg)),
+    };
+    if !model_limits.is_empty()
+        && crate::playbooks::providers::allowed_harnesses(
+            body.kind,
+            endpoint.as_ref().map(|e| e.protocol),
+        )
+        .is_empty()
+    {
+        return Ok(Err(format!(
+            "model_limits: a {} provider serves route decisions, not agents, so its models take \
+             no limits",
+            body.kind.as_str()
+        )));
+    }
     let secret = match body.secret_name.as_deref().map(str::trim) {
         None | Some("") => None,
         Some(raw) => {
@@ -531,6 +618,7 @@ async fn check_provider(
         endpoint,
         harness,
         price,
+        model_limits,
         enabled: body.enabled,
     }))
 }
@@ -588,6 +676,7 @@ async fn check_provider_secret(
         }
     };
     let mut prospective = ModelProvider {
+        model_limits: Default::default(),
         id: id.to_string(),
         owner: crate::authz::model::Principal::platform(),
         display_name: String::new(),
@@ -643,6 +732,7 @@ fn new_provider<'a>(
         endpoint: checked.endpoint.as_ref(),
         harness: checked.harness,
         price: checked.price,
+        model_limits: checked.model_limits.clone(),
         enabled: checked.enabled,
         created_by: actor,
         owner,
@@ -1425,6 +1515,57 @@ pub(crate) async fn require_agent_pin(
 #[cfg(test)]
 mod tests {
     use crate::playbooks::api::providers::*;
+
+    #[test]
+    fn model_limits_are_positive_and_the_output_fits_the_window() {
+        let one = |model: &str, context_window, max_output_tokens| {
+            check_model_limits(&BTreeMap::from([(
+                model.to_string(),
+                ModelLimitsDto {
+                    context_window,
+                    max_output_tokens,
+                },
+            )]))
+        };
+        let ok = one("zai-org/glm-5", 200_000, 64_000).expect("limits");
+        assert_eq!(ok["zai-org/glm-5"].context_window.get(), 200_000);
+        assert_eq!(ok["zai-org/glm-5"].max_output_tokens.get(), 64_000);
+        assert_eq!(
+            model_limits_dto(&ok)["zai-org/glm-5"].max_output_tokens,
+            64_000
+        );
+        assert!(
+            check_model_limits(&BTreeMap::new())
+                .expect("none")
+                .is_empty()
+        );
+
+        for (model, window, output, said) in [
+            (
+                "m",
+                0,
+                1,
+                "model_limits.m.context_window must be a positive",
+            ),
+            (
+                "m",
+                8_000,
+                0,
+                "model_limits.m.max_output_tokens must be a positive",
+            ),
+            (
+                "m",
+                8_000,
+                16_000,
+                "max_output_tokens 16000 exceeds its context_window 8000",
+            ),
+            ("two words", 8_000, 1_000, "is not a model id"),
+            ("", 8_000, 1_000, "is not a model id"),
+        ] {
+            let err = one(model, window, output).expect_err("refused");
+            assert!(err.contains(said), "{model:?}: {err}");
+        }
+    }
 
     #[test]
     fn a_price_rate_is_finite_and_not_negative() {

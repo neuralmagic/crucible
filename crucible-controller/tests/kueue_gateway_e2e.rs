@@ -386,10 +386,12 @@ async fn serve_controller(
         token_ttl: Default::default(),
         spire: vec![spire],
         audiences: vec![Audience {
+            server: "kueue".to_string(),
             resource: RESOURCE.to_string(),
             cluster: env.cluster.clone(),
             scopes: vec!["kueue.read".into(), "kueue.submit".into()],
             namespaces: Vec::new(),
+            remote: true,
         }],
     };
     let keys =

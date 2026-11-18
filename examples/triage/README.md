@@ -11,7 +11,7 @@ crucible plan run --manifest examples/triage/crucible.toml \
   --max-cost 5 --max-time 20m
 ```
 
-`--param label=bug` narrows the sweep, `--param limit=10` widens it (`max_fanout` caps it
+`--param label=bug` narrows the sweep, `--param limit=10` widens it (`each(..., max = N)` caps it
 at 12 regardless). `crucible plan params --file examples/triage/workflow.star` prints the
 accepted parameters without evaluating a line of the graph.
 

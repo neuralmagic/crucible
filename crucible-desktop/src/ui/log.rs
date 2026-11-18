@@ -1,11 +1,11 @@
 //! The engine's console, one typed row per line.
 
 use rune::{Color, El, ScrollSpec, TextStyle, Tx, col, el, icon, row, text};
-use rune_kit::{SegmentedControl, TextInput};
+use rune_kit::{IconButton, IconButtonVariant, SegmentedControl, TextInput};
 use rune_theme_opencode::icons as oc;
 
-use crate::logline::{Body, Level, LogLine, LogView};
-use crate::session::{TaskState, TaskView};
+use crate::logline::{self, Body, Level, LogLine, LogView};
+use crate::session::{TaskState, TaskView, split_name};
 use crate::settings::LogFont;
 use crate::ui::Paint;
 use crate::ui::tasks::{count, state_mark, status_color};
@@ -29,26 +29,13 @@ pub(crate) fn log_pane(
     app: &App,
     p: &Paint,
 ) -> El {
-    let reading = if transcript.is_empty() {
-        LogSource::Console
-    } else {
-        app.log_source
-    };
-    let log = match reading {
-        LogSource::Transcript => transcript,
-        LogSource::Console => console,
-    };
-    let query = app.log_search.text.trim().to_ascii_lowercase();
-    let in_scope = |line: &&LogLine| {
-        app.log_task.as_deref().is_none_or(|task| line.is_for(task))
-            && (query.is_empty() || line.raw.to_ascii_lowercase().contains(&query))
-    };
-    let scoped: Vec<&LogLine> = log.iter().filter(in_scope).collect();
-    let matched: Vec<&LogLine> = scoped
-        .iter()
-        .copied()
-        .filter(|line| app.log_view.keeps(line, app.log_chatter))
-        .collect();
+    let Shown {
+        reading,
+        log,
+        scoped,
+        matched,
+    } = shown(transcript, console, app);
+    let query = app.log_search.text.trim();
 
     let style = p.sized(TextStyle::new(11.5, 400.0).lh(17.0).family(font.family()));
     let mode = app
@@ -63,8 +50,9 @@ pub(crate) fn log_pane(
         .px(10.0)
         .py(8.0)
         .scroll(ScrollSpec {
-            stick_bottom: app.log_task.is_none() && query.is_empty() && mode == LogMode::Stream,
+            stick_bottom: app.run.log_task.is_none() && query.is_empty() && mode == LogMode::Stream,
         })
+        .scroll_anchor()
         .scroll_edge_fade(8.0);
     if matched.is_empty() {
         lines = lines.child(
@@ -81,11 +69,13 @@ pub(crate) fn log_pane(
     match mode {
         LogMode::Stream => {
             for line in matched.iter().skip(matched.len().saturating_sub(SHOWN)) {
-                lines = lines.child(line_row(line, style, app.log_task.is_some(), p));
+                let row = line_row(line, style, app.run.log_task.is_some(), p);
+                lines = lines.child(keyed(row, log, line));
             }
         }
         LogMode::ByTask => {
             let blocks = Blocks {
+                log,
                 tasks,
                 app,
                 style,
@@ -112,7 +102,8 @@ pub(crate) fn log_pane(
                 .center_y()
                 .child(scope_row(app, p).grow(1.0).min_w(0.0))
                 .child(modes(mode, p))
-                .children((!transcript.is_empty()).then(|| sources(reading, p))),
+                .children((!transcript.is_empty()).then(|| sources(reading, p)))
+                .child(copy_button(p)),
         )
         .children((!log.is_empty()).then(|| views(&scoped, app, p)))
         .child(
@@ -125,6 +116,61 @@ pub(crate) fn log_pane(
                 .border(p.hair, p.c.border_muted)
                 .clip_rounded(p.k.radius.md),
         )
+}
+
+/// The lines the pane reads from, and the ones its task, filter and view keep.
+struct Shown<'a> {
+    reading: LogSource,
+    log: &'a [LogLine],
+    scoped: Vec<&'a LogLine>,
+    matched: Vec<&'a LogLine>,
+}
+
+fn shown<'a>(transcript: &'a [LogLine], console: &'a [LogLine], app: &App) -> Shown<'a> {
+    let reading = if transcript.is_empty() {
+        LogSource::Console
+    } else {
+        app.log_source
+    };
+    let log = match reading {
+        LogSource::Transcript => transcript,
+        LogSource::Console => console,
+    };
+    let query = app.log_search.text.trim().to_ascii_lowercase();
+    let scoped: Vec<&LogLine> = log
+        .iter()
+        .filter(|line| {
+            app.run
+                .log_task
+                .as_deref()
+                .is_none_or(|task| line.is_for(task))
+                && (query.is_empty() || line.raw.to_ascii_lowercase().contains(&query))
+        })
+        .collect();
+    let matched = scoped
+        .iter()
+        .copied()
+        .filter(|line| app.log_view.keeps(line, app.log_chatter))
+        .collect();
+    Shown {
+        reading,
+        log,
+        scoped,
+        matched,
+    }
+}
+
+/// Copies every line the pane's task, filter and view keep, drawn or not.
+fn copy_button(p: &Paint) -> El {
+    IconButton::new(&oc::COPY)
+        .variant(IconButtonVariant::GhostMuted)
+        .label("Copy log")
+        .on_press_tx(|app: &mut App, tx: &mut Tx| {
+            let (transcript, console) = app.log_lines();
+            tx.copy(logline::copy_text(shown(transcript, console, app).matched));
+        })
+        .build(p.k)
+        .key("log-copy")
 }
 
 /// One stream, or a block per task.
@@ -152,6 +198,7 @@ enum Fold {
 
 /// The pieces every block draws with.
 struct Blocks<'a> {
+    log: &'a [LogLine],
     tasks: &'a [TaskView],
     app: &'a App,
     style: TextStyle,
@@ -159,26 +206,19 @@ struct Blocks<'a> {
 }
 
 impl Blocks<'_> {
-    /// Where the task or instance `name` stands; `None` for the lines no task owns.
+    /// Where the task, instance or round `name` stands; `None` for the lines no task owns.
     fn state(&self, name: &str) -> Option<TaskState> {
-        let (task, key) = match name.split_once('[') {
-            Some((task, rest)) => (task, rest.strip_suffix(']')),
-            None => (name, None),
-        };
+        let (task, key) = split_name(name);
         let task = self.tasks.iter().find(|t| t.name == task)?;
         match key {
             None => Some(task.state()),
-            Some(key) => task
-                .instances
-                .iter()
-                .find(|i| i.key == key)
-                .map(|i| i.state()),
+            Some(key) => task.part_state(key),
         }
     }
 
     /// A running task shows its tail, a failed one opens, the rest fold.
     fn fold(&self, block: &Block) -> Fold {
-        if let Some(open) = self.app.log_folds.get(&block.name) {
+        if let Some(open) = self.app.run.log_folds.get(&block.name) {
             return if *open { Fold::Open } else { Fold::Folded };
         }
         match self.state(&block.name) {
@@ -198,7 +238,8 @@ impl Blocks<'_> {
         let indent = INDENT * depth as f32;
         let mut rows = vec![self.header(block, fold, indent)];
         let line = |line: &LogLine, scoped: bool| {
-            line_row(line, self.style, scoped, self.p).pl(indent + INDENT)
+            let row = line_row(line, self.style, scoped, self.p).pl(indent + INDENT);
+            keyed(row, self.log, line)
         };
         match fold {
             Fold::Folded => {}
@@ -247,7 +288,7 @@ impl Blocks<'_> {
             .hover(p.c.hover)
             .focusable(true)
             .on_press(move |app: &mut App| {
-                app.log_folds.insert(name.clone(), !open);
+                app.run.log_folds.insert(name.clone(), !open);
             })
             .child(
                 icon(
@@ -353,7 +394,7 @@ fn views(scoped: &[&LogLine], app: &App, p: &Paint) -> El {
 
 fn scope_row(app: &App, p: &Paint) -> El {
     let mut bar = row().w_full().gap(6.0).center_y();
-    if let Some(task) = &app.log_task {
+    if let Some(task) = &app.run.log_task {
         bar = bar.child(
             row()
                 .key("log-task")
@@ -413,6 +454,15 @@ fn toggle(
         .focusable(true)
         .on_press(on_press)
         .child(text(label.to_string()).font(p.k.ty.small_medium).color(ink))
+}
+
+/// Keys a line's row by where the line sits in `log`, so it stays the same row while the lines
+/// drawn around it change.
+fn keyed(row: El, log: &[LogLine], line: &LogLine) -> El {
+    match log.element_offset(line) {
+        Some(at) => row.key(format!("log-line-{at}")),
+        None => row,
+    }
 }
 
 fn line_row(line: &LogLine, style: TextStyle, scoped: bool, p: &Paint) -> El {

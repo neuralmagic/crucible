@@ -8,7 +8,7 @@ use crate::config::{Config, Lifetimes, QUEUE_LABEL};
 use kube::core::ApiResource;
 use kube_quantity::ParsedQuantity;
 use rmcp::schemars;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -24,6 +24,12 @@ pub enum WorkloadKind {
     JobSet,
     PyTorchJob,
 }
+
+/// The most ports one workload exposes.
+pub const MAX_EXPOSED_PORTS: usize = 8;
+
+/// The label a LeaderWorkerSet puts on each pod with its index in the group; the leader is `0`.
+const LWS_WORKER_INDEX_LABEL: &str = "leaderworkerset.sigs.k8s.io/worker-index";
 
 /// How Kueue admits the pods of a kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -59,6 +65,15 @@ impl WorkloadKind {
         matches!(
             self,
             Self::Job | Self::RayJob | Self::JobSet | Self::PyTorchJob
+        )
+    }
+
+    /// Kinds `expose` gives a Service. A RayJob, JobSet or PyTorchJob has Services its own
+    /// controller makes.
+    pub fn takes_service(self) -> bool {
+        matches!(
+            self,
+            Self::Job | Self::Deployment | Self::StatefulSet | Self::LeaderWorkerSet
         )
     }
 
@@ -129,6 +144,12 @@ pub enum ManifestError {
     #[error("manifest must be a JSON object")]
     NotObject,
     #[error(
+        "expose takes a Job, Deployment, StatefulSet or LeaderWorkerSet; a {kind} makes its own Services"
+    )]
+    ExposeKind { kind: &'static str },
+    #[error("expose takes 1 to {MAX_EXPOSED_PORTS} distinct ports from 1 to 65535, got {got:?}")]
+    ExposePorts { got: Vec<u16> },
+    #[error(
         "{api_version}/{kind} is not submittable; allowed: batch/v1 Job, ray.io/v1 RayJob, leaderworkerset.x-k8s.io/v1 LeaderWorkerSet, apps/v1 Deployment, apps/v1 StatefulSet, jobset.x-k8s.io/v1alpha2 JobSet, kubeflow.org/v1 PyTorchJob"
     )]
     Kind { api_version: String, kind: String },
@@ -155,6 +176,12 @@ pub enum ManifestError {
         false => format!("it offers {}. The server adds the secret an image's registry needs to the pod itself; an image on any other registry must be public, so dropping the field does not let a private image pull", allowed.join(", ")),
     })]
     PullSecret {
+        path: String,
+        name: String,
+        allowed: Vec<String>,
+    },
+    #[error("{path}: storage class {name:?} is not one this server offers; it offers {}. Without the field a claim takes the cluster's default class", allowed.join(", "))]
+    StorageClass {
         path: String,
         name: String,
         allowed: Vec<String>,
@@ -193,6 +220,8 @@ pub struct Normalized {
     pub name: String,
     pub object: Value,
     pub pod_sets: Vec<PodSet>,
+    /// The ports a Service of the workload's name exposes; none, no Service.
+    pub expose: Vec<u16>,
     pub plan_hash: String,
     /// What the server added to the manifest beyond its own labels and defaults, for the plan.
     pub server_changes: Vec<String>,
@@ -201,6 +230,76 @@ pub struct Normalized {
 impl Normalized {
     pub fn total_requests(&self) -> BTreeMap<String, ParsedQuantity> {
         total_requests(&self.pod_sets)
+    }
+
+    /// Expose `ports` of the workload's pods through a Service of its name. The ports are part
+    /// of the plan, so they change its hash.
+    pub fn exposing(mut self, ports: &[u16]) -> Result<Self, ManifestError> {
+        if ports.is_empty() {
+            return Ok(self);
+        }
+        if !self.kind.takes_service() {
+            return Err(ManifestError::ExposeKind {
+                kind: self.kind.kind(),
+            });
+        }
+        let mut distinct = ports.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        if distinct.len() != ports.len() || ports.len() > MAX_EXPOSED_PORTS || ports.contains(&0) {
+            return Err(ManifestError::ExposePorts {
+                got: ports.to_vec(),
+            });
+        }
+        self.expose = distinct;
+        self.plan_hash = plan_hash(&json!({"object": self.object, "expose": self.expose}));
+        Ok(self)
+    }
+
+    /// The Service exposing the workload's ports in `namespace`, selecting its pods by the
+    /// `workload_label` the server stamps on them (a LeaderWorkerSet's leaders only), carrying
+    /// the workload's own labels, and owned by the workload when `owner_uid` names it, so it is
+    /// deleted with it. `None` when nothing is exposed.
+    pub fn service(
+        &self,
+        namespace: &str,
+        workload_label: &str,
+        owner_uid: Option<&str>,
+    ) -> Option<Value> {
+        if self.expose.is_empty() {
+            return None;
+        }
+        let mut selector = serde_json::Map::new();
+        selector.insert(workload_label.to_string(), json!(self.name));
+        if self.kind == WorkloadKind::LeaderWorkerSet {
+            selector.insert(LWS_WORKER_INDEX_LABEL.to_string(), json!("0"));
+        }
+        let ports: Vec<Value> = self
+            .expose
+            .iter()
+            .map(|port| {
+                json!({"name": format!("port-{port}"), "port": port, "targetPort": port, "protocol": "TCP"})
+            })
+            .collect();
+        let mut metadata = json!({
+            "name": self.name,
+            "namespace": namespace,
+            "labels": self.object.pointer("/metadata/labels").cloned().unwrap_or_else(|| json!({})),
+        });
+        if let Some(uid) = owner_uid {
+            metadata["ownerReferences"] = json!([{
+                "apiVersion": self.kind.api_version(),
+                "kind": self.kind.kind(),
+                "name": self.name,
+                "uid": uid,
+            }]);
+        }
+        Some(json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": metadata,
+            "spec": {"type": "ClusterIP", "selector": selector, "ports": ports},
+        }))
     }
 
     /// How long Kubernetes keeps the object after it finishes, when it is deleted then.
@@ -428,6 +527,7 @@ pub fn normalize(
     Ok(Normalized {
         kind,
         name,
+        expose: Vec::new(),
         object,
         pod_sets,
         plan_hash,
@@ -970,6 +1070,7 @@ const RUN_POLICY: &[&str] = &[
 const REPLICA_SPEC: &[&str] = &["replicas", "restartPolicy", "template"];
 const PVC_TEMPLATE: &[&str] = &["metadata", "spec"];
 const PVC_SPEC: &[&str] = &["accessModes", "resources", "volumeMode"];
+const PVC_SPEC_CLASSED: &[&str] = &["accessModes", "resources", "storageClassName", "volumeMode"];
 
 /// Object-level fields outside the pod templates. Each kind's spec is allowlisted, so fields that
 /// hand the object to another controller (`managedBy`, `clusterSelector`), adopt foreign pods,
@@ -1104,8 +1205,8 @@ fn check_claim_templates(
     Ok(())
 }
 
-/// A claim the workload provisions: default storage class only, empty, never cloned from or
-/// bound to an existing volume.
+/// A claim the workload provisions: empty, never cloned from or bound to an existing volume, on
+/// the default storage class or one the server offers.
 fn check_claim_template(t: &Value, path: &str, cfg: &Config) -> Result<(), ManifestError> {
     let t = object_at(t, path)?;
     only_fields(t, PVC_TEMPLATE, path)?;
@@ -1117,11 +1218,32 @@ fn check_claim_template(t: &Value, path: &str, cfg: &Config) -> Result<(), Manif
             cfg,
         )?;
     }
-    if let Some(spec) = t.get("spec") {
-        let s_path = format!("{path}/spec");
-        only_fields(object_at(spec, &s_path)?, PVC_SPEC, &s_path)?;
+    let Some(spec) = t.get("spec") else {
+        return Ok(());
+    };
+    let s_path = format!("{path}/spec");
+    let spec = object_at(spec, &s_path)?;
+    let offered = &cfg.storage_classes;
+    if offered.is_empty() {
+        return only_fields(spec, PVC_SPEC, &s_path);
     }
-    Ok(())
+    only_fields(spec, PVC_SPEC_CLASSED, &s_path)?;
+    let Some(class) = spec.get("storageClassName") else {
+        return Ok(());
+    };
+    let c_path = format!("{s_path}/storageClassName");
+    let name = class.as_str().ok_or(ManifestError::Shape {
+        path: c_path.clone(),
+        expected: "a string",
+    })?;
+    if offered.contains(name) {
+        return Ok(());
+    }
+    Err(ManifestError::StorageClass {
+        path: c_path,
+        name: name.to_string(),
+        allowed: offered.iter().cloned().collect(),
+    })
 }
 
 /// Pins a Deployment or StatefulSet selector to the server-set template labels, so its
@@ -2069,6 +2191,169 @@ mod tests {
         assert_eq!(n.object.pointer("/spec/ttlSecondsAfterFinished"), None);
     }
 
+    fn deployment() -> Value {
+        json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "serve"},
+            "spec": {"replicas": 1, "template": {"spec": {"containers": [{"name": "c"}]}}}
+        })
+    }
+
+    #[test]
+    fn an_exposed_workload_gets_a_service_of_its_name_selecting_its_pods() {
+        let plain = normalize(deployment(), &caller(), &queue(), &Config::default()).unwrap();
+        assert_eq!(plain.service("team-a", "crucible.dev/workload", None), None);
+        let unexposed = plain.plan_hash.clone();
+        assert_eq!(plain.exposing(&[]).unwrap().plan_hash, unexposed);
+
+        let n = normalize(deployment(), &caller(), &queue(), &Config::default())
+            .unwrap()
+            .exposing(&[8000, 9090])
+            .unwrap();
+        assert_ne!(n.plan_hash, unexposed, "the ports are part of the plan");
+        let reordered = normalize(deployment(), &caller(), &queue(), &Config::default())
+            .unwrap()
+            .exposing(&[9090, 8000])
+            .unwrap();
+        assert_eq!(n.plan_hash, reordered.plan_hash);
+        let service = n
+            .service("team-a", "crucible.dev/workload", Some("uid-1"))
+            .unwrap();
+        assert_eq!(
+            service["metadata"],
+            json!({
+                "name": "serve",
+                "namespace": "team-a",
+                "labels": n.object["metadata"]["labels"],
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1", "kind": "Deployment", "name": "serve", "uid": "uid-1"
+                }],
+            })
+        );
+        assert_eq!(
+            service["spec"],
+            json!({
+                "type": "ClusterIP",
+                "selector": {"crucible.dev/workload": "serve"},
+                "ports": [
+                    {"name": "port-8000", "port": 8000, "targetPort": 8000, "protocol": "TCP"},
+                    {"name": "port-9090", "port": 9090, "targetPort": 9090, "protocol": "TCP"},
+                ],
+            })
+        );
+        assert_eq!(
+            n.object["spec"]["template"]["metadata"]["labels"]["crucible.dev/workload"], "serve",
+            "the selector matches the label the server stamps on the pods"
+        );
+        assert!(
+            n.service("team-a", "crucible.dev/workload", None).unwrap()["metadata"]
+                .get("ownerReferences")
+                .is_none(),
+            "a dry run names no owner"
+        );
+    }
+
+    #[test]
+    fn a_leader_worker_sets_service_selects_its_leaders() {
+        let lws = json!({
+            "apiVersion": "leaderworkerset.x-k8s.io/v1",
+            "kind": "LeaderWorkerSet",
+            "metadata": {"name": "vllm"},
+            "spec": {"replicas": 1, "leaderWorkerTemplate": {"size": 2, "workerTemplate": {
+                "spec": {"containers": [{"name": "c"}]}
+            }}}
+        });
+        let n = normalize(lws, &caller(), &queue(), &Config::default())
+            .unwrap()
+            .exposing(&[8000])
+            .unwrap();
+        assert_eq!(
+            n.service("team-a", "crucible.dev/workload", None).unwrap()["spec"]["selector"],
+            json!({
+                "crucible.dev/workload": "vllm",
+                "leaderworkerset.sigs.k8s.io/worker-index": "0",
+            })
+        );
+    }
+
+    #[test]
+    fn an_exposed_job_gets_a_service_it_owns_selecting_its_pods() {
+        let n = normalize(job(), &caller(), &queue(), &Config::default())
+            .unwrap()
+            .exposing(&[8000])
+            .unwrap();
+        let service = n
+            .service("team-a", "crucible.dev/workload", Some("uid-1"))
+            .unwrap();
+        assert_eq!(
+            service["metadata"]["ownerReferences"],
+            json!([{"apiVersion": "batch/v1", "kind": "Job", "name": n.name, "uid": "uid-1"}])
+        );
+        assert_eq!(
+            service["spec"]["selector"],
+            json!({"crucible.dev/workload": n.name})
+        );
+        assert_eq!(
+            n.object["spec"]["template"]["metadata"]["labels"]["crucible.dev/workload"],
+            json!(n.name)
+        );
+    }
+
+    #[test]
+    fn kinds_with_their_own_services_do_not_expose() {
+        let ray = json!({
+            "apiVersion": "ray.io/v1",
+            "kind": "RayJob",
+            "metadata": {"name": "tune"},
+            "spec": {"entrypoint": "python t.py", "rayClusterSpec": {"headGroupSpec": {
+                "template": {"spec": {"containers": [{"name": "head"}]}}
+            }}}
+        });
+        for (manifest, kind) in [
+            (jobset(), "JobSet"),
+            (pytorchjob(), "PyTorchJob"),
+            (ray, "RayJob"),
+        ] {
+            let refused = normalize(manifest, &caller(), &queue(), &Config::default())
+                .unwrap()
+                .exposing(&[8000]);
+            assert_eq!(
+                refused.unwrap_err().to_string(),
+                format!(
+                    "expose takes a Job, Deployment, StatefulSet or LeaderWorkerSet; a {kind} makes its own Services"
+                )
+            );
+        }
+        for kind in WorkloadKind::ALL {
+            assert_eq!(
+                kind.takes_service(),
+                !matches!(
+                    kind,
+                    WorkloadKind::RayJob | WorkloadKind::JobSet | WorkloadKind::PyTorchJob
+                ),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_few_distinct_ports_are_exposed() {
+        for bad in [vec![0], vec![8000, 8000], (1..=9).collect::<Vec<u16>>()] {
+            let refused = normalize(deployment(), &caller(), &queue(), &Config::default())
+                .unwrap()
+                .exposing(&bad);
+            assert!(
+                matches!(&refused, Err(ManifestError::ExposePorts { got }) if got == &bad),
+                "{bad:?}"
+            );
+        }
+        normalize(deployment(), &caller(), &queue(), &Config::default())
+            .unwrap()
+            .exposing(&(1..=8).collect::<Vec<u16>>())
+            .unwrap();
+    }
+
     #[test]
     fn job_requests_multiply_by_parallelism_and_limits_fill_missing_requests() {
         let n = normalize(job(), &caller(), &queue(), &Config::default()).unwrap();
@@ -2712,6 +2997,76 @@ mod tests {
             "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "1Gi"}}}
         }}}]);
         assert!(normalize(m, &caller(), &queue(), &Config::default()).is_ok());
+    }
+
+    #[test]
+    fn a_claim_may_name_only_a_storage_class_the_server_offers() {
+        let cfg = Config {
+            storage_classes: ["gpu-local", "shared"].map(String::from).into(),
+            ..Config::default()
+        };
+        let classed = |class: Value| {
+            let mut m = statefulset();
+            m["spec"]["volumeClaimTemplates"][0]["spec"]["storageClassName"] = class;
+            m
+        };
+        let ephemeral = |class: &str| {
+            let mut m = job();
+            m["spec"]["template"]["spec"]["volumes"] = json!([{"name": "v", "ephemeral": {"volumeClaimTemplate": {
+                "spec": {"accessModes": ["ReadWriteOnce"], "storageClassName": class, "resources": {"requests": {"storage": "1Gi"}}}
+            }}}]);
+            m
+        };
+
+        let n = normalize(classed(json!("gpu-local")), &caller(), &queue(), &cfg).unwrap();
+        assert_eq!(
+            n.object
+                .pointer("/spec/volumeClaimTemplates/0/spec/storageClassName"),
+            Some(&json!("gpu-local"))
+        );
+        assert!(normalize(ephemeral("shared"), &caller(), &queue(), &cfg).is_ok());
+        assert!(normalize(statefulset(), &caller(), &queue(), &cfg).is_ok());
+
+        let err =
+            normalize(classed(json!("control-plane")), &caller(), &queue(), &cfg).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "/spec/volumeClaimTemplates/0/spec/storageClassName: storage class \"control-plane\" is not one this server offers; it offers gpu-local, shared. Without the field a claim takes the cluster's default class"
+        );
+        for refused in [
+            ephemeral("control-plane"),
+            ephemeral(""),
+            classed(json!(null)),
+            classed(json!(["gpu-local"])),
+        ] {
+            let err = normalize(refused, &caller(), &queue(), &cfg).unwrap_err();
+            assert!(err.to_string().contains("storageClassName"), "{err}");
+        }
+        for (needle, field, value) in [
+            ("volumeName", "volumeName", json!("pv-victim")),
+            (
+                "dataSource",
+                "dataSource",
+                json!({"kind": "PersistentVolumeClaim", "name": "victim"}),
+            ),
+        ] {
+            let mut m = classed(json!("gpu-local"));
+            m["spec"]["volumeClaimTemplates"][0]["spec"][field] = value;
+            let err = normalize(m, &caller(), &queue(), &cfg).unwrap_err();
+            assert!(err.to_string().contains(needle), "{needle}: {err}");
+        }
+
+        let err = normalize(
+            classed(json!("gpu-local")),
+            &caller(),
+            &queue(),
+            &Config::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ManifestError::NotAllowed { .. }),
+            "with no classes offered the field itself is refused: {err}"
+        );
     }
 
     #[test]

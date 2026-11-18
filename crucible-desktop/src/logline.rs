@@ -11,6 +11,7 @@
 //! plan v1: completed — spent $0.0000 of $50                      Summary
 //! ```
 
+use crucible_contract::console::strip_ansi;
 use crucible_contract::event::AgentEvent;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -109,6 +110,31 @@ pub struct LogLine {
     pub raw: String,
 }
 
+/// `lines` as text, one each. A line whose text does not name its task gets the console's
+/// `[task]` prefix.
+pub fn copy_text<'a>(lines: impl IntoIterator<Item = &'a LogLine>) -> String {
+    let mut text = String::new();
+    for line in lines {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        if let Some(task) = &line.task {
+            let named = line
+                .raw
+                .strip_prefix('[')
+                .and_then(|rest| rest.strip_prefix(task.as_str()))
+                .is_some_and(|rest| rest.starts_with(']'));
+            if !named {
+                text.push('[');
+                text.push_str(task);
+                text.push_str("] ");
+            }
+        }
+        text.push_str(&line.raw);
+    }
+    text
+}
+
 /// Which switch in the log pane a line answers to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Group {
@@ -124,14 +150,17 @@ impl LogLine {
     pub fn from_output(task: &str, stderr: bool, lines: &[String]) -> Vec<Self> {
         lines
             .iter()
-            .map(|text| LogLine {
-                at: None,
-                task: Some(task.to_string()),
-                body: Body::Output {
-                    stderr,
-                    text: text.clone(),
-                },
-                raw: text.clone(),
+            .map(|text| {
+                let text = strip_ansi(text).into_owned();
+                LogLine {
+                    at: None,
+                    task: Some(task.to_string()),
+                    body: Body::Output {
+                        stderr,
+                        text: text.clone(),
+                    },
+                    raw: text,
+                }
             })
             .collect()
     }
@@ -260,7 +289,7 @@ impl LogLine {
     }
 
     pub fn parse(raw: &str) -> Self {
-        let raw = raw.trim_end().to_string();
+        let raw = strip_ansi(raw.trim_end()).into_owned();
         let (task, rest) = task_prefix(&raw);
         let mut line = LogLine {
             at: None,
@@ -593,7 +622,7 @@ fn task_row(raw: &str) -> Option<Body> {
 
 #[cfg(test)]
 mod tests {
-    use crate::logline::{Activity, Body, Group, Level, LogLine, LogView, activity};
+    use crate::logline::{Activity, Body, Group, Level, LogLine, LogView, activity, copy_text};
 
     #[test]
     fn engine_notices_and_traces_read_as_engine_lines() {
@@ -619,6 +648,33 @@ mod tests {
         assert_eq!(warn.group(), Group::Engine);
         assert!(warn.is_problem());
         assert!(matches!(warn.body, Body::Trace { ref target, .. } if target.is_empty()));
+    }
+
+    #[test]
+    fn a_colored_tracing_line_reads_as_a_trace_without_its_escapes() {
+        let line = LogLine::parse(
+            "\u{1b}[2m2026-11-09T18:02:41.069974Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m \u{1b}[1mcve-triage\u{1b}[0m\u{1b}[1m{\u{1b}[0m\u{1b}[3mcommand\u{1b}[0m\u{1b}[2m=\u{1b}[0m\"discover\"\u{1b}[1m}\u{1b}[0m\u{1b}[2m:\u{1b}[0m\u{1b}[1mtriage.prepare\u{1b}[0m\u{1b}[1m{\u{1b}[0m\u{1b}[3mprofile\u{1b}[0m\u{1b}[2m=\u{1b}[0mllm-d\u{1b}[1m}\u{1b}[0m\u{1b}[2m:\u{1b}[0m \u{1b}[2mcve_triage::tickets\u{1b}[0m\u{1b}[2m:\u{1b}[0m [llm-d] Jira search returned 176 ticket(s)",
+        );
+        assert_eq!(line.at.as_deref(), Some("18:02:41"));
+        assert_eq!(
+            line.body,
+            Body::Trace {
+                level: Level::Info,
+                target: "cve-triage{command=\"discover\"}:triage.prepare{profile=llm-d}".into(),
+                text: "cve_triage::tickets: [llm-d] Jira search returned 176 ticket(s)".into()
+            }
+        );
+        assert!(!line.raw.contains('\u{1b}'));
+        assert_eq!(line.group(), Group::Chatter);
+
+        let output = LogLine::from_output("seed", true, &["\u{1b}[31merror\u{1b}[0m: no".into()]);
+        assert_eq!(
+            output[0].body,
+            Body::Output {
+                stderr: true,
+                text: "error: no".into()
+            }
+        );
     }
 
     #[test]
@@ -762,6 +818,44 @@ mod tests {
         assert_eq!(shown(LogView::Problems, false), 3);
         assert_eq!(shown(LogView::Engine, false), 3);
         assert_eq!(shown(LogView::Engine, true), 4);
+    }
+
+    #[test]
+    fn copied_text_keeps_every_line_and_names_each_task_once() {
+        let console = [
+            LogLine::parse("[crucible] OTLP span export enabled"),
+            LogLine::parse(
+                "\u{1b}[31m[edit[cache]] \u{1f527} Bash $ git init -q build/vllm\u{1b}[0m",
+            ),
+            LogLine::parse("plan v1: completed"),
+        ];
+        assert_eq!(
+            copy_text(&console),
+            "[crucible] OTLP span export enabled\n[edit[cache]] \u{1f527} Bash $ git init -q build/vllm\nplan v1: completed"
+        );
+
+        let output = LogLine::from_output(
+            "build",
+            false,
+            &[
+                "[127/130] Building CUDA object".into(),
+                String::new(),
+                "done".into(),
+            ],
+        );
+        assert_eq!(
+            copy_text(&output),
+            "[build] [127/130] Building CUDA object\n[build] \n[build] done"
+        );
+
+        let many: Vec<LogLine> = (0..5000)
+            .map(|i| LogLine::parse(&format!("line {i}")))
+            .collect();
+        let text = copy_text(many.iter().filter(|line| !line.raw.ends_with('7')));
+        assert_eq!(text.lines().count(), 4500);
+        assert!(text.starts_with("line 0\nline 1\n"));
+        assert!(text.ends_with("\nline 4999"));
+        assert_eq!(copy_text(&[]), "");
     }
 
     #[test]

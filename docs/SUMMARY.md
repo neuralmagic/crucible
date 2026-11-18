@@ -6,6 +6,7 @@
 
 - [Your first playbook](./playbooks.md)
 - [Launching from webhooks](./webhooks.md)
+- [Drafting with a local agent](./desktop-agent-local.md)
 - [Branching and review](./playbook-patterns.md)
 - [Workflow DSL reference](./dsl-reference.md)
 - [Work graphs](./work-graphs.md)
@@ -122,3 +123,8 @@
   - [ADR-0070: A dynamic choice reads its options from a dependency field, bounded and recorded](./adr/ADR-0070.md)
   - [ADR-0071: A pack edition gates contract changes, and edition 2 gives host commands only declared env](./adr/ADR-0071.md)
   - [ADR-0072: Standing launches fire on their save snapshot, with no offline credential](./adr/ADR-0072.md)
+  - [ADR-0073: A run acts as its own scope to Kubernetes, not as its launcher](./adr/ADR-0073.md)
+  - [ADR-0074: A launch-form choice reads its options from a recorded task output](./adr/ADR-0074.md)
+  - [ADR-0075: Workflow tasks reach the run's MCP servers with controller-minted task tokens](./adr/ADR-0075.md)
+  - [ADR-0076: A launch confirms a value a task output flags](./adr/ADR-0076.md)
+  - [ADR-0077: A provider names each model's limits, and the binding carries them to the harness](./adr/ADR-0077.md)

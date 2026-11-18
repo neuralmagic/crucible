@@ -58,6 +58,11 @@ pub fn plan_admitted(
                     .unwrap_or_default(),
                 history_depth: t.history.unwrap_or_default(),
                 definition: definitions.get(&t.name).cloned().unwrap_or_default(),
+                command: match &t.task {
+                    crate::plan::ir::TaskKind::Command { command }
+                    | crate::plan::ir::TaskKind::Evaluate { command, .. } => command.clone(),
+                    _ => String::new(),
+                },
             })
             .collect(),
         history_record: history_record.map(|t| t.0.clone()).unwrap_or_default(),

@@ -1,6 +1,18 @@
+diff --git a/crates/rune-mac/Cargo.toml b/crates/rune-mac/Cargo.toml
+index fa32d566..8463f0b6 100644
+--- a/crates/rune-mac/Cargo.toml
++++ b/crates/rune-mac/Cargo.toml
+@@ -9,6 +9,7 @@ description = "Small macOS helpers for Rune apps: a remembered window frame, ful
+ rune-notify = { path = "../rune-notify" }
+ 
+ [target.'cfg(target_os = "macos")'.dependencies]
++block2 = "0.5"
+ objc2 = "0.5.2"
+ 
+ [lints]
 diff --git a/crates/rune-mac/src/dock.rs b/crates/rune-mac/src/dock.rs
 new file mode 100644
-index 0000000..0a67f1a
+index 00000000..0a67f1aa
 --- /dev/null
 +++ b/crates/rune-mac/src/dock.rs
 @@ -0,0 +1,146 @@
@@ -152,7 +164,7 @@ index 0000000..0a67f1a
 +mod tests;
 diff --git a/crates/rune-mac/src/dock_tests.rs b/crates/rune-mac/src/dock_tests.rs
 new file mode 100644
-index 0000000..09c3faf
+index 00000000..09c3faf9
 --- /dev/null
 +++ b/crates/rune-mac/src/dock_tests.rs
 @@ -0,0 +1,11 @@
@@ -169,7 +181,7 @@ index 0000000..09c3faf
 +}
 diff --git a/crates/rune-mac/src/files.rs b/crates/rune-mac/src/files.rs
 new file mode 100644
-index 0000000..85599a2
+index 00000000..85599a21
 --- /dev/null
 +++ b/crates/rune-mac/src/files.rs
 @@ -0,0 +1,199 @@
@@ -374,7 +386,7 @@ index 0000000..85599a2
 +mod tests;
 diff --git a/crates/rune-mac/src/files_tests.rs b/crates/rune-mac/src/files_tests.rs
 new file mode 100644
-index 0000000..c646b23
+index 00000000..c646b230
 --- /dev/null
 +++ b/crates/rune-mac/src/files_tests.rs
 @@ -0,0 +1,34 @@
@@ -413,18 +425,18 @@ index 0000000..c646b23
 +    assert!(rx.try_recv().is_err(), "an empty batch is not delivered");
 +}
 diff --git a/crates/rune-mac/src/lib.rs b/crates/rune-mac/src/lib.rs
-index a91aed8..19f87b5 100644
+index cc0fe436..10fb2bb0 100644
 --- a/crates/rune-mac/src/lib.rs
 +++ b/crates/rune-mac/src/lib.rs
 @@ -4,9 +4,13 @@
  //! Off macOS every helper is a no-op: `remember_frame` returns true (so a `poll` that waits on it
  //! stops), `saved_size` returns `None`, `is_full_screen` returns false, and `toggle_full_screen`,
- //! `launch` and `busy` do nothing. `notify` posts nothing and reports `available() == false`.
+ //! `launch` and `busy` do nothing. `notify` is `rune-notify`, which also posts on Windows.
 +//! `dock` and `status` draw nothing.
  
 +pub mod dock;
 +pub mod files;
- pub mod notify;
+ pub use rune_notify as notify;
  mod quiet;
 +pub mod status;
  pub use quiet::launch;
@@ -432,7 +444,7 @@ index a91aed8..19f87b5 100644
  /// Has AppKit save the app's window frame under `name` and put the next launch's window in the
 diff --git a/crates/rune-mac/src/status.rs b/crates/rune-mac/src/status.rs
 new file mode 100644
-index 0000000..a852a44
+index 00000000..a852a44a
 --- /dev/null
 +++ b/crates/rune-mac/src/status.rs
 @@ -0,0 +1,208 @@
@@ -646,7 +658,7 @@ index 0000000..a852a44
 +mod tests;
 diff --git a/crates/rune-mac/src/status_tests.rs b/crates/rune-mac/src/status_tests.rs
 new file mode 100644
-index 0000000..acf2a47
+index 00000000..acf2a47c
 --- /dev/null
 +++ b/crates/rune-mac/src/status_tests.rs
 @@ -0,0 +1,22 @@

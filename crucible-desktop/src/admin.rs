@@ -1,21 +1,27 @@
-//! Schedules, secrets, shares and decision requests, read and changed through crux on a worker
-//! thread of their own so a slow call never holds up the launch list.
+//! Schedules, secrets, shares and decision requests, read and changed through crux on a task of
+//! their own so a slow call never holds up the launch list.
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crux::client::Shared;
 use crux::dto;
+use rune::time::Instant;
 use rune::{TextEdit, Waker};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-use crate::live::{Cache, Connection};
+use crate::net::{Connection, Connector, Task, within};
 
 /// How often what is on screen is read again.
 const SHOWN: Duration = Duration::from_secs(15);
 /// How often the decision queue is read while nothing shows it, for the badge and notifications.
 const QUEUE: Duration = Duration::from_secs(30);
+/// How many of a webhook's newest deliveries are read.
+const DELIVERIES: i64 = 20;
+/// How many of the newest transitions the Activity page reads.
+const EVENTS: usize = 200;
 
 /// A read that has not come back yet, failed, or landed.
 pub type Loaded<T> = Option<Result<T, String>>;
@@ -30,6 +36,29 @@ pub struct Watch {
     pub secret: Option<String>,
     pub shares: Option<Shared>,
     pub decision: Option<String>,
+    /// The API keys page is shown.
+    pub keys: bool,
+    pub teams: bool,
+    /// The team whose audit trail the Teams page shows.
+    pub team_audit: Option<String>,
+    pub webhooks: bool,
+    /// The webhook whose deliveries the Triggers page shows.
+    pub webhook: Option<String>,
+    /// The playbook the open webhook form launches.
+    pub webhook_form: Option<String>,
+    pub providers: bool,
+    pub blueprints: bool,
+    pub activity: bool,
+    /// The Admin page is shown.
+    pub admin: bool,
+    /// The Admin page's policy tab is shown.
+    pub policy: bool,
+    /// The Settings page is shown, with the controller's version on it.
+    pub about: bool,
+    /// The Issues page is shown, listing this status or every one.
+    pub issues: Option<InStatus>,
+    /// The issue the Issues page shows in full.
+    pub issue: Option<String>,
 }
 
 /// A change to make on the controller.
@@ -70,6 +99,17 @@ pub enum Action {
         secret: String,
         owner: String,
     },
+    /// Fire schedule `id` now instead of at its next window.
+    FireSchedule {
+        id: String,
+        playbook: String,
+    },
+    /// Launch schedule `id` once with `cursor`, leaving the schedule as it is.
+    TestFireSchedule {
+        id: String,
+        playbook: String,
+        cursor: dto::TestCursor,
+    },
     /// Create a schedule, or replace schedule `id` whole.
     SaveSchedule {
         id: Option<String>,
@@ -88,6 +128,115 @@ pub enum Action {
     CancelLaunch {
         key: String,
     },
+    /// Mint an API key that expires in `days`, or never.
+    MintKey {
+        name: String,
+        days: Option<i64>,
+    },
+    RevokeKey {
+        id: String,
+    },
+    /// Sign out one MCP client, or all of them.
+    SignOutMcp {
+        client: Option<String>,
+    },
+    CreateTeam {
+        slug: String,
+        name: String,
+    },
+    RenameTeam {
+        slug: String,
+        name: String,
+    },
+    DeleteTeam {
+        slug: String,
+    },
+    /// Replace team `slug`'s whole member list.
+    PutMembers {
+        slug: String,
+        members: Vec<dto::TeamMemberBody>,
+    },
+    /// Resume (`on`) or pause a webhook.
+    EnableWebhook {
+        id: String,
+        on: bool,
+    },
+    RotateWebhook {
+        id: String,
+    },
+    DeleteWebhook {
+        id: String,
+    },
+    /// Create a webhook, or replace webhook `id`.
+    SaveWebhook {
+        id: Option<String>,
+        body: Box<dto::WebhookBody>,
+    },
+    CheckWebhook {
+        body: Box<dto::WebhookBody>,
+    },
+    /// Register a provider, or replace registration `id`.
+    SaveProvider {
+        id: Option<String>,
+        register: Box<dto::RegisterProvider>,
+    },
+    DeleteProvider {
+        id: String,
+    },
+    /// Store a policy set. It is not activated.
+    CreatePolicy {
+        text: String,
+    },
+    ActivatePolicy {
+        digest: String,
+    },
+    /// Ask how the active policy decides `action` for `login`.
+    Explain {
+        login: String,
+        action: String,
+        resource: Option<String>,
+    },
+    /// Replace the controller's whole override set.
+    SetOverrides {
+        overrides: serde_json::Map<String, serde_json::Value>,
+        justification: String,
+    },
+    SetAutopilot {
+        enabled: bool,
+        reason: String,
+    },
+    Reconcile,
+    AddRepo {
+        repo: String,
+        justification: String,
+    },
+    /// Pause discovery for a repo, or resume it.
+    PauseRepo {
+        repo: String,
+        paused: bool,
+    },
+    UnwatchRepo {
+        repo: String,
+    },
+    /// Start draft `to` from blueprint `id`.
+    UseBlueprint {
+        id: String,
+        to: String,
+        description: Option<String>,
+    },
+    /// Run the form's transform on a sample delivery.
+    PreviewWebhook {
+        body: Box<dto::WebhookBody>,
+        sample: serde_json::Value,
+        headers: BTreeMap<String, String>,
+    },
+    ParkIssue {
+        key: String,
+        reason: String,
+    },
+    UnparkIssue {
+        key: String,
+    },
 }
 
 /// Which kind of action an outcome answers.
@@ -101,10 +250,39 @@ pub enum Did {
     Answer,
     CreateSecret,
     MoveSecret,
+    FireSchedule,
+    TestFireSchedule,
     SaveSchedule,
     RegisterImport,
     DiscardImport,
     CancelLaunch,
+    MintKey,
+    RevokeKey,
+    SignOutMcp,
+    CreateTeam,
+    RenameTeam,
+    DeleteTeam,
+    PutMembers,
+    EnableWebhook,
+    RotateWebhook,
+    DeleteWebhook,
+    SaveWebhook,
+    CheckWebhook,
+    PreviewWebhook,
+    SaveProvider,
+    DeleteProvider,
+    UseBlueprint,
+    SetOverrides,
+    SetAutopilot,
+    Reconcile,
+    AddRepo,
+    PauseRepo,
+    UnwatchRepo,
+    CreatePolicy,
+    ActivatePolicy,
+    Explain,
+    ParkIssue,
+    UnparkIssue,
 }
 
 impl Action {
@@ -118,10 +296,39 @@ impl Action {
             Action::Answer { .. } => Did::Answer,
             Action::CreateSecret { .. } => Did::CreateSecret,
             Action::MoveSecret { .. } => Did::MoveSecret,
+            Action::FireSchedule { .. } => Did::FireSchedule,
+            Action::TestFireSchedule { .. } => Did::TestFireSchedule,
             Action::SaveSchedule { .. } => Did::SaveSchedule,
             Action::RegisterImport { .. } => Did::RegisterImport,
             Action::DiscardImport { .. } => Did::DiscardImport,
             Action::CancelLaunch { .. } => Did::CancelLaunch,
+            Action::MintKey { .. } => Did::MintKey,
+            Action::RevokeKey { .. } => Did::RevokeKey,
+            Action::SignOutMcp { .. } => Did::SignOutMcp,
+            Action::CreateTeam { .. } => Did::CreateTeam,
+            Action::RenameTeam { .. } => Did::RenameTeam,
+            Action::DeleteTeam { .. } => Did::DeleteTeam,
+            Action::PutMembers { .. } => Did::PutMembers,
+            Action::EnableWebhook { .. } => Did::EnableWebhook,
+            Action::RotateWebhook { .. } => Did::RotateWebhook,
+            Action::DeleteWebhook { .. } => Did::DeleteWebhook,
+            Action::SaveWebhook { .. } => Did::SaveWebhook,
+            Action::CheckWebhook { .. } => Did::CheckWebhook,
+            Action::PreviewWebhook { .. } => Did::PreviewWebhook,
+            Action::SaveProvider { .. } => Did::SaveProvider,
+            Action::DeleteProvider { .. } => Did::DeleteProvider,
+            Action::UseBlueprint { .. } => Did::UseBlueprint,
+            Action::SetOverrides { .. } => Did::SetOverrides,
+            Action::SetAutopilot { .. } => Did::SetAutopilot,
+            Action::Reconcile => Did::Reconcile,
+            Action::AddRepo { .. } => Did::AddRepo,
+            Action::PauseRepo { .. } => Did::PauseRepo,
+            Action::UnwatchRepo { .. } => Did::UnwatchRepo,
+            Action::CreatePolicy { .. } => Did::CreatePolicy,
+            Action::ActivatePolicy { .. } => Did::ActivatePolicy,
+            Action::Explain { .. } => Did::Explain,
+            Action::ParkIssue { .. } => Did::ParkIssue,
+            Action::UnparkIssue { .. } => Did::UnparkIssue,
         }
     }
 
@@ -141,11 +348,45 @@ impl Action {
                     .unwrap_or("the secret")
             ),
             Action::MoveSecret { owner, .. } => format!("Moved to {owner}"),
+            Action::FireSchedule { playbook, .. } => format!("Firing {playbook}"),
+            Action::TestFireSchedule { playbook, .. } => format!("Test-firing {playbook}"),
             Action::SaveSchedule { id: None, .. } => "Scheduled".to_string(),
             Action::SaveSchedule { id: Some(_), .. } => "Saved the schedule".to_string(),
             Action::RegisterImport { id, .. } => format!("Registered {id}"),
             Action::DiscardImport { .. } => "Discarded the import".to_string(),
             Action::CancelLaunch { .. } => "Cancelling the launch".to_string(),
+            Action::MintKey { name, .. } => format!("Minted {name}"),
+            Action::RevokeKey { .. } => "Revoked".to_string(),
+            Action::SignOutMcp { .. } => "Signed out".to_string(),
+            Action::CreateTeam { slug, .. } => format!("Created {slug}"),
+            Action::RenameTeam { name, .. } => format!("Renamed to {name}"),
+            Action::DeleteTeam { slug } => format!("Deleted {slug}"),
+            Action::PutMembers { .. } => "Saved the members".to_string(),
+            Action::EnableWebhook { on: true, .. } => "Resumed the webhook".to_string(),
+            Action::EnableWebhook { .. } => "Paused the webhook".to_string(),
+            Action::RotateWebhook { .. } => "Rotated the secret".to_string(),
+            Action::DeleteWebhook { .. } => "Deleted the webhook".to_string(),
+            Action::SaveWebhook { id: None, .. } => "Created the webhook".to_string(),
+            Action::SaveWebhook { id: Some(_), .. } => "Saved the webhook".to_string(),
+            Action::CheckWebhook { .. } => "Checked".to_string(),
+            Action::PreviewWebhook { .. } => "Previewed".to_string(),
+            Action::SaveProvider { id: None, register } => format!("Registered {}", register.id),
+            Action::SaveProvider { id: Some(_), .. } => "Saved the provider".to_string(),
+            Action::DeleteProvider { id } => format!("Deregistered {id}"),
+            Action::UseBlueprint { to, .. } => format!("Started draft {to}"),
+            Action::SetOverrides { .. } => "Saved the overrides".to_string(),
+            Action::SetAutopilot { enabled: true, .. } => "Autopilot on".to_string(),
+            Action::SetAutopilot { .. } => "Autopilot off".to_string(),
+            Action::Reconcile => "Reconcile asked for".to_string(),
+            Action::AddRepo { repo, .. } => format!("Watching {repo}"),
+            Action::PauseRepo { repo, paused: true } => format!("Paused {repo}"),
+            Action::PauseRepo { repo, .. } => format!("Resumed {repo}"),
+            Action::UnwatchRepo { repo } => format!("Stopped watching {repo}"),
+            Action::CreatePolicy { .. } => "Stored the policy set".to_string(),
+            Action::ActivatePolicy { .. } => "Activated the policy set".to_string(),
+            Action::Explain { .. } => "Explained".to_string(),
+            Action::ParkIssue { key, .. } => format!("Parked {key}"),
+            Action::UnparkIssue { key } => format!("Unparked {key}"),
         }
     }
 }
@@ -176,6 +417,41 @@ pub struct AdminView {
     pub decision: Option<(String, Loaded<dto::Decision>)>,
     /// Scope packs to approve, imports to settle and kept PRs to review.
     pub approvals: Loaded<dto::Approvals>,
+    pub keys: Loaded<Vec<dto::ApiKey>>,
+    pub mcp: Loaded<dto::McpSignIns>,
+    pub teams: Loaded<Vec<dto::Team>>,
+    pub team_audit: Option<(String, Loaded<Vec<dto::TeamAudit>>)>,
+    pub webhooks: Loaded<Vec<dto::Webhook>>,
+    pub deliveries: Option<(String, Loaded<Vec<dto::WebhookDelivery>>)>,
+    /// The secret of the webhook just created or rotated, until another webhook is opened or
+    /// the Triggers page is left.
+    pub rotated: Option<dto::WebhookSecret>,
+    /// The open webhook form's playbook and its params schema.
+    pub webhook_schema: Option<(String, Loaded<serde_json::Value>)>,
+    pub presets: Loaded<Vec<dto::WebhookPreset>>,
+    pub providers: Loaded<Vec<dto::Provider>>,
+    pub blueprints: Loaded<Vec<dto::Blueprint>>,
+    /// The build the controller is running.
+    pub version: Loaded<dto::Version>,
+    /// The issues in the status they were asked for.
+    pub issues: Option<(InStatus, Loaded<Vec<dto::Issue>>)>,
+    pub issue: Option<(String, Loaded<dto::IssueDetail>)>,
+    /// The draft the last blueprint use started, while the Blueprints page stays open.
+    pub used: Option<dto::BlueprintUsed>,
+    pub events: Loaded<Vec<dto::Event>>,
+    pub config: Loaded<dto::ControllerConfig>,
+    pub access: Loaded<dto::Access>,
+    pub autopilot: Loaded<dto::Autopilot>,
+    pub repos: Loaded<Vec<dto::WatchedRepo>>,
+    pub policy_sets: Loaded<Vec<dto::PolicySet>>,
+    /// The set just stored, to show it once the list has it.
+    pub stored_policy: Option<String>,
+    pub explained: Option<dto::Explanation>,
+    /// What the last check and preview of the open webhook form came to.
+    pub webhook_check: Option<dto::WebhookCheck>,
+    pub webhook_preview: Option<dto::WebhookPreview>,
+    /// The key just minted, with its secret, for as long as the API keys page stays open.
+    pub minted: Option<dto::MintedKey>,
     pub acted: Option<Acted>,
 }
 
@@ -185,10 +461,11 @@ enum Msg {
     Reconnect,
 }
 
-/// The UI-side handle to the worker. Dropping it stops the thread.
+/// The UI-side handle to the worker. Dropping it ends its task.
 pub struct Client {
-    tx: Sender<Msg>,
+    tx: UnboundedSender<Msg>,
     shared: Arc<Mutex<Published>>,
+    _task: Option<Task>,
 }
 
 #[derive(Default)]
@@ -199,21 +476,28 @@ struct Published {
 }
 
 impl Client {
-    pub fn spawn(target: crate::profile::Target) -> Self {
-        let (tx, rx) = mpsc::channel();
+    pub fn spawn(connector: Connector) -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
         let shared = Arc::new(Mutex::new(Published::default()));
-        let worker = Arc::clone(&shared);
-        if let Err(error) = std::thread::Builder::new()
-            .name("crucible-playbooks-admin".into())
-            .spawn(move || run(target, rx, worker))
-        {
-            let view = AdminView {
-                decisions: Some(Err(format!("starting the admin worker: {error}"))),
-                ..AdminView::default()
-            };
-            publish(&shared, view);
+        let task = match connector.runtime() {
+            Ok(runtime) => Some(Task::spawn(
+                &runtime,
+                run(connector, rx, Arc::clone(&shared)),
+            )),
+            Err(why) => {
+                let view = AdminView {
+                    decisions: Some(Err(why)),
+                    ..AdminView::default()
+                };
+                publish(&shared, view);
+                None
+            }
+        };
+        Client {
+            tx,
+            shared,
+            _task: task,
         }
-        Client { tx, shared }
     }
 
     pub fn set_waker(&self, waker: Waker) {
@@ -255,26 +539,15 @@ fn publish(shared: &Mutex<Published>, view: AdminView) {
 }
 
 struct Worker {
-    target: crate::profile::Target,
-    cache: Option<Cache>,
-    connection: Option<Connection>,
+    connector: Connector,
     view: AdminView,
     acted: u64,
 }
 
 impl Worker {
-    fn connection(&mut self) -> Result<&Connection, String> {
-        if self.connection.is_none() {
-            self.connection = Some(Connection::open(&self.target, self.cache.as_ref())?);
-        }
-        self.connection
-            .as_ref()
-            .ok_or_else(|| "no controller connection".to_string())
-    }
-
-    fn refresh(&mut self, watch: &Watch) {
-        let read = match self.connection() {
-            Ok(c) => read(c, watch),
+    async fn refresh(&mut self, watch: &Watch) {
+        let read = match self.connector.connect().await {
+            Ok(c) => read(&c.client, watch).await,
             Err(why) => Read::failed(&why, watch),
         };
         self.view.decisions = Some(read.decisions);
@@ -288,11 +561,77 @@ impl Worker {
         self.view.secret = read.secret.map(|(id, view)| (id, Some(view)));
         self.view.shares = read.shares.map(|(of, shares)| (of, Some(shares)));
         self.view.decision = read.decision.map(|(id, decision)| (id, Some(decision)));
+        if let Some(keys) = read.keys {
+            self.view.keys = Some(keys);
+        }
+        if let Some(mcp) = read.mcp {
+            self.view.mcp = Some(mcp);
+        }
+        if !watch.keys {
+            self.view.minted = None;
+        }
+        if let Some(teams) = read.teams {
+            self.view.teams = Some(teams);
+        }
+        self.view.team_audit = read.team_audit.map(|(slug, audit)| (slug, Some(audit)));
+        if let Some(webhooks) = read.webhooks {
+            self.view.webhooks = Some(webhooks);
+        }
+        self.view.deliveries = read.deliveries.map(|(id, list)| (id, Some(list)));
+        let rotated = self.view.rotated.as_ref().map(|r| r.webhook.id.as_str());
+        let elsewhere = watch
+            .webhook
+            .as_deref()
+            .is_some_and(|shown| Some(shown) != rotated);
+        if !watch.webhooks || elsewhere {
+            self.view.rotated = None;
+        }
+        self.view.webhook_schema = read.webhook_schema.map(|(id, schema)| (id, Some(schema)));
+        if let Some(presets) = read.presets {
+            self.view.presets = Some(presets);
+        }
+        if let Some(providers) = read.providers {
+            self.view.providers = Some(providers);
+        }
+        if let Some(blueprints) = read.blueprints {
+            self.view.blueprints = Some(blueprints);
+        }
+        if let Some(version) = read.version {
+            self.view.version = Some(version);
+        }
+        self.view.issues = read.issues.map(|(status, issues)| (status, Some(issues)));
+        self.view.issue = read.issue.map(|(key, issue)| (key, Some(issue)));
+        if !watch.blueprints {
+            self.view.used = None;
+        }
+        if let Some(events) = read.events {
+            self.view.events = Some(events);
+        }
+        if let Some(sets) = read.policy_sets {
+            self.view.policy_sets = Some(sets);
+        }
+        if !watch.policy {
+            self.view.stored_policy = None;
+            self.view.explained = None;
+        }
+        if let Some((config, access, autopilot, repos)) = read.admin {
+            self.view.config = Some(config);
+            self.view.access = Some(access);
+            self.view.autopilot = Some(autopilot);
+            self.view.repos = Some(repos);
+        }
+        if watch.webhook_form.is_none() {
+            self.view.webhook_check = None;
+            self.view.webhook_preview = None;
+        }
     }
 
-    fn act(&mut self, action: Action) {
+    async fn act(&mut self, action: Action) {
         let what = action.what();
-        let result = self.connection().and_then(|c| act(c, &action));
+        let result = match self.connector.connect().await {
+            Ok(c) => act(&c, &action, &mut self.view).await,
+            Err(why) => Err(why),
+        };
         self.acted += 1;
         self.view.acted = Some(Acted {
             seq: self.acted,
@@ -302,7 +641,7 @@ impl Worker {
     }
 }
 
-/// One pass over what `Watch` asks for.
+/// One pass over what `Watch` asks for, read all at once.
 struct Read {
     decisions: Result<Vec<dto::DecisionSummary>, String>,
     approvals: Result<dto::Approvals, String>,
@@ -311,7 +650,34 @@ struct Read {
     secret: Option<(String, Result<SecretView, String>)>,
     shares: Option<(Shared, Result<Vec<dto::Share>, String>)>,
     decision: Option<(String, Result<dto::Decision, String>)>,
+    keys: Option<Result<Vec<dto::ApiKey>, String>>,
+    mcp: Option<Result<dto::McpSignIns, String>>,
+    teams: Option<Result<Vec<dto::Team>, String>>,
+    team_audit: Option<(String, Result<Vec<dto::TeamAudit>, String>)>,
+    webhooks: Option<Result<Vec<dto::Webhook>, String>>,
+    deliveries: Option<(String, Result<Vec<dto::WebhookDelivery>, String>)>,
+    webhook_schema: Option<(String, Result<serde_json::Value, String>)>,
+    presets: Option<Result<Vec<dto::WebhookPreset>, String>>,
+    providers: Option<Result<Vec<dto::Provider>, String>>,
+    blueprints: Option<Result<Vec<dto::Blueprint>, String>>,
+    events: Option<Result<Vec<dto::Event>, String>>,
+    admin: Option<Controller>,
+    policy_sets: Option<Result<Vec<dto::PolicySet>, String>>,
+    issues: Option<(InStatus, Result<Vec<dto::Issue>, String>)>,
+    issue: Option<(String, Result<dto::IssueDetail, String>)>,
+    version: Option<Result<dto::Version, String>>,
 }
+
+/// The status an issue list is asked for; none is every status.
+pub type InStatus = Option<String>;
+
+/// What the Admin page reads: settings, access lists, the autopilot flag and the watched repos.
+type Controller = (
+    Result<dto::ControllerConfig, String>,
+    Result<dto::Access, String>,
+    Result<dto::Autopilot, String>,
+    Result<Vec<dto::WatchedRepo>, String>,
+);
 
 impl Read {
     fn failed(why: &str, watch: &Watch) -> Read {
@@ -324,122 +690,421 @@ impl Read {
             secret: watch.secret.clone().map(|id| (id, Err(why.clone()))),
             shares: watch.shares.clone().map(|of| (of, Err(why.clone()))),
             decision: watch.decision.clone().map(|id| (id, Err(why.clone()))),
+            keys: watch.keys.then(|| Err(why.clone())),
+            mcp: watch.keys.then(|| Err(why.clone())),
+            teams: watch.teams.then(|| Err(why.clone())),
+            team_audit: watch
+                .team_audit
+                .clone()
+                .map(|slug| (slug, Err(why.clone()))),
+            webhooks: watch.webhooks.then(|| Err(why.clone())),
+            deliveries: watch.webhook.clone().map(|id| (id, Err(why.clone()))),
+            webhook_schema: watch.webhook_form.clone().map(|id| (id, Err(why.clone()))),
+            presets: watch.webhook_form.is_some().then(|| Err(why.clone())),
+            providers: watch.providers.then(|| Err(why.clone())),
+            blueprints: watch.blueprints.then(|| Err(why.clone())),
+            events: watch.activity.then(|| Err(why.clone())),
+            policy_sets: watch.policy.then(|| Err(why.clone())),
+            issues: watch
+                .issues
+                .clone()
+                .map(|status| (status, Err(why.clone()))),
+            issue: watch.issue.clone().map(|key| (key, Err(why.clone()))),
+            version: watch.about.then(|| Err(why.clone())),
+            admin: watch.admin.then(|| {
+                (
+                    Err(why.clone()),
+                    Err(why.clone()),
+                    Err(why.clone()),
+                    Err(why.clone()),
+                )
+            }),
         }
     }
 }
 
-fn read(c: &Connection, watch: &Watch) -> Read {
-    let client = &c.client;
+/// `read`'s answer when `on`, and nothing asked otherwise.
+async fn when<T>(on: bool, read: impl Future<Output = T>) -> Option<T> {
+    if on { Some(read.await) } else { None }
+}
+
+async fn read(client: &crux::Client, watch: &Watch) -> Read {
+    let secret = async {
+        let id = watch.secret.as_ref()?;
+        let (detail, audit) = tokio::join!(
+            within("the secret", client.secret(id)),
+            within("its audit trail", client.secret_audit(id)),
+        );
+        let view = detail.and_then(|detail| {
+            Ok(SecretView {
+                detail,
+                audit: audit?,
+            })
+        });
+        Some((id.clone(), view))
+    };
+    let shares = async {
+        let of = watch.shares.as_ref()?;
+        Some((of.clone(), within("the shares", client.shares(of)).await))
+    };
+    let decision = async {
+        let id = watch.decision.as_ref()?;
+        let decision = within("the decision request", client.decision(id)).await;
+        Some((id.clone(), decision))
+    };
+    let team_audit = async {
+        let slug = watch.team_audit.as_ref()?;
+        let audit = within("the team's audit trail", client.team_audit(slug)).await;
+        Some((slug.clone(), audit))
+    };
+    let deliveries = async {
+        let id = watch.webhook.as_ref()?;
+        let list = within(
+            "the deliveries",
+            client.webhook_deliveries(id, None, Some(DELIVERIES)),
+        )
+        .await;
+        Some((id.clone(), list))
+    };
+    let webhook_schema = async {
+        let playbook = watch.webhook_form.as_ref()?;
+        let schema = within("the params schema", client.playbook_schema(playbook)).await;
+        Some((playbook.clone(), schema))
+    };
+    let issues = async {
+        let status = watch.issues.as_ref()?;
+        let list = within("the issues", client.lane_issues(status.as_deref())).await;
+        Some((status.clone(), list))
+    };
+    let issue = async {
+        let key = watch.issue.as_ref()?;
+        let detail = within("the issue", client.issue::<dto::IssueDetail>(key)).await;
+        Some((key.clone(), detail))
+    };
+    let (
+        decisions,
+        approvals,
+        schedules,
+        secrets,
+        secret,
+        shares,
+        decision,
+        keys,
+        mcp,
+        teams,
+        team_audit,
+        webhooks,
+        deliveries,
+        webhook_schema,
+        presets,
+        providers,
+        blueprints,
+        events,
+        admin,
+        policy_sets,
+        issues,
+        issue,
+        version,
+    ) = tokio::join!(
+        within("the decision queue", client.decisions()),
+        within("the approval queue", client.approvals()),
+        when(watch.schedules, within("the schedules", client.schedules())),
+        when(watch.secrets, within("the secrets", client.secrets())),
+        secret,
+        shares,
+        decision,
+        when(watch.keys, within("the API keys", client.api_keys())),
+        when(watch.keys, within("the MCP clients", client.mcp_sign_ins())),
+        when(watch.teams, within("the teams", client.teams())),
+        team_audit,
+        when(watch.webhooks, within("the webhooks", client.webhooks())),
+        deliveries,
+        webhook_schema,
+        when(
+            watch.webhook_form.is_some(),
+            within("the presets", client.webhook_presets()),
+        ),
+        when(watch.providers, within("the providers", client.providers())),
+        when(
+            watch.blueprints,
+            within("the blueprints", client.blueprints()),
+        ),
+        when(
+            watch.activity,
+            within("the activity", client.events(EVENTS))
+        ),
+        when(watch.admin, async {
+            tokio::join!(
+                within("the settings", client.config()),
+                within("the access lists", client.access()),
+                within("the autopilot flag", client.autopilot()),
+                within("the repos", client.repos()),
+            )
+        }),
+        when(
+            watch.policy,
+            within("the policy sets", client.policy_sets()),
+        ),
+        issues,
+        issue,
+        when(
+            watch.about,
+            within("the version", client.version::<dto::Version>()),
+        ),
+    );
     Read {
-        decisions: c
-            .call("the decision queue", client.decisions())
-            .map(|queue| queue.open),
-        approvals: c.call("the approval queue", client.approvals()),
-        schedules: watch
-            .schedules
-            .then(|| c.call("the schedules", client.schedules())),
-        secrets: watch
-            .secrets
-            .then(|| c.call("the secrets", client.secrets())),
-        secret: watch.secret.clone().map(|id| {
-            let view = c.call("the secret", client.secret(&id)).and_then(|detail| {
-                let audit = c.call("its audit trail", client.secret_audit(&id))?;
-                Ok(SecretView { detail, audit })
-            });
-            (id, view)
-        }),
-        shares: watch.shares.clone().map(|of| {
-            let shares = c.call("the shares", client.shares(&of));
-            (of, shares)
-        }),
-        decision: watch.decision.clone().map(|id| {
-            let decision = c.call("the decision request", client.decision(&id));
-            (id, decision)
-        }),
+        decisions: decisions.map(|queue| queue.open),
+        approvals,
+        schedules,
+        secrets,
+        secret,
+        shares,
+        decision,
+        keys,
+        mcp,
+        teams,
+        team_audit,
+        webhooks,
+        deliveries,
+        webhook_schema,
+        presets,
+        providers,
+        blueprints,
+        events,
+        admin,
+        policy_sets,
+        issues,
+        issue,
+        version,
     }
 }
 
-fn act(c: &Connection, action: &Action) -> Result<(), String> {
+async fn act(c: &Connection, action: &Action, view: &mut AdminView) -> Result<(), String> {
     let client = &c.client;
     match action {
-        Action::Enable { schedule, on } => c
-            .call(
-                "saving the schedule",
-                client.update_schedule::<serde_json::Value>(&schedule.id, &schedule.body(*on)),
-            )
-            .map(drop),
+        Action::Enable { schedule, on } => within(
+            "saving the schedule",
+            client.update_schedule::<serde_json::Value>(&schedule.id, &schedule.body(*on)),
+        )
+        .await
+        .map(drop),
         Action::Grant {
             of,
             grantee,
             role,
             not_after,
-        } => c
-            .call(
-                "the share",
-                client.grant_share(of, grantee, role, not_after.as_deref()),
-            )
-            .map(drop),
-        Action::Revoke { of, grantee } => c.call("the share", client.revoke_share(of, grantee)),
-        Action::Rotate { secret, value } => c
-            .call("the rotation", client.rotate_secret(secret, value))
-            .map(drop),
+        } => within(
+            "the share",
+            client.grant_share(of, grantee, role, not_after.as_deref()),
+        )
+        .await
+        .map(drop),
+        Action::Revoke { of, grantee } => {
+            within("the share", client.revoke_share(of, grantee)).await
+        }
+        Action::Rotate { secret, value } => {
+            within("the rotation", client.rotate_secret(secret, value))
+                .await
+                .map(drop)
+        }
         Action::Unbind { secret, binding } => {
-            c.call("the binding", client.unbind_secret(secret, binding))
+            within("the binding", client.unbind_secret(secret, binding)).await
         }
         Action::Answer {
             id,
             labels,
             digest,
             note,
-        } => c
-            .call(
-                "the answer",
-                client.answer_decision(id, labels, digest, note.as_deref()),
-            )
-            .map(drop),
-        Action::CreateSecret { body } => c
-            .call(
-                "the new secret",
-                client.create_secret::<serde_json::Value>(body),
-            )
-            .map(drop),
-        Action::MoveSecret { secret, owner } => c
-            .call("the owner change", client.transfer_secret(secret, owner))
-            .map(drop),
-        Action::SaveSchedule { id: None, body } => c
-            .call(
-                "the new schedule",
-                client.create_schedule::<serde_json::Value>(body),
-            )
-            .map(drop),
-        Action::SaveSchedule { id: Some(id), body } => c
-            .call(
-                "the schedule",
-                client.update_schedule::<serde_json::Value>(id, body),
-            )
-            .map(drop),
+        } => within(
+            "the answer",
+            client.answer_decision(id, labels, digest, note.as_deref()),
+        )
+        .await
+        .map(drop),
+        Action::CreateSecret { body } => within(
+            "the new secret",
+            client.create_secret::<serde_json::Value>(body),
+        )
+        .await
+        .map(drop),
+        Action::MoveSecret { secret, owner } => {
+            within("the owner change", client.transfer_secret(secret, owner))
+                .await
+                .map(drop)
+        }
+        Action::FireSchedule { id, .. } => {
+            within("the firing", client.fire_schedule::<serde_json::Value>(id))
+                .await
+                .map(drop)
+        }
+        Action::TestFireSchedule { id, cursor, .. } => {
+            within("the test firing", client.test_fire_schedule(id, cursor))
+                .await
+                .map(drop)
+        }
+        Action::SaveSchedule { id: None, body } => within(
+            "the new schedule",
+            client.create_schedule::<serde_json::Value>(body),
+        )
+        .await
+        .map(drop),
+        Action::SaveSchedule { id: Some(id), body } => within(
+            "the schedule",
+            client.update_schedule::<serde_json::Value>(id, body),
+        )
+        .await
+        .map(drop),
         Action::RegisterImport {
             import,
             id,
             description,
-        } => c
-            .call(
-                "the registration",
-                client.register_import(import, &dto::RegisterImport { id, description }),
+        } => within(
+            "the registration",
+            client.register_import(import, &dto::RegisterImport { id, description }),
+        )
+        .await
+        .map(drop),
+        Action::DiscardImport { import } => within("the discard", client.discard_import(import))
+            .await
+            .map(drop),
+        Action::CancelLaunch { key } => within("the cancel", client.cancel_launch(key))
+            .await
+            .map(drop),
+        Action::MintKey { name, days } => within("the new key", client.mint_api_key(name, *days))
+            .await
+            .map(|key| view.minted = Some(key)),
+        Action::RevokeKey { id } => within("the revoke", client.revoke_api_key(id)).await,
+        Action::SignOutMcp { client: one } => {
+            within("the sign-out", client.sign_out_mcp(one.as_deref()))
+                .await
+                .map(drop)
+        }
+        Action::CreateTeam { slug, name } => within("the new team", client.create_team(slug, name))
+            .await
+            .map(drop),
+        Action::RenameTeam { slug, name } => within("the rename", client.rename_team(slug, name))
+            .await
+            .map(drop),
+        Action::DeleteTeam { slug } => within("the delete", client.delete_team(slug)).await,
+        Action::PutMembers { slug, members } => {
+            within("the members", client.put_team_members(slug, members))
+                .await
+                .map(drop)
+        }
+        Action::EnableWebhook { id, on } => {
+            within("the webhook", client.set_webhook_enabled(id, *on))
+                .await
+                .map(drop)
+        }
+        Action::RotateWebhook { id } => within("the rotation", client.rotate_webhook_secret(id))
+            .await
+            .map(|rotated| view.rotated = Some(rotated)),
+        Action::DeleteWebhook { id } => within("the delete", client.delete_webhook(id)).await,
+        Action::SaveWebhook { id: None, body } => {
+            within("the new webhook", client.create_webhook(body))
+                .await
+                .map(|created| view.rotated = Some(created))
+        }
+        Action::SaveWebhook { id: Some(id), body } => {
+            within("the webhook", client.update_webhook(id, body))
+                .await
+                .map(drop)
+        }
+        Action::SaveProvider { id: None, register } => {
+            within("the registration", client.register_provider(register))
+                .await
+                .map(drop)
+        }
+        Action::SaveProvider {
+            id: Some(id),
+            register,
+        } => within(
+            "the provider",
+            client.update_provider(id, &register.provider),
+        )
+        .await
+        .map(drop),
+        Action::DeleteProvider { id } => within("the delete", client.delete_provider(id)).await,
+        Action::CreatePolicy { text } => within("the policy set", client.create_policy_set(text))
+            .await
+            .map(|stored| view.stored_policy = Some(stored.digest)),
+        Action::ParkIssue { key, reason } => {
+            within("the park", client.park::<serde_json::Value>(key, reason))
+                .await
+                .map(drop)
+        }
+        Action::UnparkIssue { key } => {
+            within("the unpark", client.unpark::<serde_json::Value>(key, None))
+                .await
+                .map(drop)
+        }
+        Action::ActivatePolicy { digest } => {
+            within("the activation", client.activate_policy_set(digest)).await
+        }
+        Action::Explain {
+            login,
+            action,
+            resource,
+        } => {
+            view.explained = None;
+            within(
+                "the explanation",
+                client.explain(login, action, resource.as_deref()),
             )
+            .await
+            .map(|explained| view.explained = Some(explained))
+        }
+        Action::SetOverrides {
+            overrides,
+            justification,
+        } => within(
+            "the overrides",
+            client.set_overrides(overrides, justification),
+        )
+        .await
+        .map(drop),
+        Action::SetAutopilot { enabled, reason } => {
+            within("the autopilot flag", client.set_autopilot(*enabled, reason))
+                .await
+                .map(drop)
+        }
+        Action::Reconcile => within("the reconcile", client.reconcile::<serde_json::Value>())
+            .await
             .map(drop),
-        Action::DiscardImport { import } => c
-            .call("the discard", client.discard_import(import))
-            .map(drop),
-        Action::CancelLaunch { key } => c.call("the cancel", client.cancel_launch(key)).map(drop),
+        Action::AddRepo {
+            repo,
+            justification,
+        } => within("the new repo", client.add_repo(repo, justification)).await,
+        Action::PauseRepo { repo, paused } => {
+            within("the repo", client.pause_repo(repo, *paused)).await
+        }
+        Action::UnwatchRepo { repo } => within("the repo", client.unwatch_repo(repo)).await,
+        Action::UseBlueprint {
+            id,
+            to,
+            description,
+        } => within(
+            "the new draft",
+            client.use_blueprint(id, to, description.as_deref()),
+        )
+        .await
+        .map(|used| view.used = Some(used)),
+        Action::CheckWebhook { body } => within("the check", client.check_webhook(body))
+            .await
+            .map(|check| view.webhook_check = Some(check)),
+        Action::PreviewWebhook {
+            body,
+            sample,
+            headers,
+        } => within("the preview", client.preview_webhook(body, sample, headers))
+            .await
+            .map(|preview| view.webhook_preview = Some(preview)),
     }
 }
 
-fn run(target: crate::profile::Target, rx: Receiver<Msg>, shared: Arc<Mutex<Published>>) {
+async fn run(connector: Connector, mut rx: UnboundedReceiver<Msg>, shared: Arc<Mutex<Published>>) {
     let mut worker = Worker {
-        target,
-        cache: Cache::open(),
-        connection: None,
+        connector,
         view: AdminView::default(),
         acted: 0,
     };
@@ -449,27 +1114,27 @@ fn run(target: crate::profile::Target, rx: Receiver<Msg>, shared: Arc<Mutex<Publ
         let wait = next
             .saturating_duration_since(Instant::now())
             .min(Duration::from_millis(500));
-        match rx.recv_timeout(wait) {
-            Ok(Msg::Watch(now)) => {
+        match crate::net::timeout(wait, rx.recv()).await {
+            Ok(Some(Msg::Watch(now))) => {
                 if now != watch {
                     watch = now;
                     next = Instant::now();
                 }
             }
-            Ok(Msg::Act(action)) => {
-                worker.act(action);
+            Ok(Some(Msg::Act(action))) => {
+                worker.act(action).await;
                 next = Instant::now();
             }
-            Ok(Msg::Reconnect) => {
-                worker.connection = None;
+            Ok(Some(Msg::Reconnect)) => {
+                worker.connector.reset();
                 worker.view = AdminView {
                     acted: worker.view.acted.take(),
                     ..AdminView::default()
                 };
                 next = Instant::now();
             }
-            Err(RecvTimeoutError::Disconnected) => return,
-            Err(RecvTimeoutError::Timeout) => {}
+            Ok(None) => return,
+            Err(_) => {}
         }
         if Instant::now() < next {
             continue;
@@ -478,13 +1143,23 @@ fn run(target: crate::profile::Target, rx: Receiver<Msg>, shared: Arc<Mutex<Publ
             next = Instant::now() + QUEUE;
             continue;
         }
-        worker.refresh(&watch);
+        worker.refresh(&watch).await;
         publish(&shared, worker.view.clone());
         let shown = watch.schedules
             || watch.secrets
             || watch.secret.is_some()
             || watch.shares.is_some()
-            || watch.decision.is_some();
+            || watch.decision.is_some()
+            || watch.keys
+            || watch.teams
+            || watch.webhooks
+            || watch.webhook_form.is_some()
+            || watch.providers
+            || watch.blueprints
+            || watch.activity
+            || watch.admin
+            || watch.policy
+            || watch.issues.is_some();
         next = Instant::now() + if shown { SHOWN } else { QUEUE };
     }
 }
@@ -502,7 +1177,8 @@ pub struct Desk {
     pub decision: Option<String>,
     pub picks: BTreeMap<String, Vec<String>>,
     pub note: TextEdit,
-    /// The share form.
+    /// Whether the share form is open.
+    pub sharing: bool,
     pub grantee: TextEdit,
     pub role: usize,
     /// `YYYY-MM-DD`, or blank for no end.
@@ -519,6 +1195,46 @@ pub struct Desk {
     pub move_to: Option<String>,
     /// The import being registered: its id, and the registry id and description typed.
     pub register: Option<(String, TextEdit, TextEdit)>,
+    /// The webhook the Triggers page shows in full.
+    pub webhook: Option<String>,
+    /// Whether the Admin page shows its policy tab.
+    pub policy_tab: bool,
+    /// The policy set shown, by digest; the active one when none is picked.
+    pub policy: Option<String>,
+    /// A new policy set's text, while its editor is open.
+    pub policy_draft: Option<TextEdit>,
+    /// The status the Issues page lists; none lists every one.
+    pub issue_status: InStatus,
+    /// The issue picked on the Issues page.
+    pub issue: Option<String>,
+    /// The scratch copy of a policy set open in the user's own editor.
+    pub policy_file: Option<std::path::PathBuf>,
+    /// The login, action and resource to explain a decision for.
+    pub explain: (TextEdit, TextEdit, TextEdit),
+    /// The setting being overridden on the Admin page, and the value typed for it.
+    pub knob: Option<(String, TextEdit)>,
+    /// Why an admin change is made, which the controller records.
+    pub why: TextEdit,
+    /// The repo typed to start watching.
+    pub new_repo: TextEdit,
+    /// The blueprint being used, with the new draft's id and description, while its form is open.
+    pub use_blueprint: Option<(String, TextEdit, TextEdit)>,
+    /// The provider the Providers page shows, and its form while open.
+    pub provider: Option<String>,
+    pub provider_form: Option<crate::provider::ProviderForm>,
+    /// The webhook form, while open.
+    pub webhook_form: Option<crate::webhook::WebhookForm>,
+    /// The team the Teams page shows.
+    pub team: Option<String>,
+    /// The new-team form, while open.
+    pub new_team: Option<crate::teams::TeamForm>,
+    pub add_member: crate::teams::MemberForm,
+    /// The team's next display name, while its rename form is open.
+    pub rename_team: Option<TextEdit>,
+    /// The test-fire form, while open on a schedule.
+    pub test_fire: Option<TestFireForm>,
+    /// The mint form on the API keys page.
+    pub new_key: crate::apikeys::KeyForm,
     /// The decision requests already announced; `None` until the first queue lands.
     seen: Option<HashSet<String>>,
 }
@@ -531,6 +1247,7 @@ impl Default for Desk {
             decision: None,
             picks: BTreeMap::new(),
             note: TextEdit::new(""),
+            sharing: false,
             grantee: TextEdit::new(""),
             role: 0,
             until: TextEdit::new(""),
@@ -540,6 +1257,27 @@ impl Default for Desk {
             new_secret: None,
             move_to: None,
             register: None,
+            new_key: crate::apikeys::KeyForm::default(),
+            policy_tab: false,
+            policy: None,
+            policy_draft: None,
+            policy_file: None,
+            issue_status: Some(crate::issues::FIRST.to_string()),
+            issue: None,
+            explain: (TextEdit::new(""), TextEdit::new(""), TextEdit::new("")),
+            knob: None,
+            why: TextEdit::new(""),
+            new_repo: TextEdit::new(""),
+            use_blueprint: None,
+            provider: None,
+            provider_form: None,
+            webhook: None,
+            webhook_form: None,
+            team: None,
+            new_team: None,
+            add_member: crate::teams::MemberForm::default(),
+            rename_team: None,
+            test_fire: None,
             seen: None,
         }
     }
@@ -559,6 +1297,15 @@ impl Desk {
             self.rotate = None;
         }
         self.secret = Some(id.to_string());
+    }
+
+    pub fn pick_team(&mut self, slug: &str) {
+        if self.team.as_deref() != Some(slug) {
+            self.add_member = crate::teams::MemberForm::default();
+            self.rename_team = None;
+        }
+        self.new_team = None;
+        self.team = Some(slug.to_string());
     }
 
     pub fn busy(&self) -> bool {
@@ -597,6 +1344,54 @@ impl Desk {
         };
         self.seen = Some(ids);
         new
+    }
+}
+
+/// Which cursor a test firing is given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorFrom {
+    Stored,
+    None,
+    Value,
+}
+
+impl CursorFrom {
+    pub const ALL: [CursorFrom; 3] = [CursorFrom::Stored, CursorFrom::None, CursorFrom::Value];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CursorFrom::Stored => "Stored",
+            CursorFrom::None => "None",
+            CursorFrom::Value => "Value",
+        }
+    }
+}
+
+/// The test-fire form open on one schedule: which cursor its firing gets.
+pub struct TestFireForm {
+    pub schedule: String,
+    pub from: CursorFrom,
+    pub value: TextEdit,
+}
+
+impl TestFireForm {
+    pub fn on(schedule: &str) -> Self {
+        TestFireForm {
+            schedule: schedule.to_string(),
+            from: CursorFrom::Stored,
+            value: TextEdit::new(""),
+        }
+    }
+
+    /// The cursor to send, or `None` while a value is asked for and none is typed.
+    pub fn ask(&self) -> Option<dto::TestCursor> {
+        match self.from {
+            CursorFrom::Stored => Some(dto::TestCursor::Stored),
+            CursorFrom::None => Some(dto::TestCursor::None),
+            CursorFrom::Value => (!self.value.text.is_empty()).then(|| dto::TestCursor::Value {
+                value: self.value.text.clone(),
+            }),
+        }
     }
 }
 
@@ -839,24 +1634,97 @@ impl crate::App {
         let on = |page: crate::Page| controller && self.page == page;
         let watch = Watch {
             controller,
-            schedules: on(crate::Page::Schedules),
+            schedules: on(crate::Page::Triggers),
             secrets: on(crate::Page::Secrets),
             secret: self
+                .remote
                 .desk
                 .secret
                 .clone()
                 .filter(|_| on(crate::Page::Secrets)),
             shares: self.shared_here().filter(|_| on(crate::Page::Runs)),
             decision: self
+                .remote
                 .desk
                 .decision
                 .clone()
                 .filter(|_| on(crate::Page::Decisions)),
+            keys: on(crate::Page::Keys),
+            webhooks: on(crate::Page::Triggers),
+            webhook: self
+                .remote
+                .desk
+                .webhook
+                .clone()
+                .filter(|_| on(crate::Page::Triggers)),
+            webhook_form: self
+                .remote
+                .desk
+                .webhook_form
+                .as_ref()
+                .filter(|_| on(crate::Page::Triggers))
+                .map(|form| form.playbook.clone()),
+            providers: on(crate::Page::Providers),
+            blueprints: on(crate::Page::Blueprints),
+            activity: on(crate::Page::Activity),
+            admin: on(crate::Page::Admin) && !self.remote.desk.policy_tab,
+            policy: on(crate::Page::Admin) && self.remote.desk.policy_tab,
+            issues: on(crate::Page::Issues).then(|| self.remote.desk.issue_status.clone()),
+            issue: self
+                .remote
+                .desk
+                .issue
+                .clone()
+                .filter(|_| on(crate::Page::Issues)),
+            about: on(crate::Page::Settings),
+            teams: controller,
+            team_audit: self.owned_team().filter(|_| on(crate::Page::Teams)),
         };
-        if self.admin_sent.as_ref() != Some(&watch) {
-            self.admin_client.watch(watch.clone());
-            self.admin_sent = Some(watch);
+        if self.remote.admin_sent.as_ref() != Some(&watch) {
+            self.remote.admin_client.watch(watch.clone());
+            self.remote.admin_sent = Some(watch);
         }
+    }
+
+    /// Start a new policy set from `text`: in the user's own editor on a scratch copy, or in the
+    /// page where there is no editor to hand it to.
+    pub fn edit_policy(&mut self, digest: &str, text: &str) {
+        if cfg!(target_arch = "wasm32") {
+            self.remote.desk.policy_draft = Some(TextEdit::new(text));
+            return;
+        }
+        let name = format!("policy-{}.cedar", digest.get(..12).unwrap_or(digest));
+        match crate::editor::scratch(&name, text) {
+            Ok(path) => {
+                self.open_path_in_editor(&path, 1);
+                self.remote.desk.policy_file = Some(path);
+                self.remote.desk.outcome = self.editor_error.clone().map(Err);
+            }
+            Err(why) => self.remote.desk.outcome = Some(Err(why)),
+        }
+    }
+
+    /// Store the scratch copy as it is on disk now.
+    pub fn store_policy_file(&mut self) {
+        let Some(path) = &self.remote.desk.policy_file else {
+            return;
+        };
+        match std::fs::read_to_string(path) {
+            Ok(text) => self.act(Action::CreatePolicy { text }),
+            Err(why) => {
+                self.remote.desk.outcome = Some(Err(format!("reading {}: {why}", path.display())));
+            }
+        }
+    }
+
+    /// The picked team's slug, when the caller owns it and so may read its audit trail.
+    fn owned_team(&self) -> Option<String> {
+        let slug = self.remote.desk.team.as_ref()?;
+        let teams = self.remote.admin.teams.as_ref()?.as_ref().ok()?;
+        teams
+            .iter()
+            .find(|team| &team.slug == slug && team.my_role == Some(dto::TeamRole::Owner))
+            .map(|team| team.slug.clone())
     }
 
     /// What the runs page on screen can share: the selected playbook, or the draft it launched
@@ -869,7 +1737,7 @@ impl crate::App {
         else {
             return None;
         };
-        Some(if self.registered.contains(playbook) {
+        Some(if self.remote.registered.contains(playbook) {
             Shared::Playbook(playbook.clone())
         } else {
             Shared::Draft(playbook.clone())
@@ -877,53 +1745,128 @@ impl crate::App {
     }
 
     pub fn act(&mut self, action: Action) {
-        self.desk.armed = None;
-        self.desk.sent = Some(self.admin.acted.as_ref().map_or(0, |acted| acted.seq));
-        self.desk.outcome = None;
-        self.admin_client.act(action);
+        self.remote.desk.armed = None;
+        self.remote.desk.sent = Some(
+            self.remote
+                .admin
+                .acted
+                .as_ref()
+                .map_or(0, |acted| acted.seq),
+        );
+        self.remote.desk.outcome = None;
+        self.remote.admin_client.act(action);
     }
 
     pub fn apply_admin(&mut self, view: AdminView) {
-        if let (Some(sent), Some(acted)) = (self.desk.sent, &view.acted)
+        if let (Some(sent), Some(acted)) = (self.remote.desk.sent, &view.acted)
             && acted.seq > sent
         {
-            self.desk.sent = None;
+            self.remote.desk.sent = None;
             if acted.result.is_ok() {
                 match acted.did {
-                    Did::Rotate => self.desk.rotate = None,
+                    Did::Rotate => self.remote.desk.rotate = None,
                     Did::Answer => {
-                        self.desk.picks.clear();
-                        self.desk.note = TextEdit::new("");
+                        self.remote.desk.picks.clear();
+                        self.remote.desk.note = TextEdit::new("");
                     }
                     Did::Grant => {
-                        self.desk.grantee = TextEdit::new("");
-                        self.desk.until = TextEdit::new("");
+                        self.remote.desk.sharing = false;
+                        self.remote.desk.grantee = TextEdit::new("");
+                        self.remote.desk.until = TextEdit::new("");
                     }
-                    Did::CreateSecret => self.desk.new_secret = None,
-                    Did::MoveSecret => self.desk.move_to = None,
+                    Did::CreateSecret => self.remote.desk.new_secret = None,
+                    Did::MoveSecret => self.remote.desk.move_to = None,
+                    Did::MintKey => {
+                        self.remote.desk.new_key = crate::apikeys::KeyForm::default();
+                    }
+                    Did::CreateTeam => {
+                        if let Some(Ok((slug, _))) =
+                            self.remote.desk.new_team.as_ref().map(|form| form.ask())
+                        {
+                            self.remote.desk.pick_team(&slug);
+                        }
+                        self.remote.desk.new_team = None;
+                    }
+                    Did::RenameTeam => self.remote.desk.rename_team = None,
+                    Did::DeleteTeam => self.remote.desk.team = None,
+                    Did::DeleteWebhook => self.remote.desk.webhook = None,
+                    Did::SaveProvider => {
+                        if let Some(form) = self.remote.desk.provider_form.take() {
+                            self.remote.desk.provider = Some(form.id.text.trim().to_string());
+                        }
+                    }
+                    Did::UseBlueprint => self.remote.desk.use_blueprint = None,
+                    Did::ParkIssue => self.remote.desk.why = TextEdit::new(""),
+                    Did::CreatePolicy => {
+                        self.remote.desk.policy_draft = None;
+                        self.remote.desk.policy_file = None;
+                        self.remote.desk.policy = view.stored_policy.clone();
+                    }
+                    Did::SetOverrides => {
+                        self.remote.desk.knob = None;
+                        self.remote.desk.why = TextEdit::new("");
+                    }
+                    Did::SetAutopilot => self.remote.desk.why = TextEdit::new(""),
+                    Did::AddRepo => {
+                        self.remote.desk.new_repo = TextEdit::new("");
+                        self.remote.desk.why = TextEdit::new("");
+                    }
+                    Did::DeleteProvider => {
+                        self.remote.desk.provider = None;
+                        self.remote.desk.provider_form = None;
+                    }
+                    Did::SaveWebhook => {
+                        let saved = self
+                            .remote
+                            .desk
+                            .webhook_form
+                            .take()
+                            .and_then(|form| form.editing);
+                        let created = view.rotated.as_ref().map(|r| r.webhook.id.clone());
+                        self.remote.desk.webhook = saved.or(created);
+                    }
+                    Did::PutMembers => {
+                        self.remote.desk.add_member = crate::teams::MemberForm::default();
+                    }
                     Did::SaveSchedule => {
-                        self.launcher = None;
-                        self.page = crate::Page::Schedules;
+                        self.remote.launcher = None;
+                        self.page = crate::Page::Triggers;
+                    }
+                    Did::TestFireSchedule => {
+                        self.remote.desk.test_fire = None;
                     }
                     Did::Enable
+                    | Did::FireSchedule
                     | Did::Revoke
                     | Did::Unbind
                     | Did::RegisterImport
                     | Did::DiscardImport
-                    | Did::CancelLaunch => {}
+                    | Did::CancelLaunch
+                    | Did::RevokeKey
+                    | Did::SignOutMcp
+                    | Did::EnableWebhook
+                    | Did::RotateWebhook
+                    | Did::CheckWebhook
+                    | Did::PreviewWebhook
+                    | Did::Reconcile
+                    | Did::UnparkIssue
+                    | Did::PauseRepo
+                    | Did::UnwatchRepo
+                    | Did::ActivatePolicy
+                    | Did::Explain => {}
                 }
             }
             if let (Did::SaveSchedule, Err(why), Some(launcher)) =
-                (acted.did, &acted.result, self.launcher.as_mut())
+                (acted.did, &acted.result, self.remote.launcher.as_mut())
             {
                 launcher.stage = crate::Stage::Ready;
                 launcher.refusal = Some(why.clone());
             }
-            self.desk.outcome = Some(acted.result.clone());
+            self.remote.desk.outcome = Some(acted.result.clone());
         }
         if let Some(Ok(open)) = &view.decisions {
             let looking = crate::notify::app_focused() && self.page == crate::Page::Decisions;
-            for decision in self.desk.arrived(open) {
+            for decision in self.remote.desk.arrived(open) {
                 if self.settings.ask
                     && !looking
                     && let Some(notifier) = &self.notifier
@@ -932,12 +1875,17 @@ impl crate::App {
                 }
             }
         }
-        self.admin = view;
+        if let (Some(form), Some((playbook, Some(Ok(schema))))) =
+            (&mut self.remote.desk.webhook_form, &view.webhook_schema)
+        {
+            form.lay_out(playbook, &crate::form::fields(schema));
+        }
+        self.remote.admin = view;
     }
 
     /// How many decision requests wait on the signed-in user.
     pub fn waiting(&self) -> usize {
-        match &self.admin.decisions {
+        match &self.remote.admin.decisions {
             Some(Ok(open)) => open.len(),
             _ => 0,
         }
@@ -945,7 +1893,7 @@ impl crate::App {
 
     /// Scope packs to approve and imports to settle.
     pub fn approvals_waiting(&self) -> usize {
-        match &self.admin.approvals {
+        match &self.remote.admin.approvals {
             Some(Ok(queue)) => queue.waiting(),
             _ => 0,
         }
@@ -962,7 +1910,7 @@ fn fixture() -> Result<dto::Decision, String> {
 pub fn show_fixture(app: &mut crate::App) {
     let decision = fixture();
     if let Ok(d) = &decision {
-        app.admin.decisions = Some(Ok(vec![dto::DecisionSummary {
+        app.remote.admin.decisions = Some(Ok(vec![dto::DecisionSummary {
             id: d.id.clone(),
             run_id: d.run_id.clone(),
             task: d.task.clone(),
@@ -971,10 +1919,10 @@ pub fn show_fixture(app: &mut crate::App) {
             opened_at: d.opened_at.clone(),
             expires_at: d.expires_at.clone(),
         }]));
-        app.desk.pick_decision(&d.id);
-        app.admin.decision = Some((d.id.clone(), Some(Ok(d.clone()))));
+        app.remote.desk.pick_decision(&d.id);
+        app.remote.admin.decision = Some((d.id.clone(), Some(Ok(d.clone()))));
     } else {
-        app.admin.decisions = Some(decision.map(|_| Vec::new()));
+        app.remote.admin.decisions = Some(decision.map(|_| Vec::new()));
     }
 }
 
@@ -993,6 +1941,901 @@ mod tests {
         desk.toggle_pick("ship", "yes", false);
         desk.toggle_pick("repos", "llm-d/llm-d", true);
         assert!(desk.unanswered(&decision).is_empty());
+    }
+
+    #[test]
+    fn everything_watched_is_read_at_once() {
+        let slow = Duration::from_secs(1);
+        let (url, _) = crate::testserver::serve(move |request| {
+            std::thread::sleep(slow);
+            match request.split_whitespace().nth(1) {
+                Some("/api/decisions") => r#"{"open":[]}"#.into(),
+                Some("/api/approvals") => "{}".into(),
+                _ => "[]".into(),
+            }
+        });
+        let keys = tempfile::tempdir().unwrap();
+        let net = crate::net::Net::uncached_for_tests();
+        let client =
+            Client::spawn(net.connector(crate::testserver::target("t", &url, keys.path())));
+        let asked = Instant::now();
+        client.watch(Watch {
+            controller: true,
+            schedules: true,
+            secrets: true,
+            ..Watch::default()
+        });
+        let view = loop {
+            if let Some((_, view)) = client.take(0) {
+                break view;
+            }
+            assert!(
+                asked.elapsed() < Duration::from_secs(10),
+                "nothing was read"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            asked.elapsed() < slow * 3,
+            "four reads of {slow:?} each took {:?}",
+            asked.elapsed()
+        );
+        assert_eq!(view.decisions, Some(Ok(Vec::new())));
+        assert_eq!(view.approvals.map(|a| a.map(|a| a.waiting())), Some(Ok(0)));
+        assert_eq!(view.schedules.map(|s| s.map(|s| s.len())), Some(Ok(0)));
+        assert_eq!(view.secrets.map(|s| s.map(|s| s.len())), Some(Ok(0)));
+        assert!(view.secret.is_none() && view.shares.is_none() && view.decision.is_none());
+    }
+
+    /// A worker reading a server that answers each `[method, path]` with `answer`, and every
+    /// request line that server took.
+    fn worker(
+        answer: impl Fn(&[&str]) -> String + Send + Sync + 'static,
+    ) -> (Client, Arc<Mutex<Vec<String>>>, tempfile::TempDir) {
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&requests);
+        let (url, _) = crate::testserver::serve(move |request| {
+            let line: Vec<&str> = request.split_whitespace().take(2).collect();
+            seen.lock().unwrap().push(line.join(" "));
+            answer(&line)
+        });
+        let keys = tempfile::tempdir().unwrap();
+        let net = crate::net::Net::uncached_for_tests();
+        let client =
+            Client::spawn(net.connector(crate::testserver::target("t", &url, keys.path())));
+        (client, requests, keys)
+    }
+
+    /// The newest view once `done` holds for it.
+    fn until(client: &Client, done: impl Fn(&AdminView) -> bool) -> AdminView {
+        let asked = Instant::now();
+        loop {
+            if let Some((_, view)) = client.take(0)
+                && done(&view)
+            {
+                return view;
+            }
+            assert!(
+                asked.elapsed() < Duration::from_secs(10),
+                "the view never got there"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn keys_are_read_only_while_their_page_shows_and_a_minted_secret_lasts_as_long() {
+        let (client, requests, _keys) = worker(|line| match line {
+            ["GET", "/api/decisions"] => r#"{"open":[]}"#.into(),
+            ["GET", "/api/approvals"] => "{}".into(),
+            ["GET", "/api/keys"] => r#"[{"id":"k1","name":"laptop",
+                    "created_at":"2026-11-01T00:00:00Z","expires_at":null,
+                    "last_used_at":null,"revoked_at":null}]"#
+                .into(),
+            ["POST", "/api/keys"] => r#"{"id":"k2","name":"ci",
+                    "created_at":"2026-11-10T00:00:00Z","expires_at":null,"last_used_at":null,
+                    "revoked_at":null,"secret":"crk_once","mcp_url":null}"#
+                .into(),
+            ["GET", "/api/me/mcp-sign-ins"] => r#"{"enabled":true,"sign_ins":[]}"#.into(),
+            ["DELETE", "/api/me/mcp-sign-ins?client_id=dyn-1"] => r#"{"revoked":1}"#.into(),
+            _ => "[]".into(),
+        });
+        let elsewhere = Watch {
+            controller: true,
+            ..Watch::default()
+        };
+        let on_page = Watch {
+            keys: true,
+            ..elsewhere.clone()
+        };
+
+        client.watch(elsewhere.clone());
+        let view = until(&client, |view| view.decisions.is_some());
+        assert!(view.keys.is_none() && view.mcp.is_none());
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.contains("/api/keys")),
+            "keys were read off their page"
+        );
+
+        client.watch(on_page);
+        let view = until(&client, |view| view.keys.is_some() && view.mcp.is_some());
+        assert_eq!(view.keys.map(|k| k.map(|k| k.len())), Some(Ok(1)));
+        assert_eq!(view.mcp.map(|m| m.map(|m| m.enabled)), Some(Ok(true)));
+
+        client.act(Action::MintKey {
+            name: "ci".into(),
+            days: None,
+        });
+        let view = until(&client, |view| view.acted.is_some());
+        assert_eq!(
+            view.acted.map(|a| (a.did, a.result)),
+            Some((Did::MintKey, Ok("Minted ci".to_string())))
+        );
+        assert_eq!(view.minted.map(|m| m.secret), Some("crk_once".to_string()));
+
+        client.act(Action::RevokeKey { id: "k1".into() });
+        until(&client, |view| {
+            view.acted.as_ref().is_some_and(|a| a.did == Did::RevokeKey)
+        });
+        client.act(Action::SignOutMcp {
+            client: Some("dyn-1".into()),
+        });
+        let view = until(&client, |view| {
+            view.acted
+                .as_ref()
+                .is_some_and(|a| a.did == Did::SignOutMcp)
+        });
+        assert_eq!(
+            view.acted.map(|a| a.result),
+            Some(Ok("Signed out".to_string()))
+        );
+        assert!(
+            view.minted.is_some(),
+            "the secret went while its page showed"
+        );
+        let sent = requests.lock().unwrap().clone();
+        for change in [
+            "POST /api/keys",
+            "DELETE /api/keys/k1",
+            "DELETE /api/me/mcp-sign-ins?client_id=dyn-1",
+        ] {
+            assert!(sent.iter().any(|r| r == change), "{change} was not sent");
+        }
+
+        client.watch(elsewhere);
+        until(&client, |view| view.minted.is_none());
+    }
+
+    #[test]
+    fn teams_are_read_on_their_page_with_the_audit_of_the_one_asked_for() {
+        let (client, requests, _keys) = worker(|line| match line {
+            ["GET", "/api/decisions"] => r#"{"open":[]}"#.into(),
+            ["GET", "/api/approvals"] => "{}".into(),
+            ["GET", "/api/teams"] => r#"[{"slug":"infra","display_name":"Infra",
+                    "members":[{"kind":"user","member":"wynn","role":"owner"}],
+                    "my_role":"owner","reachable":true}]"#
+                .into(),
+            ["GET", "/api/teams/infra/audit"] => r#"[{"id":7,"at":"2026-11-01T00:00:00Z",
+                    "actor":"user:wynn","action":"team:create","decision":"allow","rule":"owner"}]"#
+                .into(),
+            ["POST", "/api/teams"] | ["PUT", _] => {
+                r#"{"slug":"infra","display_name":"Infra"}"#.into()
+            }
+            _ => "[]".into(),
+        });
+        let listed = Watch {
+            controller: true,
+            teams: true,
+            ..Watch::default()
+        };
+
+        client.watch(listed.clone());
+        let view = until(&client, |view| view.teams.is_some());
+        assert_eq!(
+            view.teams
+                .map(|teams| teams.map(|teams| (teams.len(), teams[0].my_role))),
+            Some(Ok((1, Some(dto::TeamRole::Owner))))
+        );
+        assert!(view.team_audit.is_none());
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.ends_with("/audit")),
+            "an audit trail nobody asked for was read"
+        );
+
+        client.watch(Watch {
+            team_audit: Some("infra".into()),
+            ..listed.clone()
+        });
+        let view = until(&client, |view| view.team_audit.is_some());
+        let (slug, audit) = view.team_audit.unwrap();
+        assert_eq!(slug, "infra");
+        assert_eq!(
+            audit.map(|a| a.map(|a| a[0].action.clone())),
+            Some(Ok("team:create".to_string()))
+        );
+
+        let steps = [
+            (
+                Action::CreateTeam {
+                    slug: "infra".into(),
+                    name: "Infra".into(),
+                },
+                Did::CreateTeam,
+                "Created infra",
+                "POST /api/teams",
+            ),
+            (
+                Action::RenameTeam {
+                    slug: "infra".into(),
+                    name: "Platform".into(),
+                },
+                Did::RenameTeam,
+                "Renamed to Platform",
+                "PUT /api/teams/infra",
+            ),
+            (
+                Action::PutMembers {
+                    slug: "infra".into(),
+                    members: Vec::new(),
+                },
+                Did::PutMembers,
+                "Saved the members",
+                "PUT /api/teams/infra/members",
+            ),
+            (
+                Action::DeleteTeam {
+                    slug: "infra".into(),
+                },
+                Did::DeleteTeam,
+                "Deleted infra",
+                "DELETE /api/teams/infra",
+            ),
+        ];
+        for (action, did, said, sent) in steps {
+            client.act(action);
+            let view = until(&client, |view| {
+                view.acted.as_ref().is_some_and(|a| a.did == did)
+            });
+            assert_eq!(view.acted.map(|a| a.result), Some(Ok(said.to_string())));
+            assert!(
+                requests.lock().unwrap().iter().any(|r| r == sent),
+                "{sent} was not sent"
+            );
+        }
+
+        client.watch(listed);
+        until(&client, |view| view.team_audit.is_none());
+    }
+
+    #[test]
+    fn webhooks_are_read_on_triggers_and_a_rotated_secret_lasts_while_its_webhook_shows() {
+        const HOOK: &str = r#"{"id":"w1","playbook":"triage","verifier":"path_token",
+            "enabled":true,"max_launches_per_hour":3}"#;
+        let (client, requests, _keys) = worker(|line| match line {
+            ["GET", "/api/decisions"] => r#"{"open":[]}"#.into(),
+            ["GET", "/api/approvals"] => "{}".into(),
+            ["GET", "/api/webhooks"] => format!("[{HOOK}]"),
+            ["GET", "/api/webhooks/w1/deliveries?limit=20"] => r#"[{"id":"d1",
+                    "received_at":"2026-11-01T00:00:00Z","outcome":"filtered",
+                    "reason":"the filter was false","launch_key":null}]"#
+                .into(),
+            ["POST", "/api/webhooks/w1/secret"] => {
+                format!(r#"{{"webhook":{HOOK},"secret":"whsec_once","delivery_url":null}}"#)
+            }
+            ["POST", "/api/webhooks/w1/enabled"] => HOOK.into(),
+            _ => "[]".into(),
+        });
+        let listed = Watch {
+            controller: true,
+            schedules: true,
+            webhooks: true,
+            ..Watch::default()
+        };
+        let opened = Watch {
+            webhook: Some("w1".into()),
+            ..listed.clone()
+        };
+
+        client.watch(listed.clone());
+        let view = until(&client, |view| view.webhooks.is_some());
+        assert_eq!(
+            view.webhooks
+                .map(|hooks| hooks.map(|hooks| hooks[0].playbook.clone())),
+            Some(Ok("triage".to_string()))
+        );
+        assert!(view.deliveries.is_none());
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.contains("/deliveries")),
+            "deliveries nobody opened were read"
+        );
+
+        client.watch(opened);
+        let view = until(&client, |view| view.deliveries.is_some());
+        let (id, list) = view.deliveries.unwrap();
+        assert_eq!(id, "w1");
+        assert_eq!(
+            list.map(|list| list.map(|list| list[0].outcome.clone())),
+            Some(Ok("filtered".to_string()))
+        );
+
+        client.act(Action::RotateWebhook { id: "w1".into() });
+        let view = until(&client, |view| view.rotated.is_some());
+        assert_eq!(
+            view.rotated.map(|r| r.secret),
+            Some("whsec_once".to_string())
+        );
+        client.act(Action::EnableWebhook {
+            id: "w1".into(),
+            on: false,
+        });
+        let view = until(&client, |view| {
+            view.acted
+                .as_ref()
+                .is_some_and(|a| a.did == Did::EnableWebhook)
+        });
+        assert_eq!(
+            view.acted.map(|a| a.result),
+            Some(Ok("Paused the webhook".to_string()))
+        );
+        assert!(
+            view.rotated.is_some(),
+            "the secret went while its webhook showed"
+        );
+        client.act(Action::DeleteWebhook { id: "w1".into() });
+        until(&client, |view| {
+            view.acted
+                .as_ref()
+                .is_some_and(|a| a.did == Did::DeleteWebhook)
+        });
+        let sent = requests.lock().unwrap().clone();
+        for change in [
+            "POST /api/webhooks/w1/secret",
+            "POST /api/webhooks/w1/enabled",
+            "DELETE /api/webhooks/w1",
+        ] {
+            assert!(sent.iter().any(|r| r == change), "{change} was not sent");
+        }
+
+        client.watch(listed);
+        let view = until(&client, |view| view.deliveries.is_none());
+        assert!(
+            view.rotated.is_some(),
+            "closing the details dropped the secret"
+        );
+        client.watch(Watch {
+            controller: true,
+            ..Watch::default()
+        });
+        until(&client, |view| view.rotated.is_none());
+    }
+
+    #[test]
+    fn a_webhook_form_reads_its_schema_and_presets_and_a_created_secret_is_kept() {
+        const HOOK: &str = r#"{"id":"w2","playbook":"triage","verifier":"path_token"}"#;
+        let (client, requests, _keys) = worker(|line| match line {
+            ["GET", "/api/decisions"] => r#"{"open":[]}"#.into(),
+            ["GET", "/api/approvals"] => "{}".into(),
+            ["GET", "/api/playbooks/triage/schema"] => {
+                r#"{"properties":{"repo":{"type":"string"}},"required":["repo"]}"#.into()
+            }
+            ["GET", "/api/webhooks/presets"] => r#"[{"id":"quay-push","title":"quay.io push",
+                    "verifier":"path_token","header":null,"filter":"true","dedupe":"delivery",
+                    "derive":{}}]"#
+                .into(),
+            ["POST", "/api/webhooks"] => {
+                format!(r#"{{"webhook":{HOOK},"secret":"whsec_new","delivery_url":null}}"#)
+            }
+            ["PUT", "/api/webhooks/w2"] => HOOK.into(),
+            ["POST", "/api/webhooks/check"] => r#"{"diagnostics":[]}"#.into(),
+            ["POST", "/api/webhooks/preview"] => r#"{"filter":{"value":true},
+                    "dedupe":{"value":"d1"},"derive":{"error":"no such key"}}"#
+                .into(),
+            _ => "[]".into(),
+        });
+        let listed = Watch {
+            controller: true,
+            webhooks: true,
+            ..Watch::default()
+        };
+        let filling = Watch {
+            webhook_form: Some("triage".into()),
+            ..listed.clone()
+        };
+        let mut form = crate::webhook::WebhookForm::new("triage");
+
+        client.watch(listed.clone());
+        let view = until(&client, |view| view.webhooks.is_some());
+        assert!(view.webhook_schema.is_none() && view.presets.is_none());
+
+        client.watch(filling);
+        let view = until(&client, |view| {
+            view.webhook_schema.is_some() && view.presets.is_some()
+        });
+        let (playbook, schema) = view.webhook_schema.unwrap();
+        form.lay_out(&playbook, &crate::form::fields(&schema.unwrap().unwrap()));
+        assert_eq!(form.choices[0].name, "repo");
+        assert_eq!(view.presets.unwrap().unwrap()[0].id, "quay-push");
+        let body = Box::new(form.body().unwrap());
+
+        client.act(Action::CheckWebhook { body: body.clone() });
+        let view = until(&client, |view| view.webhook_check.is_some());
+        assert!(view.webhook_check.unwrap().diagnostics.is_empty());
+        client.act(Action::PreviewWebhook {
+            body: body.clone(),
+            sample: serde_json::json!({}),
+            headers: BTreeMap::new(),
+        });
+        let view = until(&client, |view| view.webhook_preview.is_some());
+        let preview = view.webhook_preview.unwrap();
+        assert_eq!(preview.filter.value, Some(serde_json::json!(true)));
+        assert_eq!(preview.derive.error.as_deref(), Some("no such key"));
+
+        client.act(Action::SaveWebhook {
+            id: None,
+            body: body.clone(),
+        });
+        let view = until(&client, |view| {
+            view.acted
+                .as_ref()
+                .is_some_and(|a| a.did == Did::SaveWebhook)
+        });
+        assert_eq!(
+            view.acted.map(|a| a.result),
+            Some(Ok("Created the webhook".to_string()))
+        );
+        assert_eq!(
+            view.rotated.map(|r| r.secret),
+            Some("whsec_new".to_string())
+        );
+        client.act(Action::SaveWebhook {
+            id: Some("w2".into()),
+            body,
+        });
+        until(&client, |view| {
+            view.acted
+                .as_ref()
+                .is_some_and(|a| a.result == Ok("Saved the webhook".to_string()))
+        });
+        let sent = requests.lock().unwrap().clone();
+        for change in ["POST /api/webhooks", "PUT /api/webhooks/w2"] {
+            assert!(sent.iter().any(|r| r == change), "{change} was not sent");
+        }
+
+        client.watch(listed);
+        let view = until(&client, |view| {
+            view.webhook_check.is_none() && view.webhook_preview.is_none()
+        });
+        assert!(view.webhook_schema.is_none());
+        assert_eq!(
+            view.rotated.map(|r| r.secret),
+            Some("whsec_new".to_string()),
+            "closing the form dropped the new webhook's secret"
+        );
+    }
+
+    #[test]
+    fn providers_are_read_on_their_page_and_a_save_registers_or_replaces() {
+        const PROVIDER: &str = r#"{"id":"lab","display_name":"Lab","kind":"openai",
+            "default_model":"gpt-5","enabled":true,"owner":"user:wynn","actions":["update"]}"#;
+        let (client, requests, _keys) = worker(|line| match line {
+            ["GET", "/api/decisions"] => r#"{"open":[]}"#.into(),
+            ["GET", "/api/approvals"] => "{}".into(),
+            ["GET", "/api/providers"] => format!("[{PROVIDER}]"),
+            ["POST", "/api/providers"] | ["PUT", "/api/providers/lab"] => PROVIDER.into(),
+            _ => "[]".into(),
+        });
+        let elsewhere = Watch {
+            controller: true,
+            ..Watch::default()
+        };
+
+        client.watch(elsewhere.clone());
+        let view = until(&client, |view| view.decisions.is_some());
+        assert!(view.providers.is_none());
+        client.watch(Watch {
+            providers: true,
+            ..elsewhere
+        });
+        let view = until(&client, |view| view.providers.is_some());
+        let stored = view.providers.unwrap().unwrap().remove(0);
+        assert!(crate::provider::may(&stored, "update"));
+
+        let mut form = crate::provider::ProviderForm::editing(&stored);
+        form.enabled = false;
+        let register = Box::new(form.register().unwrap());
+        let steps = [
+            (None, "Registered lab", "POST /api/providers"),
+            (
+                Some("lab".to_string()),
+                "Saved the provider",
+                "PUT /api/providers/lab",
+            ),
+        ];
+        for (id, said, sent) in steps {
+            client.act(Action::SaveProvider {
+                id,
+                register: register.clone(),
+            });
+            until(&client, |view| {
+                view.acted
+                    .as_ref()
+                    .is_some_and(|a| a.result == Ok(said.to_string()))
+            });
+            assert!(
+                requests.lock().unwrap().iter().any(|r| r == sent),
+                "{sent} was not sent"
+            );
+        }
+        client.act(Action::DeleteProvider { id: "lab".into() });
+        until(&client, |view| {
+            view.acted
+                .as_ref()
+                .is_some_and(|a| a.did == Did::DeleteProvider)
+        });
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r == "DELETE /api/providers/lab")
+        );
+    }
+
+    #[test]
+    fn the_controllers_version_is_read_while_settings_show_it() {
+        let (client, _requests, _keys) = worker(|line| match line {
+            ["GET", "/api/decisions"] => r#"{"open":[]}"#.into(),
+            ["GET", "/api/approvals"] => "{}".into(),
+            ["GET", "/api/version"] => {
+                r#"{"git_sha":"abc123def456","version":"0.6.1","autoresearch":true}"#.into()
+            }
+            _ => "[]".into(),
+        });
+        let elsewhere = Watch {
+            controller: true,
+            ..Watch::default()
+        };
+        client.watch(elsewhere.clone());
+        let view = until(&client, |view| view.decisions.is_some());
+        assert!(view.version.is_none());
+
+        client.watch(Watch {
+            about: true,
+            ..elsewhere
+        });
+        let view = until(&client, |view| view.version.is_some());
+        let version = view.version.unwrap().unwrap();
+        assert_eq!(
+            (version.version.as_str(), version.git_sha.as_str()),
+            ("0.6.1", "abc123def456")
+        );
+    }
+
+    #[test]
+    fn issues_are_read_in_the_status_shown_and_one_is_parked_and_unparked() {
+        const ISSUE: &str = r#"{"key":"github:acme/engine#7","repo":"acme/engine",
+            "kind":{"type":"github","owner":"acme","repo":"engine","number":7},
+            "status":"running","title":"Slow start","updated_at":"2026-11-10T18:01:39Z"}"#;
+        let (client, requests, _keys) = worker(|line| match line {
+            ["GET", "/api/decisions"] => r#"{"open":[]}"#.into(),
+            ["GET", "/api/approvals"] => "{}".into(),
+            ["GET", "/api/issues?exclude_kind=playbook&status=running"] => format!("[{ISSUE}]"),
+            ["GET", "/api/issues?exclude_kind=playbook"] => format!("[{ISSUE},{ISSUE}]"),
+            ["GET", "/api/issues/github%3Aacme%2Fengine%237"] => format!(
+                r#"{{"issue":{ISSUE},"body":"It is slow","events":[{{"ts":"2026-11-10T18:00:00Z",
+                "key":"github:acme/engine#7","from":"scoped","to":"running"}}]}}"#
+            ),
+            ["POST", _] => "{}".into(),
+            _ => "[]".into(),
+        });
+        let elsewhere = Watch {
+            controller: true,
+            ..Watch::default()
+        };
+
+        client.watch(elsewhere.clone());
+        let view = until(&client, |view| view.decisions.is_some());
+        assert!(view.issues.is_none() && view.issue.is_none());
+
+        let running = Some("running".to_string());
+        client.watch(Watch {
+            issues: Some(running.clone()),
+            ..elsewhere.clone()
+        });
+        let view = until(&client, |view| view.issues.is_some());
+        let (status, issues) = view.issues.unwrap();
+        assert_eq!(status, running);
+        assert_eq!(
+            issues.unwrap().unwrap()[0].title.as_deref(),
+            Some("Slow start")
+        );
+
+        client.watch(Watch {
+            issues: Some(None),
+            issue: Some("github:acme/engine#7".into()),
+            ..elsewhere.clone()
+        });
+        let view = until(&client, |view| {
+            view.issue.is_some() && matches!(&view.issues, Some((None, _)))
+        });
+        assert_eq!(view.issues.unwrap().1.unwrap().unwrap().len(), 2);
+        let (key, detail) = view.issue.unwrap();
+        let detail = detail.unwrap().unwrap();
+        assert_eq!(key, "github:acme/engine#7");
+        assert_eq!(detail.body.as_deref(), Some("It is slow"));
+        assert_eq!(detail.events[0].to, "running");
+
+        client.act(Action::ParkIssue {
+            key: key.clone(),
+            reason: "needs a repro".into(),
+        });
+        let view = until(&client, |view| view.acted.is_some());
+        assert_eq!(
+            view.acted.map(|a| a.result),
+            Some(Ok("Parked github:acme/engine#7".to_string()))
+        );
+        client.act(Action::UnparkIssue { key });
+        until(&client, |view| {
+            view.acted.as_ref().map(|a| &a.result)
+                == Some(&Ok("Unparked github:acme/engine#7".to_string()))
+        });
+        let asked = requests.lock().unwrap();
+        for post in [
+            "POST /api/issues/github%3Aacme%2Fengine%237/park",
+            "POST /api/issues/github%3Aacme%2Fengine%237/unpark",
+        ] {
+            assert!(asked.iter().any(|r| r == post), "{post} in {asked:?}");
+        }
+        drop(asked);
+
+        client.watch(elsewhere);
+        until(&client, |view| {
+            view.issues.is_none() && view.issue.is_none()
+        });
+    }
+
+    #[test]
+    fn activity_and_blueprints_are_read_on_their_pages_and_a_use_shows_what_it_started() {
+        let (client, requests, _keys) = worker(|line| match line {
+            ["GET", "/api/decisions"] => r#"{"open":[]}"#.into(),
+            ["GET", "/api/approvals"] => "{}".into(),
+            ["GET", "/api/events?limit=200"] => r#"[{"ts":"2026-11-10T18:01:39Z",
+                "key":"playbook:triage:01a1","from":"running","to":"done",
+                "reason":{"text":"run finished","truncated":false},"actor":null}]"#
+                .into(),
+            ["GET", "/api/blueprints"] => r#"[{"id":"triage","description":"Triage issues",
+                "owner":"team:infra","rev":"abc","public":true,
+                "secrets":[{"declared_name":"gh","carries":false}]}]"#
+                .into(),
+            ["POST", "/api/blueprints/triage/use"] => r#"{"id":"my-triage","version":1,
+                "bindings":[],"placeholders":[{"declared_name":"gh","projection_kind":"env",
+                "projection":"GH_TOKEN","reason":"personal_secret"}]}"#
+                .into(),
+            _ => "[]".into(),
+        });
+        let elsewhere = Watch {
+            controller: true,
+            ..Watch::default()
+        };
+
+        client.watch(elsewhere.clone());
+        let view = until(&client, |view| view.decisions.is_some());
+        assert!(view.events.is_none() && view.blueprints.is_none());
+
+        client.watch(Watch {
+            activity: true,
+            ..elsewhere.clone()
+        });
+        let view = until(&client, |view| view.events.is_some());
+        let events = view.events.unwrap().unwrap();
+        assert_eq!(events[0].key, "playbook:triage:01a1");
+        assert_eq!(
+            events[0].reason.as_ref().map(|r| r.text.as_str()),
+            Some("run finished")
+        );
+
+        let catalog = Watch {
+            blueprints: true,
+            ..elsewhere.clone()
+        };
+        client.watch(catalog);
+        let view = until(&client, |view| view.blueprints.is_some());
+        assert_eq!(view.blueprints.unwrap().unwrap()[0].secrets.len(), 1);
+        client.act(Action::UseBlueprint {
+            id: "triage".into(),
+            to: "my-triage".into(),
+            description: None,
+        });
+        let view = until(&client, |view| view.used.is_some());
+        let used = view.used.unwrap();
+        assert_eq!((used.id.as_str(), used.version), ("my-triage", 1));
+        assert_eq!(used.placeholders[0].reason, "personal_secret");
+        assert_eq!(
+            view.acted.map(|a| a.result),
+            Some(Ok("Started draft my-triage".to_string()))
+        );
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r == "POST /api/blueprints/triage/use")
+        );
+
+        client.watch(elsewhere);
+        until(&client, |view| view.used.is_none());
+    }
+
+    #[test]
+    fn the_admin_page_reads_settings_access_autopilot_and_repos_and_sends_each_change() {
+        const CONFIG: &str = r#"{"knobs":[{"name":"max_concurrent_pods","value":10,
+            "source":"override","overridable":true,"description":"Pods at once."},
+            {"name":"allow_t3","value":false,"source":"env","overridable":true}]}"#;
+        let (client, requests, _keys) = worker(|line| match line {
+            ["GET", "/api/decisions"] => r#"{"open":[]}"#.into(),
+            ["GET", "/api/approvals"] => "{}".into(),
+            ["GET", "/api/config"] | ["PUT", "/api/config/overrides"] => CONFIG.into(),
+            ["GET", "/api/access"] => r#"{"admins":["wynn"],"operators":[]}"#.into(),
+            ["GET", "/api/autopilot"] | ["POST", "/api/autopilot"] => r#"{"enabled":true}"#.into(),
+            ["GET", "/api/repos"] => r#"[{"repo":"llm-d/llm-d","total":9,"watched":true}]"#.into(),
+            _ => "{}".into(),
+        });
+        let elsewhere = Watch {
+            controller: true,
+            ..Watch::default()
+        };
+
+        client.watch(elsewhere.clone());
+        let view = until(&client, |view| view.decisions.is_some());
+        assert!(view.config.is_none() && view.repos.is_none());
+
+        client.watch(Watch {
+            admin: true,
+            ..elsewhere
+        });
+        let view = until(&client, |view| view.config.is_some());
+        let knobs = view.config.unwrap().unwrap().knobs;
+        assert_eq!(view.access.unwrap().unwrap().admins, ["wynn"]);
+        assert!(view.autopilot.unwrap().unwrap().enabled);
+        assert_eq!(view.repos.unwrap().unwrap()[0].total, 9);
+
+        let steps = [
+            (
+                Action::SetOverrides {
+                    overrides: crate::overrides::with(&knobs, "allow_t3", "true").unwrap(),
+                    justification: "trial".into(),
+                },
+                "Saved the overrides",
+                "PUT /api/config/overrides",
+            ),
+            (
+                Action::SetAutopilot {
+                    enabled: false,
+                    reason: "deploy".into(),
+                },
+                "Autopilot off",
+                "POST /api/autopilot",
+            ),
+            (
+                Action::Reconcile,
+                "Reconcile asked for",
+                "POST /api/reconcile",
+            ),
+            (
+                Action::AddRepo {
+                    repo: "llm-d/new".into(),
+                    justification: "asked".into(),
+                },
+                "Watching llm-d/new",
+                "POST /api/repos",
+            ),
+            (
+                Action::PauseRepo {
+                    repo: "llm-d/llm-d".into(),
+                    paused: true,
+                },
+                "Paused llm-d/llm-d",
+                "POST /api/repos/llm-d%2Fllm-d/pause",
+            ),
+            (
+                Action::UnwatchRepo {
+                    repo: "llm-d/llm-d".into(),
+                },
+                "Stopped watching llm-d/llm-d",
+                "DELETE /api/repos/llm-d%2Fllm-d",
+            ),
+        ];
+        for (action, said, sent) in steps {
+            client.act(action);
+            until(&client, |view| {
+                view.acted
+                    .as_ref()
+                    .is_some_and(|a| a.result == Ok(said.to_string()))
+            });
+            assert!(
+                requests.lock().unwrap().iter().any(|r| r == sent),
+                "{sent} was not sent"
+            );
+        }
+    }
+
+    #[test]
+    fn the_policy_tab_reads_the_sets_stores_activates_and_explains() {
+        const SET: &str = r#"{"digest":"abc123","text":"permit(principal, action, resource);",
+            "created_at":"2026-11-04T21:28:21Z","active":true}"#;
+        let (client, requests, _keys) = worker(|line| match line {
+            ["GET", "/api/decisions"] => r#"{"open":[]}"#.into(),
+            ["GET", "/api/approvals"] => "{}".into(),
+            ["GET", "/api/authz/policy-sets"] => format!("[{SET}]"),
+            ["POST", "/api/authz/policy-sets"] => SET.replace("abc123", "def456"),
+            ["GET", "/api/authz/explain?login=wynn&action=team%3Aread"] => {
+                r#"{"login":"wynn","action":"team:read","allowed":false,"rules":[]}"#.into()
+            }
+            _ => "{}".into(),
+        });
+        let elsewhere = Watch {
+            controller: true,
+            ..Watch::default()
+        };
+
+        client.watch(Watch {
+            admin: true,
+            ..elsewhere.clone()
+        });
+        let view = until(&client, |view| view.config.is_some());
+        assert!(view.policy_sets.is_none(), "policy was read off its tab");
+
+        client.watch(Watch {
+            policy: true,
+            ..elsewhere.clone()
+        });
+        let view = until(&client, |view| view.policy_sets.is_some());
+        assert!(view.policy_sets.unwrap().unwrap()[0].active);
+
+        client.act(Action::CreatePolicy {
+            text: "permit(principal, action, resource);".into(),
+        });
+        let view = until(&client, |view| view.stored_policy.is_some());
+        assert_eq!(view.stored_policy.as_deref(), Some("def456"));
+        client.act(Action::ActivatePolicy {
+            digest: "def456".into(),
+        });
+        until(&client, |view| {
+            view.acted
+                .as_ref()
+                .is_some_and(|a| a.did == Did::ActivatePolicy)
+        });
+        client.act(Action::Explain {
+            login: "wynn".into(),
+            action: "team:read".into(),
+            resource: None,
+        });
+        let view = until(&client, |view| view.explained.is_some());
+        assert!(!view.explained.unwrap().allowed);
+        let sent = requests.lock().unwrap().clone();
+        for change in [
+            "POST /api/authz/policy-sets",
+            "POST /api/authz/policy-sets/def456/activate",
+        ] {
+            assert!(sent.iter().any(|r| r == change), "{change} was not sent");
+        }
+
+        client.watch(elsewhere);
+        until(&client, |view| {
+            view.stored_policy.is_none() && view.explained.is_none()
+        });
     }
 
     fn summary(id: &str) -> dto::DecisionSummary {
@@ -1162,6 +3005,24 @@ mod tests {
         assert_eq!(body["provider"], "vertex");
         assert_eq!(body["cursor"]["param"], "since");
         assert_eq!(body["target_kind"], "adopted");
+    }
+
+    #[test]
+    fn a_test_fire_form_sends_the_cursor_it_shows_and_waits_for_a_typed_value() {
+        let mut form = TestFireForm::on("sch-1");
+        assert_eq!(form.ask(), Some(dto::TestCursor::Stored));
+        form.from = CursorFrom::None;
+        assert_eq!(form.ask(), Some(dto::TestCursor::None));
+        form.from = CursorFrom::Value;
+        assert_eq!(form.ask(), None);
+        form.value = TextEdit::new(" {\"seen\": []}\n");
+        assert_eq!(
+            form.ask(),
+            Some(dto::TestCursor::Value {
+                value: " {\"seen\": []}\n".to_string()
+            }),
+            "a file body goes as typed"
+        );
     }
 
     #[test]

@@ -7,12 +7,12 @@
 //! the gateway's metadata emulator for Claude (and for opencode and pi, which speak Vertex through
 //! their own provider tables), the selected `[agent.codex]` auth for Codex.
 
-use crate::manifest::Harness;
+use crate::knobs::Harness;
 use anyhow::{Context, Result};
 use crucible::harness::ApiFamily;
 use crucible::openshell::endpoint::Endpoint;
 use crucible_contract::inference::{
-    InferenceBinding, InferenceProtocol, InferenceRole, TokenPrice,
+    InferenceBinding, InferenceProtocol, InferenceRole, ModelLimits, TokenPrice,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -80,12 +80,13 @@ impl WireApi {
     }
 }
 
-/// The protocol, model and price an injected agent binding fixes for the run.
+/// The protocol, model, price and limits an injected agent binding fixes for the run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSelection {
     pub protocol: InferenceProtocol,
     pub model: String,
     pub price: Option<TokenPrice>,
+    pub limits: Option<ModelLimits>,
 }
 
 impl AgentSelection {
@@ -174,6 +175,7 @@ impl InferenceEnv {
                 protocol: binding.protocol,
                 model: binding.model.clone(),
                 price: binding.price,
+                limits: binding.limits,
             }),
             ..InferenceEnv::default()
         };
@@ -283,6 +285,7 @@ mod tests {
             model: "the-model".into(),
             key_env: key_env.map(|n| crucible_contract::inference::EnvName::new(n).unwrap()),
             price: None,
+            limits: None,
         }
     }
 
@@ -310,6 +313,7 @@ mod tests {
                     protocol: InferenceProtocol::Messages,
                     model: "the-model".into(),
                     price: None,
+                    limits: None,
                 }),
                 ..InferenceEnv::default()
             }
@@ -473,6 +477,7 @@ mod tests {
             protocol,
             model: "m".into(),
             price: None,
+            limits: None,
         };
         let messages = select(InferenceProtocol::Messages);
         assert_eq!(messages.harness(Harness::Claude), Harness::Claude);

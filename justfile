@@ -177,6 +177,10 @@ hooks:
 forge-capture-e2e:
     scripts/forge-capture-e2e.sh
 
+# Tests the CI job selection (`cargo xtask ci plan`) against its rules and this tree.
+ci-jobs-test:
+    scripts/ci-jobs-test.sh
+
 # End-to-end proof of the pod executor on a throwaway kind cluster: the controller from this
 # checkout launches command-only drafts and playbooks as pods, across restarts and contract
 # mismatches (scenarios in the script header). Needs docker, kind, kubectl, jq, curl, git, shasum.
@@ -203,11 +207,35 @@ kueue-e2e context loop_image kueue_image controller_image pull_secret push_repo 
         ANTHROPIC_BASE_URL={{anthropic_base_url}} ANTHROPIC_KEY_SECRET={{anthropic_key_secret}} \
         SANDBOX_SCC_ROLE={{sandbox_scc_role}} LOOP_SCC_ROLE={{loop_scc_role}} scripts/kueue-e2e.sh
 
+# A loop image for the kueue e2e of an engine-only change: this checkout's `crucible` over <base>,
+# a published runtime image whose Cargo.lock matches (docker/Containerfile.runtime-overlay). Builds
+# on <context> with the buildit CLI and prints the digest-pinned ref last. Further arguments go to
+# buildit, e.g. `--cache-hostpath <path> --node <node>` to keep the cargo cache between builds.
+runtime-overlay context namespace base tag *args:
+    buildit build {{tag}} --kubecontext {{context}} -n {{namespace}} \
+        -f docker/Containerfile.runtime-overlay -c . --build-arg BASE={{base}} \
+        --request cpu=32 --request memory=64Gi {{args}}
+
 # kueue-e2e with a cluster's values from e2e/kueue/clusters/<name>.env (git-ignored; copy
 # openshift.env.example or kubernetes.env.example). Pass pack= to launch another pack.
 kueue-e2e-cluster name loop_image kueue_image controller_image pack="e2e/kueue/pack":
     set -a && . e2e/kueue/clusters/{{name}}.env && set +a && \
         PACK={{pack}} LOOP_IMAGE={{loop_image}} KUEUE_IMAGE={{kueue_image}} \
+        CONTROLLER_IMAGE={{controller_image}} scripts/kueue-e2e.sh
+
+# The kueue e2e's pi session pack on <name>: two pi turns share one conversation across two fresh
+# sandboxes and a third task takes a repair turn (e2e/kueue/pi-session-pack). Its verify task
+# passes only when the second turn reports a codeword only the first was told.
+pi-session-e2e name loop_image kueue_image controller_image:
+    PARAMS="{\"codeword\": \"cw-$(openssl rand -hex 12)\"}" \
+        just kueue-e2e-cluster {{name}} {{loop_image}} {{kueue_image}} {{controller_image}} e2e/kueue/pi-session-pack
+
+# The kueue e2e's task pack on <name>: a command task with no agent runs GPU Jobs on two queues
+# and serves a LeaderWorkerSet through crucible-kueue with its task token, on loop pods that carry
+# an SVID of their own (scripts/kueue-e2e.sh, TASKS=1).
+kueue-task-e2e name loop_image kueue_image controller_image:
+    set -a && . e2e/kueue/clusters/{{name}}.env && set +a && \
+        TASKS=1 MAX_TIME=60m TIMEOUT_SECS=3600 LOOP_IMAGE={{loop_image}} KUEUE_IMAGE={{kueue_image}} \
         CONTROLLER_IMAGE={{controller_image}} scripts/kueue-e2e.sh
 
 # The verifier of examples/optimize-loop against real report, evidence and image files, and the
@@ -306,10 +334,83 @@ desktop-hot:
     python3.14 vendor/rune/scripts/rune-dev \
         --manifest-path crucible-desktop/Cargo.toml --patch 'src/ui/*.rs' --local -- --scene local
 
+# Build the image the desktop app's drafting agent runs in, for the local OpenShell gateway.
+desktop-agent-image:
+    podman build -t localhost/crucible-agent -f crucible-desktop/sandbox/Containerfile .
+
 # Format, lint and test the desktop app.
 desktop-check:
     sh crucible-desktop/rune-patches.sh
     cd crucible-desktop && cargo fmt --check && cargo clippy --all-targets --all-features --locked -- -D warnings && cargo test --locked
+
+# Lint the desktop app's library, and the crux client under it, for the browser (wasm32, Rune's
+# web target).
+desktop-web-check:
+    sh crucible-desktop/rune-patches.sh
+    rustup target add wasm32-unknown-unknown
+    cargo clippy -p crux --no-default-features --target wasm32-unknown-unknown -- -D warnings
+    cd crucible-desktop && cargo clippy --lib --locked --target wasm32-unknown-unknown -- -D warnings
+
+# Build the desktop app for the browser (dev profile) and serve it on http://localhost:8765,
+# forwarding /api to the controller in crux's config with crux's key. Read-only unless
+# `just desktop-web --write`. Needs the wasm-bindgen CLI at the version in
+# crucible-desktop/Cargo.lock.
+desktop-web *args:
+    sh crucible-desktop/rune-patches.sh
+    rustup target add wasm32-unknown-unknown
+    cd crucible-desktop && CARGO="$(command -v cargo)" bash ../vendor/rune/scripts/web-build.sh crucible-playbooks --dev --out target/web
+    python3 crucible-desktop/web-dev-proxy.py --dir crucible-desktop/target/web {{ args }}
+
+# Build the desktop app for the browser into crucible-controller/next-dist, which the controller
+# serves under /next. Release profile unless `just controller-next --dev`.
+controller-next *args:
+    sh crucible-desktop/rune-patches.sh
+    rustup target add wasm32-unknown-unknown
+    cd crucible-desktop && CARGO="$(command -v cargo)" bash ../vendor/rune/scripts/web-build.sh crucible-playbooks --no-html --out ../crucible-controller/next-dist {{ args }}
+
+# Run a command in the Fedora builder (crucible-desktop/linux/Containerfile) with the repo at /src,
+# for the host's architecture. Cargo's registry and target directory persist in podman volumes.
+[private]
+desktop-fedora *cmd:
+    podman build -q -t crucible-desktop-fedora crucible-desktop/linux
+    podman run --rm -v "$PWD":/src:Z -v crucible-desktop-cargo:/opt/cargo/registry \
+        -v crucible-desktop-target:/target -e CARGO_TARGET_DIR=/target -e SQLX_OFFLINE=true \
+        -e VERSION -w /src crucible-desktop-fedora sh -euc '{{ cmd }}'
+
+# Lint and test the desktop app on Fedora, in a container.
+desktop-linux-check:
+    just desktop-fedora 'sh crucible-desktop/rune-patches.sh && cargo build --locked -p crucible-lsp \
+        && cd crucible-desktop && cargo clippy --all-targets --all-features --locked -- -D warnings \
+        && CRUCIBLE_LSP=/target/debug/crucible-lsp dbus-run-session -- cargo test --locked'
+
+# Install the newest RPM `desktop-linux` built into a Fedora 45 GNOME VM (Lima, crucible-desktop/linux/lima.yaml)
+# and open the app in its window. The first run installs GNOME, which takes a while.
+desktop-linux-vm:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir="$PWD/crucible-desktop/target/linux"
+    rpm=$(ls -t "$dir"/*.rpm 2>/dev/null | head -1)
+    [ -n "$rpm" ] || { echo "no RPM in $dir: run just desktop-linux first" >&2; exit 1; }
+    if ! limactl list -q | grep -qx crucible-fedora; then
+        limactl create -y --name crucible-fedora --mount-only "$dir" crucible-desktop/linux/lima.yaml
+    fi
+    limactl start -y crucible-fedora 2>/dev/null || true
+    limactl shell crucible-fedora sh -euc "
+        if rpm -q crucible-playbooks >/dev/null; then sudo dnf -y reinstall '$rpm'; else sudo dnf -y install '$rpm'; fi
+        uid=\$(id -u)
+        until [ -S /run/user/\$uid/wayland-0 ]; do sleep 1; done
+        export XDG_RUNTIME_DIR=/run/user/\$uid WAYLAND_DISPLAY=wayland-0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus
+        pkill -x crucible-playbo || true
+        setsid crucible-playbooks >/tmp/crucible-playbooks.log 2>&1 < /dev/null &
+    "
+    echo "running in the crucible-fedora window; log: limactl shell crucible-fedora cat /tmp/crucible-playbooks.log"
+
+# Build the desktop app's Fedora RPM, in a container, into crucible-desktop/target/linux.
+desktop-linux version="0.0.0":
+    VERSION={{ version }} just desktop-fedora 'sh crucible-desktop/rune-patches.sh \
+        && cargo build --release --locked -p crucible-lsp \
+        && (cd crucible-desktop && cargo build --release --locked) \
+        && sh crucible-desktop/linux-bundle.sh'
 
 # Prepare a cluster for the gateway isolation e2e (crucible-controller/tests/kueue_gateway_e2e.rs): the
 # profile's loop and sandbox namespaces, its pull secret copied from `pull_from`, the loop and

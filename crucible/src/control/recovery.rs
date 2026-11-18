@@ -941,6 +941,7 @@ mod tests {
                     emits_files: Vec::new(),
                     history_depth: 0,
                     definition: String::new(),
+                    command: String::new(),
                     optional: Vec::new(),
                 },
                 PlanTaskWire {
@@ -963,6 +964,7 @@ mod tests {
                     emits_files: Vec::new(),
                     history_depth: 0,
                     definition: String::new(),
+                    command: String::new(),
                     optional: Vec::new(),
                 },
             ],

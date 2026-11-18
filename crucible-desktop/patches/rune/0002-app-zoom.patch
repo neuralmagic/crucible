@@ -1,93 +1,93 @@
 diff --git a/crates/rune/src/lib.rs b/crates/rune/src/lib.rs
-index 753542a..7c20ebc 100644
+index b2ec8f2d..ce3c40f6 100644
 --- a/crates/rune/src/lib.rs
 +++ b/crates/rune/src/lib.rs
-@@ -57,6 +57,7 @@ pub mod tok;
+@@ -59,6 +59,7 @@ pub mod time;
+ pub mod tok;
  pub mod tooling;
  pub mod tray;
- pub mod windows;
 +pub mod zoom;
  
- /// AccessKit's types, for [`Runtime::accessibility_tree`] and [`Runtime::accessibility_action`].
- pub use a11y::AccessibilityLink;
-diff --git a/crates/rune/src/window.rs b/crates/rune/src/window.rs
-index c942850..8d1d732 100644
---- a/crates/rune/src/window.rs
-+++ b/crates/rune/src/window.rs
-@@ -873,7 +873,7 @@ impl<S: 'static> Host<S> {
-         let alpha = (self.options.transparent && config.alpha_mode == wgpu::CompositeAlphaMode::PostMultiplied
-             && gpu.adapter.get_info().backend != wgpu::Backend::Metal)
-             .then(|| crate::render::surface_alpha::AlphaSurface::new(&gpu.device, target_format, (config.width, config.height)));
+ pub(crate) use image::pixels;
+ pub(crate) use input::cursor;
+diff --git a/crates/rune/src/window/create.rs b/crates/rune/src/window/create.rs
+index 794b23dc..8b8fc111 100644
+--- a/crates/rune/src/window/create.rs
++++ b/crates/rune/src/window/create.rs
+@@ -167,7 +167,7 @@ impl<S: 'static> Host<S> {
+         // Metal's PostMultiplied mode only makes CAMetalLayer non-opaque; Core Animation
+         // still composites premultiplied pixels. Other backends follow wgpu's straight-alpha contract.
+         let alpha = alpha_pass(gpu, self.options.transparent, &config, target_format);
 -        let scale = window.scale_factor() as f32;
 +        let scale = crate::zoom::content_scale(&window);
          self.rt.set_system_dark(crate::platform::preferences::window_dark(&window, self.args.theme.as_deref()));
          self.rt.set_viewport((phys.width as f32 / scale, phys.height as f32 / scale), scale);
          if (self.shown || launcher) && !built {
-@@ -956,7 +956,7 @@ impl<S: 'static> Host<S> {
+@@ -254,7 +254,7 @@ impl<S: 'static> Host<S> {
              #[cfg(target_os = "macos")]
              if let Some(pacing) = &mut w.native.pacing { pacing.update_display(&w.window); }
              let size = w.window.inner_size();
 -            let scale = w.window.scale_factor() as f32;
 +            let scale = crate::zoom::content_scale(&w.window);
              if size.width > 0 && size.height > 0 {
-                 w.resize_surface(&gpu.device, size);
+                 w.resize_surface(gpu, size);
                  self.rt.set_viewport((size.width as f32 / scale, size.height as f32 / scale), scale);
 diff --git a/crates/rune/src/window/events.rs b/crates/rune/src/window/events.rs
-index 7487961..8990e2e 100644
+index baf4d192..3272f8a9 100644
 --- a/crates/rune/src/window/events.rs
 +++ b/crates/rune/src/window/events.rs
-@@ -214,6 +214,13 @@ impl<S: 'static> Host<S> {
-                 if let Some(l) = self.win.as_ref().filter(|l| l.native.full_screen.take()) {
-                     self.rt.set_titlebar_inset(place_chrome(&l.window, self.chrome));
-                 }
-+                if let Some(l) = self.win.as_ref() {
-+                    let size = l.window.inner_size();
-+                    let scale = crate::zoom::content_scale(&l.window);
-+                    if size.width > 0 && size.height > 0 {
-+                        self.rt.set_viewport((size.width as f32 / scale, size.height as f32 / scale), scale);
-+                    }
-+                }
-                 self.redraw();
-                 self.shell(event_loop);
-                 return;
-@@ -230,7 +237,7 @@ impl<S: 'static> Host<S> {
+@@ -235,7 +235,7 @@ impl<S: 'static> Host<S> {
          if matches!(event, WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. }) { self.sync_origin(); }
          let (Some(l), Some((gpu, ..))) = (self.win.as_mut(), self.gpu.as_ref()) else { return };
          let rt = &mut self.rt;
 -        let scale = l.window.scale_factor() as f32;
 +        let scale = crate::zoom::content_scale(&l.window);
-         let chrome = self.chrome;
+         let (chrome, titlebar) = (self.chrome, self.titlebar);
          // A finger presses through `WindowEvent::Touch`; the mouse events a system makes up
          // from it (Windows promotes touches) would press a second time.
+@@ -557,6 +557,13 @@ impl<S: 'static> Host<S> {
+         if let Some(l) = self.win.as_ref().filter(|l| l.native.full_screen.take()) {
+             sync_chrome(&mut self.rt, l, self.chrome, self.titlebar);
+         }
++        if let Some(l) = self.win.as_ref() {
++            let size = l.window.inner_size();
++            let scale = crate::zoom::content_scale(&l.window);
++            if size.width > 0 && size.height > 0 {
++                self.rt.set_viewport((size.width as f32 / scale, size.height as f32 / scale), scale);
++            }
++        }
+         // The window procedure asks for this paint when a caption button's hover or
+         // press changes.
+         #[cfg(target_os = "windows")]
 diff --git a/crates/rune/src/window/lifecycle.rs b/crates/rune/src/window/lifecycle.rs
-index b3b884b..7a2bcd9 100644
+index fdb4467a..6dbc5076 100644
 --- a/crates/rune/src/window/lifecycle.rs
 +++ b/crates/rune/src/window/lifecycle.rs
-@@ -64,7 +64,7 @@ impl<S: 'static> Host<S> {
+@@ -149,7 +149,7 @@ impl<S: 'static> Host<S> {
          if let (Some(w), Some((gpu, ..))) = (self.win.as_mut(), self.gpu.as_ref()) {
              let size = w.window.inner_size();
-             w.resize_surface(&gpu.device, size);
+             w.resize_surface(gpu, size);
 -            let scale = w.window.scale_factor() as f32;
 +            let scale = crate::zoom::content_scale(&w.window);
              self.rt.set_viewport((size.width as f32 / scale, size.height as f32 / scale), scale);
          }
          true
 diff --git a/crates/rune/src/window/stepping.rs b/crates/rune/src/window/stepping.rs
-index 20eacd0..c32ea06 100644
+index 4ed18063..2ea858da 100644
 --- a/crates/rune/src/window/stepping.rs
 +++ b/crates/rune/src/window/stepping.rs
 @@ -190,7 +190,7 @@ impl<S: 'static> Host<S> {
-             self.rt.set_titlebar_inset(place_chrome(&w.window, self.chrome));
+             sync_chrome(&mut self.rt, w, self.chrome, self.titlebar);
              let size = w.window.inner_size();
-             w.resize_surface(&gpu.device, size);
+             w.resize_surface(gpu, size);
 -            let scale = w.window.scale_factor() as f32;
 +            let scale = crate::zoom::content_scale(&w.window);
              self.rt.step_viewport((size.width as f32 / scale, size.height as f32 / scale), scale);
              // In this frame's layout, not the next one when `Moved` arrives.
-             if let Some(origin) = screen_origin(&w.window) {
+             sync_screen_origin(&mut self.rt, &w.window);
 diff --git a/crates/rune/src/zoom.rs b/crates/rune/src/zoom.rs
 new file mode 100644
-index 0000000..fa372d4
+index 00000000..fa372d49
 --- /dev/null
 +++ b/crates/rune/src/zoom.rs
 @@ -0,0 +1,43 @@

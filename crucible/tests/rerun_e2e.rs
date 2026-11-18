@@ -299,3 +299,114 @@ workflow(type = "playbook", tasks = [make, check])
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn git(dir: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "user.name=c",
+            "-c",
+            "user.email=c@l",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(out.status.success(), "git {args:?}: {}", describe(&out));
+}
+
+/// An origin that serves partial clones: `main`, and a `release` branch holding a file `main`
+/// does not.
+fn partial_clone_origin(dir: &Path) -> PathBuf {
+    let origin = dir.join("origin");
+    std::fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "-q", "-b", "main"]);
+    std::fs::write(origin.join("a.txt"), "main\n").unwrap();
+    git(&origin, &["add", "-A"]);
+    git(&origin, &["commit", "-q", "-m", "main"]);
+    git(&origin, &["checkout", "-q", "-b", "release"]);
+    std::fs::write(origin.join("release.txt"), "only on release\n").unwrap();
+    git(&origin, &["add", "-A"]);
+    git(&origin, &["commit", "-q", "-m", "release"]);
+    git(&origin, &["checkout", "-q", "main"]);
+    git(&origin, &["config", "uploadpack.allowFilter", "true"]);
+    git(
+        &origin,
+        &["config", "uploadpack.allowAnySHA1InWant", "true"],
+    );
+    origin
+}
+
+/// A blobless clone holds file contents only once something fetches them. A reused task fetched
+/// some in the parent, origin has moved on since, and the task that runs again reads them where
+/// origin is out of reach, as in a sandbox.
+#[test]
+fn a_rerun_holds_the_file_contents_its_reused_tasks_fetched() {
+    let dir = pack("fetched");
+    let origin = partial_clone_origin(&dir);
+    std::fs::write(
+        dir.join("crucible.toml"),
+        format!(
+            r#"
+[repo]
+url = "file://{}"
+filter = "blob:none"
+[workspace]
+dir = "workspace"
+[agent]
+backend = "command"
+agent_cmd = "true"
+goal = "rerun a task that reads what an earlier one fetched"
+[workflow]
+type = "playbook"
+file = "workflow.star"
+"#,
+            origin.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("workflow.star"),
+        r#"
+warm = command(
+    name = "warm",
+    run = "echo warm >> ../ran.log && git cat-file -p origin/release:release.txt > /dev/null && printf '{}\n'",
+)
+check = command(name = "check", run = "echo check >> ../ran.log && exit 1", depends_on = [warm])
+workflow(type = "playbook", tasks = [warm, check])
+"#,
+    )
+    .unwrap();
+
+    let first = run(&dir, "crucible-run-parent", &[]);
+    assert!(!first.status.success(), "{}", describe(&first));
+    assert_eq!(ran(&dir), ["warm", "check"]);
+
+    keep_parent(&dir);
+    edit_workflow(
+        &dir,
+        r#"run = "echo check >> ../ran.log && exit 1","#,
+        r#"run = "echo check >> ../ran.log && cat a.txt > ../base.log && git -c url./nonexistent/.insteadOf=file:// cat-file -p origin/release:release.txt > ../seen.log && printf '{}\n'","#,
+    );
+    std::fs::remove_dir_all(dir.join("workspace")).unwrap();
+    std::fs::write(origin.join("a.txt"), "moved on\n").unwrap();
+    git(&origin, &["commit", "-q", "-a", "-m", "moved on"]);
+
+    let rerun = run(&dir, "crucible-run-child", RERUN_CHECK);
+    assert!(rerun.status.success(), "{}", describe(&rerun));
+    assert_eq!(&ran(&dir)[2..], ["check"], "warm is not dispatched again");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("seen.log")).unwrap(),
+        "only on release\n",
+        "what the reused task fetched is in the rerun's workspace"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("base.log")).unwrap(),
+        "main\n",
+        "the rerun starts from the parent's commit, not origin's newer one"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

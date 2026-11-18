@@ -41,6 +41,8 @@ pub struct Finding {
     pub message: String,
     /// Renders faded: the code it covers can be deleted.
     pub unnecessary: bool,
+    /// Renders struck through: the code it covers has a replacement.
+    pub deprecated: bool,
 }
 
 impl Finding {
@@ -68,7 +70,16 @@ impl Finding {
                 .to_owned(),
             ),
             message: self.message.clone(),
-            tags: self.unnecessary.then(|| vec![DiagnosticTag::UNNECESSARY]),
+            tags: Some(
+                [
+                    (self.unnecessary, DiagnosticTag::UNNECESSARY),
+                    (self.deprecated, DiagnosticTag::DEPRECATED),
+                ]
+                .into_iter()
+                .filter_map(|(set, tag)| set.then_some(tag))
+                .collect::<Vec<_>>(),
+            )
+            .filter(|tags| !tags.is_empty()),
             ..Diagnostic::default()
         }
     }
@@ -88,6 +99,7 @@ pub fn parse(source: &str, path: &Path) -> Result<AstModule, Finding> {
             origin: Origin::Compiler,
             message: error.without_diagnostic().to_string(),
             unnecessary: false,
+            deprecated: false,
         }
     })
 }
@@ -159,6 +171,7 @@ fn compile_finding(error: &CompileError, anchor: Option<&SourceAnchor>) -> Findi
         origin: Origin::Compiler,
         message: message(error),
         unnecessary: false,
+        deprecated: false,
     }
 }
 

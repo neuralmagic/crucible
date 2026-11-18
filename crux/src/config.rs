@@ -129,7 +129,6 @@ impl FileConfig {
     /// holds a key. The file is replaced whole, through a sibling written first.
     pub fn save(&self, path: Option<&Path>) -> Result<PathBuf> {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
 
         let path = match path {
             Some(p) => p.to_path_buf(),
@@ -139,11 +138,14 @@ impl FileConfig {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         let text = toml::to_string(self).context("encoding the config")?;
         let staged = path.with_extension("toml.new");
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
             .open(&staged)
             .with_context(|| format!("writing {}", staged.display()))?;
         file.write_all(text.as_bytes())

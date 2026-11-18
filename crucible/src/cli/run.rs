@@ -486,7 +486,7 @@ mod tests {
     #[test]
     fn a_model_less_run_takes_the_resolved_harness_default() {
         let a = args_from(&["crucible", "--harness", "codex"]);
-        assert_eq!(a.model(), crate::manifest::Harness::Codex.default_model());
+        assert_eq!(a.model(), crate::knobs::Harness::Codex.default_model());
     }
 
     /// Without a manifest there is no `[agent]` table to replace, so the flags are refused rather

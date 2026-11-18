@@ -162,13 +162,15 @@ times would otherwise print twelve copies of the same verdict. `(any)` means the
 *one* dependency passes, so a red dependency above it is not necessarily what is blocking it.
 `--mermaid` emits a flowchart.
 
-### Drafts: `draft-create` / `draft-pull` / `draft-push` / `draft-preview` / `draft-launch` / `draft-graduate` / `draft-rename` / `draft-clone` / `draft-delete`
+### Drafts: `draft-create` / `draft-pull` / `draft-push` / `draft-preview` / `draft-log` / `draft-diff` / `draft-launch` / `draft-graduate` / `draft-rename` / `draft-clone` / `draft-delete`
 
 ```
 $ crux draft-create calibrate --description "EPP calibration sweep"   # version 1, a skeleton
 $ crux draft-pull calibrate ./calibrate                               # write the pack into a dir
 $ crux draft-push calibrate ./calibrate --base-version 1              # save the dir as version 2
 $ crux draft-preview calibrate                                        # compile: digest + diagnostics
+$ crux draft-log calibrate                                            # every save and the files it changed
+$ crux draft-diff calibrate --from 2 --to 7                           # unified diff between two saves
 $ crux draft-launch calibrate --params '{"repo":"o/n"}' --max-cost 4 --max-time 30m
 $ crux draft-graduate calibrate --repo wren/packs --path packs/calibrate
 $ crux draft-rename calibrate epp-sweep                                # bindings and runs follow
@@ -180,6 +182,11 @@ the refusal naming the version that landed since, not as an error: re-pull, merg
 Pull and push read the directory the way the controller does: `state/`, `workspace/` and `.git`
 are skipped and listed as `ignored`, a symlink is refused, and `local tree:` prints the
 directory's `tree1:` digest.
+`draft-log` lists the saves newest first with who saved each, whether it compiled, and the files
+it added (`A`), modified (`M`) or removed (`D`). `draft-diff` with no versions is the newest save
+against the one before it; `--from` and `--to` take any two versions in either order, and `--stat`
+prints the per-file line counts without the diff text. To find the save that broke a pack, diff a
+good version against a bad one and keep halving the range.
 A rename moves the draft's saves, secret bindings, shares, schedules and launches to the new id. A
 clone copies only the bindings you could make yourself and lists the rest; a reference-mode secret
 needs your Vault token, which `crux` never sends, so bind those from the UI.
@@ -202,11 +209,16 @@ never sends, so it stays a placeholder.
 ### `providers`
 
 ```
-$ crux providers                                 # id, kind, model, harness, price, enabled, owner
+$ crux providers                                 # id, kind, model, harness, price, limits, enabled, owner
 ```
 
 `PRICE` is USD per million tokens as `input/output/cache read/cache write`. A dash means the
 engine prices the run from the vendor's list, which charges nothing for a model no vendor sells.
+
+`LIMITS` is the default model's `context window/max output` in tokens. A dash means the
+registration names none for that model and the harness uses its own. Set them per model in the
+JSON body `provider-create` and `provider-update` take:
+`"model_limits": {"<model>": {"context_window": 200000, "max_output_tokens": 64000}}`.
 
 ### `secrets` / `secret-bind`
 

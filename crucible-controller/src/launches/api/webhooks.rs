@@ -464,6 +464,7 @@ async fn authorize_webhook(
     match (verifier, params) {
         (Some(verifier), Some(params)) if refused.is_empty() => Ok(AuthorizedWebhook {
             launch: AuthorizedLaunch {
+                choice_snapshots: serde_json::json!({}),
                 pack,
                 params,
                 max_cost: body.max_cost,

@@ -78,10 +78,14 @@ pub struct GraphNodeDto {
     /// Set when this task is mapped over a producer's field.
     pub fanout: Option<FanOutDto>,
     /// `producer.field` references each instance receives narrowed to its own entry.
+    #[serde(default)]
+    #[schema(required = true)]
     pub keyed: Vec<String>,
     /// Set when the task runs only on some answers of a route.
     pub when: Option<WhenDto>,
     /// A route's question ids; empty for any other task.
+    #[serde(default)]
+    #[schema(required = true)]
     pub questions: Vec<String>,
     /// The conversation an agent turn belongs to; null when the turn stands alone.
     pub session: Option<String>,
@@ -107,8 +111,12 @@ pub struct GraphEdgeDto {
     /// The consumer's `when`, on the edge from the route it names.
     pub when: Option<WhenDto>,
     /// Both ends map over the same `producer.field`: instance k reads the producer's instance k.
+    #[serde(default)]
+    #[schema(required = true)]
     pub aligned: bool,
     /// The producer's fields the consumer narrows to each instance's entry.
+    #[serde(default)]
+    #[schema(required = true)]
     pub keyed: Vec<String>,
 }
 
@@ -526,6 +534,59 @@ mod tests {
 
         let fold = edge("fix", "roll");
         assert!(!fold.aligned, "an unmapped consumer reads the fold");
+    }
+
+    #[test]
+    fn a_graph_stored_before_routes_decodes_with_defaults() {
+        let stored = serde_json::json!({
+            "workflow_type": "playbook",
+            "result": "b",
+            "nodes": [
+                {"name": "a", "kind": "command", "required": true, "needs": "any", "join": "all",
+                 "isolation": null, "emits": ["idea"], "emits_files": [], "fanout": null,
+                 "session": null, "harness": null, "model": null, "effort": null,
+                 "prompt": null, "command": "true"},
+                {"name": "b", "kind": "agent", "required": false, "needs": "all", "join": "passed",
+                 "isolation": "worktree", "emits": [], "emits_files": ["out.json"],
+                 "fanout": {"over_task": "a", "over_field": "idea", "max_fanout": 2},
+                 "session": "scribe", "harness": "claude", "model": "opus", "effort": "high",
+                 "prompt": "go", "command": null}
+            ],
+            "edges": [{"from": "a", "to": "b", "join": "passed", "required": false}]
+        });
+        let graph: WorkflowGraphDto = serde_json::from_value(stored).expect("decodes");
+
+        for name in ["a", "b"] {
+            let node = node(&graph, name);
+            assert!(node.keyed.is_empty(), "{name}: keyed defaults to empty");
+            assert!(
+                node.questions.is_empty(),
+                "{name}: questions default to empty"
+            );
+            assert_eq!(node.when, None, "{name}: when defaults to none");
+        }
+        assert_eq!(
+            graph.edges,
+            [GraphEdgeDto {
+                from: "a".into(),
+                to: "b".into(),
+                join: Join::Passed,
+                required: false,
+                when: None,
+                aligned: false,
+                keyed: Vec::new(),
+            }]
+        );
+        let b = node(&graph, "b");
+        assert_eq!(b.session.as_deref(), Some("scribe"));
+        assert_eq!(b.emits_files, ["out.json"]);
+        assert_eq!(b.fanout.as_ref().and_then(|f| f.max_fanout), Some(2));
+
+        let reencoded = serde_json::to_value(&graph).expect("encodes");
+        assert_eq!(reencoded["edges"][0]["aligned"], false);
+        assert_eq!(reencoded["edges"][0]["keyed"], serde_json::json!([]));
+        assert_eq!(reencoded["nodes"][0]["questions"], serde_json::json!([]));
+        assert_eq!(reencoded["nodes"][0]["keyed"], serde_json::json!([]));
     }
 
     #[test]

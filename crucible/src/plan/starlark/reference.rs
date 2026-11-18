@@ -10,7 +10,7 @@ use crate::plan::ir::KEPT_INPUT;
 use crate::plan::ir::{HISTORY_INPUT, ITEM_INPUT, OUTCOME_INPUT, PARAMS_INPUT, REVISION_INPUT};
 use crate::plan::ir::{MAX_FANOUT_CEILING, MAX_REPAIR_CEILING, MAX_ROUNDS_CEILING};
 use crate::plan::workflow::WorkflowType;
-use crucible_contract::decision::{MAX_DYNAMIC_OPTIONS, UNCERTAIN};
+use crucible_contract::decision::MAX_DYNAMIC_OPTIONS;
 use crucible_contract::history::MAX_HISTORY_DEPTH;
 
 /// Which lanes see a constructor.
@@ -38,6 +38,8 @@ pub struct Kwarg {
     pub name: &'static str,
     pub ty: &'static str,
     pub purpose: String,
+    /// What to write instead of a deprecated argument.
+    pub replaced_by: Option<&'static str>,
 }
 
 impl Kwarg {
@@ -46,6 +48,16 @@ impl Kwarg {
             name,
             ty,
             purpose: purpose.into(),
+            replaced_by: None,
+        }
+    }
+
+    fn deprecated(name: &'static str, ty: &'static str, replaced_by: &'static str) -> Self {
+        Kwarg {
+            name,
+            ty,
+            purpose: format!("Deprecated. Write `{replaced_by}`."),
+            replaced_by: Some(replaced_by),
         }
     }
 }
@@ -64,8 +76,9 @@ fn task_knobs() -> Vec<Kwarg> {
     vec![
         Kwarg::new(
             "depends_on",
-            "list[task | optional(task)]",
-            "Dependencies. Readiness decides execution order; declaration order does not.",
+            "list[task | optional(task) | others()]",
+            "Dependencies. Readiness decides execution order; declaration order does not. A task \
+             named by `over`, `keyed`, or `when` is a dependency without being listed.",
         ),
         Kwarg::new(
             "needs",
@@ -100,7 +113,7 @@ fn task_knobs() -> Vec<Kwarg> {
              `\"list\"`, `\"object\"`, `\"link\"`, `\"links\"`, or a list of labels the value is \
              one of. A passing output missing a field, or holding one of the wrong type, fails \
              the task. Types are checked where the graph reads them: `over` needs a list, a \
-             `top_k` or grade score a number, and a `route(source = ...)` question labels it can \
+             `top_k` or grade score a number, and a `route(decider = output(...))` question labels it can \
              answer. A `link` is one http(s) url and `links` a list of them, each naming a result \
              the task produced outside the run (a pull request, a pushed branch, an issue), \
              which the run and task views then link out to. A `schema_file(...)` promises a value \
@@ -122,33 +135,20 @@ fn task_knobs() -> Vec<Kwarg> {
         ),
         Kwarg::new(
             "over",
-            "producer.field",
-            "Map the task over a dependency's emitted list, one instance per item.",
+            "each(producer.field, max = N)",
+            "Map the task over a task's emitted list, one instance per item, up to `max`.",
         ),
-        Kwarg::new(
-            "max_fanout",
-            "int",
-            format!(
-                "Instance cap for `over`, within the engine's ceiling of {MAX_FANOUT_CEILING}."
-            ),
-        ),
+        max_fanout_kwarg(),
         keyed_kwarg(),
         Kwarg::new(
             "revise",
-            "task | list[task]",
+            "send_back(tasks, rounds = N)",
             "The tasks this task sends back when it settles failing. They run again, in dependency \
              order, with the verdict under `revision`, then this task does, until this task stops \
-             failing or `max_rounds` is spent. Every task on a path between them and this task must \
-             be listed. Playbooks only; not with `over`.",
+             failing or the rounds are spent. Every task on a path between them and this task is \
+             sent back with them. Playbooks only; not with `over`.",
         ),
-        Kwarg::new(
-            "max_rounds",
-            "int",
-            format!(
-                "Round cap for `revise`, counting the first, from 2 to the engine's ceiling of \
-                 {MAX_ROUNDS_CEILING}."
-            ),
-        ),
+        Kwarg::deprecated("max_rounds", "int", "revise = send_back(tasks, rounds = N)"),
         Kwarg::new(
             "timeout",
             "str",
@@ -177,6 +177,10 @@ fn task_knobs() -> Vec<Kwarg> {
     ]
 }
 
+fn max_fanout_kwarg() -> Kwarg {
+    Kwarg::deprecated("max_fanout", "int", "over = each(producer.field, max = N)")
+}
+
 fn keyed_kwarg() -> Kwarg {
     Kwarg::new(
         "keyed",
@@ -189,38 +193,28 @@ fn keyed_kwarg() -> Kwarg {
 fn when_kwarg() -> Kwarg {
     Kwarg::new(
         "when",
-        "route.question",
-        "Run only on a listed answer to one question of a `route()` this task depends on. \
-         Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, \
-         and every `all`-join dependent is not taken with it unless it lists the task as \
-         `optional(...)`. Rejoin branches with `join = \"passed\"` or `join = \"settled\"`. \
-         Playbook and custom workflows only.",
+        "question.any_of(...) | question.otherwise() | question",
+        "Run only on some answers to one question. A question is one a `route()` asks, named \
+         `gate.<id>`, or a field a task emits typed `\"boolean\"` or as a list of labels, named \
+         `task.<field>`; a field needs no route, and answers no `when` reads lead nowhere. \
+         `.any_of(\"a\", \"b\")` lists the answers: labels the question declares, or \
+         `\"uncertain\"`. `.otherwise()` is every answer no other task lists and the question \
+         does not `drop`, `\"uncertain\"` included; it is expanded at compile time, an \
+         unreachable one is an error, and on a choice whose options come from a field it also \
+         stands for every option the choice resolves to and is the only way to route them. A \
+         bare yes/no question means `\"yes\"`. Otherwise the task settles `not_taken`: no \
+         dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken \
+         with it unless it lists the task as `optional(...)`. Rejoin branches with \
+         `join = \"passed\"` or `join = \"settled\"`. Playbook and custom workflows only.",
     )
 }
 
 fn otherwise_kwarg() -> Kwarg {
-    Kwarg::new(
-        "otherwise",
-        "bool",
-        format!(
-            "In place of `answers`: every answer no other task lists and the question does not \
-             `drop`, `\"{UNCERTAIN}\"` included. Expanded at compile time. An unreachable \
-             `otherwise` is an error. On a choice whose options come from a field, it also \
-             stands for every option the choice resolves to, and is the only way to route them."
-        ),
-    )
+    Kwarg::deprecated("otherwise", "bool", "when = question.otherwise()")
 }
 
 fn answers_kwarg() -> Kwarg {
-    Kwarg::new(
-        "answers",
-        "str | list[str]",
-        format!(
-            "The answers `when` accepts: labels the question declares, or `\"{UNCERTAIN}\"`. \
-             Defaults to `\"yes\"` for a noul and is required for a choice or a score. A choice \
-             whose options come from a field declares none, so only `\"{UNCERTAIN}\"`."
-        ),
-    )
+    Kwarg::deprecated("answers", "str | list[str]", "when = question.any_of(...)")
 }
 
 /// Agent knobs shared by `agent()` and `skill()`.
@@ -330,18 +324,96 @@ pub fn functions() -> Vec<Function> {
                     Kwarg::new("run", "str", "The command, run through `sh -c`."),
                     Kwarg::new(
                         "threshold",
-                        "number",
+                        "at_least(n) | at_most(n)",
                         "Grade the emitted score against this bound. `pass = false` fails a score \
                          within it; `pass` cannot pass a score outside it.",
                     ),
-                    Kwarg::new(
+                    Kwarg::deprecated(
                         "direction",
                         "\"lower\" | \"higher\"",
-                        "Which side of the threshold passes.",
+                        "threshold = at_least(n) or at_most(n)",
                     ),
                 ],
                 task_knobs(),
             ),
+        },
+        Function {
+            name: "each",
+            lane: Lane::Common,
+            purpose: "A fan-out for `over`: the list to map over and how wide it may get.",
+            positional: Some("list"),
+            kwargs: vec![
+                Kwarg::new(
+                    "list",
+                    "producer.field",
+                    "A list field a dependency emits; each item is one instance's key.",
+                ),
+                Kwarg::new(
+                    "max",
+                    "int",
+                    format!(
+                        "Instance cap, within the engine's ceiling of {MAX_FANOUT_CEILING}. A \
+                         longer list fails the task."
+                    ),
+                ),
+            ],
+        },
+        Function {
+            name: "others",
+            lane: Lane::Common,
+            purpose: "An entry of `depends_on` that stands for every main-graph task no \
+                      `others()` task feeds. With `join = \"settled\"` the task reads how each of \
+                      them settled. Not in the epilogue, where `outcome` already carries that.",
+            positional: None,
+            kwargs: Vec::new(),
+        },
+        Function {
+            name: "task_defaults",
+            lane: Lane::Common,
+            purpose: "Defaults for `workflow(defaults = ...)`.",
+            positional: None,
+            kwargs: vec![Kwarg::new(
+                "required",
+                "bool",
+                "False makes every task advisory unless it sets `required = True`.",
+            )],
+        },
+        Function {
+            name: "send_back",
+            lane: Lane::Common,
+            purpose: "A bounded send-back for `revise`: the tasks a failing reviewer runs again \
+                      and how many rounds the loop may take.",
+            positional: Some("tasks"),
+            kwargs: vec![
+                Kwarg::new(
+                    "tasks",
+                    "task | list[task]",
+                    "Where the send-back starts. Every task between these and the reviewer \
+                     runs again with them.",
+                ),
+                Kwarg::new(
+                    "rounds",
+                    "int",
+                    format!(
+                        "Round cap, counting the first, from 2 to the engine's ceiling of \
+                         {MAX_ROUNDS_CEILING}."
+                    ),
+                ),
+            ],
+        },
+        Function {
+            name: "at_least",
+            lane: Lane::Common,
+            purpose: "A bound for `evaluate(threshold = ...)` that a score at or above passes.",
+            positional: Some("bound"),
+            kwargs: vec![Kwarg::new("bound", "number", "The bound.")],
+        },
+        Function {
+            name: "at_most",
+            lane: Lane::Common,
+            purpose: "A bound for `evaluate(threshold = ...)` that a score at or below passes.",
+            positional: Some("bound"),
+            kwargs: vec![Kwarg::new("bound", "number", "The bound.")],
         },
         Function {
             name: "report",
@@ -445,6 +517,12 @@ pub fn functions() -> Vec<Function> {
                     "The lane, which decides which constructors exist.",
                 ),
                 Kwarg::new("tasks", "list[task]", "Every task that ships."),
+                Kwarg::new(
+                    "defaults",
+                    "task_defaults(...)",
+                    "What each agent, skill, command, evaluate, and route task takes for an \
+                     argument it does not set.",
+                ),
                 Kwarg::new(
                     "result",
                     "task",
@@ -569,64 +647,28 @@ pub fn functions() -> Vec<Function> {
                      for `when`.",
                 ),
                 Kwarg::new(
+                    "decider",
+                    "model(...) | human(...) | output(task)",
+                    "What answers the questions: a decision model, a person, or a dependency's \
+                     output.",
+                ),
+                Kwarg::deprecated(
                     "min_confidence",
                     "number",
-                    "A decision model answers, through the broker's `decision` capability. An \
-                     answer whose probability is below this, in (0, 1], is recorded as \
-                     `\"uncertain\"`. Exactly one of `min_confidence` and `source`.",
+                    "decider = model(min_confidence = N)",
                 ),
-                Kwarg::new(
-                    "source",
-                    "task",
-                    "A dependency's output answers instead: it emits one declared label (or a \
-                     boolean, for a noul) under each question id. Deterministic, free, and \
-                     needs no capability. Any other value fails the route. When the dependency \
-                     types its emits, each question's field must be typed with labels the \
-                     question answers, or `\"boolean\"` for a noul.",
-                ),
-                Kwarg::new(
-                    "human",
-                    "bool",
-                    "True: a person allowed to approve the run answers, from the controller \
-                     UI, after seeing the dependencies' declared outputs and files. Needs the \
-                     `human` capability. Tasks that do not depend on the route keep running \
-                     while it waits.",
-                ),
-                Kwarg::new(
-                    "review",
-                    "path",
-                    "With `human`: a Markdown template in the pack, rendered over the evidence \
-                     (`inputs`, `run`, `gated`) and shown above it. Every inserted value is \
-                     escaped.",
-                ),
-                Kwarg::new(
-                    "timeout",
-                    "duration",
-                    "With `human`: how long the request stays open, from when it opens; the \
-                     run's wall-clock ceiling by default. An unanswered request records every \
-                     question as `\"uncertain\"`.",
-                ),
-                Kwarg::new(
-                    "files",
-                    "list[str]",
-                    "Declared JSON files of dependencies the model reads, under `files` in its \
-                     state, by dependency and path. Each must be declared by a dependency with a \
-                     `schema_file(...)`. Not with `source`.",
-                ),
+                Kwarg::deprecated("source", "task", "decider = output(task)"),
+                Kwarg::deprecated("human", "bool", "decider = human()"),
+                Kwarg::deprecated("review", "path", "decider = human(review = path)"),
+                Kwarg::deprecated("timeout", "duration", "decider = human(timeout = duration)"),
+                Kwarg::deprecated("files", "list[str]", "decider = model(files = [...])"),
                 Kwarg::new(
                     "over",
-                    "producer.field",
+                    "each(producer.field, max = N)",
                     "Decide once per item. A task mapped over the same list reads each item's \
                      answer with `when`; one mapped over another list, or not mapped, cannot.",
                 ),
-                Kwarg::new(
-                    "max_fanout",
-                    "int",
-                    format!(
-                        "Instance cap for `over`, within the engine's ceiling of \
-                         {MAX_FANOUT_CEILING}."
-                    ),
-                ),
+                max_fanout_kwarg(),
                 keyed_kwarg(),
                 Kwarg::new(
                     "depends_on",
@@ -644,6 +686,67 @@ pub fn functions() -> Vec<Function> {
                 answers_kwarg(),
                 otherwise_kwarg(),
             ],
+        },
+        Function {
+            name: "model",
+            lane: Lane::Routed,
+            purpose: "A route decider: a decision model answers, through the broker's `decision` \
+                      capability.",
+            positional: None,
+            kwargs: vec![
+                Kwarg::new(
+                    "min_confidence",
+                    "number",
+                    "An answer whose probability is below this, in (0, 1], is recorded as \
+                     `\"uncertain\"`.",
+                ),
+                Kwarg::new(
+                    "files",
+                    "list[str]",
+                    "Declared JSON files of dependencies the model reads, under `files` in its \
+                     state, by dependency and path. Each must be declared by a dependency with a \
+                     `schema_file(...)`.",
+                ),
+            ],
+        },
+        Function {
+            name: "human",
+            lane: Lane::Routed,
+            purpose: "A route decider: a person allowed to approve the run answers, from the \
+                      controller UI, after seeing the dependencies' declared outputs and files. \
+                      Needs the `human` capability. Tasks that do not depend on the route keep \
+                      running while it waits.",
+            positional: None,
+            kwargs: vec![
+                Kwarg::new(
+                    "review",
+                    "path",
+                    "A Markdown template in the pack, rendered over the evidence (`inputs`, \
+                     `run`, `gated`) and shown above it. Every inserted value is escaped.",
+                ),
+                Kwarg::new(
+                    "timeout",
+                    "duration",
+                    "How long the request stays open, from when it opens; the run's wall-clock \
+                     ceiling by default. An unanswered request records every question as \
+                     `\"uncertain\"`.",
+                ),
+            ],
+        },
+        Function {
+            name: "output",
+            lane: Lane::Routed,
+            purpose: "A route decider: a dependency's output answers. It emits one declared label \
+                      (or a boolean, for a noul) under each question id. Deterministic, free, and \
+                      needs no capability. Any other value fails the route. When the dependency \
+                      types its emits, each question's field must be typed with labels the \
+                      question answers, or `\"boolean\"` for a noul.",
+            positional: Some("task"),
+            kwargs: vec![Kwarg::new(
+                "task",
+                "task",
+                "The dependency whose output answers.",
+            )],
         },
         Function {
             name: "noul",
@@ -677,13 +780,13 @@ pub fn functions() -> Vec<Function> {
                          Each entry is a label or `{{\"value\": label, \"description\": str}}`; \
                          at most {MAX_DYNAMIC_OPTIONS}, a repeated label keeps its first entry, \
                          and fewer than two fails that decision. The answer records the options \
-                         it chose among. Needs `min_confidence`."
+                         it chose among. Needs a `model(...)` decider."
                     ),
                 ),
                 Kwarg::new(
                     "multiple",
                     "bool",
-                    "Take one or more labels. Only a `human = True` route asks it; a `when` runs \
+                    "Take one or more labels. Only a route decided by `human(...)` asks it; a `when` runs \
                      if any listed label was chosen.",
                 ),
                 Kwarg::new(
@@ -696,7 +799,7 @@ pub fn functions() -> Vec<Function> {
         Function {
             name: "pick",
             lane: Lane::Routed,
-            purpose: "A question for a `human = True` route whose options are a list a \
+            purpose: "A question for a route decided by `human(...)` whose options are a list a \
                       dependency produced. The route's output holds the picked values under the \
                       question id, so `over = gate.question` fans out over them. No `when` \
                       routes on it.",
@@ -1024,6 +1127,7 @@ pub fn json() -> serde_json::Value {
                         "name": kwarg.name,
                         "type": kwarg.ty,
                         "purpose": kwarg.purpose,
+                        "replaced_by": kwarg.replaced_by,
                     }))
                     .collect::<Vec<_>>(),
             }))

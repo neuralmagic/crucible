@@ -2138,7 +2138,12 @@ identity = {{ claim = "email", prefix = "oidc:" }}
         );
         assert_eq!(
             doc["grant_types_supported"],
-            json!(["client_credentials", "authorization_code", "refresh_token"])
+            json!([
+                "client_credentials",
+                "urn:ietf:params:oauth:grant-type:token-exchange",
+                "authorization_code",
+                "refresh_token"
+            ])
         );
         assert_eq!(doc["response_types_supported"], json!(["code"]));
         assert_eq!(doc["code_challenge_methods_supported"], json!(["S256"]));

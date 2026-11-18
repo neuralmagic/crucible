@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::editor::Editor;
 use crate::profile::Profile;
-use crate::workspace::Workspace;
+use crate::workspace::{Rails, Workspace};
 
 /// The colours the app paints with.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,13 +170,22 @@ pub struct Settings {
     pub tx02: Option<PathBuf>,
     /// The run workspace as the user last arranged it; `None` lays each run out by its graph.
     pub layout: Option<Workspace>,
+    pub rails: Rails,
     pub theme: Theme,
     pub appearance: Appearance,
     pub text_size: TextSize,
+    /// The sidebar's owner, origin and landed switches.
+    pub filters: crate::filter::Filters,
     /// Display points per layout point: below 1 fits more on screen.
     pub zoom: f32,
     /// Draw charts through the CRT pass.
     pub crt: bool,
+    /// Draw run graphs with less room in and between their nodes, unless a run is switched.
+    pub compact_graph: bool,
+    /// Keep profile keys in the system credential store, not in files.
+    pub keychain: bool,
+    /// Ask GitHub once a day whether a newer release exists.
+    pub updates: bool,
     /// Announce the signed-in user's runs as they finish.
     pub notify: bool,
     /// Announce decision requests the signed-in user may answer as they open.
@@ -195,9 +204,17 @@ pub struct Settings {
     profiles: BTreeMap<String, toml::Value>,
     /// The profile in use, by name.
     pub profile: Option<String>,
+    /// The team each profile acts as (`team:<slug>`), by profile name.
+    act_as: BTreeMap<String, String>,
+    /// Where draft working copies are kept; `None` keeps them in the app's data directory.
+    pub drafts_dir: Option<PathBuf>,
     /// The cost and time ceilings a pack folder dropped on the app is test-fired under.
     pub drop_max_cost: f64,
     pub drop_max_time: String,
+    /// The harness a drafting agent runs, and the sandbox it runs in.
+    pub agent: crate::agent::Config,
+    /// Why the file on disk did not read. While set, nothing is saved over it.
+    pub unreadable: Option<String>,
     path: PathBuf,
 }
 
@@ -210,11 +227,18 @@ struct Config {
     tx02_path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     layout: Option<Workspace>,
+    #[serde(skip_serializing_if = "Rails::is_fitted")]
+    rails: Rails,
+    #[serde(skip_serializing_if = "crate::filter::Filters::is_default")]
+    filters: crate::filter::Filters,
     theme: Theme,
     appearance: Appearance,
     text_size: TextSize,
     zoom: Option<f32>,
     crt: Option<bool>,
+    compact_graph: Option<bool>,
+    keychain: Option<bool>,
+    check_updates: Option<bool>,
     notify: Option<bool>,
     notify_decisions: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -227,9 +251,16 @@ struct Config {
     checks: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    drafts_dir: Option<PathBuf>,
     drop_max_cost: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     drop_max_time: Option<String>,
+    /// The team each profile acts as, by profile name.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    act_as: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<crate::agent::Config>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     profiles: BTreeMap<String, toml::Value>,
 }
@@ -240,11 +271,12 @@ impl Settings {
     }
 
     fn load_from(path: PathBuf) -> Self {
-        let mut config: Config = fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| toml::from_str(&text).ok())
-            .unwrap_or_default();
-        if config.profiles.is_empty()
+        let (mut config, unreadable) = match read(&path) {
+            Ok(config) => (config, None),
+            Err(why) => (Config::default(), Some(why)),
+        };
+        if unreadable.is_none()
+            && config.profiles.is_empty()
             && let Some(dir) = path.parent().and_then(Path::parent)
             && let Ok(text) = fs::read_to_string(crate::profile::tauri_config(dir))
         {
@@ -268,6 +300,8 @@ impl Settings {
             log_font,
             tx02,
             layout: config.layout.and_then(Workspace::repaired),
+            rails: config.rails,
+            filters: config.filters,
             theme: config.theme,
             appearance: config.appearance,
             text_size: config.text_size,
@@ -276,6 +310,9 @@ impl Settings {
                 .filter(|z| ZOOMS.iter().any(|known| (known - z).abs() < 0.01))
                 .unwrap_or(1.0),
             crt: config.crt.unwrap_or(true),
+            compact_graph: config.compact_graph.unwrap_or(true),
+            keychain: config.keychain.unwrap_or(false),
+            updates: config.check_updates.unwrap_or(true),
             notify: config.notify.unwrap_or(true),
             ask: config.notify_decisions.unwrap_or(true),
             editor: config.editor,
@@ -285,6 +322,8 @@ impl Settings {
             checks: config.checks.unwrap_or(true),
             profiles: config.profiles,
             profile: config.profile,
+            act_as: config.act_as,
+            drafts_dir: config.drafts_dir.filter(|dir| dir.is_absolute()),
             drop_max_cost: config
                 .drop_max_cost
                 .filter(|c| c.is_finite() && *c > 0.0)
@@ -293,6 +332,8 @@ impl Settings {
                 .drop_max_time
                 .filter(|t| crate::form::minutes(t).is_some())
                 .unwrap_or_else(|| "30m".to_string()),
+            agent: config.agent.unwrap_or_default(),
+            unreadable,
             path,
         }
     }
@@ -330,6 +371,31 @@ impl Settings {
         }
     }
 
+    /// Where draft working copies are kept now.
+    pub fn drafts_root(&self) -> Option<PathBuf> {
+        crate::draft::root(self.drafts_dir.as_deref())
+    }
+
+    /// Keep draft working copies under `dir`, an absolute path or one under `~/`. An empty `dir`
+    /// goes back to the app's data directory.
+    pub fn set_drafts_dir(&mut self, dir: &str) -> Result<(), String> {
+        let dir = dir.trim();
+        let chosen = if dir.is_empty() {
+            None
+        } else if let Some(rest) = dir.strip_prefix("~/") {
+            let home = std::env::var_os("HOME").ok_or("There is no home directory for ~")?;
+            Some(PathBuf::from(home).join(rest))
+        } else {
+            Some(PathBuf::from(dir))
+        };
+        if chosen.as_deref().is_some_and(Path::is_relative) {
+            return Err("The drafts folder is an absolute path".into());
+        }
+        self.drafts_dir = chosen;
+        self.save();
+        Ok(())
+    }
+
     /// Set the drop ceilings, when both read.
     pub fn set_drop(&mut self, max_cost: &str, max_time: &str) -> Result<(), String> {
         let cost: f64 = max_cost
@@ -348,6 +414,21 @@ impl Settings {
         Ok(())
     }
 
+    /// The team profile `name` acts as.
+    pub fn act_as(&self, name: &str) -> Option<String> {
+        self.act_as.get(name).cloned()
+    }
+
+    pub fn set_act_as(&mut self, name: &str, team: Option<String>) {
+        let changed = match team {
+            Some(team) => self.act_as.insert(name.to_string(), team.clone()) != Some(team),
+            None => self.act_as.remove(name).is_some(),
+        };
+        if changed {
+            self.save();
+        }
+    }
+
     pub fn use_profile(&mut self, name: &str) {
         if self.profile.as_deref() != Some(name) {
             self.profile = Some(name.to_string());
@@ -356,7 +437,22 @@ impl Settings {
     }
 
     /// Where profiles keep their own keys.
-    pub fn keys_dir(&self) -> PathBuf {
+    pub fn keys(&self) -> crate::keys::Store {
+        self.keys_in(self.keychain)
+    }
+
+    /// The system credential store when `keychain`, else the key files.
+    pub fn keys_in(&self, keychain: bool) -> crate::keys::Store {
+        #[cfg(not(target_arch = "wasm32"))]
+        if keychain {
+            return crate::keys::Store::Keychain;
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = keychain;
+        crate::keys::Store::Dir(self.keys_dir())
+    }
+
+    fn keys_dir(&self) -> PathBuf {
         self.path
             .parent()
             .map_or_else(|| PathBuf::from("profiles"), |dir| dir.join("profiles"))
@@ -381,6 +477,13 @@ impl Settings {
         }
     }
 
+    pub fn set_rails(&mut self, rails: Rails) {
+        if self.rails != rails {
+            self.rails = rails;
+            self.save();
+        }
+    }
+
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
         self.save();
@@ -391,8 +494,28 @@ impl Settings {
         self.save();
     }
 
+    pub fn set_compact_graph(&mut self, on: bool) {
+        self.compact_graph = on;
+        self.save();
+    }
+
+    pub fn set_keychain(&mut self, on: bool) {
+        self.keychain = on;
+        self.save();
+    }
+
     pub fn set_checks(&mut self, on: bool) {
         self.checks = on;
+        self.save();
+    }
+
+    pub fn set_filters(&mut self, filters: crate::filter::Filters) {
+        self.filters = filters;
+        self.save();
+    }
+
+    pub fn set_updates(&mut self, on: bool) {
+        self.updates = on;
         self.save();
     }
 
@@ -443,15 +566,23 @@ impl Settings {
     }
 
     fn save(&self) {
+        if self.unreadable.is_some() {
+            return;
+        }
         let config = Config {
             log_font: Some(self.log_font),
             tx02_path: None,
             layout: self.layout.clone(),
+            rails: self.rails,
+            filters: self.filters,
             theme: self.theme,
             appearance: self.appearance,
             text_size: self.text_size,
             zoom: Some(self.zoom),
             crt: Some(self.crt),
+            compact_graph: Some(self.compact_graph),
+            keychain: Some(self.keychain),
+            check_updates: Some(self.updates),
             notify: Some(self.notify),
             notify_decisions: Some(self.ask),
             editor: self.editor,
@@ -460,9 +591,12 @@ impl Settings {
             keys: self.keys.clone(),
             checks: Some(self.checks),
             profile: self.profile.clone(),
+            act_as: self.act_as.clone(),
             profiles: self.profiles.clone(),
+            drafts_dir: self.drafts_dir.clone(),
             drop_max_cost: Some(self.drop_max_cost),
             drop_max_time: Some(self.drop_max_time.clone()),
+            agent: (self.agent != crate::agent::Config::default()).then(|| self.agent.clone()),
         };
         let Ok(text) = toml::to_string(&config) else {
             return;
@@ -470,8 +604,27 @@ impl Settings {
         if let Some(parent) = self.path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let _ = fs::write(&self.path, text);
+        let file = fs::canonicalize(&self.path).unwrap_or_else(|_| self.path.clone());
+        let partial = file.with_extension("toml.partial");
+        if fs::write(&partial, text).is_ok() && fs::rename(&partial, &file).is_err() {
+            let _ = fs::remove_file(&partial);
+        }
     }
+}
+
+/// The config at `path`, the default when there is no file, or why the file does not read.
+fn read(path: &Path) -> Result<Config, String> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
+        Err(e) => return Err(e.to_string()),
+    };
+    toml::from_str(&text).map_err(|e| {
+        let line = e
+            .span()
+            .map_or(1, |span| text[..span.start].matches('\n').count() + 1);
+        format!("line {line}: {}", e.message())
+    })
 }
 
 /// The fonts registered with Rune: the theme's faces, plus TX-02 read from this machine when
@@ -603,6 +756,36 @@ mod tests {
     use crate::settings::*;
 
     #[test]
+    fn the_update_check_is_on_until_turned_off_and_stays_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crucible-playbooks").join("config.toml");
+        let mut settings = Settings::load_from(path.clone());
+        assert!(settings.updates);
+        settings.set_updates(false);
+        assert!(!Settings::load_from(path.clone()).updates);
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("check_updates = false")
+        );
+    }
+
+    #[test]
+    fn graphs_draw_compact_until_turned_roomy_and_stay_roomy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crucible-playbooks").join("config.toml");
+        let mut settings = Settings::load_from(path.clone());
+        assert!(settings.compact_graph);
+        settings.set_compact_graph(false);
+        assert!(!Settings::load_from(path.clone()).compact_graph);
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("compact_graph = false")
+        );
+    }
+
+    #[test]
     fn with_no_profiles_of_its_own_the_app_takes_the_tauri_apps() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("crucible-playbooks").join("config.toml");
@@ -673,6 +856,7 @@ proxxy = "socks5://127.0.0.1:1080"
             url: "https://internal.example.com".into(),
             proxy: Some("socks5h://127.0.0.1:1080".into()),
             tunnel: Some("ssh -N -D 1080 jumpbox".into()),
+            shell: Some("/bin/bash".into()),
             ..Profile::default()
         };
         settings.set_profile_def("jump", &jump).unwrap();
@@ -696,6 +880,148 @@ proxxy = "socks5://127.0.0.1:1080"
     }
 
     #[test]
+    fn the_team_a_profile_acts_as_is_kept_per_profile_until_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crucible-playbooks").join("config.toml");
+        let mut settings = Settings::load_from(path.clone());
+        assert_eq!(settings.act_as("mpp"), None);
+
+        settings.set_act_as("mpp", Some("team:infra".into()));
+        settings.set_act_as("local", Some("team:lab".into()));
+        let read = Settings::load_from(path.clone());
+        assert_eq!(read.act_as("mpp").as_deref(), Some("team:infra"));
+        assert_eq!(read.act_as("local").as_deref(), Some("team:lab"));
+
+        settings.set_act_as("mpp", None);
+        let read = Settings::load_from(path.clone());
+        assert_eq!(read.act_as("mpp"), None);
+        assert_eq!(read.act_as("local").as_deref(), Some("team:lab"));
+        settings.set_act_as("local", None);
+        assert!(!fs::read_to_string(&path).unwrap().contains("act_as"));
+    }
+
+    #[test]
+    fn a_file_that_does_not_read_is_reported_and_never_saved_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crucible-playbooks").join("config.toml");
+        let tauri = crate::profile::tauri_config(dir.path());
+        fs::create_dir_all(tauri.parent().unwrap()).unwrap();
+        fs::write(&tauri, "[profiles.old]\nurl = \"http://127.0.0.1:8870\"\n").unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let written = "profile = \"mine\"\ntheme = \"mauve\"\n\n[profiles.mine]\nurl = \"https://mine.example.com\"\n";
+        fs::write(&path, written).unwrap();
+
+        let mut settings = Settings::load_from(path.clone());
+        let why = settings.unreadable.clone().expect("the file does not read");
+        assert!(why.starts_with("line 2: "), "{why}");
+        assert!(why.contains("mauve"), "{why}");
+        assert!(
+            settings.profiles().is_empty(),
+            "the Tauri app's profiles do not stand in for a file that is there"
+        );
+
+        settings.set_theme(Theme::Ember);
+        settings.set_zoom(1.25);
+        settings.use_profile("other");
+        settings
+            .set_profile_def(
+                "new",
+                &Profile {
+                    url: "https://new.example.com".into(),
+                    ..Profile::default()
+                },
+            )
+            .unwrap();
+        settings.remove_profile("new");
+        settings.set_drop("2", "1h").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), written);
+        assert_eq!(
+            fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1,
+            "nothing is left beside it"
+        );
+
+        fs::write(&path, written.replace("mauve", "moss")).unwrap();
+        let mut fixed = Settings::load_from(path.clone());
+        assert_eq!(fixed.unreadable, None);
+        assert_eq!(fixed.theme, Theme::Moss);
+        fixed.set_theme(Theme::Ember);
+        let again = Settings::load_from(path);
+        assert_eq!(again.theme, Theme::Ember);
+        assert!(again.profiles()["mine"].is_ok());
+    }
+
+    #[test]
+    fn the_sidebar_switches_are_kept_once_they_leave_their_defaults() {
+        use crate::filter::{Filters, LandedFilter, OriginFilter, OwnerFilter};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crucible-playbooks").join("config.toml");
+        let mut settings = Settings::load_from(path.clone());
+        assert_eq!(settings.filters, Filters::default());
+        settings.set_theme(Theme::Moss);
+        assert!(!fs::read_to_string(&path).unwrap().contains("filters"));
+
+        let picked = Filters {
+            owner: OwnerFilter::All,
+            origin: OriginFilter::Drafts,
+            landed: LandedFilter::Week,
+        };
+        settings.set_filters(picked);
+        assert_eq!(Settings::load_from(path.clone()).filters, picked);
+
+        fs::write(&path, "[filters]\norigin = \"schedules\"\n").unwrap();
+        assert_eq!(
+            Settings::load_from(path.clone()).filters,
+            Filters {
+                origin: OriginFilter::Schedules,
+                ..Filters::default()
+            },
+            "a switch the file leaves out keeps its default"
+        );
+
+        settings.set_filters(Filters::default());
+        assert!(!fs::read_to_string(&path).unwrap().contains("filters"));
+    }
+
+    #[test]
+    fn no_file_is_not_an_unreadable_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crucible-playbooks").join("config.toml");
+        let mut settings = Settings::load_from(path.clone());
+        assert_eq!(settings.unreadable, None);
+        settings.set_theme(Theme::Midnight);
+        assert_eq!(Settings::load_from(path).theme, Theme::Midnight);
+    }
+
+    #[test]
+    fn a_save_replaces_the_file_whole_and_writes_through_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("dotfiles").join("playbooks.toml");
+        fs::create_dir_all(real.parent().unwrap()).unwrap();
+        fs::write(&real, "theme = \"moss\"\n").unwrap();
+        let path = dir.path().join("config").join("config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real, &path).unwrap();
+
+        let mut settings = Settings::load_from(path.clone());
+        assert_eq!(settings.theme, Theme::Moss);
+        settings.set_theme(Theme::Ember);
+        assert!(
+            fs::symlink_metadata(&path).unwrap().is_symlink(),
+            "the link stays a link"
+        );
+        assert!(fs::read_to_string(&real).unwrap().contains("ember"));
+        for folder in [real.parent().unwrap(), path.parent().unwrap()] {
+            assert_eq!(
+                fs::read_dir(folder).unwrap().count(),
+                1,
+                "no partial file is left in {}",
+                folder.display()
+            );
+        }
+    }
+
+    #[test]
     fn the_tx02_scan_ignores_italic_and_condensed_faces() {
         let dir = tempfile::tempdir().unwrap();
         for name in [
@@ -709,5 +1035,55 @@ proxxy = "socks5://127.0.0.1:1080"
             scan(dir.path(), 0).unwrap().file_name().unwrap(),
             "TX-02-Regular.otf"
         );
+    }
+
+    #[test]
+    fn the_drafts_folder_is_kept_when_absolute_and_dropped_when_emptied() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crucible-playbooks").join("config.toml");
+        let mut settings = Settings::load_from(path.clone());
+        assert_eq!(settings.drafts_dir, None);
+
+        assert_eq!(
+            settings.set_drafts_dir("packs/drafts"),
+            Err("The drafts folder is an absolute path".to_string())
+        );
+        assert!(settings.set_drafts_dir("~").is_err());
+        assert_eq!(settings.drafts_dir, None);
+        assert!(!path.exists(), "a refused folder saves nothing");
+
+        settings.set_drafts_dir(" /work/drafts ").unwrap();
+        assert_eq!(settings.drafts_dir, Some(PathBuf::from("/work/drafts")));
+        assert_eq!(
+            Settings::load_from(path.clone()).drafts_dir,
+            Some(PathBuf::from("/work/drafts"))
+        );
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("drafts_dir = \"/work/drafts\"")
+        );
+
+        settings.set_drafts_dir("~/packs").unwrap();
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert_eq!(
+            Settings::load_from(path.clone()).drafts_dir,
+            Some(home.join("packs"))
+        );
+
+        settings.set_drafts_dir("").unwrap();
+        assert_eq!(Settings::load_from(path.clone()).drafts_dir, None);
+        assert!(!fs::read_to_string(&path).unwrap().contains("drafts_dir"));
+    }
+
+    #[test]
+    fn a_relative_drafts_folder_in_the_file_is_not_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crucible-playbooks").join("config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "drafts_dir = \"drafts\"\n").unwrap();
+        let settings = Settings::load_from(path);
+        assert_eq!(settings.unreadable, None);
+        assert_eq!(settings.drafts_dir, None);
     }
 }

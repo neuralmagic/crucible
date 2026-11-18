@@ -1180,7 +1180,8 @@ traffic. These are the broker, the OTLP collector, `buildit` on 8848 with `[buil
 | `crucible-openshell-gateway` | cluster | `tokenreviews`: create; `nodes`: get, list, watch; `runtimeclasses`, `priorityclasses`, `namespaces`: get | same |
 | sandbox service account (`[cluster] sandbox_service_account`, default `crucible-sandbox` under isolated gateways) | sandbox | none. Sandbox and supervisor pods mount no token; the account needs only what admits them (an OpenShift SCC). The render creates it | loop render `sandbox_rbac` |
 | controller identity (`[cluster] sandbox_readers`) | sandbox | `sandboxes`: get, list, patch, delete; `pods`: get, list, create, delete; `pods/finalizers`: update; `services`, `secrets`, `networkpolicies`: list, create, delete | loop render `sandbox_reader_rbac` (`kube.rs:1658`) |
-| controller identity | loop | `services`: list, create, delete; plus the dispatch rights in `docs/controller-deploy.md` | same, and the operator |
+| controller identity | loop | `services`: list, create, delete | same |
+| controller identity | loop | `crucible-dispatch`: `pods`: create, get, list, watch, delete; `pods/log`: get; `pods/finalizers`: update; `configmaps`: create, delete; `secrets`: create, delete, list, patch | loop render `dispatch_rbac`, for any `sandbox_readers` |
 | controller identity | SPIRE | `services/proxy`: get | the operator |
 | controller identity | cluster | `tokenreviews`: create (`system:auth-delegator`), for links | the operator |
 | loop service account | sandbox | none under an isolated profile | loop render |
@@ -1756,6 +1757,11 @@ completed build task and `push` report it after a server restart too. `buildit c
 <dir>` stages a directory the way a build does and computes the same digest with the same code,
 so a script can check that what was built is what it prepared.
 
+A `build` whose context digest and parameters equal those of a build the same sandbox still has
+running returns that build, with `already_running: true`, and starts nothing. A build that has
+ended is never reused. `status` takes `wait_seconds` (up to 50) and then answers when the build
+ends or the wait passes, so a caller with no timer of its own can wait without polling.
+
 ### 8.7 The shared cache
 
 With `[buildit.cache]`, `crucible deploy --buildit-cache` renders `buildit cache` in the loop
@@ -1822,6 +1828,7 @@ clusters            = ["pirate", "waldorf"]
 workload_namespaces = ["crucible-kueue-e2e"]
 people              = true
 people_urls         = { pirate = "https://kueue.pirate.example.com/mcp" }
+storage_classes     = { pirate = ["gpu-local"] }
 
 [buildit]
 clusters  = ["pirate", "waldorf"]
@@ -1831,6 +1838,11 @@ push_repo = "quay.io/example/crucible-smoke"
 `people_urls` is needed once `people` covers more than one cluster: every cluster's server has the
 same Service URL, and a person's token names its cluster by URL, so all but one cluster need a URL
 of their own. `deploy render --kueue` also needs `[kueue] image`.
+
+`storage_classes` lists, for each cluster, the StorageClasses a workload's volume claims may name.
+A cluster left out offers none: a claim there names no class and takes the cluster's default. List
+them where the default class cannot serve the nodes workloads run on, as with node-local classes
+that each exist on one node pool.
 
 ### 9.2 Derived values
 

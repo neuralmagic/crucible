@@ -1,0 +1,27 @@
+# What the task pack needs beyond cluster.yaml.in: a second LocalQueue on the B200 ClusterQueue,
+# and an SVID for each loop pod that names the pod, which the controller requires beside the
+# run's pod token for task tokens (cluster.loop_svid).
+apiVersion: kueue.x-k8s.io/@KUEUE_API@
+kind: LocalQueue
+metadata:
+  name: crucible-e2e-b200
+  namespace: @WORKLOAD_NS@
+spec:
+  clusterQueue: @CLUSTER_QUEUE_B200@
+---
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: crucible-kueue-e2e-loop
+  labels:
+    crucible.dev/e2e: kueue
+spec:
+  className: @SPIRE_CLASS@
+  jwtTtl: 5m
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: @LOOP_NS@
+  podSelector:
+    matchLabels:
+      crucible.io/work-kind: run
+  spiffeIDTemplate: spiffe://{{ .TrustDomain }}/crucible/run/{{ .PodMeta.Name }}

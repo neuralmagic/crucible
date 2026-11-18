@@ -15,6 +15,7 @@ pub mod flow;
 pub mod harness;
 pub mod host_env;
 pub mod inference;
+pub mod knobs;
 pub mod manifest;
 pub mod openshell;
 pub mod outputs;

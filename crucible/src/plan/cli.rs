@@ -1,6 +1,7 @@
 //! The `crucible plan` CLI: `show` compiles and prints a plan; `run` executes one.
 
 use crate::args::AgentOverride;
+use crate::knobs::Harness;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -68,8 +69,6 @@ pub fn load(path: &Path) -> Result<ValidPlan> {
     } else {
         Plan::from_json_str(&src)?
     };
-    crate::manifest::launch::check_agent_knobs(&plan.tasks)
-        .with_context(|| format!("validating plan {}", path.display()))?;
     plan.validate()
         .with_context(|| format!("validating plan {}", path.display()))
 }
@@ -102,7 +101,7 @@ pub fn render(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
         let mut detail = match &t.task {
             TaskKind::Agent { model, harness, .. } => format!(
                 "agent[{}/{}]",
-                harness.as_deref().unwrap_or("default"),
+                harness.map_or("default", Harness::as_str),
                 model.as_deref().unwrap_or("default")
             ),
             TaskKind::Command { command } => format!("command[{command}]"),
@@ -248,7 +247,7 @@ fn render_mermaid_styled(
         let mut detail = match &t.task {
             TaskKind::Agent { harness, model, .. } => format!(
                 "<br/>{}/{}",
-                mermaid_label(harness.as_deref().unwrap_or("default")),
+                mermaid_label(harness.map_or("default", Harness::as_str)),
                 mermaid_label(model.as_deref().unwrap_or("default"))
             ),
             TaskKind::Command { command } if metadata == Metadata::Preview => {
@@ -600,15 +599,16 @@ pub fn parse_params(pairs: &[String]) -> Result<BTreeMap<String, String>> {
 fn record_git_memory(paths: &crate::args::Paths) -> Result<()> {
     let start = RunStart::read(&paths.state)?;
     let commits = crucible_vcs::git_memory::task_commits(&paths.workspace, &start.base)?;
-    crate::plan::rerun::write_git_memory(&paths.state, &start, &commits)?;
+    let fetched = crate::cli::workspace::fetched_blobs(&paths.workspace)?;
+    crate::plan::rerun::write_git_memory(&paths.state, &start, &commits, &fetched)?;
     Ok(())
 }
 
 /// Where a rerun fetches a parent named by URL, inside its own state directory.
 const FETCHED_PARENT_DIR: &str = "rerun-parent";
 
-/// Seed a rerun: rebuild the workspace from the parent's base and the reused tasks' commits,
-/// restore their captured files, and record where this run started.
+/// Seed a rerun: rebuild the workspace from the parent's base, the blobs its partial clone held
+/// and the reused tasks' commits, restore their captured files, and record where this run started.
 fn start_rerun(
     manifest: &Path,
     loaded: &crate::manifest::Manifest,
@@ -638,7 +638,9 @@ fn start_rerun(
     let parent = crate::plan::rerun::ParentDir::read(&dir)?;
     let seeded = crate::plan::rerun::plan(plan, &parent.parent, &rerun.from)?;
     let commits = seeded.evidence(plan, &parent)?;
-    let base = crate::cli::setup::restore_for_rerun(manifest, loaded, &parent.start, &commits)?;
+    let fetched = crate::plan::rerun::read_fetched_blobs(&parent.dir)?;
+    let base =
+        crate::cli::setup::restore_for_rerun(manifest, loaded, &parent.start, &commits, &fetched)?;
     seeded
         .restore_captured(&parent, &paths.state)
         .context("restoring the parent's captured files")?;
@@ -803,6 +805,7 @@ pub fn run(
                         agent_cmd,
                         env: crucible::host_env::HostEnv::inherited(),
                         buildit_socket: None,
+                        task_servers: Vec::new(),
                         github: false,
                     }),
                     None,
@@ -971,6 +974,7 @@ pub fn run(
         .as_ref()
         .map(|p| crate::plan::files::CapturedFiles::new(&p.state));
     let clock = crate::plan::admission::TaskClock::default();
+    let mut took = BTreeMap::new();
     let out = execute(
         &plan,
         &substrate,
@@ -990,6 +994,11 @@ pub fn run(
         runner.as_mut(),
         |task, result| {
             observe(task, result);
+            let started = clock.ran(&task.name);
+            if let Some(secs) = started {
+                took.insert(task.name.clone(), secs);
+            }
+            let secs = started.unwrap_or(0.0);
             if let Some(f) = &events {
                 append(
                     f,
@@ -999,7 +1008,7 @@ pub fn run(
                         task,
                         result,
                         agent_args.as_ref(),
-                        clock.secs(&task.name),
+                        secs,
                     ),
                 );
             }
@@ -1010,11 +1019,14 @@ pub fn run(
     for t in plan.tasks_topo() {
         if let Some(r) = out.results.get(&t.name) {
             println!(
-                "  {:<20} {:<10} attempts={} cost=${:.4}{}{}",
+                "  {:<20} {:<10} attempts={} cost=${:.4}{}{}{}",
                 t.name.0,
                 r.status.as_str(),
                 r.attempts,
                 r.cost_usd,
+                took.get(&t.name)
+                    .map(|secs| format!(" elapsed={}", elapsed(*secs)))
+                    .unwrap_or_default(),
                 r.output
                     .as_ref()
                     .map(|v| format!("  out={v}"))
@@ -1081,10 +1093,32 @@ pub fn run(
     Ok(())
 }
 
+/// `secs` as the run summary prints a task's wall time: `4.2s`, `12m03s`, `1h05m09s`.
+fn elapsed(secs: f64) -> String {
+    if secs < 60.0 {
+        return format!("{secs:.1}s");
+    }
+    let whole = std::time::Duration::try_from_secs_f64(secs)
+        .unwrap_or_default()
+        .as_secs();
+    let (h, m, s) = (whole / 3600, whole / 60 % 60, whole % 60);
+    match h {
+        0 => format!("{m}m{s:02}s"),
+        _ => format!("{h}h{m:02}m{s:02}s"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::manifest::variant::VariantName;
+
+    #[test]
+    fn a_tasks_wall_time_reads_in_the_largest_unit_it_reaches() {
+        assert_eq!(elapsed(4.24), "4.2s");
+        assert_eq!(elapsed(723.9), "12m03s");
+        assert_eq!(elapsed(3909.0), "1h05m09s");
+    }
 
     const SRC: &str = r#"
         version = 1
@@ -1114,7 +1148,7 @@ mod tests {
         .unwrap();
         let err = load(&file).map(|_| ()).expect_err("refused");
         assert!(
-            format!("{err:#}").contains("sets harness \"gpt\""),
+            format!("{err:#}").contains("harness \"gpt\" is not claude, codex, opencode or pi"),
             "{err:#}"
         );
         std::fs::write(&file, SRC).unwrap();

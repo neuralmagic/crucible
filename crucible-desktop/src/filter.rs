@@ -1,10 +1,14 @@
-//! The sidebar's search and switches over live launches.
+//! The sidebar's search and switches over live launches and drafts.
 
-use crate::live::LivePlaybook;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+use crate::live::{LiveDraft, LivePlaybook};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum OwnerFilter {
     All,
+    #[default]
     Mine,
 }
 
@@ -28,8 +32,10 @@ impl OwnerFilter {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum OriginFilter {
+    #[default]
     All,
     Schedules,
     Drafts,
@@ -59,8 +65,10 @@ impl OriginFilter {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum LandedFilter {
+    #[default]
     Any,
     Hour,
     Day,
@@ -95,6 +103,33 @@ impl LandedFilter {
     }
 }
 
+/// The sidebar's switches, as the config file keeps them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Filters {
+    pub owner: OwnerFilter,
+    pub origin: OriginFilter,
+    pub landed: LandedFilter,
+}
+
+impl Filters {
+    pub fn is_default(&self) -> bool {
+        *self == Filters::default()
+    }
+
+    /// With no signed-in user there is no "mine", so the owner switch is off.
+    pub fn for_viewer(self, signed_in: bool) -> Filters {
+        Filters {
+            owner: if signed_in {
+                self.owner
+            } else {
+                OwnerFilter::All
+            },
+            ..self
+        }
+    }
+}
+
 fn principal(name: &str) -> &str {
     name.strip_prefix("user:").unwrap_or(name).trim()
 }
@@ -122,11 +157,20 @@ impl LaunchFilter {
             && self.origin.keeps(&launch.origin)
             && self.landed.keeps(launch.landed, now)
     }
+
+    /// A draft counts as the viewer's when they own it or created it, and lands when it is saved.
+    pub fn keeps_draft(&self, draft: &LiveDraft, me: &str, now: i64) -> bool {
+        (self.query.is_empty() || draft.matches(&self.query))
+            && (self.owner.keeps(&draft.owner, me) || self.owner.keeps(&draft.by, me))
+            && self.origin.keeps("draft")
+            && self.landed.keeps(draft.saved, now)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::filter::{LandedFilter, OriginFilter, OwnerFilter};
+    use crate::filter::{Filters, LandedFilter, LaunchFilter, OriginFilter, OwnerFilter};
+    use crate::live::LiveDraft;
 
     #[test]
     fn the_owner_filter_keeps_only_the_signed_in_principal() {
@@ -135,6 +179,26 @@ mod tests {
         assert!(OwnerFilter::Mine.keeps("user:weaton", "weaton"));
         assert!(!OwnerFilter::Mine.keeps("lwilkins", "weaton"));
         assert!(!OwnerFilter::Mine.keeps("weaton", ""));
+    }
+
+    #[test]
+    fn the_switches_start_on_just_mine_and_the_owner_one_needs_a_signed_in_user() {
+        let start = Filters::default();
+        assert_eq!(
+            (start.owner, start.origin, start.landed),
+            (OwnerFilter::Mine, OriginFilter::All, LandedFilter::Any)
+        );
+        assert!(start.is_default());
+        assert_eq!(start.for_viewer(true), start);
+        let anonymous = start.for_viewer(false);
+        assert_eq!(anonymous.owner, OwnerFilter::All);
+        let picked = Filters {
+            owner: OwnerFilter::All,
+            origin: OriginFilter::Schedules,
+            landed: LandedFilter::Day,
+        };
+        assert!(!picked.is_default());
+        assert_eq!(picked.for_viewer(false), picked);
     }
 
     #[test]
@@ -157,5 +221,40 @@ mod tests {
         assert!(LandedFilter::Week.keeps(now - 500_000, now));
         assert!(!LandedFilter::Week.keeps(now - 700_000, now));
         assert!(!LandedFilter::Hour.keeps(0, now));
+    }
+
+    #[test]
+    fn a_draft_is_kept_as_a_draft_its_owner_or_maker_saved() {
+        let now = 1_800_000_000;
+        let draft = LiveDraft {
+            id: "triage-wren".into(),
+            owner: "team:infra".into(),
+            by: "wren".into(),
+            saved: now - 4_000,
+            ..LiveDraft::default()
+        };
+        let filter = |owner, origin, landed, query: &str| LaunchFilter {
+            query: query.into(),
+            owner,
+            origin,
+            landed,
+        };
+        let all = (OwnerFilter::All, OriginFilter::All, LandedFilter::Any);
+        assert!(filter(all.0, all.1, all.2, "").keeps_draft(&draft, "lark", now));
+        assert!(filter(all.0, OriginFilter::Drafts, all.2, "").keeps_draft(&draft, "lark", now));
+        assert!(
+            !filter(all.0, OriginFilter::Schedules, all.2, "").keeps_draft(&draft, "lark", now)
+        );
+        assert!(filter(OwnerFilter::Mine, all.1, all.2, "").keeps_draft(&draft, "wren", now));
+        assert!(!filter(OwnerFilter::Mine, all.1, all.2, "").keeps_draft(&draft, "lark", now));
+        let own = LiveDraft {
+            owner: "user:lark".into(),
+            ..draft.clone()
+        };
+        assert!(filter(OwnerFilter::Mine, all.1, all.2, "").keeps_draft(&own, "lark", now));
+        assert!(filter(all.0, all.1, LandedFilter::Day, "").keeps_draft(&draft, "lark", now));
+        assert!(!filter(all.0, all.1, LandedFilter::Hour, "").keeps_draft(&draft, "lark", now));
+        assert!(filter(all.0, all.1, all.2, "triage").keeps_draft(&draft, "lark", now));
+        assert!(!filter(all.0, all.1, all.2, "nightly").keeps_draft(&draft, "lark", now));
     }
 }

@@ -87,7 +87,7 @@ fn clock(secs: i64) -> String {
 
 /// The launches running now, newest first.
 pub fn running(app: &App) -> Vec<Running> {
-    let crate::live::LiveView::Ready { now, launches, .. } = &app.live else {
+    let crate::live::LiveView::Ready { now, launches, .. } = &*app.remote.live else {
         return Vec::new();
     };
     let mut running: Vec<&LivePlaybook> = launches
@@ -210,17 +210,17 @@ impl App {
             return;
         }
         let running = running(self);
-        if let Some(key) = &self.pinned
+        if let Some(key) = &self.remote.pinned
             && !running.iter().any(|r| &r.key == key)
-            && matches!(self.live, crate::live::LiveView::Ready { .. })
+            && matches!(*self.remote.live, crate::live::LiveView::Ready { .. })
         {
-            self.pinned = None;
+            self.remote.pinned = None;
         }
         let now = shown(
-            &self.target.name,
+            &self.remote.target.name,
             &running,
             self.waiting() + self.approvals_waiting(),
-            self.pinned.as_deref(),
+            self.remote.pinned.as_deref(),
             &self.fleet,
         );
         self.announce_approvals();
@@ -245,8 +245,8 @@ impl App {
             .filter(|o| o.error.is_none())
             .map(|o| (o.name.clone(), o.approvals))
             .collect();
-        if matches!(self.admin.approvals, Some(Ok(_))) {
-            counts.push((self.target.name.clone(), self.approvals_waiting()));
+        if matches!(self.remote.admin.approvals, Some(Ok(_))) {
+            counts.push((self.remote.target.name.clone(), self.approvals_waiting()));
         }
         for (profile, now) in counts {
             let before = self.approvals_known.insert(profile.clone(), now);
@@ -269,7 +269,7 @@ impl App {
     pub fn picked(&mut self, id: &str) {
         match pick(id) {
             Some(Pick::Open(key)) => {
-                if let Some(playbook) = self.live.launch(&key).map(|l| l.id.clone()) {
+                if let Some(playbook) = self.remote.live.launch(&key).map(|l| l.id.clone()) {
                     self.follow(&crate::link::Link::Launch {
                         playbook,
                         key,
@@ -296,7 +296,7 @@ impl App {
                 self.page = crate::Page::Approvals;
                 crate::notify::bring_to_front();
             }
-            Some(Pick::Pin(key)) => self.pinned = key,
+            Some(Pick::Pin(key)) => self.remote.pinned = key,
             Some(Pick::Decisions) => {
                 self.page = crate::Page::Decisions;
                 crate::notify::bring_to_front();

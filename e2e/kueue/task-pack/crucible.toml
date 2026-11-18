@@ -1,0 +1,14 @@
+# The kueue e2e's task pack: one command task runs GPU Jobs on two queues and serves a
+# LeaderWorkerSet on a GPU, all through crucible-kueue with its task token. No agent turn.
+[workspace]
+inject = ["gpu.py"]
+
+[agent]
+backend   = "command"
+agent_cmd = "true"
+goal      = "Run GPU work on Kueue from a command task."
+
+[workflow]
+type    = "playbook"
+file    = "workflow.star"
+servers = ["kueue"]

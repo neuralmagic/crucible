@@ -194,6 +194,109 @@ impl Index {
             })
     }
 
+    /// The variable an expression starts with: `scan` of `scan.items` or `scan.items.any_of()`.
+    fn root(&self, value: &Value) -> Option<&str> {
+        self.identifiers
+            .iter()
+            .find(|(_, at)| at.start == value.span.start)
+            .map(|(name, _)| name.as_str())
+    }
+
+    /// The task variables `call` names outside `depends_on`, each with the argument that names
+    /// it. The compiler makes every one a dependency.
+    fn implied_dependencies<'a>(&'a self, call: &'a Call) -> Vec<(&'a str, &'static str)> {
+        let mut implied: Vec<(&str, &'static str)> = Vec::new();
+        if let Some(over) = call.kwarg("over") {
+            let list = match over.kind {
+                ValueKind::Call(each) => self
+                    .calls
+                    .get(each)
+                    .and_then(|each| each.positional(0).or_else(|| each.kwarg("list"))),
+                _ => Some(over),
+            };
+            implied.extend(
+                list.and_then(|list| self.root(list))
+                    .map(|name| (name, "over")),
+            );
+        }
+        if let Some(keyed) = call.kwarg("keyed") {
+            let fields = match &keyed.kind {
+                ValueKind::List(fields) => fields.iter().collect(),
+                _ => vec![keyed],
+            };
+            implied.extend(
+                fields
+                    .into_iter()
+                    .filter_map(|field| self.root(field))
+                    .map(|name| (name, "keyed")),
+            );
+        }
+        let is_route = |name: &&str| {
+            self.assigned_call(name)
+                .is_some_and(|assigned| assigned.callee == "route")
+        };
+        implied.extend(
+            call.kwarg("when")
+                .and_then(|when| self.root(when))
+                .filter(is_route)
+                .map(|name| (name, "when")),
+        );
+        if call.callee == "route" {
+            let answered_by = call
+                .kwarg("decider")
+                .and_then(|decider| match decider.kind {
+                    ValueKind::Call(output) => self.calls.get(output),
+                    _ => None,
+                })
+                .filter(|output| output.callee == "output")
+                .and_then(|output| output.positional(0).or_else(|| output.kwarg("task")))
+                .map(|task| (task, "decider"))
+                .or_else(|| call.kwarg("source").map(|task| (task, "source")));
+            implied.extend(answered_by.and_then(|(task, argument)| match &task.kind {
+                ValueKind::Ident(name) => Some((name.as_str(), argument)),
+                _ => None,
+            }));
+            if let Some(ValueKind::Dict(questions)) = call.kwarg("questions").map(|q| &q.kind) {
+                for (_, question) in questions {
+                    let ValueKind::Call(asked) = question.kind else {
+                        continue;
+                    };
+                    let source = self
+                        .calls
+                        .get(asked)
+                        .and_then(|asked| asked.kwarg("source").or_else(|| asked.kwarg("options")));
+                    implied.extend(
+                        source
+                            .filter(|source| matches!(source.kind, ValueKind::Other))
+                            .and_then(|source| self.root(source))
+                            .map(|name| (name, "questions")),
+                    );
+                }
+            }
+        }
+        implied
+    }
+
+    /// The entries of `call`'s literal `depends_on` that another argument already implies: the
+    /// entry's position in the list, the variable, and the argument that names it.
+    pub fn implied_entries<'a>(&'a self, call: &'a Call) -> Vec<(usize, &'a str, &'static str)> {
+        let Some(ValueKind::List(entries)) = call.kwarg("depends_on").map(|d| &d.kind) else {
+            return Vec::new();
+        };
+        let implied = self.implied_dependencies(call);
+        entries
+            .iter()
+            .enumerate()
+            .filter_map(|(position, entry)| {
+                let ValueKind::Ident(name) = &entry.kind else {
+                    return None;
+                };
+                let (name, argument) = implied.iter().find(|(implied, _)| implied == name)?;
+                Some((position, *name, *argument))
+            })
+            .collect()
+    }
+
     /// The constructor call whose literal `name` is `task`.
     pub fn task_named(&self, task: &str) -> Option<&Call> {
         self.calls.iter().find(|call| {

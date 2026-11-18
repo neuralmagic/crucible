@@ -41,7 +41,12 @@ impl Completer<'_> {
         }
         let word = self.snapshot.word_before(offset);
         if let Some(object) = self.snapshot.receiver(word.start) {
-            return self.fields(&object, &word);
+            let fields = self.fields(&object, &word);
+            return if fields.is_empty() {
+                self.answer_methods(&object, &word)
+            } else {
+                fields
+            };
         }
         let call = structure.call_at(offset);
         if let Some(call) = call
@@ -129,7 +134,7 @@ impl Completer<'_> {
             .kwargs
             .iter()
             .enumerate()
-            .filter(|(_, kwarg)| !used.contains(kwarg.name))
+            .filter(|(_, kwarg)| !used.contains(kwarg.name) && kwarg.replaced_by.is_none())
             .map(|(rank, kwarg)| {
                 let mut item = self.item(kwarg.name, CompletionItemKind::FIELD, word);
                 item.detail = Some(kwarg.ty.to_owned());
@@ -259,6 +264,47 @@ impl Completer<'_> {
                 item
             })
             .collect()
+    }
+
+    /// `gate.question.` and `task.field.` offer the selections a `when` takes.
+    fn answer_methods(&self, question: &str, word: &Range<usize>) -> Vec<CompletionItem> {
+        let Some(index) = &self.snapshot.index else {
+            return Vec::new();
+        };
+        let object = word.start.saturating_sub(question.len() + 1);
+        let asks = self
+            .snapshot
+            .receiver(object)
+            .and_then(|object| index.assigned_call(&object))
+            .and_then(|call| match call.callee.as_str() {
+                "route" => call.kwarg("questions"),
+                callee if TASK_CONSTRUCTORS.contains(&callee) => call.kwarg("emits"),
+                _ => None,
+            })
+            .is_some_and(|declared| match &declared.kind {
+                ValueKind::Dict(entries) => entries
+                    .iter()
+                    .any(|(key, _)| key.as_str() == Some(question)),
+                _ => false,
+            });
+        if !asks {
+            return Vec::new();
+        }
+        [
+            ("any_of", "any_of($0)", "run on the listed answers"),
+            (
+                "otherwise",
+                "otherwise()",
+                "run on every answer no other task lists",
+            ),
+        ]
+        .into_iter()
+        .map(|(name, snippet, detail)| {
+            let mut item = self.item(name, CompletionItemKind::METHOD, word);
+            item.detail = Some(detail.to_owned());
+            self.snippet(item, snippet.to_owned())
+        })
+        .collect()
     }
 
     fn in_string(&self, literal: &Literal, offset: usize) -> Vec<CompletionItem> {
@@ -734,6 +780,25 @@ mod tests {
         assert_eq!(
             case.labels(&format!("{parsed}x = agent(when = gate.|"), parsed),
             ["ship"]
+        );
+        assert_eq!(
+            case.labels(&format!("{parsed}x = agent(when = gate.ship.|"), parsed),
+            ["any_of", "otherwise"]
+        );
+        assert!(
+            case.labels(&format!("{parsed}x = agent(when = gate.nope.|"), parsed)
+                .is_empty()
+        );
+        assert_eq!(
+            case.labels(
+                &format!("{parsed}x = agent(when = review.verdict.|"),
+                parsed
+            ),
+            ["any_of", "otherwise"]
+        );
+        assert!(
+            case.labels(&format!("{parsed}x = agent(when = review.nope.|"), parsed)
+                .is_empty()
         );
     }
 

@@ -1,0 +1,40 @@
+id: claude-sub
+resource_version: 1
+display_name: Claude Code (subscription OAuth)
+description: Claude Code CLI authenticated with a personal subscription OAuth token
+category: agent
+credentials:
+  - name: oauth_token
+    description: Claude Code subscription OAuth token (from `claude setup-token`)
+    env_vars:
+      - CLAUDE_CODE_OAUTH_TOKEN
+    required: true
+    auth_style: bearer
+    header_name: Authorization
+    query_param: ""
+endpoints:
+  - host: api.anthropic.com
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+  - host: statsig.anthropic.com
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+  - host: sentry.io
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+binaries:
+  - /usr/bin/claude
+  - /usr/local/bin/claude
+  - /usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe
+inference_capable: true
+discovery:
+  credentials:
+    - oauth_token
+source: user
+scope: workspace

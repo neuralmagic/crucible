@@ -170,7 +170,7 @@ graph reads a field:
   argument.
 - A `top_k` dependency, a `grade` score source or tiebreak, and a thresholded `evaluate` need
   `score` declared `"number"` or `"integer"`.
-- `route(source = scan, ...)` needs the field of each question declared as labels that the
+- `route(decider = output(scan), ...)` needs the field of each question declared as labels that the
   question answers (its options, or `yes`/`no`, plus `uncertain`), or as `"boolean"` for a
   `noul`. The compiler rejects `"string"`, because it does not limit which label arrives.
 
@@ -210,7 +210,7 @@ requirement:
   instance. For this reason, `{"type": "array"}` without `items`, or
   `"items": {"type": "integer"}`, is a compile error at the `over` argument.
 - A score needs a numeric `type`, and its `const`/`enum` must contain only numbers.
-- A `route(source = ...)` question needs every value that the schema limits (`const`, `enum`,
+- A `route(decider = output(...))` question needs every value that the schema limits (`const`, `enum`,
   or `"type": "boolean"`, which answers `yes`/`no`) to be a label that the question accepts.
   The compiler rejects a schema that limits no value, as it rejects `"string"`.
 
@@ -344,8 +344,7 @@ review = command(
     run = "./check.sh",
     depends_on = [author],
     emits_files = ["evidence/review.json"],
-    revise = author,
-    max_rounds = 3,
+    revise = send_back(author, rounds = 3),
 )
 ```
 
@@ -361,8 +360,7 @@ confirm = evaluate(
     name = "confirm",
     run = "python3 tools/probe.py --rung confirm",
     depends_on = [rig],
-    revise = [pick, build, rig],
-    max_rounds = 3,
+    revise = send_back([pick, build, rig], rounds = 3),
 )
 ```
 
@@ -490,8 +488,7 @@ diff = evaluate(
     name = "single-gpu-diff",
     run = "./diff.sh",
     depends_on = [refcheck],
-    threshold = 0.001,
-    direction = "lower",
+    threshold = at_most(0.001),
     needs = "gpu",
     isolated = True,
 )
@@ -499,8 +496,7 @@ latency = evaluate(
     name = "latency",
     run = "./latency.sh",
     depends_on = [diff],
-    direction = "lower",
-    threshold = 12.5,
+    threshold = at_most(12.5),
     isolated = True,
 )
 racecheck = evaluate(

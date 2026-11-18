@@ -7,11 +7,13 @@
 //! <log>.exit       `<code>[ timeout]`, hard-linked into place, first writer wins
 //! ```
 //!
-//! A build also stamps each `STEP`, `COMMIT` and `CACHE` line of its log, and its end, into a
-//! steps file: `<unix ns> <line>`, then `<unix ns> END <exit record>` once the runner has exited.
+//! A build also stamps each line of its log that names a step ([`BUILDAH_STAMPS`],
+//! [`BUILDKIT_STAMPS`]), the first time it appears, and its end, into a steps file:
+//! `<unix ns> <line>`, then `<unix ns> END <exit record>` once the runner has exited.
 //!
-//! A build with cluster caches restores their snapshots before `bud` and, when `bud` succeeds and
-//! the build may write to the shared cache, saves them after it ([`RESTORE`], [`SAVE`]).
+//! A build with cluster caches restores their snapshots before the build stage and, when that
+//! succeeds and the build may write to the shared cache, saves them after it ([`RESTORE`],
+//! [`SAVE`]).
 #![allow(clippy::disallowed_macros)]
 
 use std::time::Duration;
@@ -22,27 +24,40 @@ pub const FETCH_LIMIT: u64 = 512 * 1024 * 1024;
 /// Where the runner writes its exit record and log path when the build pod passes no other file.
 pub const TERMINATION_LOG: &str = "/tmp/buildit-runner.term";
 
-/// Arguments: the log, the build's timeout, the termination file, the steps file, the snapshot
-/// plan, the shared cache's URL, the save header file, [`RESTORE`], [`SAVE`], then `bud`'s argv.
+/// The log lines a `buildah bud` build stamps: its steps, its commits and the cache stages.
+pub const BUILDAH_STAMPS: &str = "^(STEP |COMMIT |CACHE )";
+/// The log lines a `buildctl build` build stamps: each vertex `buildctl` names as a step of a
+/// stage or as `CACHED`, the layer cache's imports and export, the image's export, and the cache
+/// stages.
+pub const BUILDKIT_STAMPS: &str = r"^(#[0-9]+ (\[|CACHED$|exporting to image|importing cache manifest from |inferred cache manifest type|exporting cache to )|CACHE )";
+
+/// Arguments: the log, the build's timeout, the termination file, the regex of the log lines to
+/// stamp, the steps file, the snapshot plan, the shared cache's URL, the save header file,
+/// [`RESTORE`], [`SAVE`], then the build stage's argv.
 pub(crate) const RUNNER: &str = r#"log=$1; shift; t=
 stage() {
-  secs=$1; shift
+  lim=$1; shift
   printf '$ %s\n' "$*" >> "$log"
   s=$(date +%s)
-  timeout "$secs" "$@" >> "$log" 2>&1 < /dev/null
-  c=$?; t=
-  [ "$c" -ne 0 ] && [ $(($(date +%s) - s)) -ge "$secs" ] && t=" timeout"
-  return "$c"
+  timeout "$lim" "$@" >> "$log" 2>&1 < /dev/null
+  rc=$?; t=
+  [ "$rc" -ne 0 ] && [ $(($(date +%s) - s)) -ge "$lim" ] && t=" timeout"
+  return "$rc"
 }
-secs=$1; term=$2; steps=$3; plan=$4; url=$5; auth=$6; restore=$7; save=$8; shift 8
+secs=$1; term=$2; stamps=$3; steps=$4; plan=$5; url=$6; auth=$7; restore=$8; save=$9; shift 9
 sleep 2147483647 & hold=$!
 {
   tail -n +1 -f -s 0.1 --pid=$hold "$log" 2> /dev/null \
-    | grep --line-buffered -E '^(STEP |COMMIT |CACHE )' \
-    | while IFS= read -r l; do printf '%s %s\n' "$(date +%s%N)" "$l"; done
+    | grep --line-buffered -E "$stamps" \
+    | while IFS= read -r l; do
+        grep -qxF -e "$l" "$log.stamped" 2> /dev/null && continue
+        printf '%s\n' "$l" >> "$log.stamped"
+        printf '%s %s\n' "$(date +%s%N)" "$l"
+      done
   n=50; while [ ! -s "$log.exit" ] && [ "$n" -gt 0 ]; do sleep 0.1; n=$((n - 1)); done
   printf '%s END %s\n' "$(date +%s%N)" "$(head -n 1 "$log.exit" 2> /dev/null)"
 } >> "$steps" &
+stamper=$!
 if [ -n "$plan" ]; then
   printf '%s\n' "$restore" > "$log.restore"
   stage 900 sh "$log.restore" "$plan" "$url"
@@ -55,6 +70,7 @@ fi
 t=$bt
 kill "$hold" 2> /dev/null; wait "$hold" 2> /dev/null
 printf '%s%s\n' "$c" "$t" > "$log.exit"
+wait "$stamper" 2> /dev/null
 [ -n "$term" ] && { cat "$log.exit"; printf '%s\n' "$log"; } > "$term" 2>/dev/null
 exit 0"#;
 
@@ -112,6 +128,69 @@ while read -r name key dir use; do
   fi
   rm -f "$dir.snap"
 done < "$plan""#;
+
+/// How much of a BuildKit build came from its layer cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayerCacheUse {
+    /// Whether a cache was there to read
+    pub imported: bool,
+    /// The Dockerfile steps the build reached, its FROMs aside
+    pub steps: usize,
+    /// The steps taken from the cache instead of run
+    pub cached: usize,
+}
+
+/// The snapshotter a BuildKit build's pod recorded at the head of its steps file.
+pub fn snapshotter(steps: &str) -> Option<String> {
+    steps
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .find_map(|(_, text)| text.strip_prefix("SNAPSHOTTER "))
+        .map(str::to_string)
+}
+
+/// What a build's steps file says of its layer cache; None for a build that read none.
+pub fn layer_cache_use(steps: &str) -> Option<LayerCacheUse> {
+    use std::collections::BTreeSet;
+    let (mut asked, mut found) = (BTreeSet::new(), BTreeSet::new());
+    let (mut reached, mut cached) = (BTreeSet::new(), BTreeSet::new());
+    for line in steps.lines() {
+        let vertex = line
+            .split_once(' ')
+            .and_then(|(_, text)| text.strip_prefix('#'))
+            .and_then(|text| text.split_once(' '));
+        let Some((vertex, what)) = vertex else {
+            continue;
+        };
+        if what.starts_with("importing cache manifest from ") {
+            asked.insert(vertex);
+        } else if what.starts_with("inferred cache manifest type") {
+            found.insert(vertex);
+        } else if what == "CACHED" {
+            cached.insert(vertex);
+        } else if is_dockerfile_step(what) {
+            reached.insert(vertex);
+        }
+    }
+    (!asked.is_empty()).then(|| LayerCacheUse {
+        imported: asked.intersection(&found).next().is_some(),
+        steps: reached.len(),
+        cached: reached.intersection(&cached).count(),
+    })
+}
+
+fn is_dockerfile_step(vertex: &str) -> bool {
+    let Some((stage, instruction)) = vertex.strip_prefix('[').and_then(|v| v.split_once("] "))
+    else {
+        return false;
+    };
+    let numbered = stage
+        .rsplit(' ')
+        .next()
+        .and_then(|position| position.split_once('/'))
+        .is_some_and(|(i, n)| i.parse::<u32>().is_ok() && n.parse::<u32>().is_ok());
+    numbered && !instruction.starts_with("FROM ")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -234,9 +313,10 @@ pub struct SnapshotFiles {
     pub auth: String,
 }
 
-/// `steps` is the file the build stamps its steps into.
+/// `steps` is the file the build stamps the log lines matching `stamps` into.
 pub fn build_args(
     limit: Duration,
+    stamps: &str,
     steps: &str,
     snapshots: Option<&SnapshotFiles>,
     cmd: &[String],
@@ -248,6 +328,7 @@ pub fn build_args(
     let mut args = vec![
         limit.as_secs().to_string(),
         TERMINATION_LOG.to_string(),
+        stamps.to_string(),
         steps.to_string(),
         plan.to_string(),
         url.to_string(),
@@ -353,6 +434,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_steps_file_says_how_much_of_a_build_came_from_the_layer_cache() {
+        use crate::step::{LayerCacheUse, layer_cache_use};
+        let stamped = |lines: &[&str]| -> String {
+            lines
+                .iter()
+                .enumerate()
+                .map(|(at, line)| format!("17000000000000000{at:02} {line}\n"))
+                .collect()
+        };
+        let hit = stamped(&[
+            "#1 [internal] load build definition from Dockerfile",
+            "#3 [auth] library/alpine:pull token for registry-1.docker.io",
+            "#4 importing cache manifest from r:5000/b:cache-00000000000000aa",
+            "#5 importing cache manifest from r:5000/b:cache-sb-a-00000000000000aa",
+            "#5 inferred cache manifest type: application/vnd.oci.image.manifest.v1+json done",
+            "#6 [build 1/3] FROM docker.io/library/alpine:3.20@sha256:ab",
+            "#7 [build 2/3] RUN make",
+            "#7 CACHED",
+            "#8 [build 3/3] COPY . .",
+            "#9 [stage-1 2/2] COPY --from=build /out /out",
+            "#6 CACHED",
+            "#10 exporting to image",
+            "#11 exporting cache to registry",
+            "CACHE save deps",
+            "END 0",
+        ]);
+        assert_eq!(
+            layer_cache_use(&hit),
+            Some(LayerCacheUse {
+                imported: true,
+                steps: 3,
+                cached: 1
+            }),
+            "a FROM is no step, and one of two refs is enough"
+        );
+        let cold = stamped(&[
+            "#4 importing cache manifest from r:5000/b:cache-00000000000000aa",
+            "#5 [2/2] RUN make",
+            "END 0",
+        ]);
+        assert_eq!(
+            layer_cache_use(&cold),
+            Some(LayerCacheUse {
+                imported: false,
+                steps: 1,
+                cached: 0
+            })
+        );
+        let without = stamped(&["#5 [2/2] RUN make", "#5 CACHED", "END 0"]);
+        assert_eq!(layer_cache_use(&without), None);
+        assert_eq!(
+            layer_cache_use(&stamped(&["STEP 1/2: FROM base", "COMMIT img", "END 0"])),
+            None
+        );
+        assert_eq!(layer_cache_use(""), None);
+        assert_eq!(crate::step::snapshotter(&hit), None);
+        let recorded = stamped(&["SNAPSHOTTER overlayfs", "#5 [2/2] RUN make", "END 0"]);
+        assert_eq!(
+            crate::step::snapshotter(&recorded).as_deref(),
+            Some("overlayfs")
+        );
+    }
+
     #[cfg(target_os = "linux")]
     fn read(p: &std::path::Path) -> String {
         std::fs::read_to_string(p).unwrap_or_default()
@@ -365,12 +510,25 @@ mod tests {
 
     /// The runner as a build pod runs it, to its end.
     #[cfg(target_os = "linux")]
-    fn build(log: &std::path::Path, secs: &str, cmd: &[&str]) {
+    fn build(log: &std::path::Path, secs: &str, stamps: &str, cmd: &[&str]) {
+        build_with_caches(log, secs, stamps, ["", "", ""], cmd);
+    }
+
+    /// The runner as a build pod with cluster caches runs it: `snapshots` is the plan, the
+    /// shared cache's URL and the save header file.
+    #[cfg(target_os = "linux")]
+    fn build_with_caches(
+        log: &std::path::Path,
+        secs: &str,
+        stamps: &str,
+        snapshots: [&str; 3],
+        cmd: &[&str],
+    ) {
         use std::path::Path;
         std::fs::create_dir_all(log.parent().unwrap()).unwrap();
         let (term, steps) = (ext(log, "term"), ext(log, "steps"));
-        let mut args = vec![log, Path::new(secs), &term, &steps];
-        args.extend(["", "", ""].map(Path::new));
+        let mut args = vec![log, Path::new(secs), &term, Path::new(stamps), &steps];
+        args.extend(snapshots.map(Path::new));
         args.extend([crate::step::RESTORE, crate::step::SAVE].map(Path::new));
         args.extend(cmd.iter().map(Path::new));
         let out = std::process::Command::new("sh")
@@ -388,7 +546,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let run = |name: &str, secs: &str, cmd: &[&str]| {
             let log = dir.path().join(name).join("build.log");
-            build(&log, secs, cmd);
+            build(&log, secs, crate::step::BUILDAH_STAMPS, cmd);
             let record = format!("{}{}\n", read(&ext(&log, "exit")), log.display());
             assert_eq!(read(&ext(&log, "term")), record, "{name}");
             (
@@ -426,26 +584,136 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_build_stamps_its_steps_and_its_end() {
+    fn a_build_with_caches_keeps_its_own_timeout_and_exit() {
         let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("logs/build.log");
-        let script = "echo 'STEP 1/2: FROM base'; echo noise; sleep 1; \
-                      echo 'STEP 2/2: RUN make'; echo 'COMMIT img'; exit 4";
-        build(&log, "30", &["sh", "-c", script]);
-        let steps = ext(&log, "steps");
+        let run = |name: &str, secs: &str, cmd: &str| {
+            let log = dir.path().join(name).join("build.log");
+            let (plan, auth) = (dir.path().join(name).join("plan"), dir.path().join("auth"));
+            std::fs::create_dir_all(plan.parent().unwrap()).unwrap();
+            std::fs::write(&plan, "").unwrap();
+            std::fs::write(&auth, "Authorization: Bearer t\n").unwrap();
+            let cmd = cmd.replace("$plan", plan.to_str().unwrap());
+            build_with_caches(
+                &log,
+                secs,
+                crate::step::BUILDAH_STAMPS,
+                [
+                    plan.to_str().unwrap(),
+                    "http://127.0.0.1:9",
+                    auth.to_str().unwrap(),
+                ],
+                &["sh", "-c", &cmd],
+            );
+            (
+                State::record(read(&ext(&log, "exit")).trim()).unwrap(),
+                read(&log),
+            )
+        };
+
+        let (state, log) = run("slow", "1", "sleep 5");
+        assert_eq!(
+            state,
+            State::Exited {
+                code: 124,
+                timed_out: true
+            },
+            "{log}"
+        );
+        assert!(!log.contains(".save "), "{log}");
+
+        let (state, log) = run("failed-save", "30", "rm $plan");
+        assert_eq!(
+            state,
+            State::Exited {
+                code: 0,
+                timed_out: false
+            },
+            "{log}"
+        );
+        assert!(log.contains(".save "), "{log}");
+    }
+
+    /// The steps file of a build, once it holds `lines` lines.
+    #[cfg(target_os = "linux")]
+    fn stamped(log: &std::path::Path, lines: usize) -> Vec<(u128, String)> {
+        let steps = ext(log, "steps");
         for _ in 0..50 {
-            if read(&steps).lines().count() == 4 {
+            if read(&steps).lines().count() == lines {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        let stamped: Vec<(u128, String)> = read(&steps)
+        read(&steps)
             .lines()
             .map(|line| {
                 let (at, text) = line.split_once(' ').unwrap();
                 (at.parse().unwrap(), text.to_string())
             })
-            .collect();
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_buildkit_build_stamps_each_vertex_once_and_its_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("logs/build.log");
+        let script = "echo '#1 [internal] load build definition from Dockerfile'; \
+                      echo '#1 DONE 0.0s'; \
+                      echo '#5 [build 2/3] RUN make'; echo '#5 0.100 cc a.c'; \
+                      echo '#6 [stage-1 2/2] COPY --from=build /out /out'; \
+                      echo '#5 [build 2/3] RUN make'; echo '#5 1.200 cc b.c'; echo '#5 DONE 1.3s'; \
+                      echo '#2 importing cache manifest from r:5000/b:cache-aa'; \
+                      echo '#2 inferred cache manifest type: application/vnd.oci.image.manifest.v1+json done'; \
+                      echo '#2 DONE 0.0s'; echo '#6 CACHED'; echo '#3 ERROR: not found'; \
+                      echo 'CACHE save deps'; echo '#7 exporting to image'; \
+                      echo '#7 pushing layers 0.1s done'; echo '#8 exporting cache to registry'; \
+                      echo '#8 writing layer sha256:ab done'";
+        build(
+            &log,
+            "30",
+            crate::step::BUILDKIT_STAMPS,
+            &["sh", "-c", script],
+        );
+        let texts: Vec<String> = stamped(&log, 11).into_iter().map(|(_, t)| t).collect();
+        assert_eq!(
+            texts,
+            [
+                "#1 [internal] load build definition from Dockerfile",
+                "#5 [build 2/3] RUN make",
+                "#6 [stage-1 2/2] COPY --from=build /out /out",
+                "#2 importing cache manifest from r:5000/b:cache-aa",
+                "#2 inferred cache manifest type: application/vnd.oci.image.manifest.v1+json done",
+                "#6 CACHED",
+                "CACHE save deps",
+                "#7 exporting to image",
+                "#8 exporting cache to registry",
+                "END 0",
+            ]
+        );
+        assert_eq!(
+            crate::step::layer_cache_use(&read(&ext(&log, "steps"))),
+            Some(crate::step::LayerCacheUse {
+                imported: true,
+                steps: 2,
+                cached: 1
+            })
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_build_stamps_its_steps_and_its_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("logs/build.log");
+        let script = "echo 'STEP 1/2: FROM base'; echo noise; sleep 1; \
+                      echo 'STEP 2/2: RUN make'; echo 'COMMIT img'; exit 4";
+        build(
+            &log,
+            "30",
+            crate::step::BUILDAH_STAMPS,
+            &["sh", "-c", script],
+        );
+        let stamped = stamped(&log, 4);
         let texts: Vec<&str> = stamped.iter().map(|(_, t)| t.as_str()).collect();
         assert!(texts.contains(&"STEP 1/2: FROM base"), "{texts:?}");
         assert!(texts.contains(&"STEP 2/2: RUN make"), "{texts:?}");

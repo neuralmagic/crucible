@@ -60,6 +60,7 @@ const PlaybookImportReviewPage = page(() => import('./pages/PlaybookImportReview
 const PlaybookDraftsPage = page(() => import('./pages/PlaybookDraftsPage'), 'PlaybookDraftsPage');
 const BlueprintsPage = page(() => import('./pages/BlueprintsPage'), 'BlueprintsPage');
 const DraftStudioPage = page(() => import('./pages/DraftStudioPage'), 'DraftStudioPage');
+const DraftHistoryPage = page(() => import('./pages/DraftHistoryPage'), 'DraftHistoryPage');
 const PlaybookLaunchPage = page(() => import('./pages/PlaybookLaunchPage'), 'PlaybookLaunchPage');
 const PlaybookRunsPage = page(() => import('./pages/PlaybookRunsPage'), 'PlaybookRunsPage');
 const SchedulesPage = page(() => import('./pages/SchedulesPage'), 'SchedulesPage');
@@ -504,6 +505,13 @@ export function App() {
         <div className="flex items-stretch">
           {autoresearch ? <AutopilotIndicator /> : null}
           <OwnerSwitcher />
+          <a
+            href="/next/"
+            data-ui="next-ui"
+            className="flex items-center border-l border-rule px-3 font-mono text-data font-medium text-ink-3 hover:bg-hi hover:text-ink"
+          >
+            Next UI
+          </a>
           <IdentityBadge />
           <DisplayPrefs />
         </div>
@@ -550,6 +558,7 @@ export function App() {
             <Route path="/playbooks/import/:id" element={<PlaybookImportReviewPage />} />
             <Route path="/playbooks/drafts" element={<PlaybookDraftsPage />} />
             <Route path="/playbooks/drafts/:id" element={<DraftStudioPage />} />
+            <Route path="/playbooks/drafts/:id/history" element={<DraftHistoryPage />} />
             <Route path="/blueprints" element={<BlueprintsPage />} />
             <Route path="/playbooks/:id/launch" element={<PlaybookLaunchPage />} />
             <Route path="/playbook-runs" element={<PlaybookRunsPage />} />

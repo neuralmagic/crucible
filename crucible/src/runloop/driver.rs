@@ -3094,6 +3094,7 @@ if [ -f "$d/turn-$n.json" ]; then cat "$d/turn-$n.json"; elif [ -f "$d/default.j
             workflow_frozen_injects: Vec::new(),
             workflow_toolbox_exclude: Vec::new(),
             workflow_env: Default::default(),
+            workflow_servers: Vec::new(),
             buildit_socket: None,
             watch_feedback: false,
             sandbox_run_id: None,

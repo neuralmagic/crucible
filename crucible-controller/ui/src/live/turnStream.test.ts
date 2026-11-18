@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   activityLabel,
   appendLog,
+  logText,
   parseActivity,
   parseProgress,
   phaseColor,
@@ -129,6 +130,21 @@ describe('appendLog', () => {
     const lines = [{ id: 1, text: 'a' }];
     appendLog(lines, 2, 'b', 10);
     expect(lines).toHaveLength(1);
+  });
+});
+
+describe('logText', () => {
+  it('joins every buffered line in order', () => {
+    let lines: LogLine[] = [];
+    for (let i = 1; i <= 4; i++) {
+      lines = appendLog(lines, i, `line ${i}`, 3);
+    }
+    expect(logText(lines)).toBe('line 2\nline 3\nline 4');
+  });
+
+  it('keeps blank lines and is empty for no lines', () => {
+    expect(logText([{ id: 1, text: 'a' }, { id: 2, text: '' }, { id: 3, text: 'b' }])).toBe('a\n\nb');
+    expect(logText([])).toBe('');
   });
 });
 

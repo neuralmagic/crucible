@@ -25,9 +25,10 @@ use crate::agent::harness::{
 };
 use crate::agent::inference::{InferenceEnv, VertexConfig, WireApi};
 use crate::args::TurnAgent;
-use crate::manifest::{Harness, ReasoningEffort};
+use crate::knobs::{Harness, ReasoningEffort};
 use crate::turn_trace::{self, GenAiRecord, ToolCall, ToolInvocation};
 use crucible::harness::HarnessSpec;
+use crucible_contract::inference::ModelLimits;
 use crucible_harness::line::LineFormat;
 use crucible_harness::otel::LiveMeters;
 use crucible_harness::pi_json::PiJsonParser;
@@ -61,6 +62,15 @@ impl Pi {
         }
         a
     }
+}
+
+fn session_flags(session: &crate::agent::agent_session::SessionTurn) -> [String; 2] {
+    let flag = if session.is_resume() {
+        "--session"
+    } else {
+        "--session-id"
+    };
+    [flag.to_string(), session.provider_id.clone()]
 }
 
 /// Crucible's five reasoning tiers onto pi's `--thinking` levels; `max` is pi's ceiling on
@@ -109,6 +119,9 @@ const PROJECT = __PROJECT__;
 const REGION = __REGION__;
 const HOST = __HOST__;
 const MODEL = __MODEL__;
+const REASONING = __REASONING__;
+const CONTEXT_WINDOW = __CONTEXT_WINDOW__;
+const MAX_TOKENS = __MAX_TOKENS__;
 const PREFIX = `/v1/projects/${PROJECT}/locations/${REGION}/publishers/anthropic/models/`;
 const ANTHROPIC_VERSION = "vertex-2023-10-16";
 
@@ -160,11 +173,11 @@ export default function (pi: any) {
       {
         id: MODEL,
         name: MODEL,
-        reasoning: false,
+        reasoning: REASONING,
         input: ["text"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 200000,
-        maxTokens: 16384,
+        contextWindow: CONTEXT_WINDOW,
+        maxTokens: MAX_TOKENS,
       },
     ],
     streamSimple: (model: any, context: any, options: any) =>
@@ -173,20 +186,43 @@ export default function (pi: any) {
 }
 "#;
 
+/// The context window and output limit a seeded model entry declares: the binding's, else
+/// `default`.
+fn declared_limits(limits: Option<ModelLimits>, default: (u32, u32)) -> (u32, u32) {
+    limits.map_or(default, |l| {
+        (l.context_window.get(), l.max_output_tokens.get())
+    })
+}
+
 /// Render the Vertex extension for a project, region, and model.
-fn vertex_extension(model: &str, vertex: &VertexConfig) -> String {
+fn vertex_extension(
+    model: &str,
+    vertex: &VertexConfig,
+    reasoning: bool,
+    limits: Option<ModelLimits>,
+) -> String {
+    let (context_window, max_tokens) = declared_limits(limits, (200_000, 16_384));
     let literal = |s: &str| serde_json::Value::String(s.to_string()).to_string();
     VERTEX_EXTENSION_TEMPLATE
         .replace("__PROJECT__", &literal(&vertex.project))
         .replace("__REGION__", &literal(&vertex.region))
         .replace("__HOST__", &literal(&format!("https://{}", vertex.host())))
         .replace("__MODEL__", &literal(model))
+        .replace("__REASONING__", &reasoning.to_string())
+        .replace("__CONTEXT_WINDOW__", &context_window.to_string())
+        .replace("__MAX_TOKENS__", &max_tokens.to_string())
 }
 
 /// Render `models.json`: a keyed endpoint as the `crucible` provider (its API family, base URL,
 /// and the env var the key is read from) carrying the one model the turn runs. A Vertex turn
 /// seeds none: its provider comes from the extension.
-fn models_json(model: &str, endpoint: &ApiEndpoint) -> Option<String> {
+fn models_json(
+    model: &str,
+    endpoint: &ApiEndpoint,
+    reasoning: bool,
+    limits: Option<ModelLimits>,
+) -> Option<String> {
+    let (context_window, max_tokens) = declared_limits(limits, (128_000, 16_384));
     let (api, base_url, key_env) = match endpoint {
         ApiEndpoint::OpenAi { base_url, wire_api } => (
             match wire_api {
@@ -212,10 +248,10 @@ fn models_json(model: &str, endpoint: &ApiEndpoint) -> Option<String> {
                 "models": [{
                     "id": model,
                     "name": model,
-                    "reasoning": false,
+                    "reasoning": reasoning,
                     "input": ["text"],
-                    "contextWindow": 128_000,
-                    "maxTokens": 16_384,
+                    "contextWindow": context_window,
+                    "maxTokens": max_tokens,
                 }],
             }
         }
@@ -258,6 +294,40 @@ impl Backend for Pi {
         a
     }
 
+    fn local_session_argv(
+        &self,
+        agent: &TurnAgent<'_>,
+        prompt: &str,
+        session: &crate::agent::agent_session::SessionTurn,
+    ) -> std::io::Result<Vec<String>> {
+        let mut a = self.local_argv(agent, prompt);
+        a.extend(session_flags(session));
+        Ok(a)
+    }
+
+    fn sandbox_session_argv(
+        &self,
+        agent: &TurnAgent<'_>,
+        mcp_seeded: bool,
+        session: &crate::agent::agent_session::SessionTurn,
+    ) -> std::io::Result<Vec<String>> {
+        let mut a = self.sandbox_argv(agent, mcp_seeded);
+        a.extend(session_flags(session));
+        Ok(a)
+    }
+
+    fn is_session_transcript(
+        &self,
+        file_name: &str,
+        session: &crate::agent::agent_session::SessionTurn,
+    ) -> bool {
+        file_name
+            .strip_suffix(".jsonl")
+            .and_then(|stem| stem.strip_suffix(session.provider_id.as_str()))
+            .and_then(|timestamp| timestamp.strip_suffix('_'))
+            .is_some_and(|timestamp| !timestamp.is_empty())
+    }
+
     /// `models.json` for a keyed endpoint (it is where the `crucible` provider and the model come
     /// from); a Vertex turn seeds the extension instead. MCP servers ride [`Backend::mcp_config`].
     fn config(
@@ -269,6 +339,8 @@ impl Backend for Pi {
         models_json(
             agent.model,
             &api_endpoint(agent.model, inference, agent.env),
+            agent.reasoning_effort.is_some(),
+            inference.selection.as_ref().and_then(|s| s.limits),
         )
     }
 
@@ -281,10 +353,20 @@ impl Backend for Pi {
     }
 
     /// The Vertex extension, when the turn runs on the gateway's ambient credential.
-    fn credential(&self, agent: &TurnAgent<'_>, auth: &SandboxAuth) -> Option<SeedFile> {
+    fn credential(
+        &self,
+        agent: &TurnAgent<'_>,
+        auth: &SandboxAuth,
+        inference: &InferenceEnv,
+    ) -> Option<SeedFile> {
         match auth {
             SandboxAuth::Gateway => Some(SeedFile {
-                content: vertex_extension(agent.model, &VertexConfig::from_env(agent.env)),
+                content: vertex_extension(
+                    agent.model,
+                    &VertexConfig::from_env(agent.env),
+                    agent.reasoning_effort.is_some(),
+                    inference.selection.as_ref().and_then(|s| s.limits),
+                ),
                 dest: VERTEX_EXTENSION,
             }),
             SandboxAuth::AnthropicKey | SandboxAuth::ApiKey | SandboxAuth::Codex(_) => None,
@@ -559,6 +641,57 @@ mod tests {
         assert_eq!(thinking_level(ReasoningEffort::Max), "xhigh");
     }
 
+    fn session(completed_turns: u32) -> crate::agent::agent_session::SessionTurn {
+        crate::agent::agent_session::SessionTurn {
+            logical_name: "solver".into(),
+            provider_id: "018f47a0-0000-7000-8000-000000000000".into(),
+            completed_turns,
+        }
+    }
+
+    #[test]
+    fn a_first_turn_creates_the_session_and_a_later_turn_resumes_it_by_id() {
+        let a = args();
+        let agent = a.turn_agent();
+        let id = session(0).provider_id;
+
+        let base = Pi.sandbox_argv(&agent, true);
+        let started = Pi.sandbox_session_argv(&agent, true, &session(0)).unwrap();
+        assert_eq!(&started[..base.len()], &base[..]);
+        assert_eq!(&started[base.len()..], &["--session-id", id.as_str()]);
+        let resumed = Pi.sandbox_session_argv(&agent, true, &session(2)).unwrap();
+        assert_eq!(&resumed[..base.len()], &base[..]);
+        assert_eq!(&resumed[base.len()..], &["--session", id.as_str()]);
+
+        let base = Pi.local_argv(&agent, "try one");
+        let started = Pi
+            .local_session_argv(&agent, "try one", &session(0))
+            .unwrap();
+        assert_eq!(&started[..base.len()], &base[..]);
+        assert_eq!(&started[base.len()..], &["--session-id", id.as_str()]);
+        let resumed = Pi
+            .local_session_argv(&agent, "try one", &session(1))
+            .unwrap();
+        assert_eq!(&resumed[base.len()..], &["--session", id.as_str()]);
+    }
+
+    #[test]
+    fn a_session_transcript_is_a_timestamp_then_the_exact_session_id() {
+        let s = session(1);
+        let id = &s.provider_id;
+        assert!(Pi.is_session_transcript(&format!("2026-11-18T03-30-47-424Z_{id}.jsonl"), &s));
+        for other in [
+            format!("{id}.jsonl"),
+            format!("_{id}.jsonl"),
+            format!("2026-11-18T03-30-47-424Z_{id}"),
+            format!("2026-11-18T03-30-47-424Z_{id}.jsonl.bak"),
+            format!("2026-11-18T03-30-47-424Z-{id}.jsonl"),
+            "2026-11-18T03-30-47-424Z_other.jsonl".to_string(),
+        ] {
+            assert!(!Pi.is_session_transcript(&other, &s), "{other}");
+        }
+    }
+
     /// A local turn feeds the prompt through a here-doc, so a prompt starting with `-` (a
     /// SKILL.md's frontmatter) reaches pi as stdin rather than as a flag; the delimiter dodges a
     /// prompt line that spells it.
@@ -673,6 +806,92 @@ mod tests {
         assert_eq!(p["baseUrl"], "https://claude.corp");
         assert_eq!(p["apiKey"], "$ANTHROPIC_API_KEY");
         assert_eq!(p["models"][0]["id"], a.model());
+    }
+
+    #[test]
+    fn a_turn_with_a_reasoning_effort_declares_its_model_as_reasoning() {
+        let inference = InferenceEnv {
+            anthropic_key: Some("sk-ant".into()),
+            ..Default::default()
+        };
+        let reasoning = |a: &Args| {
+            let seeds = seed_files(&a.turn_agent(), &[], &inference);
+            let v: Value = serde_json::from_str(&seeds[0].content).expect("valid json");
+            v["providers"]["crucible"]["models"][0]["reasoning"].clone()
+        };
+        let vertex = |a: &Args| {
+            Pi.seed_files(
+                &a.turn_agent(),
+                &[],
+                &SandboxAuth::Gateway,
+                &InferenceEnv::default(),
+            )[0]
+            .content
+            .clone()
+        };
+        let mut a = args();
+        assert_eq!(reasoning(&a), false);
+        assert!(vertex(&a).contains("const REASONING = false;"));
+        a.reasoning_effort = Some(ReasoningEffort::High);
+        assert_eq!(reasoning(&a), true);
+        assert!(vertex(&a).contains("const REASONING = true;"));
+    }
+
+    #[test]
+    fn a_seeded_model_takes_the_bindings_limits_and_defaults_without_them() {
+        use crate::agent::inference::AgentSelection;
+        use crucible_contract::inference::InferenceProtocol;
+        use std::num::NonZeroU32;
+
+        let bound = |limits| InferenceEnv {
+            anthropic_key: Some("sk-ant".into()),
+            selection: Some(AgentSelection {
+                protocol: InferenceProtocol::Messages,
+                model: "m".into(),
+                price: None,
+                limits,
+            }),
+            ..Default::default()
+        };
+        let limits = ModelLimits {
+            context_window: NonZeroU32::new(32_768).unwrap(),
+            max_output_tokens: NonZeroU32::new(4_096).unwrap(),
+        };
+        let a = args();
+        let model = |inference: &InferenceEnv| {
+            let seeds = seed_files(&a.turn_agent(), &[], inference);
+            let v: Value = serde_json::from_str(&seeds[0].content).expect("valid json");
+            v["providers"]["crucible"]["models"][0].clone()
+        };
+        let limited = model(&bound(Some(limits)));
+        assert_eq!(limited["contextWindow"], 32_768);
+        assert_eq!(limited["maxTokens"], 4_096);
+        for inference in [
+            bound(None),
+            InferenceEnv {
+                anthropic_key: Some("sk-ant".into()),
+                ..Default::default()
+            },
+        ] {
+            let unset = model(&inference);
+            assert_eq!(unset["contextWindow"], 128_000);
+            assert_eq!(unset["maxTokens"], 16_384);
+        }
+
+        let vertex = |inference: &InferenceEnv| {
+            Pi.seed_files(&a.turn_agent(), &[], &SandboxAuth::Gateway, inference)[0]
+                .content
+                .clone()
+        };
+        let ext = vertex(&InferenceEnv {
+            selection: bound(Some(limits)).selection,
+            ..Default::default()
+        });
+        assert!(ext.contains("const CONTEXT_WINDOW = 32768;"), "{ext}");
+        assert!(ext.contains("const MAX_TOKENS = 4096;"), "{ext}");
+        let ext = vertex(&InferenceEnv::default());
+        assert!(ext.contains("const CONTEXT_WINDOW = 200000;"), "{ext}");
+        assert!(ext.contains("const MAX_TOKENS = 16384;"), "{ext}");
     }
 
     /// No key and no base URL is the ambient Vertex credential: no `models.json`, and the

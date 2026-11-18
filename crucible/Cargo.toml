@@ -130,6 +130,9 @@ prost-types.workspace = true
 # process-default rustls CryptoProvider, which is ambiguous in this dep graph (both ring and
 # aws-lc-rs are compiled in) and panics at channel construction.
 tonic.workspace = true
+# The loop pod's JWT-SVID from the SPIFFE Workload API, which the engine presents beside the
+# run's pod token for task tokens. Same tonic and prost as the gateway client.
+spiffe = { version = "0.19", features = ["workload-api-jwt"] }
 # The gateway version gate parses the Health-reported git-describe string with the same semver
 # crate cargo uses (dtolnay's); already in the dependency graph, so this adds no new code.
 semver = "1"

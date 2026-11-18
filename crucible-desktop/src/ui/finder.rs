@@ -13,14 +13,14 @@ const WIDTH: f32 = 780.0;
 const ROW: f32 = 28.0;
 
 pub(crate) fn finder(app: &App, p: &Paint, layer: &mut Vec<El>) {
-    let Some(open) = &app.finder else {
+    let Some(open) = &app.remote.finder else {
         return;
     };
     let query = open.query.text.trim().to_string();
     let input = TextInput::new(&open.query)
         .placeholder("Search runs: tickets, errors, outputs")
         .leading_icon(&oc::MAGNIFYING_GLASS)
-        .on_edit(|app: &mut App| match &mut app.finder {
+        .on_edit(|app: &mut App| match &mut app.remote.finder {
             Some(finder) => &mut finder.query,
             None => &mut app.scratch,
         })
@@ -43,7 +43,7 @@ pub(crate) fn finder(app: &App, p: &Paint, layer: &mut Vec<El>) {
             .label("Search in")
             .fit()
             .on_pick(move |app: &mut App, i: usize, _: &mut Tx| {
-                if let Some(finder) = &mut app.finder {
+                if let Some(finder) = &mut app.remote.finder {
                     finder.playbook = if i == 0 {
                         playbook.clone()
                     } else {
@@ -113,7 +113,7 @@ pub(crate) fn finder(app: &App, p: &Paint, layer: &mut Vec<El>) {
         .radius(p.k.radius.lg)
         .fill(p.c.layer_01)
         .border(p.hair, p.c.border_muted)
-        .modal(true, |app: &mut App| app.finder = None)
+        .modal(true, |app: &mut App| app.remote.finder = None)
         .child(input)
         .child(head)
         .child(list);
@@ -146,10 +146,10 @@ fn note(label: &str, p: &Paint) -> El {
 
 /// The launch a group of hits came from: when it landed, how it ended, how many lines matched.
 fn launch_head(app: &App, key: &str, count: usize, p: &Paint) -> El {
-    let (title, status) = match app.live.launch(key) {
+    let (title, status) = match app.remote.live.launch(key) {
         Some(launch) => (
             format!("{} \u{b7} {}", launch.id, launch.landed_at),
-            launch.status.clone(),
+            launch.status.to_string(),
         ),
         None => (key.to_string(), String::new()),
     };

@@ -163,10 +163,16 @@ pub fn config(signing: &EcKey) -> AgentIssuerConfig {
 /// An audience for runs on `cluster` at `resource` with `scopes`, needing no `kube_user`.
 pub fn audience(cluster: &str, resource: &str, scopes: &str) -> Audience {
     Audience {
+        server: match resource {
+            KUEUE => "kueue",
+            _ => "other",
+        }
+        .to_string(),
         resource: resource.to_string(),
         cluster: cluster.to_string(),
         scopes: scopes.split_whitespace().map(str::to_string).collect(),
         namespaces: Vec::new(),
+        remote: true,
     }
 }
 

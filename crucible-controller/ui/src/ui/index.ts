@@ -73,6 +73,8 @@ export { Tooltip } from './Tooltip';
 export type { TooltipProps, TooltipSide } from './Tooltip';
 export { Facets, Applied } from './Facets';
 export { formatStamp, middleTruncate } from './format';
+export { CopyButton } from './CopyButton';
+export type { CopyButtonProps } from './CopyButton';
 export { CopyText } from './CopyText';
 export type { CopyTextProps } from './CopyText';
 export type { FacetOption, FacetRow, AppliedFilter } from './Facets';

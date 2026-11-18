@@ -15,7 +15,7 @@
 //! session of a run that has shut down.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::Result;
@@ -47,6 +47,8 @@ pub fn cache_root() -> Option<PathBuf> {
 pub struct Store {
     db: Mutex<Connection>,
     budget: i64,
+    /// Bytes of bodies held, counted once at open and kept in step under the `db` lock.
+    held: AtomicI64,
 }
 
 impl Store {
@@ -89,9 +91,15 @@ impl Store {
              );",
         )?;
         backfill(&db)?;
+        let held = db.query_row(
+            "SELECT COALESCE(SUM(LENGTH(body)), 0) FROM responses",
+            [],
+            |row| row.get(0),
+        )?;
         Ok(Store {
             db: Mutex::new(db),
             budget,
+            held: AtomicI64::new(held),
         })
     }
 
@@ -152,9 +160,26 @@ impl Store {
         Some(hit)
     }
 
-    /// Keep `body`, then drop what was used longest ago until the cache fits its budget.
+    /// Keep `body`, then drop what was used longest ago until the cache fits its budget. A body
+    /// the cache already holds is only marked used: nothing is written or indexed again.
     pub fn put(&self, base: &str, path: &str, body: &[u8], settled: bool) {
         let db = self.db();
+        let before: Option<(i64, bool)> = db
+            .query_row(
+                "SELECT LENGTH(body), body = ?3 FROM responses WHERE base = ?1 AND path = ?2",
+                params![base, path, body],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        if let Some((_, true)) = before {
+            let _ = db.execute(
+                "UPDATE responses SET used = ?3 WHERE base = ?1 AND path = ?2",
+                params![base, path, now()],
+            );
+            return;
+        }
         let stored = db.execute(
             "INSERT INTO responses (base, path, body, settled, used) VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT (base, path) DO UPDATE
@@ -164,28 +189,23 @@ impl Store {
         if stored.is_err() {
             return;
         }
+        let grew = body.len() as i64 - before.map_or(0, |(length, _)| length);
+        let mut held = self.held.fetch_add(grew, Ordering::Relaxed) + grew;
         let _ = index(&db, base, path, body);
-        loop {
-            let total: i64 = db
+        while held > self.budget {
+            let dropped: Option<i64> = db
                 .query_row(
-                    "SELECT COALESCE(SUM(LENGTH(body)), 0) FROM responses",
+                    "DELETE FROM responses WHERE rowid IN
+                     (SELECT rowid FROM responses ORDER BY used LIMIT 1)
+                     RETURNING LENGTH(body)",
                     [],
                     |row| row.get(0),
                 )
-                .unwrap_or(0);
-            if total <= self.budget {
-                break;
-            }
-            let dropped = db
-                .execute(
-                    "DELETE FROM responses WHERE rowid IN
-                     (SELECT rowid FROM responses ORDER BY used LIMIT 1)",
-                    [],
-                )
-                .unwrap_or(0);
-            if dropped == 0 {
-                break;
-            }
+                .optional()
+                .ok()
+                .flatten();
+            let Some(dropped) = dropped else { break };
+            held = self.held.fetch_sub(dropped, Ordering::Relaxed) - dropped;
         }
     }
 }
@@ -287,16 +307,27 @@ fn query_hits(
     .unwrap_or_default()
 }
 
+/// How many of a session's last lines are read for its shutdown event.
+const TAIL_LINES: usize = 16;
+
 /// Whether a response at `path` can never change.
 fn settled(path: &str, body: &[u8]) -> bool {
     let draft_at_version = path.starts_with("/api/playbook-drafts/")
         && path.contains("/files?")
         && path.contains("version=");
-    let ended_session = path.ends_with("/artifacts/session.jsonl")
-        && body
-            .windows(br#""kind":"shutdown""#.len())
-            .any(|w| w == br#""kind":"shutdown""#);
-    draft_at_version || ended_session
+    draft_at_version || (path.ends_with("/artifacts/session.jsonl") && shut_down(body))
+}
+
+/// Whether one of a session's last events is its shutdown.
+fn shut_down(session: &[u8]) -> bool {
+    session
+        .rsplit(|byte| *byte == b'\n')
+        .filter(|line| !line.trim_ascii().is_empty())
+        .take(TAIL_LINES)
+        .any(|line| {
+            serde_json::from_slice::<serde_json::Value>(line)
+                .is_ok_and(|event| event["kind"] == "shutdown")
+        })
 }
 
 fn now() -> i64 {
@@ -322,20 +353,50 @@ impl CachedTransport {
         }
     }
 
+    /// The stored copy of `path`.
+    async fn stored(&self, path: &str) -> Option<(Vec<u8>, bool)> {
+        let (store, base, path) = (
+            Arc::clone(&self.store),
+            self.inner.base().to_string(),
+            path.to_string(),
+        );
+        tokio::task::spawn_blocking(move || store.get(&base, &path))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Store `body` as `path`'s copy, and hand it back.
+    async fn keep(&self, path: &str, body: Vec<u8>) -> Vec<u8> {
+        let (store, base, path) = (
+            Arc::clone(&self.store),
+            self.inner.base().to_string(),
+            path.to_string(),
+        );
+        let body = Arc::new(body);
+        let stored = Arc::clone(&body);
+        let _ = tokio::task::spawn_blocking(move || {
+            store.put(&base, &path, &stored, settled(&path, &stored));
+        })
+        .await;
+        Arc::try_unwrap(body).unwrap_or_else(|shared| shared.to_vec())
+    }
+
     async fn read(&self, path: &str) -> Result<(StatusCode, Vec<u8>)> {
-        let base = self.inner.base().to_string();
-        if let Some((body, true)) = self.store.get(&base, path) {
+        if let Some((body, true)) = self.stored(path).await {
             return Ok((StatusCode::OK, body));
         }
         match self.inner.get_bytes(path).await {
             Ok((status, body)) => {
                 self.offline.store(false, Ordering::Relaxed);
-                if status.is_success() {
-                    self.store.put(&base, path, &body, settled(path, &body));
-                }
+                let body = if status.is_success() {
+                    self.keep(path, body).await
+                } else {
+                    body
+                };
                 Ok((status, body))
             }
-            Err(error) => match self.store.get(&base, path) {
+            Err(error) => match self.stored(path).await {
                 Some((body, _)) => {
                     self.offline.store(true, Ordering::Relaxed);
                     Ok((StatusCode::OK, body))
@@ -527,9 +588,103 @@ mod tests {
             "/api/runs/r/artifacts/session.jsonl",
             b"{\"kind\":\"task_started\"}"
         ));
+        let quoted =
+            br#"{"v":1,"kind":"note","text":"saw {\"kind\":\"shutdown\"} in the old log"}"#;
+        assert!(
+            !settled("/api/runs/r/artifacts/session.jsonl", quoted),
+            "an event that quotes a shutdown is not one"
+        );
+        let mut running = ended.to_vec();
+        running.extend_from_slice(b"\nnot json");
+        assert!(settled("/api/runs/r/artifacts/session.jsonl", &running));
+        let mut long = ended.to_vec();
+        for _ in 0..40 {
+            long.extend_from_slice(b"\n{\"kind\":\"task_started\"}");
+        }
+        assert!(
+            !settled("/api/runs/r/artifacts/session.jsonl", &long),
+            "a shutdown far from the end is not the run's last word"
+        );
         assert!(settled("/api/playbook-drafts/d/files?version=4", b""));
         assert!(!settled("/api/playbook-drafts/d/files", b""));
         assert!(!settled("/api/runs/r/log", ended));
+    }
+
+    fn held(store: &Store) -> (i64, i64) {
+        let summed = store
+            .db()
+            .query_row(
+                "SELECT COALESCE(SUM(LENGTH(body)), 0) FROM responses",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (store.held.load(Ordering::Relaxed), summed)
+    }
+
+    #[test]
+    fn the_bytes_held_are_counted_through_replacing_dropping_and_reopening() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.sqlite");
+        {
+            let store = Store::with_budget(&path, 40).unwrap();
+            store.put("b", "/a", b"0123456789", false);
+            store.put("b", "/b", b"0123456789", false);
+            assert_eq!(held(&store), (20, 20));
+            store.put("b", "/a", b"01234", false);
+            assert_eq!(held(&store), (15, 15), "a shorter body gives bytes back");
+            store.put("b", "/a", b"01234", false);
+            assert_eq!(
+                held(&store),
+                (15, 15),
+                "the same body again changes nothing"
+            );
+            store.put("b", "/c", &[b'x'; 30], false);
+            let (counted, summed) = held(&store);
+            assert_eq!(counted, summed);
+            assert!(summed <= 40, "over budget, the oldest went: {summed}");
+        }
+        let reopened = Store::with_budget(&path, 40).unwrap();
+        let (counted, summed) = held(&reopened);
+        assert_eq!(counted, summed);
+        assert!(summed > 0);
+    }
+
+    #[test]
+    fn a_body_already_held_is_not_written_or_indexed_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("cache.sqlite")).unwrap();
+        let path = format!("/api/runs/{RUN}/artifacts/session.jsonl");
+        let changes = |store: &Store| store.db().total_changes();
+        let used = |store: &Store| -> i64 {
+            store
+                .db()
+                .query_row("SELECT used FROM responses", [], |row| row.get(0))
+                .unwrap()
+        };
+        let empty = changes(&store);
+        store.put("b", &path, &session(), false);
+        let (first, first_used) = (changes(&store), used(&store));
+        assert!(first - empty > 3, "the body and its lines are written");
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        store.put("b", &path, &session(), false);
+        assert_eq!(
+            changes(&store) - first,
+            1,
+            "the same body again only marks the row used"
+        );
+        assert!(used(&store) > first_used);
+
+        let again = changes(&store);
+        let mut grown = session();
+        grown.extend_from_slice(b"\n{\"v\":1,\"kind\":\"shutdown\",\"outcome\":\"ok\"}");
+        store.put("b", &path, &grown, true);
+        assert!(
+            changes(&store) - again > 3,
+            "a changed body is written whole"
+        );
+        assert_eq!(store.get("b", &path), Some((grown, true)));
     }
 
     const RUN: &str = "playbook_cve_01a2-1";

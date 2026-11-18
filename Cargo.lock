@@ -359,9 +359,9 @@ dependencies = [
 
 [[package]]
 name = "async-executor"
-version = "1.14.0"
+version = "1.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c96bf972d85afc50bf5ab8fe2d54d1586b4e0b46c97c50a0c9e71e2f7bcd812a"
+checksum = "f426a31126c735126297bc5ea7a521263c9faff4f63ca415267ee625651c4f37"
 dependencies = [
  "async-task",
  "concurrent-queue",
@@ -1631,9 +1631,9 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "clipboard-win"
-version = "5.4.1"
+version = "5.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bde03770d3df201d4fb868f2c9c59e66a3e4e2bd06692a0fe701e7103c7e84d4"
+checksum = "052af7878466feccda12ba7a6a67d019d712f296809559b47c12c8cc196d3a9a"
 dependencies = [
  "error-code",
 ]
@@ -2007,7 +2007,7 @@ checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
 name = "crucible"
-version = "0.6.0"
+version = "0.7.2"
 dependencies = [
  "allocative",
  "anyhow",
@@ -2046,6 +2046,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_norway",
+ "spiffe",
  "starlark",
  "starlark_syntax",
  "tar",
@@ -2067,7 +2068,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-broker"
-version = "0.6.0"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -2096,7 +2097,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-capability"
-version = "0.6.0"
+version = "0.7.2"
 dependencies = [
  "semver",
  "serde",
@@ -2106,7 +2107,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-contract"
-version = "0.6.0"
+version = "0.7.2"
 dependencies = [
  "flate2",
  "jsonschema",
@@ -2123,7 +2124,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-controller"
-version = "0.6.0"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2140,6 +2141,7 @@ dependencies = [
  "crucible-contract",
  "crucible-kueue",
  "crucible-mcp-auth",
+ "crucible-vcs",
  "crux",
  "ctrlc",
  "flate2",
@@ -2181,6 +2183,7 @@ dependencies = [
  "serde_json",
  "serde_norway",
  "sha2 0.10.9",
+ "similar",
  "sqlx",
  "strum 0.28.0",
  "tar",
@@ -2207,7 +2210,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-git"
-version = "0.6.0"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "apollo-parser",
@@ -2238,7 +2241,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-harness"
-version = "0.6.0"
+version = "0.7.2"
 dependencies = [
  "axum",
  "crucible-contract",
@@ -2251,14 +2254,16 @@ dependencies = [
 
 [[package]]
 name = "crucible-kueue"
-version = "0.6.0"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "axum",
  "clap",
  "crucible-mcp-auth",
+ "futures-util",
  "hex",
  "http",
+ "jiff",
  "k8s-openapi 0.29.0",
  "kube 5.0.0",
  "kube_quantity",
@@ -2279,8 +2284,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "crucible-kueue-client"
+version = "0.7.2"
+dependencies = [
+ "axum",
+ "crucible-contract",
+ "crucible-kueue",
+ "crucible-mcp-auth",
+ "kube 5.0.0",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
 name = "crucible-lsp"
-version = "0.6.0"
+version = "0.7.2"
 dependencies = [
  "crucible",
  "crucible-contract",
@@ -2295,12 +2317,13 @@ dependencies = [
 
 [[package]]
 name = "crucible-mcp-auth"
-version = "0.6.0"
+version = "0.7.2"
 dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
  "cel",
+ "crucible-contract",
  "http",
  "http-body-util",
  "jsonwebtoken 11.1.0",
@@ -2323,9 +2346,10 @@ dependencies = [
 
 [[package]]
 name = "crucible-vcs"
-version = "0.6.0"
+version = "0.7.2"
 dependencies = [
  "anyhow",
+ "duct",
  "git2",
  "thiserror 2.0.21",
 ]
@@ -2338,13 +2362,15 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "crux"
-version = "0.6.0"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "async-trait",
  "axum",
  "clap",
  "crucible-contract",
+ "futures-util",
+ "gloo-timers",
  "reqwest",
  "rmcp",
  "serde",
@@ -2815,6 +2841,18 @@ name = "dotenvy"
 version = "0.15.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
+
+[[package]]
+name = "duct"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "61b9e2a29ff01e8bb526a571ad06c10ed72aae80d5999ed204f7971f99f19974"
+dependencies = [
+ "libc",
+ "os_pipe",
+ "shared_child",
+ "shared_thread",
+]
 
 [[package]]
 name = "dunce"
@@ -3383,7 +3421,7 @@ checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
 name = "forge"
-version = "0.6.0"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -6160,9 +6198,9 @@ dependencies = [
 
 [[package]]
 name = "libz-sys"
-version = "1.1.31"
+version = "1.1.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff20308ecabd635a2dc1dd5834a86c462cca20efba1d5d3ddab1f8aea3455cb2"
+checksum = "fee3f59f4321dab0c78d828942e7aa09d0bd8ad6e78a501977e6bf3d02938045"
 dependencies = [
  "cc",
  "libc",
@@ -7068,7 +7106,7 @@ dependencies = [
 [[package]]
 name = "openshell-core"
 version = "0.0.0"
-source = "git+https://github.com/wseaton/OpenShell.git?rev=8350ed52b7754750e93d505de6f5d62b9ed5de0b#8350ed52b7754750e93d505de6f5d62b9ed5de0b"
+source = "git+https://github.com/wseaton/OpenShell.git?rev=a18f1bba75e997f83321213311d8c55a5df81781#a18f1bba75e997f83321213311d8c55a5df81781"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -7103,7 +7141,7 @@ dependencies = [
 [[package]]
 name = "openshell-crypto"
 version = "0.0.0"
-source = "git+https://github.com/wseaton/OpenShell.git?rev=8350ed52b7754750e93d505de6f5d62b9ed5de0b#8350ed52b7754750e93d505de6f5d62b9ed5de0b"
+source = "git+https://github.com/wseaton/OpenShell.git?rev=a18f1bba75e997f83321213311d8c55a5df81781#a18f1bba75e997f83321213311d8c55a5df81781"
 dependencies = [
  "aws-lc-rs",
  "jsonwebtoken 10.4.0",
@@ -7121,7 +7159,7 @@ dependencies = [
 [[package]]
 name = "openshell-extension-core"
 version = "0.0.0"
-source = "git+https://github.com/wseaton/OpenShell.git?rev=8350ed52b7754750e93d505de6f5d62b9ed5de0b#8350ed52b7754750e93d505de6f5d62b9ed5de0b"
+source = "git+https://github.com/wseaton/OpenShell.git?rev=a18f1bba75e997f83321213311d8c55a5df81781#a18f1bba75e997f83321213311d8c55a5df81781"
 dependencies = [
  "hyper-util",
  "serde",
@@ -7134,7 +7172,7 @@ dependencies = [
 [[package]]
 name = "openshell-policy"
 version = "0.0.0"
-source = "git+https://github.com/wseaton/OpenShell.git?rev=8350ed52b7754750e93d505de6f5d62b9ed5de0b#8350ed52b7754750e93d505de6f5d62b9ed5de0b"
+source = "git+https://github.com/wseaton/OpenShell.git?rev=a18f1bba75e997f83321213311d8c55a5df81781#a18f1bba75e997f83321213311d8c55a5df81781"
 dependencies = [
  "hickory-proto",
  "miette",
@@ -7148,7 +7186,7 @@ dependencies = [
 [[package]]
 name = "openshell-policy-schema"
 version = "0.0.0"
-source = "git+https://github.com/wseaton/OpenShell.git?rev=8350ed52b7754750e93d505de6f5d62b9ed5de0b#8350ed52b7754750e93d505de6f5d62b9ed5de0b"
+source = "git+https://github.com/wseaton/OpenShell.git?rev=a18f1bba75e997f83321213311d8c55a5df81781#a18f1bba75e997f83321213311d8c55a5df81781"
 dependencies = [
  "miette",
  "noyalib",
@@ -7262,6 +7300,16 @@ dependencies = [
 [[package]]
 name = "ordered_hashmap"
 version = "0.0.3"
+
+[[package]]
+name = "os_pipe"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "outref"
@@ -8713,9 +8761,9 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.5"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags 2.13.2",
  "errno",
@@ -9361,10 +9409,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "shared_child"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "607549934f6cc26b89cfecfdc46fa90f1e5d1536a68349b0c3a4f9d1c0d37959"
+dependencies = [
+ "libc",
+ "sigchld",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "shared_thread"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de1c6cdf07f3a4b1900680728ac1a12f72aa6424f37138f9253116461576e00f"
+
+[[package]]
 name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
+name = "sigchld"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24f2b37f04360cd465089b87a9c3869c08220a2f3458463f0adf8badf5e77f2c"
+dependencies = [
+ "libc",
+ "os_pipe",
+ "signal-hook",
+]
+
+[[package]]
+name = "signal-hook"
+version = "0.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "49f7447afd772ca79ad17ae0a3972a6b0df0cb4b80990fd82707593e9e012a74"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
 
 [[package]]
 name = "signal-hook-registry"
@@ -9509,6 +9595,32 @@ checksum = "94bf565ee1681b4473aa5a9d71d807347c28021bd1d8947cb626b02f42a0141f"
 dependencies = [
  "itertools 0.14.0",
  "quickcheck",
+]
+
+[[package]]
+name = "spiffe"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb3330f98f1b0c56c42e8d25f4793b242ffd2df57cb21d0cfdd8dfc24cc444b8"
+dependencies = [
+ "arc-swap",
+ "base64ct",
+ "fastrand",
+ "futures",
+ "hyper-util",
+ "prost",
+ "prost-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tonic",
+ "tonic-prost",
+ "tower",
+ "url",
+ "zeroize",
 ]
 
 [[package]]
@@ -10141,7 +10253,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -11830,7 +11942,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.6.0"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "clap",

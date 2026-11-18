@@ -1,0 +1,13 @@
+diff --git a/crates/rune/src/marks.rs b/crates/rune/src/marks.rs
+index 332e3f2d..74158c21 100644
+--- a/crates/rune/src/marks.rs
++++ b/crates/rune/src/marks.rs
+@@ -13,7 +13,7 @@
+ 
+ use std::sync::Mutex;
+ use std::sync::atomic::{AtomicBool, Ordering};
+-use std::time::Instant;
++use crate::time::Instant;
+ 
+ #[derive(Default)]
+ struct Book {

@@ -1,0 +1,20 @@
+# The pi session pack: two agent tasks share one conversation across two fresh sandboxes, and a
+# third task takes a repair turn. The launch names a random `codeword` that only the first turn
+# is told; `verify` passes only when the second turn reports it.
+[workspace]
+inject = ["verify.py"]
+
+[agent]
+backend       = "openshell"
+harness       = "pi"
+model         = "claude-haiku-4-5"
+sandbox_image = "ghcr.io/neuralmagic/sandbox-triage-pi@sha256:cab89d02382645bcc7ed7494b033ab76e605ecdf68b5f5f1dbe0a2af9ede4f18"
+goal          = "Keep one pi conversation across sandboxes and repair turns."
+
+# The images are linux/amd64.
+[agent.resources]
+node_selector = { "kubernetes.io/arch" = "amd64" }
+
+[workflow]
+type = "playbook"
+file = "workflow.star"

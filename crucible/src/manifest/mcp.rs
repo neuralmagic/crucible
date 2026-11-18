@@ -23,6 +23,54 @@ pub struct McpCfg {
     /// Handed to the server as `MCP_TOOLS`.
     #[serde(default)]
     pub tools: Vec<String>,
+    /// Which of the server's stderr lines reach crucible's own stderr.
+    #[serde(default)]
+    pub log: McpLog,
+}
+
+/// The least severe `tracing` level of a server's stderr that crucible passes on. Lines that are
+/// not `tracing` lines (a panic, a plain print) pass at every level but `off`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpLog {
+    Off,
+    Error,
+    #[default]
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl McpLog {
+    /// Whether `line`, as the server wrote it, passes.
+    pub fn passes(self, line: &str) -> bool {
+        if self == McpLog::Off {
+            return false;
+        }
+        tracing_level(&crucible_contract::console::strip_ansi(line))
+            .is_none_or(|level| level <= self)
+    }
+}
+
+/// The level of a `tracing_subscriber` line: its first word, or its second after a timestamp.
+fn tracing_level(line: &str) -> Option<McpLog> {
+    let level = |word: &str| match word {
+        "ERROR" => Some(McpLog::Error),
+        "WARN" => Some(McpLog::Warn),
+        "INFO" => Some(McpLog::Info),
+        "DEBUG" => Some(McpLog::Debug),
+        "TRACE" => Some(McpLog::Trace),
+        _ => None,
+    };
+    let mut words = line.split_whitespace();
+    let first = words.next()?;
+    level(first).or_else(|| {
+        first
+            .starts_with(|c: char| c.is_ascii_digit())
+            .then(|| words.next().and_then(level))
+            .flatten()
+    })
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -79,7 +127,44 @@ pub fn validate(table: &BTreeMap<String, McpCfg>, agent: &AgentCfg) -> Result<()
 #[cfg(test)]
 mod tests {
     use crate::manifest::Manifest;
-    use crate::manifest::mcp::McpError;
+    use crate::manifest::mcp::{McpError, McpLog};
+
+    #[test]
+    fn a_server_passes_its_warnings_and_untagged_lines_by_default() {
+        let colored_info = "\u{1b}[2m2026-11-09T18:02:41.069974Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m \u{1b}[1mcve-triage\u{1b}[0m\u{1b}[2m:\u{1b}[0m [llm-d] Jira search returned 176 ticket(s)";
+        let warn = "2026-11-09T18:02:41.07Z  WARN cve_triage::tickets: rate limited";
+        let error = "ERROR cve_triage: token expired";
+        let debug = "2026-11-09T18:02:41Z DEBUG hyper::client: connecting";
+        let panic = "thread 'main' panicked at src/main.rs:4:5:";
+        let quiet = McpLog::default();
+        assert_eq!(quiet, McpLog::Warn);
+        assert!(!quiet.passes(colored_info));
+        assert!(!quiet.passes(debug));
+        assert!(quiet.passes(warn));
+        assert!(quiet.passes(error));
+        assert!(quiet.passes(panic));
+        assert!(McpLog::Info.passes(colored_info));
+        assert!(!McpLog::Info.passes(debug));
+        assert!(McpLog::Trace.passes(debug));
+        assert!(!McpLog::Error.passes(warn));
+        assert!(McpLog::Error.passes(error));
+        assert!(!McpLog::Off.passes(panic));
+        assert!(
+            McpLog::Warn.passes("2026 was a year of INFO"),
+            "a level must be the line's own"
+        );
+    }
+
+    #[test]
+    fn a_servers_log_level_is_read_from_its_table() {
+        let text = "[repo]\npath = \".\"\n[agent]\nbackend = \"openshell\"\ngoal = \"g\"\n\
+                    [mcp.triage]\nbin = \"cve-triage\"\nlog = \"info\"\n[mcp.quiet]\nbin = \"q\"\n";
+        let m: Manifest = toml::from_str(text).expect("parses");
+        assert_eq!(m.mcp["triage"].log, McpLog::Info);
+        assert_eq!(m.mcp["quiet"].log, McpLog::Warn);
+        let bad = text.replace("\"info\"", "\"loud\"");
+        assert!(toml::from_str::<Manifest>(&bad).is_err());
+    }
 
     fn refusal(extra: &str) -> McpError {
         let text = format!(

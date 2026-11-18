@@ -45,7 +45,7 @@ pub enum Command {
 }
 
 impl Command {
-    pub const ALL: [Command; 46] = [
+    pub const ALL: [Command; 54] = [
         Command::Palette,
         Command::Search,
         Command::Focus(Edge::Left),
@@ -62,6 +62,8 @@ impl Command {
         Command::Show(PaneKind::Compare),
         Command::Show(PaneKind::Log),
         Command::Show(PaneKind::Pack),
+        Command::Show(PaneKind::Agent),
+        Command::Show(PaneKind::History),
         Command::LogStream,
         Command::LogByTask,
         Command::CopyLink,
@@ -69,10 +71,16 @@ impl Command {
         Command::FixWithAgent,
         Command::SwitchBackend,
         Command::Open(Page::Runs),
-        Command::Open(Page::Schedules),
+        Command::Open(Page::Triggers),
         Command::Open(Page::Secrets),
         Command::Open(Page::Decisions),
         Command::Open(Page::Approvals),
+        Command::Open(Page::Teams),
+        Command::Open(Page::Providers),
+        Command::Open(Page::Blueprints),
+        Command::Open(Page::Activity),
+        Command::Open(Page::Issues),
+        Command::Open(Page::Admin),
         Command::Open(Page::Settings),
         Command::SaveDraft,
         Command::LaunchWorkingCopy,
@@ -177,6 +185,8 @@ impl Command {
             Command::Show(PaneKind::Log) => vec![primary("cmd+6", "ctrl+6")],
             Command::Show(PaneKind::Pack) => vec![primary("cmd+7", "ctrl+7")],
             Command::Show(PaneKind::Transcript) => vec![primary("cmd+8", "ctrl+8")],
+            Command::Show(PaneKind::Agent) => vec![primary("cmd+9", "ctrl+9")],
+            Command::Show(PaneKind::History) => vec![primary("cmd+y", "ctrl+y")],
             Command::Open(Page::Settings) => vec![primary("cmd+,", "ctrl+,")],
             Command::Open(Page::Decisions) => vec![primary("cmd+shift+d", "ctrl+shift+d")],
             Command::SaveDraft => vec![primary("cmd+s", "ctrl+s")],

@@ -135,7 +135,7 @@ impl ApprovalPoll {
         if crate::issues::store::record_approval(self.db.pool(), row.scope_id, &approval.by, &now)
             .await?
         {
-            if self.cfg.issues_agent_tokens()
+            if self.cfg.issues_run_tokens()
                 && let Some(login) = self.authz.crucible_login(&approval.by)
             {
                 crate::issues::store::request_dispatch(self.db.pool(), &row.key, login).await?;

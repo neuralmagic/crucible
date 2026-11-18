@@ -172,19 +172,7 @@ fn pack_push_url(repo: &str, token: Option<&str>) -> String {
 /// `publish.rs` base-branch trick). Uses the SYSTEM git binary (the runtime image's libgit2 has no
 /// TLS backend — the same reason `publish::push_ref` shells git). `--force` makes a re-push idempotent.
 fn push_pack_branches(pack_out: &Path, push_url: &str, branches: &PackBranches) -> Result<()> {
-    let git = |args: &[&str]| -> Result<()> {
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(pack_out)
-            .args(args)
-            .status()
-            .context("running `git` (is it on PATH?)")?;
-        if !status.success() {
-            // `args` never carries the token (that's only in the push URL, handled separately).
-            bail!("git {:?} failed ({status})", args.first().unwrap_or(&""));
-        }
-        Ok(())
-    };
+    let git = |args: &[&str]| crucible_vcs::cli::git(pack_out, args).run();
 
     // Fresh repo (idempotent on re-run), identity set locally so no global config is required.
     git(&["init", "-q"])?;
@@ -193,7 +181,7 @@ fn push_pack_branches(pack_out: &Path, push_url: &str, branches: &PackBranches) 
     // The pristine empty base commit, then the pack head on top of it.
     git(&["checkout", "-q", "-B", "crucible-pack-base"])?;
     git(&["commit", "-q", "--allow-empty", "-m", "pristine base"])?;
-    let base_sha = git_stdout(pack_out, &["rev-parse", "HEAD"])?;
+    let base_sha = crucible_vcs::cli::git(pack_out, ["rev-parse", "HEAD"]).read()?;
     git(&["checkout", "-q", "-B", "crucible-pack-head"])?;
     git(&["add", "-A"])?;
     git(&["commit", "-q", "--allow-empty", "-m", "scope pack"])?;
@@ -205,41 +193,13 @@ fn push_pack_branches(pack_out: &Path, push_url: &str, branches: &PackBranches) 
     Ok(())
 }
 
-/// `git -C <dir> <args>` capturing stdout (trimmed by the caller).
-fn git_stdout(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .context("running `git`")?;
-    if !out.status.success() {
-        bail!(
-            "git {:?} failed: {}",
-            args.first().unwrap_or(&""),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
 /// Push `local_ref` (a branch, `HEAD`, or a bare SHA) to `url` as `refs/heads/{branch}`. `--force`
 /// makes a re-push idempotent. `url` may carry the PAT, so it is excluded from the error message.
 fn push_ref(workspace: &Path, url: &str, local_ref: &str, branch: &str) -> Result<()> {
     let refspec = format!("{local_ref}:refs/heads/{branch}");
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(workspace)
-        .arg("push")
-        .arg("--force")
-        .arg(url)
-        .arg(&refspec)
-        .status()
-        .context("running `git push`")?;
-    if !status.success() {
-        bail!("git push of {refspec} failed ({status})");
-    }
-    Ok(())
+    crucible_vcs::cli::git(workspace, ["push", "--force", url, &refspec])
+        .run()
+        .with_context(|| format!("git push of {refspec}"))
 }
 
 /// The existing draft PR's url for `head`, if one is already open (idempotency). Shells `gh pr list`.

@@ -4433,6 +4433,7 @@ async fn a_pinned_issue_dispatches_its_loop_run_with_the_pair(pool: PgPool) -> R
     crate::playbooks::providers::upsert(
         db.pool(),
         &crate::playbooks::providers::NewProvider {
+            model_limits: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "openai-plat",
             display_name: "OpenAI",
@@ -4605,6 +4606,7 @@ async fn a_pinned_scope_turn_renders_its_provider_and_carries_its_key(pool: PgPo
     crate::playbooks::providers::upsert(
         db.pool(),
         &crate::playbooks::providers::NewProvider {
+            model_limits: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "openai-plat",
             display_name: "OpenAI",
@@ -6791,6 +6793,7 @@ async fn adopt_launch_with_groups(
                 db.pool(),
                 key,
                 &crate::launches::model::NewPlaybookLaunch {
+                    choice_snapshots: None,
                     playbook: "survey",
                     repo: "owner/repo",
                     title: "a survey",
@@ -6863,6 +6866,7 @@ async fn scheduled_launch_with_cursor(db: &Db, key: &str) -> String {
         db.pool(),
         key,
         &crate::launches::model::NewPlaybookLaunch {
+            choice_snapshots: None,
             playbook: "survey",
             repo: "owner/repo",
             title: "a survey",
@@ -7350,6 +7354,7 @@ async fn a_playbook_launch_carries_its_agent_and_decision_bindings(pool: PgPool)
     crate::playbooks::providers::upsert(
         db.pool(),
         &NewProvider {
+            model_limits: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "openai",
             display_name: "OpenAI",
@@ -8180,8 +8185,11 @@ impl crate::runs::workpod::PodDispatcher for ClusterRunPodDispatcher {
             message: self.message.clone(),
         })
     }
-    async fn logs(&self, cluster: &str, _ns: &str, _name: &str) -> Result<String> {
+    async fn logs(&self, cluster: &str, _ns: &str, name: &str) -> Result<String> {
         self.reachable(cluster)?;
+        if self.deleted().iter().any(|(_, pod)| pod == name) {
+            return Err(Self::not_found());
+        }
         Ok(self.logs.clone())
     }
     async fn delete(&self, cluster: &str, _ns: &str, name: &str) -> Result<()> {
@@ -8458,14 +8466,16 @@ async fn a_cancel_parks_the_launch_deletes_its_pod_and_marks_the_run_cancelled(
         std::time::Duration::from_secs(5 * 60),
     )
     .await?;
-    let dispatcher = std::sync::Arc::new(ClusterRunPodDispatcher::on(
-        "pirate",
-        crate::runs::workpod::TurnPhase::TimedOut,
-    ));
+    let dispatcher = std::sync::Arc::new(ClusterRunPodDispatcher {
+        logs: "gateway_boot: ok\nsetup: cloning vllm\n".to_string(),
+        ..ClusterRunPodDispatcher::on("pirate", crate::runs::workpod::TurnPhase::TimedOut)
+    });
     let mut cfg = cfg_with(dir.path(), Profile::default());
     cfg.runtime.dispatcher = dispatcher.clone();
 
-    let store = std::sync::Arc::new(crate::daemon::overrides::OverrideStore::new());
+    let store = std::sync::Arc::new(crate::daemon::overrides::OverrideStore::new(
+        db.pool().clone(),
+    ));
     crate::daemon::overrides::QueueOverrideSink::new(
         store.clone(),
         crate::daemon::queue::WorkQueue::new(),
@@ -8476,7 +8486,8 @@ async fn a_cancel_parks_the_launch_deletes_its_pod_and_marks_the_run_cancelled(
         reason: None,
         priority: None,
         actor: Some("wseaton".into()),
-    });
+    })
+    .await?;
     let applied = crate::daemon::overrides::apply_pending(&db, &store, key, false)
         .await?
         .expect("the cancel was pending");
@@ -8490,6 +8501,13 @@ async fn a_cancel_parks_the_launch_deletes_its_pod_and_marks_the_run_cancelled(
         dispatcher.deleted(),
         vec![("pirate".to_string(), pod.to_string())],
         "the pod is deleted on the spoke it runs on"
+    );
+    assert_eq!(
+        crate::runs::blob_store::get_run_engine_log(db.pool(), "run-cancel-1")
+            .await?
+            .as_deref(),
+        Some("gateway_boot: ok\nsetup: cloning vllm\n"),
+        "the pod's log is read before the pod is deleted"
     );
     let row = work_pod(&db, pod).await?;
     assert_eq!(row.state, crate::runs::workpod::WorkPodState::Collected);

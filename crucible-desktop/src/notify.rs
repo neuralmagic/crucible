@@ -8,7 +8,7 @@ use std::sync::mpsc::Sender;
 
 use rune::Waker;
 
-use crate::live::Finished;
+use crate::live::{Finished, LaunchStatus};
 
 /// One notification: what it says and the run it opens.
 #[derive(Clone, Debug, PartialEq)]
@@ -23,10 +23,11 @@ pub struct Note {
 
 /// What a finished launch is announced with.
 pub fn note(finished: &Finished) -> Note {
-    let outcome = match (finished.status.as_str(), &finished.why) {
-        ("done", _) => "Finished".to_string(),
-        (status, Some(why)) => format!("{} \u{2014} {why}", capitalized(status)),
-        (status, None) => capitalized(status),
+    let outcome = match (&finished.status, &finished.why) {
+        (LaunchStatus::Done, _) => "Finished".to_string(),
+        (LaunchStatus::Cancelled, Some(why)) => capitalized(why),
+        (status, Some(why)) => format!("{} \u{2014} {why}", capitalized(status.as_str())),
+        (status, None) => capitalized(status.as_str()),
     };
     let body = match finished.cost {
         Some(cost) if cost > 0.0 => format!("{outcome} \u{b7} ${cost:.2}"),
@@ -243,7 +244,7 @@ mod freedesktop {
 #[cfg(test)]
 mod tests {
     use crate::link::Link;
-    use crate::live::Finished;
+    use crate::live::{Finished, LaunchStatus};
     use crate::notify::{note, quoted};
 
     fn finished(status: &str, why: Option<&str>, cost: Option<f64>) -> Finished {
@@ -251,11 +252,17 @@ mod tests {
             seq: 1,
             key: "playbook:vllm-agent-fanout:01a1".into(),
             playbook: "vllm-agent-fanout".into(),
-            status: status.into(),
+            status: LaunchStatus::parse(status, why),
             by: "weaton".into(),
             why: why.map(Into::into),
             cost,
         }
+    }
+
+    #[test]
+    fn a_cancelled_launch_says_who_cancelled_it() {
+        let cancelled = finished("parked", Some("cancelled by weaton"), None);
+        assert_eq!(note(&cancelled).body, "Cancelled by weaton");
     }
 
     #[test]

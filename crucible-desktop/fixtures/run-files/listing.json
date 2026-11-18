@@ -1,0 +1,40 @@
+{
+  "files": [
+    {
+      "instance": null,
+      "key": "climb/best.patch",
+      "path": "best.patch",
+      "size_bytes": 3955,
+      "task": "climb"
+    },
+    {
+      "instance": null,
+      "key": "climb/report.json",
+      "path": "report.json",
+      "size_bytes": 4408,
+      "task": "climb"
+    },
+    {
+      "instance": null,
+      "key": "climb/results.jsonl",
+      "path": "results.jsonl",
+      "size_bytes": 5505,
+      "task": "climb"
+    },
+    {
+      "instance": null,
+      "key": "climb/timeline.jsonl",
+      "path": "timeline.jsonl",
+      "size_bytes": 1857,
+      "task": "climb"
+    },
+    {
+      "instance": null,
+      "key": "report/summary.md",
+      "path": "summary.md",
+      "size_bytes": 2013,
+      "task": "report"
+    }
+  ],
+  "run_id": "playbook_vllm-hill-climb_01a1c0e3-34e5-744a-91d0-e23124d75945-1794237478"
+}

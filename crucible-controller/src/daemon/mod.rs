@@ -124,7 +124,7 @@ pub async fn assemble(
                 &db,
                 &store,
                 &key.0,
-                cfg.issues_agent_tokens(),
+                cfg.issues_run_tokens(),
             )
             .await?;
             if let Some(ov) = applied
@@ -158,6 +158,9 @@ pub async fn assemble(
             Arc::new(crate::launches::webhooks::trigger::WebhookTrigger),
         ])),
         Arc::new(crate::launches::pending::PendingLaunches::new(
+            db.pool().clone(),
+        )),
+        Arc::new(crate::daemon::overrides::PendingOverrides::new(
             db.pool().clone(),
         )),
     ]));

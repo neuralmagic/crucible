@@ -102,13 +102,13 @@ mod tests {
         h.saw(at(Page::Runs, Some("a")));
         h.saw(at(Page::Runs, Some("a")));
         h.saw(at(Page::Runs, Some("b")));
-        h.saw(at(Page::Schedules, Some("b")));
+        h.saw(at(Page::Triggers, Some("b")));
         assert_eq!(h.back(), Some(at(Page::Runs, Some("b"))));
         assert_eq!(h.back(), Some(at(Page::Runs, Some("a"))));
         assert_eq!(h.back(), None, "nothing before the first");
         assert_eq!(h.forward(), Some(at(Page::Runs, Some("b"))));
         h.saw(at(Page::Runs, Some("b")));
-        assert_eq!(h.forward(), Some(at(Page::Schedules, Some("b"))));
+        assert_eq!(h.forward(), Some(at(Page::Triggers, Some("b"))));
         h.back();
         h.saw(at(Page::Secrets, None));
         assert_eq!(h.forward(), None, "a new place ends forward");
