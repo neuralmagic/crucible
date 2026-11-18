@@ -34,6 +34,8 @@ pub enum AttemptOutcome {
 pub struct TransportFailure {
     pub cause: TransportCause,
     pub note: String,
+    /// The same attempt made again would die the same way, so it is not retried.
+    pub permanent: bool,
 }
 
 impl TransportFailure {
@@ -41,6 +43,14 @@ impl TransportFailure {
         Self {
             cause,
             note: note.into(),
+            permanent: false,
+        }
+    }
+
+    pub fn permanent(cause: TransportCause, note: impl Into<String>) -> Self {
+        Self {
+            permanent: true,
+            ..Self::new(cause, note)
         }
     }
 }
