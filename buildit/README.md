@@ -131,7 +131,7 @@ and content-addressed; prune with your registry's lifecycle policy.
 
 ## MCP server
 
-`buildit mcp` serves `build`, `status`, `run`, `push`, `logs`, and `clean` as MCP tools over
+`buildit mcp` serves `build`, `status`, `wait`, `run`, `push`, `logs`, and `clean` as MCP tools over
 stateless streamable http, for agents in sandboxes that can't build images. Each build, run and
 push is a Kubernetes Job that ends: Kueue admits it against its queue's quota (`--queue`), its pod
 runs in a user namespace (`--pod-users`), and Kubernetes deletes it `--job-ttl` seconds after it

@@ -3264,6 +3264,7 @@ async fn a_resolved_provider_reaches_the_loop_wrapper(pool: sqlx::PgPool) -> Res
         &pool,
         &crate::playbooks::providers::NewProvider {
             model_limits: Default::default(),
+            model_prices: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "openai-plat",
             display_name: "OpenAI",
@@ -3339,6 +3340,7 @@ async fn a_resolved_provider_reaches_the_playbook_wrapper(pool: sqlx::PgPool) ->
         &pool,
         &crate::playbooks::providers::NewProvider {
             model_limits: Default::default(),
+            model_prices: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "openai-plat",
             display_name: "OpenAI",
@@ -5038,6 +5040,7 @@ async fn the_resolved_providers_key_is_delivered_with_the_scopes_bindings(
         &pool,
         &crate::playbooks::providers::NewProvider {
             model_limits: Default::default(),
+            model_prices: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "openai-plat",
             display_name: "OpenAI",
@@ -5217,6 +5220,7 @@ async fn a_grounded_rank_runs_under_its_resolved_provider(pool: sqlx::PgPool) ->
         &pool,
         &crate::playbooks::providers::NewProvider {
             model_limits: Default::default(),
+            model_prices: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "gateway",
             display_name: "Gateway",
@@ -5328,6 +5332,7 @@ async fn a_custom_provider_delivers_its_endpoint_and_price_beside_its_key(
         &pool,
         &crate::playbooks::providers::NewProvider {
             model_limits: Default::default(),
+            model_prices: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "onprem",
             display_name: "On-prem vLLM",
@@ -5469,6 +5474,7 @@ async fn a_provider_key_the_dispatch_cannot_resolve_refuses_the_run(
     // Registered nowhere: `register_inference_key` is deliberately not called.
     let missing = crate::playbooks::providers::ModelProvider {
         model_limits: Default::default(),
+        model_prices: Default::default(),
         owner: crate::authz::model::Principal::platform(),
         id: "openai-plat".to_string(),
         display_name: "OpenAI".to_string(),

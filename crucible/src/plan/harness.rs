@@ -15,7 +15,7 @@ use anyhow::Context;
 use serde_json::Value;
 
 use crate::agent::event::{AgentEvent, RawStream};
-use crate::agent::turn::TurnFailure;
+use crate::agent::turn::{TurnCost, TurnFailure};
 use crate::plan::admission::{Admission, Lane, Refusal};
 use crate::plan::attempt::{Attempt, AttemptOutcome, BatchItem, TransportFailure};
 use crate::plan::exec::TaskRunner;
@@ -1066,6 +1066,7 @@ fn stream_turn(
         let name = name.clone();
         Heartbeat::spawn(Arc::clone(&log), move |line| eprintln!("[{name}] {line}"))
     };
+    let mut live = TurnCost::new(cx.args.pricing());
     let turn = crate::agent::run_turn_with_session(
         cx.args,
         paths,
@@ -1084,8 +1085,8 @@ fn stream_turn(
                     eprintln!("[{name}] {progress}");
                 }
             }
-            if let (Some(lane), Some(cost)) = (cx.lane, ev.and_then(crate::agent::event::cost_of)) {
-                lane.spent_so_far(banked + cost);
+            if let (Some(lane), Some(ev)) = (cx.lane, ev) {
+                report_spend(lane, banked, &mut live, ev);
             }
             if let Some(failure) = ev.and_then(agent_transport_error) {
                 reported = matches!(ev, Some(AgentEvent::Result { .. }));
@@ -1119,6 +1120,13 @@ fn stream_turn(
         Some(failure) => (cost, TurnStop::Transport(failure)),
         None => (cost, TurnStop::Clean),
     }
+}
+
+/// Fold `ev` into the turn's running cost and report the lane's spend as the turn would settle
+/// it now, on top of what its earlier turns `banked`.
+fn report_spend(lane: &Lane<'_>, banked: f64, live: &mut TurnCost, ev: &AgentEvent) {
+    live.observe(ev);
+    lane.spent_so_far(banked + live.total());
 }
 
 #[cfg(feature = "autoresearch")]
@@ -5781,6 +5789,160 @@ pathlib.Path('PLAN_TASK_RESULT.json').write_text(
         assert!(
             prompt.contains("}\n\n## Result contract"),
             "a prompt without history is laid out as before: {prompt}"
+        );
+    }
+
+    fn spending_agent(name: &str) -> Task {
+        Task {
+            name: name.into(),
+            task: TaskKind::Agent {
+                prompt: "assess".into(),
+                harness: None,
+                model: None,
+                effort: None,
+                sandbox: None,
+            },
+            depends_on: Vec::new(),
+            session: None,
+            needs: "any".into(),
+            required: true,
+            isolation: None,
+            join: crate::plan::ir::Join::default(),
+            stage: crate::plan::ir::Stage::Iteration,
+            emits: crate::plan::ir::Emits::default(),
+            emits_files: Vec::new(),
+            over: None,
+            max_fanout: None,
+            keyed: Vec::new(),
+            when: None,
+            revise: None,
+            timeout: None,
+            history: None,
+            repair: 0,
+            optional: Vec::new(),
+        }
+    }
+
+    /// Run one lane priced by `model` whose harness reports `harness_usd` mid-turn and at its
+    /// result, under a $2 ceiling with $0.50 already banked by its earlier turns, and return
+    /// whether a second lane admitted while it runs is refused on cost.
+    fn second_lane_refused(model: &str, harness_usd: f64) -> bool {
+        let admission = Admission::new(2.0, 0.0, None, std::num::NonZeroUsize::MIN);
+        let first = spending_agent("assess[a]");
+        let second = spending_agent("assess[b]");
+        let item = |task| crate::plan::attempt::BatchItem {
+            task,
+            attempt: 1,
+            inputs: BTreeMap::new(),
+        };
+        let pricing = crate::agent::event::Pricing::resolve(model, None);
+        let events = [
+            AgentEvent::Tokens(crate::agent::event::Tokens {
+                input: 120_000,
+                output: 40_000,
+                total: 160_000,
+                cost_usd: Some(harness_usd),
+                ..Default::default()
+            }),
+            AgentEvent::Result {
+                subtype: "success".into(),
+                is_error: false,
+                turns: 9,
+                cost_usd: harness_usd,
+                error: None,
+            },
+        ];
+        let mut refused = None;
+        admission
+            .run(&item(&first), |lane| {
+                let mut live = TurnCost::new(pricing);
+                for ev in &events {
+                    report_spend(lane, 0.5, &mut live, ev);
+                }
+                refused = admission
+                    .run(&item(&second), |_| Attempt {
+                        outcome: AttemptOutcome::Pass(serde_json::json!({})),
+                        cost_usd: 0.0,
+                        repairs: Vec::new(),
+                    })
+                    .err();
+                Attempt {
+                    outcome: AttemptOutcome::Pass(serde_json::json!({})),
+                    cost_usd: live.total(),
+                    repairs: Vec::new(),
+                }
+            })
+            .expect("the first lane is admitted");
+        refused == Some(Refusal::CostCeiling)
+    }
+
+    /// A model no vendor bills settles at $0 whatever its harness estimates, so the harness's
+    /// figure must not count against the ceiling while the lane runs either.
+    #[test]
+    fn a_free_lanes_harness_cost_estimate_does_not_close_admission() {
+        assert!(!second_lane_refused(
+            "rits/deepseek-ai/DeepSeek-V4.1-Flash-1017",
+            1.75
+        ));
+    }
+
+    /// A vendor-billed lane settles at its harness's figure, so that figure counts while it runs.
+    #[test]
+    fn a_vendor_lanes_harness_cost_closes_admission_while_it_runs() {
+        assert!(second_lane_refused("claude-opus-4-6", 1.75));
+    }
+
+    /// A lane's live spend is what its turn would settle at, not the harness's raw figure.
+    #[test]
+    fn a_lanes_live_spend_is_the_turns_settled_cost() {
+        let admission = Admission::new(2.0, 0.0, None, std::num::NonZeroUsize::MIN);
+        let task = spending_agent("assess[a]");
+        let item = crate::plan::attempt::BatchItem {
+            task: &task,
+            attempt: 1,
+            inputs: BTreeMap::new(),
+        };
+        let priced = crucible_contract::inference::TokenPrice {
+            input: crucible_contract::inference::UsdPerMtok::new(1.0).expect("a price"),
+            output: crucible_contract::inference::UsdPerMtok::new(5.0).expect("a price"),
+            cache_read: crucible_contract::inference::UsdPerMtok::new(0.0).expect("a price"),
+            cache_write: crucible_contract::inference::UsdPerMtok::new(0.0).expect("a price"),
+        };
+        let pricing = crate::agent::event::Pricing::resolve("served-model", Some(&priced));
+        let mut refused = None;
+        admission
+            .run(&item, |lane| {
+                let mut live = TurnCost::new(pricing);
+                report_spend(
+                    lane,
+                    0.0,
+                    &mut live,
+                    &AgentEvent::Tokens(crate::agent::event::Tokens {
+                        input: 1_000_000,
+                        output: 200_000,
+                        total: 1_200_000,
+                        cost_usd: Some(0.01),
+                        ..Default::default()
+                    }),
+                );
+                refused = admission
+                    .run(&item, |_| Attempt {
+                        outcome: AttemptOutcome::Pass(serde_json::json!({})),
+                        cost_usd: 0.0,
+                        repairs: Vec::new(),
+                    })
+                    .err();
+                Attempt {
+                    outcome: AttemptOutcome::Pass(serde_json::json!({})),
+                    cost_usd: 0.0,
+                    repairs: Vec::new(),
+                }
+            })
+            .expect("the first lane is admitted");
+        assert_eq!(
+            refused,
+            Some(Refusal::CostCeiling),
+            "a $2.00 binding-priced turn reporting $0.01 must count at $2.00"
         );
     }
 }

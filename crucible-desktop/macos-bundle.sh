@@ -1,9 +1,10 @@
 #!/bin/sh
 # Assemble the release .app bundle with the blue-shaded icon and the workspace's crucible-lsp
 # beside the executable. Run after `cargo build --release` here and `cargo build --release -p
-# crucible-lsp` at the repo root. VERSION (default 0.0.0) is the bundle's version. FEATURE names
-# a build of an unmerged feature: "Crucible Playbooks (<FEATURE>)" with the green icon, its own
-# bundle id and no URL schemes, so it sits beside an installed release and takes none of its
+# crucible-lsp` at the repo root. VERSION (default 0.0.0) is the bundle's version. ICON (default
+# icon) names the icon in assets: icon-feature is the green one nightly builds carry. FEATURE
+# names a build of an unmerged feature: "Crucible Playbooks (<FEATURE>)" with the green icon, its
+# own bundle id and no URL schemes, so it sits beside an installed release and takes none of its
 # links.
 set -eu
 cd "$(dirname "$0")"
@@ -17,7 +18,7 @@ esac
 FEATURE="${FEATURE:-}"
 NAME="Crucible Playbooks"
 ID=dev.crucible.playbooks
-ICON=assets/icon.icns
+ICON="${ICON:-icon}"
 SCHEMES='    <key>CFBundleURLTypes</key>
     <array>
         <dict>
@@ -33,7 +34,7 @@ SCHEMES='    <key>CFBundleURLTypes</key>
 if [ -n "$FEATURE" ]; then
     NAME="Crucible Playbooks ($FEATURE)"
     ID="dev.crucible.playbooks.feature.$(printf '%s' "$FEATURE" | tr -c 'A-Za-z0-9-' '-')"
-    ICON=assets/icon-feature.icns
+    ICON=icon-feature
     SCHEMES=""
 fi
 
@@ -42,7 +43,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/crucible-playbooks "$APP/Contents/MacOS/crucible-playbooks"
 cp ../target/release/crucible-lsp "$APP/Contents/MacOS/crucible-lsp"
-cp "$ICON" "$APP/Contents/Resources/AppIcon.icns"
+cp "assets/$ICON.icns" "$APP/Contents/Resources/AppIcon.icns"
 cp THIRD-PARTY-NOTICES "$APP/Contents/Resources/THIRD-PARTY-NOTICES"
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

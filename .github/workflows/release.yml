@@ -10,9 +10,30 @@ name: Release
 # Tag a release (v*) to publish. workflow_dispatch: build-only smoke by default, or pass an
 # existing release tag as `tag` to build from it and backfill its assets (how a new matrix
 # target gets onto an already-cut release without re-tagging).
+#
+# workflow_call: the Nightly workflow builds commit `ref` and uploads to the release `tag`, with
+# `stamp` in the asset names and `version` in the bundles in place of the tag, and the app icon
+# `icon` from crucible-desktop/assets.
 on:
   push:
     tags: ['v*']
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+      ref:
+        type: string
+        required: true
+      stamp:
+        type: string
+        required: true
+      version:
+        type: string
+        required: true
+      icon:
+        type: string
+        required: true
   workflow_dispatch:
     inputs:
       tag:
@@ -45,7 +66,7 @@ jobs:
         with:
           persist-credentials: false
           # Backfill mode builds the tagged source, not whatever main has moved to.
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.ref || inputs.tag || github.ref }}
 
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
 
@@ -104,7 +125,7 @@ jobs:
         id: pkg
         run: |
           set -euo pipefail
-          tag="${{ inputs.tag || github.ref_name }}"
+          tag="${{ inputs.stamp || inputs.tag || github.ref_name }}"
           triple="$(rustc -vV | sed -n 's/^host: //p')"
           name="crucible-${tag}-${triple}"
           mkdir -p dist staging
@@ -146,7 +167,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.ref || inputs.tag || github.ref }}
 
       - name: Fedora packages
         run: sh crucible-desktop/linux/deps.sh
@@ -170,10 +191,10 @@ jobs:
           SQLX_OFFLINE: "true"
         run: |
           set -euo pipefail
-          tag="${{ inputs.tag || github.ref_name }}"
+          version="${{ inputs.version || inputs.tag || github.ref_name }}"
           cargo build --release --locked -p crucible-lsp
           ( cd crucible-desktop && cargo build --release --locked )
-          VERSION="${tag#v}" sh crucible-desktop/linux-bundle.sh
+          VERSION="${version#v}" ICON="${{ inputs.icon || 'icon' }}" sh crucible-desktop/linux-bundle.sh
           mkdir -p dist
           cp crucible-desktop/target/linux/*.rpm dist/
           ( cd dist && for f in *.rpm; do sha256sum "$f" > "$f.sha256"; done )
@@ -198,7 +219,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.ref || inputs.tag || github.ref }}
 
       # rustflags off: the action's default `-D warnings` reaches the vendored Rune, whose release
       # build warns about debug-only tooling.
@@ -221,15 +242,15 @@ jobs:
           SQLX_OFFLINE: "true"
         run: |
           set -euo pipefail
-          tag="${{ inputs.tag || github.ref_name }}"
+          version="${{ inputs.version || inputs.tag || github.ref_name }}"
           cargo build --release --locked -p crucible-lsp
           ( cd crucible-desktop && cargo build --release --locked )
-          VERSION="${tag#v}" sh crucible-desktop/macos-bundle.sh
+          VERSION="${version#v}" ICON="${{ inputs.icon || 'icon' }}" sh crucible-desktop/macos-bundle.sh
 
       - name: Package
         run: |
           set -euo pipefail
-          tag="${{ inputs.tag || github.ref_name }}"
+          tag="${{ inputs.stamp || inputs.tag || github.ref_name }}"
           name="Crucible-Playbooks-${tag}-aarch64-apple-darwin"
           mkdir -p dist
           ditto -c -k --keepParent "crucible-desktop/target/release/Crucible Playbooks.app" "dist/${name}.zip"

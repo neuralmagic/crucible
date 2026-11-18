@@ -1275,6 +1275,9 @@ pub struct Provider {
     pub harness: Option<String>,
     #[serde(default)]
     pub price: Option<ProviderPrice>,
+    /// What each model costs, by model id; a model with no entry is charged `price`.
+    #[serde(default)]
+    pub model_prices: std::collections::BTreeMap<String, ProviderPrice>,
     /// What each model can take and give, in tokens, by model id.
     #[serde(default)]
     pub model_limits: std::collections::BTreeMap<String, ModelLimits>,
@@ -1344,6 +1347,8 @@ pub struct ProviderBody {
     pub secret_owner: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub price: Option<ProviderPrice>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub model_prices: std::collections::BTreeMap<String, ProviderPrice>,
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub model_limits: std::collections::BTreeMap<String, ModelLimits>,
     pub enabled: bool,
