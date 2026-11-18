@@ -1757,6 +1757,11 @@ completed build task and `push` report it after a server restart too. `buildit c
 <dir>` stages a directory the way a build does and computes the same digest with the same code,
 so a script can check that what was built is what it prepared.
 
+A `build` whose context digest and parameters equal those of a build the same sandbox still has
+running returns that build, with `already_running: true`, and starts nothing. A build that has
+ended is never reused. `status` takes `wait_seconds` (up to 50) and then answers when the build
+ends or the wait passes, so a caller with no timer of its own can wait without polling.
+
 ### 8.7 The shared cache
 
 With `[buildit.cache]`, `crucible deploy --buildit-cache` renders `buildit cache` in the loop

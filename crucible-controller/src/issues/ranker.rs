@@ -1183,6 +1183,7 @@ mod tests {
         crate::playbooks::providers::upsert(
             db.pool(),
             &crate::playbooks::providers::NewProvider {
+                model_limits: Default::default(),
                 owner: crate::authz::model::Principal::platform(),
                 id: "gateway",
                 display_name: "Gateway",
@@ -1213,6 +1214,7 @@ mod tests {
     fn a_messages_endpoint_gains_v1_and_an_openai_one_is_used_as_given() {
         let dispatch = |protocol, url: &str| ResolvedDispatch {
             provider: crate::playbooks::providers::ModelProvider {
+                model_limits: Default::default(),
                 id: "p".to_string(),
                 display_name: "p".to_string(),
                 kind: ProviderKind::Custom,

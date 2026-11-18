@@ -115,6 +115,8 @@ export interface ProviderForm {
   secretName: string;
   secretOwner: string;
   enabled: boolean;
+  price: ProviderDetailDto['price'];
+  modelLimits: ProviderDetailDto['model_limits'];
 }
 
 export function emptyProviderForm(): ProviderForm {
@@ -130,6 +132,8 @@ export function emptyProviderForm(): ProviderForm {
     secretName: '',
     secretOwner: '',
     enabled: true,
+    price: null,
+    modelLimits: {},
   };
 }
 
@@ -147,6 +151,8 @@ export function formOf(provider: ProviderDetailDto): ProviderForm {
     secretName: provider.secret_name ?? '',
     secretOwner: provider.secret_owner ?? '',
     enabled: provider.enabled,
+    price: provider.price ?? null,
+    modelLimits: provider.model_limits,
   };
 }
 
@@ -222,6 +228,8 @@ export function providerBody(form: ProviderForm): ProviderBody {
     ...(secretName.length > 0 ? { secret_name: secretName } : {}),
     ...(secretName.length > 0 && secretOwner.length > 0 ? { secret_owner: secretOwner } : {}),
     enabled: form.enabled,
+    ...(form.price ? { price: form.price } : {}),
+    model_limits: form.modelLimits,
   };
 }
 

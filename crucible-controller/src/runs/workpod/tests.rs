@@ -3263,6 +3263,7 @@ async fn a_resolved_provider_reaches_the_loop_wrapper(pool: sqlx::PgPool) -> Res
     crate::playbooks::providers::upsert(
         &pool,
         &crate::playbooks::providers::NewProvider {
+            model_limits: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "openai-plat",
             display_name: "OpenAI",
@@ -3337,6 +3338,7 @@ async fn a_resolved_provider_reaches_the_playbook_wrapper(pool: sqlx::PgPool) ->
     crate::playbooks::providers::upsert(
         &pool,
         &crate::playbooks::providers::NewProvider {
+            model_limits: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "openai-plat",
             display_name: "OpenAI",
@@ -5035,6 +5037,7 @@ async fn the_resolved_providers_key_is_delivered_with_the_scopes_bindings(
     crate::playbooks::providers::upsert(
         &pool,
         &crate::playbooks::providers::NewProvider {
+            model_limits: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "openai-plat",
             display_name: "OpenAI",
@@ -5159,6 +5162,7 @@ async fn the_resolved_providers_key_is_delivered_with_the_scopes_bindings(
         inference_document(pod).bindings,
         vec![
             InferenceBinding {
+                limits: None,
                 role: InferenceRole::Agent,
                 protocol: WireProtocol::Responses,
                 url: None,
@@ -5167,6 +5171,7 @@ async fn the_resolved_providers_key_is_delivered_with_the_scopes_bindings(
                 price: None,
             },
             InferenceBinding {
+                limits: None,
                 role: InferenceRole::Decision,
                 protocol: WireProtocol::Decisions,
                 url: None,
@@ -5211,6 +5216,7 @@ async fn a_grounded_rank_runs_under_its_resolved_provider(pool: sqlx::PgPool) ->
     crate::playbooks::providers::upsert(
         &pool,
         &crate::playbooks::providers::NewProvider {
+            model_limits: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "gateway",
             display_name: "Gateway",
@@ -5321,6 +5327,7 @@ async fn a_custom_provider_delivers_its_endpoint_and_price_beside_its_key(
     crate::playbooks::providers::upsert(
         &pool,
         &crate::playbooks::providers::NewProvider {
+            model_limits: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "onprem",
             display_name: "On-prem vLLM",
@@ -5404,6 +5411,7 @@ async fn a_custom_provider_delivers_its_endpoint_and_price_beside_its_key(
     assert_eq!(
         inference_document(pod).bindings,
         vec![InferenceBinding {
+            limits: None,
             role: InferenceRole::Agent,
             protocol: WireProtocol::Responses,
             url: Some("http://vllm.internal:8000/v1".to_string()),
@@ -5460,6 +5468,7 @@ async fn a_provider_key_the_dispatch_cannot_resolve_refuses_the_run(
     let admin = crate::authz::model::Principal::parse("user:platform-admin").expect("a principal");
     // Registered nowhere: `register_inference_key` is deliberately not called.
     let missing = crate::playbooks::providers::ModelProvider {
+        model_limits: Default::default(),
         owner: crate::authz::model::Principal::platform(),
         id: "openai-plat".to_string(),
         display_name: "OpenAI".to_string(),

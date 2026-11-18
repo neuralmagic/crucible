@@ -103,7 +103,7 @@ pub(crate) fn pack_view(pack: Result<&PackFiles, &str>, font: LogFont, app: &App
 fn toolbar(app: &App, pack: &PackFiles, p: &Paint) -> El {
     let mut bar = row().w_full().gap(8.0).center_y().h(28.0);
     let draft = app.draft_target();
-    if app.remote.working_pack.is_some() {
+    if app.remote.working_pack.is_some() && app.selected_draft().is_none() {
         let showing = usize::from(app.showing_working());
         bar = bar.child(
             SegmentedControl::new(&["Run", "Draft"], Some(showing))

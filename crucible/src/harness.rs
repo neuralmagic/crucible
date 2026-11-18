@@ -267,7 +267,7 @@ static PI: HarnessSpec = HarnessSpec {
     ],
     model_endpoints: OPENAI_API_ENDPOINTS,
     sandbox_capability: Some("agent.pi"),
-    persistent_sessions: false,
+    persistent_sessions: true,
     otel_capable: false,
     backfill_required: false,
 };
@@ -351,10 +351,14 @@ mod tests {
     }
 
     #[test]
-    fn only_claude_resumes_sessions_and_only_vertex_harnesses_are_key_free() {
+    fn claude_and_pi_resume_sessions_and_only_vertex_harnesses_are_key_free() {
         for harness in Harness::all() {
             let spec = harness.spec();
-            assert_eq!(spec.persistent_sessions, *harness == Harness::Claude);
+            assert_eq!(
+                spec.persistent_sessions,
+                matches!(harness, Harness::Claude | Harness::Pi),
+                "{harness:?}"
+            );
             let key_free = matches!(spec.auth, AuthProvider::Vertex);
             assert_eq!(key_free, *harness == Harness::Claude, "{harness:?}");
         }

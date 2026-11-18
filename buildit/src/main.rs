@@ -506,7 +506,10 @@ async fn main() -> Result<ExitCode> {
             }
         }
         Cmd::Status { build_id, server } => {
-            let call = Call::Status(StatusParams { build_id });
+            let call = Call::Status(StatusParams {
+                build_id,
+                wait_seconds: None,
+            });
             return Ok(remote(&server.server, Ok(call)).await);
         }
         Cmd::Run(args) => {

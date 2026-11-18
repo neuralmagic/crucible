@@ -312,7 +312,7 @@ asyncio.run(main())
 ```
 
 `run` submits a Job, waits for it to finish and answers its log; it raises when the Job fails.
-`serving` submits a Deployment, StatefulSet or LeaderWorkerSet with that port exposed, waits
+`serving` submits a Job, Deployment, StatefulSet or LeaderWorkerSet with that port exposed, waits
 until it is ready, and deletes it and its Service on the way out. `follow_logs` yields a
 workload's log lines as they are written. Under them are the server's own tools as methods
 (`submit`, `wait`, `workload_status`, `workload_logs`, `workload_delete` and the rest), for
