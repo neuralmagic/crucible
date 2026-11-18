@@ -75,6 +75,7 @@ jobs:
       - name: Build /next
         run: |
           sh crucible-desktop/rune-patches.sh
+          sh crucible-desktop/js-engine.sh
           rustup target add wasm32-unknown-unknown
           cd crucible-desktop
           RUSTFLAGS= CARGO="$(command -v cargo)" bash ../vendor/rune/scripts/web-build.sh crucible-playbooks --no-html --out ../crucible-controller/next-dist
@@ -159,6 +160,10 @@ jobs:
       - name: Rune
         run: sh crucible-desktop/rune-patches.sh
 
+      # The engine JavaScript view plugins run in, which the app is built with.
+      - name: JavaScript engine
+        run: sh crucible-desktop/js-engine.sh
+
       - name: Build the RPM
         env:
           SQLX_OFFLINE: "true"
@@ -205,6 +210,10 @@ jobs:
 
       - name: Rune
         run: sh crucible-desktop/rune-patches.sh
+
+      # The engine JavaScript view plugins run in, which the app is built with.
+      - name: JavaScript engine
+        run: sh crucible-desktop/js-engine.sh
 
       - name: Build Crucible Playbooks.app
         env:

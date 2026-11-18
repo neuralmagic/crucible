@@ -310,23 +310,22 @@ example-stack-test:
 example-report-ts-view:
     npx --yes -p typescript@5.9.3 tsc --strict --noEmitOnError --target es2022 --module es2022 --lib es2022 --outDir examples/report-ts/ui crucible-view/js/crucible-view.d.ts examples/report-ts/ui/report.ts
 
-# Fetch the engine JavaScript view plugins run in: Javy's QuickJS module, checked against the
-# release's digest.
+# Fetch the engine JavaScript view plugins run in, which the desktop app is built with: Javy's
+# QuickJS module, checked against its digest.
 desktop-js-engine:
-    mkdir -p crucible-desktop/assets/js-engine
-    gh release download v9.1.0 --repo bytecodealliance/javy --pattern plugin.wasm.gz --dir crucible-desktop/assets/js-engine --clobber
-    echo "dc237a6fb9c7e58423456a12fc3c4e7a97d9d1eeb91b89ca73db76b78ae95e83  crucible-desktop/assets/js-engine/plugin.wasm.gz" | shasum -a 256 -c -
-    gunzip -f crucible-desktop/assets/js-engine/plugin.wasm.gz
+    sh crucible-desktop/js-engine.sh
 
 # Open the desktop app (Crucible Playbooks), its own Cargo workspace on Rune.
 desktop-run:
     sh crucible-desktop/rune-patches.sh
+    sh crucible-desktop/js-engine.sh
     cd crucible-desktop && cargo run
 
 # Build the release binary and open it as a bundled .app with the dock icon, crucible-lsp inside.
 desktop-release *args:
     cargo build --release -p crucible-lsp
     sh crucible-desktop/rune-patches.sh
+    sh crucible-desktop/js-engine.sh
     cd crucible-desktop && cargo build --release
     sh crucible-desktop/macos-bundle.sh
     open "crucible-desktop/target/release/Crucible Playbooks.app" --args {{ args }}
@@ -336,6 +335,7 @@ desktop-release *args:
 desktop-feature name *args:
     cargo build --release -p crucible-lsp
     sh crucible-desktop/rune-patches.sh
+    sh crucible-desktop/js-engine.sh
     cd crucible-desktop && cargo build --release
     FEATURE="{{ name }}" sh crucible-desktop/macos-bundle.sh
     open "crucible-desktop/target/release/Crucible Playbooks ({{ name }}).app" --args {{ args }}
@@ -344,6 +344,7 @@ desktop-feature name *args:
 desktop-install:
     cargo build --release -p crucible-lsp
     sh crucible-desktop/rune-patches.sh
+    sh crucible-desktop/js-engine.sh
     cd crucible-desktop && cargo build --release
     sh crucible-desktop/macos-bundle.sh
     mkdir -p ~/Applications
@@ -355,6 +356,7 @@ desktop-install:
 # anything else. Needs Python >= 3.13 (rune-dev uses PurePosixPath.full_match).
 desktop-hot:
     sh crucible-desktop/rune-patches.sh
+    sh crucible-desktop/js-engine.sh
     python3.14 vendor/rune/scripts/rune-dev \
         --manifest-path crucible-desktop/Cargo.toml --patch 'src/ui/*.rs' --local -- --scene local
 
@@ -365,12 +367,14 @@ desktop-agent-image:
 # Format, lint and test the desktop app.
 desktop-check:
     sh crucible-desktop/rune-patches.sh
+    sh crucible-desktop/js-engine.sh
     cd crucible-desktop && cargo fmt --check && cargo clippy --all-targets --all-features --locked -- -D warnings && cargo test --locked
 
 # Lint the desktop app's library, and the crux client under it, for the browser (wasm32, Rune's
 # web target).
 desktop-web-check:
     sh crucible-desktop/rune-patches.sh
+    sh crucible-desktop/js-engine.sh
     rustup target add wasm32-unknown-unknown
     cargo clippy -p crux --no-default-features --target wasm32-unknown-unknown -- -D warnings
     cd crucible-desktop && cargo clippy --lib --locked --target wasm32-unknown-unknown -- -D warnings
@@ -381,6 +385,7 @@ desktop-web-check:
 # crucible-desktop/Cargo.lock.
 desktop-web *args:
     sh crucible-desktop/rune-patches.sh
+    sh crucible-desktop/js-engine.sh
     rustup target add wasm32-unknown-unknown
     cd crucible-desktop && CARGO="$(command -v cargo)" bash ../vendor/rune/scripts/web-build.sh crucible-playbooks --dev --out target/web
     python3 crucible-desktop/web-dev-proxy.py --dir crucible-desktop/target/web {{ args }}
@@ -389,6 +394,7 @@ desktop-web *args:
 # serves under /next. Release profile unless `just controller-next --dev`.
 controller-next *args:
     sh crucible-desktop/rune-patches.sh
+    sh crucible-desktop/js-engine.sh
     rustup target add wasm32-unknown-unknown
     cd crucible-desktop && CARGO="$(command -v cargo)" bash ../vendor/rune/scripts/web-build.sh crucible-playbooks --no-html --out ../crucible-controller/next-dist {{ args }}
 
@@ -403,7 +409,8 @@ desktop-fedora *cmd:
 
 # Lint and test the desktop app on Fedora, in a container.
 desktop-linux-check:
-    just desktop-fedora 'sh crucible-desktop/rune-patches.sh && cargo build --locked -p crucible-lsp \
+    just desktop-fedora 'sh crucible-desktop/rune-patches.sh && sh crucible-desktop/js-engine.sh \
+        && cargo build --locked -p crucible-lsp \
         && cd crucible-desktop && cargo clippy --all-targets --all-features --locked -- -D warnings \
         && CRUCIBLE_LSP=/target/debug/crucible-lsp dbus-run-session -- cargo test --locked'
 
@@ -431,7 +438,7 @@ desktop-linux-vm:
 
 # Build the desktop app's Fedora RPM, in a container, into crucible-desktop/target/linux.
 desktop-linux version="0.0.0":
-    VERSION={{ version }} just desktop-fedora 'sh crucible-desktop/rune-patches.sh \
+    VERSION={{ version }} just desktop-fedora 'sh crucible-desktop/rune-patches.sh && sh crucible-desktop/js-engine.sh \
         && cargo build --release --locked -p crucible-lsp \
         && (cd crucible-desktop && cargo build --release --locked) \
         && sh crucible-desktop/linux-bundle.sh'

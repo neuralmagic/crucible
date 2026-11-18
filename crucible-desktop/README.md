@@ -137,7 +137,7 @@ dev rev the engine workspace must not inherit.
 ## Run
 
 ```sh
-just desktop-run       # or `cargo run` here, after rune-patches.sh
+just desktop-run       # or `cargo run` here, after rune-patches.sh and js-engine.sh
 ```
 
 The **Local** backend lists every pack under `<repo>/examples` whose manifest says

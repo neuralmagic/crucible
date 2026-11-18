@@ -3305,7 +3305,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs assets/js-engine/plugin.wasm from `just desktop-js-engine`"]
     fn a_runs_view_is_built_from_what_each_launch_captured() {
         const PLUGIN: &str = r#"
             export const inputs = ["verdicts.json"];

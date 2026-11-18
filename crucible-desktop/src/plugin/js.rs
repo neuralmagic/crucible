@@ -3,7 +3,6 @@
 //! the script gets nothing the engine module does not: no files, network or real clock.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crucible_view::{Reply, View};
@@ -36,18 +35,16 @@ enum Answer {
     Error(String),
 }
 
+/// Javy's QuickJS module, which `just desktop-js-engine` fetches.
+const ENGINE: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/js-engine/plugin.wasm"
+));
+
 impl Script {
-    /// The engine scripts run in: the module `CRUCIBLE_JS_ENGINE` names, else the one
-    /// `just desktop-js-engine` fetches into this crate's assets.
+    /// The engine scripts run in.
     pub fn engine() -> Result<Arc<Module>, String> {
-        let path = std::env::var_os("CRUCIBLE_JS_ENGINE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/js-engine/plugin.wasm")
-            });
-        let wasm = std::fs::read(&path)
-            .map_err(|e| format!("reading the JavaScript engine {}: {e}", path.display()))?;
-        Module::engine(&wasm, Limits::DEFAULT)
+        Module::engine(ENGINE, Limits::DEFAULT)
             .map(Arc::new)
             .map_err(|fault| fault.to_string())
     }
@@ -106,53 +103,22 @@ impl Script {
     /// reads its answer from its standard output.
     fn ask(&self, asked: Vec<u8>) -> Result<Answer, Fault> {
         let mut call = self.engine.start()?;
-        let export = |call: &crate::plugin::Call, name: &'static str| {
-            call.instance
-                .get_func(&call.store, name)
-                .ok_or(Fault::Export(name))
-        };
-        let initialize = export(&call, "initialize-runtime")?
-            .typed::<(), ()>(&call.store)
-            .map_err(|_| Fault::Export("initialize-runtime"))?;
-        let allocate = export(&call, "cabi_realloc")?
-            .typed::<(u32, u32, u32, u32), u32>(&call.store)
-            .map_err(|_| Fault::Export("cabi_realloc"))?;
-        let compile = export(&call, "compile-src")?
-            .typed::<(u32, u32), u32>(&call.store)
-            .map_err(|_| Fault::Export("compile-src"))?;
-        let invoke = export(&call, "invoke")?
-            .typed::<(u32, u32, u32, u32, u32), ()>(&call.store)
-            .map_err(|_| Fault::Export("invoke"))?;
+        let initialize = call.typed_export::<(), ()>("initialize-runtime")?;
+        let allocate = call.typed_export::<(u32, u32, u32, u32), u32>("cabi_realloc")?;
+        let compile = call.typed_export::<(u32, u32), u32>("compile-src")?;
+        let invoke = call.typed_export::<(u32, u32, u32, u32, u32), ()>("invoke")?;
 
         initialize
             .call(&mut call.store, ())
             .map_err(|e| said(fault(e), &call.store))?;
 
-        let source = self.source.as_bytes();
-        let len = u32::try_from(source.len()).map_err(|_| Fault::Memory)?;
-        let at = allocate
-            .call(&mut call.store, (0, 0, 1, len))
-            .map_err(|e| said(fault(e), &call.store))?;
-        call.memory
-            .write(&mut call.store, at as usize, source)
-            .map_err(|e| Fault::Trap(e.to_string()))?;
+        let (at, len) = call.write(&allocate, self.source.as_bytes())?;
         let result = compile
             .call(&mut call.store, (at, len))
             .map_err(|e| said(fault(e), &call.store))?;
-        let mut area = [0; 12];
-        call.memory
-            .read(&call.store, result as usize, &mut area)
-            .map_err(|e| Fault::Reply(e.to_string()))?;
-        let word = |i: usize| u32::from_le_bytes([area[i], area[i + 1], area[i + 2], area[i + 3]]);
-        let (failed, code, code_len) = (word(0) != 0, word(4), word(8));
+        let (failed, code, code_len) = call.read_triple(result)?;
         if failed {
-            let mut message = vec![0; (code_len as usize).min(4096)];
-            call.memory
-                .read(&call.store, code as usize, &mut message)
-                .map_err(|e| Fault::Reply(e.to_string()))?;
-            return Err(Fault::Script(
-                String::from_utf8_lossy(&message).trim().to_string(),
-            ));
+            return Err(Fault::Script(call.read_string(code, code_len)?));
         }
 
         call.store.data_mut().hand(asked);
@@ -179,10 +145,11 @@ mod tests {
 
     use crucible_view::{Draw, File, Node, Request};
 
+    use crate::plugin::js::ENGINE;
     use crate::plugin::{Fault, Limits, Loaded, Module, Script};
 
     fn engine() -> Arc<Module> {
-        Script::engine().expect("fetch it with `just desktop-js-engine`")
+        Script::engine().unwrap()
     }
 
     fn loaded(engine: Arc<Module>, source: &str) -> Loaded {
@@ -239,7 +206,6 @@ mod tests {
     "#;
 
     #[test]
-    #[ignore = "needs assets/js-engine/plugin.wasm from `just desktop-js-engine`"]
     fn a_script_with_runs_draws_the_launches_and_one_without_draws_none() {
         use crucible_view::{Param, Run, RunsRequest, Status};
         let with = loaded(engine(), HISTORY);
@@ -382,7 +348,6 @@ mod tests {
     "#;
 
     #[test]
-    #[ignore = "needs assets/js-engine/plugin.wasm from `just desktop-js-engine`"]
     fn a_script_reads_the_state_and_the_event_and_returns_live() {
         use crucible_view::{Event, Key, RunsRequest};
         let script = loaded(engine(), COUNTER);
@@ -465,7 +430,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs assets/js-engine/plugin.wasm from `just desktop-js-engine`"]
     fn a_script_names_its_inputs_and_draws_a_view_with_the_canvas() {
         let script = loaded(engine(), COUNTS);
         let started = std::time::Instant::now();
@@ -493,7 +457,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs assets/js-engine/plugin.wasm from `just desktop-js-engine`"]
     fn the_canvas_records_transforms_baselines_widths_and_hints_under_the_browser_s_names() {
         let script = loaded(
             engine(),
@@ -563,7 +526,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs assets/js-engine/plugin.wasm from `just desktop-js-engine`"]
     fn a_script_that_does_not_compile_or_throws_says_why() {
         let broken = loaded(engine(), "export const inputs = [;");
         let Err(Fault::Script(why)) = broken.inputs() else {
@@ -589,18 +551,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs assets/js-engine/plugin.wasm from `just desktop-js-engine`"]
     fn a_script_is_held_to_the_same_limits_and_rules() {
-        let wasm = std::fs::read(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/js-engine/plugin.wasm"),
-        )
-        .unwrap();
         let tight = Limits {
             fuel: 400_000_000,
             ..Limits::DEFAULT
         };
         let spins = loaded(
-            Arc::new(Module::engine(&wasm, tight).unwrap()),
+            Arc::new(Module::engine(ENGINE, tight).unwrap()),
             "export const inputs = []; export function view() { for (;;) {} }",
         );
         assert_eq!(spins.view(&Request::default()), Err(Fault::Fuel));
@@ -646,7 +603,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs assets/js-engine/plugin.wasm from `just desktop-js-engine`"]
     fn a_reply_over_a_mebibyte_arrives_whole() {
         let source = r#"export const inputs = [];
             export function view() {
@@ -665,15 +621,11 @@ mod tests {
         assert_eq!(rows.len(), 70);
         assert_eq!(rows[69].cells[0].text.len(), 20_000);
 
-        let wasm = std::fs::read(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/js-engine/plugin.wasm"),
-        )
-        .unwrap();
         let small = Limits {
             reply_bytes: 1 << 20,
             ..Limits::DEFAULT
         };
-        let capped = loaded(Arc::new(Module::engine(&wasm, small).unwrap()), source);
+        let capped = loaded(Arc::new(Module::engine(ENGINE, small).unwrap()), source);
         assert_eq!(
             capped.view(&Request::default()),
             Err(Fault::Reply("over the 1048576 bytes allowed".into()))
@@ -681,7 +633,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs assets/js-engine/plugin.wasm from `just desktop-js-engine`"]
     fn a_script_s_formatted_cells_match_the_rust_constructors() {
         use crucible_view::Cell;
         let cases = include_str!("../../../crucible-view/js/formatted.json");
@@ -733,7 +684,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs assets/js-engine/plugin.wasm from `just desktop-js-engine`"]
     fn a_script_reads_params_as_plain_values_and_declares_controls() {
         use crucible_view::{Control, Param};
         let script = loaded(

@@ -67,6 +67,10 @@ jobs:
       - name: Rune
         run: sh crucible-desktop/rune-patches.sh
 
+      # The engine JavaScript view plugins run in, which the app is built with.
+      - name: JavaScript engine
+        run: sh crucible-desktop/js-engine.sh
+
       - name: fmt
         working-directory: crucible-desktop
         run: cargo fmt --check
@@ -121,6 +125,10 @@ jobs:
 
       - name: Rune
         run: sh crucible-desktop/rune-patches.sh
+
+      # The engine JavaScript view plugins run in, which the app is built with.
+      - name: JavaScript engine
+        run: sh crucible-desktop/js-engine.sh
 
       - name: Build
         env:
@@ -184,6 +192,10 @@ jobs:
 
       - name: Rune
         run: sh crucible-desktop/rune-patches.sh
+
+      # The engine JavaScript view plugins run in, which the app is built with.
+      - name: JavaScript engine
+        run: sh crucible-desktop/js-engine.sh
 
       - name: clippy
         working-directory: crucible-desktop

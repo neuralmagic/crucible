@@ -321,6 +321,53 @@ impl Module {
 }
 
 impl Call {
+    /// Looks up a typed export by name.
+    fn typed_export<Params: wasmi::WasmParams, Results: wasmi::WasmResults>(
+        &self,
+        name: &'static str,
+    ) -> Result<wasmi::TypedFunc<Params, Results>, Fault> {
+        self.instance
+            .get_func(&self.store, name)
+            .ok_or(Fault::Export(name))?
+            .typed::<Params, Results>(&self.store)
+            .map_err(|_| Fault::Export(name))
+    }
+
+    /// Allocates `len` bytes through `allocate` and writes `bytes` into guest memory.
+    fn write(
+        &mut self,
+        allocate: &wasmi::TypedFunc<(u32, u32, u32, u32), u32>,
+        bytes: &[u8],
+    ) -> Result<(u32, u32), Fault> {
+        let len = u32::try_from(bytes.len()).map_err(|_| Fault::Memory)?;
+        let at = allocate
+            .call(&mut self.store, (0, 0, 1, len))
+            .map_err(|e| said(fault(e), &self.store))?;
+        self.memory
+            .write(&mut self.store, at as usize, bytes)
+            .map_err(|e| Fault::Trap(e.to_string()))?;
+        Ok((at, len))
+    }
+
+    /// Reads a three-word (failed, ptr, len) result struct from guest memory.
+    fn read_triple(&self, at: u32) -> Result<(bool, u32, u32), Fault> {
+        let mut area = [0; 12];
+        self.memory
+            .read(&self.store, at as usize, &mut area)
+            .map_err(|e| Fault::Reply(e.to_string()))?;
+        let word = |i: usize| u32::from_le_bytes([area[i], area[i + 1], area[i + 2], area[i + 3]]);
+        Ok((word(0) != 0, word(4), word(8)))
+    }
+
+    /// Reads `len` bytes from guest memory at `at`, capped to 4 KiB.
+    fn read_string(&self, at: u32, len: u32) -> Result<String, Fault> {
+        let mut buf = vec![0; (len as usize).min(4096)];
+        self.memory
+            .read(&self.store, at as usize, &mut buf)
+            .map_err(|e| Fault::Reply(e.to_string()))?;
+        Ok(String::from_utf8_lossy(&buf).trim().to_string())
+    }
+
     /// The bytes a plugin returned as an address in the high half and a length in the low half.
     fn read(&self, packed: u64, limits: &Limits) -> Result<Vec<u8>, Fault> {
         let at = (packed >> 32) as usize;

@@ -815,7 +815,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs assets/js-engine/plugin.wasm from `just desktop-js-engine`"]
     fn the_javascript_engine_is_loaded_once_for_every_script() {
         let script = |title: &str| {
             format!(
@@ -909,7 +908,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs assets/js-engine/plugin.wasm from `just desktop-js-engine`"]
     fn a_javascript_plugin_in_the_pack_or_from_a_task_is_compiled_and_drawn() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("ui")).unwrap();
@@ -957,7 +955,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs assets/js-engine/plugin.wasm from `just desktop-js-engine`"]
     fn the_typescript_example_s_script_draws_its_view() {
         let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/report-ts");
         let dir = tempfile::tempdir().unwrap();
@@ -1349,7 +1346,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs assets/js-engine/plugin.wasm from `just desktop-js-engine`"]
     fn the_typescript_example_s_runs_view_follows_each_ticket_across_launches() {
         let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/report-ts");
         let script = fs::read(example.join("ui/report.js")).unwrap();

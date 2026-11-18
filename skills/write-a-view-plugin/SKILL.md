@@ -372,8 +372,6 @@ When the pane shows an error:
   a library that needs the system. Build for `wasm32-unknown-unknown` and remove the dependency
   that pulls it in.
 - `the script does not compile: ...`: a syntax error in the `.js`, with its line.
-- `reading the JavaScript engine ...`: the app has no engine module; `just desktop-js-engine`
-  fetches it.
 
 ## Handing back
 
