@@ -1273,6 +1273,17 @@ pub fn secret_created(s: &dto::Secret) -> String {
     )
 }
 
+pub fn secret_rotated(s: &dto::Secret) -> String {
+    let version = s
+        .current_version
+        .map_or_else(|| "-".to_string(), |v| v.to_string());
+    format!(
+        "rotated {} ({}) to version {}\n  kind: {}  owner: {}\n\
+         runs started from now on get it\n",
+        s.name, s.id, version, s.kind, s.owner
+    )
+}
+
 pub fn secret_bound(b: &dto::SecretBinding) -> String {
     format!(
         "bound {} to {}/{}: accepted\n  as {} -> {} {}\n  binding: {}\nactor: {}\n",

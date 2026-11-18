@@ -17,6 +17,7 @@ mod openshell;
 pub mod outputs;
 mod overrides;
 mod preflight;
+mod registry;
 mod relay;
 mod resources;
 mod search;
@@ -41,6 +42,9 @@ pub use openshell::OpenshellCfg;
 pub use outputs::OutputsCfg;
 pub use overrides::AgentOverridesCfg;
 pub use preflight::{MODE_PLACEHOLDER, PreflightCfg};
+pub use registry::{
+    BuilditPushCfg, KueuePullCfg, PullSecretCfg, RegistryError, Repository, RepositoryError,
+};
 pub use relay::RelayFile;
 pub use resources::{Quantity, QuantityError, SandboxResources};
 pub use search::SearchCfg;
@@ -370,6 +374,12 @@ pub struct Manifest {
     /// The cluster the controller dispatches every launch of this pack to.
     #[serde(default)]
     pub dispatch: DispatchCfg,
+    /// Where this pack's runs push their builds, and with which declared secret.
+    #[serde(default)]
+    pub buildit: BuilditPushCfg,
+    /// The declared secrets this pack's workloads pull images with.
+    #[serde(default)]
+    pub kueue: KueuePullCfg,
 }
 
 /// A single-repo run's publish-on-keep config: the fork the kept commits are pushed to as a draft PR.
@@ -1154,6 +1164,7 @@ impl Manifest {
     /// Cross-field checks the type system + `deny_unknown_fields` can't express. Run at load.
     fn validate(&self) -> Result<()> {
         self.repo.validate(self.is_playbook(), &self.workspace)?;
+        registry::validate_registries(&self.buildit, &self.kueue, &self.secrets)?;
         validate_common(CommonCfg {
             edition: self.edition,
             world: &self.world,

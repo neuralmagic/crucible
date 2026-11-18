@@ -883,6 +883,11 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
             ));
         }
 
+        tokio::spawn(crucible_controller::runs::workpod::registries::sweep_loop(
+            db.clone(),
+            dispatcher.clone(),
+        ));
+
         // Convert legacy pack bytes to stored trees before anything below reads a pack. A failure
         // leaves rows on their legacy bytes, which every reader still falls back to.
         match crucible_controller::playbooks::pack_migration::convert_pack_trees(db.pool()).await {

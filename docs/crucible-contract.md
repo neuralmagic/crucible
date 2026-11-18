@@ -106,6 +106,15 @@ policy_k   = 1                                # how many wide-round winners seed
 
 [dispatch]                                    # optional. Read by the controller, never by the engine.
 target = "cluster-a"                          # the one shared cluster every launch of this pack dispatches to
+
+[buildit]                                     # optional. Read by the controller, never by the engine.
+push_repo   = "quay.io/team/app"              # the one repository this pack's runs push builds to
+push_secret = "registry"                      # the [[secret]] (kind registry_authfile) that pushes to it
+
+[kueue]                                       # optional. Read by the controller, never by the engine.
+pull_secrets = [                              # registry credentials this pack's workloads pull with
+  { secret = "registry", registry = "quay.io/team" },
+]
 ```
 
 Rules:
@@ -125,6 +134,20 @@ Rules:
   policy fences off the pinned cluster, a pin the controller cannot reach, and local mode. A
   draft whose pin names a cluster the controller cannot reach carries a `dispatch` diagnostic on
   `crucible.toml`.
+- `[buildit]`, if present, names both `push_repo` (`<registry>/<path>`, lowercase, no scheme or
+  tag) and `push_secret`, a `[[secret]]` of kind `registry_authfile`. The run's buildit then
+  pushes to that repository with the bound authfile, read from the path the binding projects it
+  to, instead of the deployment's own push repository. Give the secret a credential that
+  reaches that one repository: the push runs in the pod the agent's build steps ran in.
+- `[kueue].pull_secrets` entries each name a `[[secret]]` of kind `registry_authfile` and the
+  `registry` (a host, or a host/path prefix) whose images pull with it; a registry appears once.
+  For the run's lifetime the controller keeps each as an image pull Secret beside crucible-kueue,
+  which copies it next to any workload the run submits whose image is on that registry. The copy
+  belongs to the workload and is deleted with it, so a Deployment that outlives the run keeps
+  pulling. The deployment must take them (`[kueue] run_pull_secrets` in the deploy profile).
+- A launch whose scope binds no secret for a name either table uses, or whose cluster has no
+  buildit (for `[buildit]`) or no crucible-kueue that takes run pull secrets (for `[kueue]`), is
+  refused before anything is created.
 - **Edition.** `edition` is 1 when absent; 1 and 2 are the editions this engine runs, and any
   other value fails the parse naming them. An `env` list in `[judge]`, `[world]`, or
   `[workflow]` needs edition 2 and fails the parse of an edition-1 manifest (§3).

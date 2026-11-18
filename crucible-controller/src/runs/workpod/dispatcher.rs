@@ -44,6 +44,10 @@ pub trait PodDispatcher: Send + Sync {
     async fn create_secret(&self, _cluster: &str, _namespace: &str, _secret: Secret) -> Result<()> {
         Ok(())
     }
+    /// Delete the Secret `name`. One that is already gone is success. The default no-ops.
+    async fn delete_secret(&self, _cluster: &str, _namespace: &str, _name: &str) -> Result<()> {
+        Ok(())
+    }
     /// Replace one key of an existing Secret. The default refuses.
     async fn set_secret_value(
         &self,

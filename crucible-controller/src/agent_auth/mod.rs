@@ -437,6 +437,7 @@ async fn issue(
     let launcher = issuer::launcher(&run)?;
     let scopes = issuer::granted_scopes(req.scope.as_deref(), audience)?;
     let kube = issuer::RunIdentity::of(&run.pod_name, run.owner.as_deref());
+    let pull_secrets = run_pull_secrets(&state.pool, &run.pod_name, audience).await?;
     let grant = AgentGrant {
         actor: Actor::Sandbox(sandbox.clone()),
         launcher,
@@ -445,6 +446,7 @@ async fn issue(
         audience: audience.resource.clone(),
         scopes,
         namespaces: audience.namespaces.clone(),
+        pull_secrets,
     };
     let minted = state
         .issuer
@@ -570,6 +572,7 @@ async fn issue_task(
     let launcher = issuer::launcher(&run)?;
     let scopes = issuer::granted_scopes(req.scope.as_deref(), audience)?;
     let kube = issuer::RunIdentity::of(&run.pod_name, run.owner.as_deref());
+    let pull_secrets = run_pull_secrets(&state.pool, &run.pod_name, audience).await?;
     let grant = AgentGrant {
         actor: Actor::Task(req.task),
         launcher,
@@ -578,6 +581,7 @@ async fn issue_task(
         audience: audience.resource.clone(),
         scopes,
         namespaces: audience.namespaces.clone(),
+        pull_secrets,
     };
     let minted = state
         .issuer
@@ -603,6 +607,20 @@ async fn issue_task(
         }))
         .into_response(),
     ))
+}
+
+/// The `pull_secrets` claim of a token for `audience`, for the run on `pod_name`.
+async fn run_pull_secrets(
+    pool: &PgPool,
+    pod_name: &str,
+    audience: &issuer::Audience,
+) -> Result<Vec<String>, OAuthError> {
+    let Some(namespace) = audience.pull_secret_namespace.as_deref() else {
+        return Ok(Vec::new());
+    };
+    crate::runs::workpod::registries::claim(pool, pod_name, namespace)
+        .await
+        .map_err(|e| OAuthError::Server(format!("{e:#}")))
 }
 
 /// Whether the pack run `run_id` executes discloses that its tasks reach `server`: the manifest

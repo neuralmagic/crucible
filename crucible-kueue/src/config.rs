@@ -21,6 +21,9 @@ pub const DEFAULT_MANAGER: &str = "crucible-kueue";
 pub const RUN_ID_CLAIM: &str = "run_id";
 pub const NAMESPACE_CLAIM: &str = "namespace";
 pub const NAMESPACES_CLAIM: &str = "namespaces";
+/// A run token's own pull secrets, each `name=registry`: Secrets its issuer placed in
+/// [`Config::run_pull_secret_namespace`].
+pub const PULL_SECRETS_CLAIM: &str = "pull_secrets";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -36,6 +39,9 @@ pub struct Config {
     /// The image pull secrets a pod template may name, and the ones the server adds itself to a
     /// pod whose image is on their registries; none when empty.
     pub pull_secrets: Vec<PullSecret>,
+    /// The namespace run tokens' `pull_secrets` claims name Secrets in. The server copies one
+    /// beside each workload that pulls with it. `None`: the claim is ignored.
+    pub run_pull_secret_namespace: Option<String>,
     /// The StorageClasses a volume claim template may name. With none, a claim names none and
     /// takes the cluster's default class.
     pub storage_classes: BTreeSet<String>,
@@ -131,6 +137,20 @@ fn repository_of(image: &str) -> String {
     }
 }
 
+impl Config {
+    /// This configuration offering `copies` beside its own pull secrets.
+    pub fn offering(&self, copies: Vec<PullSecret>) -> std::borrow::Cow<'_, Config> {
+        if copies.is_empty() {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let offered = self.pull_secrets.iter().cloned().chain(copies).collect();
+        std::borrow::Cow::Owned(Config {
+            pull_secrets: merge_pull_secrets(offered),
+            ..self.clone()
+        })
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -143,6 +163,7 @@ impl Default for Config {
             hardware: Hardware::default(),
             namespaces: Vec::new(),
             pull_secrets: Vec::new(),
+            run_pull_secret_namespace: None,
             storage_classes: BTreeSet::new(),
             cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
         }

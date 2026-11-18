@@ -180,6 +180,11 @@ struct Cli {
         value_parser = PullSecret::parse
     )]
     pull_secrets: Vec<PullSecret>,
+    /// The namespace run tokens' `pull_secrets` claims name Secrets in: the server reads each one
+    /// a workload's images need and copies it beside the workload, owned by it. Unset, the claim
+    /// is ignored.
+    #[arg(long, env = "CRUCIBLE_KUEUE_RUN_PULL_SECRETS_NAMESPACE")]
+    run_pull_secrets_namespace: Option<String>,
     /// A StorageClass a volume claim template may name. With none, a claim names none and takes
     /// the cluster's default class. Repeatable.
     #[arg(
@@ -264,6 +269,7 @@ impl Cli {
             },
             namespaces: self.namespaces.clone(),
             pull_secrets: config::merge_pull_secrets(self.pull_secrets.clone()),
+            run_pull_secret_namespace: self.run_pull_secrets_namespace.clone(),
             storage_classes: self.storage_classes.iter().cloned().collect(),
             cluster_domain: self.cluster_domain.clone(),
         })
