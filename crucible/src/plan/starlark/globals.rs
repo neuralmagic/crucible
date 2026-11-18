@@ -19,9 +19,9 @@ use starlark_syntax::codemap::FileSpan;
 use crate::plan::ir::TaskName;
 use crate::plan::starlark as dsl;
 use crate::plan::starlark::values::{
-    AnswerRefValue, BoundValue, CONVERTED, DeciderValue, EachValue, ExternalText, OptionalValue,
-    OthersValue, OutputRefValue, QuestionValue, SchemaValue, SendBackValue, SessionValue,
-    TaskDefaultsValue, TaskValue, WhenValue, WorkflowValue,
+    AnswerRefValue, BoundValue, CONVERTED, DeciderValue, EachValue, ExternalText, LoopValue,
+    OptionalValue, OthersValue, OutputRefValue, QuestionValue, SchemaValue, SendBackValue,
+    SessionValue, TaskDefaultsValue, TaskValue, WhenValue, WorkflowValue,
 };
 use crate::plan::workflow::{WorkflowCfg, WorkflowType};
 
@@ -77,6 +77,14 @@ pub(crate) fn common(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
         dispatch("send_back", args, kwargs, eval)
+    }
+
+    fn r#loop<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("loop", args, kwargs, eval)
     }
 
     fn at_least<'v>(
@@ -564,6 +572,9 @@ fn convert_at(value: Value<'_>, depth: usize) -> dsl::Result<dsl::Value> {
     if let Some(send_back) = SendBackValue::from_value(value) {
         return Ok(dsl::Value::SendBack(send_back.0.clone()));
     }
+    if let Some(looped) = LoopValue::from_value(value) {
+        return Ok(dsl::Value::Loop(looped.0.clone()));
+    }
     if let Some(bound) = BoundValue::from_value(value) {
         return Ok(dsl::Value::Bound(bound.0));
     }
@@ -635,6 +646,7 @@ fn alloc_at<'v>(heap: Heap<'v>, value: dsl::Value, depth: usize) -> Value<'v> {
         dsl::Value::When(when) => heap.alloc(WhenValue(when)),
         dsl::Value::Each(each) => heap.alloc(EachValue(each)),
         dsl::Value::SendBack(revise) => heap.alloc(SendBackValue(revise)),
+        dsl::Value::Loop(body) => heap.alloc(LoopValue(body)),
         dsl::Value::Bound(bound) => heap.alloc(BoundValue(bound)),
         dsl::Value::Decider(decider) => heap.alloc(DeciderValue(decider)),
         dsl::Value::Others => heap.alloc(OthersValue),

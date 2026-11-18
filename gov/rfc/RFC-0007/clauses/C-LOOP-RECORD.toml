@@ -1,0 +1,15 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-LOOP-RECORD"
+title = "Session rows"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+Each round of each body task MUST produce one session row named after the task followed by "[round-N]", written as that round settles and carrying that round's status, output, note, and spend. N counts from 1 and MUST have no gaps. A first round that dispatched no body task MUST produce no round rows.
+
+Once the loop has ended, each body task MUST produce one row under its own name carrying its last round's status, output, note, blocked reason, and transport cause, and the sum of every round's spend. A round row MUST NOT affect the verdict or halt the run. The rows under the tasks' own names do, exactly as [[RFC-0002:C-PLAYBOOK-LANE]] states for any task.
+
+A reader MUST be able to tell why a loop ended from the session log alone. The deciding task's last round row carries the field the condition read, the count of round rows gives the rounds run, and the shutdown event names an exhausted ceiling."""

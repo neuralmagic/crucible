@@ -282,6 +282,18 @@ pub struct PlanTask {
     pub needs: String,
     #[serde(default)]
     pub required: bool,
+    /// The tasks of the loop this task decides, in dispatch order; empty otherwise.
+    #[serde(default)]
+    pub r#loop: Vec<String>,
+    /// `task.field in a|b`, the loop's condition; empty when the task decides no loop.
+    #[serde(default)]
+    pub again: String,
+    /// The most rounds `loop` may run; 0 when the task decides no loop.
+    #[serde(default)]
+    pub loop_rounds: u32,
+    /// How long after its first round begins `loop` may still begin a round; empty for none.
+    #[serde(default)]
+    pub loop_duration: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

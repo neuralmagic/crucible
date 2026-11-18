@@ -1,0 +1,17 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-LOOP-RESUME"
+title = "Resumption and rerun"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+A resumed run MUST treat a folded round row as terminal for that round of that task and MUST NOT dispatch that round of that task again. Where the interruption cut a round, the engine MUST dispatch only the body tasks that have no row for that round, in dependency order, against the folded results of that round. It MUST NOT restart the round or the loop.
+
+The engine MUST decide whether to begin the next round from the folded round rows by the rule in [[RFC-0007:C-LOOP-ROUNDS]]. That decision MUST depend only on the admitted plan, the round rows, the ceilings, and, for a loop that declares a duration, the time, so a resumed run begins exactly the rounds the interrupted run would have at the same times. A duration is measured on the wall clock and counts time the run spent down. A resumed run MUST measure it from the time the session log records for the first dispatch of the first task of the loop's first round. Folded rounds count toward rounds. Their spend and elapsed time count against the ceilings as [[RFC-0002:C-PLAYBOOK-RESUME]] requires.
+
+The input "loop" a resumed round receives MUST be the one an uninterrupted run would have given it, with "previous" built from the folded rows. A resumed run MUST reconstruct its workspace as [[RFC-0002:C-PLAYBOOK-RESUME]] requires, taking for each body task the declared files of its latest round that settled passing. Where a body task's own-name row is folded, the loop has ended, and the engine MUST NOT dispatch any round of it.
+
+Where a rerun under [[RFC-0002:C-PLAYBOOK-RERUN]] reruns a body task, the engine MUST rerun every task of that body from round 1 and MUST NOT reuse a round row of the parent."""

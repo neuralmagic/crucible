@@ -7,8 +7,12 @@
 
 use crate::plan::attempt::DeclaredStatus;
 use crate::plan::ir::KEPT_INPUT;
-use crate::plan::ir::{HISTORY_INPUT, ITEM_INPUT, OUTCOME_INPUT, PARAMS_INPUT, REVISION_INPUT};
-use crate::plan::ir::{MAX_FANOUT_CEILING, MAX_REPAIR_CEILING, MAX_ROUNDS_CEILING};
+use crate::plan::ir::{
+    HISTORY_INPUT, ITEM_INPUT, LOOP_INPUT, OUTCOME_INPUT, PARAMS_INPUT, REVISION_INPUT,
+};
+use crate::plan::ir::{
+    MAX_FANOUT_CEILING, MAX_LOOP_ROUNDS, MAX_REPAIR_CEILING, MAX_ROUNDS_CEILING,
+};
 use crate::plan::workflow::WorkflowType;
 use crucible_contract::decision::MAX_DYNAMIC_OPTIONS;
 use crucible_contract::history::MAX_HISTORY_DEPTH;
@@ -355,6 +359,45 @@ pub fn functions() -> Vec<Function> {
                         "Instance cap, within the engine's ceiling of {MAX_FANOUT_CEILING}. A \
                          longer list fails the task."
                     ),
+                ),
+            ],
+        },
+        Function {
+            name: "loop",
+            lane: Lane::Common,
+            purpose: "A bounded loop, listed in `workflow(tasks = ...)` in place of its body: the \
+                      body's tasks run in rounds while a field one of them emits holds. Each \
+                      round reports as `task[round-N]`, and a dependent reads the last round. \
+                      Playbooks only.",
+            positional: None,
+            kwargs: vec![
+                Kwarg::new(
+                    "body",
+                    "list[task]",
+                    "The agent, command, and evaluate tasks a round runs, with every task \
+                     between two of them.",
+                ),
+                Kwarg::new(
+                    "again",
+                    "task.field | task.field.any_of(...)",
+                    "A field a body task emits: a boolean, which continues on true, or a list \
+                     of labels with the labels to continue on. Read after each round.",
+                ),
+                Kwarg::new(
+                    "rounds",
+                    "int",
+                    format!(
+                        "Round cap, counting the first, from 1 to the engine's ceiling of \
+                         {MAX_LOOP_ROUNDS}. Reaching it is not a failure. Optional beside \
+                         `duration`, where it defaults to that ceiling."
+                    ),
+                ),
+                Kwarg::new(
+                    "duration",
+                    "str",
+                    "How long after the first round begins another round may still begin \
+                     (`90s`, `30m`, `8h`), on the wall clock. A round in flight is not cut, and \
+                     the loop ends without failing. Give `rounds`, `duration`, or both.",
                 ),
             ],
         },
@@ -977,6 +1020,13 @@ pub fn reserved_inputs() -> Vec<Reserved> {
              \"reviewer\": str, \"review\": {\"status\", \"note\", \"output\", \"files\"}}`, \
              from the second round of a revise loop on.",
         ),
+        Reserved::new(
+            LOOP_INPUT,
+            "object",
+            "The round about to run and the round before, as `{\"round\": int, \"max_rounds\": \
+             int, \"previous\": {task: output}}`, in a task of a loop's body only. `previous` \
+             holds each body task that passed in the round before and is empty in the first.",
+        ),
     ]
 }
 
@@ -1252,7 +1302,11 @@ mod tests {
                 .iter()
                 .map(|row| row.name)
                 .collect::<Vec<_>>(),
-            crate::plan::ir::RESERVED_INPUTS,
+            [
+                &crate::plan::ir::RESERVED_INPUTS[..],
+                &[crate::plan::ir::LOOP_INPUT]
+            ]
+            .concat(),
             "an input the engine writes is undocumented, or a documented one is invented"
         );
     }

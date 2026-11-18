@@ -396,6 +396,7 @@ mod tests {
             keyed: Vec::new(),
             when: None,
             revise: None,
+            loop_while: None,
             timeout: None,
             history: None,
             repair: 0,

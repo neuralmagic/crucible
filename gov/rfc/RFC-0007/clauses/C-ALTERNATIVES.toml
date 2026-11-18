@@ -1,0 +1,25 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-ALTERNATIVES"
+title = "Alternatives considered"
+kind = "informative"
+status = "active"
+
+[content]
+text = """
+Five designs were weighed. The first two are the ones that need no new construct.
+
+Keep unrolling and fold the copies in the renderer. The engine does not change, and each round stays a task of its own that a rerun can select. It loses on everything except the picture. The round count stays tied to the task limit, and raising the limit grows the admitted plan, the compile cost, and the embedded prompt total by one copy of the body per round. A loop that stops at round 3 of 62 still writes a not-taken row for every task and route of the other 59 rounds. Every reader of the graph (crux graph, the desktop app, the run export, a report's task list) would have to infer the same loop from task names, and a pack that names its copies another way is not folded. Launch settings, definition digests, and rerun selection all stay per copy. Rejected.
+
+Lift the revise ceiling and make revise run on a condition. This adds no new name to the DSL. It loses because a revise round and a loop round mean opposite things. A revise loop continues on a failing verdict, discards the failing round's work, hands the verdict back as "revision", and settles the reviewer failed when the rounds are spent. A loop continues on a passing round, commits it, and ends without a failure when the rounds are spent. To continue on the existing rules an author would have to fail the scoring task every round, which discards the work the round did and fails the run at the bound. To continue without failing, every rule of [[RFC-0002:C-REVISE-LOOP]] would fork on a mode: commit or discard, "revision" or not, pass or fail at the bound. The ceiling of five is also deliberate for rework, where each round re-pays for the same output. Rejected as a surface. Accepted as machinery: a loop uses the same round rows, the same folded row per task, the same checks between rounds, and the same replay on resume.
+
+A reserved output field in place of a declared reference, the way "complete" ends a run. The last body task would return "again": true. It avoids naming a field in the source, but the condition is then invisible in the compiled graph, untyped, and unchecked at compile time. Rejected.
+
+Loop inside one task, as [[RFC-0002:C-PLAYBOOK-SHAPE]] advises for polling. It is the right answer when the rounds do not deserve their own budget check, row, commit, or resume point. It is the wrong one when a round pairs an agent turn with a check the engine runs separately, which one task cannot hold. Unchanged and still recommended where it fits.
+
+Reuse the scored loop. Its iteration is propose, apply, measure, decide against a judge and a baseline, with keep or discard and operator parking between iterations. A playbook has no judge under [[RFC-0002:C-PLAYBOOK-LANE]], and a loop round keeps no best candidate and discards nothing on a score. The two share the session log and the task rows and nothing of the driver. Rejected.
+
+On the duration. It bounds when the last round may begin and not when the loop ends. A deadline for the end would cut an agent turn in flight and discard its work, and the run's wall-clock ceiling and each task's timeout already bound the end. It is measured from the loop's first dispatch and not from the run's start, so tasks ahead of the loop do not spend its time.
+
+On the name. The construct is called loop because that is the established name for the pattern it serves: an agent turn run again and again on the same prompt until a check says stop, widely known as a Ralph loop. repeat was the other candidate and was dropped so the DSL matches the term authors already use. while is a reserved word in Starlark, so the condition is again."""

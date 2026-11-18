@@ -2,7 +2,9 @@
 
 use crate::errors::FileError;
 use crate::plan::diag;
-use crate::plan::ir::{MAX_FANOUT_CEILING, MAX_REPAIR_CEILING, MAX_ROUNDS_CEILING};
+use crate::plan::ir::{
+    MAX_FANOUT_CEILING, MAX_LOOP_ROUNDS, MAX_REPAIR_CEILING, MAX_ROUNDS_CEILING,
+};
 use crate::plan::workflow::WorkflowError;
 use starlark_syntax::codemap::FileSpan;
 
@@ -509,6 +511,34 @@ pub enum CompileError {
     ReviseNamesNoTask,
     #[error("max_rounds without \"revise\"; there is no loop to bound")]
     RoundsWithoutRevise,
+    #[error("loop body must be a list of tasks")]
+    LoopBodyNotTasks,
+    #[error("loop body = [] names no task")]
+    LoopBodyEmpty,
+    #[error(
+        "loop \"again\" must be a field a body task emits, as `again = task.field` for a boolean \
+         or `again = task.field.any_of(...)` for a list of labels"
+    )]
+    LoopAgainNotField,
+    #[error(
+        "loop again = {reference} reads a field declared as {declared}; a loop condition reads a \
+         boolean, or a list of labels through `.any_of(...)`"
+    )]
+    LoopAgainNotAnswerable { reference: String, declared: String },
+    #[error("loop again = {reference} reads a task outside the body; the body is {body}")]
+    LoopAgainOutsideBody { reference: String, body: String },
+    #[error("loop rounds = {got} is outside 1..={MAX_LOOP_ROUNDS}")]
+    LoopRoundsOutOfRange { got: i64 },
+    #[error("loop needs a bound: give rounds, duration, or both")]
+    LoopUnbounded,
+    #[error("loop duration = {raw:?} is not a positive duration (try `90s`, `30m`, `8h`)")]
+    LoopDurationInvalid { raw: String },
+    #[error(
+        "loop(s) constructed but not included in the workflow: {}; list the loop itself in \
+         workflow(tasks = ...), in place of its body's tasks",
+        Site::list(.sites)
+    )]
+    DroppedLoops { sites: Vec<Site> },
     #[error("emits entries must be strings")]
     EmitsEntryNotString,
     #[error("argument \"emits\" must be a list of field names, or a dict from field name to type")]

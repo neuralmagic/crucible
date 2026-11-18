@@ -1,0 +1,24 @@
+# loop: a bounded loop with no model. The agent is tools/fake-agent.py behind the command
+# backend, so only the model is absent.
+#
+#   just loop-example
+
+[repo]
+path = "."
+
+[workspace]
+dir = "workspace"
+inject = ["score.sh", "report.sh"]
+setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+
+[agent]
+backend = "command"
+agent_cmd = "python3 ../../../tools/fake-agent.py"
+goal = "Take steps until the score says stop."
+
+[agent.env]
+FAKE_AGENT_SCRIPT = "../agents.json"
+
+[workflow]
+type = "playbook"
+file = "workflow.star"

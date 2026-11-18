@@ -86,6 +86,9 @@ pub(crate) fn graph_view(pane: &Pane, app: &App, p: &Paint) -> El {
                 } else if from.revise.contains(&task.name) {
                     pointer(spot, format!("{name}'s rounds, each sent back by {by}"))
                         .on_press(move |app: &mut App| app.pick_task(&name, None))
+                } else if from.looped.contains(&task.name) {
+                    pointer(spot, format!("{by}'s rounds, while {}", from.again))
+                        .on_press(move |app: &mut App| app.pick_task(&by, None))
                 } else {
                     spot
                 }
@@ -577,7 +580,12 @@ fn instances_each(tasks: &[TaskView], unfolded: impl Fn(&TaskView) -> bool) -> u
         .map(|task| 2 * task.depends_on.len() + task.revise.len())
         .sum();
     let framed = tasks.iter().filter(|task| !task.instances.is_empty());
-    let taken = tasks.len() + edges + 3 * framed.count();
+    let looped: usize = tasks
+        .iter()
+        .filter(|task| !task.looped.is_empty())
+        .map(|task| 2 + task.looped.len())
+        .sum();
+    let taken = tasks.len() + edges + 3 * framed.count() + looped;
     let per: usize = tasks
         .iter()
         .filter(|task| unfolded(task))
@@ -630,6 +638,8 @@ struct Shown<'a> {
 ///   a[k] -->|yes| b[k]  a and b spread over the same list and each fits one row, so b's
 ///                       instance reads a's
 ///   r -.->|revise 2/3| a  r failing sends a back for another round, of at most 3
+///   d -.->|go: yes 2/5| a  d's loop, framed as subgraph `l<d>`, runs again from a while
+///                          d.go is yes, for at most 5 rounds
 /// ```
 ///
 /// Node colour carries each task's state, the open task has an accent outline, and the edges
@@ -854,6 +864,39 @@ fn mermaid_source<'a>(tasks: &'a [TaskView], shown: &Shown, ink: &Ink) -> String
             revise.push(edge.to_string());
             edge += 1;
         }
+    }
+    for (decider, task) in tasks.iter().enumerate() {
+        let Some(first) = task.looped.first() else {
+            continue;
+        };
+        source.push_str(&format!("  subgraph l{decider} [\"loop\"]\n"));
+        for member in &task.looped {
+            source.push_str(&format!("    {}\n", id(member)));
+        }
+        source.push_str("  end\n");
+        let (asked, values) = task.again.split_once(" in ").unwrap_or((&task.again, ""));
+        let field = asked.split_once('.').map_or(asked, |(_, field)| field);
+        let begun = tasks
+            .iter()
+            .filter(|t| task.looped.contains(&t.name))
+            .filter_map(|t| t.rounds.last())
+            .map(|round| round.n)
+            .max();
+        let mut rounds = match begun {
+            Some(n) => format!("{n}/{}", task.loop_rounds),
+            None => format!("\u{2264}{}", task.loop_rounds),
+        };
+        if !task.loop_duration.is_empty() {
+            rounds.push_str(&format!(" {}", clean(&task.loop_duration)));
+        }
+        source.push_str(&format!(
+            "  t{decider} -.->|{}: {} {rounds}| {}\n",
+            clean(field),
+            clean(&values.replace('|', " / ")),
+            id(first)
+        ));
+        revise.push(edge.to_string());
+        edge += 1;
     }
     if !revise.is_empty() {
         source.push_str(&format!(
@@ -1338,6 +1381,50 @@ mod tests {
         assert!(
             !ran.contains("t0 -.-> t1"),
             "a revise loop is not a passed-over edge"
+        );
+    }
+
+    /// `turn` and `score` loop while `score.go`, for at most five rounds; `last` reads `score`.
+    const LOOPED: &str = concat!(
+        r#"{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":1.0,"tasks":["#,
+        r#"{"name":"turn","kind":"agent","required":true},"#,
+        r#"{"name":"score","kind":"command","depends_on":["turn"],"required":true,"loop":["turn","score"],"again":"score.go in yes","loop_rounds":5,"loop_duration":"8h"},"#,
+        r#"{"name":"last","kind":"command","depends_on":["score"],"required":true}"#,
+        r#"]}"#,
+        "\n",
+        r#"{"v":1,"kind":"task_result","task":"turn[round-1]","status":"pass","attempts":1,"cost_usd":0.1,"secs":1.0,"note":""}"#,
+        "\n",
+        r#"{"v":1,"kind":"task_result","task":"score[round-1]","status":"pass","attempts":1,"cost_usd":0.0,"secs":1.0,"note":""}"#,
+        "\n",
+        r#"{"v":1,"kind":"task_result","task":"turn[round-2]","status":"pass","attempts":1,"cost_usd":0.1,"secs":1.0,"note":""}"#,
+        "\n",
+    );
+
+    #[test]
+    fn a_loop_is_framed_and_draws_one_edge_back_with_its_condition_and_rounds() {
+        let plan = LOOPED.lines().next().unwrap();
+        let before = source(&fold(plan), None, &[]);
+        contains_all(
+            &before,
+            &[
+                "t0(\"\u{2726} turn\")",
+                "  subgraph l1 [\"loop\"]\n    t0\n    t1\n  end\n",
+                "t1 -.->|go: yes \u{2264}5 8h| t0",
+                "t0 --> t1",
+                "t1 --> t2",
+            ],
+        );
+        assert_eq!(before.matches("-.->").count(), 1, "{before}");
+
+        let ran = source(&fold(LOOPED), None, &[]);
+        contains_all(
+            &ran,
+            &[
+                "t0(\"\u{2726} turn r2/5\")",
+                "t1[\"\u{203a} score r1/5\"]",
+                "t2[\"\u{203a} last\"]",
+                "t1 -.->|go: yes 2/5 8h| t0",
+            ],
         );
     }
 

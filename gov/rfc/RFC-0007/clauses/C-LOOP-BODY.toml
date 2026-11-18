@@ -1,0 +1,17 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-LOOP-BODY"
+title = "What a body may hold"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+The engine MUST reject a loop in which any body task is anything other than an agent, command, or evaluate task, or maps over a list. The engine MUST reject a body that omits a task lying on a dependency path between two body tasks: a round re-runs the body, and a task between two body tasks outside it would read a result a later round replaces.
+
+The engine MUST reject a task that is in two loops. It MUST reject a task that is in a loop's body and is also a reviewer or a target under [[RFC-0002:C-REVISE-LOOP]]. Loops do not nest, do not chain, and do not contain a revise loop. The engine MUST reject a body that holds both a main-graph task and an epilogue task.
+
+The engine MUST reject a body task whose when reads a field of another body task, because the route that answers that when would lie between two body tasks and a route cannot be in a body. A body task's when MAY read an answer produced outside the body.
+
+These checks apply to every plan the engine admits, whatever produced it."""
