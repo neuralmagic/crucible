@@ -1179,6 +1179,7 @@ impl App {
         self.remote.live_base = snapshot.base;
         self.remote.draft_pack = snapshot.draft;
         self.remote.registered = snapshot.registered;
+        self.remote.shareable = snapshot.shareable;
         self.answer_rerun(snapshot.reran);
         self.answer_launcher(snapshot.prepared, snapshot.launched);
         self.answer_draft(snapshot.synced);
