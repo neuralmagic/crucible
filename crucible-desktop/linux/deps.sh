@@ -6,5 +6,5 @@ dnf -y install \
     libxkbcommon-devel libxkbcommon-x11-devel wayland-devel libxcb-devel \
     dbus-devel dbus-daemon fontconfig-devel openssl-devel \
     vulkan-loader mesa-vulkan-drivers \
-    python3 rpm-build desktop-file-utils
+    python3 rpm-build desktop-file-utils unzip
 dnf clean all

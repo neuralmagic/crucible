@@ -679,6 +679,22 @@ fn query_of(location: &str) -> std::collections::HashMap<String, String> {
         .collect()
 }
 
+fn app_callback(page: &Reply) -> String {
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+    assert!(page.location.is_none());
+    let marker = "http-equiv=\"refresh\" content=\"0;url=";
+    let start = page.body.find(marker).expect("a return page refresh") + marker.len();
+    let target = page.body[start..]
+        .split('"')
+        .next()
+        .expect("a quoted callback");
+    assert!(
+        page.body.contains(&format!("href=\"{target}\"")),
+        "a manual callback link"
+    );
+    target.replace("&amp;", "&")
+}
+
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn a_desktop_app_signs_in_through_the_browser_and_gets_a_working_key(pool: PgPool) {
     use base64::Engine;
@@ -741,8 +757,7 @@ async fn a_desktop_app_signs_in_through_the_browser_and_gets_a_working_key(pool:
         ),
     )
     .await;
-    assert_eq!(approved.status, StatusCode::SEE_OTHER, "{}", approved.body);
-    let back = approved.location.expect("back to the app");
+    let back = app_callback(&approved);
     assert!(
         back.starts_with("http://127.0.0.1:53111/callback?"),
         "{back}"
@@ -808,7 +823,7 @@ async fn a_desktop_app_signs_in_through_the_browser_and_gets_a_working_key(pool:
         ),
     )
     .await;
-    let stolen = query_of(&second.location.expect("back"))["code"].clone();
+    let stolen = query_of(&app_callback(&second))["code"].clone();
     let wrong = call(&app, redeem(&stolen, &format!("{verifier}x"))).await;
     assert_eq!(wrong.status, StatusCode::BAD_REQUEST, "{}", wrong.body);
     assert!(wrong.body.contains("does not match"), "{}", wrong.body);
@@ -830,7 +845,7 @@ async fn a_desktop_app_signs_in_through_the_browser_and_gets_a_working_key(pool:
         ),
     )
     .await;
-    let params = query_of(&denied.location.expect("back"));
+    let params = query_of(&app_callback(&denied));
     assert_eq!(
         params.get("error").map(String::as_str),
         Some("access_denied")

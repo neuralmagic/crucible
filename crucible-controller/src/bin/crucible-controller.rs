@@ -1,6 +1,7 @@
 //! crucible-controller — the control plane's CLI: discovery (`triage`), the reconcile daemon
-//! (`autopilot`), ledger maintenance (`db verify|export-events|adopt`), the grounded-vs-API ranking
-//! comparison harness (`rank-compare`), and the OpenAPI spec print (`openapi`). Split out of the
+//! (`autopilot`), that daemon on one machine (`local`), ledger maintenance
+//! (`db verify|export-events|adopt`), the grounded-vs-API ranking comparison harness
+//! (`rank-compare`), and the OpenAPI spec print (`openapi`). Split out of the
 //! public `crucible` engine binary so the engine ships without the control plane: the controller
 //! shells the engine (`crucible rank-grounded`, `crucible deploy render`) as a subprocess and the
 //! two meet only at the `crucible-contract` wire types.
@@ -51,6 +52,9 @@ pub(crate) enum Cmd {
         #[arg(long)]
         once: bool,
     },
+    /// The controller on this machine: its own Postgres, one login, no identity provider, Vault,
+    /// or cluster. Launches run as local subprocesses.
+    Local(crucible_controller::local::LocalArgs),
     /// Controller ledger maintenance: verify the schema, export the event log, or adopt a run
     /// launched elsewhere.
     Db {
@@ -156,6 +160,7 @@ fn main() -> Result<()> {
         #[cfg(feature = "autoresearch")]
         Cmd::Triage { cfg, full } => dispatch_triage(cfg, full),
         Cmd::Autopilot { cfg, once } => dispatch_autopilot(cfg, once),
+        Cmd::Local(args) => dispatch_local(args),
         Cmd::Db { action } => dispatch_db(action),
         Cmd::Openapi => {
             println!("{}", crucible_controller::openapi_spec()?);
@@ -504,6 +509,18 @@ fn dispatch_autopilot(mut cfg: crucible_controller::ControllerCfg, once: bool) -
     let ran = rt.block_on(run_autopilot_daemon(cfg));
     rt.shutdown_timeout(AUTOPILOT_DRAIN);
     ran
+}
+
+/// `crucible-controller local`: becomes `autopilot` with the local settings.
+fn dispatch_local(args: crucible_controller::local::LocalArgs) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let exe = std::env::current_exe().context("locating crucible-controller")?;
+    let local = args.resolve(exe)?;
+    let mut autopilot = local.autopilot()?;
+    println!("UI  {} as {}", local.url(), local.identity());
+    println!("Webhook deliveries {}/hooks/<id>", local.hooks_url());
+    Err(autopilot.exec()).context("starting the local controller")
 }
 
 /// How long a stopping autopilot waits on blocking work after its tasks are dropped.

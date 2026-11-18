@@ -667,18 +667,33 @@ fn read_start(dir: &Path) -> String {
     time
 }
 
-/// The binary the Run button spawns: an override beats the checkout's build, which beats `$PATH`.
+/// `name` from the runtime the app ships with, in `beside` its executable, else as the checkout
+/// built it.
+fn runtime_binary(beside: Option<&Path>, repo: &Path, name: &str) -> Option<PathBuf> {
+    beside
+        .map(|dir| dir.join(name))
+        .into_iter()
+        .chain(["target/debug", "target/release"].map(|built| repo.join(built).join(name)))
+        .find(|path| path.is_file())
+}
+
+fn beside_the_app() -> Option<PathBuf> {
+    Some(std::env::current_exe().ok()?.parent()?.to_path_buf())
+}
+
+/// The engine the Run button spawns: an override beats the bundled one, which beats the
+/// checkout's build, which beats `$PATH`.
 pub fn crucible_binary(repo: &Path) -> PathBuf {
     if let Ok(bin) = std::env::var("CRUCIBLE_BIN") {
         return PathBuf::from(bin);
     }
-    for candidate in ["target/debug/crucible", "target/release/crucible"] {
-        let path = repo.join(candidate);
-        if path.is_file() {
-            return path;
-        }
-    }
-    PathBuf::from("crucible")
+    runtime_binary(beside_the_app().as_deref(), repo, "crucible")
+        .unwrap_or_else(|| PathBuf::from("crucible"))
+}
+
+/// The controller a local profile starts: the bundled one, else the checkout's build.
+pub fn controller_binary(repo: &Path) -> Option<PathBuf> {
+    runtime_binary(beside_the_app().as_deref(), repo, "crucible-controller")
 }
 
 fn find_repo(start: PathBuf, levels: usize) -> Option<PathBuf> {
@@ -1001,5 +1016,32 @@ printf '%s\n' '{SHUTDOWN}' >> "$d/state/session.jsonl"
                 .unwrap()
                 .contains("missing --max-time")
         );
+    }
+
+    #[test]
+    fn the_runtime_beside_the_app_beats_the_checkouts_builds() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("Crucible Playbooks.app/Contents/MacOS");
+        let repo = dir.path().join("repo");
+        let name = "crucible-controller";
+        let find = |beside: Option<&Path>| runtime_binary(beside, &repo, name);
+        let build = |at: &Path| {
+            std::fs::create_dir_all(at).unwrap();
+            std::fs::write(at.join(name), "").unwrap();
+            at.join(name)
+        };
+        assert_eq!(find(Some(&app)), None);
+
+        std::fs::create_dir_all(repo.join("target/debug").join(name)).unwrap();
+        assert_eq!(find(Some(&app)), None, "a directory is not a binary");
+        std::fs::remove_dir(repo.join("target/debug").join(name)).unwrap();
+
+        let release = build(&repo.join("target/release"));
+        assert_eq!(find(Some(&app)), Some(release));
+        let debug = build(&repo.join("target/debug"));
+        assert_eq!(find(Some(&app)), Some(debug.clone()));
+        let bundled = build(&app);
+        assert_eq!(find(Some(&app)), Some(bundled));
+        assert_eq!(find(None), Some(debug));
     }
 }

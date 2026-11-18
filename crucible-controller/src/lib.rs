@@ -37,6 +37,7 @@ pub mod images;
 pub mod issues;
 pub mod launches;
 pub mod ledger;
+pub mod local;
 pub mod mcp;
 pub mod metrics;
 pub mod model;

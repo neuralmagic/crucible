@@ -74,14 +74,23 @@ tunnel = "ssh -N -D 1080 jumpbox"      # kept running while the app is
 shell = "/bin/bash"                    # runs it as `<shell> -l -c`; `$SHELL` when unset
 
 [profiles.local]
-url = "http://127.0.0.1:8870"          # starts `just controller-local 8870` in the repo
+url = "http://127.0.0.1:8870"          # starts `crucible-controller local --port 8870`
 ```
 
 A tunnel (or, for a loopback profile, the local controller) starts the first time its profile is
 used, unless something already answers at its proxy or URL, and the profile waits until it does.
-It runs under the app's own binary (`crucible-playbooks --keep`) as a supervisor, which kills the
-tunnel's process group when the app's end of a pipe closes, so it stops with the app however the
-app stops, crash included. A tunnel that stops after it has answered is started again, after 2s
+The installed app includes `crucible-controller`, `crucible`, and `crux`; it needs no source
+checkout, Rust toolchain, Bun, or `just`. The local controller is `crucible-controller local`
+([Running the controller locally](../docs/controller-local.md)): it stores its database and run
+state under `${XDG_STATE_HOME:-$HOME/.local/state}/crucible-controller`, and on first use it
+downloads Postgres into `~/.theseus/postgresql`. A source build runs the `crucible-controller`
+the checkout built (`target/debug`, else `target/release`); `just controller-local` builds and
+runs one, which the app then uses in place of starting its own.
+Either runs under the app's own binary (`crucible-playbooks --keep`) as a supervisor, which kills
+its process group when the app's end of a pipe closes, so it stops with the app however the
+app stops, crash included. A tunnel is a command line for your login shell. The local controller
+is started directly, in the environment your login shell exports, so its runs find the `PATH`
+and variables your shell startup files set even when the app was opened from the desktop. A tunnel that stops after it has answered is started again, after 2s
 and then twice as long each time up to a minute; one that never answered is left stopped, with
 `Retry` on its profile in Settings. A profile that fails to read is shown with why in Settings and
 left as written in the file. A `config.toml` that does not read as a whole is shown the same way,
@@ -94,6 +103,9 @@ controller's `/auth/native` page, you sign in and approve, and the controller ha
 `config.toml` with `auth = "crux"`, so the `crux` CLI is signed in too. For a controller the
 browser cannot reach, paste a `crk_` key instead. Keys can be revoked in the controller's Settings
 like any other key.
+
+Browser sign-in needs a profile URL that serves `/auth/native` and `/auth/native/token`.
+An API-only hostname exposing `/api` and `/mcp` needs a pasted key instead.
 
 Settings' `Keys in keychain` switch (`keychain = true` in the config) keeps those keys in the
 system credential store instead: the macOS Keychain, or the Secret Service on Linux, under the
