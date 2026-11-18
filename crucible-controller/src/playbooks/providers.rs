@@ -414,6 +414,9 @@ pub struct ModelProvider {
     pub harness: Option<Harness>,
     /// What this provider's agent tokens cost; `None` leaves pricing to the engine's vendor table.
     pub price: Option<TokenPrice>,
+    /// What each model's agent tokens cost, by model id; a model with no entry is charged
+    /// [`Self::price`].
+    pub model_prices: BTreeMap<String, TokenPrice>,
     /// What each model can take and give, by model id; a model with no entry leaves its limits
     /// to the harness.
     pub model_limits: BTreeMap<String, ModelLimits>,
@@ -478,7 +481,8 @@ impl ModelProvider {
 
     /// This provider as the engine's binding for `role`, asking `model`. A provider that spends a
     /// secret names the role's key variable; one that does not authenticates ambiently. Only the
-    /// agent binding carries the price and the model's limits.
+    /// agent binding carries a price, the model's own before the provider's, and the model's
+    /// limits.
     pub fn binding(&self, role: ModelRole, model: &str) -> Result<InferenceBinding> {
         let Some(protocol) = self.protocol_for(role) else {
             bail!(
@@ -498,7 +502,7 @@ impl ModelProvider {
             model: model.to_owned(),
             key_env,
             price: match role {
-                ModelRole::Agent => self.price,
+                ModelRole::Agent => self.model_prices.get(model).copied().or(self.price),
                 ModelRole::Decision => None,
             },
             limits: match role {
@@ -537,6 +541,8 @@ pub struct NewProvider<'a> {
     pub harness: Option<Harness>,
     /// Refused on a provider that serves no agent.
     pub price: Option<TokenPrice>,
+    /// Refused on a provider that serves no agent.
+    pub model_prices: BTreeMap<String, TokenPrice>,
     /// Refused on a provider that serves no agent.
     pub model_limits: BTreeMap<String, ModelLimits>,
     pub enabled: bool,
@@ -682,7 +688,7 @@ impl From<ResolvedModel> for ResolvedDispatch {
 
 const PROVIDER_COLS: &str = "id, display_name, kind, models, default_model, secret_name, \
      secret_owner, endpoint, protocol, harness, price_input, price_output, price_cache_read, \
-     price_cache_write, model_limits, enabled, owner, created_by, created_at, updated_at";
+     price_cache_write, model_prices, model_limits, enabled, owner, created_by, created_at, updated_at";
 
 fn price_from_row(row: &sqlx::postgres::PgRow) -> Result<Option<TokenPrice>> {
     let cols: [Option<f64>; 4] = [
@@ -751,6 +757,9 @@ fn provider_from_row(row: &sqlx::postgres::PgRow) -> Result<ModelProvider> {
         endpoint,
         harness,
         price: price_from_row(row)?,
+        model_prices: row
+            .try_get::<sqlx::types::Json<BTreeMap<String, TokenPrice>>, _>("model_prices")?
+            .0,
         model_limits: row
             .try_get::<sqlx::types::Json<BTreeMap<String, ModelLimits>>, _>("model_limits")?
             .0,
@@ -788,6 +797,7 @@ struct ProviderBinds {
     protocol: Option<&'static str>,
     harness: Option<&'static str>,
     price: [Option<f64>; 4],
+    model_prices: sqlx::types::Json<BTreeMap<String, TokenPrice>>,
     model_limits: sqlx::types::Json<BTreeMap<String, ModelLimits>>,
 }
 
@@ -842,6 +852,16 @@ fn provider_binds(new: &NewProvider<'_>) -> Result<ProviderBinds> {
             protocol.map_or(String::new(), |p| format!(" speaking {}", p.as_str())),
         );
     }
+    if !new.model_prices.is_empty() && allowed_harnesses(new.kind, protocol).is_empty() {
+        bail!(
+            "a {} provider{} serves no agent, so it takes no model prices",
+            new.kind.as_str(),
+            protocol.map_or(String::new(), |p| format!(" speaking {}", p.as_str())),
+        );
+    }
+    if let Some(model) = new.model_prices.keys().find(|m| !is_model_id(m)) {
+        bail!("model prices name the model {model:?}, which is not a model id");
+    }
     if !new.model_limits.is_empty() && allowed_harnesses(new.kind, protocol).is_empty() {
         bail!(
             "a {} provider{} serves no agent, so it takes no model limits",
@@ -850,7 +870,7 @@ fn provider_binds(new: &NewProvider<'_>) -> Result<ProviderBinds> {
         );
     }
     for (model, limits) in &new.model_limits {
-        if model.trim().is_empty() || model.chars().any(char::is_whitespace) {
+        if !is_model_id(model) {
             bail!("model limits name the model {model:?}, which is not a model id");
         }
         if limits.max_output_tokens > limits.context_window {
@@ -878,8 +898,14 @@ fn provider_binds(new: &NewProvider<'_>) -> Result<ProviderBinds> {
                 Some(p.cache_write.get()),
             ],
         },
+        model_prices: sqlx::types::Json(new.model_prices.clone()),
         model_limits: sqlx::types::Json(new.model_limits.clone()),
     })
+}
+
+/// Whether `model` can key a per-model setting: not blank and free of whitespace.
+pub fn is_model_id(model: &str) -> bool {
+    !model.trim().is_empty() && !model.chars().any(char::is_whitespace)
 }
 
 /// The harnesses spelled for a refusal: `claude, opencode, pi`.
@@ -894,9 +920,10 @@ pub fn harness_list(harnesses: impl AsRef<[Harness]>) -> String {
 
 const PROVIDER_INSERT: &str = "INSERT INTO model_providers (id, display_name, kind, models, default_model, secret_name, \
      secret_owner, endpoint, protocol, enabled, created_by, created_at, updated_at, owner, harness, \
-     price_input, price_output, price_cache_read, price_cache_write, model_limits) \
+     price_input, price_output, price_cache_read, price_cache_write, model_limits, \
+     model_prices) \
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $13, $14, $15, $16, $17, $18, \
-     $19)";
+     $19, $20)";
 
 const PROVIDER_INSERT_OR_IGNORE: &str =
     const_format::concatcp!(PROVIDER_INSERT, " ON CONFLICT (id) DO NOTHING");
@@ -912,6 +939,7 @@ const PROVIDER_UPSERT: &str = const_format::concatcp!(
          price_cache_read = EXCLUDED.price_cache_read, \
          price_cache_write = EXCLUDED.price_cache_write, \
          model_limits = EXCLUDED.model_limits, \
+         model_prices = EXCLUDED.model_prices, \
          enabled = EXCLUDED.enabled, updated_at = EXCLUDED.updated_at"
 );
 
@@ -942,6 +970,7 @@ async fn write_provider(
         .bind(binds.price[2])
         .bind(binds.price[3])
         .bind(&binds.model_limits)
+        .bind(&binds.model_prices)
         .execute(ex)
         .await
         .context(context)?;
@@ -1579,6 +1608,7 @@ mod tests {
         };
         let new = |harness| NewProvider {
             model_limits: Default::default(),
+            model_prices: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "chat",
             display_name: "chat",
@@ -1620,6 +1650,7 @@ mod tests {
                 &pool,
                 &NewProvider {
                     model_limits: Default::default(),
+                    model_prices: Default::default(),
                     owner: crate::authz::model::Principal::platform(),
                     id,
                     display_name: id,
@@ -1684,6 +1715,7 @@ mod tests {
             &pool,
             &NewProvider {
                 model_limits: Default::default(),
+                model_prices: Default::default(),
                 owner: crate::authz::model::Principal::platform(),
                 id: "onprem",
                 display_name: "On-prem vLLM",
@@ -1734,6 +1766,7 @@ mod tests {
             &pool,
             &NewProvider {
                 model_limits: Default::default(),
+                model_prices: Default::default(),
                 owner: crate::authz::model::Principal::platform(),
                 id: "onprem-2",
                 display_name: "no default",
@@ -1758,6 +1791,7 @@ mod tests {
             &pool,
             &NewProvider {
                 model_limits: Default::default(),
+                model_prices: Default::default(),
                 owner: crate::authz::model::Principal::platform(),
                 id: "oa",
                 display_name: "OpenAI",
@@ -1784,6 +1818,7 @@ mod tests {
     fn new_provider<'a>(id: &'a str, kind: ProviderKind) -> NewProvider<'a> {
         NewProvider {
             model_limits: Default::default(),
+            model_prices: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id,
             display_name: "Some Provider",
@@ -1802,6 +1837,7 @@ mod tests {
     fn registered(kind: ProviderKind, endpoint: Option<Endpoint>, keyed: bool) -> ModelProvider {
         ModelProvider {
             model_limits: Default::default(),
+            model_prices: Default::default(),
             id: "p".to_string(),
             display_name: "P".to_string(),
             kind,
@@ -2843,6 +2879,7 @@ mod tests {
     fn selfhosted(endpoint: &Endpoint, price: Option<TokenPrice>) -> NewProvider<'_> {
         NewProvider {
             model_limits: Default::default(),
+            model_prices: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "selfhosted",
             display_name: "Self-hosted",
@@ -2935,6 +2972,7 @@ mod tests {
 
         let mut openai = ModelProvider {
             model_limits: Default::default(),
+            model_prices: Default::default(),
             id: "plat-openai".to_string(),
             display_name: "OpenAI".to_string(),
             kind: ProviderKind::OpenAi,
@@ -2969,6 +3007,159 @@ mod tests {
             openai
                 .binding(ModelRole::Agent, "gpt-5.6-luna")
                 .expect("agent")
+                .price,
+            None
+        );
+    }
+
+    fn luna_price() -> TokenPrice {
+        let usd = |v| UsdPerMtok::new(v).expect("a price");
+        TokenPrice {
+            input: usd(1.25),
+            output: usd(10.0),
+            cache_read: usd(0.125),
+            cache_write: usd(1.25),
+        }
+    }
+
+    /// A model's price round-trips the registry, rides the agent binding of the model it names in
+    /// place of the provider's price, leaves every other model on the provider's price, and is
+    /// cleared by a re-registration without it.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn a_model_price_wins_over_the_provider_price_for_its_model_only(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let endpoint = Endpoint {
+            url: "https://selfhosted.example/v1".to_string(),
+            protocol: InferenceProtocol::Messages,
+        };
+        let mut new = selfhosted(&endpoint, Some(glm_price()));
+        new.model_prices = BTreeMap::from([("zai-org/glm-5".to_string(), luna_price())]);
+        upsert(&pool, &new).await?;
+        let stored = get(&pool, "selfhosted").await?.expect("the row");
+        assert_eq!(stored.model_prices, new.model_prices);
+        assert_eq!(stored.price, Some(glm_price()));
+
+        let resolved = resolve_dispatch(
+            &pool,
+            Some(DispatchOverride {
+                provider_id: "selfhosted",
+                model: None,
+            }),
+            None,
+            WorkloadClass::Playbook,
+        )
+        .await?
+        .expect("the pinned provider");
+        let document = inference_document(&[resolved.inference()])?;
+        let agent = document
+            .binding(InferenceRole::Agent)
+            .expect("the agent binding");
+        assert_eq!(agent.model, "zai-org/glm-5");
+        assert_eq!(agent.price, Some(luna_price()));
+        assert_eq!(
+            stored.binding(ModelRole::Agent, "small")?.price,
+            Some(glm_price())
+        );
+
+        let mut unpriced = selfhosted(&endpoint, None);
+        unpriced.model_prices = new.model_prices.clone();
+        upsert(&pool, &unpriced).await?;
+        let stored = get(&pool, "selfhosted").await?.expect("the row");
+        assert_eq!(
+            stored.binding(ModelRole::Agent, "zai-org/glm-5")?.price,
+            Some(luna_price())
+        );
+        assert_eq!(stored.binding(ModelRole::Agent, "small")?.price, None);
+
+        upsert(&pool, &selfhosted(&endpoint, Some(glm_price()))).await?;
+        let cleared = get(&pool, "selfhosted").await?.expect("the row");
+        assert!(cleared.model_prices.is_empty());
+        assert_eq!(
+            cleared.binding(ModelRole::Agent, "zai-org/glm-5")?.price,
+            Some(glm_price())
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn the_table_refuses_model_prices_that_are_not_an_object(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let endpoint = Endpoint {
+            url: "https://selfhosted.example/v1".to_string(),
+            protocol: InferenceProtocol::Messages,
+        };
+        upsert(&pool, &selfhosted(&endpoint, None)).await?;
+        for sql in [
+            "UPDATE model_providers SET model_prices = '[]' WHERE id = 'selfhosted'",
+            "UPDATE model_providers SET model_prices = '3' WHERE id = 'selfhosted'",
+            "UPDATE model_providers SET model_prices = NULL WHERE id = 'selfhosted'",
+        ] {
+            let refused = sqlx::query(sql).execute(&pool).await;
+            assert!(refused.is_err(), "{sql}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn model_prices_need_an_agent_and_a_model_id() {
+        let refusal = |endpoint: &Endpoint, model: &str| {
+            let mut new = selfhosted(endpoint, None);
+            new.model_prices = BTreeMap::from([(model.to_string(), luna_price())]);
+            match provider_binds(&new) {
+                Err(e) => e.to_string(),
+                Ok(_) => String::new(),
+            }
+        };
+        let decide = Endpoint {
+            url: "http://dgemma.internal:8011/v1/systemone".to_string(),
+            protocol: InferenceProtocol::SystemOne,
+        };
+        let agent = Endpoint {
+            url: "https://selfhosted.example/v1".to_string(),
+            protocol: InferenceProtocol::Messages,
+        };
+        let err = refusal(&decide, "m");
+        assert!(err.contains("takes no model prices"), "{err}");
+        let err = refusal(&agent, "two words");
+        assert!(err.contains("is not a model id"), "{err}");
+        let err = refusal(&agent, "");
+        assert!(err.contains("is not a model id"), "{err}");
+        assert_eq!(refusal(&agent, "m"), "");
+    }
+
+    #[test]
+    fn a_decision_binding_carries_no_model_price() {
+        let openai = ModelProvider {
+            model_limits: Default::default(),
+            model_prices: BTreeMap::from([("gpt-6-luna".to_string(), luna_price())]),
+            id: "plat-openai".to_string(),
+            display_name: "OpenAI".to_string(),
+            kind: ProviderKind::OpenAi,
+            models: Vec::new(),
+            default_model: "gpt-6-luna".to_string(),
+            secret: None,
+            endpoint: None,
+            harness: None,
+            price: None,
+            enabled: true,
+            owner: crate::authz::model::Principal::platform(),
+            created_by: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        assert_eq!(
+            openai
+                .binding(ModelRole::Agent, "gpt-6-luna")
+                .expect("agent")
+                .price,
+            Some(luna_price())
+        );
+        assert_eq!(
+            openai
+                .binding(ModelRole::Decision, "gpt-6-luna")
+                .expect("decision")
                 .price,
             None
         );
@@ -3085,6 +3276,7 @@ mod tests {
     fn only_the_agent_binding_carries_the_models_limits() {
         let openai = ModelProvider {
             model_limits: BTreeMap::from([("gpt-6-luna".to_string(), limits(400_000, 128_000))]),
+            model_prices: Default::default(),
             id: "plat-openai".to_string(),
             display_name: "OpenAI".to_string(),
             kind: ProviderKind::OpenAi,

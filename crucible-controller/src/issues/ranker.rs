@@ -1184,6 +1184,7 @@ mod tests {
             db.pool(),
             &crate::playbooks::providers::NewProvider {
                 model_limits: Default::default(),
+                model_prices: Default::default(),
                 owner: crate::authz::model::Principal::platform(),
                 id: "gateway",
                 display_name: "Gateway",
@@ -1215,6 +1216,7 @@ mod tests {
         let dispatch = |protocol, url: &str| ResolvedDispatch {
             provider: crate::playbooks::providers::ModelProvider {
                 model_limits: Default::default(),
+                model_prices: Default::default(),
                 id: "p".to_string(),
                 display_name: "p".to_string(),
                 kind: ProviderKind::Custom,

@@ -1185,10 +1185,10 @@ pub fn playbook_caps(caps: &dto::PlaybookCaps) -> String {
     )
 }
 
-/// `-` for a provider with no price, which the engine prices by the vendor's list price, or at
-/// nothing for a model no vendor sells.
-fn price(p: Option<&dto::ProviderPrice>) -> String {
-    match p {
+/// The default model's price, its own before the provider's, or `-` for a provider with neither,
+/// which the engine prices by the vendor's list price, or at nothing for a model no vendor sells.
+fn price(p: &dto::Provider) -> String {
+    match p.model_prices.get(&p.default_model).or(p.price.as_ref()) {
         Some(p) => format!(
             "{}/{}/{}/{}",
             p.input, p.output, p.cache_read, p.cache_write
@@ -1218,7 +1218,7 @@ pub fn providers(list: &[dto::Provider]) -> String {
                 p.kind.clone(),
                 p.default_model.clone(),
                 p.harness.clone().unwrap_or_else(|| "-".to_string()),
-                price(p.price.as_ref()),
+                price(p),
                 limits(p),
                 if p.enabled { "yes" } else { "no" }.to_string(),
                 p.owner.clone(),
@@ -3243,6 +3243,14 @@ mod tests {
                "enabled":true,"owner":"platform","created_by":"wren",
                "created_at":"2026-10-22T00:00:00Z","updated_at":"2026-10-22T00:00:00Z",
                "actions":[]},
+              {"id":"lab","display_name":"Lab","kind":"custom","models":[],
+               "default_model":"big","harness":"pi","roles":["agent"],
+               "price":{"input":0.6,"output":2.2,"cache_read":0.11,"cache_write":0.6},
+               "model_prices":{"big":{"input":3,"output":15,"cache_read":0.3,"cache_write":3.75},
+                               "small":{"input":0.1,"output":0.4,"cache_read":0.01,"cache_write":0.1}},
+               "enabled":true,"owner":"platform","created_by":"wren",
+               "created_at":"2026-10-22T00:00:00Z","updated_at":"2026-10-22T00:00:00Z",
+               "actions":[]},
               {"id":"plat-openai","display_name":"OpenAI","kind":"openai","models":[],
                "default_model":"gpt-5.6-luna","harness":"codex","roles":["agent"],
                "price":null,"enabled":false,"owner":"platform","created_by":"wren",
@@ -3252,7 +3260,7 @@ mod tests {
         )
         .expect("wire shape");
         let out = providers(&list);
-        assert!(out.starts_with("2 providers"), "{out}");
+        assert!(out.starts_with("3 providers"), "{out}");
         assert!(out.contains("PRICE"), "{out}");
         let rows: Vec<&str> = out.lines().collect();
         let row = rows
@@ -3266,6 +3274,12 @@ mod tests {
             "only the default model's limits: {row}"
         );
         assert!(row.contains("yes"), "{row}");
+        let lab = rows.iter().find(|l| l.starts_with("lab")).expect("row");
+        assert!(lab.contains("3/15/0.3/3.75"), "{lab}");
+        assert!(
+            !lab.contains("0.6/2.2") && !lab.contains("0.1/0.4"),
+            "only the default model's price: {lab}"
+        );
         let openai = rows
             .iter()
             .find(|l| l.starts_with("plat-openai"))

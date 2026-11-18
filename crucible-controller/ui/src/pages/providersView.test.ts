@@ -26,6 +26,7 @@ const ONPREM: ProviderDetailDto = {
   kind: 'custom',
   models: ['gpt-oss-120b'],
   default_model: 'gpt-oss-120b',
+  model_prices: {},
   model_limits: {},
   secret_name: 'vllm-key',
   secret_owner: 'user:alice',
@@ -57,15 +58,21 @@ describe('providerBody', () => {
     expect('secret_name' in openai).toBe(false);
   });
 
-  it('keeps the price and model limits of the registration it edits', () => {
+  it('keeps the price, model prices and model limits of the registration it edits', () => {
     const price = { input: 0.6, output: 2.2, cache_read: 0.11, cache_write: 0.6 };
     const model_limits = { 'gpt-oss-120b': { context_window: 131072, max_output_tokens: 32768 } };
-    const body = providerBody({ ...formOf({ ...ONPREM, price, model_limits }), displayName: 'Renamed' });
+    const model_prices = { 'gpt-oss-120b': { input: 0.15, output: 0.6, cache_read: 0.02, cache_write: 0.15 } };
+    const body = providerBody({
+      ...formOf({ ...ONPREM, price, model_prices, model_limits }),
+      displayName: 'Renamed',
+    });
     expect(body.price).toEqual(price);
+    expect(body.model_prices).toEqual(model_prices);
     expect(body.model_limits).toEqual(model_limits);
 
     const fresh = providerBody(formOf(ONPREM));
     expect('price' in fresh).toBe(false);
+    expect(fresh.model_prices).toEqual({});
     expect(fresh.model_limits).toEqual({});
   });
 

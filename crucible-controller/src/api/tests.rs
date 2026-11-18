@@ -12104,6 +12104,7 @@ async fn seed_provider(
         pool,
         &crate::playbooks::providers::NewProvider {
             model_limits: Default::default(),
+            model_prices: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id,
             display_name: "Platform OpenAI",
@@ -12193,6 +12194,7 @@ async fn config_providers_lists_enabled_providers_and_the_defaults(pool: PgPool)
         db.pool(),
         &crate::playbooks::providers::NewProvider {
             model_limits: Default::default(),
+            model_prices: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "plat-openai",
             display_name: "Platform OpenAI",
@@ -12289,6 +12291,7 @@ async fn an_owned_provider_is_offered_and_pinned_only_by_those_who_may_read_it(
             db.pool(),
             &crate::playbooks::providers::NewProvider {
                 model_limits: Default::default(),
+                model_prices: Default::default(),
                 owner: crate::authz::model::Principal::parse("user:reed").expect("a principal"),
                 id,
                 display_name: "Reed's",
@@ -13901,6 +13904,109 @@ async fn a_provider_carries_limits_per_model(pool: PgPool) -> Result<()> {
         serde_json::json!({}),
         "a PUT without limits clears them"
     );
+    Ok(())
+}
+
+/// A provider's model prices are per model: registered beside the provider's price, shown to the
+/// picker and the admin list, cleared by a PUT, and refused when a rate is negative, a bucket is
+/// missing, the key is not a model id, or the provider serves no agent.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_provider_carries_prices_per_model(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool);
+    let app = app_with_admins(db.clone(), vec!["wren".to_string()]);
+    let glm = |prices: serde_json::Value| {
+        serde_json::json!({
+            "id": "selfhosted", "display_name": "Self-hosted", "kind": "custom",
+            "default_model": "zai-org/glm-5", "protocol": "messages",
+            "endpoint": "https://selfhosted.example/v1",
+            "price": {"input": 0.6, "output": 2.2, "cache_read": 0.11, "cache_write": 0.6},
+            "model_prices": prices,
+        })
+    };
+    let rates = |input: f64| serde_json::json!({"input": input, "output": 10.0, "cache_read": 0.125, "cache_write": 1.25});
+
+    for (body, expected) in [
+        (
+            glm(serde_json::json!({"small": rates(-1.0)})),
+            "model_prices.small.input must be a finite, non-negative",
+        ),
+        (
+            glm(serde_json::json!({"two words": rates(1.25)})),
+            "model_prices names \"two words\", which is not a model id",
+        ),
+        (
+            serde_json::json!({"id": "dgemma", "display_name": "dgemma", "kind": "custom",
+                "default_model": "dgemma", "protocol": "system_one",
+                "endpoint": "http://dgemma.internal:8011/v1/systemone",
+                "model_prices": {"dgemma": rates(1.25)}}),
+            "take no prices",
+        ),
+    ] {
+        let (status, refused) = post_admin(&app, "/api/providers", body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(expected),
+            "{expected}: {refused}"
+        );
+    }
+    let res = app
+        .clone()
+        .oneshot(admin_json(
+            "POST",
+            "/api/providers",
+            glm(serde_json::json!({"small": {"input": 1.25, "output": 10.0}})),
+        )?)
+        .await?;
+    assert!(
+        res.status().is_client_error(),
+        "a model price names all four buckets: {}",
+        res.status()
+    );
+
+    let prices = serde_json::json!({"small": rates(1.25)});
+    let (status, created) = post_admin(&app, "/api/providers", glm(prices.clone())).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["model_prices"], prices);
+    let stored = crate::playbooks::providers::get(db.pool(), "selfhosted")
+        .await?
+        .expect("the row");
+    let price_of = |model: &str| -> Result<Option<f64>> {
+        Ok(stored
+            .binding(crate::playbooks::providers::ModelRole::Agent, model)?
+            .price
+            .map(|p| p.input.get()))
+    };
+    assert_eq!(price_of("small")?, Some(1.25), "the model's own price");
+    assert_eq!(
+        price_of("zai-org/glm-5")?,
+        Some(0.6),
+        "a model with no entry takes the provider's price"
+    );
+
+    let (status, picker) = get_json_object(&app, "/api/config/providers").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(picker["providers"][0]["model_prices"], prices);
+
+    let mut body = glm(serde_json::json!({}));
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("id");
+        obj.remove("model_prices");
+    }
+    let res = app
+        .clone()
+        .oneshot(admin_json("PUT", "/api/providers/selfhosted", body)?)
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
+    let replaced = json_of(res).await?;
+    assert_eq!(
+        replaced["model_prices"],
+        serde_json::json!({}),
+        "a PUT without model prices clears them"
+    );
+    assert_eq!(replaced["price"]["input"], 0.6);
     Ok(())
 }
 
