@@ -1,0 +1,84 @@
+name: Nightly
+
+# Build main's head with the Release workflow's jobs and publish the artifacts to one rolling
+# prerelease tagged `nightly`. A night on which main has not moved since the last nightly builds
+# nothing.
+on:
+  schedule:
+    - cron: '23 8 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+permissions:
+  contents: write # create the release, replace its assets, move the tag
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      stale: ${{ steps.plan.outputs.stale }}
+      date: ${{ steps.plan.outputs.date }}
+      stamp: ${{ steps.plan.outputs.stamp }}
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Plan
+        id: plan
+        run: |
+          set -euo pipefail
+          if gh release view nightly --json body --jq .body 2>/dev/null | grep -q "$GITHUB_SHA"; then
+            echo "nightly is already built from $GITHUB_SHA"
+            echo "stale=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          base=$(awk -F'"' '/^version = / { print $2; exit }' crucible-desktop/Cargo.toml)
+          [ -n "$base" ]
+          date=$(date -u +%Y-%m-%d)
+          short="${GITHUB_SHA::7}"
+          {
+            echo "stale=true"
+            echo "date=$date"
+            echo "stamp=nightly-${date//-/}-$short"
+            echo "version=$base.${date//-/}.$short"
+          } >> "$GITHUB_OUTPUT"
+          gh release view nightly >/dev/null 2>&1 || gh release create nightly \
+            --target "$GITHUB_SHA" --prerelease --title "Nightly" --notes "First build in progress."
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.stale == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: nightly
+      ref: ${{ github.sha }}
+      stamp: ${{ needs.plan.outputs.stamp }}
+      version: ${{ needs.plan.outputs.version }}
+
+  publish:
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish
+        env:
+          DATE: ${{ needs.plan.outputs.date }}
+        run: |
+          set -euo pipefail
+          gh release view nightly --json assets --jq '.assets[].name' \
+            | { grep -v -- "${GITHUB_SHA::7}" || true; } \
+            | while read -r name; do gh release delete-asset nightly "$name" --yes; done
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/nightly" \
+            -f sha="$GITHUB_SHA" -F force=true --silent
+          gh release edit nightly --prerelease --title "Nightly $DATE" \
+            --notes "Built from $GITHUB_SHA on $DATE (UTC). Replaced by the next nightly; not a tagged release."
