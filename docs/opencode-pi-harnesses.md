@@ -72,6 +72,12 @@ model under it, so the CLI does not use its own model catalog. OpenCode gets an
   a controller, register them on the provider, for each model:
   `"model_limits": {"<model>": {"context_window": 32768, "max_output_tokens": 4096}}`. Set them
   for a self-hosted model with a smaller window, or pi sends requests the endpoint refuses.
+- **Model prices.** The engine costs every agent turn at its tokens times the `price` of the
+  agent binding, and a run on a model with no price and no vendor list price costs nothing, so
+  `--max-cost` never stops it. With a controller, a provider's `price` covers all of its models.
+  A provider that serves models at different rates registers them for each model, and a model
+  with no entry takes the provider's `price`:
+  `"model_prices": {"<model>": {"input": 0.6, "output": 2.2, "cache_read": 0.11, "cache_write": 0.6}}`.
 
 ## OpenCode's transcript is the session export
 

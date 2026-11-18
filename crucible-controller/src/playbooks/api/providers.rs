@@ -48,6 +48,9 @@ dto! {
         /// What an agent run on this provider is charged per million tokens; null charges the
         /// vendor's list price, or nothing for a model no vendor sells.
         pub price: Option<ProviderPriceDto> = p.price.as_ref().map(ProviderPriceDto::from),
+        /// What an agent run on each model is charged per million tokens, by model id. A model
+        /// with no entry is charged `price`.
+        pub model_prices: BTreeMap<String, ProviderPriceDto> = model_prices_dto(&p.model_prices),
         /// What each model can take and give, in tokens, by model id. A model with no entry
         /// leaves its limits to the harness.
         pub model_limits: BTreeMap<String, ModelLimitsDto> = model_limits_dto(&p.model_limits),
@@ -97,12 +100,12 @@ impl From<&TokenPrice> for ProviderPriceDto {
     }
 }
 
-/// Check a registration's price: every rate a finite, non-negative number.
-fn check_price(price: &ProviderPriceDto) -> Result<TokenPrice, String> {
+/// Check a price named `path` in a registration: every rate a finite, non-negative number.
+fn check_price(path: &str, price: &ProviderPriceDto) -> Result<TokenPrice, String> {
     let rate = |field: &str, usd: f64| {
         UsdPerMtok::new(usd).map_err(|_| {
             format!(
-                "price.{field} must be a finite, non-negative number of USD per million tokens, \
+                "{path}.{field} must be a finite, non-negative number of USD per million tokens, \
                  not {usd}"
             )
         })
@@ -113,6 +116,34 @@ fn check_price(price: &ProviderPriceDto) -> Result<TokenPrice, String> {
         cache_read: rate("cache_read", price.cache_read)?,
         cache_write: rate("cache_write", price.cache_write)?,
     })
+}
+
+fn model_prices_dto(prices: &BTreeMap<String, TokenPrice>) -> BTreeMap<String, ProviderPriceDto> {
+    prices
+        .iter()
+        .map(|(model, price)| (model.clone(), ProviderPriceDto::from(price)))
+        .collect()
+}
+
+/// Check a registration's model prices: each a model id with a price that passes
+/// [`check_price`].
+fn check_model_prices(
+    prices: &BTreeMap<String, ProviderPriceDto>,
+) -> Result<BTreeMap<String, TokenPrice>, String> {
+    prices
+        .iter()
+        .map(|(model, price)| {
+            if !crate::playbooks::providers::is_model_id(model) {
+                return Err(format!(
+                    "model_prices names {model:?}, which is not a model id"
+                ));
+            }
+            Ok((
+                model.clone(),
+                check_price(&format!("model_prices.{model}"), price)?,
+            ))
+        })
+        .collect()
 }
 
 /// One model's limits in tokens: what a request may hold and what a response may produce. A
@@ -147,7 +178,7 @@ fn check_model_limits(
     limits
         .iter()
         .map(|(model, l)| {
-            if model.trim().is_empty() || model.chars().any(char::is_whitespace) {
+            if !crate::playbooks::providers::is_model_id(model) {
                 return Err(format!(
                     "model_limits names {model:?}, which is not a model id"
                 ));
@@ -308,6 +339,9 @@ dto! {
         /// What an agent run on this provider is charged per million tokens; null charges the
         /// vendor's list price, or nothing for a model no vendor sells.
         pub price: Option<ProviderPriceDto> = p.price.as_ref().map(ProviderPriceDto::from),
+        /// What an agent run on each model is charged per million tokens, by model id. A model
+        /// with no entry is charged `price`.
+        pub model_prices: BTreeMap<String, ProviderPriceDto> = model_prices_dto(&p.model_prices),
         /// What each model can take and give, in tokens, by model id. A model with no entry
         /// leaves its limits to the harness.
         pub model_limits: BTreeMap<String, ModelLimitsDto> = model_limits_dto(&p.model_limits),
@@ -387,6 +421,10 @@ pub(crate) struct ProviderBody {
     /// for a model no vendor sells. Refused on a provider that serves no agent.
     #[serde(default)]
     price: Option<ProviderPriceDto>,
+    /// What each model's agent tokens cost, by model id. A model with no entry is charged
+    /// `price`. Refused on a provider that serves no agent.
+    #[serde(default)]
+    model_prices: BTreeMap<String, ProviderPriceDto>,
     /// What each model can take and give, in tokens, by model id. A model with no entry leaves
     /// its limits to the harness. Refused on a provider that serves no agent.
     #[serde(default)]
@@ -445,6 +483,7 @@ struct CheckedProvider {
     endpoint: Option<Endpoint>,
     harness: Option<crucible::knobs::Harness>,
     price: Option<TokenPrice>,
+    model_prices: BTreeMap<String, TokenPrice>,
     model_limits: BTreeMap<String, ModelLimits>,
     enabled: bool,
 }
@@ -558,7 +597,12 @@ async fn check_provider(
         Ok(harness) => harness,
         Err(msg) => return Ok(Err(msg)),
     };
-    let price = match body.price.as_ref().map(check_price).transpose() {
+    let price = match body
+        .price
+        .as_ref()
+        .map(|price| check_price("price", price))
+        .transpose()
+    {
         Ok(price) => price,
         Err(msg) => return Ok(Err(msg)),
     };
@@ -571,6 +615,23 @@ async fn check_provider(
     {
         return Ok(Err(format!(
             "price: a {} provider serves route decisions, not agents, so it takes no price",
+            body.kind.as_str()
+        )));
+    }
+    let model_prices = match check_model_prices(&body.model_prices) {
+        Ok(prices) => prices,
+        Err(msg) => return Ok(Err(msg)),
+    };
+    if !model_prices.is_empty()
+        && crate::playbooks::providers::allowed_harnesses(
+            body.kind,
+            endpoint.as_ref().map(|e| e.protocol),
+        )
+        .is_empty()
+    {
+        return Ok(Err(format!(
+            "model_prices: a {} provider serves route decisions, not agents, so its models take \
+             no prices",
             body.kind.as_str()
         )));
     }
@@ -618,6 +679,7 @@ async fn check_provider(
         endpoint,
         harness,
         price,
+        model_prices,
         model_limits,
         enabled: body.enabled,
     }))
@@ -677,6 +739,7 @@ async fn check_provider_secret(
     };
     let mut prospective = ModelProvider {
         model_limits: Default::default(),
+        model_prices: Default::default(),
         id: id.to_string(),
         owner: crate::authz::model::Principal::platform(),
         display_name: String::new(),
@@ -732,6 +795,7 @@ fn new_provider<'a>(
         endpoint: checked.endpoint.as_ref(),
         harness: checked.harness,
         price: checked.price,
+        model_prices: checked.model_prices.clone(),
         model_limits: checked.model_limits.clone(),
         enabled: checked.enabled,
         created_by: actor,
@@ -1575,11 +1639,43 @@ mod tests {
             cache_read: 0.11,
             cache_write: 0.6,
         };
-        let ok = check_price(&price(0.0)).expect("free input");
+        let ok = check_price("price", &price(0.0)).expect("free input");
         assert_eq!(ok.output.get(), 2.2);
         for bad in [-0.01, f64::NAN, f64::INFINITY] {
-            let err = check_price(&price(bad)).expect_err("a bad rate");
+            let err = check_price("price", &price(bad)).expect_err("a bad rate");
             assert!(err.starts_with("price.input must be"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn model_prices_are_keyed_by_model_id_and_every_rate_is_checked() {
+        let price = |input| ProviderPriceDto {
+            input,
+            output: 2.2,
+            cache_read: 0.11,
+            cache_write: 0.6,
+        };
+        let one = |model: &str, input| {
+            check_model_prices(&BTreeMap::from([(model.to_string(), price(input))]))
+        };
+        let ok = one("zai-org/glm-5", 0.6).expect("a price");
+        assert_eq!(ok["zai-org/glm-5"].input.get(), 0.6);
+        assert_eq!(model_prices_dto(&ok)["zai-org/glm-5"], price(0.6));
+        assert!(
+            check_model_prices(&BTreeMap::new())
+                .expect("none")
+                .is_empty()
+        );
+
+        for (model, input, said) in [
+            ("m", -0.01, "model_prices.m.input must be a finite"),
+            ("m", f64::NAN, "model_prices.m.input must be a finite"),
+            ("m", f64::INFINITY, "model_prices.m.input must be a finite"),
+            ("two words", 0.6, "is not a model id"),
+            ("", 0.6, "is not a model id"),
+        ] {
+            let err = one(model, input).expect_err("refused");
+            assert!(err.contains(said), "{model:?}: {err}");
         }
     }
 

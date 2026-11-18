@@ -2734,6 +2734,7 @@ mod tests {
             secret_name: None,
             secret_owner: None,
             price: None,
+            model_prices: Default::default(),
             model_limits: Default::default(),
             enabled: true,
         };
@@ -2761,6 +2762,16 @@ mod tests {
                 cache_read: 0.11,
                 cache_write: 0.6,
             }),
+            model_prices: [(
+                "glm-5-2".to_string(),
+                dto::ProviderPrice {
+                    input: 0.3,
+                    output: 1.1,
+                    cache_read: 0.05,
+                    cache_write: 0.3,
+                },
+            )]
+            .into(),
             model_limits: [(
                 "glm-5-3".to_string(),
                 dto::ModelLimits {
@@ -2796,6 +2807,8 @@ mod tests {
                         "secret_name": "lab-key", "secret_owner": "team:infra",
                         "price": {"input": 0.6, "output": 2.2, "cache_read": 0.11,
                                   "cache_write": 0.6},
+                        "model_prices": {"glm-5-2": {"input": 0.3, "output": 1.1,
+                                                     "cache_read": 0.05, "cache_write": 0.3}},
                         "model_limits": {"glm-5-3": {"context_window": 200000,
                                                      "max_output_tokens": 64000}},
                         "enabled": false,
