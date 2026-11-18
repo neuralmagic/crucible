@@ -72,9 +72,10 @@ import { buildCostBreakdown, type TaskCostRow } from './costBreakdown';
 import { RunTaskGraph, type RunGraph } from './RunTaskGraph';
 import { latestResults, toneOf } from './taskGraph';
 import { RunTaskGrid } from './RunTaskGrid';
+import { EngineLogSection } from './EngineLogSection';
 import { planOrder } from './runGrid';
 import { absoluteTime, relativeTime } from './journeyView';
-import { detailPath, isLaunchKey, launchPath, launchVersion } from './launchView';
+import { detailPath, isLaunchKey, launchPath, launchVersion, treeDigestShort } from './launchView';
 import {
   downloadName,
   imageMimeType,
@@ -136,12 +137,13 @@ export function RunDetailPage() {
   const flowProbe = useFlowArtifact(runId, runDetail.data !== undefined && !isLiveRun && !isPlaybook);
   const flowAbsent = isLiveRun || flowProbe.isError || flowProbe.data === null;
   const launchKeyOfRun = runDetail.data?.run.issue_key ?? '';
-  const launch = $api.useQuery(
+  const launchDetail = $api.useQuery(
     'get',
     '/api/playbook-runs/{key}',
     { params: { path: { key: launchKeyOfRun } } },
     { enabled: isLaunchKey(launchKeyOfRun) },
-  ).data?.launch;
+  ).data;
+  const launch = launchDetail?.launch;
 
   // When the live stream ends because the run finished or is no longer running, refetch the run's
   // queries so the freshly-ingested record replaces the live pane (mirrors the old RunsPage behavior).
@@ -232,6 +234,11 @@ export function RunDetailPage() {
                   {launch.playbook}
                 </Link>
                 <span>{launchVersion(launch)}</span>
+                {treeDigestShort(launchDetail?.tree_digest) !== null && (
+                  <span title={launchDetail?.tree_digest ?? undefined}>
+                    {treeDigestShort(launchDetail?.tree_digest)}
+                  </span>
+                )}
                 <span title={absoluteTime(launch.created_at) ?? undefined}>
                   started {relativeTime(launch.created_at) ?? launch.created_at}
                 </span>
@@ -293,6 +300,8 @@ export function RunDetailPage() {
       <RunTaskGraph runId={runId} />
 
       <RunTaskGrid runId={runId} />
+
+      <EngineLogSection runId={runId} live={isLiveRun} />
 
       {!isPlaybook && !isLiveRun && <FlowSection runId={runId} />}
 

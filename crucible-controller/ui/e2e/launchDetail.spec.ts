@@ -59,6 +59,55 @@ test.describe('the launch header', () => {
     await expect(page.getByRole('button', { name: 'Copy playbook:survey:0199' })).toBeVisible();
   });
 
+  /// The frozen pack is named by its tree digest, short enough for the header and complete in the
+  /// title.
+  test('names the frozen pack tree', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, LAUNCH);
+    await expect(page.getByText('tree1:9f2c9f…')).toHaveAttribute(
+      'title',
+      `tree1:${'9f2c'.repeat(16)}`,
+    );
+  });
+
+  /// The current attempt names the run, the labels its pack declared, and the failure that
+  /// stopped it.
+  test('names the attempt and its declared failure', async ({ page }) => {
+    await stubApi(page);
+    const detail = ROUTES['/api/playbook-runs/playbook:survey:0199'];
+    if (typeof detail !== 'object' || detail === null || Array.isArray(detail)) {
+      throw new Error('launch 0199 fixture is not an object');
+    }
+    const body = {
+      ...detail,
+      attempt: {
+        run_id: 'RUN-0412',
+        name: null,
+        status: 'failed',
+        pod: 'run-0412',
+        cluster: 'local',
+        namespace: null,
+        labels: { job: 'batch/overlay-p1', pod: 'overlay-p1-runner' },
+        failure: {
+          line: '[pod/overlay-p1-runner/runner] FATAL: prebuild failed',
+          source: 'overlay-p1-runner',
+        },
+      },
+    };
+    await page.route('**/api/playbook-runs/playbook%3Asurvey%3A0199', (route: Route) =>
+      route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) }),
+    );
+    await ready(page, LAUNCH);
+
+    const attempt = page.getByTestId('launch-attempt');
+    await expect(attempt).toContainText('work pod');
+    await expect(attempt).toContainText('run-0412');
+    await expect(attempt).toContainText('job');
+    await expect(attempt).toContainText('batch/overlay-p1');
+    await expect(attempt).toContainText('overlay-p1-runner');
+    await expect(page.getByTestId('failure-line')).toContainText('FATAL: prebuild failed');
+  });
+
   /// A run that is still going has no wall time to show yet.
   test('shows no wall time while the launch runs', async ({ page }) => {
     await stubApi(page);

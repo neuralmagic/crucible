@@ -1597,6 +1597,12 @@ pub fn launched(ack: &dto::LaunchAck, run_url: &str) -> String {
         format_args!("${:.2}", ack.max_cost),
         ack.max_time
     );
+    if let Some(digest) = &ack.tree_digest {
+        out.push_str(&format!("  pack {digest}\n"));
+    }
+    if let Some(version) = ack.draft_version {
+        out.push_str(&format!("  draft v{version}\n"));
+    }
     if let Some(actor) = &ack.actor {
         out.push_str(&format!("  as {actor}\n"));
     }
@@ -2049,11 +2055,12 @@ mod tests {
         let ack: dto::LaunchAck = serde_json::from_str(
             r#"{"key":"pb-9","playbook":"report","max_cost":10.0,"max_time":"30m",
                 "actor":"alice","dispatch_target":"wharf","provider":"plat-openai",
-                "model":"gpt-5.6-luna"}"#,
+                "model":"gpt-5.6-luna","tree_digest":"tree1:9f2c"}"#,
         )
         .expect("wire shape");
         let out = launched(&ack, "https://crucible.example.com/playbook-runs/pb-9");
         assert!(out.contains("launched report as pb-9"), "{out}");
+        assert!(out.contains("pack tree1:9f2c"), "{out}");
         assert!(out.contains("$10.00 / 30m"), "{out}");
         assert!(out.contains("dispatching to wharf"), "{out}");
         assert!(out.contains("agent plat-openai · gpt-5.6-luna"), "{out}");
@@ -2078,11 +2085,14 @@ mod tests {
         let ack: dto::LaunchAck = serde_json::from_str(
             r#"{"key":"pb-9","playbook":"report","max_cost":10.0,"max_time":"30m",
                 "actor":"alice","dispatch_target":"wharf",
+                "tree_digest":"tree1:9f2c","draft_version":4,
                 "exposure":{"digest":"sha256:expo",
                             "lines":["outputs:","  draft-pr x1 -> owner/repo"]}}"#,
         )
         .expect("wire shape");
         let out = launched(&ack, "https://crucible.example.com/playbook-runs/pb-9");
+        assert!(out.contains("pack tree1:9f2c"), "{out}");
+        assert!(out.contains("draft v4"), "{out}");
         assert!(out.contains("exposure sha256:expo"), "{out}");
         assert!(out.contains("    outputs:"), "{out}");
         assert!(out.contains("      draft-pr x1 -> owner/repo"), "{out}");

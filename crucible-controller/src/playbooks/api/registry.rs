@@ -624,6 +624,12 @@ pub struct PlaybookLaunchAck {
     pub playbook: String,
     pub params: std::collections::BTreeMap<String, String>,
     pub schema_digest: String,
+    /// The `tree1:` digest of the pack this launch runs; null on a legacy tarball-only row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_digest: Option<String>,
+    /// The draft version this launch pinned; null for a registered pack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_version: Option<i64>,
     pub max_cost: f64,
     pub max_time: String,
     pub advance_dedupe: bool,
@@ -823,6 +829,8 @@ pub(crate) async fn launch_playbook(
             playbook: pack.id,
             params: body.params,
             schema_digest: pack.schema_digest,
+            tree_digest: pack.tree_digest.as_ref().map(ToString::to_string),
+            draft_version: None,
             max_cost: authorized.max_cost,
             max_time: max_time.as_str().to_string(),
             advance_dedupe: body.advance_dedupe,
