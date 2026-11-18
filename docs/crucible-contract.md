@@ -375,7 +375,7 @@ uses agents and commands.
 
 This is Starlark over a constructor-only global surface: assignments, strings, numbers, booleans,
 lists, `def`, `if`/`else`, `for`, comprehensions, and calls to the functions below, at the top
-level or inside a `def`. `load()` resolves against the pack directory only. Task, session, and
+level or inside a `def`. `load()` resolves against the pack directory, or against a dependency `crucible.lock` pins. Task, session, and
 workflow values are opaque and immutable, so they can be referenced directly in `depends_on`,
 `measurement`, and `result` without repeating names, and a library cannot mutate one after
 handing it back.
@@ -413,6 +413,22 @@ one is an unknown-name error where it was written, and a did-you-mean never offe
   same byte budget, their `session()` declarations precede every root reference, and a task they
   construct at module level must still appear in `workflow(tasks = ...)`. Re-export is off, so a symbol a library loads is
   not visible through it.
+- `@name//path` in `load()`, `prompt_file()`, or `schema_file()` names a file in a dependency.
+  `[deps.<name>]` in the manifest gives its `git` URL and `rev`; `crucible deps lock` writes
+  `crucible.lock` with the resolved commit and `tree1:` digest, and `crucible deps fetch` fills
+  the cache (`CRUCIBLE_DEPS_DIR`, else the user cache directory) from the lock. A `<pack>.deps`
+  directory beside the pack directory is read before that cache. A plain path
+  written in a dependency's file resolves against that dependency's root, never the pack's.
+- `[tools.<name>]` in the manifest pins a binary that `command` and `evaluate` tasks find on
+  `PATH` as `<name>`. `url` is the binary or a `.tar.gz` holding it, with `{platform}` replaced by
+  `linux_amd64`, `linux_arm64`, `darwin_amd64` or `darwin_arm64`; `member` names the file inside
+  an archive and defaults to the tool's name; `platforms` lists which to pin and defaults to both
+  Linux platforms and the locking machine's, leaving out any with no download. `crucible deps
+  lock` records each download's sha256 and `crucible deps fetch` installs this machine's, refusing
+  a download whose digest differs. Saving a pack on the controller stores every locked download,
+  and a run pod fetches its own from `GET /api/tools/<sha256 hex>` with its pod token
+  (`crucible deps fetch --from-controller`) before the run, checking each against the lock. The
+  controller serves a download only to a run whose pack locks it.
 - `workflow(type = ..., tasks = ..., result = ...)` is the explicit final expression. A list of
   tasks is accepted anywhere a list of task names is, in `tasks` and in `depends_on` alike, so a
   list never needs wrapping to be passed.

@@ -2020,6 +2020,7 @@ dependencies = [
  "crucible-harness",
  "crucible-kueue",
  "crucible-mcp-auth",
+ "crucible-task",
  "crucible-vcs",
  "ctrlc",
  "flate2",
@@ -2342,6 +2343,16 @@ dependencies = [
  "tower",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "crucible-task"
+version = "0.6.4"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

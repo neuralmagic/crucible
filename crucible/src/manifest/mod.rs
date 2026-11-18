@@ -134,6 +134,10 @@ pub enum ManifestError {
         declared: WorkflowType,
         compiled: WorkflowType,
     },
+    #[error("a compiled workflow was supplied, but the manifest carries its tasks inline")]
+    PrecompiledWithInlineTasks,
+    #[error("the supplied compiled workflow holds no tasks")]
+    PrecompiledUnresolved,
     #[error(
         "a choices refresh takes no parameters, but {} supplied",
         names.join(", ")
@@ -360,6 +364,13 @@ pub struct Manifest {
     /// MCP servers by `[mcp.<key>]`, started on the loop pod.
     #[serde(default)]
     pub mcp: BTreeMap<String, McpCfg>,
+    /// Remote Starlark dependencies by `[deps.<name>]`, pinned in `crucible.lock`.
+    #[serde(default)]
+    pub deps: crate::plan::deps::DepSpecs,
+    /// Tool binaries by `[tools.<name>]`, pinned in `crucible.lock` and on `PATH` for command
+    /// tasks.
+    #[serde(default)]
+    pub tools: crate::plan::deps::ToolSpecs,
     /// The `[variant.<name>]` this manifest was read as; `None` for the base.
     #[serde(skip)]
     pub variant: Option<VariantName>,
@@ -1191,6 +1202,18 @@ impl Manifest {
         manifest_dir: &Path,
         params: &std::collections::BTreeMap<String, String>,
     ) -> Result<()> {
+        self.resolve_workflow_from(manifest_dir, params, None)
+    }
+
+    /// [`Manifest::resolve_workflow_with`], reading the compiled graph from `precompiled` instead
+    /// of compiling `[workflow].file` when one is given. The file is the JSON `plan
+    /// compile-workflow` prints for the same source and parameters.
+    pub fn resolve_workflow_from(
+        &mut self,
+        manifest_dir: &Path,
+        params: &std::collections::BTreeMap<String, String>,
+        precompiled: Option<&Path>,
+    ) -> Result<()> {
         let (declared_params, addressed) = launch::split(params);
         let launch = launch::LaunchSettings::parse(&addressed)?;
         let Some(workflow) = &mut self.workflow else {
@@ -1219,6 +1242,9 @@ impl Manifest {
             }
         }
         if !workflow.is_unresolved() {
+            if precompiled.is_some() {
+                return Err(ManifestError::PrecompiledWithInlineTasks.into());
+            }
             refuse_unconsumable(&declared_params)?;
             if !launch.is_empty() {
                 launch.apply(&mut workflow.tasks, &self.agent.overrides)?;
@@ -1229,20 +1255,37 @@ impl Manifest {
         let declared = workflow.workflow_type;
         let file = workflow.file.clone().unwrap_or_default();
         let source = manifest_dir.join(&file);
-        let compiled = if launch.refresh() {
-            crate::plan::starlark::compile_refresh_file(&source, manifest_dir)
-        } else {
-            crate::plan::starlark::compile_launch_file(&source, manifest_dir, &declared_params)
-        }
-        .with_context(|| format!("compiling [workflow].file = {file:?}"))?;
-        if compiled.workflow.workflow_type != declared {
+        let mut resolved = match precompiled {
+            Some(path) => {
+                let text = std::fs::read_to_string(path)
+                    .with_context(|| format!("reading the compiled workflow {}", path.display()))?;
+                serde_json::from_str::<WorkflowCfg>(&text)
+                    .with_context(|| format!("parsing the compiled workflow {}", path.display()))?
+            }
+            None => {
+                if launch.refresh() {
+                    crate::plan::starlark::compile_refresh_file(&source, manifest_dir)
+                } else {
+                    crate::plan::starlark::compile_launch_file(
+                        &source,
+                        manifest_dir,
+                        &declared_params,
+                    )
+                }
+                .with_context(|| format!("compiling [workflow].file = {file:?}"))?
+                .workflow
+            }
+        };
+        if resolved.workflow_type != declared {
             return Err(ManifestError::WorkflowTypeMismatch {
                 declared,
-                compiled: compiled.workflow.workflow_type,
+                compiled: resolved.workflow_type,
             }
             .into());
         }
-        let mut resolved = compiled.workflow;
+        if resolved.is_unresolved() {
+            return Err(ManifestError::PrecompiledUnresolved.into());
+        }
         resolved.resolved_from = Some(file);
         resolved.edition = self.edition;
         resolved.env = workflow.env.clone();

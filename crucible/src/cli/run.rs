@@ -150,6 +150,36 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
         return crate::scope::rank_grounded::run(args, engine.handle());
     }
 
+    if let Some(Cmd::Deps { action }) = &cli.command {
+        use crucible::plan::deps;
+        let cache = deps::Cache::from_env()?;
+        match action {
+            crate::cli::DepsAction::Lock { pack } => {
+                let lock = deps::lock(pack, &cache, &deps::Auth::Ambient)?;
+                for dep in lock.deps {
+                    println!("{} {} {}", dep.name, dep.commit, dep.tree);
+                }
+                for tool in lock.tools {
+                    println!("{} {} {}", tool.name, tool.platform, tool.sha256);
+                }
+            }
+            crate::cli::DepsAction::Fetch {
+                pack,
+                from_controller,
+            } => {
+                let fetched = if *from_controller {
+                    deps::fetch_tools_from(pack, &cache, &deps::Controller::from_env()?)?
+                } else {
+                    deps::fetch_locked(pack, &cache, &deps::Auth::Ambient)?
+                };
+                for name in fetched {
+                    println!("fetched {name}");
+                }
+            }
+        }
+        return Ok(());
+    }
+
     if let Some(Cmd::Plan { action }) = &cli.command {
         return match action {
             crate::cli::PlanAction::CompileWorkflow {
@@ -211,22 +241,24 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&schema)?);
                 Ok(())
             }
-            crate::cli::PlanAction::Run {
-                file,
-                params,
-                max_cost,
-                max_time,
-                caps,
-                agent_cmd,
-                manifest,
-                compute_driver,
-                harness,
-                model,
-                resume,
-                variant,
-                rerun_of,
-                from,
-            } => {
+            crate::cli::PlanAction::Run(args) => {
+                let crate::cli::PlanRunArgs {
+                    file,
+                    params,
+                    max_cost,
+                    max_time,
+                    caps,
+                    agent_cmd,
+                    manifest,
+                    compute_driver,
+                    harness,
+                    model,
+                    resume,
+                    variant,
+                    rerun_of,
+                    from,
+                    resolved_workflow,
+                } = &**args;
                 let engine = crate::agent::engine::EngineCtx::new()?;
                 crate::plan::cli::run(
                     file.as_deref(),
@@ -250,6 +282,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                         resume: *resume,
                         variant: variant.clone(),
                         engine: Some(engine.handle()),
+                        resolved_workflow: resolved_workflow.clone(),
                         rerun: rerun_of.as_ref().map(|parent| crate::plan::cli::Rerun {
                             parent: parent.clone(),
                             from: from

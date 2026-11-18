@@ -165,6 +165,8 @@ opentelemetry-otlp = { version = "0.33", default-features = false, features = [
 ] }
 
 [dev-dependencies]
+# The task SDK names the same environment variables and paths the engine sets.
+crucible-task = { path = "../crucible-task" }
 crucible-kueue = { path = "../crucible-kueue" }
 crucible-mcp-auth = { path = "../crucible-mcp-auth" }
 

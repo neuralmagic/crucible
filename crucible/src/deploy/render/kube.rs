@@ -69,6 +69,11 @@ pub enum RenderError {
          [cluster].ingest_url to reach it"
     )]
     RerunNeedsControllerUrl,
+    #[error(
+        "the pack's lock pins tools, which a pod fetches from the controller, and this profile \
+         names no [cluster].ingest_url to reach it"
+    )]
+    ToolsNeedControllerUrl,
 }
 
 /// In-pod paths fixed by the openshell-loop template (the volume mounts the renderer always emits).
@@ -231,6 +236,10 @@ const BUILDIT_IN_IMAGE: &str = "/usr/local/bin/buildit";
 /// there are inputs.
 pub const RUN_INPUTS_KEY: &str = "inputs.tar.gz";
 
+/// The run input holding the graph the controller compiled for the launch. A playbook run that
+/// is delivered one runs it instead of compiling the pack's source.
+pub const RESOLVED_WORKFLOW_INPUT: &str = "workflow.resolved.json";
+
 /// POSIX single-quote one argv element for the `/bin/sh -c` wrapper.
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
@@ -368,8 +377,14 @@ pub fn render(
         }
         .into());
     }
+    let fetches_tools = opts.pack.is_some()
+        && crate::plan::deps::Lock::read(manifest_dir)?.is_some_and(|lock| !lock.tools.is_empty());
+    if fetches_tools && profile.cluster.ingest_url.is_none() {
+        return Err(RenderError::ToolsNeedControllerUrl.into());
+    }
     let r = Renderer {
         input,
+        fetches_tools,
         domain,
         manifest_file,
         profile,
@@ -495,6 +510,8 @@ fn pack_configmap(
 /// threading the same six values through their signatures.
 struct Renderer<'a> {
     input: RenderInput<'a>,
+    /// Whether the delivered pack's lock pins tools the pod fetches from the controller.
+    fetches_tools: bool,
     /// The domain pack's directory name (where the loop image baked it).
     domain: &'a str,
     /// The manifest's file name (the wrapper passes it to the nested `crucible --manifest`).
@@ -1116,16 +1133,38 @@ impl Renderer<'_> {
                 .as_ref()
                 .map(|v| format!(" --variant {v}"))
                 .unwrap_or_default();
+            let resolved_flag = match &self.opts.pack {
+                Some(pack)
+                    if pack
+                        .inputs
+                        .keys()
+                        .any(|path| path.as_str() == RESOLVED_WORKFLOW_INPUT) =>
+                {
+                    format!(" --resolved-workflow \"$D/{RESOLVED_WORKFLOW_INPUT}\"")
+                }
+                _ => String::new(),
+            };
             let (rerun_setup, resume_flag) = self.playbook_resume(pb)?;
+            let (tools_dir, tools_fetch) = if self.fetches_tools {
+                (
+                    format!(
+                        "\nexport {}=\"$D/state/deps\"",
+                        crate::plan::deps::CACHE_ENV
+                    ),
+                    r#"crucible deps fetch --pack "$D" --from-controller && "#,
+                )
+            } else {
+                (String::new(), "")
+            };
             let (echo_setup, echo_stop) = self.session_echo();
             let invalid_verdict = crate::plan::INVALID_VERDICT_EXIT;
             return Ok(format!(
                 r#"D={domain_dir}
-mkdir -p "$D/state"
+mkdir -p "$D/state"{tools_dir}
 n=$(( $(cat "$D/state/starts" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$D/state/starts"
 if [ "$n" -le {MAX_PLAYBOOK_STARTS} ]; then{rerun_setup}{echo_setup}
-  crucible plan run --manifest "$D/{manifest_file}" --max-cost {max_cost} --max-time {max_time}{driver_flag}{harness_flag}{model_flag}{variant_flag}{param_flags}{resume_flag}
+  {tools_fetch}crucible plan run --manifest "$D/{manifest_file}" --max-cost {max_cost} --max-time {max_time}{driver_flag}{harness_flag}{model_flag}{variant_flag}{resolved_flag}{param_flags}{resume_flag}
   rc=$?{echo_stop}
 else
   echo "[crucible] this run has started $n times; leaving it unfinished" >&2
@@ -6110,6 +6149,88 @@ mod tests {
         let yaml = render_playbook(&k8s_profile(""), playbook_launch());
         assert!(yaml.contains("--max-cost 4.5"), "{yaml}");
         assert!(yaml.contains("--max-time 1800s"), "{yaml}");
+    }
+
+    #[test]
+    fn a_delivered_compiled_graph_is_passed_to_the_plan_runner() {
+        let pack = tempfile::tempdir().expect("pack dir");
+        std::fs::write(pack.path().join("crucible.toml"), "").expect("manifest");
+        let render_with = |inputs: BTreeMap<PackFilePath, Vec<u8>>| {
+            render(
+                RenderInput::from_playbook_manifest(&playbook_manifest(), "alpha"),
+                pack.path(),
+                "crucible.toml",
+                &k8s_profile(""),
+                &RenderOpts {
+                    iterations: 1,
+                    pack: Some(delivery(inputs)),
+                    playbook: Some(playbook_launch()),
+                    ..RenderOpts::default()
+                },
+            )
+            .expect("render")
+        };
+        let flag = r#" --resolved-workflow "$D/workflow.resolved.json" --param"#;
+
+        let compiled = BTreeMap::from([(
+            RESOLVED_WORKFLOW_INPUT.parse().expect("path"),
+            b"{}".to_vec(),
+        )]);
+        let yaml = render_with(compiled);
+        assert!(yaml.contains(flag), "{yaml}");
+
+        let steered = BTreeMap::from([("STEER.md".parse().expect("path"), b"go".to_vec())]);
+        let yaml = render_with(steered);
+        assert!(!yaml.contains("--resolved-workflow"), "{yaml}");
+    }
+
+    /// A delivered pack whose lock pins tools fetches them from the controller before the run,
+    /// into a cache the run reads, and cannot render without a controller to fetch from.
+    #[test]
+    fn a_pack_that_locks_tools_fetches_them_before_the_run() {
+        let pack = tempfile::tempdir().expect("pack dir");
+        std::fs::write(pack.path().join("crucible.toml"), "").expect("manifest");
+        let render_with = |profile: &DeployProfile| {
+            render(
+                RenderInput::from_playbook_manifest(&playbook_manifest(), "alpha"),
+                pack.path(),
+                "crucible.toml",
+                profile,
+                &RenderOpts {
+                    iterations: 1,
+                    pack: Some(delivery(BTreeMap::new())),
+                    playbook: Some(playbook_launch()),
+                    ..RenderOpts::default()
+                },
+            )
+        };
+        let reachable = k8s_profile(r#"ingest_url = "https://controller.example""#);
+        let fetch = r#"crucible deps fetch --pack "$D" --from-controller && crucible plan run"#;
+
+        let yaml = render_with(&reachable).expect("render");
+        assert!(!yaml.contains("deps fetch"), "{yaml}");
+        assert!(!yaml.contains("CRUCIBLE_DEPS_DIR"), "{yaml}");
+
+        std::fs::write(
+            pack.path().join(crate::plan::deps::LOCK_FILE),
+            "version = 1\n\n[[tool]]\nname = \"greet\"\nplatform = \"linux_amd64\"\nurl = \"https://example.com/greet\"\nsha256 = \"sha256:00\"\n",
+        )
+        .expect("lock");
+        let yaml = render_with(&reachable).expect("render");
+        assert!(yaml.contains(fetch), "{yaml}");
+        assert!(
+            yaml.contains(r#"export CRUCIBLE_DEPS_DIR="$D/state/deps""#),
+            "{yaml}"
+        );
+
+        let error = render_with(&k8s_profile("")).expect_err("no controller");
+        assert!(
+            matches!(
+                error.downcast_ref::<RenderError>(),
+                Some(RenderError::ToolsNeedControllerUrl)
+            ),
+            "{error:#}"
+        );
     }
 
     /// Params are operator text landing in a `/bin/sh -c` string: single-quoted, glued before

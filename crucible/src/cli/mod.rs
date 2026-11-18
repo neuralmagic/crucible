@@ -108,6 +108,11 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         action: PlanAction,
     },
+    /// Remote Starlark dependencies: pin `[deps]` in `crucible.lock` and fetch the pinned trees.
+    Deps {
+        #[command(subcommand)]
+        action: DepsAction,
+    },
     /// Print the loop's control states: the transition table the driver runs on, as the
     /// reference page (`docs/loop-states.md` is generated from it), as Graphviz dot (the
     /// page's diagram), or as mermaid.
@@ -209,6 +214,96 @@ pub(crate) struct FlowArgs {
     pub out: PathBuf,
 }
 
+/// `crucible deps <lock|fetch>`.
+#[derive(clap::Subcommand)]
+pub(crate) enum DepsAction {
+    /// Resolve every `[deps]` entry to a commit and a tree digest, and write `crucible.lock`.
+    Lock {
+        /// The pack directory holding `crucible.toml`.
+        #[arg(long, default_value = ".")]
+        pack: PathBuf,
+    },
+    /// Fetch the trees `crucible.lock` pins that the cache lacks.
+    Fetch {
+        /// The pack directory holding `crucible.lock`.
+        #[arg(long, default_value = ".")]
+        pack: PathBuf,
+        /// Fetch this machine's tools from the controller, as a run pod does, and nothing else.
+        #[arg(long)]
+        from_controller: bool,
+    },
+}
+
+/// `crucible plan run`.
+#[derive(clap::Args)]
+pub(crate) struct PlanRunArgs {
+    /// The plan file to execute. Omit it to build the plan from `--manifest`'s own
+    /// `[workflow]`, which is how a playbook runs: the pack names its graph and the engine
+    /// compiles it per run.
+    #[arg(long, required_unless_present = "manifest")]
+    pub(crate) file: Option<PathBuf>,
+    /// A parameter value, `name=value`, repeatable. What the pack's `params` block declares
+    /// is what it accepts; `crucible plan params --file <source>` prints the schema. Only a
+    /// `--manifest` run compiles a graph, so a precompiled `--file` plan takes none.
+    #[arg(long = "param", value_name = "NAME=VALUE", conflicts_with = "file")]
+    pub(crate) params: Vec<String>,
+    /// Total cost ceiling for the run, in USD. A playbook must be given one: its source may
+    /// not declare a limit its operator set.
+    #[arg(long)]
+    pub(crate) max_cost: Option<f64>,
+    /// Total wall-clock ceiling for the run (`90s`, `30m`, `2h`). A playbook must be given
+    /// one, for the same reason.
+    #[arg(long)]
+    pub(crate) max_time: Option<String>,
+    /// Substrate capabilities (repeatable). `any`-needs tasks always run.
+    #[arg(long = "cap")]
+    pub(crate) caps: Vec<String>,
+    /// Stand-in command for agent tasks; receives CRUCIBLE_PROMPT / _HARNESS / _MODEL /
+    /// _EFFORT in env. Without it, agent tasks are refused.
+    #[arg(long, conflicts_with = "manifest")]
+    pub(crate) agent_cmd: Option<String>,
+    /// Run agent tasks through the real harness path using this manifest's `[agent]`
+    /// config (workspace set up exactly as a loop run). Command tasks run in the
+    /// workspace.
+    #[arg(long)]
+    pub(crate) manifest: Option<PathBuf>,
+    /// OpenShell compute driver for an agent task's sandbox: `podman` (default, nests it
+    /// beside the runner) or `kubernetes` (schedules it as a sibling pod in-cluster). Fixed
+    /// per deployment, so a rendered wrapper passes it; the manifest cannot declare it.
+    #[arg(long, value_enum, default_value_t = openshell::gateway::ComputeDriver::Podman)]
+    pub(crate) compute_driver: openshell::gateway::ComputeDriver,
+    /// The harness every agent task runs, replacing the manifest's `[agent].harness`. A task
+    /// that pins its own harness keeps it. Only a `--manifest` run has an agent to replace.
+    #[arg(long, value_enum, requires = "manifest")]
+    pub(crate) harness: Option<crate::knobs::Harness>,
+    /// The model every agent task asks for, replacing the manifest's `[agent].model`. A task
+    /// that pins its own model keeps it.
+    #[arg(long, requires = "manifest")]
+    pub(crate) model: Option<String>,
+    /// Continue the playbook run the manifest's state dir holds: tasks its session log
+    /// settled are not dispatched again, and its spend and elapsed time count against the
+    /// ceilings. The graph compiled now must be the one the run started with.
+    #[arg(long, requires = "manifest")]
+    pub(crate) resume: bool,
+    /// The `[variant.<name>]` of the manifest to read; the base manifest without it.
+    #[arg(long, value_name = "NAME", requires = "manifest")]
+    pub(crate) variant: Option<crate::manifest::variant::VariantName>,
+    /// Rerun a finished playbook run: the tasks `--from` names, everything downstream of
+    /// them, and every task the run did not pass run again; every other task is reused with
+    /// its output, files, and commits. PARENT is that run's state directory, or its evidence
+    /// on the controller (`https://controller/api/evidence/runs/<id>`), fetched with the run token in
+    /// CRUCIBLE_POD_TOKEN or a person's CONTROLLER_API_TOKEN.
+    #[arg(long, value_name = "PARENT", requires = "manifest")]
+    pub(crate) rerun_of: Option<crucible::plan::rerun::ParentRef>,
+    /// A task the rerun dispatches again, with everything downstream of it. Repeatable.
+    #[arg(long, value_name = "TASK", requires = "rerun_of")]
+    pub(crate) from: Vec<String>,
+    /// Run this compiled graph instead of compiling the manifest's workflow source: the JSON
+    /// `plan compile-workflow` prints for the same source and `--param` values.
+    #[arg(long, value_name = "FILE", requires = "manifest")]
+    pub(crate) resolved_workflow: Option<PathBuf>,
+}
+
 /// `crucible plan <show|run>`: compile and inspect a plan, or execute one.
 #[derive(clap::Subcommand)]
 pub(crate) enum PlanAction {
@@ -287,69 +382,7 @@ pub(crate) enum PlanAction {
     /// Execute a plan with the shell runner: `command` tasks run as real subprocesses,
     /// `agent` tasks run `--agent-cmd` (the command-backend stand-in). Exits nonzero when
     /// the plan does not reach a valid verdict.
-    Run {
-        /// The plan file to execute. Omit it to build the plan from `--manifest`'s own
-        /// `[workflow]`, which is how a playbook runs: the pack names its graph and the engine
-        /// compiles it per run.
-        #[arg(long, required_unless_present = "manifest")]
-        file: Option<PathBuf>,
-        /// A parameter value, `name=value`, repeatable. What the pack's `params` block declares
-        /// is what it accepts; `crucible plan params --file <source>` prints the schema. Only a
-        /// `--manifest` run compiles a graph, so a precompiled `--file` plan takes none.
-        #[arg(long = "param", value_name = "NAME=VALUE", conflicts_with = "file")]
-        params: Vec<String>,
-        /// Total cost ceiling for the run, in USD. A playbook must be given one: its source may
-        /// not declare a limit its operator set.
-        #[arg(long)]
-        max_cost: Option<f64>,
-        /// Total wall-clock ceiling for the run (`90s`, `30m`, `2h`). A playbook must be given
-        /// one, for the same reason.
-        #[arg(long)]
-        max_time: Option<String>,
-        /// Substrate capabilities (repeatable). `any`-needs tasks always run.
-        #[arg(long = "cap")]
-        caps: Vec<String>,
-        /// Stand-in command for agent tasks; receives CRUCIBLE_PROMPT / _HARNESS / _MODEL /
-        /// _EFFORT in env. Without it, agent tasks are refused.
-        #[arg(long, conflicts_with = "manifest")]
-        agent_cmd: Option<String>,
-        /// Run agent tasks through the real harness path using this manifest's `[agent]`
-        /// config (workspace set up exactly as a loop run). Command tasks run in the
-        /// workspace.
-        #[arg(long)]
-        manifest: Option<PathBuf>,
-        /// OpenShell compute driver for an agent task's sandbox: `podman` (default, nests it
-        /// beside the runner) or `kubernetes` (schedules it as a sibling pod in-cluster). Fixed
-        /// per deployment, so a rendered wrapper passes it; the manifest cannot declare it.
-        #[arg(long, value_enum, default_value_t = openshell::gateway::ComputeDriver::Podman)]
-        compute_driver: openshell::gateway::ComputeDriver,
-        /// The harness every agent task runs, replacing the manifest's `[agent].harness`. A task
-        /// that pins its own harness keeps it. Only a `--manifest` run has an agent to replace.
-        #[arg(long, value_enum, requires = "manifest")]
-        harness: Option<crate::knobs::Harness>,
-        /// The model every agent task asks for, replacing the manifest's `[agent].model`. A task
-        /// that pins its own model keeps it.
-        #[arg(long, requires = "manifest")]
-        model: Option<String>,
-        /// Continue the playbook run the manifest's state dir holds: tasks its session log
-        /// settled are not dispatched again, and its spend and elapsed time count against the
-        /// ceilings. The graph compiled now must be the one the run started with.
-        #[arg(long, requires = "manifest")]
-        resume: bool,
-        /// The `[variant.<name>]` of the manifest to read; the base manifest without it.
-        #[arg(long, value_name = "NAME", requires = "manifest")]
-        variant: Option<crate::manifest::variant::VariantName>,
-        /// Rerun a finished playbook run: the tasks `--from` names, everything downstream of
-        /// them, and every task the run did not pass run again; every other task is reused with
-        /// its output, files, and commits. PARENT is that run's state directory, or its evidence
-        /// on the controller (`https://controller/api/evidence/runs/<id>`), fetched with the run token in
-        /// CRUCIBLE_POD_TOKEN or a person's CONTROLLER_API_TOKEN.
-        #[arg(long, value_name = "PARENT", requires = "manifest")]
-        rerun_of: Option<crucible::plan::rerun::ParentRef>,
-        /// A task the rerun dispatches again, with everything downstream of it. Repeatable.
-        #[arg(long, value_name = "TASK", requires = "rerun_of")]
-        from: Vec<String>,
-    },
+    Run(Box<PlanRunArgs>),
 }
 
 /// How `crucible plan dsl-reference` renders the DSL surface.
