@@ -84,6 +84,7 @@ const EXEC_SLACK: Duration = Duration::from_secs(60);
 const SETTLE_RETRY: Duration = Duration::from_secs(2);
 const MAX_STATUS_WAIT_S: u64 = 50;
 const STATUS_WAIT_POLL: Duration = Duration::from_secs(2);
+const MAX_WAIT_BUILDS: usize = 16;
 const SUMMARY_LINES: usize = 40;
 const SUMMARY_BYTES: usize = 8 * 1024;
 const SUMMARY_WINDOW: u64 = 256 * 1024;
@@ -1076,6 +1077,24 @@ pub struct StatusParams {
     #[serde(default)]
     #[schemars(range(min = 1, max = 50))]
     pub wait_seconds: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WaitParams {
+    /// build_ids from build, at most 16
+    #[schemars(length(min = 1, max = 16))]
+    pub build_ids: Vec<String>,
+    /// Wait on the server for every build to end, up to this many seconds (max 50), then answer
+    /// as usual. Unset answers at once
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 50))]
+    pub wait_seconds: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WaitReply {
+    /// Each build's status, in the order asked
+    pub builds: Vec<StatusReply>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -2340,6 +2359,43 @@ impl Broker {
         }
     }
 
+    pub async fn wait(&self, sandbox: &SandboxName, p: WaitParams) -> Result<WaitReply> {
+        if p.build_ids.is_empty() || p.build_ids.len() > MAX_WAIT_BUILDS {
+            bail!(
+                "wait takes 1 to {MAX_WAIT_BUILDS} build_ids, not {}",
+                p.build_ids.len()
+            );
+        }
+        let ids = p
+            .build_ids
+            .iter()
+            .map(|id| BuildId::parse(id))
+            .collect::<Result<Vec<_>>>()?;
+        let wait = Duration::from_secs(p.wait_seconds.unwrap_or(0).min(MAX_STATUS_WAIT_S));
+        let started = Instant::now();
+        loop {
+            let mut seen = Vec::with_capacity(ids.len());
+            for id in &ids {
+                seen.push(
+                    self.seen(sandbox, id, LogName::Build)
+                        .await?
+                        .ok_or_else(|| anyhow!("no build {}; build again", id.0))?,
+                );
+            }
+            let running = seen
+                .iter()
+                .any(|s| matches!(s.snap.state, step::State::Running));
+            if !running || started.elapsed() + STATUS_WAIT_POLL > wait {
+                let mut builds = Vec::with_capacity(ids.len());
+                for (id, seen) in ids.iter().zip(&seen) {
+                    builds.push(self.build_status(sandbox, id, seen).await?);
+                }
+                return Ok(WaitReply { builds });
+            }
+            tokio::time::sleep(STATUS_WAIT_POLL).await;
+        }
+    }
+
     async fn build_status(
         &self,
         sandbox: &SandboxName,
@@ -3057,7 +3113,7 @@ impl AccessRules for BuilditRules {
     fn scopes(&self, call: &Call<'_>) -> Result<&'static [&'static str], Refusal> {
         match call {
             Call::Tool { name, .. } => match *name {
-                "status" | "logs" => Ok(&[SCOPE_READ]),
+                "status" | "wait" | "logs" => Ok(&[SCOPE_READ]),
                 "build" | "run" | "push" | "clean" => Ok(&[SCOPE_BUILD]),
                 _ => Err(call.unserved()),
             },
@@ -3202,6 +3258,20 @@ impl BuilditMcp {
         Parameters(p): Parameters<StatusParams>,
     ) -> Result<String, String> {
         reply(async { self.broker.status(&caller(&ctx)?.sandbox, p).await }.await)
+    }
+
+    #[tool(
+        description = "Report several builds' status in one call (params: build_ids, wait_seconds): \
+        `builds` holds what `status` reports for each, in the order asked. With wait_seconds it \
+        answers when every build has ended or the wait passes. Use it instead of one `status` \
+        call per build when builds run side by side."
+    )]
+    async fn wait(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(p): Parameters<WaitParams>,
+    ) -> Result<String, String> {
+        reply(async { self.broker.wait(&caller(&ctx)?.sandbox, p).await }.await)
     }
 
     #[tool(
@@ -4268,6 +4338,47 @@ mod tests {
         let wait = &schema["properties"]["wait_seconds"];
         assert_eq!(wait["minimum"], 1, "{schema}");
         assert_eq!(wait["maximum"], 50, "{schema}");
+    }
+
+    #[test]
+    fn wait_takes_one_to_sixteen_builds_and_waits_as_status_does() {
+        use crate::mcp::WaitParams;
+        let p: WaitParams =
+            serde_json::from_value(serde_json::json!({"build_ids": ["a", "b"]})).unwrap();
+        assert_eq!(p.build_ids, ["a", "b"]);
+        assert_eq!(p.wait_seconds, None);
+        let schema = serde_json::to_value(rmcp::schemars::schema_for!(WaitParams)).unwrap();
+        let ids = &schema["properties"]["build_ids"];
+        assert_eq!(ids["minItems"], 1, "{schema}");
+        assert_eq!(ids["maxItems"], 16, "{schema}");
+        let wait = &schema["properties"]["wait_seconds"];
+        assert_eq!(wait["minimum"], 1, "{schema}");
+        assert_eq!(wait["maximum"], 50, "{schema}");
+    }
+
+    #[tokio::test]
+    async fn wait_refuses_no_builds_and_too_many_before_it_asks_the_cluster() {
+        use crate::mcp::WaitParams;
+        let dir = tempfile::tempdir().unwrap();
+        let broker = broker_value(offline_client(), &tokens(dir.path(), ""), None);
+        let sandbox = sandbox_caller("sb-a").sandbox;
+        for ids in [Vec::new(), vec!["buildit-1".to_string(); 17]] {
+            let asked = ids.len();
+            let err = broker
+                .wait(
+                    &sandbox,
+                    WaitParams {
+                        build_ids: ids,
+                        wait_seconds: None,
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("wait takes 1 to 16 build_ids, not {asked}")
+            );
+        }
     }
 
     #[test]
