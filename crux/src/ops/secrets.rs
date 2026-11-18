@@ -1,6 +1,6 @@
 //! Secrets: what the caller owns, registering one, and binding it to the scope a run reads it at.
 
-use crate::client::Client;
+use crate::client::{Client, encode};
 use crate::dto;
 use crate::ops::{Operation, put_trimmed};
 use crate::render;
@@ -114,6 +114,31 @@ impl Operation for SecretCreate {
 
     fn render(&self, _c: &Client, created: Self::Output) -> Result<String> {
         Ok(render::secret_created(&created))
+    }
+
+    fn json(&self) -> bool {
+        self.json
+    }
+}
+
+/// Write a managed secret's next version. The CLI fills the value from stdin.
+pub struct SecretRotate {
+    pub id: String,
+    pub value: SecretValue,
+    pub json: bool,
+}
+
+impl Operation for SecretRotate {
+    type Output = dto::Secret;
+
+    async fn call(&self, c: &Client) -> Result<Value> {
+        let path = format!("/api/secrets/{}/rotate", encode(&self.id));
+        c.post(&path, Some(&serde_json::json!({ "value": self.value.0 })))
+            .await
+    }
+
+    fn render(&self, _c: &Client, rotated: Self::Output) -> Result<String> {
+        Ok(render::secret_rotated(&rotated))
     }
 
     fn json(&self) -> bool {
@@ -394,5 +419,97 @@ mod tests {
         .await
         .expect("create");
         assert!(bare.contains("\"id\": \"01b0\""), "{bare}");
+    }
+
+    /// A rotate posts only the value to the secret's own route and prints the new version, never
+    /// the value. A refusal reaches the caller.
+    #[tokio::test]
+    async fn secret_rotate_posts_the_value_and_prints_the_new_version() {
+        use axum::extract::Path as AxumPath;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+
+        async fn rotate(AxumPath(id): AxumPath<String>, body: String) -> (StatusCode, String) {
+            if id != "01b0" {
+                return (
+                    StatusCode::NOT_FOUND,
+                    serde_json::json!({ "error": "no secret with that id" }).to_string(),
+                );
+            }
+            let sent: Value = serde_json::from_str(&body).expect("a JSON body");
+            assert_eq!(sent, serde_json::json!({ "value": "sk-next" }));
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "id": "01b0",
+                    "name": "gateway-key",
+                    "owner": "team:platform",
+                    "kind": "inference_api_key",
+                    "visibility": "broker_only",
+                    "consumer": "run",
+                    "mode": "managed",
+                    "vault_path": "secret/x",
+                    "current_version": 2,
+                    "created_by": "wynn",
+                    "created_at": "2026-09-29T16:00:00Z",
+                    "updated_at": "2026-11-17T16:00:00Z"
+                })
+                .to_string(),
+            )
+        }
+
+        let app = axum::Router::new()
+            .route("/healthz", axum::routing::get(|| async { "ok" }))
+            .route("/api/secrets/{id}/rotate", post(rotate));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let client = test_client(&url);
+
+        let printed = SecretRotate {
+            id: "01b0".into(),
+            value: SecretValue::new("sk-next\n".into()).expect("value"),
+            json: false,
+        }
+        .run(&client)
+        .await
+        .expect("rotate");
+        assert!(
+            printed.starts_with("rotated gateway-key (01b0) to version 2\n"),
+            "{printed}"
+        );
+        assert!(printed.contains("owner: team:platform"), "{printed}");
+        assert!(!printed.contains("sk-next"), "never the value: {printed}");
+        assert!(
+            !printed.contains("secret/x"),
+            "never the vault path: {printed}"
+        );
+
+        let raw = SecretRotate {
+            id: "01b0".into(),
+            value: SecretValue::new("sk-next".into()).expect("value"),
+            json: true,
+        }
+        .run(&client)
+        .await
+        .expect("rotate");
+        assert!(raw.contains("\"current_version\": 2"), "{raw}");
+
+        let refused = SecretRotate {
+            id: "nope".into(),
+            value: SecretValue::new("sk-next".into()).expect("value"),
+            json: false,
+        }
+        .run(&client)
+        .await
+        .expect_err("an unknown id is refused");
+        assert!(
+            format!("{refused:#}").contains("no secret with that id"),
+            "{refused:#}"
+        );
     }
 }

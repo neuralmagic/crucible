@@ -220,10 +220,11 @@ registration names none for that model and the harness uses its own. Set them pe
 JSON body `provider-create` and `provider-update` take:
 `"model_limits": {"<model>": {"context_window": 200000, "max_output_tokens": 64000}}`.
 
-### `secrets` / `secret-bind`
+### `secrets` / `secret-rotate` / `secret-bind`
 
 ```
 $ crux secrets                                   # id, name, kind, visibility, mode, owner — never a value
+$ crux secret-rotate 01a0 < new-value.txt        # the next version, read from stdin; prints the version
 $ crux secret-bind 01a0 --playbook calibrate --env GH_TOKEN --declared-name pr-token
 ```
 
