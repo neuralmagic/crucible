@@ -167,6 +167,19 @@ fn viewer(file: &Captured, run: Option<&str>, app: &App, p: &Paint) -> El {
                 .build(p.k)
                 .key("files-md-mode")
         }))
+        .children(
+            (kind == Kind::Html && crate::html_preview::SUPPORTED).then(|| {
+                SegmentedControl::new(
+                    &["Preview", "Source"],
+                    Some(usize::from(app.files_html_source)),
+                )
+                .label("Show HTML")
+                .fit()
+                .on_pick(|app: &mut App, i: usize, _: &mut Tx| app.files_html_source = i == 1)
+                .build(p.k)
+                .key("files-html-mode")
+            }),
+        )
         .children(disk.map(|disk| {
             let path = disk.display().to_string();
             IconButton::new(&oc::COPY)
@@ -214,6 +227,14 @@ fn content(kind: Kind, key: &str, body: &str, app: &App, p: &Paint) -> El {
             .clip_rounded(p.k.radius.lg)
     };
     match kind {
+        Kind::Html if crate::html_preview::SUPPORTED && !app.files_html_source => {
+            frame().key(crate::html_preview::ELEMENT).child(note(
+                app.html_preview_error.as_deref().unwrap_or("HTML preview"),
+                "",
+                p,
+            ))
+        }
+        Kind::Html => frame().child(code(body, Some("html"), app, p)),
         Kind::Patch => frame().child(
             DiffView::new(
                 |app: &App| &app.remote.file_diff,

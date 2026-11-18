@@ -205,7 +205,11 @@ host, at the commit the playbook is pinned to.
 
 The Files pane lists the files a controller run's tasks captured (their `emits_files`), by task,
 with sizes, and shows one: markdown rendered (or its source), a patch in a diff view, JSON and
-JSON Lines indented and highlighted, anything else as highlighted text. A shown file is copied to
+JSON Lines indented and highlighted, anything else as highlighted text. On macOS, HTML files
+have a Preview/Source switch. Preview renders the captured document in an embedded WebKit view;
+scripts run in an opaque sandbox, with network access, forms and navigation outside the report
+disabled. The preview receives no controller credentials and uses no persistent browser storage.
+Other platforms and hot-reload builds show HTML source. A shown file is copied to
 `~/Library/Caches/crucible-playbooks/run-files/<run>/<key>`; the copy button copies that path and
 the edit button opens it in the editor. A file over 8 MiB is not fetched; the pane gives the
 `crux run-file` command instead.
