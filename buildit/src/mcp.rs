@@ -70,6 +70,7 @@ const LABEL_LAUNCHED_BY: &str = "crucible.dev/launched-by";
 /// The [`ContextDigest`] of what buildit uploaded for a builder pod's first build.
 const ANNOTATION_CONTEXT_DIGEST: &str = "buildit.dev/context-digest";
 const ANNOTATION_BUILDER: &str = "buildit.dev/builder";
+const ANNOTATION_REQUEST_DIGEST: &str = "buildit.dev/request-digest";
 
 /// Scope that lets a token read build status and logs.
 pub const SCOPE_READ: &str = "buildit.read";
@@ -81,6 +82,8 @@ const DEFAULT_RUN_TIMEOUT_S: u64 = 600;
 const FROM_TIMEOUT: Duration = Duration::from_secs(300);
 const EXEC_SLACK: Duration = Duration::from_secs(60);
 const SETTLE_RETRY: Duration = Duration::from_secs(2);
+const MAX_STATUS_WAIT_S: u64 = 50;
+const STATUS_WAIT_POLL: Duration = Duration::from_secs(2);
 const SUMMARY_LINES: usize = 40;
 const SUMMARY_BYTES: usize = 8 * 1024;
 const SUMMARY_WINDOW: u64 = 256 * 1024;
@@ -1068,6 +1071,11 @@ pub enum CacheScope {
 pub struct StatusParams {
     /// build_id from build
     pub build_id: String,
+    /// Wait on the server for the build to end, up to this many seconds (max 50), then answer
+    /// as usual. Unset answers at once
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 50))]
+    pub wait_seconds: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1118,6 +1126,33 @@ pub struct BuildReply {
     /// What builds the Dockerfile; absent for a build with `base`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub builder: Option<jobs::Builder>,
+    /// The same request from this sandbox was still building, and this is that build
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub already_running: bool,
+}
+
+struct Started {
+    id: BuildId,
+    snap: Snapshot,
+    context_digest: ContextDigest,
+    builder: Option<jobs::Builder>,
+    already_running: bool,
+}
+
+struct LiveBuild {
+    name: String,
+    request: Option<String>,
+}
+
+/// A digest of everything a build was asked for, its context by content.
+fn request_digest(p: &BuildParams, context: &ContextDigest) -> Result<String> {
+    use sha2::Digest;
+    let request =
+        serde_json::to_vec(&(context.as_str(), p)).context("serializing the build request")?;
+    Ok(sha2::Sha256::digest(&request)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1890,11 +1925,7 @@ impl Broker {
         Ok(())
     }
 
-    async fn start_build(
-        &self,
-        caller: &Caller,
-        p: BuildParams,
-    ) -> Result<(BuildId, Snapshot, ContextDigest, Option<jobs::Builder>)> {
+    async fn start_build(&self, caller: &Caller, p: BuildParams) -> Result<Started> {
         let cache = self.cache()?;
         let context = caller.workspace.context(&p.context)?;
         let recipe = Recipe::of(&p)?;
@@ -1904,14 +1935,6 @@ impl Broker {
         let limit = timeout(p.timeout_s, DEFAULT_BUILD_TIMEOUT_S);
         let mounts = run_mounts(cache_mounts(&p.caches)?, p.ccache);
         let live = self.live_builds(&caller.sandbox).await?;
-        if live.len() >= self.max_builds {
-            bail!(
-                "this sandbox has {} builds running (max {}): {}; wait for one or clean it",
-                live.len(),
-                self.max_builds,
-                live.join(", ")
-            );
-        }
         let stage = tempfile::tempdir().context("creating staging dir")?;
         let ctx = stage.path().join("ctx");
         tokio::task::block_in_place(|| {
@@ -1921,6 +1944,30 @@ impl Broker {
         })?;
         let tar = crate::context::staged_tar_bytes(&ctx)?;
         let digest = crate::context::digest(&tar)?;
+        let request = request_digest(&p, &digest)?;
+        if let Some(same) = live
+            .iter()
+            .find(|b| b.request.as_deref() == Some(request.as_str()))
+        {
+            return Ok(Started {
+                id: BuildId::parse(&same.name)?,
+                snap: Snapshot::running(&now_string()),
+                context_digest: digest,
+                builder,
+                already_running: true,
+            });
+        }
+        if live.len() >= self.max_builds {
+            bail!(
+                "this sandbox has {} builds running (max {}): {}; wait for one or clean it",
+                live.len(),
+                self.max_builds,
+                live.iter()
+                    .map(|b| b.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         let key = jobs::context_key(digest.as_str());
         if !self.has_blob(&key).await? {
             self.put_blob(&key, crate::context::gzip(&tar)?).await?;
@@ -1990,10 +2037,13 @@ impl Broker {
             );
         }
         let labels = self.labels(caller, &id);
-        let mut annotations = BTreeMap::from([(
-            ANNOTATION_CONTEXT_DIGEST.to_string(),
-            digest.as_str().to_string(),
-        )]);
+        let mut annotations = BTreeMap::from([
+            (
+                ANNOTATION_CONTEXT_DIGEST.to_string(),
+                digest.as_str().to_string(),
+            ),
+            (ANNOTATION_REQUEST_DIGEST.to_string(), request),
+        ]);
         if let Some(builder) = builder {
             annotations.insert(ANNOTATION_BUILDER.to_string(), builder.as_str().to_string());
         }
@@ -2061,7 +2111,13 @@ impl Broker {
             tar.len() / 1024,
         );
         let now = now_string();
-        Ok((id, Snapshot::running(&now), digest, builder))
+        Ok(Started {
+            id,
+            snap: Snapshot::running(&now),
+            context_digest: digest,
+            builder,
+            already_running: false,
+        })
     }
 
     /// Creates `job` and then its inputs Secret, owned by it; deletes the Job when the Secret
@@ -2095,7 +2151,7 @@ impl Broker {
     }
 
     /// The sandbox's builds that have not ended.
-    async fn live_builds(&self, sandbox: &SandboxName) -> Result<Vec<String>> {
+    async fn live_builds(&self, sandbox: &SandboxName) -> Result<Vec<LiveBuild>> {
         let sel = format!(
             "{LABEL_MANAGED_BY}={MANAGED_BY},{LABEL_SANDBOX}={},{}=build",
             sandbox.as_str(),
@@ -2110,17 +2166,23 @@ impl Broker {
             .items
             .iter()
             .filter(|j| !job_ended(j))
-            .filter_map(|j| j.metadata.name.clone())
+            .filter_map(|j| {
+                Some(LiveBuild {
+                    name: j.metadata.name.clone()?,
+                    request: annotation(&j.metadata, ANNOTATION_REQUEST_DIGEST).map(str::to_string),
+                })
+            })
             .collect())
     }
 
     pub async fn build(&self, caller: &Caller, p: BuildParams) -> Result<BuildReply> {
-        let (id, snap, context_digest, builder) = self.start_build(caller, p).await?;
+        let started = self.start_build(caller, p).await?;
         Ok(BuildReply {
-            build_id: id.0,
-            status: snap.state.status(),
-            context_digest,
-            builder,
+            build_id: started.id.0,
+            status: started.snap.state.status(),
+            context_digest: started.context_digest,
+            builder: started.builder,
+            already_running: started.already_running,
         })
     }
 
@@ -2237,11 +2299,20 @@ impl Broker {
 
     pub async fn status(&self, sandbox: &SandboxName, p: StatusParams) -> Result<StatusReply> {
         let id = BuildId::parse(&p.build_id)?;
-        let seen = self
-            .seen(sandbox, &id, LogName::Build)
-            .await?
-            .ok_or_else(|| anyhow!("no build {}; build again", id.0))?;
-        self.build_status(sandbox, &id, &seen).await
+        let wait = Duration::from_secs(p.wait_seconds.unwrap_or(0).min(MAX_STATUS_WAIT_S));
+        let started = Instant::now();
+        loop {
+            let seen = self
+                .seen(sandbox, &id, LogName::Build)
+                .await?
+                .ok_or_else(|| anyhow!("no build {}; build again", id.0))?;
+            if !matches!(seen.snap.state, step::State::Running)
+                || started.elapsed() + STATUS_WAIT_POLL > wait
+            {
+                return self.build_status(sandbox, &id, &seen).await;
+            }
+            tokio::time::sleep(STATUS_WAIT_POLL).await;
+        }
     }
 
     async fn build_status(
@@ -3064,7 +3135,9 @@ impl BuilditMcp {
     #[tool(
         description = "Start building a Dockerfile (params: context, dockerfile, target, build_args, \
         timeout_s, builder); `push` publishes it once it succeeds. Returns build_id with status running \
-        at once, and the builder used; the build waits in the queue until there is room. Poll `status` \
+        at once, and the builder used; the build waits in the queue until there is room. The same \
+        request again while it is still building returns that build with already_running true \
+        instead of starting another. Poll `status` \
         until succeeded or failed, then `run`/`logs` as needed, and `clean` the build_id when done. A \
         Dockerfile that builds under `docker build` and fails here under buildah may build with \
         builder \"buildkit\". \
@@ -3079,17 +3152,18 @@ impl BuilditMcp {
             return complete(async { self.broker.build(&caller(&ctx)?, p).await }.await);
         }
         let started = async { self.broker.start_build(&caller(&ctx)?, p).await }.await;
-        let (id, snap, _, _) = started.map_err(|e| format!("{e:#}"))?;
+        let started = started.map_err(|e| format!("{e:#}"))?;
         let t = TaskRef {
-            build: id,
+            build: started.id,
             log: LogName::Build,
         };
-        Ok(created(&t, &snap))
+        Ok(created(&t, &started.snap))
     }
 
     #[tool(
-        description = "Report a build's status (params: build_id): running, succeeded, failed or \
-        cancelled, with exit, timed_out and the build log's last lines. An ended buildkit build \
+        description = "Report a build's status (params: build_id, wait_seconds): running, succeeded, \
+        failed or cancelled, with exit, timed_out and the build log's last lines. With wait_seconds \
+        it answers when the build ends or the wait passes, so polling needs no sleep in between. An ended buildkit build \
         also reports its snapshotter and layer_cache: whether a cache was imported and how many \
         of its steps were cached. Poll it after `build`; `clean` when done."
     )]
@@ -4149,8 +4223,59 @@ mod tests {
             status: crate::step::Status::Running,
             context_digest: ContextDigest::parse(&format!("sha256:{}", "0".repeat(64))).unwrap(),
             builder: Some(Buildkit),
+            already_running: false,
         };
-        assert_eq!(serde_json::to_value(&reply).unwrap()["builder"], "buildkit");
+        let reply = serde_json::to_value(&reply).unwrap();
+        assert_eq!(reply["builder"], "buildkit");
+        assert!(reply.get("already_running").is_none());
+    }
+
+    #[test]
+    fn status_waits_at_most_fifty_seconds_and_not_at_all_by_default() {
+        use crate::mcp::StatusParams;
+        let p: StatusParams = serde_json::from_value(serde_json::json!({"build_id": "b"})).unwrap();
+        assert_eq!(p.wait_seconds, None);
+        let schema = serde_json::to_value(rmcp::schemars::schema_for!(StatusParams)).unwrap();
+        let wait = &schema["properties"]["wait_seconds"];
+        assert_eq!(wait["minimum"], 1, "{schema}");
+        assert_eq!(wait["maximum"], 50, "{schema}");
+    }
+
+    #[test]
+    fn a_request_digest_names_the_context_by_content_and_every_parameter() {
+        use crate::context::ContextDigest;
+        use crate::mcp::{BuildParams, request_digest};
+        let params = |extra: serde_json::Value| {
+            let mut p = serde_json::json!({"context": "cand/a", "base": "img@sha256:00", "script": "true", "path": "/src"});
+            p.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<BuildParams>(p).unwrap()
+        };
+        let context =
+            |byte: &str| ContextDigest::parse(&format!("sha256:{}", byte.repeat(64))).unwrap();
+        let same = request_digest(&params(serde_json::json!({})), &context("a")).unwrap();
+        assert_eq!(same.len(), 64);
+        assert_eq!(
+            same,
+            request_digest(&params(serde_json::json!({})), &context("a")).unwrap()
+        );
+        for other in [
+            request_digest(&params(serde_json::json!({})), &context("b")).unwrap(),
+            request_digest(
+                &params(serde_json::json!({"script": "make"})),
+                &context("a"),
+            )
+            .unwrap(),
+            request_digest(
+                &params(serde_json::json!({"build_args": {"MAX_JOBS": "8"}})),
+                &context("a"),
+            )
+            .unwrap(),
+            request_digest(&params(serde_json::json!({"timeout_s": 60})), &context("a")).unwrap(),
+        ] {
+            assert_ne!(same, other);
+        }
     }
 
     #[test]
@@ -7019,7 +7144,13 @@ mod tests {
         assert!(started.ok, "{}", started.reply);
         assert_eq!(started.reply["status"], "running");
         assert_eq!(started.reply["context_digest"], expected.as_str());
+        assert!(started.reply.get("already_running").is_none());
         let second = started.reply["build_id"].as_str().unwrap().to_string();
+
+        let repeated = run(&socket, build(false)).await;
+        assert!(repeated.ok, "{}", repeated.reply);
+        assert_eq!(repeated.reply["build_id"], second.as_str());
+        assert_eq!(repeated.reply["already_running"], true);
 
         let cleaned = run(&socket, Call::Clean(CleanParams { build_id: None })).await;
         assert!(cleaned.ok, "{}", cleaned.reply);
