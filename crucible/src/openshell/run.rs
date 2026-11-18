@@ -1784,6 +1784,28 @@ async fn restore_private_session(
     .await
 }
 
+/// What a saved transcript holds where the sandbox printed a reserved credential marker.
+const CREDENTIAL_MARKER_REDACTED: &str = "[credential placeholder]";
+
+/// `transcript` with the gateway's reserved credential markers taken out. The egress proxy
+/// refuses a request body that carries one it cannot resolve, and the next turn's sandbox is
+/// issued different ones.
+fn without_credential_markers(transcript: Vec<u8>) -> Vec<u8> {
+    match String::from_utf8(transcript) {
+        Ok(text) => text
+            .replace(
+                openshell_core::secrets::PLACEHOLDER_PREFIX_PUBLIC,
+                CREDENTIAL_MARKER_REDACTED,
+            )
+            .replace(
+                openshell_core::secrets::PROVIDER_ALIAS_MARKER_PUBLIC,
+                CREDENTIAL_MARKER_REDACTED,
+            )
+            .into_bytes(),
+        Err(not_text) => not_text.into_bytes(),
+    }
+}
+
 /// Persist the updated harness transcript outside the disposable sandbox. This is deliberately a
 /// private engine file, mode 0600, and is never part of the public session-event/publish contract.
 async fn persist_private_session(
@@ -1821,9 +1843,11 @@ async fn persist_private_session(
     let downloaded = newest_jsonl(scratch.path())
         .await
         .context("private session download contained no transcript")?;
-    let bytes = fs::read(&downloaded)
-        .await
-        .context("reading downloaded private session transcript")?;
+    let bytes = without_credential_markers(
+        fs::read(&downloaded)
+            .await
+            .context("reading downloaded private session transcript")?,
+    );
 
     let (locator_path, transcript_path) = private_session_paths(p, session);
     let root = locator_path
@@ -2699,6 +2723,53 @@ mod tests {
             "/sandbox/.claude/projects-evil/018f47a0-0000-7000-8000-000000000000.jsonl",
             &session
         ));
+    }
+
+    #[test]
+    fn a_saved_session_carries_no_reserved_credential_marker() {
+        use openshell_core::secrets::{
+            PROVIDER_ALIAS_MARKER_PUBLIC, contains_reserved_credential_marker_bytes,
+            placeholder_for_env_key_for_revision,
+        };
+        let placeholder = placeholder_for_env_key_for_revision("ANTHROPIC_API_KEY", 7);
+        let line = |text: &str| {
+            format!(
+                "{}\n",
+                serde_json::json!({ "role": "toolResult", "content": text })
+            )
+        };
+        let printed = [
+            line("PI_MODEL=m"),
+            line(&format!("ANTHROPIC_API_KEY={placeholder}\nPI_OFFLINE=1")),
+            line(&format!(
+                "alias {PROVIDER_ALIAS_MARKER_PUBLIC}abc and {placeholder}"
+            )),
+        ]
+        .concat();
+        assert!(contains_reserved_credential_marker_bytes(
+            printed.as_bytes()
+        ));
+
+        let saved = without_credential_markers(printed.clone().into_bytes());
+        assert!(!contains_reserved_credential_marker_bytes(&saved));
+        let saved = String::from_utf8(saved).unwrap();
+        let lines: Vec<serde_json::Value> = saved
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0]["content"], "PI_MODEL=m");
+        let env = lines[1]["content"].as_str().unwrap();
+        assert!(
+            env.starts_with("ANTHROPIC_API_KEY=[credential placeholder]"),
+            "{env}"
+        );
+        assert!(env.ends_with("\nPI_OFFLINE=1"), "{env}");
+
+        let clean = line("nothing reserved here").into_bytes();
+        assert_eq!(without_credential_markers(clean.clone()), clean);
+        let binary = vec![0xff, 0xfe, 0x00, 0x41];
+        assert_eq!(without_credential_markers(binary.clone()), binary);
     }
 
     #[test]
