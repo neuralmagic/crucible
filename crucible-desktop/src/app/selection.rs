@@ -1,9 +1,9 @@
 //! What is selected and shown: the pack or launch, its tasks, log and files, and the links that
 //! lead to them.
 
-use crate::filter::LaunchFilter;
+use crate::filter::{Filters, LaunchFilter};
 use crate::link::Link;
-use crate::live::{LiveDetail, LivePlaybook};
+use crate::live::{LiveDetail, LiveDraft, LivePlaybook, Row};
 use crate::logline::LogLine;
 use crate::model::PackView;
 use crate::pack::{PackFile, PackFiles};
@@ -34,18 +34,37 @@ impl App {
         self.playbook_search.text.trim().to_ascii_lowercase()
     }
 
+    /// The sidebar's switches as they apply to whoever is signed in.
+    pub fn filters(&self) -> Filters {
+        self.settings.filters.for_viewer(self.user().is_some())
+    }
+
+    pub fn set_filters(&mut self, filters: Filters) {
+        self.settings.set_filters(filters);
+    }
+
     pub fn launch_filter(&self) -> LaunchFilter {
+        let Filters {
+            owner,
+            origin,
+            landed,
+        } = self.filters();
         LaunchFilter {
             query: self.query(),
-            owner: self.owner_filter,
-            origin: self.origin_filter,
-            landed: self.landed_filter,
+            owner,
+            origin,
+            landed,
         }
     }
 
-    /// The sidebar's live rows: each playbook's newest launch the filters keep.
+    /// The sidebar's live rows: one launch per playbook the filters keep, a running one first.
     pub fn visible_playbooks(&self) -> Vec<&LivePlaybook> {
         self.remote.live.playbooks(&self.launch_filter())
+    }
+
+    /// The sidebar's live rows with the viewer's drafts no launch ran among them.
+    pub fn visible_rows(&self) -> Vec<Row<'_>> {
+        self.remote.live.rows(&self.launch_filter())
     }
 
     /// Whether the sidebar is showing a subset of the active backend's list.
@@ -76,6 +95,27 @@ impl App {
         self.remote
             .live
             .resolve(playbook, launch.as_deref(), &self.launch_filter())
+    }
+
+    /// The selected draft, when no launch ran it.
+    pub fn selected_draft(&self) -> Option<&LiveDraft> {
+        if self.backend != Backend::Controller {
+            return None;
+        }
+        let Some(Selection::Live { playbook, .. }) = &self.selection else {
+            return None;
+        };
+        self.remote.live.draft(playbook)
+    }
+
+    /// The selected draft's newest save, or why it could not be read; `None` until read.
+    pub fn selected_draft_pack(&self) -> Option<&Result<PackFiles, String>> {
+        let draft = self.selected_draft()?;
+        self.remote
+            .draft_pack
+            .as_deref()
+            .filter(|read| read.draft == draft.id && read.version == draft.version)
+            .map(|read| &read.pack)
     }
 
     /// The live graph, only when it is the one the selection shows.
@@ -141,7 +181,10 @@ impl App {
             Some(Selection::Live { .. }) if self.showing_working() => {
                 self.remote.working_pack.as_ref()
             }
-            Some(Selection::Live { .. }) => self.selected_detail()?.pack.as_ref().ok(),
+            Some(Selection::Live { .. }) => match self.selected_draft_pack() {
+                Some(pack) => pack.as_ref().ok(),
+                None => self.selected_detail()?.pack.as_ref().ok(),
+            },
             None => None,
         }
     }

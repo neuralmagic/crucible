@@ -1,7 +1,7 @@
 //! Turning crux's answers into what the views draw: folds, labels and times.
 
 use crate::captured::Captured;
-use crate::live::{Identity, LaunchStatus, LiveDetail, LivePlaybook};
+use crate::live::{Identity, LaunchStatus, LiveDetail, LiveDraft, LivePlaybook};
 use crate::logline::LogLine;
 use crate::model::Verdict;
 use crate::net::{Connection, within};
@@ -11,6 +11,7 @@ use crucible_contract::session::SessionEvent;
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use serde_json::Value;
+use std::collections::HashSet;
 
 pub(in crate::live) async fn captured_files(
     connection: &Connection,
@@ -106,6 +107,48 @@ pub(in crate::live) fn identity(whoami: crux::dto::Whoami) -> Identity {
         owners,
         autoresearch: whoami.entitlements.iter().any(|e| e == "autoresearch"),
     }
+}
+
+/// The listed drafts `identity` owns, as themself or as a team, that are not retired, newest
+/// save first.
+pub(in crate::live) fn owned(
+    drafts: Vec<crux::dto::PlaybookDraft>,
+    identity: &Identity,
+) -> Vec<LiveDraft> {
+    let mut drafts: Vec<LiveDraft> = drafts
+        .into_iter()
+        .filter(|draft| draft.retired_at.is_none())
+        .filter(|draft| {
+            identity
+                .owners
+                .iter()
+                .any(|owner| owner.eq_ignore_ascii_case(&draft.owner))
+        })
+        .map(|draft| LiveDraft {
+            by: draft.created_by.unwrap_or_else(|| draft.owner.clone()),
+            id: draft.id,
+            description: Some(draft.description).filter(|text| !text.is_empty()),
+            owner: draft.owner,
+            version: draft.latest_version,
+            compiles: draft.compiles,
+            saved: epoch(&draft.updated_at).unwrap_or_default(),
+        })
+        .collect();
+    drafts.sort_by_key(|draft| std::cmp::Reverse(draft.saved));
+    drafts
+}
+
+/// The drafts none of `launches` ran.
+pub(in crate::live) fn unlaunched(
+    drafts: &[LiveDraft],
+    launches: &[LivePlaybook],
+) -> Vec<LiveDraft> {
+    let launched: HashSet<&str> = launches.iter().map(|launch| launch.id.as_str()).collect();
+    drafts
+        .iter()
+        .filter(|draft| !launched.contains(draft.id.as_str()))
+        .cloned()
+        .collect()
 }
 
 pub(in crate::live) fn agent_label(launch: &crux::dto::PlaybookRun) -> String {

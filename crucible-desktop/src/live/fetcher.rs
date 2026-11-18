@@ -5,9 +5,12 @@ use crate::captured::Captured;
 use crate::live::action::Msg;
 use crate::live::shape::{
     agent_label, build_detail, captured, captured_files, clock, console, epoch, graph_fold,
-    identity, landed_label, pin_label, typed_log, unix_now,
+    identity, landed_label, owned, pin_label, typed_log, unix_now, unlaunched,
 };
-use crate::live::{Base, Finished, Identity, LaunchStatus, LiveDetail, LivePlaybook, LiveView};
+use crate::live::{
+    Base, DraftPack, Finished, Identity, LaunchStatus, LiveDetail, LiveDraft, LivePlaybook,
+    LiveView,
+};
 use crate::logline::LogLine;
 use crate::net::{Connection, Connector, Down, reaching, within};
 use crate::pack::PackFiles;
@@ -41,6 +44,9 @@ pub(in crate::live) struct Fetcher {
     pub(in crate::live) view: LiveView,
     pub(in crate::live) detail: Option<Arc<LiveDetail>>,
     pub(in crate::live) base: Option<Base>,
+    /// The viewer's drafts, as last listed.
+    pub(in crate::live) drafts: Vec<LiveDraft>,
+    pub(in crate::live) draft: Option<Arc<DraftPack>>,
     launches: HashMap<String, CachedLaunch>,
     packs: HashMap<String, PackFiles>,
     runs: HashMap<String, CachedRun>,
@@ -270,6 +276,8 @@ impl Fetcher {
             view: LiveView::Loading,
             detail: None,
             base: None,
+            drafts: Vec::new(),
+            draft: None,
             launches: HashMap::new(),
             packs: HashMap::new(),
             runs: HashMap::new(),
@@ -446,11 +454,17 @@ impl Fetcher {
         let (endpoint, identity) = self.identity.clone().unwrap_or_default();
 
         let connection = self.connection().await?;
-        let launches: Vec<crux::dto::PlaybookRun> = reaching(
-            "the launch list",
-            connection.client.playbook_runs(None, None),
-        )
-        .await?;
+        let (launches, drafts) = tokio::join!(
+            reaching(
+                "the launch list",
+                connection.client.playbook_runs(None, None),
+            ),
+            within("the drafts", connection.client.playbook_drafts()),
+        );
+        let launches: Vec<crux::dto::PlaybookRun> = launches?;
+        if let Ok(drafts) = drafts {
+            self.drafts = owned(drafts, &identity);
+        }
         let zone = TimeZone::system();
         let mut launches: Vec<LivePlaybook> = launches
             .into_iter()
@@ -482,11 +496,13 @@ impl Fetcher {
 
         self.note_finished(&launches);
         let now = unix_now();
+        let drafts = unlaunched(&self.drafts, &launches);
         let next = LiveView::Ready {
             endpoint,
             identity,
             now: now - now % 60,
             launches,
+            drafts,
             stale: self
                 .connector
                 .offline()
@@ -495,6 +511,26 @@ impl Fetcher {
         let changed = next != self.view;
         self.view = next;
         Ok(changed)
+    }
+
+    /// Read `shown`'s pack, once: a draft save never changes. A read that failed is tried again.
+    pub(in crate::live) async fn refresh_draft(&mut self, shown: Option<&(String, i64)>) -> bool {
+        let Some((draft, version)) = shown else {
+            return self.draft.take().is_some();
+        };
+        if self.draft.as_ref().is_some_and(|read| {
+            read.draft == *draft && read.version == *version && read.pack.is_ok()
+        }) {
+            return false;
+        }
+        let next = DraftPack {
+            draft: draft.clone(),
+            version: *version,
+            pack: self.pack(draft, Some(*version)).await,
+        };
+        let changed = self.draft.as_deref() != Some(&next);
+        self.draft = Some(Arc::new(next));
+        changed
     }
 
     /// The launch's own record, re-read when its run count or status moved.

@@ -1,12 +1,13 @@
 //! The selected pack or launch: its header, its figures and its panes.
 
-use crate::live::{LiveDetail, LivePlaybook, LiveView};
+use crate::live::{LiveDetail, LiveDraft, LivePlaybook, LiveView};
 use crate::logline::activity;
 use crate::model::{PackView, Verdict};
+use crate::pack::PackFiles;
 use crate::session::TaskState;
 use crate::settings::LogFont;
 use crate::ui::settings::settings_pane;
-use crate::ui::sidebar::{verdict_color, verdict_icon};
+use crate::ui::sidebar::{draft_meta, verdict_color, verdict_icon};
 use crate::ui::{
     Flight, Paint, Pane, SECTION, TITLE, TITLE_BAND, admin, approvals, banner, blueprints,
     decisions, dock, issues, keys, launcher, meter, providers, pulsing, report, runs, secrets,
@@ -135,6 +136,50 @@ fn live_pane<'a>(
     }
 }
 
+/// A draft no launch ran: its newest save, and nothing of a run.
+fn draft_pane<'a>(
+    draft: &LiveDraft,
+    pack: Option<&'a Result<PackFiles, String>>,
+    log_font: LogFont,
+) -> Pane<'a> {
+    Pane {
+        title: draft.id.clone(),
+        subtitle: draft
+            .description
+            .clone()
+            .unwrap_or_else(|| format!("{} \u{b7} by {}", draft_meta(draft), draft.by)),
+        path: format!("draft {} v{}", draft.id, draft.version),
+        verdict: Verdict::NotRun,
+        spent: 0.0,
+        cap: 0.0,
+        passed: 0,
+        failed: 0,
+        tasks: &[],
+        time: "\u{2014}".to_string(),
+        time_note: None,
+        meta: Some(draft.owner.clone()),
+        streaming: false,
+        problem: None,
+        log: &[],
+        transcript: &[],
+        agent_events: &[],
+        log_font,
+        launchable: false,
+        preview: None,
+        previewing: false,
+        run_tasks: &[],
+        empty: ("No launches listed.", String::new()),
+        pack: match pack {
+            Some(pack) => pack.as_ref().map_err(Clone::clone),
+            None if draft.version > 0 => Err("Reading the pack\u{2026}".to_string()),
+            None => Err("Nothing saved.".to_string()),
+        },
+        launch: None,
+        run_id: None,
+        files: Some(Ok(&[])),
+    }
+}
+
 /// Why a live launch shows no tasks: still loading, unreadable, never dispatched, or no plan.
 fn live_empty(launch: &LivePlaybook, detail: Option<&LiveDetail>) -> (&'static str, String) {
     let Some(detail) = detail else {
@@ -216,10 +261,16 @@ pub(crate) fn detail(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
         Some(Selection::Local(_)) => app.selected_pack().map(|pack| local_pane(pack, font)),
         Some(Selection::Live { launch, .. }) => {
             let pinned = launch.is_some() && app.playbook_launches().is_some();
-            app.selected_live().map(|live| Pane {
-                preview: app.remote.working_preview.as_ref(),
-                ..live_pane(live, app.selected_detail(), font, pinned)
-            })
+            app.selected_live()
+                .map(|live| live_pane(live, app.selected_detail(), font, pinned))
+                .or_else(|| {
+                    app.selected_draft()
+                        .map(|draft| draft_pane(draft, app.selected_draft_pack(), font))
+                })
+                .map(|pane| Pane {
+                    preview: app.remote.working_preview.as_ref(),
+                    ..pane
+                })
         }
         None => None,
     }
@@ -296,7 +347,7 @@ pub(crate) fn detail(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
         }
         None => stats(&pane, p),
     };
-    body.child(stats)
+    body.children(app.selected_draft().is_none().then_some(stats))
         .child(dock::workspace(&pane, app, p, layer))
 }
 

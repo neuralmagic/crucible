@@ -26,6 +26,8 @@ pub(in crate::live) enum Msg {
     Reconnect,
     /// Which launch to read as the base of a comparison; `None` stops.
     Compare(Option<String>),
+    /// Which draft save to read the pack of; `None` stops.
+    Draft(Option<(String, i64)>),
 }
 
 /// What the window asks for that runs as a task of its own.

@@ -1,8 +1,8 @@
 //! The sidebar: the brand, the pages, search and filters, and the playbooks or packs.
 
-use crate::filter::{LandedFilter, OriginFilter, OwnerFilter};
+use crate::filter::{Filters, LandedFilter, OriginFilter, OwnerFilter};
 use crate::ignition::Spark;
-use crate::live::{LaunchStatus, LivePlaybook, LiveView};
+use crate::live::{LaunchStatus, LiveDraft, LivePlaybook, LiveView, Row};
 use crate::model::{PackView, Verdict};
 use crate::net::Down;
 use crate::ui::account::account;
@@ -158,8 +158,11 @@ pub(crate) fn sidebar(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
                 ),
         );
     }
-    if app.backend == Backend::Controller && app.filters_open {
-        head = head.child(filters(app, p));
+    if app.backend == Backend::Controller {
+        head = head.children(active_filters(app, p));
+        if app.filters_open {
+            head = head.child(filters(app, p));
+        }
     }
 
     col()
@@ -243,9 +246,6 @@ fn search(app: &App, p: &Paint) -> El {
     if !app.playbook_search.text.is_empty() {
         input = input.clear_button();
     }
-    let filtered = app.owner_filter != OwnerFilter::All
-        || app.origin_filter != OriginFilter::All
-        || app.landed_filter != LandedFilter::Any;
     row()
         .w_full()
         .gap(6.0)
@@ -253,9 +253,7 @@ fn search(app: &App, p: &Paint) -> El {
         .child(input.build(p.k).key("playbook-search"))
         .children(filterable.then(|| {
             IconButton::new(&oc::OUTLINE_DOTS)
-                .variant(if filtered {
-                    IconButtonVariant::Contrast
-                } else if app.filters_open {
+                .variant(if app.filters_open {
                     IconButtonVariant::Neutral
                 } else {
                     IconButtonVariant::GhostMuted
@@ -267,27 +265,94 @@ fn search(app: &App, p: &Paint) -> El {
         }))
 }
 
+/// The switches that narrow the list, each a button that turns it off.
+fn active_filters(app: &App, p: &Paint) -> Option<El> {
+    let set = app.filters();
+    let chip = |label: &'static str, cleared: Filters| {
+        Button::new(label)
+            .variant(ButtonVariant::Outline)
+            .icon(&oc::XMARK_SMALL)
+            .on_press(move |app: &mut App| app.set_filters(cleared))
+            .build(p.k)
+            .key(format!("filter-on-{}", slug(label)))
+    };
+    let stored = app.settings.filters;
+    let chips: Vec<El> = [
+        (set.owner != OwnerFilter::All).then(|| {
+            chip(
+                set.owner.label(),
+                Filters {
+                    owner: OwnerFilter::All,
+                    ..stored
+                },
+            )
+        }),
+        (set.origin != OriginFilter::All).then(|| {
+            chip(
+                set.origin.label(),
+                Filters {
+                    origin: OriginFilter::All,
+                    ..stored
+                },
+            )
+        }),
+        (set.landed != LandedFilter::Any).then(|| {
+            chip(
+                set.landed.label(),
+                Filters {
+                    landed: LandedFilter::Any,
+                    ..stored
+                },
+            )
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!chips.is_empty()).then(|| {
+        row()
+            .key("filters-on")
+            .w_full()
+            .gap(6.0)
+            .flex_wrap()
+            .children(chips)
+    })
+}
+
 fn filters(app: &App, p: &Paint) -> El {
+    let stored = app.settings.filters;
     col()
         .key("filters")
         .w_full()
         .gap(6.0)
-        .child(filter_row(
-            "Owner",
-            &OwnerFilter::ALL.map(|choice| choice.label()),
-            OwnerFilter::ALL
-                .iter()
-                .position(|choice| *choice == app.owner_filter),
-            |app: &mut App, i: usize, _: &mut Tx| app.owner_filter = OwnerFilter::ALL[i],
-            p,
-        ))
+        .children(app.user().is_some().then(|| {
+            filter_row(
+                "Owner",
+                &OwnerFilter::ALL.map(|choice| choice.label()),
+                OwnerFilter::ALL
+                    .iter()
+                    .position(|choice| *choice == stored.owner),
+                move |app: &mut App, i: usize, _: &mut Tx| {
+                    app.set_filters(Filters {
+                        owner: OwnerFilter::ALL[i],
+                        ..stored
+                    })
+                },
+                p,
+            )
+        }))
         .child(filter_row(
             "Origin",
             &OriginFilter::ALL.map(|choice| choice.label()),
             OriginFilter::ALL
                 .iter()
-                .position(|choice| *choice == app.origin_filter),
-            |app: &mut App, i: usize, _: &mut Tx| app.origin_filter = OriginFilter::ALL[i],
+                .position(|choice| *choice == stored.origin),
+            move |app: &mut App, i: usize, _: &mut Tx| {
+                app.set_filters(Filters {
+                    origin: OriginFilter::ALL[i],
+                    ..stored
+                })
+            },
             p,
         ))
         .child(filter_row(
@@ -295,8 +360,13 @@ fn filters(app: &App, p: &Paint) -> El {
             &LandedFilter::ALL.map(|choice| choice.label()),
             LandedFilter::ALL
                 .iter()
-                .position(|choice| *choice == app.landed_filter),
-            |app: &mut App, i: usize, _: &mut Tx| app.landed_filter = LandedFilter::ALL[i],
+                .position(|choice| *choice == stored.landed),
+            move |app: &mut App, i: usize, _: &mut Tx| {
+                app.set_filters(Filters {
+                    landed: LandedFilter::ALL[i],
+                    ..stored
+                })
+            },
             p,
         ))
 }
@@ -351,7 +421,7 @@ fn pack_list(app: &App, p: &Paint) -> El {
     match app.backend {
         Backend::Controller => match &*app.remote.live {
             LiveView::Ready { now, .. } => {
-                let playbooks = app.visible_playbooks();
+                let playbooks = app.visible_rows();
                 if playbooks.is_empty() {
                     list = list.child(note(
                         if app.filtering() {
@@ -575,11 +645,14 @@ fn ignited(mark: El, spark: Spark, ember: Color) -> El {
 /// The side of the status slot the flare starts from.
 const IGNITION: f32 = 12.0;
 
-fn live_rows(app: &App, playbooks: &[&LivePlaybook], now: i64, p: &Paint) -> Vec<El> {
+fn live_rows(app: &App, rows: &[Row], now: i64, p: &Paint) -> Vec<El> {
     let current = app.selected_playbook();
-    playbooks
-        .iter()
-        .map(|playbook| {
+    rows.iter()
+        .map(|row| {
+            let playbook = match row {
+                Row::Launch(playbook) => playbook,
+                Row::Draft(draft) => return draft_row(draft, current, now, p),
+            };
             let id = playbook.id.clone();
             let status = match (
                 verdict_status(playbook.verdict(), p),
@@ -602,6 +675,28 @@ fn live_rows(app: &App, playbooks: &[&LivePlaybook], now: i64, p: &Paint) -> Vec
             item.build(p.k).key(format!("live-{}", playbook.id))
         })
         .collect()
+}
+
+pub(crate) fn draft_meta(draft: &LiveDraft) -> String {
+    if draft.compiles {
+        format!("draft \u{b7} v{}", draft.version)
+    } else {
+        format!("draft \u{b7} v{} \u{b7} does not compile", draft.version)
+    }
+}
+
+fn draft_row(draft: &LiveDraft, current: Option<&str>, now: i64, p: &Paint) -> El {
+    let id = draft.id.clone();
+    let mut item = SidebarRow::new(draft.id.clone())
+        .subtitle(draft_meta(draft))
+        .height(ROW * p.text)
+        .status(verdict_status(Verdict::NotRun, p))
+        .selected(current == Some(draft.id.as_str()))
+        .on_select(move |app: &mut App, _: &mut Tx| app.select(Selection::playbook(&id)));
+    if draft.saved > 0 {
+        item = item.detail(age(draft.saved, now));
+    }
+    item.build(p.k).key(format!("draft-{}", draft.id))
 }
 
 fn pack_row(app: &App, pack: &PackView, p: &Paint) -> El {

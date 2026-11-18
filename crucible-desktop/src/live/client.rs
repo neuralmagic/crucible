@@ -5,8 +5,8 @@ use crate::draft::Working;
 use crate::live::action::{Action, Msg, Reply, Reporting};
 use crate::live::fetcher::Fetcher;
 use crate::live::{
-    Base, Dropped, Finished, Launched, LiveDetail, LiveView, Prepared, Reran, Snapshot, Synced,
-    Target,
+    Base, DraftPack, Dropped, Finished, Launched, LiveDetail, LiveView, Prepared, Reran, Snapshot,
+    Synced, Target,
 };
 use crate::net::{Connector, Down, Task};
 use crate::report::WantedRuns;
@@ -28,6 +28,7 @@ struct Polled {
     view: Arc<LiveView>,
     detail: Option<Arc<LiveDetail>>,
     base: Option<Base>,
+    draft: Option<Arc<DraftPack>>,
     finished: Vec<Finished>,
     registered: Vec<String>,
 }
@@ -70,6 +71,7 @@ impl Shared {
         self.snapshot.view = polled.view;
         self.snapshot.detail = polled.detail;
         self.snapshot.base = polled.base;
+        self.snapshot.draft = polled.draft;
         self.snapshot.finished = polled.finished;
         self.snapshot.registered = polled.registered;
     }
@@ -248,6 +250,11 @@ impl Client {
         let _ = self.tx.send(Msg::Compare(base.map(ToString::to_string)));
     }
 
+    /// Which draft save's pack to read; `None` stops.
+    pub fn draft(&self, shown: Option<(String, i64)>) {
+        let _ = self.tx.send(Msg::Draft(shown));
+    }
+
     /// Fetch the file `run` captured under `key`. Its copy on disk is used only when the run
     /// has `settled` and the copy is the `size` the listing gives.
     pub fn file(&self, run: &str, key: &str, size: u64, settled: bool) {
@@ -308,6 +315,7 @@ async fn run_client(
     let mut selected: Option<String> = None;
     let mut view = Arc::new(LiveView::default());
     let mut compare: Option<String> = None;
+    let mut draft: Option<(String, i64)> = None;
     let mut next_list = Instant::now();
     let mut next_detail = Instant::now();
     let mut next_stream: Option<Instant> = None;
@@ -332,9 +340,14 @@ async fn run_client(
                 compare = base;
                 force = fetcher.refresh_base(compare.as_deref()).await;
             }
+            Ok(Some(Msg::Draft(shown))) => {
+                draft = shown;
+                force = fetcher.refresh_draft(draft.as_ref()).await;
+            }
             Ok(Some(Msg::Reconnect)) => {
                 fetcher.connector.reset();
                 fetcher.identity = None;
+                fetcher.drafts.clear();
                 fetcher.registered_at = None;
                 fetcher.view = LiveView::Loading;
                 next_list = Instant::now();
@@ -353,6 +366,7 @@ async fn run_client(
             }
             changed |= fetcher.refresh_registered().await;
             changed |= fetcher.refresh_base(compare.as_deref()).await;
+            changed |= fetcher.refresh_draft(draft.as_ref()).await;
             next_list = now
                 + if fetcher.any_running() || !matches!(fetcher.view, LiveView::Ready { .. }) {
                     Duration::from_secs(2)
@@ -382,6 +396,7 @@ async fn run_client(
                 view: Arc::clone(&view),
                 detail: fetcher.detail.clone(),
                 base: fetcher.base.clone(),
+                draft: fetcher.draft.clone(),
                 finished: fetcher.finished.clone(),
                 registered: fetcher.registered.clone(),
             };

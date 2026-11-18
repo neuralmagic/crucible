@@ -9,7 +9,7 @@ mod fetcher;
 mod reports;
 mod shape;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -36,6 +36,8 @@ pub enum LiveView {
         now: i64,
         /// Every launch the controller returned, newest first.
         launches: Vec<LivePlaybook>,
+        /// The viewer's drafts that none of `launches` ran, newest save first.
+        drafts: Vec<LiveDraft>,
         /// Why the newest refresh failed, while this list is the last one that did not.
         stale: Option<String>,
     },
@@ -76,15 +78,57 @@ impl LiveView {
             .collect()
     }
 
-    /// Each playbook's newest launch the filter keeps: running ones first, then newest first.
+    /// One launch per playbook the filter keeps, its newest running one, else its newest:
+    /// running playbooks first, then by newest launch.
     pub fn playbooks(&self, filter: &LaunchFilter) -> Vec<&LivePlaybook> {
-        let mut seen = HashSet::new();
-        let mut rows: Vec<&LivePlaybook> = self
-            .kept(filter)
-            .into_iter()
-            .filter(|launch| seen.insert(launch.id.as_str()))
-            .collect();
+        let mut at: HashMap<&str, usize> = HashMap::new();
+        let mut rows: Vec<&LivePlaybook> = Vec::new();
+        for launch in self.kept(filter) {
+            match at.get(launch.id.as_str()).and_then(|&i| rows.get_mut(i)) {
+                Some(row) if launch.status.is_running() && !row.status.is_running() => {
+                    *row = launch;
+                }
+                Some(_) => {}
+                None => {
+                    at.insert(launch.id.as_str(), rows.len());
+                    rows.push(launch);
+                }
+            }
+        }
         rows.sort_by_key(|row| !row.status.is_running());
+        rows
+    }
+
+    pub fn drafts(&self) -> &[LiveDraft] {
+        match self {
+            LiveView::Ready { drafts, .. } => drafts,
+            _ => &[],
+        }
+    }
+
+    pub fn draft(&self, id: &str) -> Option<&LiveDraft> {
+        self.drafts().iter().find(|draft| draft.id == id)
+    }
+
+    /// The sidebar's rows the filter keeps: [`LiveView::playbooks`] with each draft no launch
+    /// ran placed among the ones not running by its save.
+    pub fn rows(&self, filter: &LaunchFilter) -> Vec<Row<'_>> {
+        let (me, now) = self.viewer();
+        let drafts = self
+            .drafts()
+            .iter()
+            .filter(|draft| filter.keeps_draft(draft, me, now))
+            .map(Row::Draft);
+        let playbooks = self.playbooks(filter);
+        let running = playbooks
+            .iter()
+            .take_while(|launch| launch.status.is_running())
+            .count();
+        let mut rows: Vec<Row> = playbooks.into_iter().map(Row::Launch).collect();
+        let mut rest = rows.split_off(running);
+        rest.extend(drafts);
+        rest.sort_by_key(|row| std::cmp::Reverse(row.at()));
+        rows.extend(rest);
         rows
     }
 
@@ -180,6 +224,60 @@ impl LivePlaybook {
             LaunchStatus::New | LaunchStatus::Other(_) => Verdict::Unfinished,
         }
     }
+}
+
+/// A draft the viewer owns.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LiveDraft {
+    pub id: String,
+    pub description: Option<String>,
+    /// `user:<login>` or `team:<slug>`.
+    pub owner: String,
+    pub by: String,
+    /// The newest save; 0 when nothing is saved yet.
+    pub version: i64,
+    pub compiles: bool,
+    pub saved: i64,
+}
+
+impl LiveDraft {
+    /// A case-insensitive match on the fields a reader can see in the row.
+    pub fn matches(&self, query: &str) -> bool {
+        [self.id.as_str(), self.by.as_str(), "draft"]
+            .iter()
+            .any(|field| field.to_ascii_lowercase().contains(query))
+    }
+}
+
+/// One sidebar row.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Row<'a> {
+    Launch(&'a LivePlaybook),
+    Draft(&'a LiveDraft),
+}
+
+impl Row<'_> {
+    pub fn id(&self) -> &str {
+        match self {
+            Row::Launch(launch) => &launch.id,
+            Row::Draft(draft) => &draft.id,
+        }
+    }
+
+    fn at(&self) -> i64 {
+        match self {
+            Row::Launch(launch) => launch.landed,
+            Row::Draft(draft) => draft.saved,
+        }
+    }
+}
+
+/// The newest save of the draft the window shows.
+#[derive(Clone, PartialEq)]
+pub struct DraftPack {
+    pub draft: String,
+    pub version: i64,
+    pub pack: Result<PackFiles, String>,
 }
 
 /// What the newest run of one launch did.
@@ -386,6 +484,8 @@ pub struct Snapshot {
     pub detail: Option<Arc<LiveDetail>>,
     /// The launch the selected one is compared against.
     pub base: Option<Base>,
+    /// The pack of the draft the window shows, when it shows one no launch ran.
+    pub draft: Option<Arc<DraftPack>>,
     /// Recently finished launches, oldest first.
     pub finished: Vec<Finished>,
     /// Registered playbook ids: the ones the app can launch.
@@ -422,15 +522,17 @@ mod tests {
     use crate::live::shape::graph_fold;
     use crate::live::shape::identity;
     use crate::live::shape::landed_label;
+    use crate::live::shape::owned;
+    use crate::live::shape::unlaunched;
     use crate::live::*;
     use crate::net::within;
     use crate::revisions;
     use crate::revisions::Wanted;
     use jiff::tz::TimeZone;
-    use rune::time::Instant;
     use std::path::Path;
     use std::sync::Mutex;
     use std::time::Duration;
+    use std::time::Instant;
     use tokio::sync::mpsc;
 
     fn launch(status: &str) -> LivePlaybook {
@@ -478,8 +580,32 @@ mod tests {
             },
             now: NOW,
             launches,
+            drafts: Vec::new(),
             stale: None,
         }
+    }
+
+    fn draft(id: &str, saved: i64) -> LiveDraft {
+        LiveDraft {
+            id: id.into(),
+            description: None,
+            owner: "user:wren".into(),
+            by: "wren".into(),
+            version: 2,
+            compiles: true,
+            saved: 1_760_000_000 + saved * 60,
+        }
+    }
+
+    fn with_drafts(mut view: LiveView, listed: Vec<LiveDraft>) -> LiveView {
+        if let LiveView::Ready { drafts, .. } = &mut view {
+            *drafts = listed;
+        }
+        view
+    }
+
+    fn row_ids(rows: &[Row]) -> Vec<String> {
+        rows.iter().map(|row| row.id().to_string()).collect()
     }
 
     #[test]
@@ -671,13 +797,160 @@ mod tests {
         assert_eq!(
             keys(&view.playbooks(&everything())),
             [
+                "playbook:nightly:1",
                 "playbook:hourly:0",
                 "playbook:weekly:4",
                 "playbook:adhoc:3",
-                "playbook:nightly:2",
             ]
         );
         assert_eq!(view.playbook_count(), 4);
+    }
+
+    #[test]
+    fn the_sidebar_lists_a_draft_no_launch_ran_by_its_save_among_the_launches() {
+        let view = with_drafts(
+            ready(vec![
+                firing("nightly", 1, "schedule", "done"),
+                firing("adhoc", 5, "manual", "done"),
+                firing("hourly", 0, "schedule", "running"),
+            ]),
+            vec![draft("fresh", 9), draft("stale", 3)],
+        );
+        assert_eq!(
+            row_ids(&view.rows(&everything())),
+            ["hourly", "fresh", "adhoc", "stale", "nightly"]
+        );
+        assert_eq!(
+            row_ids(&view.rows(&only(OriginFilter::Drafts))),
+            ["fresh", "stale"]
+        );
+        assert_eq!(
+            row_ids(&view.rows(&only(OriginFilter::Schedules))),
+            ["hourly", "nightly"]
+        );
+        assert_eq!(view.draft("stale").map(|d| d.version), Some(2));
+        assert_eq!(view.draft("nightly"), None);
+    }
+
+    #[test]
+    fn running_rows_keep_the_order_of_their_playbooks_ahead_of_any_draft() {
+        let view = with_drafts(
+            ready(vec![
+                firing("fanout", 2, "manual", "running"),
+                firing("fanout", 8, "manual", "done"),
+                firing("hourly", 5, "schedule", "running"),
+                firing("adhoc", 1, "manual", "done"),
+            ]),
+            vec![draft("fresh", 9)],
+        );
+        assert_eq!(
+            row_ids(&view.rows(&everything())),
+            ["fanout", "hourly", "fresh", "adhoc"],
+            "a playbook whose older launch still runs sorts by its newest launch"
+        );
+    }
+
+    #[test]
+    fn the_search_owner_and_landed_filters_narrow_the_drafts() {
+        let mut team = draft("shared", 2);
+        team.owner = "team:infra".into();
+        team.by = "lark".into();
+        let mut old = draft("old", 0);
+        old.saved = NOW - 90_000;
+        let view = with_drafts(ready(Vec::new()), vec![draft("mine", 3), team, old]);
+        let rows = |filter: LaunchFilter| row_ids(&view.rows(&filter));
+        assert_eq!(
+            rows(LaunchFilter {
+                owner: OwnerFilter::Mine,
+                ..everything()
+            }),
+            ["mine", "old"],
+            "a team's draft someone else made is not just mine"
+        );
+        assert_eq!(
+            rows(LaunchFilter {
+                landed: LandedFilter::Day,
+                ..everything()
+            }),
+            ["mine", "shared"]
+        );
+        assert_eq!(
+            rows(LaunchFilter {
+                query: "shar".into(),
+                ..everything()
+            }),
+            ["shared"]
+        );
+        assert_eq!(
+            rows(LaunchFilter {
+                query: "draft".into(),
+                ..everything()
+            })
+            .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn only_the_viewers_own_and_their_teams_unretired_drafts_are_kept() {
+        let listed: Vec<crux::dto::PlaybookDraft> = serde_json::from_value(serde_json::json!([
+            {"id": "mine", "owner": "user:wren", "latest_version": 2, "compiles": true,
+             "created_by": "wren", "updated_at": "2026-08-22T09:00:00Z"},
+            {"id": "ours", "owner": "team:infra", "description": "the team's",
+             "latest_version": 1, "created_by": "lark", "updated_at": "2026-08-22T10:00:00Z"},
+            {"id": "theirs", "owner": "user:lark", "updated_at": "2026-08-22T11:00:00Z"},
+            {"id": "other-team", "owner": "team:ml", "updated_at": "2026-08-22T11:00:00Z"},
+            {"id": "retired", "owner": "user:wren", "retired_at": "2026-08-23T00:00:00Z",
+             "updated_at": "2026-08-22T12:00:00Z"},
+        ]))
+        .unwrap();
+        let whoami: crux::dto::Whoami = serde_json::from_value(serde_json::json!({
+            "user": "wren", "role": "user", "teams": [{"team": "infra", "role": "member"}],
+        }))
+        .unwrap();
+        let kept = owned(listed, &identity(whoami));
+        assert_eq!(
+            kept.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+            ["ours", "mine"],
+            "newest save first"
+        );
+        assert_eq!(kept[0].description.as_deref(), Some("the team's"));
+        assert_eq!(kept[0].by, "lark");
+        assert!(!kept[0].compiles);
+        assert_eq!(kept[1].description, None);
+        assert_eq!((kept[1].version, kept[1].compiles), (2, true));
+        assert_eq!(kept[1].saved, epoch("2026-08-22T09:00:00Z").unwrap());
+    }
+
+    #[test]
+    fn a_draft_a_listed_launch_ran_is_not_listed_again() {
+        let drafts = [draft("ran", 1), draft("idle", 2)];
+        let launches = [firing("ran", 1, "draft", "done")];
+        assert_eq!(unlaunched(&drafts, &launches), [draft("idle", 2)]);
+        assert_eq!(unlaunched(&drafts, &[]), drafts);
+    }
+
+    #[test]
+    fn a_playbook_reads_as_running_while_an_older_launch_outlives_a_newer_one() {
+        let view = ready(vec![
+            firing("fanout", 1, "manual", "cancelled"),
+            firing("fanout", 2, "manual", "running"),
+            firing("fanout", 3, "manual", "running"),
+            firing("fanout", 4, "manual", "done"),
+        ]);
+        assert_eq!(
+            keys(&view.playbooks(&everything())),
+            ["playbook:fanout:3"],
+            "the newest of the launches still running"
+        );
+        let settled = ready(vec![
+            firing("fanout", 2, "manual", "done"),
+            firing("fanout", 4, "manual", "done"),
+        ]);
+        assert_eq!(
+            keys(&settled.playbooks(&everything())),
+            ["playbook:fanout:4"]
+        );
     }
 
     #[test]
@@ -773,6 +1046,7 @@ mod tests {
             identity: Identity::default(),
             now: 0,
             launches: vec![newest, older],
+            drafts: Vec::new(),
             stale: None,
         };
         assert_eq!(view.launches_of("demo").count(), 2);
@@ -1619,6 +1893,78 @@ mod tests {
             "with no launch read the view is why: {:?}",
             none.view
         );
+    }
+
+    #[test]
+    fn the_worker_lists_the_viewers_unlaunched_drafts_and_reads_the_shown_ones_pack() {
+        let draft = format!("unlaunched-fixture-{}", std::process::id());
+        let files = format!("GET /api/playbook-drafts/{draft}/files?version=2 ");
+        let listed = serde_json::json!([
+            {"id": draft, "owner": "user:wren", "latest_version": 2, "compiles": true,
+             "created_by": "wren", "updated_at": "2026-08-22T09:00:00Z"},
+            {"id": "ran", "owner": "user:wren", "latest_version": 1, "compiles": true,
+             "updated_at": "2026-08-22T10:00:00Z"},
+            {"id": "theirs", "owner": "user:lark", "latest_version": 1,
+             "updated_at": "2026-08-22T11:00:00Z"},
+        ])
+        .to_string();
+        let (url, _) = crate::testserver::serve(move |request| {
+            if request.starts_with("GET /api/whoami") {
+                return r#"{"user":"wren","role":"user"}"#.into();
+            }
+            if request.starts_with("GET /api/playbook-runs") {
+                return r#"[{"key":"playbook:ran:1","playbook":"ran","status":"done",
+                    "origin":"draft","draft_version":1,"created_at":"2026-08-22T10:05:00Z"}]"#
+                    .into();
+            }
+            if request.starts_with("GET /api/playbook-drafts ") {
+                return listed.clone();
+            }
+            if request.starts_with(&files) {
+                return r#"{"version":2,"saved_by":"wren","files":{"workflow.star":"plan()"}}"#
+                    .into();
+            }
+            "[]".into()
+        });
+        let keys = tempfile::tempdir().unwrap();
+        let net = crate::net::Net::uncached_for_tests();
+        let client = Client::spawn_with(
+            net.connector(crate::testserver::target("t", &url, keys.path())),
+            no_dirs(),
+        );
+        let listed = snapshot_when(&client, Duration::from_secs(5), |s| {
+            matches!(*s.view, LiveView::Ready { .. })
+        });
+        assert_eq!(
+            listed
+                .view
+                .drafts()
+                .iter()
+                .map(|d| d.id.as_str())
+                .collect::<Vec<_>>(),
+            [draft.as_str()],
+            "not the one a launch ran, nor someone else's"
+        );
+        assert_eq!(listed.view.launches().len(), 1);
+        assert!(listed.draft.is_none());
+
+        client.draft(Some((draft.clone(), 2)));
+        let read = snapshot_when(&client, Duration::from_secs(5), |s| s.draft.is_some())
+            .draft
+            .unwrap();
+        if let Some(copy) = crate::pack::cache_dir(&format!("{draft}@draft-2")) {
+            let _ = std::fs::remove_dir_all(copy);
+        }
+        assert_eq!((read.draft.as_str(), read.version), (draft.as_str(), 2));
+        let pack = read.pack.as_ref().unwrap();
+        assert_eq!(
+            pack.file("workflow.star").and_then(|f| f.text.as_deref()),
+            Some("plan()")
+        );
+        assert_eq!(pack.origin, format!("draft {draft} v2, saved by wren"));
+
+        client.draft(None);
+        snapshot_when(&client, Duration::from_secs(5), |s| s.draft.is_none());
     }
 
     /// The first snapshot `ready` accepts, within `within`.

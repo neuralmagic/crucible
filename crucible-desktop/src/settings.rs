@@ -174,6 +174,8 @@ pub struct Settings {
     pub theme: Theme,
     pub appearance: Appearance,
     pub text_size: TextSize,
+    /// The sidebar's owner, origin and landed switches.
+    pub filters: crate::filter::Filters,
     /// Display points per layout point: below 1 fits more on screen.
     pub zoom: f32,
     /// Draw charts through the CRT pass.
@@ -227,6 +229,8 @@ struct Config {
     layout: Option<Workspace>,
     #[serde(skip_serializing_if = "Rails::is_fitted")]
     rails: Rails,
+    #[serde(skip_serializing_if = "crate::filter::Filters::is_default")]
+    filters: crate::filter::Filters,
     theme: Theme,
     appearance: Appearance,
     text_size: TextSize,
@@ -300,6 +304,7 @@ impl Settings {
             tx02,
             layout: config.layout.and_then(Workspace::repaired),
             rails: config.rails,
+            filters: config.filters,
             theme: config.theme,
             appearance: config.appearance,
             text_size: config.text_size,
@@ -507,6 +512,11 @@ impl Settings {
         self.save();
     }
 
+    pub fn set_filters(&mut self, filters: crate::filter::Filters) {
+        self.filters = filters;
+        self.save();
+    }
+
     pub fn set_updates(&mut self, on: bool) {
         self.updates = on;
         self.save();
@@ -567,6 +577,7 @@ impl Settings {
             tx02_path: None,
             layout: self.layout.clone(),
             rails: self.rails,
+            filters: self.filters,
             theme: self.theme,
             appearance: self.appearance,
             text_size: self.text_size,
@@ -941,6 +952,38 @@ proxxy = "socks5://127.0.0.1:1080"
         let again = Settings::load_from(path);
         assert_eq!(again.theme, Theme::Ember);
         assert!(again.profiles()["mine"].is_ok());
+    }
+
+    #[test]
+    fn the_sidebar_switches_are_kept_once_they_leave_their_defaults() {
+        use crate::filter::{Filters, LandedFilter, OriginFilter, OwnerFilter};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crucible-playbooks").join("config.toml");
+        let mut settings = Settings::load_from(path.clone());
+        assert_eq!(settings.filters, Filters::default());
+        settings.set_theme(Theme::Moss);
+        assert!(!fs::read_to_string(&path).unwrap().contains("filters"));
+
+        let picked = Filters {
+            owner: OwnerFilter::All,
+            origin: OriginFilter::Drafts,
+            landed: LandedFilter::Week,
+        };
+        settings.set_filters(picked);
+        assert_eq!(Settings::load_from(path.clone()).filters, picked);
+
+        fs::write(&path, "[filters]\norigin = \"schedules\"\n").unwrap();
+        assert_eq!(
+            Settings::load_from(path.clone()).filters,
+            Filters {
+                origin: OriginFilter::Schedules,
+                ..Filters::default()
+            },
+            "a switch the file leaves out keeps its default"
+        );
+
+        settings.set_filters(Filters::default());
+        assert!(!fs::read_to_string(&path).unwrap().contains("filters"));
     }
 
     #[test]

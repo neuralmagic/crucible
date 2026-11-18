@@ -968,6 +968,29 @@ impl Diagnostic {
     }
 }
 
+/// One draft, as `GET /api/playbook-drafts` lists it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PlaybookDraft {
+    pub id: String,
+    #[serde(default)]
+    pub description: String,
+    /// `user:<login>` or `team:<slug>`.
+    #[serde(default)]
+    pub owner: String,
+    /// The newest save; 0 when nothing is saved yet.
+    #[serde(default)]
+    pub latest_version: i64,
+    #[serde(default)]
+    pub compiles: bool,
+    /// Set once the graduated pack was imported: the draft is read-only from then on.
+    #[serde(default)]
+    pub retired_at: Option<String>,
+    #[serde(default)]
+    pub created_by: Option<String>,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
 /// `GET /api/playbook-drafts/{id}/files`: the whole pack at one save, and the base a writer edits
 /// from.
 #[derive(Debug, Clone, Deserialize)]

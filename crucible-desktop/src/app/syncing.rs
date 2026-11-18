@@ -18,6 +18,7 @@ impl App {
         self.remote.live = snapshot.view;
         self.remote.live_detail = snapshot.detail;
         self.remote.live_base = snapshot.base;
+        self.remote.draft_pack = snapshot.draft;
         self.remote.registered = snapshot.registered;
         self.answer_rerun(snapshot.reran);
         self.answer_launcher(snapshot.prepared, snapshot.launched);
@@ -39,13 +40,15 @@ impl App {
             (Backend::Local, Some(Selection::Local(name))) => {
                 self.visible_packs().any(|pack| &pack.name == name)
             }
-            (Backend::Controller, Some(Selection::Live { playbook, .. })) => match &*self
-                .remote
-                .live
-            {
-                LiveView::Ready { .. } => self.remote.live.launches_of(playbook).next().is_some(),
-                LiveView::Loading | LiveView::Unavailable(_) => true,
-            },
+            (Backend::Controller, Some(Selection::Live { playbook, .. })) => {
+                match &*self.remote.live {
+                    LiveView::Ready { .. } => {
+                        self.remote.live.launches_of(playbook).next().is_some()
+                            || self.remote.live.draft(playbook).is_some()
+                    }
+                    LiveView::Loading | LiveView::Unavailable(_) => true,
+                }
+            }
             _ => false,
         };
         if !valid {
@@ -63,9 +66,9 @@ impl App {
     fn initial_selection(&self) -> Option<Selection> {
         match self.backend {
             Backend::Controller => self
-                .visible_playbooks()
+                .visible_rows()
                 .first()
-                .map(|playbook| Selection::playbook(&playbook.id)),
+                .map(|row| Selection::playbook(row.id())),
             Backend::Local => self
                 .visible_packs()
                 .find(|pack| pack.verdict == Verdict::Running)
@@ -97,6 +100,14 @@ impl App {
         if base != self.remote.compare_sent {
             self.remote.live_client.compare(base.as_deref());
             self.remote.compare_sent = base;
+        }
+        let draft = self
+            .selected_draft()
+            .filter(|draft| draft.version > 0)
+            .map(|draft| (draft.id.clone(), draft.version));
+        if draft != self.remote.draft_sent {
+            self.remote.live_client.draft(draft.clone());
+            self.remote.draft_sent = draft;
         }
         let file = self.wanted_file();
         if file != self.remote.file_sent {

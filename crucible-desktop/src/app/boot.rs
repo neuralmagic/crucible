@@ -1,6 +1,5 @@
 //! Starting the app: its first state, its workers, and the poll that folds their answers in.
 
-use crate::filter::{LandedFilter, OriginFilter, OwnerFilter};
 use crate::link::Link;
 use crate::logline::LogView;
 use crate::model::Client;
@@ -71,9 +70,6 @@ pub(crate) fn init() -> App {
         backend: Backend::Controller,
         packs: Vec::new(),
         playbook_search: TextEdit::new(""),
-        owner_filter: OwnerFilter::All,
-        origin_filter: OriginFilter::All,
-        landed_filter: LandedFilter::Any,
         filters_open: false,
         selection: None,
         log_search: TextEdit::new(""),

@@ -85,7 +85,6 @@ use rune::{AppSpec, TextEdit, Waker};
 #[cfg(not(feature = "hot"))]
 use crate::app::boot::open_link;
 use crate::app::boot::{init, poll, scene_tab, setup};
-use crate::filter::{LandedFilter, OriginFilter, OwnerFilter};
 use crate::link::Link;
 use crate::live::{LivePlaybook, Target};
 use crate::logline::LogView;
@@ -452,9 +451,6 @@ pub struct App {
     pub backend: Backend,
     pub packs: Vec<PackView>,
     pub playbook_search: TextEdit,
-    pub owner_filter: OwnerFilter,
-    pub origin_filter: OriginFilter,
-    pub landed_filter: LandedFilter,
     /// Whether the sidebar shows the owner, origin and landed filters.
     pub filters_open: bool,
     pub selection: Option<Selection>,
