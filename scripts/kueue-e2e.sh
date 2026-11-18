@@ -75,7 +75,8 @@
 # every node that is not amd64, as the contents of a TOML list ('"cpu-07", "gpu-01"'). It does
 # not reach the sandbox and supervisor pods the gateway creates; on OpenShift,
 # SANDBOX_NODE_SELECTOR sets SANDBOX_NS's project node selector for those.
-# KEEP=1 leaves everything behind.
+# KEEP=1 leaves everything behind. ARTIFACTS names a directory that gets the run's graph.json and
+# run-log.json when the script ends, pass or fail.
 set -euo pipefail
 TASKS=${TASKS:-0}
 
@@ -141,6 +142,10 @@ FORWARD_PID=
 cleanup() {
     [ -n "$FORWARD_PID" ] && kill "$FORWARD_PID" 2>/dev/null || true
     kc -n "$CTL_NS" logs deploy/crucible-controller > "$WORK/controller.log" 2>/dev/null || true
+    if [ -n "${ARTIFACTS:-}" ]; then
+        mkdir -p "$ARTIFACTS"
+        cp "$WORK/graph.json" "$WORK/run-log.json" "$ARTIFACTS/" 2>/dev/null || true
+    fi
     if [ "${KEEP:-0}" = 1 ]; then
         log "kept $WORK, the namespaces, and Job $WORKLOAD_NS/$JOB"
         return
