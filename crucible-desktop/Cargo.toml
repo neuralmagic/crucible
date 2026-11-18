@@ -60,6 +60,15 @@ gloo-timers = { version = "0.3", features = ["futures"] }
 web-sys = { version = "0.3", features = ["Window", "Location"] }
 jiff = { version = "0.2", features = ["js"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSResponder", "NSView", "objc2-quartz-core"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSGeometry", "NSObject", "NSThread"] }
+objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "WKWebView", "WKWebViewConfiguration", "WKWebsiteDataStore", "WKNavigation", "objc2-app-kit", "objc2-core-foundation"] }
+raw-window-handle = "0.6"
+thiserror = "2"
+objc2-quartz-core = { version = "0.3", default-features = false, features = ["std", "CALayer"] }
+
 [dev-dependencies]
 tempfile = "3"
 wasmi = { version = "2", default-features = false, features = ["wat"] }

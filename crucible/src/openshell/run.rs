@@ -4,7 +4,7 @@
 //! Per turn: ensure the gateway is up → mint a Vertex token and create/update the provider →
 //! create the sandbox (attaching that provider) → apply the egress policy → upload the
 //! workspace → targeted-upload each relayed cred to its sandbox path → upload the env script
-//! and the prompt → optionally restore a private Claude session → exec claude (prompt over stdin), streaming its `stream-json` into the shared
+//! and the prompt → optionally restore a private agent session → exec claude (prompt over stdin), streaming its `stream-json` into the shared
 //! [`crate::agent::turn::StreamPump`] → sweep the sandbox log for egress denials
 //! (blocked-connection attempts are turn telemetry) → download the workspace and private session back → delete
 //! the sandbox (per-turn-fresh, so a discarded iteration leaves no residue).
@@ -73,10 +73,22 @@ pub enum OpenshellCliError {
          whatever the turn had already done is neither complete nor reportable"
     )]
     ExecStreamBroke { code: tonic::Code, message: String },
-    #[error("private session locator is outside Claude's pinned config directory")]
-    LocatorOutsideConfigDir,
-    #[error("Claude transcript path does not match the admitted session id")]
-    TranscriptSessionMismatch,
+    #[error(
+        "private session locator {locator:?} is not a {harness} transcript of session {session}"
+    )]
+    LocatorOutsideConfigDir {
+        harness: &'static str,
+        locator: String,
+        session: String,
+    },
+    #[error(
+        "{harness} transcript {transcript:?} does not belong to the admitted session {session}"
+    )]
+    TranscriptSessionMismatch {
+        harness: &'static str,
+        transcript: String,
+        session: String,
+    },
     #[error(
         "workspace retrieval failed after bounded retry; sandbox '{sandbox}' was preserved for operator recovery: {detail}"
     )]
@@ -871,13 +883,13 @@ async fn try_turn(
             .await?;
         }
 
-        // The sandbox itself is intentionally per-turn-fresh. A continuing Claude solver gets
+        // The sandbox itself is intentionally per-turn-fresh. A continuing solver gets
         // only its private native transcript restored outside the uploaded workspace; world state
         // still comes exclusively from Crucible's retain/restore decision.
         if let Some(session) = session
             && session.is_resume()
         {
-            restore_private_session(p, session, &gw, &name, &cancel).await?;
+            restore_private_session(p, harness, session, &gw, &name, &cancel).await?;
         }
 
         // 8. Exec the agent (prompt over stdin), streaming its stdout through the harness decoder.
@@ -972,7 +984,7 @@ async fn try_turn(
         // Save the updated native transcript before telemetry parsing and teardown. It is private
         // 0600 runtime state, never appended to session.jsonl or published with the run record.
         if let Some(session) = session {
-            persist_private_session(p, session, &gw, &name, &cancel).await?;
+            persist_private_session(p, harness, session, &gw, &name, &cancel).await?;
         }
 
         // The post-turn transcript fetch: pure telemetry garnish for claude (export-gated), but
@@ -1706,22 +1718,33 @@ fn private_session_paths(
     (root.join("locator"), root.join("transcript.jsonl"))
 }
 
-fn valid_private_remote(remote: &str, session: &crate::agent::agent_session::SessionTurn) -> bool {
-    Harness::Claude
+fn valid_private_remote(
+    harness: Harness,
+    remote: &str,
+    session: &crate::agent::agent_session::SessionTurn,
+) -> bool {
+    let path = std::path::Path::new(remote);
+    harness
         .spec()
         .transcript
         .jsonl_tree()
         .is_some_and(|(root, _)| remote.starts_with(&format!("{root}/")))
-        && remote.ends_with(&format!("/{}.jsonl", session.provider_id))
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                crate::agent::harness::backend(harness).is_session_transcript(name, session)
+            })
         && !remote.contains("..")
-        && std::path::Path::new(remote).is_absolute()
+        && path.is_absolute()
 }
 
-/// Restore one Claude Code transcript into a new sandbox at the exact private path where the
+/// Restore one harness transcript into a new sandbox at the exact private path where the
 /// previous sandbox wrote it. The locator is validated against the pinned config root and opaque
 /// session UUID before it is used as an upload target.
 async fn restore_private_session(
     p: &Paths,
+    harness: Harness,
     session: &crate::agent::agent_session::SessionTurn,
     gw: &Gateway,
     name: &str,
@@ -1732,8 +1755,13 @@ async fn restore_private_session(
         .await
         .with_context(|| format!("reading private session locator {}", locator_path.display()))?;
     let remote = remote.trim();
-    if !valid_private_remote(remote, session) {
-        return Err(OpenshellCliError::LocatorOutsideConfigDir.into());
+    if !valid_private_remote(harness, remote, session) {
+        return Err(OpenshellCliError::LocatorOutsideConfigDir {
+            harness: harness.spec().name,
+            locator: remote.to_string(),
+            session: session.provider_id.clone(),
+        }
+        .into());
     }
     let parent = std::path::Path::new(remote)
         .parent()
@@ -1747,7 +1775,7 @@ async fn restore_private_session(
         |_| {},
     )
     .await
-    .context("creating Claude's private session directory")?;
+    .context("creating the private session directory")?;
     run_os(
         &sandbox::file_upload_args(name, &transcript_path.to_string_lossy(), remote),
         "private session restore",
@@ -1756,25 +1784,53 @@ async fn restore_private_session(
     .await
 }
 
-/// Persist the updated Claude transcript outside the disposable sandbox. This is deliberately a
+/// What a saved transcript holds where the sandbox printed a reserved credential marker.
+const CREDENTIAL_MARKER_REDACTED: &str = "[credential placeholder]";
+
+/// `transcript` with the gateway's reserved credential markers taken out. The egress proxy
+/// refuses a request body that carries one it cannot resolve, and the next turn's sandbox is
+/// issued different ones.
+fn without_credential_markers(transcript: Vec<u8>) -> Vec<u8> {
+    match String::from_utf8(transcript) {
+        Ok(text) => text
+            .replace(
+                openshell_core::secrets::PLACEHOLDER_PREFIX_PUBLIC,
+                CREDENTIAL_MARKER_REDACTED,
+            )
+            .replace(
+                openshell_core::secrets::PROVIDER_ALIAS_MARKER_PUBLIC,
+                CREDENTIAL_MARKER_REDACTED,
+            )
+            .into_bytes(),
+        Err(not_text) => not_text.into_bytes(),
+    }
+}
+
+/// Persist the updated harness transcript outside the disposable sandbox. This is deliberately a
 /// private engine file, mode 0600, and is never part of the public session-event/publish contract.
 async fn persist_private_session(
     p: &Paths,
+    harness: Harness,
     session: &crate::agent::agent_session::SessionTurn,
     gw: &Gateway,
     name: &str,
     cancel: &CancellationToken,
 ) -> Result<()> {
-    let (root, glob) = Harness::Claude
+    let (root, glob) = harness
         .spec()
         .transcript
         .jsonl_tree()
-        .context("claude keeps its transcripts in a jsonl tree")?;
+        .context("the harness keeps no jsonl transcript tree to resume from")?;
     let remote = newest_transcript_path(gw, name, root, glob, cancel)
         .await
-        .context("Claude turn produced no resumable private transcript")?;
-    if !valid_private_remote(&remote, session) {
-        return Err(OpenshellCliError::TranscriptSessionMismatch.into());
+        .context("the turn produced no resumable private transcript")?;
+    if !valid_private_remote(harness, &remote, session) {
+        return Err(OpenshellCliError::TranscriptSessionMismatch {
+            harness: harness.spec().name,
+            transcript: remote,
+            session: session.provider_id.clone(),
+        }
+        .into());
     }
 
     let scratch = tempfile::tempdir().context("creating private session download scratch")?;
@@ -1787,9 +1843,11 @@ async fn persist_private_session(
     let downloaded = newest_jsonl(scratch.path())
         .await
         .context("private session download contained no transcript")?;
-    let bytes = fs::read(&downloaded)
-        .await
-        .context("reading downloaded private session transcript")?;
+    let bytes = without_credential_markers(
+        fs::read(&downloaded)
+            .await
+            .context("reading downloaded private session transcript")?,
+    );
 
     let (locator_path, transcript_path) = private_session_paths(p, session);
     let root = locator_path
@@ -2071,6 +2129,7 @@ mod tests {
                 protocol: crucible_contract::inference::InferenceProtocol::Responses,
                 model: "m".into(),
                 price: None,
+                limits: None,
             }),
             ..Default::default()
         };
@@ -2640,25 +2699,111 @@ mod tests {
             completed_turns: 1,
         };
         assert!(valid_private_remote(
+            Harness::Claude,
             "/sandbox/.claude/projects/-sandbox-work/018f47a0-0000-7000-8000-000000000000.jsonl",
             &session
         ));
         assert!(!valid_private_remote(
+            Harness::Claude,
             "/sandbox/.claude/projects/-sandbox-work/other.jsonl",
             &session
         ));
         assert!(!valid_private_remote(
+            Harness::Claude,
             "/sandbox/.claude/projects/../../etc/018f47a0-0000-7000-8000-000000000000.jsonl",
             &session
         ));
         assert!(!valid_private_remote(
+            Harness::Claude,
             "/tmp/018f47a0-0000-7000-8000-000000000000.jsonl",
             &session
         ));
         assert!(!valid_private_remote(
+            Harness::Claude,
             "/sandbox/.claude/projects-evil/018f47a0-0000-7000-8000-000000000000.jsonl",
             &session
         ));
+    }
+
+    #[test]
+    fn a_saved_session_carries_no_reserved_credential_marker() {
+        use openshell_core::secrets::{
+            PROVIDER_ALIAS_MARKER_PUBLIC, contains_reserved_credential_marker_bytes,
+            placeholder_for_env_key_for_revision,
+        };
+        let placeholder = placeholder_for_env_key_for_revision("ANTHROPIC_API_KEY", 7);
+        let line = |text: &str| {
+            format!(
+                "{}\n",
+                serde_json::json!({ "role": "toolResult", "content": text })
+            )
+        };
+        let printed = [
+            line("PI_MODEL=m"),
+            line(&format!("ANTHROPIC_API_KEY={placeholder}\nPI_OFFLINE=1")),
+            line(&format!(
+                "alias {PROVIDER_ALIAS_MARKER_PUBLIC}abc and {placeholder}"
+            )),
+        ]
+        .concat();
+        assert!(contains_reserved_credential_marker_bytes(
+            printed.as_bytes()
+        ));
+
+        let saved = without_credential_markers(printed.clone().into_bytes());
+        assert!(!contains_reserved_credential_marker_bytes(&saved));
+        let saved = String::from_utf8(saved).unwrap();
+        let lines: Vec<serde_json::Value> = saved
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0]["content"], "PI_MODEL=m");
+        let env = lines[1]["content"].as_str().unwrap();
+        assert!(
+            env.starts_with("ANTHROPIC_API_KEY=[credential placeholder]"),
+            "{env}"
+        );
+        assert!(env.ends_with("\nPI_OFFLINE=1"), "{env}");
+
+        let clean = line("nothing reserved here").into_bytes();
+        assert_eq!(without_credential_markers(clean.clone()), clean);
+        let binary = vec![0xff, 0xfe, 0x00, 0x41];
+        assert_eq!(without_credential_markers(binary.clone()), binary);
+    }
+
+    #[test]
+    fn private_session_locator_is_pinned_to_the_turns_harness() {
+        let session = crate::agent::agent_session::SessionTurn {
+            logical_name: "solver".into(),
+            provider_id: "018f47a0-0000-7000-8000-000000000000".into(),
+            completed_turns: 1,
+        };
+        let pi = "/sandbox/.pi/agent/sessions/--sandbox-work--/\
+                  2026-11-18T03-30-47-424Z_018f47a0-0000-7000-8000-000000000000.jsonl";
+        let claude =
+            "/sandbox/.claude/projects/-sandbox-work/018f47a0-0000-7000-8000-000000000000.jsonl";
+        assert!(valid_private_remote(Harness::Pi, pi, &session));
+        assert!(!valid_private_remote(Harness::Pi, claude, &session));
+        assert!(!valid_private_remote(Harness::Claude, pi, &session));
+        assert!(!valid_private_remote(
+            Harness::Pi,
+            "/sandbox/.pi/agent/sessions/--sandbox-work--/2026-11-18T03-30-47-424Z_other.jsonl",
+            &session
+        ));
+        assert!(!valid_private_remote(
+            Harness::Pi,
+            "/sandbox/.pi/agent/sessions/../../../etc/\
+             2026-11-18T03-30-47-424Z_018f47a0-0000-7000-8000-000000000000.jsonl",
+            &session
+        ));
+        for harness in [Harness::Codex, Harness::OpenCode] {
+            assert!(!valid_private_remote(harness, pi, &session), "{harness:?}");
+            assert!(
+                !valid_private_remote(harness, claude, &session),
+                "{harness:?}"
+            );
+        }
     }
 
     /// A non-recording turn CLEARS the per-turn traceparent channel, a stale file would parent

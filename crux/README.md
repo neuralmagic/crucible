@@ -209,16 +209,22 @@ never sends, so it stays a placeholder.
 ### `providers`
 
 ```
-$ crux providers                                 # id, kind, model, harness, price, enabled, owner
+$ crux providers                                 # id, kind, model, harness, price, limits, enabled, owner
 ```
 
 `PRICE` is USD per million tokens as `input/output/cache read/cache write`. A dash means the
 engine prices the run from the vendor's list, which charges nothing for a model no vendor sells.
 
-### `secrets` / `secret-bind`
+`LIMITS` is the default model's `context window/max output` in tokens. A dash means the
+registration names none for that model and the harness uses its own. Set them per model in the
+JSON body `provider-create` and `provider-update` take:
+`"model_limits": {"<model>": {"context_window": 200000, "max_output_tokens": 64000}}`.
+
+### `secrets` / `secret-rotate` / `secret-bind`
 
 ```
 $ crux secrets                                   # id, name, kind, visibility, mode, owner — never a value
+$ crux secret-rotate 01a0 < new-value.txt        # the next version, read from stdin; prints the version
 $ crux secret-bind 01a0 --playbook calibrate --env GH_TOKEN --declared-name pr-token
 ```
 

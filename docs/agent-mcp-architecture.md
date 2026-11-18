@@ -224,6 +224,7 @@ with the same key and the same `iss`.
 | `kube_cluster` | the run's cluster | yes | The cluster the token acts on. A server started with `--cluster` refuses a token naming another, so a token for one cluster's URL does not work at the same URL on another |
 | `namespace` | when the audience names namespaces | absent | The audience's first namespace, the default for its server |
 | `namespaces` | when the audience names namespaces | absent | Every namespace of the audience. A server that reads it confines the caller to these namespaces, within those it serves |
+| `pull_secrets` | when the run brought pull secrets and the audience's server takes them | absent | Each `name=registry`: the run's own image pull Secrets in that server's namespace, which it copies from ([7.6](#76-pull-secrets)) |
 
 The agent token is built in `crucible-controller/src/agent_auth/issuer.rs:820`. The people token is
 built in `crucible-controller/src/agent_auth/people.rs:299`.
@@ -1112,6 +1113,8 @@ OTLP collector port. Turn sandboxes are never bound, so they get no agent tokens
 | loop | run Secret | from `secret_name(<run pod>)` | controller | owner reference to the loop pod |
 | loop | loop Service | `<run pod>` (hashed if long) | controller `start` | `teardown` |
 | buildit | builder pods | per build | `buildit` | `buildit clean`; the pod deadline stops them |
+| crucible-kueue | run pull Secrets | `<run pod>-pull-<n>` | controller at dispatch | collection, and the pull secret sweep |
+| workload | pull Secret copies | `<workload>-pull-<n>` | `crucible-kueue` at submit | owner reference to the workload |
 | sandbox | gateway Service | `<run pod>-gw` (hashed if long) | controller `reserve` | `teardown` |
 | sandbox | gateway NetworkPolicy | `<run pod>-gw` | controller `start` | `teardown` |
 | sandbox | gateway pod | `<run pod>-gw` | controller `start` | `teardown` |
@@ -1182,6 +1185,9 @@ traffic. These are the broker, the OTLP collector, `buildit` on 8848 with `[buil
 | controller identity (`[cluster] sandbox_readers`) | sandbox | `sandboxes`: get, list, patch, delete; `pods`: get, list, create, delete; `pods/finalizers`: update; `services`, `secrets`, `networkpolicies`: list, create, delete | loop render `sandbox_reader_rbac` (`kube.rs:1658`) |
 | controller identity | loop | `services`: list, create, delete | same |
 | controller identity | loop | `crucible-dispatch`: `pods`: create, get, list, watch, delete; `pods/log`: get; `pods/finalizers`: update; `configmaps`: create, delete; `secrets`: create, delete, list, patch | loop render `dispatch_rbac`, for any `sandbox_readers` |
+| controller identity | crucible-kueue | `secrets`: create, delete. Role `crucible-kueue-run-pull-secret-writer` | kueue render, with `[kueue] run_pull_secrets` |
+| `crucible-kueue` | crucible-kueue | `secrets`: get. Role `crucible-kueue-run-pull-secret-reader` | same |
+| `crucible-kueue` | workload | `secrets`: create, added to ClusterRole `crucible-kueue-workloads` | same |
 | controller identity | SPIRE | `services/proxy`: get | the operator |
 | controller identity | cluster | `tokenreviews`: create (`system:auth-delegator`), for links | the operator |
 | loop service account | sandbox | none under an isolated profile | loop render |
@@ -1452,6 +1458,72 @@ declared registry (a host, or a host/path prefix), the server adds that secret t
 Warning: The server does not create the pull secret. It must exist in the workload namespace with
 that name, or the pods cannot pull. `crucible deploy render --kueue` does not copy it.
 
+A run can bring its own. A pack names them in `crucible.toml`, each a declared
+`registry_authfile` secret and the registry it pulls:
+
+```toml
+[[secret]]
+name = "registry"
+kind = "registry_authfile"
+path = "/etc/registry/auth.json"
+
+[kueue]
+pull_secrets = [{ secret = "registry", registry = "quay.io/team" }]
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as controller
+    participant V as Vault
+    participant N as crucible-kueue namespace
+    participant S as sandbox
+    participant K as crucible-kueue
+    participant W as workload namespace
+    C->>V: read the bound authfile at dispatch
+    C->>C: record (pod, cluster, namespace, name, registry) in run_pull_secrets
+    C->>N: create Secret RUN_POD-pull-N, type dockerconfigjson
+    S->>C: token request
+    C-->>S: token with pull_secrets NAME=REGISTRY
+    S->>K: workload_submit
+    K->>W: create the workload, its pods naming WORKLOAD-pull-N
+    K->>N: read Secret RUN_POD-pull-N
+    K->>W: create Secret WORKLOAD-pull-N, owned by the workload
+    Note over C,N: on collection, and on a sweep every 5 minutes, the controller deletes its Secret
+    Note over W: the copy is deleted with its workload
+```
+
+There are two Secrets, with two lifetimes.
+
+The controller's lasts as long as the run. It is written only on a cluster whose `[kueue]` sets
+`run_pull_secrets` (`crucible-controller/src/runs/workpod/registries.rs`); elsewhere the launch is
+refused before anything is created. It sits in the server's own namespace, where no workload
+runs. The loop pod is in another namespace and cannot own it, so `run_pull_secrets` records it
+before it is created, collection deletes it after the loop pod, and a sweep on the leader deletes
+those of any pod no longer `running`. A row is dropped only once its Secret is gone. It holds the
+value read at dispatch: a rotation reaches the next run.
+
+The copy lasts as long as the workload that pulls with it. `crucible-kueue` reads the claim from
+run tokens only (`Identity::from_principal`, `crucible-kueue/src/auth.rs`), and only when started
+with `--run-pull-secrets-namespace`. For a workload whose image is on a claimed registry it adds
+`<workload>-pull-<n>` to the pod template (`own_pull_copies`, `crucible-kueue/src/manifest.rs`),
+which is part of the plan and its hash. After it creates the workload it reads the run's Secret,
+checks that it is a `kubernetes.io/dockerconfigjson` Secret, and creates the copy with an owner
+reference to the workload (`copy_pull_secrets`, `crucible-kueue/src/server.rs`), so a Deployment
+that outlives its run keeps pulling and the copy is collected with it. A resubmitted plan makes
+any copy that is missing. A workload deleted and submitted again under the same name can find its
+predecessor's copy not yet collected: the submit waits up to 15 seconds for that, then refuses
+with the Secret's name. A plan or submit after the run's Secret is gone is refused.
+
+The server holds `secrets` get in its own namespace and `secrets` create in the workload
+namespaces, and nothing else on Secrets: it cannot read, change or delete one a tenant made. Its
+`get` is not limited to runs' Secrets, which is why profile load refuses `run_pull_secrets` where
+its namespace is also the loop pods', the rigs' or the controller's. A copy holds a credential for
+as long as its workload lives: unbinding or rotating the secret does not reach a copy already
+made. A pod template cannot name the run's Secret itself, only the copy, and a person's token that
+carries the claim gets nothing from it. The run cannot read a copy through `crucible-kueue`: a
+manifest that mounts it needs `secrets get` by name, which no run's RBAC grants for it.
+
 ### 7.7 Access checks and namespaces
 
 The reviewer (`crucible-mcp-auth/src/kube.rs`) builds a SubjectAccessReview with:
@@ -1713,7 +1785,21 @@ sequenceDiagram
     B-->>A: image REPO@sha256 digest, tag
 ```
 
-The authfile is the loop pod's `[secrets] push_authfile` Secret, mounted in the loop pod only
+A pack names its own repository and credential in `crucible.toml`:
+
+```toml
+[buildit]
+push_repo   = "quay.io/team/smoke"
+push_secret = "registry"      # a [[secret]] of kind registry_authfile
+```
+
+The controller then hands that run a `BuilditSite` with the pack's `push_repo` and
+`push_authfile`, the path the secret's binding projects it to in the loop pod
+(`ServerSpec::for_run`, `crucible/src/deploy/servers.rs`), and the engine starts `buildit` with
+those over the profile's (`crucible/src/openshell/buildit.rs`). The run's tools panel shows the
+repository it got.
+
+Otherwise the authfile is the loop pod's `[secrets] push_authfile` Secret, mounted in the loop pod only
 (`FORGE_AUTHFILE`). `buildit` reads it on each push and streams it to the builder pod over exec
 stdin (`buildit/src/mcp.rs:479`, `mcp.rs:1089`). The builder pod never mounts it, and the sandbox
 never sees it. Without a push repository or without the authfile, `push` is refused.
@@ -1722,7 +1808,8 @@ Warning: the push runs in the same builder pod as the agent's build steps and `r
 the same user, and nothing stops a process a step left behind when `push` starts. Such a process
 could read the authfile while the push holds it, then push to any tag, or any repository the
 credential reaches. Until the push moves to a container of its own, give `[secrets]
-push_authfile` a credential scoped to the one push repository.
+push_authfile`, and any secret a pack names as `push_secret`, a credential scoped to the one push
+repository.
 
 ### 8.6 The run's own socket
 
@@ -1756,6 +1843,11 @@ times and directory modes do not count). buildit keeps it on the builder pod, so
 completed build task and `push` report it after a server restart too. `buildit context-digest
 <dir>` stages a directory the way a build does and computes the same digest with the same code,
 so a script can check that what was built is what it prepared.
+
+A `build` whose context digest and parameters equal those of a build the same sandbox still has
+running returns that build, with `already_running: true`, and starts nothing. A build that has
+ended is never reused. `status` takes `wait_seconds` (up to 50) and then answers when the build
+ends or the wait passes, so a caller with no timer of its own can wait without polling.
 
 ### 8.7 The shared cache
 
@@ -1928,6 +2020,7 @@ tokens, the controller does not read them.
 | `[kueue] kube_authz` | `openshift` on an OpenShift cluster, `token` elsewhere | `openshift` (the cluster's Group objects) or `token` (the token's `kube_groups`): where groups come from. |
 | `[kueue] cluster_domain` | `cluster.local` | The cluster DNS domain of the Service name. |
 | `[kueue] pull_secrets` | `[]` | `name` or `name=registry` entries for `--pull-secret`. |
+| `[kueue] run_pull_secrets` | `false` | `true` takes the pull secrets a pack brings: the controller writes each run's into `[kueue] namespace`, and the server copies one beside each workload that pulls with it ([7.6](#76-pull-secrets)). Profile load refuses it where that namespace is also the loop, rig or a `sandbox_readers` account's. |
 | `[kueue] people` | `false` | `true` serves people's MCP clients too: each cluster's server is a people resource, and the render adds `--person-issuer` with the controller's agent issuer. |
 | `[kueue] people_urls` | each cluster's Service URL | `{ <cluster> = "<url>" }`: where people reach the server on a cluster (a route, a port-forward). A person's token names its cluster by this URL, so `people` on several clusters needs one per cluster; profile load refuses two clusters at one URL. The render serves it as another `--resource` and `--allowed-host`. |
 | `[buildit] clusters` or `cluster` | `["hub"]` | The clusters whose runs get `buildit`. |
@@ -1989,6 +2082,7 @@ Each flag also has a `CRUCIBLE_KUEUE_*` environment variable (`crucible-kueue/sr
 | `--kube-authz` | unset | `openshift` or `token`. Unset: every access check is refused, and people tokens are refused. |
 | `--namespace` | discover | The served namespaces. |
 | `--pull-secret` | none | Declared pull secrets. |
+| `--run-pull-secrets-namespace` | unset | Where run tokens' `pull_secrets` claims name Secrets. Unset: the claim is ignored. The render sets it to the server's own namespace under `[kueue] run_pull_secrets`. |
 | `--default-active-deadline` | `86400` | Seconds, or `none`. |
 | `--default-ttl-after-finished` | `3600` | Seconds, or `none`. |
 | `--suspend` | `true` | Create batch kinds suspended. |
@@ -2147,6 +2241,7 @@ deletes the approvals of a `dyn-` client ID that has no row.
 | `0066_run_agent_tools` | Table `run_agent_tools`, PK (`run_id`, `server`) | `agent_tools::grant` at dispatch (`crucible-controller/src/runs/agent_tools.rs:263`); `agent_tools::attribute` sets `kube_user` after the run row is committed (`agent_tools.rs:283`) | the run DTO and the issue DTO, for the run tools panel |
 | `0067_people_grant_clients` | Columns `people_grants.client_id` and `people_grants.client_name`, `NOT NULL`. Rows from before get `claude-code` and `Claude Code`. Index on (`sub`, `client_id`) | `PgGrantStore::issue_refresh` | `rotate_refresh` (the client check), `live` (Settings), `revoke_client` |
 | `0068_people_dynamic_clients` | Table `people_dynamic_clients`: `client_id` (PK), `client_name`, `redirect_uris`, `created_at`, `last_used_at`; index on `last_used_at` | `Dcr::register`; `Dcr::used` stamps `last_used_at` after a successful code or refresh exchange (`crucible-controller/src/agent_auth/people/dynamic.rs`) | `Dcr::client` at authorize and token, without stamping; `Dcr::sweep` deletes idle rows |
+| `0090_run_pull_secrets` | Table `run_pull_secrets`, PK (`pod_name`, `namespace`, `name`), with `cluster`, `registry`, `created_at`. No foreign key: a row outlives its pod until its Secret is deleted | `registries::write` at dispatch | `registries::claim` at the token endpoint; `registries::remove` at collection and in the sweep |
 
 Secrets in `people_codes` and `people_refresh_tokens` are stored only as SHA-256. A spent refresh
 token stays in its row with `used_at` until its approval goes, so a reuse is recognized.

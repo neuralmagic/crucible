@@ -601,6 +601,7 @@ mod tests {
                 protocol,
                 model: "bound-model".into(),
                 price: None,
+                limits: None,
             }),
             ..Default::default()
         }

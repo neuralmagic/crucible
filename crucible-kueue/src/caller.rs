@@ -2,6 +2,7 @@
 //! [`crate::auth`]) and who it acts as in one namespace ([`Caller`]). What it may do there is
 //! Kubernetes RBAC's to decide, for the user the token names.
 
+use crate::config::PullSecret;
 use crate::namespaces::Namespaces;
 use std::fmt;
 
@@ -166,6 +167,8 @@ pub struct Identity {
     pub kube_user: String,
     /// The party presenting a run's token (the sandbox's SPIFFE ID), stamped on what it creates.
     pub actor: Option<String>,
+    /// The pull secrets a run's token brings (its `pull_secrets` claim), by their source Secret.
+    pub pull_secrets: Vec<PullSecret>,
 }
 
 /// Why an [`Identity`] cannot act in a namespace.
@@ -205,6 +208,7 @@ impl Identity {
             namespace,
             launched_by: self.launched_by.clone(),
             kube_user: self.kube_user.clone(),
+            pull_secrets: self.pull_secrets.clone(),
             served: Served(()),
         })
     }
@@ -229,6 +233,7 @@ pub struct Caller {
     pub namespace: Namespace,
     pub launched_by: Launcher,
     pub kube_user: String,
+    pub pull_secrets: Vec<PullSecret>,
     pub served: Served,
 }
 
@@ -262,6 +267,7 @@ mod tests {
             launched_by: Launcher::parse("alice").unwrap(),
             kube_user: "alice-k8s".into(),
             actor: None,
+            pull_secrets: Vec::new(),
         };
         let act = |i: &Identity, r: Option<&'static str>| {
             let i = i.clone();
@@ -301,6 +307,7 @@ mod tests {
             launched_by: Launcher::parse("alice").unwrap(),
             kube_user: "alice-k8s".into(),
             actor: None,
+            pull_secrets: Vec::new(),
         };
         assert!(identity.act_in(None, &served).await.is_ok());
         assert_eq!(

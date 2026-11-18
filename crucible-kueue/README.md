@@ -28,13 +28,17 @@ Planning or submitting a workload that already exists with the same plan hash an
 first time did (`dry_run: "already submitted with this plan"`, `submitted: false`), so a retried
 caller can run plan then submit again. One of that name with other content is refused.
 
-`workload_plan` and `workload_submit` take `expose`, a list of up to eight ports of a Deployment,
-StatefulSet or LeaderWorkerSet. The server creates a ClusterIP Service of the workload's name for
-them, selecting the pods by the `workload` label it stamps (a LeaderWorkerSet's leaders only) and
-owned by the workload, so deleting the workload deletes it. Plan, submit and `workload_status`
-answer `service`: its `name`, its `host` (`<name>.<namespace>.svc.<cluster domain>`) and `ports`.
-The ports are part of the plan hash. A Service of that name that is not the workload's refuses
-the submit.
+`workload_plan` and `workload_submit` take `expose`, a list of up to eight ports of a Job,
+Deployment, StatefulSet or LeaderWorkerSet. The server creates a ClusterIP Service of the
+workload's name for them, selecting the pods by the `workload` label it stamps (a
+LeaderWorkerSet's leaders only) and owned by the workload, so deleting the workload deletes it.
+Plan, submit and `workload_status` answer `service`: its `name`, its `host`
+(`<name>.<namespace>.svc.<cluster domain>`) and `ports`. The ports are part of the plan hash. A
+Service of that name that is not the workload's refuses the submit. A RayJob, JobSet or
+PyTorchJob is refused: its controller makes its own Services.
+
+A server that must not outlive a time limit is a Job with `expose`: `activeDeadlineSeconds` ends
+it, and `ttlSecondsAfterFinished` deletes it and its Service. A Deployment has neither field.
 
 Every tool answers JSON text with a `status`: `ok`, `refused`, `rejected`, `not_found`, `error`,
 or `failed` (a completed task whose workload failed). Anything but `ok` is a tool result with
@@ -160,6 +164,7 @@ crucible-kueue \
 | `--suspend` (`SUSPEND`) | `true` | Create Jobs, JobSets and PyTorchJobs suspended for Kueue |
 | `--namespace` (`NAMESPACES`) | discovered | Namespaces the server is installed in; empty lists LocalQueues cluster-wide to find them |
 | `--pull-secret` (`PULL_SECRETS`) | none | Image pull secrets pod templates may name, as `name` or `name=registry` (host or host/path prefix; repeat for more registries). The server adds a secret to any pod whose image is on its registry and lists it in the plan's `server_changes`. With none, `imagePullSecrets` is refused |
+| `--run-pull-secrets-namespace` (`RUN_PULL_SECRETS_NAMESPACE`) | unset | The namespace a run issuer's tokens name their run's own pull secrets in, with a `pull_secrets` claim of `name=registry` entries. For a workload whose image is on such a registry the server reads that Secret (it must be a `kubernetes.io/dockerconfigjson` one) and creates a copy named `<workload>-pull-<n>` beside the workload, owned by it. The server's account needs `secrets` get in this namespace and `secrets` create in the served ones. Unset, the claim is ignored. It is always ignored on a person's token |
 | `--storage-class` (`STORAGE_CLASSES`) | none | StorageClasses a volume claim template may name (repeat for more). With none, `storageClassName` is refused and every claim takes the cluster's default class |
 | `--cluster-domain` (`CLUSTER_DOMAIN`) | `cluster.local` | The cluster's DNS domain, for the host of an exposed workload's Service |
 | `--accelerator-resource` (`ACCELERATOR_RESOURCES`) | `nvidia.com/gpu`, `nvidia.com/mig-*`, `amd.com/gpu`, `habana.ai/gaudi`, `google.com/tpu` | Resources `hardware_describe` counts; `*` matches a prefix |

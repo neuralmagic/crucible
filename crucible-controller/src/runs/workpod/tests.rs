@@ -3263,6 +3263,7 @@ async fn a_resolved_provider_reaches_the_loop_wrapper(pool: sqlx::PgPool) -> Res
     crate::playbooks::providers::upsert(
         &pool,
         &crate::playbooks::providers::NewProvider {
+            model_limits: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "openai-plat",
             display_name: "OpenAI",
@@ -3337,6 +3338,7 @@ async fn a_resolved_provider_reaches_the_playbook_wrapper(pool: sqlx::PgPool) ->
     crate::playbooks::providers::upsert(
         &pool,
         &crate::playbooks::providers::NewProvider {
+            model_limits: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "openai-plat",
             display_name: "OpenAI",
@@ -5035,6 +5037,7 @@ async fn the_resolved_providers_key_is_delivered_with_the_scopes_bindings(
     crate::playbooks::providers::upsert(
         &pool,
         &crate::playbooks::providers::NewProvider {
+            model_limits: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "openai-plat",
             display_name: "OpenAI",
@@ -5159,6 +5162,7 @@ async fn the_resolved_providers_key_is_delivered_with_the_scopes_bindings(
         inference_document(pod).bindings,
         vec![
             InferenceBinding {
+                limits: None,
                 role: InferenceRole::Agent,
                 protocol: WireProtocol::Responses,
                 url: None,
@@ -5167,6 +5171,7 @@ async fn the_resolved_providers_key_is_delivered_with_the_scopes_bindings(
                 price: None,
             },
             InferenceBinding {
+                limits: None,
                 role: InferenceRole::Decision,
                 protocol: WireProtocol::Decisions,
                 url: None,
@@ -5211,6 +5216,7 @@ async fn a_grounded_rank_runs_under_its_resolved_provider(pool: sqlx::PgPool) ->
     crate::playbooks::providers::upsert(
         &pool,
         &crate::playbooks::providers::NewProvider {
+            model_limits: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "gateway",
             display_name: "Gateway",
@@ -5321,6 +5327,7 @@ async fn a_custom_provider_delivers_its_endpoint_and_price_beside_its_key(
     crate::playbooks::providers::upsert(
         &pool,
         &crate::playbooks::providers::NewProvider {
+            model_limits: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "onprem",
             display_name: "On-prem vLLM",
@@ -5404,6 +5411,7 @@ async fn a_custom_provider_delivers_its_endpoint_and_price_beside_its_key(
     assert_eq!(
         inference_document(pod).bindings,
         vec![InferenceBinding {
+            limits: None,
             role: InferenceRole::Agent,
             protocol: WireProtocol::Responses,
             url: Some("http://vllm.internal:8000/v1".to_string()),
@@ -5460,6 +5468,7 @@ async fn a_provider_key_the_dispatch_cannot_resolve_refuses_the_run(
     let admin = crate::authz::model::Principal::parse("user:platform-admin").expect("a principal");
     // Registered nowhere: `register_inference_key` is deliberately not called.
     let missing = crate::playbooks::providers::ModelProvider {
+        model_limits: Default::default(),
         owner: crate::authz::model::Principal::platform(),
         id: "openai-plat".to_string(),
         display_name: "OpenAI".to_string(),
@@ -5778,6 +5787,7 @@ enum KueueEvent {
     ConfigMap { namespace: String },
     Pod(Box<Pod>),
     Secret(Box<k8s_openapi::api::core::v1::Secret>),
+    SecretDeleted { namespace: String, name: String },
 }
 
 struct KueueDispatcher {
@@ -5813,6 +5823,16 @@ impl PodDispatcher for KueueDispatcher {
             .lock()
             .expect("lock")
             .push(KueueEvent::Secret(Box::new(secret)));
+        Ok(())
+    }
+    async fn delete_secret(&self, _cluster: &str, ns: &str, name: &str) -> Result<()> {
+        self.events
+            .lock()
+            .expect("lock")
+            .push(KueueEvent::SecretDeleted {
+                namespace: ns.to_string(),
+                name: name.to_string(),
+            });
         Ok(())
     }
     async fn await_terminal(
@@ -5983,6 +6003,300 @@ async fn without_agent_tokens_a_run_gets_no_crucible_kueue_access(
             || e.name.starts_with("CRUCIBLE_AGENT_")),
         "{env:?}"
     );
+    Ok(())
+}
+
+const REGISTRY_AUTHFILE: &str = r#"{"auths":{"quay.io":{"auth":"bWluZTpzM2NyM3Q="}}}"#;
+
+const PACK_REGISTRY_TABLES: &str = r#"
+[[secret]]
+name = "registry"
+kind = "registry_authfile"
+path = "/etc/registry/auth.json"
+
+[buildit]
+push_repo = "quay.io/mine/smoke"
+push_secret = "registry"
+
+[kueue]
+pull_secrets = [{ secret = "registry", registry = "quay.io/mine" }]
+"#;
+
+/// [`kueue_profile`] with a `[buildit]` on the same cluster, crucible-kueue taking run pull
+/// secrets when `run_pull_secrets`.
+fn registries_profile(dir: &Path, run_pull_secrets: bool) -> std::path::PathBuf {
+    let path = kueue_profile(dir);
+    let mut text = std::fs::read_to_string(&path).expect("profile");
+    if run_pull_secrets {
+        text = text.replacen("[kueue]\n", "[kueue]\nrun_pull_secrets = true\n", 1);
+    }
+    text.push_str("[buildit]\ncluster = \"hub\"\npush_repo = \"quay.io/shared/smoke\"\n");
+    std::fs::write(&path, text).expect("profile");
+    path
+}
+
+/// Register a registry authfile owned by alice and bind it to the repo scope as the file the
+/// pack's `[[secret]]` names.
+async fn bind_registry_authfile(pool: &sqlx::PgPool) -> Result<()> {
+    use crate::authz::model::Principal;
+    use crate::secrets::store::{NewBinding, NewSecret};
+    use crate::secrets::{
+        ConsumerClass, ProjectionKind, ScopeKind, SecretKind, SecretMode, SecretName, Visibility,
+    };
+    let owner = Principal::parse("user:alice").expect("owner");
+    let name = SecretName::parse("registry").expect("name");
+    let id = uuid::Uuid::now_v7().to_string();
+    let mut conn = pool.acquire().await?;
+    crate::secrets::store::insert(
+        &mut conn,
+        &NewSecret {
+            id: &id,
+            name: &name,
+            owner: &owner,
+            kind: SecretKind::RegistryAuthfile,
+            visibility: Visibility::BrokerOnly,
+            consumer: ConsumerClass::Run,
+            mode: SecretMode::Managed,
+            vault_path: "user:alice/registry",
+            current_version: Some(1),
+            created_by: Some("alice"),
+        },
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    crate::secrets::store::insert_binding(
+        &mut conn,
+        &NewBinding {
+            id: &uuid::Uuid::now_v7().to_string(),
+            secret_id: &id,
+            scope_kind: ScopeKind::Repo,
+            scope_id: "owner/repo",
+            projection_kind: ProjectionKind::File,
+            projection: "/etc/registry/auth.json",
+            declared_name: &name,
+            pack_rev: None,
+            schema_digest: None,
+            created_by: Some("alice"),
+        },
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
+}
+
+/// Dispatch a loop run of a pack that brings a push repository and a pull secret, with its
+/// registry authfile bound; the admission and every kube object the dispatch touched, in order.
+async fn dispatch_bringing_registries(
+    db: &Db,
+    tmp: &Path,
+    run_pull_secrets: bool,
+    dispatcher: Arc<KueueDispatcher>,
+) -> Result<RunAdmission> {
+    let profile = registries_profile(tmp, run_pull_secrets);
+    let cfg = crate::testing::cfg_from_args([
+        "ctl",
+        "--deploy-profile",
+        &profile.to_string_lossy(),
+        "--render-no-pin",
+        "--grounded-sandbox-image",
+        "img",
+        "--agent-issuer",
+        AGENT_ISSUER,
+        "--agent-spire",
+        "hub=https://oidc.hub.example spiffe://hub.example/openshell/gateway/ spire/oidc:443",
+    ]);
+    let pack = crate::testing::fixtures::write_loop_pack(tmp);
+    let manifest = pack.join("crucible.toml");
+    let mut text = std::fs::read_to_string(&manifest)?;
+    text.push_str(PACK_REGISTRY_TABLES);
+    std::fs::write(&manifest, text)?;
+    let secrets = crate::runs::workpod::LaunchSecrets {
+        provider: Some(std::sync::Arc::new(
+            crate::secrets::provider::MapProvider::new([(
+                "registry".to_string(),
+                REGISTRY_AUTHFILE.to_string(),
+            )]),
+        )),
+        exposure: None,
+        ..repo_secrets(crate::authz::model::Principals::new(Some("alice"), &[]))
+    };
+    dispatch_run(
+        db,
+        &cfg,
+        dispatcher,
+        &dispatching(db, "owner/repo#7", "owner_repo_7-42").await,
+        &materialized(pack),
+        &BTreeMap::new(),
+        None,
+        RunRenderOpts::for_loop(&cfg, "owner/repo", AgentSelection::default()),
+        Some(&secrets),
+    )
+    .await
+}
+
+/// A pack's `[buildit]` and `[kueue]` tables reach the run: its buildit pushes to the pack's
+/// repository with the authfile the binding mounts, its pull Secret is in crucible-kueue's
+/// namespace before the loop pod exists, its tokens name that Secret, and collection deletes it.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_run_pushes_and_pulls_with_the_registry_credentials_its_pack_brings(
+    pool: sqlx::PgPool,
+) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let tmp = tempfile::tempdir()?;
+    bind_registry_authfile(&pool).await?;
+    let db = Db::new(pool);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let dispatcher = Arc::new(KueueDispatcher {
+        events: events.clone(),
+    });
+    let out = dispatch_bringing_registries(&db, tmp.path(), true, dispatcher.clone()).await?;
+    let RunAdmission::Launched { pod_name, .. } = out else {
+        panic!("expected a launch, got {out:?}");
+    };
+    let seen = events.lock().expect("lock").clone();
+
+    let env = loop_env(&seen);
+    let servers = crucible_contract::agent_servers::decode(
+        env.iter()
+            .find(|e| e.name == crucible_contract::agent_servers::ENV_AGENT_SERVERS)
+            .and_then(|e| e.value.as_deref())
+            .unwrap_or_default(),
+    )?;
+    let site = servers
+        .iter()
+        .find_map(|s| match &s.transport {
+            crucible_contract::agent_servers::Transport::Local(
+                crucible_contract::agent_servers::LocalServer::Buildit(site),
+            ) => Some(site),
+            _ => None,
+        })
+        .expect("the run gets buildit");
+    assert_eq!(site.push_repo.as_deref(), Some("quay.io/mine/smoke"));
+    assert_eq!(
+        site.push_authfile.as_deref(),
+        Some("/etc/registry/auth.json")
+    );
+    let mounted = seen.iter().any(|e| match e {
+        KueueEvent::Pod(pod) => pod
+            .spec
+            .iter()
+            .flat_map(|spec| &spec.containers)
+            .flat_map(|c| c.volume_mounts.iter().flatten())
+            .any(|m| m.mount_path == "/etc/registry/auth.json"),
+        _ => false,
+    });
+    assert!(mounted, "the loop pod mounts the authfile buildit reads");
+
+    let pull_name = format!("{pod_name}-pull-0");
+    let position = |wanted: &dyn Fn(&KueueEvent) -> bool| seen.iter().position(wanted);
+    let pull_at = position(
+        &|e| matches!(e, KueueEvent::Secret(s) if s.metadata.name.as_deref() == Some(&pull_name)),
+    )
+    .expect("the pull Secret is created");
+    let pod_at = position(&|e| matches!(e, KueueEvent::Pod(_))).expect("the loop pod");
+    assert!(pull_at < pod_at, "the pull Secret precedes the loop pod");
+    let KueueEvent::Secret(pull) = &seen[pull_at] else {
+        unreachable!()
+    };
+    assert_eq!(pull.metadata.namespace.as_deref(), Some("crucible-system"));
+    assert_eq!(
+        pull.type_.as_deref(),
+        Some("kubernetes.io/dockerconfigjson")
+    );
+    assert_eq!(
+        pull.string_data.as_ref().expect("data")[".dockerconfigjson"],
+        REGISTRY_AUTHFILE
+    );
+    assert!(
+        pull.metadata.owner_references.is_none(),
+        "the loop pod is in another namespace and cannot own it"
+    );
+
+    let claim =
+        crate::runs::workpod::registries::claim(db.pool(), &pod_name, "crucible-system").await?;
+    assert_eq!(claim, [format!("{pull_name}=quay.io/mine")]);
+
+    let tools = crate::runs::agent_tools::for_run(db.pool(), "owner_repo_7-42").await?;
+    let limits = |server: &str| {
+        tools
+            .iter()
+            .find(|t| t.server.as_str() == server)
+            .map(|t| t.limits.clone())
+            .unwrap_or_default()
+    };
+    assert_eq!(limits("buildit")["push_repo"], "quay.io/mine/smoke");
+    assert_eq!(
+        limits("kueue")["pull_secrets"],
+        format!("{pull_name}=quay.io/mine")
+    );
+
+    collect_run_pod(
+        &db,
+        dispatcher.as_ref(),
+        "autoresearch",
+        None,
+        &pod_name,
+        RunDisposition::Finished,
+    )
+    .await?;
+    let deleted: Vec<(String, String)> = events
+        .lock()
+        .expect("lock")
+        .iter()
+        .filter_map(|e| match e {
+            KueueEvent::SecretDeleted { namespace, name } => {
+                Some((namespace.clone(), name.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(deleted, [("crucible-system".to_string(), pull_name)]);
+    let claim =
+        crate::runs::workpod::registries::claim(db.pool(), &pod_name, "crucible-system").await?;
+    assert!(claim.is_empty(), "{claim:?}");
+    Ok(())
+}
+
+/// Where crucible-kueue takes no run pull secrets, a pack that brings one is refused before
+/// anything is created.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_pack_that_brings_pull_secrets_is_refused_where_none_are_taken(
+    pool: sqlx::PgPool,
+) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let tmp = tempfile::tempdir()?;
+    bind_registry_authfile(&pool).await?;
+    let db = Db::new(pool);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let dispatcher = Arc::new(KueueDispatcher {
+        events: events.clone(),
+    });
+    let out = dispatch_bringing_registries(&db, tmp.path(), false, dispatcher).await?;
+    let RunAdmission::SecretsRefused { reason } = out else {
+        panic!("expected a refusal, got {out:?}");
+    };
+    assert!(reason.contains("[kueue] run_pull_secrets"), "{reason}");
+    assert!(events.lock().expect("lock").is_empty());
+    Ok(())
+}
+
+/// A pack that names a registry secret its scope did not bind is refused by the registry's own
+/// check, the same as any other declared secret.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_pack_whose_registry_secret_is_unbound_is_refused(pool: sqlx::PgPool) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let tmp = tempfile::tempdir()?;
+    let db = Db::new(pool);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let dispatcher = Arc::new(KueueDispatcher {
+        events: events.clone(),
+    });
+    let out = dispatch_bringing_registries(&db, tmp.path(), true, dispatcher).await?;
+    let RunAdmission::SecretsRefused { reason } = out else {
+        panic!("expected a refusal, got {out:?}");
+    };
+    assert!(reason.contains("registry"), "{reason}");
+    assert!(events.lock().expect("lock").is_empty());
     Ok(())
 }
 

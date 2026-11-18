@@ -331,7 +331,19 @@ clusters; `[buildit]` needs neither. `[kueue] shared_namespaces` (a subset of
 render binds ClusterRole `crucible-kueue-caller` — every verb the crucible-kueue access checks
 can ask, Secret reads narrowed to `pull_secrets` — to Group `crucible:runs` there. Naming them
 explicitly means adding a team namespace to `workload_namespaces` later never opens it to every
-run. Each server's URL on each
+run. `[kueue] run_pull_secrets = true` takes the pull secrets a pack brings (`[kueue]
+pull_secrets` in its `crucible.toml`). At dispatch the controller writes each as a
+`kubernetes.io/dockerconfigjson` Secret named `<run pod>-pull-<n>` in `[kueue] namespace`, the
+run's tokens name them, and the controller deletes them when the run's pod is collected. For each
+workload the run submits whose image is on one of those registries, crucible-kueue copies the
+Secret into the workload's namespace as `<workload>-pull-<n>`, owned by the workload, so it lasts
+exactly as long as the workload does. The render then grants the `[cluster] sandbox_readers`
+accounts `secrets` create and delete and the server `secrets` get in `[kueue] namespace`, grants
+the server `secrets` create in the workload namespaces, and starts it with
+`--run-pull-secrets-namespace`; it refuses to render without a `sandbox_readers` account. Profile
+load refuses the key where `[kueue] namespace` is also the loop namespace, the rig namespace or a
+`sandbox_readers` account's namespace, since the server can then read every Secret there. Without
+the key, a launch of a pack that brings pull secrets is refused. Each server's URL on each
 of its clusters is an agent audience, with its scopes: `kueue.read kueue.submit` for crucible-kueue
 and `buildit.read buildit.build` for buildit. The rendered server trusts runs' tokens from the controller's
 `CONTROLLER_AGENT_ISSUER` (`crucible deploy render --kueue --issuer <it>`), fetching keys from
@@ -359,7 +371,9 @@ creates the `buildit-builders` NetworkPolicy there: no ingress, egress only to D
 registries' networks, or put the cluster's pod and service networks in `except`, to keep builds
 off in-cluster services. `push`
 publishes a succeeded build to `push_repo` only, tagged `<sandbox>-<build_id>`, with the loop
-pod's `[secrets] push_authfile`; without either, buildit pushes nothing. `queue` submits builder
+pod's `[secrets] push_authfile`; without either, buildit pushes nothing. A pack that names its own
+`[buildit] push_repo` and `push_secret` in `crucible.toml` pushes there instead, with the registry
+authfile its scope bound. `queue` submits builder
 pods to that Kueue LocalQueue in `namespace`; set it where Kueue manages the namespace and holds
 pods that name no queue (`manageJobsWithoutQueueName`), or builds wait 10 minutes and fail.
 `[buildit.builders]` sizes builder pods on every cluster: `node_arch` (their `kubernetes.io/arch`),

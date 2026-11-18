@@ -316,8 +316,8 @@ class AsyncClient(_Tools[Awaitable[Json]]):
     ) -> Json:
         """Plan ``manifest`` and submit it under the hash the plan answered.
 
-        ``expose`` lists ports of a Deployment, StatefulSet or LeaderWorkerSet to
-        reach in the cluster. The reply's ``service`` then holds ``host`` and
+        ``expose`` lists ports of a Job, Deployment, StatefulSet or LeaderWorkerSet
+        to reach in the cluster. The reply's ``service`` then holds ``host`` and
         ``ports``; the Service is deleted with the workload.
         """
         plan = await self.workload_plan(queue, manifest, namespace, expose)
@@ -383,7 +383,7 @@ class AsyncClient(_Tools[Awaitable[Json]]):
         namespace: Optional[str] = None,
         timeout: float = 3600.0,
     ) -> AsyncIterator[str]:
-        """Serve a Deployment, StatefulSet or LeaderWorkerSet and yield its URL.
+        """Serve a Job, Deployment, StatefulSet or LeaderWorkerSet and yield its URL.
 
         ``async with kueue.serving(queue, manifest, 8000) as url:`` waits until
         the workload is ready, yields ``http://<host>:<port>`` reachable from
@@ -477,8 +477,8 @@ class Client(_Tools[Json]):
     ) -> Json:
         """Plan ``manifest`` and submit it under the hash the plan answered.
 
-        ``expose`` lists ports of a Deployment, StatefulSet or LeaderWorkerSet to
-        reach in the cluster. The reply's ``service`` then holds ``host`` and
+        ``expose`` lists ports of a Job, Deployment, StatefulSet or LeaderWorkerSet
+        to reach in the cluster. The reply's ``service`` then holds ``host`` and
         ``ports``; the Service is deleted with the workload.
         """
         plan = self.workload_plan(queue, manifest, namespace, expose)
@@ -542,7 +542,7 @@ class Client(_Tools[Json]):
         namespace: Optional[str] = None,
         timeout: float = 3600.0,
     ) -> Iterator[str]:
-        """Serve a Deployment, StatefulSet or LeaderWorkerSet and yield its URL.
+        """Serve a Job, Deployment, StatefulSet or LeaderWorkerSet and yield its URL.
 
         ``with kueue.serving(queue, manifest, 8000) as url:`` waits until the
         workload is ready, yields ``http://<host>:<port>`` reachable from tasks

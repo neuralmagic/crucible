@@ -634,6 +634,7 @@ mod tests {
             model: "dgemma".into(),
             key_env: key_env.map(|name| EnvName::new(name).unwrap()),
             price: None,
+            limits: None,
         }
     }
 

@@ -67,6 +67,7 @@ pub fn by_owner(files: &[Captured]) -> Vec<(String, Vec<&Captured>)> {
 /// How a file is drawn, by its extension.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
+    Html,
     Markdown,
     Patch,
     Json,
@@ -81,6 +82,7 @@ impl Kind {
             .map(|(_, ext)| ext.to_ascii_lowercase())
             .unwrap_or_default();
         match ext.as_str() {
+            "html" | "htm" => Kind::Html,
             "md" | "markdown" => Kind::Markdown,
             "patch" | "diff" => Kind::Patch,
             "json" => Kind::Json,
@@ -171,7 +173,7 @@ pub fn display(kind: Kind, text: &str) -> String {
             .map(|line| indent(line).unwrap_or_else(|| line.to_string()))
             .collect::<Vec<_>>()
             .join("\n\n"),
-        Kind::Markdown | Kind::Patch | Kind::Text => text.to_string(),
+        Kind::Html | Kind::Markdown | Kind::Patch | Kind::Text => text.to_string(),
     }
 }
 
@@ -301,6 +303,8 @@ mod tests {
         assert_eq!(Kind::of("trace.LOG"), Kind::Text);
         assert_eq!(Kind::of("Makefile"), Kind::Text);
         assert_eq!(Kind::of("a.diff"), Kind::Patch);
+        assert_eq!(Kind::of("artifacts/report.HTML"), Kind::Html);
+        assert_eq!(Kind::of("report.htm"), Kind::Html);
     }
 
     #[test]

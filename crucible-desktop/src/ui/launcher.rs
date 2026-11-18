@@ -2,7 +2,9 @@
 //! button that starts it.
 
 use rune::{El, TextEdit, Tx, col, el, icon, row, text};
-use rune_kit::{Button, ButtonVariant, Dialog, SegmentedControl, Spinner, Switch, TextInput};
+use rune_kit::{
+    Button, ButtonVariant, Dialog, SegmentedControl, Spinner, Switch, TextArea, TextInput,
+};
 use rune_theme_opencode::icons as oc;
 
 use crate::form::{Kind, Scale, duration, minutes};
@@ -364,6 +366,15 @@ fn form(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
         };
         let offered = field.offered(&launcher.fields, &texts);
         let control = match (&field.kind, offered) {
+            (Kind::Multiline, _) => TextArea::new(launcher.answers.get(i).unwrap_or(&app.scratch))
+                .placeholder(field.placeholder(&launcher.fields, &texts))
+                .rows(8)
+                .width(Some(INNER))
+                .invalid(issue.is_some())
+                .disabled(off)
+                .on_edit(move |app: &mut App| edit(app, Slot::Answer(i)))
+                .build(p.k)
+                .key(format!("launch-param-{}", field.name)),
             (Kind::Bool, _) => Switch::new(answer == "true")
                 .label(field.name.clone())
                 .hide_label()

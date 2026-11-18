@@ -21,6 +21,7 @@ mod form;
 mod gfx;
 mod handoff;
 mod history;
+mod html_preview;
 #[cfg(not(target_arch = "wasm32"))]
 mod httpcache;
 #[cfg(target_arch = "wasm32")]
@@ -494,6 +495,8 @@ pub struct App {
     /// The plugin file that stands in for a live pack's: what `CRUCIBLE_VIEW_PLUGIN` named at
     /// start.
     view_plugin: Option<StandIn>,
+    pub files_html_source: bool,
+    pub html_preview_error: Option<String>,
     /// The workspace the user arranged; `None` lays each run out by its graph's depth.
     pub layout: Option<Workspace>,
     /// Panes picked from a tab bar while the layout follows the run, oldest first.
@@ -692,7 +695,7 @@ pub fn run() {
     #[cfg(target_arch = "wasm32")]
     rune::App::new(spec).on_open_url(open_link).run();
     #[cfg(not(any(feature = "hot", target_arch = "wasm32")))]
-    rune::App::new(spec)
+    html_preview::install(rune::App::new(spec))
         .on_open_url(open_link)
         .chrome(rune::Chrome {
             traffic_lights: Some(ui::TRAFFIC_LIGHTS),

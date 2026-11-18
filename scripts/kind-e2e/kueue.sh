@@ -132,19 +132,23 @@ pass "[KQ] the task acted as crucible:run:$POD and read the Job's log through th
 
 SERVE_HOST="task-serve.$WORKLOAD_NS.svc.cluster.local"
 grep '^\[serve\] {' "$WORK/engine-KQ.log" | sed 's/^\[serve\] //' >"$WORK/serve-KQ.json"
-jq -e --arg host "$SERVE_HOST" '
+jq -e --arg host "$SERVE_HOST" --arg expiring "task-expire.$WORKLOAD_NS.svc.cluster.local" '
     .url == "http://\($host):8000" and .resubmitted == false
     and .status_service == {name: "task-serve", host: $host, ports: [8000]}
-    and .from_task and .from_job and .batch_refused and .gone
+    and .from_task and .from_job and .gone
+    and .expired == {host: $expiring, reached: true, gone: true}
     and .ticks == ["tick-1", "tick-2", "tick-3", "tick-4", "tick-5", "tick-6"]
     and .raised.failed.phase == "finished" and (.raised.failed.reason | length > 0)
     and .raised.failed.reason != "Succeeded" and .raised.stuck.problem_pods >= 1' "$WORK/serve-KQ.json" >/dev/null ||
     fail "[KQ] serve did not reach its workload and retire it: $(cat "$WORK/serve-KQ.json"); the engine said: $(tail -n 20 "$WORK/engine-KQ.log")"
 wait_for 60 "the exposed Service to be collected with its Deployment" \
     sh -c "! kubectl -n $WORKLOAD_NS get service task-serve"
+wait_for 60 "the expired Job's Service to be collected with it" \
+    sh -c "! kubectl -n $WORKLOAD_NS get service task-expire"
 [ "$(kubectl -n "$WORKLOAD_NS" get services -o json | jq '.items | length')" = 0 ] ||
     fail "[KQ] a Service outlived its workload: $(kubectl -n "$WORKLOAD_NS" get services -o name)"
 pass "[KQ] a task served an image at $SERVE_HOST, reached it from itself and from a Job, and its Service went with it"
+pass "[KQ] a Job that served past its activeDeadlineSeconds was deleted by its TTL, and its Service with it"
 pass "[KQ] a task followed a running Job's log in two-second windows and read each line once"
 pass "[KQ] a Job that exits nonzero raised WorkloadFailed ($(jq -r .raised.failed.reason "$WORK/serve-KQ.json")) and one that cannot pull raised WorkloadStuck"
 

@@ -14,7 +14,7 @@ const POLICY: &str = include_str!("../../../buildit/deploy/buildit-policy.toml")
 
 const BOOT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The loop pod's push authfile (`[secrets] push_authfile`).
+/// The loop pod's push authfile (`[secrets] push_authfile`), for a run that brings none.
 const ENV_PUSH_AUTHFILE: &str = "FORGE_AUTHFILE";
 
 #[derive(Debug, thiserror::Error)]
@@ -151,6 +151,11 @@ impl Buildit<'_> {
         Ok(args)
     }
 
+    /// The authfile `push` reads: the run's own, else the loop pod's.
+    fn push_authfile(&self, loop_pod: Option<String>) -> Option<String> {
+        self.site.push_authfile.clone().or(loop_pod)
+    }
+
     fn listening(&self, probe: &str) -> bool {
         crate::control::broker::port_open(probe) && self.socket.is_none_or(|s| accepts(&s.path))
     }
@@ -164,7 +169,7 @@ impl Buildit<'_> {
         }
         let run_id = std::env::var(crucible_contract::ENV_POD_NAME)
             .context("buildit needs the run pod's name to know its run")?;
-        let push_authfile = std::env::var(ENV_PUSH_AUTHFILE).ok();
+        let push_authfile = self.push_authfile(std::env::var(ENV_PUSH_AUTHFILE).ok());
         if self.site.push_repo.is_some() && push_authfile.is_none() {
             tracing::warn!(
                 "buildit has a push repository but the loop pod has no push authfile; it pushes nothing"
@@ -225,6 +230,7 @@ mod tests {
             run_issuer: issuer.into(),
             namespace: "crucible-builds".into(),
             push_repo: push.map(str::to_string),
+            push_authfile: None,
             queue: None,
             builders: BuilderPods::default(),
             cache: None,
@@ -350,6 +356,24 @@ mod tests {
                 .unwrap()
                 .contains(&"--insecure-jwks-http".to_string())
         );
+    }
+
+    #[test]
+    fn a_runs_own_authfile_is_read_over_the_loop_pods() {
+        let loop_pod = || Some("/etc/quay/push.json".to_string());
+        let shared = site(ISSUER, Some("quay.io/example/crucible-smoke"));
+        assert_eq!(buildit(&shared).push_authfile(loop_pod()), loop_pod());
+        assert_eq!(buildit(&shared).push_authfile(None), None);
+        let own = BuilditSite {
+            push_authfile: Some("/etc/registry/auth.json".into()),
+            ..site(ISSUER, Some("quay.io/mine/smoke"))
+        };
+        for from_pod in [loop_pod(), None] {
+            assert_eq!(
+                buildit(&own).push_authfile(from_pod).as_deref(),
+                Some("/etc/registry/auth.json")
+            );
+        }
     }
 
     #[test]

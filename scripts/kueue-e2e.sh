@@ -75,7 +75,8 @@
 # every node that is not amd64, as the contents of a TOML list ('"cpu-07", "gpu-01"'). It does
 # not reach the sandbox and supervisor pods the gateway creates; on OpenShift,
 # SANDBOX_NODE_SELECTOR sets SANDBOX_NS's project node selector for those.
-# KEEP=1 leaves everything behind.
+# KEEP=1 leaves everything behind. ARTIFACTS names a directory that gets the run's graph.json and
+# run-log.json when the script ends, pass or fail.
 set -euo pipefail
 TASKS=${TASKS:-0}
 
@@ -141,6 +142,10 @@ FORWARD_PID=
 cleanup() {
     [ -n "$FORWARD_PID" ] && kill "$FORWARD_PID" 2>/dev/null || true
     kc -n "$CTL_NS" logs deploy/crucible-controller > "$WORK/controller.log" 2>/dev/null || true
+    if [ -n "${ARTIFACTS:-}" ]; then
+        mkdir -p "$ARTIFACTS"
+        cp "$WORK/graph.json" "$WORK/run-log.json" "$ARTIFACTS/" 2>/dev/null || true
+    fi
     if [ "${KEEP:-0}" = 1 ]; then
         log "kept $WORK, the namespaces, and Job $WORKLOAD_NS/$JOB"
         return
@@ -556,7 +561,7 @@ for aud in "$KUEUE_URL" "http://host.openshell.internal:8848/mcp"; do
     issued=$(grep 'agent token issued' "$WORK/controller.log" | grep "gateway/$RUN/sandbox/" \
         | grep -F "aud=\"$aud\"" | head -1)
     [ -n "$issued" ] || fail "the controller issued no token for $aud to run $RUN"
-    grep -qF "kube_user=crucible:run:$RUN" <<<"$issued" || fail "the token was not for the run's own kube_user: $issued"
+    grep -qE "kube_user=\"?crucible:run:$RUN\"?( |$)" <<<"$issued" || fail "the token was not for the run's own kube_user: $issued"
     grep -qE "spiffe_id=\"?${GATEWAY_PREFIX}$RUN/sandbox/" <<<"$issued" \
         || fail "the token went to no supervisor under $GATEWAY_PREFIX: $issued"
     log "issued: $issued"

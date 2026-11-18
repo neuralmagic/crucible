@@ -1275,6 +1275,9 @@ pub struct Provider {
     pub harness: Option<String>,
     #[serde(default)]
     pub price: Option<ProviderPrice>,
+    /// What each model can take and give, in tokens, by model id.
+    #[serde(default)]
+    pub model_limits: std::collections::BTreeMap<String, ModelLimits>,
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
@@ -1322,7 +1325,7 @@ pub enum InferenceProtocol {
 
 /// A provider as `PUT /api/providers/{id}` takes it. Fields a kind has no use for stay off the
 /// wire.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ProviderBody {
     pub display_name: String,
     pub kind: ProviderKind,
@@ -1339,11 +1342,15 @@ pub struct ProviderBody {
     pub secret_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret_owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price: Option<ProviderPrice>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub model_limits: std::collections::BTreeMap<String, ModelLimits>,
     pub enabled: bool,
 }
 
 /// `POST /api/providers`: a new registration under `id`, owned by `owner`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RegisterProvider {
     pub id: String,
     pub owner: String,
@@ -1377,12 +1384,19 @@ pub struct DispatchTarget {
 }
 
 /// USD per million tokens for each billed bucket.
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
 pub struct ProviderPrice {
     pub input: f64,
     pub output: f64,
     pub cache_read: f64,
     pub cache_write: f64,
+}
+
+/// One model's context window and output limit, in tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ModelLimits {
+    pub context_window: u32,
+    pub max_output_tokens: u32,
 }
 
 /// A registry secret's metadata. The value never leaves the controller.

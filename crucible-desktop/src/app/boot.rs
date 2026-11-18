@@ -128,6 +128,8 @@ pub(crate) fn init() -> App {
         pack_md_source: false,
         run_file: None,
         files_md_source: false,
+        files_html_source: false,
+        html_preview_error: None,
         report_shown: report::shown::Scoped::default(),
         report_sent: None,
         local_report: None,

@@ -263,6 +263,9 @@ pub fn view(app: &App, cx: &mut Cx<App>) -> El {
     launcher::sheet(app, &p, &mut layer);
     palette::palette(app, &p, &mut layer);
     finder::finder(app, &p, &mut layer);
+    let window = window.children(
+        (!layer.is_empty()).then(|| el().key(crate::html_preview::OBSCURED).w(0.0).h(0.0)),
+    );
     rune_kit::root(window, layer)
 }
 

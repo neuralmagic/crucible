@@ -211,7 +211,7 @@ def test_a_cancelled_wait_stops_waiting(served: Served) -> None:
     assert asyncio.run(task())
 
 
-def test_exposing_ports_is_part_of_the_plan_and_only_for_serving_kinds(
+def test_exposing_ports_is_part_of_the_plan(
     served: Served,
 ) -> None:
     client = Client(url=served.url, token=served.token)
