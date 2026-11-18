@@ -201,15 +201,11 @@ fn view<S: Slot>(report: &Report, app: &App, p: &Paint, layer: &mut Vec<El>) -> 
                 })),
         )
         .children(controls)
-        .child(if S::shown(app).fills(&view.body) {
-            node::<S>(&view.body, true, "0", app, p)
-        } else {
-            desk::scrolled(
-                "report-scroll",
-                node::<S>(&view.body, false, "0", app, p),
-                p,
-            )
-        })
+        .child(desk::scrolled(
+            "report-scroll",
+            node::<S>(&view.body, S::shown(app).fills(&view.body), "0", app, p),
+            p,
+        ))
 }
 
 /// What a runs view says of the launches it could not read: how many, and why the first.
@@ -248,6 +244,8 @@ const PAD: f32 = 12.0;
 const CARD: f32 = 2.0 * PAD;
 /// The widest a card or a block of text is drawn.
 const MEASURE: f32 = 720.0;
+/// The least height of a table's rows, and of a tab's body that scrolls under its bar.
+const LEAST: f32 = 240.0;
 
 /// A card [`MEASURE`] wide at most, holding a chart.
 fn card(p: &Paint) -> El {
@@ -267,15 +265,16 @@ fn least_width(node: &Node) -> f32 {
     }
 }
 
-/// `fills` when the node takes the height its parent has left, as a table's ancestors do;
-/// otherwise it is as tall as its content, inside a scroll area. `at` is the node's place in
-/// the view, unique among the nodes drawn.
+/// `fills` when the node takes the height its parent has left and no less than its content
+/// needs, as a table's ancestors do; otherwise it is as tall as its content. Either way the
+/// page scrolls once it is taller than the pane. `at` is the node's place in the view, unique
+/// among the nodes drawn.
 fn node<S: Slot>(node_: &Node, fills: bool, at: &str, app: &App, p: &Paint) -> El {
     match node_ {
         Node::Stack { children } => {
             let mut stack = col().w_full().gap(12.0);
             if fills {
-                stack = stack.grow(1.0).min_h(0.0);
+                stack = stack.grow(1.0);
             }
             for (i, child) in children.iter().enumerate() {
                 let place = format!("{at}-{i}");
@@ -441,7 +440,7 @@ fn section<S: Slot>(
         .gap(8.0)
         .child(header);
     if fills {
-        shown = shown.grow(1.0).min_h(0.0);
+        shown = shown.grow(1.0);
     }
     if unfolded {
         shown = shown.child(node::<S>(
@@ -486,7 +485,7 @@ fn tabs_view<S: Slot>(id: &str, tabs: &[Tab], fills: bool, app: &App, p: &Paint)
         .gap(10.0)
         .child(bar);
     if fills {
-        shown = shown.grow(1.0).min_h(0.0);
+        shown = shown.grow(1.0);
     }
     if let Some(tab) = tabs.get(picked) {
         let filled = S::shown(app).fills(&tab.body);
@@ -500,7 +499,7 @@ fn tabs_view<S: Slot>(id: &str, tabs: &[Tab], fills: bool, app: &App, p: &Paint)
         shown = shown.child(if !fills || filled {
             body
         } else {
-            desk::scrolled(&format!("report-scroll-{id}"), body, p)
+            desk::scrolled(&format!("report-scroll-{id}"), body, p).min_h(LEAST)
         });
     }
     shown
@@ -683,11 +682,10 @@ fn table<S: Slot>(columns: &[Column], app: &App, p: &Paint) -> El {
         .build(app, k)
         .key("report-table")
         .grow(1.0)
-        .min_h(0.0);
+        .min_h(LEAST);
     col()
         .w_full()
         .grow(1.0)
-        .min_h(0.0)
         .gap(10.0)
         .child(filter::<S>(app, p))
         .child(table)
