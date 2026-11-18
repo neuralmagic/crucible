@@ -2105,6 +2105,7 @@ mod tests {
                 protocol: crucible_contract::inference::InferenceProtocol::Responses,
                 model: "m".into(),
                 price: None,
+                limits: None,
             }),
             ..Default::default()
         };

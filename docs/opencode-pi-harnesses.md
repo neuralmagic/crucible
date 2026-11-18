@@ -65,8 +65,13 @@ model under it, so the CLI does not use its own model catalog. OpenCode gets an
   there. Pi finds `.agents/skills`. The turn passes `--approve`, so Pi trusts the project-local
   files of the workspace without a prompt.
 - **Reasoning effort.** Pi gets the shared `[agent].reasoning_effort` as `--thinking` (`max`
-  becomes `xhigh`). The OpenCode equivalent (`--variant`) is specific to each provider, so the
-  engine does not pass it.
+  becomes `xhigh`), and the seeded model is declared as reasoning when an effort is set. The
+  OpenCode equivalent (`--variant`) is specific to each provider, so the engine does not pass it.
+- **Model limits.** Pi's seeded model declares a context window of 128,000 tokens and an output
+  limit of 16,384 (200,000 and 16,384 on Vertex) unless the agent binding carries `limits`. With
+  a controller, register them on the provider, for each model:
+  `"model_limits": {"<model>": {"context_window": 32768, "max_output_tokens": 4096}}`. Set them
+  for a self-hosted model with a smaller window, or pi sends requests the endpoint refuses.
 
 ## OpenCode's transcript is the session export
 

@@ -28,6 +28,7 @@ use crate::args::TurnAgent;
 use crate::knobs::{Harness, ReasoningEffort};
 use crate::turn_trace::{self, GenAiRecord, ToolCall, ToolInvocation};
 use crucible::harness::HarnessSpec;
+use crucible_contract::inference::ModelLimits;
 use crucible_harness::line::LineFormat;
 use crucible_harness::otel::LiveMeters;
 use crucible_harness::pi_json::PiJsonParser;
@@ -119,6 +120,8 @@ const REGION = __REGION__;
 const HOST = __HOST__;
 const MODEL = __MODEL__;
 const REASONING = __REASONING__;
+const CONTEXT_WINDOW = __CONTEXT_WINDOW__;
+const MAX_TOKENS = __MAX_TOKENS__;
 const PREFIX = `/v1/projects/${PROJECT}/locations/${REGION}/publishers/anthropic/models/`;
 const ANTHROPIC_VERSION = "vertex-2023-10-16";
 
@@ -173,8 +176,8 @@ export default function (pi: any) {
         reasoning: REASONING,
         input: ["text"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 200000,
-        maxTokens: 16384,
+        contextWindow: CONTEXT_WINDOW,
+        maxTokens: MAX_TOKENS,
       },
     ],
     streamSimple: (model: any, context: any, options: any) =>
@@ -183,8 +186,22 @@ export default function (pi: any) {
 }
 "#;
 
+/// The context window and output limit a seeded model entry declares: the binding's, else
+/// `default`.
+fn declared_limits(limits: Option<ModelLimits>, default: (u32, u32)) -> (u32, u32) {
+    limits.map_or(default, |l| {
+        (l.context_window.get(), l.max_output_tokens.get())
+    })
+}
+
 /// Render the Vertex extension for a project, region, and model.
-fn vertex_extension(model: &str, vertex: &VertexConfig, reasoning: bool) -> String {
+fn vertex_extension(
+    model: &str,
+    vertex: &VertexConfig,
+    reasoning: bool,
+    limits: Option<ModelLimits>,
+) -> String {
+    let (context_window, max_tokens) = declared_limits(limits, (200_000, 16_384));
     let literal = |s: &str| serde_json::Value::String(s.to_string()).to_string();
     VERTEX_EXTENSION_TEMPLATE
         .replace("__PROJECT__", &literal(&vertex.project))
@@ -192,12 +209,20 @@ fn vertex_extension(model: &str, vertex: &VertexConfig, reasoning: bool) -> Stri
         .replace("__HOST__", &literal(&format!("https://{}", vertex.host())))
         .replace("__MODEL__", &literal(model))
         .replace("__REASONING__", &reasoning.to_string())
+        .replace("__CONTEXT_WINDOW__", &context_window.to_string())
+        .replace("__MAX_TOKENS__", &max_tokens.to_string())
 }
 
 /// Render `models.json`: a keyed endpoint as the `crucible` provider (its API family, base URL,
 /// and the env var the key is read from) carrying the one model the turn runs. A Vertex turn
 /// seeds none: its provider comes from the extension.
-fn models_json(model: &str, endpoint: &ApiEndpoint, reasoning: bool) -> Option<String> {
+fn models_json(
+    model: &str,
+    endpoint: &ApiEndpoint,
+    reasoning: bool,
+    limits: Option<ModelLimits>,
+) -> Option<String> {
+    let (context_window, max_tokens) = declared_limits(limits, (128_000, 16_384));
     let (api, base_url, key_env) = match endpoint {
         ApiEndpoint::OpenAi { base_url, wire_api } => (
             match wire_api {
@@ -225,8 +250,8 @@ fn models_json(model: &str, endpoint: &ApiEndpoint, reasoning: bool) -> Option<S
                     "name": model,
                     "reasoning": reasoning,
                     "input": ["text"],
-                    "contextWindow": 128_000,
-                    "maxTokens": 16_384,
+                    "contextWindow": context_window,
+                    "maxTokens": max_tokens,
                 }],
             }
         }
@@ -315,6 +340,7 @@ impl Backend for Pi {
             agent.model,
             &api_endpoint(agent.model, inference, agent.env),
             agent.reasoning_effort.is_some(),
+            inference.selection.as_ref().and_then(|s| s.limits),
         )
     }
 
@@ -327,13 +353,19 @@ impl Backend for Pi {
     }
 
     /// The Vertex extension, when the turn runs on the gateway's ambient credential.
-    fn credential(&self, agent: &TurnAgent<'_>, auth: &SandboxAuth) -> Option<SeedFile> {
+    fn credential(
+        &self,
+        agent: &TurnAgent<'_>,
+        auth: &SandboxAuth,
+        inference: &InferenceEnv,
+    ) -> Option<SeedFile> {
         match auth {
             SandboxAuth::Gateway => Some(SeedFile {
                 content: vertex_extension(
                     agent.model,
                     &VertexConfig::from_env(agent.env),
                     agent.reasoning_effort.is_some(),
+                    inference.selection.as_ref().and_then(|s| s.limits),
                 ),
                 dest: VERTEX_EXTENSION,
             }),
@@ -803,6 +835,63 @@ mod tests {
         a.reasoning_effort = Some(ReasoningEffort::High);
         assert_eq!(reasoning(&a), true);
         assert!(vertex(&a).contains("const REASONING = true;"));
+    }
+
+    #[test]
+    fn a_seeded_model_takes_the_bindings_limits_and_defaults_without_them() {
+        use crate::agent::inference::AgentSelection;
+        use crucible_contract::inference::InferenceProtocol;
+        use std::num::NonZeroU32;
+
+        let bound = |limits| InferenceEnv {
+            anthropic_key: Some("sk-ant".into()),
+            selection: Some(AgentSelection {
+                protocol: InferenceProtocol::Messages,
+                model: "m".into(),
+                price: None,
+                limits,
+            }),
+            ..Default::default()
+        };
+        let limits = ModelLimits {
+            context_window: NonZeroU32::new(32_768).unwrap(),
+            max_output_tokens: NonZeroU32::new(4_096).unwrap(),
+        };
+        let a = args();
+        let model = |inference: &InferenceEnv| {
+            let seeds = seed_files(&a.turn_agent(), &[], inference);
+            let v: Value = serde_json::from_str(&seeds[0].content).expect("valid json");
+            v["providers"]["crucible"]["models"][0].clone()
+        };
+        let limited = model(&bound(Some(limits)));
+        assert_eq!(limited["contextWindow"], 32_768);
+        assert_eq!(limited["maxTokens"], 4_096);
+        for inference in [
+            bound(None),
+            InferenceEnv {
+                anthropic_key: Some("sk-ant".into()),
+                ..Default::default()
+            },
+        ] {
+            let unset = model(&inference);
+            assert_eq!(unset["contextWindow"], 128_000);
+            assert_eq!(unset["maxTokens"], 16_384);
+        }
+
+        let vertex = |inference: &InferenceEnv| {
+            Pi.seed_files(&a.turn_agent(), &[], &SandboxAuth::Gateway, inference)[0]
+                .content
+                .clone()
+        };
+        let ext = vertex(&InferenceEnv {
+            selection: bound(Some(limits)).selection,
+            ..Default::default()
+        });
+        assert!(ext.contains("const CONTEXT_WINDOW = 32768;"), "{ext}");
+        assert!(ext.contains("const MAX_TOKENS = 4096;"), "{ext}");
+        let ext = vertex(&InferenceEnv::default());
+        assert!(ext.contains("const CONTEXT_WINDOW = 200000;"), "{ext}");
+        assert!(ext.contains("const MAX_TOKENS = 16384;"), "{ext}");
     }
 
     /// No key and no base URL is the ambient Vertex credential: no `models.json`, and the
