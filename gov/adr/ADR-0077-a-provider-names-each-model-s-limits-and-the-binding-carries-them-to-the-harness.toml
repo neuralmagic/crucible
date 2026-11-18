@@ -3,7 +3,7 @@
 [govctl]
 id = "ADR-0077"
 title = "A provider names each model's limits, and the binding carries them to the harness"
-status = "proposed"
+status = "accepted"
 date = "2026-11-18"
 refs = [
     "RFC-0001:C-INFERENCE",
