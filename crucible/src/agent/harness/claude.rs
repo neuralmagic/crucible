@@ -130,6 +130,16 @@ impl Backend for Claude {
         Ok(a)
     }
 
+    fn is_session_transcript(
+        &self,
+        file_name: &str,
+        session: &crate::agent::agent_session::SessionTurn,
+    ) -> bool {
+        file_name
+            .strip_suffix(".jsonl")
+            .is_some_and(|id| id == session.provider_id)
+    }
+
     /// The `.mcp.json` listing the turn's MCP servers, only when it reaches any.
     fn config(
         &self,

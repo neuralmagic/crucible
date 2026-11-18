@@ -243,7 +243,7 @@ pub(crate) trait Backend: Sync {
     /// The sandbox exec argv (program name first, no prompt, it arrives over stdin).
     /// `mcp_seeded` says whether the turn reaches any MCP server, and so whether
     /// [`Backend::seed_files`] delivered an MCP config, so a harness that takes it on argv
-    /// (claude's `--mcp-config`, pi's `-e` for the adapter) can point at it.
+    /// (claude's `--mcp-config`, pi's `--tools +codemode`) can act on it.
     fn sandbox_argv(&self, agent: &TurnAgent<'_>, mcp_seeded: bool) -> Vec<String>;
 
     /// Start or resume a Crucible-managed session locally.
@@ -264,6 +264,15 @@ pub(crate) trait Backend: Sync {
         _session: &crate::agent::agent_session::SessionTurn,
     ) -> std::io::Result<Vec<String>> {
         Err(no_sessions(self.spec()))
+    }
+
+    /// Whether `file_name` is the transcript this harness writes for `session`.
+    fn is_session_transcript(
+        &self,
+        _file_name: &str,
+        _session: &crate::agent::agent_session::SessionTurn,
+    ) -> bool {
+        false
     }
 
     /// The config file seeded at [`HarnessSpec::config`] before the agent execs, rendered

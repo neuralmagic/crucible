@@ -63,6 +63,15 @@ impl Pi {
     }
 }
 
+fn session_flags(session: &crate::agent::agent_session::SessionTurn) -> [String; 2] {
+    let flag = if session.is_resume() {
+        "--session"
+    } else {
+        "--session-id"
+    };
+    [flag.to_string(), session.provider_id.clone()]
+}
+
 /// Crucible's five reasoning tiers onto pi's `--thinking` levels; `max` is pi's ceiling on
 /// providers that have one and is not accepted everywhere, so the top two tiers map to `xhigh`.
 fn thinking_level(effort: ReasoningEffort) -> &'static str {
@@ -256,6 +265,40 @@ impl Backend for Pi {
             a.push("+codemode".to_string());
         }
         a
+    }
+
+    fn local_session_argv(
+        &self,
+        agent: &TurnAgent<'_>,
+        prompt: &str,
+        session: &crate::agent::agent_session::SessionTurn,
+    ) -> std::io::Result<Vec<String>> {
+        let mut a = self.local_argv(agent, prompt);
+        a.extend(session_flags(session));
+        Ok(a)
+    }
+
+    fn sandbox_session_argv(
+        &self,
+        agent: &TurnAgent<'_>,
+        mcp_seeded: bool,
+        session: &crate::agent::agent_session::SessionTurn,
+    ) -> std::io::Result<Vec<String>> {
+        let mut a = self.sandbox_argv(agent, mcp_seeded);
+        a.extend(session_flags(session));
+        Ok(a)
+    }
+
+    fn is_session_transcript(
+        &self,
+        file_name: &str,
+        session: &crate::agent::agent_session::SessionTurn,
+    ) -> bool {
+        file_name
+            .strip_suffix(".jsonl")
+            .and_then(|stem| stem.strip_suffix(session.provider_id.as_str()))
+            .and_then(|timestamp| timestamp.strip_suffix('_'))
+            .is_some_and(|timestamp| !timestamp.is_empty())
     }
 
     /// `models.json` for a keyed endpoint (it is where the `crucible` provider and the model come
@@ -557,6 +600,57 @@ mod tests {
         assert_eq!(thinking_level(ReasoningEffort::High), "high");
         assert_eq!(thinking_level(ReasoningEffort::Xhigh), "xhigh");
         assert_eq!(thinking_level(ReasoningEffort::Max), "xhigh");
+    }
+
+    fn session(completed_turns: u32) -> crate::agent::agent_session::SessionTurn {
+        crate::agent::agent_session::SessionTurn {
+            logical_name: "solver".into(),
+            provider_id: "018f47a0-0000-7000-8000-000000000000".into(),
+            completed_turns,
+        }
+    }
+
+    #[test]
+    fn a_first_turn_creates_the_session_and_a_later_turn_resumes_it_by_id() {
+        let a = args();
+        let agent = a.turn_agent();
+        let id = session(0).provider_id;
+
+        let base = Pi.sandbox_argv(&agent, true);
+        let started = Pi.sandbox_session_argv(&agent, true, &session(0)).unwrap();
+        assert_eq!(&started[..base.len()], &base[..]);
+        assert_eq!(&started[base.len()..], &["--session-id", id.as_str()]);
+        let resumed = Pi.sandbox_session_argv(&agent, true, &session(2)).unwrap();
+        assert_eq!(&resumed[..base.len()], &base[..]);
+        assert_eq!(&resumed[base.len()..], &["--session", id.as_str()]);
+
+        let base = Pi.local_argv(&agent, "try one");
+        let started = Pi
+            .local_session_argv(&agent, "try one", &session(0))
+            .unwrap();
+        assert_eq!(&started[..base.len()], &base[..]);
+        assert_eq!(&started[base.len()..], &["--session-id", id.as_str()]);
+        let resumed = Pi
+            .local_session_argv(&agent, "try one", &session(1))
+            .unwrap();
+        assert_eq!(&resumed[base.len()..], &["--session", id.as_str()]);
+    }
+
+    #[test]
+    fn a_session_transcript_is_a_timestamp_then_the_exact_session_id() {
+        let s = session(1);
+        let id = &s.provider_id;
+        assert!(Pi.is_session_transcript(&format!("2026-11-18T03-30-47-424Z_{id}.jsonl"), &s));
+        for other in [
+            format!("{id}.jsonl"),
+            format!("_{id}.jsonl"),
+            format!("2026-11-18T03-30-47-424Z_{id}"),
+            format!("2026-11-18T03-30-47-424Z_{id}.jsonl.bak"),
+            format!("2026-11-18T03-30-47-424Z-{id}.jsonl"),
+            "2026-11-18T03-30-47-424Z_other.jsonl".to_string(),
+        ] {
+            assert!(!Pi.is_session_transcript(&other, &s), "{other}");
+        }
     }
 
     /// A local turn feeds the prompt through a here-doc, so a prompt starting with `-` (a
