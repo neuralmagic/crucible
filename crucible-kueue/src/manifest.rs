@@ -68,6 +68,15 @@ impl WorkloadKind {
         )
     }
 
+    /// Kinds `expose` gives a Service. A RayJob, JobSet or PyTorchJob has Services its own
+    /// controller makes.
+    pub fn takes_service(self) -> bool {
+        matches!(
+            self,
+            Self::Job | Self::Deployment | Self::StatefulSet | Self::LeaderWorkerSet
+        )
+    }
+
     /// Kinds whose stop and resume scale `spec.replicas` to zero and back, since Kueue gives
     /// them no single Workload to deactivate.
     pub fn is_scalable(self) -> bool {
@@ -135,9 +144,9 @@ pub enum ManifestError {
     #[error("manifest must be a JSON object")]
     NotObject,
     #[error(
-        "expose takes a Deployment, StatefulSet or LeaderWorkerSet; a {kind} serves nothing to reach"
+        "expose takes a Job, Deployment, StatefulSet or LeaderWorkerSet; a {kind} makes its own Services"
     )]
-    ExposeBatch { kind: &'static str },
+    ExposeKind { kind: &'static str },
     #[error("expose takes 1 to {MAX_EXPOSED_PORTS} distinct ports from 1 to 65535, got {got:?}")]
     ExposePorts { got: Vec<u16> },
     #[error(
@@ -223,14 +232,14 @@ impl Normalized {
         total_requests(&self.pod_sets)
     }
 
-    /// Expose `ports` of the workload's pods through a Service of its name. Only kinds that serve
-    /// take one. The ports are part of the plan, so they change its hash.
+    /// Expose `ports` of the workload's pods through a Service of its name. The ports are part
+    /// of the plan, so they change its hash.
     pub fn exposing(mut self, ports: &[u16]) -> Result<Self, ManifestError> {
         if ports.is_empty() {
             return Ok(self);
         }
-        if self.kind.is_batch() {
-            return Err(ManifestError::ExposeBatch {
+        if !self.kind.takes_service() {
+            return Err(ManifestError::ExposeKind {
                 kind: self.kind.kind(),
             });
         }
@@ -2269,14 +2278,67 @@ mod tests {
     }
 
     #[test]
-    fn only_serving_kinds_expose_and_only_a_few_distinct_ports() {
-        let batch = normalize(job(), &caller(), &queue(), &Config::default())
+    fn an_exposed_job_gets_a_service_it_owns_selecting_its_pods() {
+        let n = normalize(job(), &caller(), &queue(), &Config::default())
             .unwrap()
-            .exposing(&[8000]);
+            .exposing(&[8000])
+            .unwrap();
+        let service = n
+            .service("team-a", "crucible.dev/workload", Some("uid-1"))
+            .unwrap();
         assert_eq!(
-            batch.unwrap_err().to_string(),
-            "expose takes a Deployment, StatefulSet or LeaderWorkerSet; a Job serves nothing to reach"
+            service["metadata"]["ownerReferences"],
+            json!([{"apiVersion": "batch/v1", "kind": "Job", "name": n.name, "uid": "uid-1"}])
         );
+        assert_eq!(
+            service["spec"]["selector"],
+            json!({"crucible.dev/workload": n.name})
+        );
+        assert_eq!(
+            n.object["spec"]["template"]["metadata"]["labels"]["crucible.dev/workload"],
+            json!(n.name)
+        );
+    }
+
+    #[test]
+    fn kinds_with_their_own_services_do_not_expose() {
+        let ray = json!({
+            "apiVersion": "ray.io/v1",
+            "kind": "RayJob",
+            "metadata": {"name": "tune"},
+            "spec": {"entrypoint": "python t.py", "rayClusterSpec": {"headGroupSpec": {
+                "template": {"spec": {"containers": [{"name": "head"}]}}
+            }}}
+        });
+        for (manifest, kind) in [
+            (jobset(), "JobSet"),
+            (pytorchjob(), "PyTorchJob"),
+            (ray, "RayJob"),
+        ] {
+            let refused = normalize(manifest, &caller(), &queue(), &Config::default())
+                .unwrap()
+                .exposing(&[8000]);
+            assert_eq!(
+                refused.unwrap_err().to_string(),
+                format!(
+                    "expose takes a Job, Deployment, StatefulSet or LeaderWorkerSet; a {kind} makes its own Services"
+                )
+            );
+        }
+        for kind in WorkloadKind::ALL {
+            assert_eq!(
+                kind.takes_service(),
+                !matches!(
+                    kind,
+                    WorkloadKind::RayJob | WorkloadKind::JobSet | WorkloadKind::PyTorchJob
+                ),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_few_distinct_ports_are_exposed() {
         for bad in [vec![0], vec![8000, 8000], (1..=9).collect::<Vec<u16>>()] {
             let refused = normalize(deployment(), &caller(), &queue(), &Config::default())
                 .unwrap()

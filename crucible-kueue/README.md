@@ -28,13 +28,17 @@ Planning or submitting a workload that already exists with the same plan hash an
 first time did (`dry_run: "already submitted with this plan"`, `submitted: false`), so a retried
 caller can run plan then submit again. One of that name with other content is refused.
 
-`workload_plan` and `workload_submit` take `expose`, a list of up to eight ports of a Deployment,
-StatefulSet or LeaderWorkerSet. The server creates a ClusterIP Service of the workload's name for
-them, selecting the pods by the `workload` label it stamps (a LeaderWorkerSet's leaders only) and
-owned by the workload, so deleting the workload deletes it. Plan, submit and `workload_status`
-answer `service`: its `name`, its `host` (`<name>.<namespace>.svc.<cluster domain>`) and `ports`.
-The ports are part of the plan hash. A Service of that name that is not the workload's refuses
-the submit.
+`workload_plan` and `workload_submit` take `expose`, a list of up to eight ports of a Job,
+Deployment, StatefulSet or LeaderWorkerSet. The server creates a ClusterIP Service of the
+workload's name for them, selecting the pods by the `workload` label it stamps (a
+LeaderWorkerSet's leaders only) and owned by the workload, so deleting the workload deletes it.
+Plan, submit and `workload_status` answer `service`: its `name`, its `host`
+(`<name>.<namespace>.svc.<cluster domain>`) and `ports`. The ports are part of the plan hash. A
+Service of that name that is not the workload's refuses the submit. A RayJob, JobSet or
+PyTorchJob is refused: its controller makes its own Services.
+
+A server that must not outlive a time limit is a Job with `expose`: `activeDeadlineSeconds` ends
+it, and `ttlSecondsAfterFinished` deletes it and its Service. A Deployment has neither field.
 
 Every tool answers JSON text with a `status`: `ok`, `refused`, `rejected`, `not_found`, `error`,
 or `failed` (a completed task whose workload failed). Anything but `ok` is a tool result with

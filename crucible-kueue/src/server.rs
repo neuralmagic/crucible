@@ -482,9 +482,11 @@ pub struct PlanArgs {
     /// privilege, another service account, or scheduling fields that bypass Kueue; the server's
     /// allowlist profile (whoami) decides Secrets, volume claims and tolerations.
     pub manifest: Value,
-    /// Ports of a Deployment, StatefulSet or LeaderWorkerSet to expose in the namespace: the
+    /// Ports of a Job, Deployment, StatefulSet or LeaderWorkerSet to expose in the namespace: the
     /// server creates a Service of the workload's name for them (a LeaderWorkerSet's leaders),
-    /// deleted with the workload, and plan, submit and status report where to reach it.
+    /// deleted with the workload, and plan, submit and status report where to reach it. A Job
+    /// that serves ends at its activeDeadlineSeconds and is deleted with its Service after its
+    /// ttlSecondsAfterFinished.
     #[serde(default)]
     pub expose: Vec<u16>,
 }
@@ -1876,7 +1878,7 @@ impl KueueMcp {
     }
 
     #[tool(
-        description = "Validate a workload without creating it: pins it to the namespace and queue, runs a server-side dry run, and estimates whether the queue's quota can admit it (fit: fits_now, waits_for_quota, never_fits). Returns the plan_hash workload_submit requires, how long a finished Job or RayJob is kept (finished_retention_seconds), and server_changes: what the server added, such as the image pull secret an image's registry needs. Planning a workload already submitted with the same plan answers the same plan again; one of that name with other content is refused. With expose, a Deployment, StatefulSet or LeaderWorkerSet also gets a Service of its name for those ports, and service says where it will be reached.",
+        description = "Validate a workload without creating it: pins it to the namespace and queue, runs a server-side dry run, and estimates whether the queue's quota can admit it (fit: fits_now, waits_for_quota, never_fits). Returns the plan_hash workload_submit requires, how long a finished Job or RayJob is kept (finished_retention_seconds), and server_changes: what the server added, such as the image pull secret an image's registry needs. Planning a workload already submitted with the same plan answers the same plan again; one of that name with other content is refused. With expose, a Job, Deployment, StatefulSet or LeaderWorkerSet also gets a Service of its name for those ports, and service says where it will be reached.",
         annotations(
             title = "Plan a workload",
             read_only_hint = true,

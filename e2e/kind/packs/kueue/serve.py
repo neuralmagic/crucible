@@ -1,4 +1,6 @@
-"""Serve a nonce over HTTP on Kueue, reach it from this task and from a Job, then delete it."""
+"""Serve a nonce over HTTP on Kueue, reach it from this task and from a Job, then delete it.
+
+Then serve it from a Job that ends at its deadline and is deleted by its TTL."""
 
 import asyncio
 import json
@@ -31,6 +33,24 @@ SERVER = {
                         "resources": RESOURCES,
                     }
                 ]
+            }
+        },
+    },
+}
+
+EXPIRING = {
+    "apiVersion": "batch/v1",
+    "kind": "Job",
+    "metadata": {"name": "task-expire"},
+    "spec": {
+        "backoffLimit": 0,
+        "activeDeadlineSeconds": 45,
+        "ttlSecondsAfterFinished": 0,
+        "template": {
+            "spec": {
+                "restartPolicy": "Never",
+                "terminationGracePeriodSeconds": 1,
+                "containers": SERVER["spec"]["template"]["spec"]["containers"],
             }
         },
     },
@@ -167,6 +187,15 @@ async def gone(kueue: AsyncClient, kind: str, name: str) -> bool:
     return False
 
 
+async def expiring(kueue: AsyncClient) -> dict:
+    """What a Job that serves answers at its Service, and whether it then goes by itself."""
+    served = await kueue.submit("@QUEUE@", EXPIRING, expose=[8000])
+    await kueue.wait("Job", "task-expire", "ready", timeout=240)
+    host = served["service"]["host"]
+    reached = await fetch(f"http://{host}:8000/nonce") == "@NONCE@"
+    return {"host": host, "reached": reached, "gone": await gone(kueue, "Job", "task-expire")}
+
+
 async def main() -> None:
     kueue = AsyncClient()
     async with kueue.serving("@QUEUE@", SERVER, 8000, timeout=240) as url:
@@ -174,12 +203,8 @@ async def main() -> None:
         status = await kueue.workload_status("Deployment", "task-serve")
         from_task = await fetch(f"{url}/nonce")
         from_job = await kueue.run("@QUEUE@", client_job(f"{url}/nonce"), timeout=240)
-        try:
-            await kueue.workload_plan("@QUEUE@", client_job(url), expose=[8000])
-            batch_refused = False
-        except ToolError as error:
-            batch_refused = error.status == "refused"
     retired = await gone(kueue, "Deployment", "task-serve")
+    expired = await expiring(kueue)
     await kueue.submit("@QUEUE@", TICKER)
     await kueue.wait("Job", "task-ticker", "running", timeout=240)
     ticks = await asyncio.wait_for(followed(kueue), timeout=120)
@@ -192,7 +217,7 @@ async def main() -> None:
                 "status_service": status.get("service"),
                 "from_task": from_task == "@NONCE@",
                 "from_job": "@NONCE@" in from_job,
-                "batch_refused": batch_refused,
+                "expired": expired,
                 "ticks": ticks,
                 "raised": raised,
                 "gone": retired,
