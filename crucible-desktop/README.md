@@ -17,7 +17,7 @@ Security, Open Anyway, or run `xattr -d com.apple.quarantine "/Applications/Cruc
 
 The [`nightly`](https://github.com/neuralmagic/crucible/releases/tag/nightly) prerelease carries
 the same artifacts built from `main`, rebuilt each night `main` has moved; its notes name the
-commit. Asset names carry the build date and short commit
+commit. A nightly's app icon is green. Asset names carry the build date and short commit
 (`Crucible-Playbooks-nightly-<yyyymmdd>-<commit>-aarch64-apple-darwin.zip`,
 `crucible-playbooks-<version>.<yyyymmdd>.<commit>-1.fc45.<arch>.rpm`), and each nightly replaces the
 last. They are signed exactly as the tagged builds are: the macOS app ad hoc, so the first-launch

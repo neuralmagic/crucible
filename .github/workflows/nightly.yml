@@ -65,6 +65,7 @@ jobs:
       ref: ${{ github.sha }}
       stamp: ${{ needs.plan.outputs.stamp }}
       version: ${{ needs.plan.outputs.version }}
+      icon: icon-feature
 
   publish:
     needs: [plan, build]

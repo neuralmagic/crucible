@@ -12,7 +12,8 @@ name: Release
 # target gets onto an already-cut release without re-tagging).
 #
 # workflow_call: the Nightly workflow builds commit `ref` and uploads to the release `tag`, with
-# `stamp` in the asset names and `version` in the bundles in place of the tag.
+# `stamp` in the asset names and `version` in the bundles in place of the tag, and the app icon
+# `icon` from crucible-desktop/assets.
 on:
   push:
     tags: ['v*']
@@ -28,6 +29,9 @@ on:
         type: string
         required: true
       version:
+        type: string
+        required: true
+      icon:
         type: string
         required: true
   workflow_dispatch:
@@ -184,7 +188,7 @@ jobs:
           version="${{ inputs.version || inputs.tag || github.ref_name }}"
           cargo build --release --locked -p crucible-lsp
           ( cd crucible-desktop && cargo build --release --locked )
-          VERSION="${version#v}" sh crucible-desktop/linux-bundle.sh
+          VERSION="${version#v}" ICON="${{ inputs.icon || 'icon' }}" sh crucible-desktop/linux-bundle.sh
           mkdir -p dist
           cp crucible-desktop/target/linux/*.rpm dist/
           ( cd dist && for f in *.rpm; do sha256sum "$f" > "$f.sha256"; done )
@@ -231,7 +235,7 @@ jobs:
           version="${{ inputs.version || inputs.tag || github.ref_name }}"
           cargo build --release --locked -p crucible-lsp
           ( cd crucible-desktop && cargo build --release --locked )
-          VERSION="${version#v}" sh crucible-desktop/macos-bundle.sh
+          VERSION="${version#v}" ICON="${{ inputs.icon || 'icon' }}" sh crucible-desktop/macos-bundle.sh
 
       - name: Package
         run: |
