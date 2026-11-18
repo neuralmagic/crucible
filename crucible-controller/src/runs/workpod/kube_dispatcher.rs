@@ -61,6 +61,16 @@ impl PodDispatcher for KubePodDispatcher {
         Ok(())
     }
 
+    async fn delete_secret(&self, cluster: &str, namespace: &str, name: &str) -> Result<()> {
+        let client = self.clusters.client(cluster).await?;
+        let api: kube::Api<Secret> = kube::Api::namespaced(client, namespace);
+        match api.delete(name, &kube::api::DeleteParams::default()).await {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(s)) if s.code == 404 => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("deleting Secret {namespace}/{name}")),
+        }
+    }
+
     async fn set_secret_value(
         &self,
         cluster: &str,

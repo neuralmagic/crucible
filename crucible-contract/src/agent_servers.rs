@@ -115,6 +115,10 @@ pub struct BuilditSite {
     /// The one repository it pushes to; none, it pushes nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub push_repo: Option<String>,
+    /// The file in the loop pod that holds the push authfile, when the run brings its own; none,
+    /// the loop pod's own (`FORGE_AUTHFILE`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_authfile: Option<String>,
     /// The Kueue LocalQueue its builder pods are submitted to; none, they carry no queue.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue: Option<String>,
@@ -398,6 +402,7 @@ mod tests {
                     run_issuer: "https://hub.example=https://hub.example/jwks".into(),
                     namespace: "builds".into(),
                     push_repo: None,
+                    push_authfile: None,
                     queue: Some("builders".into()),
                     builders: BuilderPods::default(),
                     cache: Some(SharedCache {
@@ -425,6 +430,7 @@ mod tests {
             run_issuer: "https://hub.example=https://hub.example/jwks".into(),
             namespace: "builds".into(),
             push_repo: None,
+            push_authfile: None,
             queue: None,
             builders,
             cache: None,

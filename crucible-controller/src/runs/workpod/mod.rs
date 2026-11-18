@@ -37,6 +37,7 @@ pub mod gateway;
 mod git_sidecar;
 pub(crate) mod kube_dispatcher;
 mod markers;
+pub mod registries;
 pub(crate) mod retry;
 mod run;
 mod scrape;

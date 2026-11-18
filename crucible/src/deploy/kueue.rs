@@ -32,6 +32,13 @@ pub struct MissingKueueTable;
 pub struct NoKueueImage;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error(
+    "[kueue] run_pull_secrets needs [cluster] sandbox_readers: the controller identity that \
+     writes a run's pull Secrets into the server's namespace"
+)]
+pub struct NoPullSecretWriter;
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum KueueClusterError {
     #[error("[kueue] serves {clusters:?}; name the one to render with --kueue-cluster")]
     Several { clusters: Vec<String> },
@@ -117,7 +124,7 @@ pub fn render(profile: &DeployProfile, opts: &RenderOpts, target: &KueueTarget) 
         "cluster ClusterRoleBinding",
         yaml(&cluster_role_binding(cfg)),
     )?;
-    push("workload ClusterRole", yaml(&workload_cluster_role()))?;
+    push("workload ClusterRole", yaml(&workload_cluster_role(cfg)))?;
     for namespace in &cfg.workload_namespaces {
         push(
             "workload RoleBinding",
@@ -127,6 +134,34 @@ pub fn render(profile: &DeployProfile, opts: &RenderOpts, target: &KueueTarget) 
     push("caller ClusterRole", yaml(&caller_cluster_role(cfg)))?;
     for namespace in &cfg.shared_namespaces {
         push("caller RoleBinding", yaml(&caller_binding(cfg, namespace)))?;
+    }
+    if cfg.run_pull_secrets {
+        let writers = &profile.cluster.sandbox_readers;
+        if writers.is_empty() {
+            return Err(NoPullSecretWriter.into());
+        }
+        let writers = writers
+            .iter()
+            .map(|sa| rbac::Subject {
+                kind: "ServiceAccount".to_string(),
+                name: sa.name.to_string(),
+                namespace: Some(sa.namespace.to_string()),
+                ..Default::default()
+            })
+            .collect();
+        for (name, verbs, subjects) in [
+            (PULL_SECRET_WRITER, &["create", "delete"][..], writers),
+            (PULL_SECRET_READER, &["get"][..], vec![server_subject(cfg)]),
+        ] {
+            push(
+                "pull secret Role",
+                yaml(&pull_secret_role(cfg, name, verbs)),
+            )?;
+            push(
+                "pull secret RoleBinding",
+                yaml(&pull_secret_binding(cfg, name, subjects)),
+            )?;
+        }
     }
     Ok(docs.join("---\n"))
 }
@@ -249,6 +284,12 @@ fn args(cfg: &KueueCfg, cluster: &str, issuer: &str, authz: KubeAuthz) -> Result
     }
     for secret in &cfg.pull_secrets {
         args.extend(["--pull-secret".to_string(), secret.clone()]);
+    }
+    if cfg.run_pull_secrets {
+        args.extend([
+            "--run-pull-secrets-namespace".to_string(),
+            cfg.namespace.to_string(),
+        ]);
     }
     for class in cfg.storage_classes.get(cluster).into_iter().flatten() {
         args.extend(["--storage-class".to_string(), class.clone()]);
@@ -417,31 +458,40 @@ fn cluster_role_binding(cfg: &KueueCfg) -> rbac::ClusterRoleBinding {
     }
 }
 
-/// Namespaced workload verbs, granted only where a RoleBinding names them.
-fn workload_cluster_role() -> rbac::ClusterRole {
+/// Namespaced workload verbs, granted only where a RoleBinding names them. With
+/// `run_pull_secrets`, also creating the copies of runs' pull Secrets their workloads own.
+fn workload_cluster_role(cfg: &KueueCfg) -> rbac::ClusterRole {
+    let copies = cfg
+        .run_pull_secrets
+        .then(|| rule(&[""], &["secrets"], &["create"]));
     rbac::ClusterRole {
         metadata: meta(format!("{NAME}-workloads"), None),
-        rules: Some(vec![
-            rule(&[KUEUE_GROUP], &["localqueues"], &["get", "list"]),
-            rule(&[KUEUE_GROUP], &["workloads"], &["get", "list", "patch"]),
-            rule(
-                &[VISIBILITY_GROUP],
-                &["localqueues/pendingworkloads"],
-                &["get", "list"],
-            ),
-            rule(&["batch"], &["jobs"], WORKLOAD_VERBS),
-            rule(&["ray.io"], &["rayjobs"], WORKLOAD_VERBS),
-            rule(
-                &["leaderworkerset.x-k8s.io"],
-                &["leaderworkersets"],
-                WORKLOAD_VERBS,
-            ),
-            rule(&["apps"], &["deployments", "statefulsets"], WORKLOAD_VERBS),
-            rule(&["jobset.x-k8s.io"], &["jobsets"], WORKLOAD_VERBS),
-            rule(&["kubeflow.org"], &["pytorchjobs"], WORKLOAD_VERBS),
-            rule(&[""], &["pods", "pods/log", "events"], &["get", "list"]),
-            rule(&[""], &["services"], &["get", "create"]),
-        ]),
+        rules: Some(
+            vec![
+                rule(&[KUEUE_GROUP], &["localqueues"], &["get", "list"]),
+                rule(&[KUEUE_GROUP], &["workloads"], &["get", "list", "patch"]),
+                rule(
+                    &[VISIBILITY_GROUP],
+                    &["localqueues/pendingworkloads"],
+                    &["get", "list"],
+                ),
+                rule(&["batch"], &["jobs"], WORKLOAD_VERBS),
+                rule(&["ray.io"], &["rayjobs"], WORKLOAD_VERBS),
+                rule(
+                    &["leaderworkerset.x-k8s.io"],
+                    &["leaderworkersets"],
+                    WORKLOAD_VERBS,
+                ),
+                rule(&["apps"], &["deployments", "statefulsets"], WORKLOAD_VERBS),
+                rule(&["jobset.x-k8s.io"], &["jobsets"], WORKLOAD_VERBS),
+                rule(&["kubeflow.org"], &["pytorchjobs"], WORKLOAD_VERBS),
+                rule(&[""], &["pods", "pods/log", "events"], &["get", "list"]),
+                rule(&[""], &["services"], &["get", "create"]),
+            ]
+            .into_iter()
+            .chain(copies)
+            .collect(),
+        ),
         ..Default::default()
     }
 }
@@ -518,6 +568,32 @@ fn caller_binding(_cfg: &KueueCfg, namespace: &KubeName) -> rbac::RoleBinding {
             name: RUNS_GROUP.to_string(),
             ..Default::default()
         }]),
+    }
+}
+
+/// The controller's Role over runs' pull Secrets in the server's namespace: it writes one at
+/// dispatch and deletes it when the run ends.
+const PULL_SECRET_WRITER: &str = "crucible-kueue-run-pull-secret-writer";
+
+/// The server's Role over them: it reads the one a workload's images need, to copy it.
+const PULL_SECRET_READER: &str = "crucible-kueue-run-pull-secret-reader";
+
+fn pull_secret_role(cfg: &KueueCfg, name: &str, verbs: &[&str]) -> rbac::Role {
+    rbac::Role {
+        metadata: meta(name, Some(cfg.namespace.as_str())),
+        rules: Some(vec![rule(&[""], &["secrets"], verbs)]),
+    }
+}
+
+fn pull_secret_binding(
+    cfg: &KueueCfg,
+    name: &str,
+    subjects: Vec<rbac::Subject>,
+) -> rbac::RoleBinding {
+    rbac::RoleBinding {
+        metadata: meta(name, Some(cfg.namespace.as_str())),
+        role_ref: role_ref("Role", name),
+        subjects: Some(subjects),
     }
 }
 
@@ -1032,6 +1108,132 @@ mod tests {
                 .iter()
                 .any(|d| d["kind"] == "RoleBinding"
                     && d["metadata"]["name"] == "crucible-kueue-runs")
+        );
+    }
+
+    #[test]
+    fn run_pull_secrets_has_the_controller_write_them_and_the_server_copy_them() {
+        let plain = docs(PROFILE);
+        assert!(!plain.iter().any(|d| {
+            d["metadata"]["name"]
+                .as_str()
+                .is_some_and(|n| n.contains("pull-secret"))
+        }));
+        assert!(!args(&plain).contains(&"--run-pull-secrets-namespace".to_string()));
+        let creates_secrets = |docs: &[serde_json::Value]| {
+            find(docs, "ClusterRole", "crucible-kueue-workloads")["rules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["resources"] == serde_json::json!(["secrets"]))
+        };
+        assert!(!creates_secrets(&plain));
+
+        let taking = PROFILE
+            .replace(
+                "namespace = \"crucible-system\"\n        workload",
+                "namespace = \"crucible-kueue\"\n        run_pull_secrets = true\n        workload",
+            )
+            .replace(
+                "[image]",
+                "sandbox_readers = [\"crucible/crucible-controller\"]\n[image]",
+            );
+        let rendered = docs(&taking);
+        assert!(
+            args(&rendered)
+                .windows(2)
+                .any(|w| w == ["--run-pull-secrets-namespace", "crucible-kueue"])
+        );
+        assert!(
+            find(&rendered, "ClusterRole", "crucible-kueue-workloads")["rules"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!({
+                    "apiGroups": [""],
+                    "resources": ["secrets"],
+                    "verbs": ["create"],
+                }))
+        );
+        for (name, verbs, subject) in [
+            (
+                "crucible-kueue-run-pull-secret-writer",
+                serde_json::json!(["create", "delete"]),
+                serde_json::json!({
+                    "kind": "ServiceAccount",
+                    "name": "crucible-controller",
+                    "namespace": "crucible",
+                }),
+            ),
+            (
+                "crucible-kueue-run-pull-secret-reader",
+                serde_json::json!(["get"]),
+                serde_json::json!({
+                    "kind": "ServiceAccount",
+                    "name": "crucible-kueue",
+                    "namespace": "crucible-kueue",
+                }),
+            ),
+        ] {
+            let role = find(&rendered, "Role", name);
+            assert_eq!(role["metadata"]["namespace"], "crucible-kueue");
+            assert_eq!(
+                role["rules"],
+                serde_json::json!([{"apiGroups": [""], "resources": ["secrets"], "verbs": verbs}])
+            );
+            let binding = find(&rendered, "RoleBinding", name);
+            assert_eq!(binding["metadata"]["namespace"], "crucible-kueue");
+            assert_eq!(binding["roleRef"]["kind"], "Role");
+            assert_eq!(binding["subjects"], serde_json::json!([subject]));
+        }
+
+        let no_writer = PROFILE.replace("[kueue]", "[kueue]\nrun_pull_secrets = true");
+        let err = render(&profile(&no_writer), &RenderOpts::default(), &target(None)).unwrap_err();
+        assert!(
+            err.downcast_ref::<NoPullSecretWriter>().is_some(),
+            "{err:#}"
+        );
+    }
+
+    /// The server reads every Secret in its namespace once it takes run pull secrets, so it
+    /// shares that namespace with no loop pod, rig or controller.
+    #[test]
+    fn a_server_that_takes_run_pull_secrets_has_a_namespace_of_its_own() {
+        use crate::deploy::profile::PullSecretNamespaceShared;
+        let taking = |profile: &str| {
+            toml::from_str::<DeployProfile>(
+                &profile.replace("[kueue]", "[kueue]\nrun_pull_secrets = true"),
+            )
+            .expect("parses")
+            .check_pull_secret_namespace()
+        };
+        assert_eq!(
+            taking(PROFILE),
+            Err(PullSecretNamespaceShared {
+                namespace: "crucible-system".into(),
+                shared: "cluster.loop_namespace",
+            })
+        );
+        let own = PROFILE.replace(
+            "namespace = \"crucible-system\"\n        workload",
+            "namespace = \"crucible-kueue\"\n        workload",
+        );
+        assert_eq!(taking(&own), Ok(()));
+        let beside_the_controller = own.replace(
+            "[image]",
+            "sandbox_readers = [\"crucible-kueue/crucible-controller\"]\n[image]",
+        );
+        assert_eq!(
+            taking(&beside_the_controller),
+            Err(PullSecretNamespaceShared {
+                namespace: "crucible-kueue".into(),
+                shared: "a cluster.sandbox_readers account's namespace",
+            })
+        );
+        assert_eq!(
+            toml::from_str::<DeployProfile>(PROFILE)
+                .expect("parses")
+                .check_pull_secret_namespace(),
+            Ok(())
         );
     }
 

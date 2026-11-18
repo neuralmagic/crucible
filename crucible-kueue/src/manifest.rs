@@ -4,7 +4,7 @@
 //! secret, or a scheduling escape from Kueue is refused by not being on the list.
 
 use crate::caller::{Caller, QueueName};
-use crate::config::{Config, Lifetimes, QUEUE_LABEL};
+use crate::config::{Config, Lifetimes, PullSecret, QUEUE_LABEL};
 use kube::core::ApiResource;
 use kube_quantity::ParsedQuantity;
 use rmcp::schemars;
@@ -216,6 +216,30 @@ pub struct Normalized {
     pub plan_hash: String,
     /// What the server added to the manifest beyond its own labels and defaults, for the plan.
     pub server_changes: Vec<String>,
+    /// The caller's own pull secrets the workload's pods name, to copy beside it.
+    pub pull_copies: Vec<PullCopy>,
+}
+
+/// A copy of one of the caller's own pull secrets, made in the workload's namespace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullCopy {
+    /// The copy's name, which the workload's pods pull with.
+    pub name: String,
+    /// The Secret it is copied from, in [`Config::run_pull_secret_namespace`].
+    pub source: String,
+}
+
+/// The type of an image pull Secret, and the one key it holds.
+const DOCKER_CONFIG_TYPE: &str = "kubernetes.io/dockerconfigjson";
+const DOCKER_CONFIG_KEY: &str = ".dockerconfigjson";
+
+/// The docker config `secret` holds, when it is an image pull Secret.
+pub fn docker_config(secret: &Value) -> Option<&Value> {
+    let typed = secret.get("type").and_then(Value::as_str) == Some(DOCKER_CONFIG_TYPE);
+    secret
+        .pointer("/data")
+        .and_then(|data| data.get(DOCKER_CONFIG_KEY))
+        .filter(|_| typed)
 }
 
 impl Normalized {
@@ -245,6 +269,37 @@ impl Normalized {
         self.expose = distinct;
         self.plan_hash = plan_hash(&json!({"object": self.object, "expose": self.expose}));
         Ok(self)
+    }
+
+    /// The Secret `copy` names, in `namespace`: `docker_config` under the workload's own labels,
+    /// owned by the workload when `owner_uid` names it, so it is deleted with it.
+    pub fn pull_secret(
+        &self,
+        copy: &PullCopy,
+        namespace: &str,
+        docker_config: &Value,
+        owner_uid: Option<&str>,
+    ) -> Value {
+        let mut metadata = json!({
+            "name": copy.name,
+            "namespace": namespace,
+            "labels": self.object.pointer("/metadata/labels").cloned().unwrap_or_else(|| json!({})),
+        });
+        if let Some(uid) = owner_uid {
+            metadata["ownerReferences"] = json!([{
+                "apiVersion": self.kind.api_version(),
+                "kind": self.kind.kind(),
+                "name": self.name,
+                "uid": uid,
+            }]);
+        }
+        json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": metadata,
+            "type": DOCKER_CONFIG_TYPE,
+            "data": {DOCKER_CONFIG_KEY: docker_config},
+        })
     }
 
     /// The Service exposing the workload's ports in `namespace`, selecting its pods by the
@@ -472,6 +527,9 @@ pub fn normalize(
         )?;
     }
 
+    let own = own_pull_copies(&name, caller, cfg);
+    let offering = cfg.offering(own.iter().map(|(_, offered)| offered.clone()).collect());
+    let cfg = offering.as_ref();
     let mut root = Value::Object(obj);
     check_object_fields(kind, &root, cfg)?;
     let mut pod_sets = Vec::new();
@@ -513,6 +571,12 @@ pub fn normalize(
     if matches!(kind, WorkloadKind::Deployment | WorkloadKind::StatefulSet) {
         pin_selector(&mut root, &name, caller.run_id.as_str(), cfg)?;
     }
+    let named = pull_secret_names(kind, &root)?;
+    let pull_copies = own
+        .into_iter()
+        .filter(|(copy, _)| named.contains(&copy.name))
+        .map(|(copy, _)| copy)
+        .collect();
     let object = root;
     let plan_hash = plan_hash(&object);
     Ok(Normalized {
@@ -523,7 +587,44 @@ pub fn normalize(
         pod_sets,
         plan_hash,
         server_changes,
+        pull_copies,
     })
+}
+
+/// The copies workload `name` may make of the caller's own pull secrets, each with the pull
+/// secret the copy is offered as; none where the server takes no run pull secrets.
+fn own_pull_copies(name: &str, caller: &Caller, cfg: &Config) -> Vec<(PullCopy, PullSecret)> {
+    if cfg.run_pull_secret_namespace.is_none() {
+        return Vec::new();
+    }
+    caller
+        .pull_secrets
+        .iter()
+        .enumerate()
+        .map(|(i, source)| {
+            let copy = PullCopy {
+                name: format!("{name}-pull-{i}"),
+                source: source.name.clone(),
+            };
+            let offered = PullSecret {
+                name: copy.name.clone(),
+                registries: source.registries.clone(),
+            };
+            (copy, offered)
+        })
+        .collect()
+}
+
+/// Every image pull secret the pod templates of `object` name.
+fn pull_secret_names(kind: WorkloadKind, object: &Value) -> Result<Vec<String>, ManifestError> {
+    Ok(template_slots(kind, object)?
+        .into_iter()
+        .filter_map(|slot| object.pointer(&format!("{}/spec/imagePullSecrets", slot.pointer)))
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(|entry| entry.get("name").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect())
 }
 
 /// Adds each configured pull secret whose registry serves one of the pod's images and that the
@@ -1618,6 +1719,7 @@ mod tests {
             namespace: Namespace::parse("team-a").unwrap(),
             launched_by: Launcher::parse("alice").unwrap(),
             kube_user: "alice-k8s".into(),
+            pull_secrets: Vec::new(),
             served: crate::caller::Served::for_test(),
         }
     }
@@ -1835,6 +1937,145 @@ mod tests {
             pull_secrets: vec![PullSecret::parse("quay-pull=quay.io/example").unwrap()],
             ..Config::default()
         }
+    }
+
+    fn taking() -> Config {
+        Config {
+            run_pull_secret_namespace: Some("crucible-kueue".into()),
+            ..quay()
+        }
+    }
+
+    fn bringing() -> Caller {
+        Caller {
+            pull_secrets: vec![
+                PullSecret::parse("run-7-pull-0=quay.io/mine").unwrap(),
+                PullSecret::parse("run-7-pull-1=ghcr.io/mine").unwrap(),
+            ],
+            ..caller()
+        }
+    }
+
+    #[test]
+    fn a_pod_pulling_from_a_callers_registry_names_a_copy_of_the_callers_secret() {
+        let n = normalize(
+            imaged("ghcr.io/mine/smoke@sha256:ab"),
+            &bringing(),
+            &queue(),
+            &taking(),
+        )
+        .unwrap();
+        assert_eq!(
+            n.object.pointer("/spec/template/spec/imagePullSecrets"),
+            Some(&json!([{"name": "train-pull-1"}]))
+        );
+        assert_eq!(
+            n.server_changes,
+            [
+                "/spec/template/spec/imagePullSecrets: added train-pull-1 to pull ghcr.io/mine/smoke@sha256:ab"
+            ]
+        );
+        assert_eq!(
+            n.pull_copies,
+            [PullCopy {
+                name: "train-pull-1".into(),
+                source: "run-7-pull-1".into(),
+            }]
+        );
+        let again = normalize(n.object.clone(), &bringing(), &queue(), &taking()).unwrap();
+        assert_eq!(
+            again.plan_hash, n.plan_hash,
+            "a normalized manifest is its own plan"
+        );
+        assert_eq!(again.pull_copies, n.pull_copies);
+        assert!(
+            again.server_changes.is_empty(),
+            "{:?}",
+            again.server_changes
+        );
+    }
+
+    #[test]
+    fn a_callers_own_pull_secret_is_offered_to_it_alone_and_only_where_the_server_takes_them() {
+        let image = || imaged("quay.io/mine/smoke@sha256:ab");
+        let others = normalize(image(), &caller(), &queue(), &taking()).unwrap();
+        assert!(others.pull_copies.is_empty());
+        assert!(
+            others.server_changes.is_empty(),
+            "{:?}",
+            others.server_changes
+        );
+
+        let not_taking = normalize(image(), &bringing(), &queue(), &quay()).unwrap();
+        assert!(not_taking.pull_copies.is_empty());
+        assert_eq!(
+            not_taking
+                .object
+                .pointer("/spec/template/spec/imagePullSecrets"),
+            None
+        );
+
+        let pulling = |name: &str| with_pod(json!({"imagePullSecrets": [{"name": name}]}));
+        let source = normalize(pulling("run-7-pull-0"), &bringing(), &queue(), &taking())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            source.contains(
+                "\"run-7-pull-0\" is not one this server offers; it offers quay-pull (quay.io/example), train-pull-0 (quay.io/mine), train-pull-1 (ghcr.io/mine)"
+            ),
+            "{source}"
+        );
+        let public = normalize(job(), &bringing(), &queue(), &taking()).unwrap();
+        assert!(public.pull_copies.is_empty());
+    }
+
+    #[test]
+    fn a_pull_copy_is_the_sources_docker_config_owned_by_the_workload() {
+        let n = normalize(
+            imaged("quay.io/mine/smoke@sha256:ab"),
+            &bringing(),
+            &queue(),
+            &taking(),
+        )
+        .unwrap();
+        let copy = &n.pull_copies[0];
+        let source = json!({
+            "metadata": {"name": "run-7-pull-0", "namespace": "crucible-kueue", "uid": "s-1"},
+            "type": "kubernetes.io/dockerconfigjson",
+            "data": {".dockerconfigjson": "eyJhdXRocyI6e319"},
+        });
+        let config = docker_config(&source).unwrap();
+        let owned = n.pull_secret(copy, "team-a", config, Some("uid-9"));
+        assert_eq!(
+            owned,
+            json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": {
+                    "name": "train-pull-0",
+                    "namespace": "team-a",
+                    "labels": n.object["metadata"]["labels"],
+                    "ownerReferences": [{
+                        "apiVersion": "batch/v1",
+                        "kind": "Job",
+                        "name": "train",
+                        "uid": "uid-9",
+                    }],
+                },
+                "type": "kubernetes.io/dockerconfigjson",
+                "data": {".dockerconfigjson": "eyJhdXRocyI6e319"},
+            })
+        );
+        assert_eq!(owned["metadata"]["labels"]["crucible.dev/run-id"], "run-7");
+        let dry = n.pull_secret(copy, "team-a", config, None);
+        assert!(dry["metadata"].get("ownerReferences").is_none());
+
+        let mut opaque = source.clone();
+        opaque["type"] = json!("Opaque");
+        assert_eq!(docker_config(&opaque), None);
+        let mut empty = source.clone();
+        empty["data"] = json!({});
+        assert_eq!(docker_config(&empty), None);
     }
 
     fn imaged(image: &str) -> Value {

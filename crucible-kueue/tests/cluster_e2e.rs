@@ -15,7 +15,8 @@
 //! tokens carry the run's own identity (`crucible:run:<pod>` in Group `crucible:runs`), decided by
 //! SubjectAccessReview: they need `use` on the
 //! LocalQueue and the workload verbs the tests exercise in the namespace, and the context's identity
-//! needs `create` on subjectaccessreviews.
+//! needs `create` on subjectaccessreviews. The pull secret test also has it create, read and
+//! delete Secrets in the namespace, which stands in for the server's source namespace.
 
 use crucible_mcp_auth::testing::{self, JwksServer};
 use rmcp::ServiceExt;
@@ -149,6 +150,17 @@ async fn serve_as(
     namespaces: &[String],
     callers: crucible_mcp_auth::principal::Callers,
 ) -> String {
+    let mut config = env.config();
+    config.namespaces = namespaces.to_vec();
+    serve_with(env, config, callers).await
+}
+
+/// The server on loopback with `config`, trusting one issuer for `callers`.
+async fn serve_with(
+    env: &Env,
+    config: crucible_kueue::config::Config,
+    callers: crucible_mcp_auth::principal::Callers,
+) -> String {
     let jwks = JwksServer::start(vec![testing::jwk("a")]).await;
     let mut rs = testing::config(jwks.url.clone());
     rs.issuers[0].callers = callers;
@@ -161,8 +173,8 @@ async fn serve_as(
         context: Some(env.context.clone()),
         ..Default::default()
     };
-    let config = kube::Config::from_kubeconfig(&options).await.unwrap();
-    let client = kube::Client::try_from(config).unwrap();
+    let kube_config = kube::Config::from_kubeconfig(&options).await.unwrap();
+    let client = kube::Client::try_from(kube_config).unwrap();
     let kueue_version = crucible_kueue::kueue::KueueVersion::discover(&client)
         .await
         .unwrap();
@@ -171,8 +183,6 @@ async fn serve_as(
         client.clone(),
         crucible_mcp_auth::kube::GroupSource::Token,
     ));
-    let mut config = env.config();
-    config.namespaces = namespaces.to_vec();
     let app = crucible_kueue::router(
         client.clone(),
         crucible_kueue::Options {
@@ -1227,6 +1237,142 @@ async fn cancelling_a_task_stops_the_job_and_unknown_tasks_are_errors() {
     )
     .await;
     assert_eq!(deleted["status"], "ok", "{deleted:#}");
+}
+
+/// A run's own pull secret, a Secret its issuer placed in the server's source namespace and
+/// named in its token, is copied beside a Job whose image is on its registry. The copy is the
+/// Job's: deleted with it, and made again for a Job of the same name submitted right after.
+#[tokio::test]
+#[ignore = "needs a cluster with Kueue; see the module docs"]
+async fn a_runs_pull_secret_is_copied_beside_its_job_and_goes_with_it() {
+    use k8s_openapi::api::core::v1::Secret;
+    let env = env();
+    if env.mode != Mode::Crucible {
+        return;
+    }
+    let run = unique("e2e-pull");
+    let source = format!("{run}-pull-0");
+    let secrets: kube::Api<Secret> = kube::Api::namespaced(kube_client(&env).await, &env.namespace);
+    let placed: Secret = serde_json::from_value(json!({
+        "metadata": {"name": source},
+        "type": "kubernetes.io/dockerconfigjson",
+        "stringData": {".dockerconfigjson": r#"{"auths":{}}"#},
+    }))
+    .unwrap();
+    let placed = secrets
+        .create(&kube::api::PostParams::default(), &placed)
+        .await
+        .unwrap();
+
+    let config = crucible_kueue::config::Config {
+        run_pull_secret_namespace: Some(env.namespace.clone()),
+        ..env.config()
+    };
+    let url = serve_with(&env, config, crucible_mcp_auth::principal::Callers::Runs).await;
+    let mut claims = token_claims(&env, &run, "kueue.read kueue.submit");
+    claims["pull_secrets"] = json!([format!("{source}=registry.access.redhat.com/ubi9")]);
+    let agent = connect(&url, &testing::sign("a", &claims)).await.unwrap();
+
+    let name = unique("ck-e2e-pull");
+    let copy = format!("{name}-pull-0");
+    let manifest = job(&name, "echo pulled");
+    let plan = submit(&agent, &env.queue, &manifest).await;
+    assert!(
+        plan["server_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c.as_str().unwrap().contains(&format!("added {copy}"))),
+        "{plan:#}"
+    );
+    assert_eq!(
+        plan["manifest"]["spec"]["template"]["spec"]["imagePullSecrets"],
+        json!([{"name": copy}])
+    );
+
+    let jobs: kube::Api<k8s_openapi::api::batch::v1::Job> =
+        kube::Api::namespaced(kube_client(&env).await, &env.namespace);
+    let owned_by = |secret: &Secret| -> Vec<String> {
+        secret
+            .metadata
+            .owner_references
+            .iter()
+            .flatten()
+            .map(|r| r.uid.clone())
+            .collect()
+    };
+    let first = jobs.get(&name).await.unwrap().metadata.uid.unwrap();
+    let copied = secrets.get(&copy).await.unwrap();
+    assert_eq!(
+        copied.type_.as_deref(),
+        Some("kubernetes.io/dockerconfigjson")
+    );
+    assert_eq!(copied.data, placed.data);
+    assert_eq!(owned_by(&copied), std::slice::from_ref(&first));
+    assert_eq!(
+        copied.metadata.labels.as_ref().unwrap()[&env.run_label()],
+        env.run_id(&run)
+    );
+    wait_for_phase(&agent, &name, &["finished"], Duration::from_secs(180)).await;
+
+    let deleted = call(
+        &agent,
+        "workload_delete",
+        json!({"kind": "Job", "name": name}),
+    )
+    .await;
+    assert_eq!(deleted["status"], "ok", "{deleted:#}");
+    let again = call_until_ok(
+        &agent,
+        "workload_submit",
+        json!({"queue": env.queue, "manifest": manifest, "plan_hash": plan["plan_hash"]}),
+        Duration::from_secs(60),
+    )
+    .await;
+    assert_eq!(again["submitted"], true, "{again:#}");
+    let second = jobs.get(&name).await.unwrap().metadata.uid.unwrap();
+    assert_ne!(first, second);
+    assert_eq!(owned_by(&secrets.get(&copy).await.unwrap()), [second]);
+
+    let resubmitted = call(
+        &agent,
+        "workload_submit",
+        json!({"queue": env.queue, "manifest": manifest, "plan_hash": plan["plan_hash"]}),
+    )
+    .await;
+    assert_eq!(resubmitted["submitted"], false, "{resubmitted:#}");
+
+    let deleted = call(
+        &agent,
+        "workload_delete",
+        json!({"kind": "Job", "name": name}),
+    )
+    .await;
+    assert_eq!(deleted["status"], "ok", "{deleted:#}");
+    let start = Instant::now();
+    while secrets.get_opt(&copy).await.unwrap().is_some() {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the copy outlived its Job"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    secrets
+        .delete(&source, &kube::api::DeleteParams::default())
+        .await
+        .unwrap();
+    let gone = call(
+        &agent,
+        "workload_plan",
+        json!({"queue": env.queue, "manifest": job(&unique("ck-e2e-pull-gone"), "true")}),
+    )
+    .await;
+    assert_eq!(gone["status"], "refused", "{gone:#}");
+    assert!(
+        gone["error"].as_str().unwrap().contains(&source),
+        "{gone:#}"
+    );
 }
 
 async fn kube_client(env: &Env) -> kube::Client {

@@ -391,6 +391,7 @@ async fn serve_controller(
             cluster: env.cluster.clone(),
             scopes: vec!["kueue.read".into(), "kueue.submit".into()],
             namespaces: Vec::new(),
+            pull_secret_namespace: None,
             remote: true,
         }],
     };

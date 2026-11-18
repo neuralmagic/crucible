@@ -230,6 +230,13 @@ pub struct KueueCfg {
     /// registry (a host or host/path prefix).
     #[serde(default)]
     pub pull_secrets: Vec<String>,
+    /// Take the pull secrets a pack brings (`[kueue] pull_secrets` in its manifest): the
+    /// controller writes each run's into `namespace` and deletes them when the run ends, and the
+    /// server copies one beside each workload that pulls with it, owned by that workload.
+    /// `deploy render --kueue` grants the controller `secrets` create and delete and the server
+    /// `secrets` get in `namespace`, and the server `secrets` create in the workload namespaces.
+    #[serde(default)]
+    pub run_pull_secrets: bool,
     /// The StorageClasses a workload's volume claims may name, by cluster:
     /// `storage_classes = { east = ["fast-local"] }`. On a cluster with none, a claim names none
     /// and takes the cluster's default class.
@@ -1248,6 +1255,16 @@ pub struct NamespaceOverlap {
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error(
+    "[kueue] run_pull_secrets lets crucible-kueue read the Secrets in kueue.namespace, \
+     {namespace:?}, which is also {shared}; give the server a namespace of its own"
+)]
+pub struct PullSecretNamespaceShared {
+    pub namespace: String,
+    pub shared: &'static str,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error("kueue.shared_namespaces names {namespace:?}, which kueue.workload_namespaces does not")]
 pub struct NotSharedNamespace {
     pub namespace: String,
@@ -1276,6 +1293,9 @@ impl DeployProfile {
             .with_context(|| format!("validating deploy profile {}", path.display()))?;
         profile
             .check_shared_namespaces()
+            .with_context(|| format!("validating deploy profile {}", path.display()))?;
+        profile
+            .check_pull_secret_namespace()
             .with_context(|| format!("validating deploy profile {}", path.display()))?;
         profile
             .check_storage_classes()
@@ -1363,6 +1383,36 @@ impl DeployProfile {
             }
         }
         Ok(())
+    }
+
+    /// Refuse `[kueue] run_pull_secrets` where the server's namespace is also the loop, rig or
+    /// controller's: the server then reads Secrets in its own namespace.
+    pub fn check_pull_secret_namespace(&self) -> Result<(), PullSecretNamespaceShared> {
+        let Some(kueue) = self.kueue.as_ref().filter(|k| k.run_pull_secrets) else {
+            return Ok(());
+        };
+        let namespace = kueue.namespace.as_str();
+        let cluster = &self.cluster;
+        let readers = cluster.sandbox_readers.iter().map(|sa| {
+            (
+                "a cluster.sandbox_readers account's namespace",
+                sa.namespace.as_str(),
+            )
+        });
+        let shared = [
+            ("cluster.loop_namespace", cluster.loop_namespace.as_str()),
+            ("cluster.rig_namespace", cluster.rig_namespace.as_str()),
+        ]
+        .into_iter()
+        .chain(readers)
+        .find(|(_, other)| *other == namespace);
+        match shared {
+            Some((shared, _)) => Err(PullSecretNamespaceShared {
+                namespace: namespace.to_string(),
+                shared,
+            }),
+            None => Ok(()),
+        }
     }
 
     /// Refuse a `[kueue] storage_classes` entry for a cluster that is not in `clusters`.
