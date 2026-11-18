@@ -24,9 +24,46 @@ pub struct ServerSpec {
     /// The namespaces a token for the server names, the first as the default. Empty: none.
     pub namespaces: Vec<String>,
     pub hosting: Hosting,
+    /// The namespace the controller writes a run's own pull secrets into, for the server to copy
+    /// beside the run's workloads (`[kueue] run_pull_secrets`); none, it takes none.
+    pub pull_secret_namespace: Option<String>,
     /// What bounds it beyond its scopes, as the run page shows it.
     pub limits: BTreeMap<String, String>,
 }
+
+/// The registry credentials a run brings, from its pack's `[buildit]` and `[kueue]` tables.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunRegistries {
+    pub push: Option<RunPush>,
+    pub pull_secrets: Vec<RunPullSecret>,
+}
+
+/// Where a run's buildit pushes, over the profile's push repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunPush {
+    pub repo: String,
+    /// The file in the loop pod that holds the authfile.
+    pub authfile: String,
+}
+
+/// A pull Secret the controller writes for one run, and the images it pulls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunPullSecret {
+    /// The Secret's name in the server's pull secret namespace.
+    pub name: String,
+    /// A registry host, or a host/path prefix.
+    pub registry: String,
+}
+
+impl std::fmt::Display for RunPullSecret {
+    /// `name=registry`, as crucible-kueue's `--pull-secret` reads one.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}={}", self.name, self.registry)
+    }
+}
+
+const PUSH_REPO_LIMIT: &str = "push_repo";
+const PULL_SECRETS_LIMIT: &str = "pull_secrets";
 
 /// Where a server runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +76,8 @@ pub enum Hosting {
         namespace: String,
         queue: Option<String>,
         push_repo: Option<String>,
+        /// The file in the loop pod that holds a run's own push authfile; none, the loop pod's.
+        push_authfile: Option<String>,
         /// Where it fetches the agent issuer's keys, when not from the issuer itself.
         run_jwks_uri: Option<url::Url>,
         /// What it runs with on each of the server's clusters.
@@ -73,6 +112,7 @@ impl ServerSpec {
                 namespace,
                 queue,
                 push_repo,
+                push_authfile,
                 run_jwks_uri,
                 sites,
             } => {
@@ -82,6 +122,7 @@ impl ServerSpec {
                     run_issuer: format!("{issuer}={jwks}"),
                     namespace: namespace.clone(),
                     push_repo: push_repo.clone(),
+                    push_authfile: push_authfile.clone(),
                     queue: queue.clone(),
                     builders: site.builders,
                     cache: site.cache,
@@ -94,6 +135,38 @@ impl ServerSpec {
                 })))
             }
         })
+    }
+
+    /// This server as a run that brings `registries` gets it: buildit pushes where the run says,
+    /// and a server that takes run pull secrets lists the run's.
+    pub fn for_run(&self, registries: &RunRegistries) -> ServerSpec {
+        let mut spec = self.clone();
+        if let (
+            Hosting::Buildit {
+                push_repo,
+                push_authfile,
+                ..
+            },
+            Some(push),
+        ) = (&mut spec.hosting, &registries.push)
+        {
+            *push_repo = Some(push.repo.clone());
+            *push_authfile = Some(push.authfile.clone());
+            spec.limits
+                .insert(PUSH_REPO_LIMIT.to_string(), push.repo.clone());
+        }
+        if spec.pull_secret_namespace.is_some() && !registries.pull_secrets.is_empty() {
+            let own = registries.pull_secrets.iter().map(ToString::to_string);
+            let all: Vec<String> = spec
+                .limits
+                .remove(PULL_SECRETS_LIMIT)
+                .into_iter()
+                .chain(own)
+                .collect();
+            spec.limits
+                .insert(PULL_SECRETS_LIMIT.to_string(), all.join(","));
+        }
+        spec
     }
 }
 
@@ -160,7 +233,7 @@ impl DeployProfile {
                 .collect();
             let mut limits = namespace_limit(&namespaces);
             if !k.pull_secrets.is_empty() {
-                limits.insert("pull_secrets".to_string(), k.pull_secrets.join(","));
+                limits.insert(PULL_SECRETS_LIMIT.to_string(), k.pull_secrets.join(","));
             }
             servers.push(ServerSpec {
                 name: ServerName::parse("kueue")?,
@@ -171,6 +244,7 @@ impl DeployProfile {
                 clusters: k.clusters.clone(),
                 namespaces,
                 hosting: Hosting::Remote,
+                pull_secret_namespace: k.run_pull_secrets.then(|| k.namespace.to_string()),
                 limits,
             });
         }
@@ -202,6 +276,7 @@ impl DeployProfile {
                     namespace: b.namespace.to_string(),
                     queue: b.queue.as_ref().map(ToString::to_string),
                     push_repo: b.push_repo.clone(),
+                    push_authfile: None,
                     run_jwks_uri: b.run_jwks_uri.clone(),
                     sites: b
                         .clusters
@@ -215,8 +290,9 @@ impl DeployProfile {
                         })
                         .collect(),
                 },
+                pull_secret_namespace: None,
                 limits: [
-                    ("push_repo", b.push_repo.clone()),
+                    (PUSH_REPO_LIMIT, b.push_repo.clone()),
                     ("queue", b.queue.as_ref().map(ToString::to_string)),
                 ]
                 .into_iter()
@@ -234,6 +310,7 @@ impl DeployProfile {
                 hosting: Hosting::Git {
                     run_jwks_uri: g.run_jwks_uri.clone(),
                 },
+                pull_secret_namespace: None,
                 limits: BTreeMap::new(),
             });
         }
@@ -247,6 +324,7 @@ impl DeployProfile {
                 limits: namespace_limit(&namespaces),
                 namespaces,
                 hosting: Hosting::Remote,
+                pull_secret_namespace: None,
             });
         }
         for s in &servers {
@@ -384,6 +462,7 @@ mod tests {
                     clusters: vec!["ocp".into(), "k8s".into()],
                     namespaces: vec!["team-a".into(), "team-b".into()],
                     hosting: Hosting::Remote,
+                    pull_secret_namespace: None,
                     limits: BTreeMap::from([
                         ("namespace".into(), "team-a,team-b".into()),
                         ("pull_secrets".into(), "quay-pull".into()),
@@ -399,9 +478,11 @@ mod tests {
                         namespace: "builds".into(),
                         queue: Some("builders".into()),
                         push_repo: Some("quay.io/team/agent".into()),
+                        push_authfile: None,
                         run_jwks_uri: None,
                         sites: BTreeMap::from([("ocp".into(), ClusterSite::default())]),
                     },
+                    pull_secret_namespace: None,
                     limits: BTreeMap::from([
                         ("push_repo".into(), "quay.io/team/agent".into()),
                         ("queue".into(), "builders".into()),
@@ -410,6 +491,63 @@ mod tests {
             ]
         );
         assert!(servers[0].serves("k8s") && !servers[1].serves("k8s"));
+    }
+
+    fn registries() -> RunRegistries {
+        RunRegistries {
+            push: Some(RunPush {
+                repo: "quay.io/mine/smoke".into(),
+                authfile: "/etc/registry/auth.json".into(),
+            }),
+            pull_secrets: vec![RunPullSecret {
+                name: "crucible-run-a-pull-0".into(),
+                registry: "quay.io/mine".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn a_runs_buildit_pushes_where_its_pack_says_with_its_own_authfile() {
+        let servers = profile(KUEUE_AND_BUILDIT).agent_servers().unwrap();
+        let buildit = servers[1].for_run(&registries());
+        assert_eq!(buildit.limits["push_repo"], "quay.io/mine/smoke");
+        let Transport::Local(LocalServer::Buildit(site)) = buildit
+            .transport("https://crucible.hub.example", "ocp")
+            .unwrap()
+        else {
+            panic!("buildit runs in the loop pod");
+        };
+        assert_eq!(site.push_repo.as_deref(), Some("quay.io/mine/smoke"));
+        assert_eq!(
+            site.push_authfile.as_deref(),
+            Some("/etc/registry/auth.json")
+        );
+        assert_eq!(servers[1].for_run(&RunRegistries::default()), servers[1]);
+    }
+
+    #[test]
+    fn a_runs_pull_secrets_are_listed_only_by_a_server_that_takes_them() {
+        let servers = profile(KUEUE_AND_BUILDIT).agent_servers().unwrap();
+        assert_eq!(servers[0].pull_secret_namespace, None);
+        assert_eq!(servers[0].for_run(&registries()), servers[0]);
+        let taking = profile(&KUEUE_AND_BUILDIT.replace(
+            "pull_secrets = [\"quay-pull\"]",
+            "pull_secrets = [\"quay-pull\"]\nrun_pull_secrets = true",
+        ))
+        .agent_servers()
+        .unwrap();
+        assert_eq!(
+            taking[0].pull_secret_namespace.as_deref(),
+            Some("kueue-server")
+        );
+        assert_eq!(
+            taking[0].for_run(&registries()).limits["pull_secrets"],
+            "quay-pull,crucible-run-a-pull-0=quay.io/mine"
+        );
+        assert_eq!(
+            taking[1].for_run(&registries()).limits.get("pull_secrets"),
+            None
+        );
     }
 
     /// buildit trusts the controller's agent issuer, which the controller supplies: the profile
@@ -428,6 +566,7 @@ mod tests {
                 run_issuer: format!("{issuer}={issuer}/.well-known/jwks.json"),
                 namespace: "builds".into(),
                 push_repo: Some("quay.io/team/agent".into()),
+                push_authfile: None,
                 queue: Some("builders".into()),
                 builders: BuilderPods::default(),
                 cache: None,
@@ -624,6 +763,7 @@ mod tests {
                 clusters: vec!["ocp".into()],
                 namespaces: vec!["team-a".into()],
                 hosting: Hosting::Remote,
+                pull_secret_namespace: None,
                 limits: BTreeMap::from([("namespace".into(), "team-a".into())]),
             }
         );
@@ -703,6 +843,7 @@ mod tests {
                 namespace: "crucible-builds".into(),
                 queue: None,
                 push_repo: Some("quay.io/example/crucible-smoke".into()),
+                push_authfile: None,
                 run_jwks_uri: None,
                 sites: servers[1]
                     .clusters

@@ -420,6 +420,7 @@ mod tests {
                     ),
                     namespace: "crucible-builds".into(),
                     push_repo: Some("quay.io/example/crucible-smoke".into()),
+                    push_authfile: None,
                     queue: Some("builders".into()),
                     builders: BuilderPods::default(),
                     cache: None,

@@ -172,6 +172,7 @@ pub fn audience(cluster: &str, resource: &str, scopes: &str) -> Audience {
         cluster: cluster.to_string(),
         scopes: scopes.split_whitespace().map(str::to_string).collect(),
         namespaces: Vec::new(),
+        pull_secret_namespace: None,
         remote: true,
     }
 }

@@ -18,7 +18,7 @@ use crate::task::{self, Outcome, TaskRef};
 use crucible_mcp_auth::access::AccessReview;
 use crucible_mcp_auth::kube::USER_CLAIM;
 use crucible_mcp_auth::principal::Principal;
-use k8s_openapi::api::core::v1::{Event, Node, Pod, Service};
+use k8s_openapi::api::core::v1::{Event, Node, Pod, Secret, Service};
 use kube::api::{
     Api, DeleteParams, DynamicObject, ListParams, LogParams, Patch, PatchParams, PostParams,
 };
@@ -41,6 +41,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MAX_WORKLOADS_SHOWN: usize = 20;
+/// How long a submit waits for a deleted workload's pull Secret to be collected.
+const STALE_PULL_SECRET_WAIT: Duration = Duration::from_secs(15);
+const STALE_PULL_SECRET_POLL: Duration = Duration::from_secs(1);
 const MAX_REPLICAS: i64 = 1000;
 const MAX_LOG_PODS: usize = 4;
 const DEFAULT_TAIL: i64 = 200;
@@ -98,6 +101,16 @@ pub enum ToolError {
         "a Service named {name} already exists and is not this {kind}'s; delete it or pick another name"
     )]
     ServiceTaken { kind: &'static str, name: String },
+    #[error(
+        "a Secret named {name} already exists and is not this {kind}'s, so its pods cannot pull \
+         with the run's own pull secret; delete the {kind} and that Secret, or pick another name"
+    )]
+    PullSecretTaken { kind: &'static str, name: String },
+    #[error(
+        "the run's pull secret {name} is not on this cluster as an image pull Secret; it lasts \
+         only while the run does"
+    )]
+    PullSecretGone { name: String },
     #[error("{kind} {name} cannot be resumed: {detail}")]
     NotStopped {
         kind: &'static str,
@@ -144,6 +157,8 @@ impl ToolError {
             | Self::HashMismatch { .. }
             | Self::Conflict { .. }
             | Self::ServiceTaken { .. }
+            | Self::PullSecretTaken { .. }
+            | Self::PullSecretGone { .. }
             | Self::SinceTime { .. }
             | Self::TwoSinces
             | Self::NotStopped { .. }
@@ -1013,6 +1028,96 @@ impl KueueMcp {
             .create(&pp, &object)
             .await
             .map_err(|e| api_rejection(n.kind, e))
+    }
+
+    /// The docker config of each of the caller's own pull secrets `n`'s pods name, in the order
+    /// of `n.pull_copies`, read from the server's pull secret namespace. One that is not there
+    /// as an image pull Secret is refused.
+    async fn pull_sources(&self, n: &Normalized) -> Result<Vec<Value>, ToolError> {
+        let Some(namespace) = self.config.run_pull_secret_namespace.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
+        let mut sources = Vec::with_capacity(n.pull_copies.len());
+        for copy in &n.pull_copies {
+            let gone = || ToolError::PullSecretGone {
+                name: copy.source.clone(),
+            };
+            let secret = secrets
+                .get_opt(&copy.source)
+                .await
+                .map_err(|e| KubeError::api("get", format!("Secret {}", copy.source), e))?
+                .ok_or_else(gone)?;
+            let secret = serde_json::to_value(&secret).map_err(|source| KubeError::Decode {
+                what: format!("Secret {}", copy.source),
+                source,
+            })?;
+            sources.push(manifest::docker_config(&secret).cloned().ok_or_else(gone)?);
+        }
+        Ok(sources)
+    }
+
+    /// Copy `sources`, as [`Self::pull_sources`] read them, into the caller's namespace under
+    /// the names `n`'s pods pull with, owned by `owner` so they are deleted with it; with no
+    /// owner, a dry run. A copy that already exists is taken as `owner`'s own unless `owner` is
+    /// `fresh`, just created: one left by a deleted workload of the same name is waited out, and
+    /// any other is refused.
+    async fn copy_pull_secrets(
+        &self,
+        caller: &Caller,
+        n: &Normalized,
+        sources: &[Value],
+        owner: Option<&DynamicObject>,
+        fresh: bool,
+    ) -> Result<(), ToolError> {
+        let namespace = caller.namespace.as_str();
+        let owner_uid = owner.and_then(|o| o.metadata.uid.as_deref());
+        let copies: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
+        let pp = PostParams {
+            dry_run: owner.is_none(),
+            field_manager: Some(self.config.labels.manager.to_string()),
+        };
+        for (copy, source) in n.pull_copies.iter().zip(sources) {
+            let wanted = n.pull_secret(copy, namespace, source, owner_uid);
+            let secret: Secret =
+                serde_json::from_value(wanted).map_err(|source| KubeError::Decode {
+                    what: format!("the pull Secret {}", copy.name),
+                    source,
+                })?;
+            let mut waited = Duration::ZERO;
+            loop {
+                match copies.create(&pp, &secret).await {
+                    Ok(_) => break,
+                    Err(kube::Error::Api(e)) if e.code == 409 && !fresh => break,
+                    Err(kube::Error::Api(e)) if e.code == 409 => {
+                        if waited >= STALE_PULL_SECRET_WAIT {
+                            return Err(ToolError::PullSecretTaken {
+                                kind: n.kind.kind(),
+                                name: copy.name.clone(),
+                            });
+                        }
+                        tokio::time::sleep(STALE_PULL_SECRET_POLL).await;
+                        waited += STALE_PULL_SECRET_POLL;
+                    }
+                    Err(kube::Error::Api(e)) if (400..500).contains(&e.code) && e.code != 404 => {
+                        return Err(ToolError::Rejected {
+                            kind: "Secret",
+                            code: e.code,
+                            message: e.message,
+                        });
+                    }
+                    Err(source) => {
+                        return Err(KubeError::api(
+                            "create",
+                            format!("Secret {}", copy.name),
+                            source,
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Where the Service exposing `n` is reached: its name, its host in the cluster and its ports.
@@ -1896,8 +2001,12 @@ impl KueueMcp {
                 let c = self.served_caller(&parts, args.namespace.as_deref()).await?;
                 let actor = identity(&parts)?.actor.as_deref();
                 let (n, cq) = self.plan(&c, &args.queue, args.manifest, &args.expose).await?;
+                let pull_sources = self.pull_sources(&n).await?;
                 let (dry_run, service) = match self.create(&c, &n, actor, true).await {
-                    Ok(_) => ("accepted", self.expose(&c, &n, None, true).await?),
+                    Ok(_) => {
+                        self.copy_pull_secrets(&c, &n, &pull_sources, None, false).await?;
+                        ("accepted", self.expose(&c, &n, None, true).await?)
+                    }
                     Err(ToolError::Rejected { .. })
                         if self.get_object(&c, n.kind, &n.name).await.is_ok() =>
                     {
@@ -1980,6 +2089,7 @@ impl KueueMcp {
                 let c = self.served_caller(parts, args.namespace.as_deref()).await?;
                 let actor = identity(parts)?.actor.as_deref();
                 let (n, _) = self.plan(&c, &args.queue, args.manifest, &args.expose).await?;
+                let pull_sources = self.pull_sources(&n).await?;
                 if n.plan_hash != args.plan_hash {
                     return Err(ToolError::HashMismatch {
                         got: args.plan_hash,
@@ -1990,6 +2100,7 @@ impl KueueMcp {
                     Ok(obj) => {
                         tracing::info!(kind = n.kind.kind(), name = %n.name, namespace = %c.namespace, run = %c.run_id, "workload submitted");
                         let task = n.kind.is_batch().then(|| new_task(&c.namespace, n.kind, &n.name, &obj));
+                        self.copy_pull_secrets(&c, &n, &pull_sources, Some(&obj), true).await?;
                         let service = self.expose(&c, &n, Some(&obj), false).await?;
                         Ok((json!({"kind": n.kind, "name": n.name, "uid": obj.metadata.uid, "task_id": task.as_ref().map(|t| t.task_id.clone()), "finished_retention_seconds": n.retention_seconds(), "service": service, "submitted": true}), task))
                     }
@@ -2010,6 +2121,7 @@ impl KueueMcp {
                             });
                         }
                         let task = n.kind.is_batch().then(|| new_task(&c.namespace, n.kind, &n.name, &existing));
+                        self.copy_pull_secrets(&c, &n, &pull_sources, Some(&existing), false).await?;
                         let service = self.expose(&c, &n, Some(&existing), false).await?;
                         Ok((json!({"kind": n.kind, "name": n.name, "uid": existing.metadata.uid, "task_id": task.as_ref().map(|t| t.task_id.clone()), "finished_retention_seconds": n.retention_seconds(), "service": service, "submitted": false, "note": "already submitted with this plan"}), task))
                     }
@@ -3409,6 +3521,7 @@ mod tests {
             namespace: Namespace::parse("team-a").unwrap(),
             launched_by: crate::caller::Launcher::parse("alice").unwrap(),
             kube_user: "alice".into(),
+            pull_secrets: Vec::new(),
             served: crate::caller::Served::for_test(),
         };
         assert_eq!(
@@ -3449,6 +3562,7 @@ mod tests {
             namespace: Namespace::parse("team-a").unwrap(),
             launched_by: crate::caller::Launcher::parse("alice").unwrap(),
             kube_user: "alice".into(),
+            pull_secrets: Vec::new(),
             served: crate::caller::Served::for_test(),
         };
         let with = |labels: Value| -> DynamicObject {
