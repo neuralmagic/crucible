@@ -1678,7 +1678,7 @@ The engine starts it with these arguments (`Buildit::args`, `crucible/src/opensh
 - `workdir`, when present, is an absolute normal path.
 - `sub` is a label value. It becomes `crucible.dev/launched-by` on builder pods.
 
-The scopes are `buildit.read` for `status`, `logs` and `tasks/get`, and `buildit.build` for
+The scopes are `buildit.read` for `status`, `wait`, `logs` and `tasks/get`, and `buildit.build` for
 `build`, `run`, `push`, `clean` and `tasks/cancel`. `buildit` does no access checks: it builds in
 its own namespace for the run's own sandboxes.
 
