@@ -968,6 +968,29 @@ impl Diagnostic {
     }
 }
 
+/// One draft, as `GET /api/playbook-drafts` lists it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PlaybookDraft {
+    pub id: String,
+    #[serde(default)]
+    pub description: String,
+    /// `user:<login>` or `team:<slug>`.
+    #[serde(default)]
+    pub owner: String,
+    /// The newest save; 0 when nothing is saved yet.
+    #[serde(default)]
+    pub latest_version: i64,
+    #[serde(default)]
+    pub compiles: bool,
+    /// Set once the graduated pack was imported: the draft is read-only from then on.
+    #[serde(default)]
+    pub retired_at: Option<String>,
+    #[serde(default)]
+    pub created_by: Option<String>,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
 /// `GET /api/playbook-drafts/{id}/files`: the whole pack at one save, and the base a writer edits
 /// from.
 #[derive(Debug, Clone, Deserialize)]
@@ -1252,6 +1275,9 @@ pub struct Provider {
     pub harness: Option<String>,
     #[serde(default)]
     pub price: Option<ProviderPrice>,
+    /// What each model can take and give, in tokens, by model id.
+    #[serde(default)]
+    pub model_limits: std::collections::BTreeMap<String, ModelLimits>,
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
@@ -1360,6 +1386,13 @@ pub struct ProviderPrice {
     pub output: f64,
     pub cache_read: f64,
     pub cache_write: f64,
+}
+
+/// One model's context window and output limit, in tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct ModelLimits {
+    pub context_window: u32,
+    pub max_output_tokens: u32,
 }
 
 /// A registry secret's metadata. The value never leaves the controller.

@@ -206,7 +206,12 @@ impl Backend for Codex {
     }
 
     /// `auth.json` whenever Codex auth was resolved; the credential never rides the env script.
-    fn credential(&self, _agent: &TurnAgent<'_>, auth: &SandboxAuth) -> Option<SeedFile> {
+    fn credential(
+        &self,
+        _agent: &TurnAgent<'_>,
+        auth: &SandboxAuth,
+        _inference: &InferenceEnv,
+    ) -> Option<SeedFile> {
         auth.codex().map(|auth| SeedFile {
             content: auth_json(auth, &Timestamp::now().to_string()),
             dest: AUTH,

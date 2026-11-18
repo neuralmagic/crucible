@@ -1,6 +1,7 @@
 //! The resolved inference bindings an orchestrator injects and the engine reads.
 
 use std::collections::BTreeSet;
+use std::num::NonZeroU32;
 
 use serde::{Deserialize, Serialize};
 
@@ -182,6 +183,15 @@ pub struct TokenPrice {
     pub cache_write: UsdPerMtok,
 }
 
+/// What an agent binding's model can take and give, in tokens. A harness that sets a model's
+/// limits in its own configuration is given these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelLimits {
+    pub context_window: NonZeroU32,
+    pub max_output_tokens: NonZeroU32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InferenceBinding {
@@ -196,6 +206,9 @@ pub struct InferenceBinding {
     /// Agent bindings only. Absent prices the run's turns by the engine's vendor table.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price: Option<TokenPrice>,
+    /// Agent bindings only. Absent leaves the model's limits to the harness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<ModelLimits>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,6 +265,13 @@ pub enum InferenceError {
     PriceForRole {
         role: InferenceRole,
     },
+    LimitsForRole {
+        role: InferenceRole,
+    },
+    OutputOverWindow {
+        context_window: NonZeroU32,
+        max_output_tokens: NonZeroU32,
+    },
 }
 
 impl std::fmt::Display for InferenceError {
@@ -297,6 +317,17 @@ impl std::fmt::Display for InferenceError {
             InferenceError::PriceForRole { role } => write!(
                 f,
                 "the {role} binding carries a price; only an agent binding is priced"
+            ),
+            InferenceError::LimitsForRole { role } => write!(
+                f,
+                "the {role} binding carries limits; only an agent binding's model has them"
+            ),
+            InferenceError::OutputOverWindow {
+                context_window,
+                max_output_tokens,
+            } => write!(
+                f,
+                "the agent binding's max_output_tokens {max_output_tokens} exceeds its context_window {context_window}"
             ),
         }
     }
@@ -378,6 +409,17 @@ impl ResolvedInference {
             if binding.price.is_some() && role != InferenceRole::Agent {
                 return Err(InferenceError::PriceForRole { role });
             }
+            if let Some(limits) = binding.limits {
+                if role != InferenceRole::Agent {
+                    return Err(InferenceError::LimitsForRole { role });
+                }
+                if limits.max_output_tokens > limits.context_window {
+                    return Err(InferenceError::OutputOverWindow {
+                        context_window: limits.context_window,
+                        max_output_tokens: limits.max_output_tokens,
+                    });
+                }
+            }
             let model = &binding.model;
             if model.is_empty()
                 || model.len() > MAX_MODEL_LEN
@@ -409,6 +451,7 @@ mod tests {
             model: "dgemma".into(),
             key_env: None,
             price: None,
+            limits: None,
         }
     }
 
@@ -420,6 +463,7 @@ mod tests {
             model: "claude-opus-5".into(),
             key_env: Some(EnvName::new("INFERENCE_KEY_AGENT").unwrap()),
             price: None,
+            limits: None,
         }
     }
 
@@ -523,6 +567,7 @@ mod tests {
             model: "gpt-6-luna".into(),
             key_env: Some(EnvName::new("OPENAI_API_KEY").unwrap()),
             price: None,
+            limits: None,
         }
     }
 
@@ -739,6 +784,82 @@ mod tests {
                 "{price}"
             );
         }
+    }
+
+    fn limits(context_window: u32, max_output_tokens: u32) -> ModelLimits {
+        ModelLimits {
+            context_window: NonZeroU32::new(context_window).unwrap(),
+            max_output_tokens: NonZeroU32::new(max_output_tokens).unwrap(),
+        }
+    }
+
+    #[test]
+    fn an_agent_binding_with_limits_has_a_pinned_wire_shape() {
+        let mut limited = agent();
+        limited.limits = Some(limits(200_000, 64_000));
+        let json = r#"{"version":1,"bindings":[{"role":"agent","protocol":"messages","url":"https://claude.corp/v1","model":"claude-opus-5","key_env":"INFERENCE_KEY_AGENT","limits":{"context_window":200000,"max_output_tokens":64000}}]}"#;
+        assert_eq!(
+            serde_json::to_string(&doc(vec![limited.clone()])).unwrap(),
+            json
+        );
+        assert_eq!(ResolvedInference::parse(json).unwrap(), doc(vec![limited]));
+    }
+
+    #[test]
+    fn limits_are_positive_whole_and_name_nothing_else() {
+        for limits in [
+            r#"{"context_window":0,"max_output_tokens":1}"#,
+            r#"{"context_window":1,"max_output_tokens":0}"#,
+            r#"{"context_window":-1,"max_output_tokens":1}"#,
+            r#"{"context_window":1.5,"max_output_tokens":1}"#,
+            r#"{"context_window":200000}"#,
+            r#"{"max_output_tokens":64000}"#,
+            r#"{"context_window":200000,"max_output_tokens":64000,"input":1}"#,
+        ] {
+            let json = format!(
+                r#"{{"version":1,"bindings":[{{"role":"agent","protocol":"messages","model":"m","limits":{limits}}}]}}"#
+            );
+            assert!(
+                matches!(
+                    ResolvedInference::parse(&json).unwrap_err(),
+                    InferenceError::Decode { .. }
+                ),
+                "{limits}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_model_cannot_give_more_than_it_can_hold() {
+        let mut over = agent();
+        over.limits = Some(limits(8_000, 16_000));
+        let err = doc(vec![over]).validate().unwrap_err();
+        assert_eq!(
+            err,
+            InferenceError::OutputOverWindow {
+                context_window: NonZeroU32::new(8_000).unwrap(),
+                max_output_tokens: NonZeroU32::new(16_000).unwrap(),
+            }
+        );
+        assert!(err.to_string().contains("16000 exceeds"), "{err}");
+
+        let mut whole = agent();
+        whole.limits = Some(limits(8_000, 8_000));
+        assert!(doc(vec![whole]).validate().is_ok());
+    }
+
+    #[test]
+    fn only_an_agent_binding_has_limits() {
+        let mut limited = decision();
+        limited.limits = Some(limits(8_000, 1_000));
+        let err = doc(vec![limited]).validate().unwrap_err();
+        assert_eq!(
+            err,
+            InferenceError::LimitsForRole {
+                role: InferenceRole::Decision
+            }
+        );
+        assert!(err.to_string().contains("decision binding"), "{err}");
     }
 
     #[test]

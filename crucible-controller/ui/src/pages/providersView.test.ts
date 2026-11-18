@@ -26,6 +26,7 @@ const ONPREM: ProviderDetailDto = {
   kind: 'custom',
   models: ['gpt-oss-120b'],
   default_model: 'gpt-oss-120b',
+  model_limits: {},
   secret_name: 'vllm-key',
   secret_owner: 'user:alice',
   owner: 'user:alice',

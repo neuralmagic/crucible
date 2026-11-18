@@ -556,7 +556,7 @@ for aud in "$KUEUE_URL" "http://host.openshell.internal:8848/mcp"; do
     issued=$(grep 'agent token issued' "$WORK/controller.log" | grep "gateway/$RUN/sandbox/" \
         | grep -F "aud=\"$aud\"" | head -1)
     [ -n "$issued" ] || fail "the controller issued no token for $aud to run $RUN"
-    grep -qF "kube_user=crucible:run:$RUN" <<<"$issued" || fail "the token was not for the run's own kube_user: $issued"
+    grep -qE "kube_user=\"?crucible:run:$RUN\"?( |$)" <<<"$issued" || fail "the token was not for the run's own kube_user: $issued"
     grep -qE "spiffe_id=\"?${GATEWAY_PREFIX}$RUN/sandbox/" <<<"$issued" \
         || fail "the token went to no supervisor under $GATEWAY_PREFIX: $issued"
     log "issued: $issued"

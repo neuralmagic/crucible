@@ -108,6 +108,7 @@ pub fn render(profile: &DeployProfile, opts: &RenderOpts, target: &KueueTarget) 
             authz,
             &image,
             pull_secret,
+            crate::deploy::render::pod::node_avoid_affinity(profile),
         )?),
     )?;
     push("Service", yaml(&service(cfg)))?;
@@ -272,6 +273,7 @@ fn deployment(
     authz: KubeAuthz,
     image: &str,
     pull_secret: &str,
+    affinity: Option<core::Affinity>,
 ) -> Result<apps::Deployment> {
     let probe = |initial: i32| core::Probe {
         http_get: Some(core::HTTPGetAction {
@@ -347,6 +349,7 @@ fn deployment(
                         name: pull_secret.to_string(),
                     }]),
                     containers: vec![container],
+                    affinity,
                     ..Default::default()
                 }),
             },
@@ -565,6 +568,24 @@ mod tests {
         docs.iter()
             .find(|d| d["kind"] == kind && d["metadata"]["name"] == name)
             .unwrap_or_else(|| panic!("no {kind} {name}"))
+    }
+
+    #[test]
+    fn the_server_stays_off_the_nodes_the_profile_avoids() {
+        let pod = |text: &str| {
+            find(&docs(text), "Deployment", "crucible-kueue")["spec"]["template"]["spec"].clone()
+        };
+        assert!(pod(PROFILE).get("affinity").is_none());
+
+        let avoiding = PROFILE.replace(
+            "[cluster]",
+            "[cluster]\n        avoid_nodes = [\"cpu-07\", \"g12e099\"]",
+        );
+        let term = &pod(&avoiding)["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
+            ["nodeSelectorTerms"][0]["matchExpressions"][0];
+        assert_eq!(term["key"], "kubernetes.io/hostname");
+        assert_eq!(term["operator"], "NotIn");
+        assert_eq!(term["values"], serde_json::json!(["cpu-07", "g12e099"]));
     }
 
     fn args(docs: &[serde_json::Value]) -> Vec<String> {

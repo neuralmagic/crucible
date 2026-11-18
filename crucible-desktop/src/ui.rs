@@ -50,8 +50,8 @@ use rune_kit::{
 use rune_theme_opencode::icons as oc;
 
 use crate::editor::Editor;
-use crate::filter::{LandedFilter, OriginFilter, OwnerFilter};
-use crate::live::{LaunchStatus, LiveDetail, LivePlaybook, LiveView};
+use crate::filter::{Filters, LandedFilter, OriginFilter, OwnerFilter};
+use crate::live::{LaunchStatus, LiveDetail, LiveDraft, LivePlaybook, LiveView, Row};
 use crate::logline::{LogLine, activity};
 use crate::model::{PackView, Verdict};
 use crate::net::Down;
@@ -514,6 +514,50 @@ fn live_pane<'a>(
     }
 }
 
+/// A draft no launch ran: its newest save, and nothing of a run.
+fn draft_pane<'a>(
+    draft: &LiveDraft,
+    pack: Option<&'a Result<PackFiles, String>>,
+    log_font: LogFont,
+) -> Pane<'a> {
+    Pane {
+        title: draft.id.clone(),
+        subtitle: draft
+            .description
+            .clone()
+            .unwrap_or_else(|| format!("{} \u{b7} by {}", draft_meta(draft), draft.by)),
+        path: format!("draft {} v{}", draft.id, draft.version),
+        verdict: Verdict::NotRun,
+        spent: 0.0,
+        cap: 0.0,
+        passed: 0,
+        failed: 0,
+        tasks: &[],
+        time: "\u{2014}".to_string(),
+        time_note: None,
+        meta: Some(draft.owner.clone()),
+        streaming: false,
+        problem: None,
+        log: &[],
+        transcript: &[],
+        agent_events: &[],
+        log_font,
+        launchable: false,
+        preview: None,
+        previewing: false,
+        run_tasks: &[],
+        empty: ("No launches listed.", String::new()),
+        pack: match pack {
+            Some(pack) => pack.as_ref().map_err(Clone::clone),
+            None if draft.version > 0 => Err("Reading the pack\u{2026}".to_string()),
+            None => Err("Nothing saved.".to_string()),
+        },
+        launch: None,
+        run_id: None,
+        files: Some(Ok(&[])),
+    }
+}
+
 /// Why a live launch shows no tasks: still loading, unreadable, never dispatched, or no plan.
 fn live_empty(launch: &LivePlaybook, detail: Option<&LiveDetail>) -> (&'static str, String) {
     let Some(detail) = detail else {
@@ -613,8 +657,11 @@ fn sidebar(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
                 ),
         );
     }
-    if app.backend == Backend::Controller && app.filters_open {
-        head = head.child(filters(app, p));
+    if app.backend == Backend::Controller {
+        head = head.children(active_filters(app, p));
+        if app.filters_open {
+            head = head.child(filters(app, p));
+        }
     }
 
     col()
@@ -875,9 +922,6 @@ fn search(app: &App, p: &Paint) -> El {
     if !app.playbook_search.text.is_empty() {
         input = input.clear_button();
     }
-    let filtered = app.owner_filter != OwnerFilter::All
-        || app.origin_filter != OriginFilter::All
-        || app.landed_filter != LandedFilter::Any;
     row()
         .w_full()
         .gap(6.0)
@@ -885,9 +929,7 @@ fn search(app: &App, p: &Paint) -> El {
         .child(input.build(p.k).key("playbook-search"))
         .children(filterable.then(|| {
             IconButton::new(&oc::OUTLINE_DOTS)
-                .variant(if filtered {
-                    IconButtonVariant::Contrast
-                } else if app.filters_open {
+                .variant(if app.filters_open {
                     IconButtonVariant::Neutral
                 } else {
                     IconButtonVariant::GhostMuted
@@ -899,27 +941,94 @@ fn search(app: &App, p: &Paint) -> El {
         }))
 }
 
+/// The switches that narrow the list, each a button that turns it off.
+fn active_filters(app: &App, p: &Paint) -> Option<El> {
+    let set = app.filters();
+    let chip = |label: &'static str, cleared: Filters| {
+        Button::new(label)
+            .variant(ButtonVariant::Outline)
+            .icon(&oc::XMARK_SMALL)
+            .on_press(move |app: &mut App| app.set_filters(cleared))
+            .build(p.k)
+            .key(format!("filter-on-{}", slug(label)))
+    };
+    let stored = app.settings.filters;
+    let chips: Vec<El> = [
+        (set.owner != OwnerFilter::All).then(|| {
+            chip(
+                set.owner.label(),
+                Filters {
+                    owner: OwnerFilter::All,
+                    ..stored
+                },
+            )
+        }),
+        (set.origin != OriginFilter::All).then(|| {
+            chip(
+                set.origin.label(),
+                Filters {
+                    origin: OriginFilter::All,
+                    ..stored
+                },
+            )
+        }),
+        (set.landed != LandedFilter::Any).then(|| {
+            chip(
+                set.landed.label(),
+                Filters {
+                    landed: LandedFilter::Any,
+                    ..stored
+                },
+            )
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!chips.is_empty()).then(|| {
+        row()
+            .key("filters-on")
+            .w_full()
+            .gap(6.0)
+            .flex_wrap()
+            .children(chips)
+    })
+}
+
 fn filters(app: &App, p: &Paint) -> El {
+    let stored = app.settings.filters;
     col()
         .key("filters")
         .w_full()
         .gap(6.0)
-        .child(filter_row(
-            "Owner",
-            &OwnerFilter::ALL.map(|choice| choice.label()),
-            OwnerFilter::ALL
-                .iter()
-                .position(|choice| *choice == app.owner_filter),
-            |app: &mut App, i: usize, _: &mut Tx| app.owner_filter = OwnerFilter::ALL[i],
-            p,
-        ))
+        .children(app.user().is_some().then(|| {
+            filter_row(
+                "Owner",
+                &OwnerFilter::ALL.map(|choice| choice.label()),
+                OwnerFilter::ALL
+                    .iter()
+                    .position(|choice| *choice == stored.owner),
+                move |app: &mut App, i: usize, _: &mut Tx| {
+                    app.set_filters(Filters {
+                        owner: OwnerFilter::ALL[i],
+                        ..stored
+                    })
+                },
+                p,
+            )
+        }))
         .child(filter_row(
             "Origin",
             &OriginFilter::ALL.map(|choice| choice.label()),
             OriginFilter::ALL
                 .iter()
-                .position(|choice| *choice == app.origin_filter),
-            |app: &mut App, i: usize, _: &mut Tx| app.origin_filter = OriginFilter::ALL[i],
+                .position(|choice| *choice == stored.origin),
+            move |app: &mut App, i: usize, _: &mut Tx| {
+                app.set_filters(Filters {
+                    origin: OriginFilter::ALL[i],
+                    ..stored
+                })
+            },
             p,
         ))
         .child(filter_row(
@@ -927,8 +1036,13 @@ fn filters(app: &App, p: &Paint) -> El {
             &LandedFilter::ALL.map(|choice| choice.label()),
             LandedFilter::ALL
                 .iter()
-                .position(|choice| *choice == app.landed_filter),
-            |app: &mut App, i: usize, _: &mut Tx| app.landed_filter = LandedFilter::ALL[i],
+                .position(|choice| *choice == stored.landed),
+            move |app: &mut App, i: usize, _: &mut Tx| {
+                app.set_filters(Filters {
+                    landed: LandedFilter::ALL[i],
+                    ..stored
+                })
+            },
             p,
         ))
 }
@@ -983,7 +1097,7 @@ fn pack_list(app: &App, p: &Paint) -> El {
     match app.backend {
         Backend::Controller => match &*app.remote.live {
             LiveView::Ready { now, .. } => {
-                let playbooks = app.visible_playbooks();
+                let playbooks = app.visible_rows();
                 if playbooks.is_empty() {
                     list = list.child(note(
                         if app.filtering() {
@@ -1236,11 +1350,14 @@ fn ignited(mark: El, spark: Spark, ember: Color) -> El {
 /// The side of the status slot the flare starts from.
 const IGNITION: f32 = 12.0;
 
-fn live_rows(app: &App, playbooks: &[&LivePlaybook], now: i64, p: &Paint) -> Vec<El> {
+fn live_rows(app: &App, rows: &[Row], now: i64, p: &Paint) -> Vec<El> {
     let current = app.selected_playbook();
-    playbooks
-        .iter()
-        .map(|playbook| {
+    rows.iter()
+        .map(|row| {
+            let playbook = match row {
+                Row::Launch(playbook) => playbook,
+                Row::Draft(draft) => return draft_row(draft, current, now, p),
+            };
             let id = playbook.id.clone();
             let status = match (
                 verdict_status(playbook.verdict(), p),
@@ -1263,6 +1380,28 @@ fn live_rows(app: &App, playbooks: &[&LivePlaybook], now: i64, p: &Paint) -> Vec
             item.build(p.k).key(format!("live-{}", playbook.id))
         })
         .collect()
+}
+
+fn draft_meta(draft: &LiveDraft) -> String {
+    if draft.compiles {
+        format!("draft \u{b7} v{}", draft.version)
+    } else {
+        format!("draft \u{b7} v{} \u{b7} does not compile", draft.version)
+    }
+}
+
+fn draft_row(draft: &LiveDraft, current: Option<&str>, now: i64, p: &Paint) -> El {
+    let id = draft.id.clone();
+    let mut item = SidebarRow::new(draft.id.clone())
+        .subtitle(draft_meta(draft))
+        .height(ROW * p.text)
+        .status(verdict_status(Verdict::NotRun, p))
+        .selected(current == Some(draft.id.as_str()))
+        .on_select(move |app: &mut App, _: &mut Tx| app.select(Selection::playbook(&id)));
+    if draft.saved > 0 {
+        item = item.detail(age(draft.saved, now));
+    }
+    item.build(p.k).key(format!("draft-{}", draft.id))
 }
 
 /// The launches of the selected live playbook the filters keep, when there is more than one.
@@ -1352,10 +1491,16 @@ fn detail(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
         Some(Selection::Local(_)) => app.selected_pack().map(|pack| local_pane(pack, font)),
         Some(Selection::Live { launch, .. }) => {
             let pinned = launch.is_some() && playbook_launches(app).is_some();
-            app.selected_live().map(|live| Pane {
-                preview: app.remote.working_preview.as_ref(),
-                ..live_pane(live, app.selected_detail(), font, pinned)
-            })
+            app.selected_live()
+                .map(|live| live_pane(live, app.selected_detail(), font, pinned))
+                .or_else(|| {
+                    app.selected_draft()
+                        .map(|draft| draft_pane(draft, app.selected_draft_pack(), font))
+                })
+                .map(|pane| Pane {
+                    preview: app.remote.working_preview.as_ref(),
+                    ..pane
+                })
         }
         None => None,
     }
@@ -1432,7 +1577,8 @@ fn detail(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
         }
         None => stats(&pane, p),
     };
-    body.child(stats).child(dock::workspace(&pane, app, p))
+    body.children(app.selected_draft().is_none().then_some(stats))
+        .child(dock::workspace(&pane, app, p))
 }
 
 /// Stops the launch on screen while it runs, after a confirming second press.
