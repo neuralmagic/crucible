@@ -889,6 +889,8 @@ async fn a_transfer_moves_the_bytes_and_the_row_to_the_new_owner(pool: PgPool) {
     crate::playbooks::providers::insert(
         &pool,
         &crate::playbooks::providers::NewProvider {
+            model_limits: Default::default(),
+            model_prices: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "openai",
             display_name: "OpenAI",

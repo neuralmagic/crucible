@@ -1185,14 +1185,23 @@ pub fn playbook_caps(caps: &dto::PlaybookCaps) -> String {
     )
 }
 
-/// `-` for a provider with no price, which the engine prices by the vendor's list price, or at
-/// nothing for a model no vendor sells.
-fn price(p: Option<&dto::ProviderPrice>) -> String {
-    match p {
+/// The default model's price, its own before the provider's, or `-` for a provider with neither,
+/// which the engine prices by the vendor's list price, or at nothing for a model no vendor sells.
+fn price(p: &dto::Provider) -> String {
+    match p.model_prices.get(&p.default_model).or(p.price.as_ref()) {
         Some(p) => format!(
             "{}/{}/{}/{}",
             p.input, p.output, p.cache_read, p.cache_write
         ),
+        None => "-".to_string(),
+    }
+}
+
+/// The default model's limits as `context window/max output`, or `-` when the registration
+/// names none for it and the harness decides.
+fn limits(p: &dto::Provider) -> String {
+    match p.model_limits.get(&p.default_model) {
+        Some(l) => format!("{}/{}", l.context_window, l.max_output_tokens),
         None => "-".to_string(),
     }
 }
@@ -1209,18 +1218,20 @@ pub fn providers(list: &[dto::Provider]) -> String {
                 p.kind.clone(),
                 p.default_model.clone(),
                 p.harness.clone().unwrap_or_else(|| "-".to_string()),
-                price(p.price.as_ref()),
+                price(p),
+                limits(p),
                 if p.enabled { "yes" } else { "no" }.to_string(),
                 p.owner.clone(),
             ]
         })
         .collect();
     format!(
-        "{} providers (price: USD per million tokens, input/output/cache read/cache write)\n{}",
+        "{} providers (price: USD per million tokens, input/output/cache read/cache write; \
+         limits: the default model's context window/max output, in tokens)\n{}",
         list.len(),
         table(
             &[
-                "ID", "KIND", "MODEL", "HARNESS", "PRICE", "ENABLED", "OWNER"
+                "ID", "KIND", "MODEL", "HARNESS", "PRICE", "LIMITS", "ENABLED", "OWNER"
             ],
             &rows
         )
@@ -1259,6 +1270,17 @@ pub fn secret_created(s: &dto::Secret) -> String {
         "registered {} as {}\n  kind: {}  visibility: {}  mode: {}  owner: {}\n\
          bind it: crux secret-bind {} --playbook <id> --env <VAR>\n",
         s.name, s.id, s.kind, s.visibility, s.mode, s.owner, s.id
+    )
+}
+
+pub fn secret_rotated(s: &dto::Secret) -> String {
+    let version = s
+        .current_version
+        .map_or_else(|| "-".to_string(), |v| v.to_string());
+    format!(
+        "rotated {} ({}) to version {}\n  kind: {}  owner: {}\n\
+         runs started from now on get it\n",
+        s.name, s.id, version, s.kind, s.owner
     )
 }
 
@@ -3216,6 +3238,16 @@ mod tests {
               {"id":"selfhosted","display_name":"Self-hosted","kind":"custom","models":[],
                "default_model":"zai-org/glm-5","harness":"claude","roles":["agent"],
                "price":{"input":0.6,"output":2.2,"cache_read":0.11,"cache_write":0.6},
+               "model_limits":{"zai-org/glm-5":{"context_window":200000,"max_output_tokens":64000},
+                               "small":{"context_window":32768,"max_output_tokens":4096}},
+               "enabled":true,"owner":"platform","created_by":"wren",
+               "created_at":"2026-10-22T00:00:00Z","updated_at":"2026-10-22T00:00:00Z",
+               "actions":[]},
+              {"id":"lab","display_name":"Lab","kind":"custom","models":[],
+               "default_model":"big","harness":"pi","roles":["agent"],
+               "price":{"input":0.6,"output":2.2,"cache_read":0.11,"cache_write":0.6},
+               "model_prices":{"big":{"input":3,"output":15,"cache_read":0.3,"cache_write":3.75},
+                               "small":{"input":0.1,"output":0.4,"cache_read":0.01,"cache_write":0.1}},
                "enabled":true,"owner":"platform","created_by":"wren",
                "created_at":"2026-10-22T00:00:00Z","updated_at":"2026-10-22T00:00:00Z",
                "actions":[]},
@@ -3228,7 +3260,7 @@ mod tests {
         )
         .expect("wire shape");
         let out = providers(&list);
-        assert!(out.starts_with("2 providers"), "{out}");
+        assert!(out.starts_with("3 providers"), "{out}");
         assert!(out.contains("PRICE"), "{out}");
         let rows: Vec<&str> = out.lines().collect();
         let row = rows
@@ -3236,7 +3268,18 @@ mod tests {
             .find(|l| l.starts_with("selfhosted"))
             .expect("row");
         assert!(row.contains("0.6/2.2/0.11/0.6"), "{row}");
+        assert!(row.contains("200000/64000"), "{row}");
+        assert!(
+            !row.contains("32768"),
+            "only the default model's limits: {row}"
+        );
         assert!(row.contains("yes"), "{row}");
+        let lab = rows.iter().find(|l| l.starts_with("lab")).expect("row");
+        assert!(lab.contains("3/15/0.3/3.75"), "{lab}");
+        assert!(
+            !lab.contains("0.6/2.2") && !lab.contains("0.1/0.4"),
+            "only the default model's price: {lab}"
+        );
         let openai = rows
             .iter()
             .find(|l| l.starts_with("plat-openai"))

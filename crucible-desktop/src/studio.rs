@@ -89,7 +89,7 @@ pub fn draft_id(playbook: &str, user: &str) -> String {
 }
 
 impl App {
-    fn user(&self) -> Option<&str> {
+    pub(crate) fn user(&self) -> Option<&str> {
         match &*self.remote.live {
             live::LiveView::Ready { identity, .. } if !identity.user.is_empty() => {
                 Some(&identity.user)
@@ -108,7 +108,9 @@ impl App {
     /// The draft the shown run's pack is edited in, and the registered playbook a new one
     /// starts from: the draft itself for a draft run, else the user's own draft of the playbook.
     pub fn draft_target(&self) -> Option<(String, Option<String>)> {
-        let launch = self.selected_live()?;
+        let Some(launch) = self.selected_live() else {
+            return self.selected_draft().map(|draft| (draft.id.clone(), None));
+        };
         if self.draft_run() {
             return Some((launch.id.clone(), None));
         }
@@ -123,7 +125,7 @@ impl App {
         self.remote.working_pack.is_some()
             && match self.run.pack_source {
                 Some(source) => source == PackSource::Working,
-                None => self.draft_run(),
+                None => self.draft_run() || self.selected_draft().is_some(),
             }
     }
 
@@ -228,11 +230,15 @@ impl App {
         }
     }
 
-    /// What a launch form for `playbook` starts: the registered playbook, or the draft the shown
-    /// run came from.
+    /// What a launch form for `playbook` starts: the registered playbook, the draft the shown
+    /// run came from, or the shown draft once it compiles.
     pub fn launch_target(&self, playbook: &str) -> Option<Target> {
         if self.remote.registered.iter().any(|id| id == playbook) {
             return Some(Target::Playbook(playbook.to_string()));
+        }
+        if let Some(draft) = self.selected_draft() {
+            return (draft.id == playbook && draft.compiles)
+                .then(|| Target::Draft(playbook.to_string()));
         }
         let shown = self.selected_live()?;
         (shown.id == playbook && self.draft_run()).then(|| Target::Draft(playbook.to_string()))

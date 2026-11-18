@@ -12,6 +12,7 @@ use serde_json::{Map, Value};
 #[derive(Clone, Debug, PartialEq)]
 pub enum Kind {
     Text,
+    Multiline,
     Integer,
     Number,
     Bool,
@@ -99,6 +100,11 @@ pub fn fields(schema: &Value) -> Vec<Field> {
                 (Some(values), _) => Kind::Choice(values.iter().map(text_of).collect()),
                 (None, Some("integer")) => Kind::Integer,
                 (None, Some("number")) => Kind::Number,
+                (None, Some("string"))
+                    if prop.get("x-multiline").and_then(Value::as_bool) == Some(true) =>
+                {
+                    Kind::Multiline
+                }
                 _ => Kind::Text,
             };
             Some(Field {
@@ -293,7 +299,7 @@ pub fn params(fields: &[Field], answers: &[String]) -> Result<Value, Problems> {
             continue;
         }
         let value = match &field.kind {
-            Kind::Text | Kind::Choice(_) => Value::String(answer.to_string()),
+            Kind::Text | Kind::Multiline | Kind::Choice(_) => Value::String(answer.to_string()),
             Kind::Integer => match answer.parse::<i64>() {
                 Ok(n) => Value::from(n),
                 Err(_) => {
@@ -519,6 +525,31 @@ mod tests {
             (Kind::Integer, "2")
         );
         assert!(fields(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn multiline_requests_keep_their_line_breaks_when_bound_to_launch_params() {
+        let schema = json!({
+            "properties": {
+                "request": {"type": "string", "x-multiline": true},
+                "mode": {"type": "string", "enum": ["quick", "full"], "x-multiline": true},
+                "enabled": {"type": "boolean", "x-multiline": true}
+            },
+            "required": ["request"],
+            "x-order": ["request", "mode", "enabled"]
+        });
+        let fields = fields(&schema);
+        assert_eq!(fields[0].kind, Kind::Multiline);
+        assert_eq!(
+            fields[1].kind,
+            Kind::Choice(vec!["quick".into(), "full".into()])
+        );
+        assert_eq!(fields[2].kind, Kind::Bool);
+        let request = "Compare revisions:\n\n  baseline: v0.17.0\n  candidate: main";
+        assert_eq!(
+            params(&fields, &[request.into(), "full".into(), "true".into()]).unwrap(),
+            json!({"request": request, "mode": "full", "enabled": true})
+        );
     }
 
     #[test]

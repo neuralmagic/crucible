@@ -4433,6 +4433,8 @@ async fn a_pinned_issue_dispatches_its_loop_run_with_the_pair(pool: PgPool) -> R
     crate::playbooks::providers::upsert(
         db.pool(),
         &crate::playbooks::providers::NewProvider {
+            model_limits: Default::default(),
+            model_prices: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "openai-plat",
             display_name: "OpenAI",
@@ -4605,6 +4607,8 @@ async fn a_pinned_scope_turn_renders_its_provider_and_carries_its_key(pool: PgPo
     crate::playbooks::providers::upsert(
         db.pool(),
         &crate::playbooks::providers::NewProvider {
+            model_limits: Default::default(),
+            model_prices: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "openai-plat",
             display_name: "OpenAI",
@@ -7352,6 +7356,8 @@ async fn a_playbook_launch_carries_its_agent_and_decision_bindings(pool: PgPool)
     crate::playbooks::providers::upsert(
         db.pool(),
         &NewProvider {
+            model_limits: Default::default(),
+            model_prices: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: "openai",
             display_name: "OpenAI",

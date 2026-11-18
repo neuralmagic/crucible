@@ -700,9 +700,9 @@ pub(crate) async fn dispatch_run(
 
     // Resolve the scope's bindings BEFORE anything is written: a refusal must leave no work-pod
     // row, no Secret, and no pod behind.
+    let variant = crate::launches::store::launch_variant(db.pool(), issue_key).await?;
     let mints = match secrets {
         Some(ls) => {
-            let variant = crate::launches::store::launch_variant(db.pool(), issue_key).await?;
             let declared =
                 crate::secrets::manifest::declared_secrets(pack.path(), variant.as_ref())?;
             match crate::secrets::launch::resolve(
@@ -724,6 +724,23 @@ pub(crate) async fn dispatch_run(
     };
 
     let cluster = crate::runs::workpod::issue_dispatch_cluster(db, cfg, issue_key).await?;
+    let tokens = crate::runs::workpod::agent_servers::AgentTokens::from_cfg(cfg)?;
+    let granted = match &tokens {
+        Some(tokens) => {
+            crate::runs::workpod::agent_servers::granted(&agent_servers, &cluster, tokens)
+        }
+        None => Vec::new(),
+    };
+    let registries = crate::runs::workpod::registries::of_pack(pack.path(), variant.as_ref())?
+        .resolve(&mints)
+        .and_then(|resolved| {
+            resolved.check_served(&granted, &cluster)?;
+            Ok(resolved)
+        });
+    let registries = match registries {
+        Ok(resolved) => resolved,
+        Err(refusal) => return Ok(secrets_refused(db, refusal.to_string())),
+    };
     if isolated.is_some()
         && push_only(
             crate::runs::cluster_push::PushTokens::from_env()?.pushes_for(&cluster),
@@ -863,11 +880,16 @@ pub(crate) async fn dispatch_run(
                 anyhow::anyhow!("folding the provider's delivery into the run's: {e}")
             })?;
         }
-        if let Some(tokens) = crate::runs::workpod::agent_servers::AgentTokens::from_cfg(cfg)?
+        let pull_secrets = registries.pull_secret_objects(&granted, &delivery, &pod_name)?;
+        let run_servers: Vec<crucible::deploy::servers::ServerSpec> = {
+            let brought = registries.for_pod(&pod_name);
+            agent_servers.iter().map(|s| s.for_run(&brought)).collect()
+        };
+        if let Some(tokens) = tokens.as_ref()
             && let Some(access) = crate::runs::workpod::agent_servers::access(
-                &agent_servers,
+                &run_servers,
                 &cluster,
-                &tokens,
+                tokens,
                 loaded
                     .as_deref()
                     .map_or(crucible::deploy::profile::DEFAULT_SPIFFE_SOCKET, |p| {
@@ -880,11 +902,11 @@ pub(crate) async fn dispatch_run(
             })?;
             crate::runs::agent_tools::grant(
                 db,
-                &agent_servers,
+                &run_servers,
                 run_id,
                 &pod_name,
                 &cluster,
-                &tokens,
+                tokens,
             )
                 .await
                 .context("recording the run's agent tools")?;
@@ -1019,6 +1041,14 @@ pub(crate) async fn dispatch_run(
                 )
                 .await?;
         }
+        crate::runs::workpod::registries::write(
+            db.pool(),
+            dispatcher.as_ref(),
+            &cluster,
+            &pod_name,
+            pull_secrets,
+        )
+        .await?;
         let created_pod = dispatcher
             .create(&cluster, &namespace, pod)
             .await
@@ -1087,6 +1117,12 @@ pub(crate) async fn dispatch_run(
             })
         }
         Err(e) => {
+            crate::runs::workpod::registries::remove_logged(
+                db.pool(),
+                dispatcher.as_ref(),
+                &pod_name,
+            )
+            .await;
             if let Some(profile) = isolated
                 && let Err(cleanup) = crate::runs::workpod::gateway::teardown(
                     dispatcher.as_ref(),
@@ -1185,6 +1221,7 @@ pub async fn collect_run_pod(
     if let Some(ns) = ns.as_deref() {
         teardown_run_gateway(dispatcher, &row.cluster, profile, pod_name, ns).await;
     }
+    crate::runs::workpod::registries::remove_logged(db.pool(), dispatcher, pod_name).await;
     Ok(())
 }
 

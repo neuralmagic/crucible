@@ -109,13 +109,8 @@ impl App {
     /// What the palette offers now: the open run's tasks, the commands, playbooks and packs.
     pub fn palette_entries(&self) -> Vec<Entry> {
         let tasks: Vec<&str> = self.run_tasks().iter().map(|t| t.name.as_str()).collect();
-        let playbooks: Vec<&str> = self
-            .remote
-            .live
-            .playbooks(&self.launch_filter())
-            .into_iter()
-            .map(|p| p.id.as_str())
-            .collect();
+        let rows = self.visible_rows();
+        let playbooks: Vec<&str> = rows.iter().map(|row| row.id()).collect();
         let packs: Vec<&str> = self.packs.iter().map(|p| p.name.as_str()).collect();
         let profiles: Vec<String> = crate::profile::usable(&self.settings)
             .into_keys()

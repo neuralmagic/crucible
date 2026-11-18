@@ -1,7 +1,12 @@
 //! The provider form: which service a registration talks to, the models it serves, the agent CLI
 //! it runs under and the secret it authenticates with.
 
-use crux::dto::{InferenceProtocol, Provider, ProviderBody, ProviderKind, RegisterProvider};
+use std::collections::BTreeMap;
+
+use crux::dto::{
+    InferenceProtocol, ModelLimits, Provider, ProviderBody, ProviderKind, ProviderPrice,
+    RegisterProvider,
+};
 use rune::TextEdit;
 
 pub const KINDS: [(ProviderKind, &str); 4] = [
@@ -86,6 +91,11 @@ pub struct ProviderForm {
     pub harness: Option<&'static str>,
     pub secret: TextEdit,
     pub secret_owner: TextEdit,
+    /// Kept from the registration being edited: a save replaces the whole registration, and the
+    /// form has no field for these.
+    pub price: Option<ProviderPrice>,
+    pub model_prices: BTreeMap<String, ProviderPrice>,
+    pub model_limits: BTreeMap<String, ModelLimits>,
     pub enabled: bool,
 }
 
@@ -104,6 +114,9 @@ impl ProviderForm {
             harness: None,
             secret: TextEdit::new(""),
             secret_owner: TextEdit::new(""),
+            price: None,
+            model_prices: BTreeMap::new(),
+            model_limits: BTreeMap::new(),
             enabled: true,
         }
     }
@@ -130,6 +143,9 @@ impl ProviderForm {
             harness,
             secret: TextEdit::new(provider.secret_name.as_deref().unwrap_or_default()),
             secret_owner: TextEdit::new(provider.secret_owner.as_deref().unwrap_or_default()),
+            price: provider.price,
+            model_prices: provider.model_prices.clone(),
+            model_limits: provider.model_limits.clone(),
             enabled: provider.enabled,
         }
     }
@@ -206,6 +222,9 @@ impl ProviderForm {
             harness: self.harness.map(str::to_string),
             secret_name: text(secret),
             secret_owner: text(secret_owner).filter(|_| !secret.is_empty()),
+            price: self.price,
+            model_prices: self.model_prices.clone(),
+            model_limits: self.model_limits.clone(),
             enabled: self.enabled,
         })
     }
@@ -245,6 +264,9 @@ mod tests {
                 "default_model":"glm-5-3","harness":"pi","harness_override":"pi",
                 "endpoint":"https://vllm.example/v1","protocol":"chat_completions",
                 "secret_name":"lab-key","secret_owner":"team:infra","enabled":false,
+                "price":{"input":0.6,"output":2.2,"cache_read":0.11,"cache_write":0.6},
+                "model_prices":{"glm-5-2":{"input":0.3,"output":1.1,"cache_read":0.05,"cache_write":0.3}},
+                "model_limits":{"glm-5-3":{"context_window":200000,"max_output_tokens":64000}},
                 "owner":"team:infra","actions":["read","update"]}"#,
         )
         .unwrap()
@@ -303,6 +325,12 @@ mod tests {
             (Some("lab-key"), Some("team:infra"))
         );
         assert!(!body.enabled);
+        assert_eq!(body.price, provider.price);
+        assert_eq!(body.price.map(|p| p.output), Some(2.2));
+        assert_eq!(body.model_prices, provider.model_prices);
+        assert_eq!(body.model_prices["glm-5-2"].output, 1.1);
+        assert_eq!(body.model_limits, provider.model_limits);
+        assert_eq!(body.model_limits["glm-5-3"].context_window, 200_000);
     }
 
     #[test]

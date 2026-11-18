@@ -13,6 +13,16 @@ Each release also carries `Crucible-Playbooks-<tag>-aarch64-apple-darwin.zip`. T
 hoc, so macOS blocks a downloaded copy on first launch: allow it from System Settings, Privacy &
 Security, Open Anyway, or run `xattr -d com.apple.quarantine "/Applications/Crucible Playbooks.app"`.
 
+## Nightly builds
+
+The [`nightly`](https://github.com/neuralmagic/crucible/releases/tag/nightly) prerelease carries
+the same artifacts built from `main`, rebuilt each night `main` has moved; its notes name the
+commit. Asset names carry the build date and short commit
+(`Crucible-Playbooks-nightly-<yyyymmdd>-<commit>-aarch64-apple-darwin.zip`,
+`crucible-playbooks-<version>.<yyyymmdd>.<commit>-1.fc45.<arch>.rpm`), and each nightly replaces the
+last. They are signed exactly as the tagged builds are: the macOS app ad hoc, so the first-launch
+steps above apply, and the RPM not at all. The app's update check follows tagged releases only.
+
 ## Fedora
 
 Each release also carries `crucible-playbooks-<version>-1.fc45.<arch>.rpm` for x86_64 and
@@ -205,7 +215,11 @@ host, at the commit the playbook is pinned to.
 
 The Files pane lists the files a controller run's tasks captured (their `emits_files`), by task,
 with sizes, and shows one: markdown rendered (or its source), a patch in a diff view, JSON and
-JSON Lines indented and highlighted, anything else as highlighted text. A shown file is copied to
+JSON Lines indented and highlighted, anything else as highlighted text. On macOS, HTML files
+have a Preview/Source switch. Preview renders the captured document in an embedded WebKit view;
+scripts run in an opaque sandbox, with network access, forms and navigation outside the report
+disabled. The preview receives no controller credentials and uses no persistent browser storage.
+Other platforms and hot-reload builds show HTML source. A shown file is copied to
 `~/Library/Caches/crucible-playbooks/run-files/<run>/<key>`; the copy button copies that path and
 the edit button opens it in the editor. A file over 8 MiB is not fetched; the pane gives the
 `crux run-file` command instead.

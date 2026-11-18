@@ -526,6 +526,8 @@ async fn register_ranker(db: &Db, url: &str) -> Result<()> {
     reg::upsert(
         db.pool(),
         &reg::NewProvider {
+            model_limits: Default::default(),
+            model_prices: Default::default(),
             owner: crucible_controller::authz::model::Principal::platform(),
             id: "e2e-ranker",
             display_name: "e2e ranker",

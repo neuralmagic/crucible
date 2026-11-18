@@ -9,7 +9,9 @@
 //! [`ClaimMap`], applied before anything else reads them; a run's claims are used as issued.
 
 use crate::caller::{Identity, NameError, Namespace};
-use crate::config::{self, ClaimMap, NAMESPACE_CLAIM, NAMESPACES_CLAIM, RUN_ID_CLAIM};
+use crate::config::{
+    self, ClaimMap, NAMESPACE_CLAIM, NAMESPACES_CLAIM, PULL_SECRETS_CLAIM, PullSecret, RUN_ID_CLAIM,
+};
 use crate::namespaces::Namespaces;
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
@@ -59,6 +61,8 @@ pub enum ClaimError {
     NoKubeUser,
     #[error("token claim namespaces must be a list of namespace names")]
     Namespaces,
+    #[error("token claim pull_secrets must be a list of name=registry strings")]
+    PullSecrets,
 }
 
 impl Identity {
@@ -101,6 +105,20 @@ impl Identity {
             ),
             Some(_) => return Err(ClaimError::Namespaces),
         };
+        let pull_secrets = match principal.claims.get(PULL_SECRETS_CLAIM) {
+            Some(Value::Array(items)) if !is_person => items
+                .iter()
+                .map(|s| {
+                    let secret = s.as_str().map(PullSecret::parse).and_then(Result::ok);
+                    secret
+                        .filter(|s| !s.registries.is_empty())
+                        .ok_or(ClaimError::PullSecrets)
+                })
+                .collect::<Result<Vec<_>, ClaimError>>()?,
+            None | Some(Value::Null) => Vec::new(),
+            Some(_) if is_person => Vec::new(),
+            Some(_) => return Err(ClaimError::PullSecrets),
+        };
         let (run_id, actor) = match is_person {
             true => (config::run_id_of(&principal.subject)?, None),
             false => (
@@ -119,6 +137,7 @@ impl Identity {
             launched_by: config::launcher_of(&principal.subject)?,
             kube_user,
             actor,
+            pull_secrets,
         })
     }
 }
@@ -222,6 +241,42 @@ mod tests {
             Identity::from_principal(&person(run_shaped), true),
             Err(ClaimError::RunFromPeopleIssuer)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_runs_token_brings_its_own_pull_secrets_and_a_persons_does_not() {
+        let mut bringing = realm_claims();
+        bringing["pull_secrets"] = json!(["crucible-run-a-pull-0=quay.io/mine"]);
+        let identity = Identity::from_principal(&principal(bringing), false).unwrap();
+        let own = [PullSecret::parse("crucible-run-a-pull-0=quay.io/mine").unwrap()];
+        assert_eq!(identity.pull_secrets, own);
+        let caller = identity.act_in(None, &served(&["team-e2e"])).await.unwrap();
+        assert_eq!(caller.pull_secrets, own);
+
+        let none = Identity::from_principal(&principal(realm_claims()), false).unwrap();
+        assert!(none.pull_secrets.is_empty());
+
+        for bad in [
+            json!("crucible-run-a-pull-0=quay.io/mine"),
+            json!([7]),
+            json!(["=quay.io/mine"]),
+            json!(["named-without-a-registry"]),
+        ] {
+            let mut claims = realm_claims();
+            claims["pull_secrets"] = bad.clone();
+            assert!(
+                matches!(
+                    Identity::from_principal(&principal(claims), false),
+                    Err(ClaimError::PullSecrets)
+                ),
+                "{bad}"
+            );
+        }
+
+        let mut claiming = person_claims();
+        claiming["pull_secrets"] = json!(["someone-elses=quay.io"]);
+        let person = Identity::from_principal(&person(claiming), true).unwrap();
+        assert!(person.pull_secrets.is_empty());
     }
 
     #[tokio::test]

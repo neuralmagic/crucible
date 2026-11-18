@@ -515,6 +515,8 @@ mod tests {
         secret: Option<(&str, &str)>,
     ) -> ModelProvider {
         ModelProvider {
+            model_limits: Default::default(),
+            model_prices: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id: id.to_string(),
             display_name: id.to_string(),

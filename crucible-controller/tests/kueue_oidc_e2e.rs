@@ -222,6 +222,7 @@ kube_authz = "openshift"
             cluster: "dev".to_string(),
             scopes: vec!["kueue.read".into(), "kueue.submit".into()],
             namespaces: Vec::new(),
+            pull_secret_namespace: None,
             remote: true,
         }],
     };

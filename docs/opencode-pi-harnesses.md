@@ -45,8 +45,11 @@ model under it, so the CLI does not use its own model catalog. OpenCode gets an
 
 ## What differs from a claude turn
 
-- **No session resume** on either harness. The second turn of a logical session fails. It
-  does not start a new session.
+- **Session resume on Pi only.** Pi starts a logical session with `--session-id <id>` and
+  resumes it with `--session <id>`, so `session =` and `repair` work as on claude. In a sandbox,
+  the engine saves the session file after each turn and restores it into the next sandbox at the
+  same path. A resume whose session file is missing fails. OpenCode has no session resume: the
+  first turn of a logical session fails, and it does not start a new session.
 - **No OTEL.** If the CLI priced the model, the cost is the number from the endpoint. The CLI
   never prices the `crucible` provider. In other cases, the cost is an estimate from the
   pricing table and the token usage in the stream. OpenCode also makes one more model request
@@ -55,15 +58,26 @@ model under it, so the CLI does not use its own model catalog. OpenCode gets an
 - **Egress.** Both add `api.openai.com` to the sandbox allowlist. For a custom base URL, the
   engine adds its host for each turn, as for codex. The allowlist of a claude turn does not
   change.
-- **Pi has no MCP client.** A pi turn cannot reach the provisioning broker, so a pack whose
-  agent needs the broker tools cannot run on pi. OpenCode gets the broker as a remote MCP
-  server in its configuration, as codex does.
+- **MCP.** OpenCode gets the MCP servers of the turn as remote servers in its configuration, as
+  codex does. Pi gets them in a seeded `mcp.json` for its built-in client. Pi exposes their
+  tools through `codemode`, so the turn passes `--tools +codemode` when a server is in scope.
 - **Skills.** OpenCode finds the `.claude/skills` directory of Claude Code, so the toolbox goes
   there. Pi finds `.agents/skills`. The turn passes `--approve`, so Pi trusts the project-local
   files of the workspace without a prompt.
 - **Reasoning effort.** Pi gets the shared `[agent].reasoning_effort` as `--thinking` (`max`
-  becomes `xhigh`). The OpenCode equivalent (`--variant`) is specific to each provider, so the
-  engine does not pass it.
+  becomes `xhigh`), and the seeded model is declared as reasoning when an effort is set. The
+  OpenCode equivalent (`--variant`) is specific to each provider, so the engine does not pass it.
+- **Model limits.** Pi's seeded model declares a context window of 128,000 tokens and an output
+  limit of 16,384 (200,000 and 16,384 on Vertex) unless the agent binding carries `limits`. With
+  a controller, register them on the provider, for each model:
+  `"model_limits": {"<model>": {"context_window": 32768, "max_output_tokens": 4096}}`. Set them
+  for a self-hosted model with a smaller window, or pi sends requests the endpoint refuses.
+- **Model prices.** The engine costs every agent turn at its tokens times the `price` of the
+  agent binding, and a run on a model with no price and no vendor list price costs nothing, so
+  `--max-cost` never stops it. With a controller, a provider's `price` covers all of its models.
+  A provider that serves models at different rates registers them for each model, and a model
+  with no entry takes the provider's `price`:
+  `"model_prices": {"<model>": {"input": 0.6, "output": 2.2, "cache_read": 0.11, "cache_write": 0.6}}`.
 
 ## OpenCode's transcript is the session export
 

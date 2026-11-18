@@ -224,6 +224,10 @@ enum Command {
     /// terminal: `pbpaste | crux secret-create NAME --kind opaque`. Prints metadata, never the value.
     SecretCreate(SecretCreateArgs),
 
+    /// Write a managed secret's next version. The value is read from piped stdin, never from an
+    /// argument or a terminal: `crux secret-rotate ID < FILE`. Prints metadata, never the value.
+    SecretRotate(SecretRotateArgs),
+
     /// Bind a secret to a draft, playbook, repo, or domain, so a run at that scope receives it.
     /// One scope flag and one projection flag.
     SecretBind(SecretBindArgs),
@@ -374,6 +378,25 @@ impl SecretCreateArgs {
     }
 }
 
+/// The flags of `secret-rotate`. The value never appears here: it is read from piped stdin.
+#[derive(Debug, clap::Args)]
+pub struct SecretRotateArgs {
+    /// The secret's id, as `secrets` lists it.
+    id: String,
+    #[arg(long)]
+    json: bool,
+}
+
+impl SecretRotateArgs {
+    fn into_op(self, value: ops::secrets::SecretValue) -> ops::secrets::SecretRotate {
+        ops::secrets::SecretRotate {
+            id: self.id,
+            value,
+            json: self.json,
+        }
+    }
+}
+
 /// The flags of `secret-bind`: one scope flag and one projection flag, which the operation
 /// carries as a kind and a value.
 #[derive(Debug, clap::Args)]
@@ -514,6 +537,11 @@ pub async fn run() -> Result<()> {
             let value = read_secret_value(&stdin, std::io::IsTerminal::is_terminal(&stdin))?;
             args.into_op(value).run(&c).await?
         }
+        Command::SecretRotate(args) => {
+            let stdin = std::io::stdin();
+            let value = read_secret_value(&stdin, std::io::IsTerminal::is_terminal(&stdin))?;
+            args.into_op(value).run(&c).await?
+        }
         Command::SecretBind(args) => args.into_op()?.run(&c).await?,
         Command::DraftPreview(op) => op.run(&c).await?,
         Command::DraftLaunch(op) => op.run(&c).await?,
@@ -537,7 +565,8 @@ pub async fn run() -> Result<()> {
 fn read_secret_value(mut input: impl Read, terminal: bool) -> Result<ops::secrets::SecretValue> {
     if terminal {
         bail!(
-            "pipe the secret value on stdin, e.g. `pbpaste | crux secret-create NAME --kind opaque`"
+            "pipe the secret value on stdin, e.g. `pbpaste | crux secret-create NAME --kind opaque` \
+             or `crux secret-rotate ID < FILE`"
         );
     }
     let mut raw = String::new();
@@ -721,6 +750,25 @@ mod tests {
             ],
             vec!["crux", "secret-create", "n", "--kind", "password"],
             vec!["crux", "secret-create", "n"],
+        ] {
+            assert!(Cli::try_parse_from(&bad).is_err(), "{bad:?} must not parse");
+        }
+    }
+
+    #[test]
+    fn secret_rotate_takes_an_id_and_no_value_argument() {
+        let cli = Cli::try_parse_from(["crux", "secret-rotate", "01b0", "--json"]).expect("parses");
+        match cli.command {
+            Command::SecretRotate(args) => {
+                assert_eq!(args.id, "01b0");
+                assert!(args.json);
+            }
+            _ => panic!("expected secret-rotate"),
+        }
+        for bad in [
+            vec!["crux", "secret-rotate"],
+            vec!["crux", "secret-rotate", "01b0", "--value", "x"],
+            vec!["crux", "secret-rotate", "01b0", "sk-positional"],
         ] {
             assert!(Cli::try_parse_from(&bad).is_err(), "{bad:?} must not parse");
         }

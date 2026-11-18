@@ -26,6 +26,10 @@ pub struct Remote {
     pub compare_sent: Option<String>,
     /// That launch's run, once read.
     pub live_base: Option<live::Base>,
+    /// The draft save whose pack the live worker was last told to read.
+    pub draft_sent: Option<(String, i64)>,
+    /// That save's pack, once read.
+    pub draft_pack: Option<Arc<live::DraftPack>>,
     /// Playbooks the controller has registered: the ones a launch form can start.
     pub registered: Vec<String>,
     pub shareable: Vec<crux::client::Shared>,
@@ -112,6 +116,8 @@ impl Remote {
             live_sent: None,
             compare_sent: None,
             live_base: None,
+            draft_sent: None,
+            draft_pack: None,
             registered: Vec::new(),
             shareable: Vec::new(),
             launcher: None,

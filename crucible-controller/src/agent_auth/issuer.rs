@@ -166,6 +166,8 @@ pub struct Audience {
     pub scopes: Vec<String>,
     /// The namespaces a token names, the first as the default.
     pub namespaces: Vec<String>,
+    /// Where the server reads a run's own pull secrets from; none, it takes none.
+    pub pull_secret_namespace: Option<String>,
     /// Whether its tokens need no sandbox, so a task may hold one: the server runs outside the
     /// loop pod.
     pub remote: bool,
@@ -181,6 +183,7 @@ impl Audience {
             cluster: cluster.clone(),
             scopes: server.scopes.clone(),
             namespaces: server.namespaces.clone(),
+            pull_secret_namespace: server.pull_secret_namespace.clone(),
             remote: matches!(server.hosting, crucible::deploy::servers::Hosting::Remote),
         })
     }
@@ -577,6 +580,9 @@ pub struct AgentGrant {
     /// The `namespaces` claim, the audience's namespaces; the first is also the `namespace`
     /// claim, the default.
     pub namespaces: Vec<String>,
+    /// The `pull_secrets` claim: the run's own pull Secrets the audience's server copies from,
+    /// each `name=registry`.
+    pub pull_secrets: Vec<String>,
 }
 
 /// A minted token. Never printed.
@@ -895,6 +901,9 @@ impl AgentIssuer {
             if let Some(default) = grant.namespaces.first() {
                 map.insert("namespace".into(), json!(default));
                 map.insert("namespaces".into(), json!(grant.namespaces));
+            }
+            if !grant.pull_secrets.is_empty() {
+                map.insert("pull_secrets".into(), json!(grant.pull_secrets));
             }
         }
         let access_token = self.sign(&claims)?;
@@ -1504,6 +1513,7 @@ mod tests {
             audience: KUEUE.into(),
             scopes: vec![SCOPE_READ.into(), SCOPE_SUBMIT.into()],
             namespaces: namespaces.iter().map(|n| n.to_string()).collect(),
+            pull_secrets: Vec::new(),
         }
     }
 
@@ -1584,9 +1594,28 @@ mod tests {
         )
         .await;
         assert_ne!(a["jti"], b["jti"]);
-        for key in ["namespace", "namespaces", "queues", "role"] {
+        for key in ["namespace", "namespaces", "pull_secrets", "queues", "role"] {
             assert!(!a.contains_key(key), "{key}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_token_names_the_pull_secrets_its_run_brought() {
+        let spire = Spire::start().await;
+        let issuer = testing::issuer(&spire, &EcKey::generate());
+        let bringing = AgentGrant {
+            pull_secrets: vec![format!("{POD}-pull-0=quay.io/mine")],
+            ..grant(&["crucible-kueue-e2e"])
+        };
+        let claims = verified(
+            &issuer,
+            &issuer.mint(&bringing, now()).unwrap().access_token,
+        )
+        .await;
+        assert_eq!(
+            claims["pull_secrets"],
+            json!([format!("{POD}-pull-0=quay.io/mine")])
+        );
     }
 
     #[tokio::test]

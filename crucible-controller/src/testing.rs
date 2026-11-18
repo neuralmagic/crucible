@@ -284,6 +284,8 @@ pub(crate) async fn register_ranker_as(
     crate::playbooks::providers::upsert(
         pool,
         &crate::playbooks::providers::NewProvider {
+            model_limits: Default::default(),
+            model_prices: Default::default(),
             owner: crate::authz::model::Principal::platform(),
             id,
             display_name: id,

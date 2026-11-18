@@ -1259,6 +1259,11 @@ impl Client {
         self.post("/api/playbook-drafts", Some(&body)).await
     }
 
+    /// Every draft the caller may read.
+    pub async fn playbook_drafts<T: DeserializeOwned>(&self) -> Result<T> {
+        self.get("/api/playbook-drafts").await
+    }
+
     pub async fn draft_files<T: DeserializeOwned>(
         &self,
         id: &str,
@@ -2728,6 +2733,9 @@ mod tests {
             harness: None,
             secret_name: None,
             secret_owner: None,
+            price: None,
+            model_prices: Default::default(),
+            model_limits: Default::default(),
             enabled: true,
         };
         client
@@ -2748,6 +2756,30 @@ mod tests {
             harness: Some("opencode".into()),
             secret_name: Some("lab-key".into()),
             secret_owner: Some("team:infra".into()),
+            price: Some(dto::ProviderPrice {
+                input: 0.6,
+                output: 2.2,
+                cache_read: 0.11,
+                cache_write: 0.6,
+            }),
+            model_prices: [(
+                "glm-5-2".to_string(),
+                dto::ProviderPrice {
+                    input: 0.3,
+                    output: 1.1,
+                    cache_read: 0.05,
+                    cache_write: 0.3,
+                },
+            )]
+            .into(),
+            model_limits: [(
+                "glm-5-3".to_string(),
+                dto::ModelLimits {
+                    context_window: 200_000,
+                    max_output_tokens: 64_000,
+                },
+            )]
+            .into(),
             enabled: false,
         };
         client
@@ -2773,6 +2805,12 @@ mod tests {
                         "default_model": "glm-5-3", "endpoint": "https://vllm.example/v1",
                         "protocol": "system_one", "harness": "opencode",
                         "secret_name": "lab-key", "secret_owner": "team:infra",
+                        "price": {"input": 0.6, "output": 2.2, "cache_read": 0.11,
+                                  "cache_write": 0.6},
+                        "model_prices": {"glm-5-2": {"input": 0.3, "output": 1.1,
+                                                     "cache_read": 0.05, "cache_write": 0.3}},
+                        "model_limits": {"glm-5-3": {"context_window": 200000,
+                                                     "max_output_tokens": 64000}},
                         "enabled": false,
                     })
                 ),
