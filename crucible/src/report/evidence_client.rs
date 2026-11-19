@@ -128,7 +128,7 @@ pub(crate) fn deliver_run_evidence(p: &Paths) {
 
 /// Leave [`crucible_contract::RUN_SESSION_UNDELIVERED`] in `state` when the session did not
 /// upload, and clear one an earlier start left when it did.
-fn mark_session(state: &Path, delivered: bool) -> std::io::Result<()> {
+pub(crate) fn mark_session(state: &Path, delivered: bool) -> std::io::Result<()> {
     let marker = state.join(crucible_contract::RUN_SESSION_UNDELIVERED);
     if !delivered {
         return std::fs::write(&marker, b"");
