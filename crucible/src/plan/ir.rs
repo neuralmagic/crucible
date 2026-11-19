@@ -524,6 +524,50 @@ impl Join {
     }
 }
 
+/// The model surface a task asks. This is [`TaskKind::spends`]'s set: every task that draws on
+/// the run's cost ceiling asks a model, and nothing else does, so a build that makes no model
+/// calls can refuse exactly these.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelAsk {
+    /// An agent turn through a harness.
+    AgentTurn,
+    /// A route task's decision model.
+    DecisionRoute,
+    /// The scored loop's propose turn.
+    ProposeTurn,
+}
+
+impl std::fmt::Display for ModelAsk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ModelAsk::AgentTurn => "an agent turn",
+            ModelAsk::DecisionRoute => "a decision model",
+            ModelAsk::ProposeTurn => "the scored loop's propose turn",
+        })
+    }
+}
+
+impl ModelAsk {
+    /// The refusal a build that makes no model calls records for one task, naming the task and
+    /// the kinds of task that still run on it.
+    pub fn refusal(task: &str, ask: ModelAsk) -> String {
+        format!(
+            "task {task} asks {ask}, and this crucible is the hard-tools-only build: it runs no \
+             agent turns and makes no model calls. Author the graph with command, evaluate, \
+             report, and output-decided route tasks, or run it on a build with the `agents` \
+             feature"
+        )
+    }
+}
+
+/// The tasks that ask a model, in the order given, with the surface each asks.
+pub fn model_asks<'a>(tasks: impl IntoIterator<Item = &'a Task>) -> Vec<(&'a Task, ModelAsk)> {
+    tasks
+        .into_iter()
+        .filter_map(|task| Some((task, task.task.model_ask()?)))
+        .collect()
+}
+
 /// What a task *is*. The executor owns advancement; agents only ever run inside `Agent` tasks.
 ///
 /// Internally tagged so TOML and JSON authoring read naturally:
@@ -646,6 +690,22 @@ impl TaskKind {
                     | EngineOp::MeasureDiff,
                 ..
             } => false,
+        }
+    }
+
+    /// The model surface this task asks, if any. Always agrees with [`TaskKind::spends`].
+    pub fn model_ask(&self) -> Option<ModelAsk> {
+        match self {
+            TaskKind::Agent { .. } => Some(ModelAsk::AgentTurn),
+            TaskKind::Route {
+                decider: Decider::Model { .. },
+                ..
+            } => Some(ModelAsk::DecisionRoute),
+            TaskKind::Engine {
+                op: EngineOp::Propose,
+                ..
+            } => Some(ModelAsk::ProposeTurn),
+            _ => None,
         }
     }
 }
@@ -3258,6 +3318,79 @@ mod tests {
     fn a_human_route_does_not_spend() {
         let gate = human_route("gate", &[], &[("pick", pick_question("a", "items", false))]);
         assert!(!gate.task.spends());
+    }
+
+    #[test]
+    fn model_ask_names_the_surface_each_spending_task_asks() {
+        let propose = Task {
+            task: TaskKind::Engine {
+                op: EngineOp::Propose,
+                source: None,
+                tiebreak: None,
+            },
+            ..agent("propose", &[])
+        };
+        let tasks = [
+            agent("scan", &[]),
+            model_route("gate", &["scan"], &[]),
+            propose,
+            human_route(
+                "human",
+                &[],
+                &[("pick", pick_question("a", "items", false))],
+            ),
+            output_route("read", "scan", &[]),
+        ];
+        let asks = model_asks(tasks.iter());
+        let asks: Vec<(&str, ModelAsk)> = asks
+            .into_iter()
+            .map(|(t, ask)| (t.name.0.as_str(), ask))
+            .collect();
+        assert_eq!(
+            asks,
+            [
+                ("scan", ModelAsk::AgentTurn),
+                ("gate", ModelAsk::DecisionRoute),
+                ("propose", ModelAsk::ProposeTurn),
+            ]
+        );
+    }
+
+    #[test]
+    fn model_ask_agrees_with_spends_over_every_kind() {
+        let propose = Task {
+            task: TaskKind::Engine {
+                op: EngineOp::Propose,
+                source: None,
+                tiebreak: None,
+            },
+            ..agent("propose", &[])
+        };
+        for task in [
+            agent("scan", &[]),
+            model_route("gate", &[], &[]),
+            propose.clone(),
+            human_route(
+                "human",
+                &[],
+                &[("pick", pick_question("a", "items", false))],
+            ),
+            output_route("read", "scan", &[]),
+        ] {
+            assert_eq!(
+                task.task.spends(),
+                task.task.model_ask().is_some(),
+                "{}",
+                task.name.0
+            );
+        }
+    }
+
+    #[test]
+    fn the_hard_tools_refusal_names_the_task_and_its_ask() {
+        let note = ModelAsk::refusal("gate", ModelAsk::DecisionRoute);
+        assert!(note.contains("task gate"), "{note}");
+        assert!(note.contains("a decision model"), "{note}");
     }
 
     fn human_route(name: &str, deps: &[&str], questions: &[(&str, Question)]) -> Task {

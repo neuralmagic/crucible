@@ -559,6 +559,43 @@ struct ResumeNeedsPlaybook {
 
 #[derive(Debug, thiserror::Error)]
 #[error(
+    "this crucible is the hard-tools-only build: it runs no agent turns and makes no model \
+     calls, so --agent-cmd, --harness, and --model have nothing to configure. Rebuild with the \
+     `agents` feature, which the default build carries"
+)]
+#[cfg_attr(feature = "agents", allow(dead_code))]
+struct AgentsNotBuilt;
+
+#[derive(Debug, thiserror::Error)]
+#[error("{}", crucible::plan::ir::ModelAsk::refusal(&self.task, self.ask))]
+#[cfg_attr(feature = "agents", allow(dead_code))]
+struct ModelTaskRefused {
+    task: String,
+    ask: crucible::plan::ir::ModelAsk,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "this crucible is the hard-tools-only build and reaches no agent servers, but the \
+     controller granted {servers}. Rebuild with the `agents` feature, or dispatch this run to a \
+     build that reaches them"
+)]
+#[cfg_attr(feature = "agents", allow(dead_code))]
+struct AgentServersNotBuilt {
+    servers: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "--rerun-of names evidence on the controller, which is fetched with the run's token; this \
+     crucible is the hard-tools-only build and reads no run token. Pass the parent run's state \
+     directory instead"
+)]
+#[cfg_attr(feature = "agents", allow(dead_code))]
+struct RerunUrlNotBuilt;
+
+#[derive(Debug, thiserror::Error)]
+#[error(
     "a playbook needs {missing} from whoever launches it. Its source may not declare a limit its \
      operator set, so the engine will not dispatch a task without one."
 )]
@@ -605,6 +642,7 @@ fn record_git_memory(paths: &crate::args::Paths) -> Result<()> {
 }
 
 /// Where a rerun fetches a parent named by URL, inside its own state directory.
+#[cfg(feature = "agents")]
 const FETCHED_PARENT_DIR: &str = "rerun-parent";
 
 /// Seed a rerun: rebuild the workspace from the parent's base, the blobs its partial clone held
@@ -630,9 +668,19 @@ fn start_rerun(
             dir.clone()
         }
         ParentRef::Url(url) => {
-            let dir = paths.state.join(FETCHED_PARENT_DIR);
-            crate::report::evidence_client::fetch_parent(url, &dir)?;
-            dir
+            // The hard-tools-only build reads no run token, so it cannot fetch a parent from
+            // the controller; a local state directory is the parent it accepts.
+            #[cfg(not(feature = "agents"))]
+            {
+                let _ = url;
+                return Err(RerunUrlNotBuilt.into());
+            }
+            #[cfg(feature = "agents")]
+            {
+                let dir = paths.state.join(FETCHED_PARENT_DIR);
+                crate::report::evidence_client::fetch_parent(url, &dir)?;
+                dir
+            }
         }
     };
     let parent = crate::plan::rerun::ParentDir::read(&dir)?;
@@ -668,6 +716,11 @@ pub fn run(
         rerun,
         engine,
     } = opts;
+
+    #[cfg(not(feature = "agents"))]
+    if agent_cmd.is_some() || agent.harness.is_some() || agent.model.is_some() {
+        return Err(AgentsNotBuilt.into());
+    }
 
     if let (None, Some(raw)) = (ceilings.wall_clock, ceilings.wall_clock_raw.as_ref()) {
         return Err(BadDuration { raw: raw.clone() }.into());
@@ -813,6 +866,33 @@ pub fn run(
             }
             (None, None) => unreachable!("clap requires --file without --manifest"),
         };
+    // The hard-tools-only build refuses a plan that asks a model before any dispatch or spend;
+    // the runner refuses again as a backstop (ADR-0078).
+    #[cfg(not(feature = "agents"))]
+    if let Some((task, ask)) = crucible::plan::ir::model_asks(plan.tasks_topo()).first() {
+        return Err(ModelTaskRefused {
+            task: task.name.0.clone(),
+            ask: *ask,
+        }
+        .into());
+    }
+    // And it refuses agent servers the controller delivered: the build starts no credential
+    // sidecar and mints no task token, so a grant it silently ignored would be a lie.
+    #[cfg(not(feature = "agents"))]
+    {
+        let granted = crate::openshell::agent_servers::AgentServers::from_env()
+            .context("reading the run's agent servers")?;
+        if !granted.is_empty() {
+            return Err(AgentServersNotBuilt {
+                servers: granted
+                    .iter()
+                    .map(|g| g.server.name.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            }
+            .into());
+        }
+    }
     if let Some(ceiling) = ceilings.wall_clock {
         plan.check_timeouts(ceiling)?;
     }
@@ -833,12 +913,22 @@ pub fn run(
     // its last line.
     let events = events.filter(|_| !prior.as_ref().is_some_and(|p| p.shut_down));
     // A run with an ingest surface can open decision requests, which is the `human` capability.
+    // The hard-tools-only build opens no desk: it authenticates to nothing, so a human-decided
+    // route cannot run on it and settles through the missing-capability path instead.
+    #[cfg(feature = "agents")]
     let desk = crate::plan::desk::HttpDesk::from_env(events.as_ref());
+    #[cfg(not(feature = "agents"))]
+    let desk: Option<crate::plan::desk::HttpDesk<'_>> = None;
     let mut caps = caps.clone();
     if desk.is_some() {
         caps.insert(crucible::plan::ir::NEEDS_HUMAN.to_owned());
     }
+    // The hard-tools build never reads the inference document: no binding it could carry makes
+    // a model call reachable, so the decision capability is not this build's to grant.
+    #[cfg(feature = "agents")]
     let substrate = Substrate::detecting(caps, &crucible::inference::from_process_env()?);
+    #[cfg(not(feature = "agents"))]
+    let substrate = Substrate { caps };
     if let Some(f) = &events {
         if let Some(prior) = prior.as_ref().filter(|_| resuming) {
             append(
@@ -1073,6 +1163,8 @@ pub fn run(
             },
         );
     }
+    // The hard-tools-only build delivers no run evidence: fire-and-forget, per ADR-0078.
+    #[cfg(feature = "agents")]
     if let Some(p) = &evidence {
         crate::report::evidence_client::deliver_run_evidence(p);
     }
@@ -1776,7 +1868,8 @@ mod tests {
 
     /// The evidence contract a pod-dispatched playbook rides (RFC-0004:C-RUN-EVIDENCE): a
     /// manifest `plan run` uploads its git memory and then its session to its own run under its
-    /// run token, on the failing path too.
+    /// run token, on the failing path too. The hard-tools-only build delivers no evidence.
+    #[cfg(feature = "agents")]
     #[test]
     fn manifest_plan_run_uploads_its_evidence_to_its_run() {
         let _guard = crucible::test_support::env_lock();
@@ -2022,6 +2115,7 @@ workflow(type = "playbook", tasks = [pick, gate, a, b, lint, optional, publish])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "agents")]
     #[test]
     fn an_mcp_server_that_fails_to_start_ends_the_run_with_its_stderr() {
         let _env = crucible::test_support::env_lock();

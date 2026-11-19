@@ -307,6 +307,12 @@ jobs:
         if: needs.changes.outputs.default_packages != ''
         run: cargo clippy $DEFAULT_PACKAGES --all-targets --locked --no-deps -- -D warnings
 
+      # The external-cluster engine (ADR-0078): clippy over the stripped feature set, so the
+      # hard-tools-only build cannot quietly break.
+      - name: Clippy (hard-tools-only build)
+        if: needs.changes.outputs.default_packages != ''
+        run: cargo clippy -p crucible --all-targets --no-default-features --features hard-tools-only --locked --no-deps -- -D warnings
+
       - name: DSL reference is current
         if: needs.changes.outputs.generated_docs == 'true'
         run: ./scripts/dsl-docs.sh --check
@@ -419,6 +425,11 @@ jobs:
 
       - name: Test (default features)
         run: cargo nextest run $DEFAULT_PACKAGES --locked
+
+      # The external-cluster engine's own suite (ADR-0078): the agent-behavior tests are gated
+      # to the `agents` build, so this run covers what the hard-tools-only build actually runs.
+      - name: Test (hard-tools-only build)
+        run: cargo test -p crucible --bin crucible --no-default-features --features hard-tools-only --locked
 
       - name: Stop Postgres
         if: always() && env.PG_CONTAINER != ''
