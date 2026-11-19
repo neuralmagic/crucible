@@ -30,6 +30,10 @@ const CEILING_SLACK: Duration = Duration::from_secs(120);
 /// How many trailing output lines ride a failure that published no session.
 const TAIL_LINES: usize = 40;
 
+/// How long the supervisor keeps draining the engine's pipes after the engine exits. A server
+/// the engine leaves behind with an inherited stderr holds the pipe open indefinitely.
+const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(10);
+
 /// A launch running as a subprocess: the child, its process group, and the directory it runs in.
 pub struct LocalRun {
     child: tokio::process::Child,
@@ -82,8 +86,17 @@ fn forge_root(dir: &Path) -> PathBuf {
     dir.join("forge")
 }
 
-/// Host variables every local run inherits.
-const HOST_ENV: [&str; 4] = ["PATH", "HOME", "USER", "OPENSHELL_PODMAN_SOCKET"];
+/// Host variables every local run inherits. The in-cluster endpoints are pointers, not
+/// credentials: a local run's cluster servers (buildit) reach the API with the pod's own
+/// service account, and the kube client cannot find it without them.
+const HOST_ENV: [&str; 6] = [
+    "PATH",
+    "HOME",
+    "USER",
+    "OPENSHELL_PODMAN_SOCKET",
+    "KUBERNETES_SERVICE_HOST",
+    "KUBERNETES_SERVICE_PORT",
+];
 
 /// The environment one local run is spawned with. Local mode has no registry and no grant, so the
 /// only credentials handed over as environment are the ones an operator named in `allowlist`;
@@ -111,7 +124,13 @@ fn run_env(
         if allowlisted && !disclosed.is_some_and(|e| e.covers_agent_credential(&name)) {
             return Err(UndisclosedGrant { name });
         }
-        if HOST_ENV.contains(&name.as_str()) || name.starts_with("CRUCIBLE_") || allowlisted {
+        // MCP_ variables configure the local servers a run starts (buildit's image repository
+        // and registry auth mode); none of them carries a credential value.
+        if HOST_ENV.contains(&name.as_str())
+            || name.starts_with("CRUCIBLE_")
+            || name.starts_with("MCP_")
+            || allowlisted
+        {
             env.push((name, value));
         }
     }
@@ -327,11 +346,17 @@ pub async fn supervise(db: Db, key: String, run: LocalRun) {
             )
         }
     };
-    while let Some(joined) = streams.join_next().await {
-        if let Ok(lines) = joined {
-            tail.extend(lines);
+    // The pipes are drained to keep a chatty run from filling a buffer, not to capture output
+    // the engine never wrote: a server the engine spawned with an inherited stderr (buildit)
+    // holds the pipe open past the engine's exit, so the join is bounded rather than waited out.
+    let _ = tokio::time::timeout(PIPE_DRAIN_GRACE, async {
+        while let Some(joined) = streams.join_next().await {
+            if let Ok(lines) = joined {
+                tail.extend(lines);
+            }
         }
-    }
+    })
+    .await;
 
     let session = std::fs::read_to_string(session_log(&dir)).unwrap_or_default();
     if session.trim().is_empty() {

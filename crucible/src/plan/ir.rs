@@ -3320,8 +3320,9 @@ mod tests {
         assert!(!gate.task.spends());
     }
 
-    #[test]
-    fn model_ask_names_the_surface_each_spending_task_asks() {
+    /// One task of every kind: an agent, a model-decided route, the loop's propose turn, a
+    /// human-decided route, and an output-decided route.
+    fn every_kind() -> Vec<Task> {
         let propose = Task {
             task: TaskKind::Engine {
                 op: EngineOp::Propose,
@@ -3330,7 +3331,7 @@ mod tests {
             },
             ..agent("propose", &[])
         };
-        let tasks = [
+        vec![
             agent("scan", &[]),
             model_route("gate", &["scan"], &[]),
             propose,
@@ -3340,7 +3341,12 @@ mod tests {
                 &[("pick", pick_question("a", "items", false))],
             ),
             output_route("read", "scan", &[]),
-        ];
+        ]
+    }
+
+    #[test]
+    fn model_ask_names_the_surface_each_spending_task_asks() {
+        let tasks = every_kind();
         let asks = model_asks(tasks.iter());
         let asks: Vec<(&str, ModelAsk)> = asks
             .into_iter()
@@ -3358,25 +3364,7 @@ mod tests {
 
     #[test]
     fn model_ask_agrees_with_spends_over_every_kind() {
-        let propose = Task {
-            task: TaskKind::Engine {
-                op: EngineOp::Propose,
-                source: None,
-                tiebreak: None,
-            },
-            ..agent("propose", &[])
-        };
-        for task in [
-            agent("scan", &[]),
-            model_route("gate", &[], &[]),
-            propose.clone(),
-            human_route(
-                "human",
-                &[],
-                &[("pick", pick_question("a", "items", false))],
-            ),
-            output_route("read", "scan", &[]),
-        ] {
+        for task in every_kind() {
             assert_eq!(
                 task.task.spends(),
                 task.task.model_ask().is_some(),
