@@ -208,10 +208,16 @@ fn operator_history_limit() -> Option<String> {
     std::env::var(crucible_contract::history::ENV_HISTORY_MAX_BYTES).ok()
 }
 
-/// Everything in a compiled graph this build refuses to run, as findings: a task that asks a
-/// model, a required one that needs a human decision (the hard-tools-only build opens no desk
-/// to take it), and a `[workflow].servers` declaration it mints no tokens for. `check` on it
-/// must not pass a pack it cannot run (ADR-0078).
+/// What the hard-tools-only build refuses, as check findings, so `check` never passes a pack
+/// the run would refuse (ADR-0078):
+///
+/// - A task that asks a model: an agent turn, a model-decided route, or the scored loop's
+///   propose turn. Plan admission refuses these before any dispatch.
+/// - A required task that needs a human decision. The run truncates that on its own — the
+///   build opens no decision desk, so the `human` capability is never available — and this
+///   finding only makes check agree with the run instead of passing a pack it then refuses.
+/// - A `[workflow].servers` declaration. Setup refuses it: the build mints no task tokens,
+///   so the servers would be unreachable were it to run.
 #[cfg(not(feature = "agents"))]
 fn refused_task_findings(m: &Manifest) -> Vec<String> {
     let mut findings: Vec<String> = m

@@ -76,7 +76,13 @@ impl Upload {
                 .trim_end_matches('/')
                 .to_string(),
             target,
+            // The hard-tools-only build reads no run token: a controller that runs open accepts
+            // its evidence with none (ADR-0078), and a guarded one's refusal marks the session
+            // for the pod-log scrape instead.
+            #[cfg(feature = "agents")]
             token: non_empty_env(crucible_contract::ENV_POD_TOKEN)?,
+            #[cfg(not(feature = "agents"))]
+            token: String::new(),
             waits: &RETRY_WAITS,
         })
     }
@@ -202,12 +208,14 @@ fn send(upload: &Upload, kind: ArtifactKind, gz: &[u8]) -> bool {
     let bytes = gz.len();
     let attempts = waits.len() + 1;
     for attempt in 1..=attempts {
-        let resp = client
+        let mut request = client
             .put(&url)
-            .bearer_auth(&upload.token)
             .header(reqwest::header::CONTENT_TYPE, "application/gzip")
-            .body(gz.to_vec())
-            .send();
+            .body(gz.to_vec());
+        if !upload.token.is_empty() {
+            request = request.bearer_auth(&upload.token);
+        }
+        let resp = request.send();
         match resp {
             Ok(r) if r.status().is_success() => {
                 eprintln!("[crucible] uploaded {kind} ({bytes} gzipped bytes)");
@@ -280,11 +288,14 @@ pub enum FetchError {
 /// Download the evidence of the run at `parent` (`<controller>/api/evidence/runs/<id>`) into `dest`, laid
 /// out like that run's state directory: `session.jsonl`, `files/`, and `git-memory/`. Evidence
 /// the controller does not hold is left absent, for the rerun's own read of the parent to name.
-/// The bearer is the run token when this process holds one, else a person's controller token.
-#[cfg_attr(not(feature = "agents"), allow(dead_code))]
+/// The bearer is the run token when this process holds one, else a person's controller token; the
+/// hard-tools-only build reads neither and asks an open controller bare (ADR-0078).
 pub fn fetch_parent(parent: &url::Url, dest: &Path) -> Result<(), FetchError> {
+    #[cfg(feature = "agents")]
     let token =
         non_empty_env(crucible_contract::ENV_POD_TOKEN).or_else(|| non_empty_env(HUMAN_TOKEN_ENV));
+    #[cfg(not(feature = "agents"))]
+    let token: Option<String> = None;
     let client = reqwest::blocking::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()
