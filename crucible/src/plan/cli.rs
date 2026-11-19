@@ -1163,10 +1163,16 @@ pub fn run(
             },
         );
     }
-    // The hard-tools-only build delivers no run evidence: fire-and-forget, per ADR-0078.
+    // The hard-tools-only build reads no run token and uploads nothing: it marks the session
+    // undelivered, so the pod wrapper prints it to the pod log, where the controller collects
+    // it when the run finishes (ADR-0078).
     #[cfg(feature = "agents")]
     if let Some(p) = &evidence {
         crate::report::evidence_client::deliver_run_evidence(p);
+    }
+    #[cfg(not(feature = "agents"))]
+    if let Some(p) = &evidence {
+        let _ = crate::report::evidence_client::mark_session(&p.state, false);
     }
     println!(
         "plan v{}: {} — spent ${:.4} of ${}",
@@ -1869,6 +1875,65 @@ mod tests {
     /// The evidence contract a pod-dispatched playbook rides (RFC-0004:C-RUN-EVIDENCE): a
     /// manifest `plan run` uploads its git memory and then its session to its own run under its
     /// run token, on the failing path too. The hard-tools-only build delivers no evidence.
+    /// The hard-tools-only build uploads nothing and reads no token; it marks the session
+    /// undelivered so the pod wrapper prints it to the pod log, where the controller's
+    /// completion edge collects it (ADR-0078).
+    #[cfg(not(feature = "agents"))]
+    #[test]
+    fn a_hard_tools_run_marks_its_session_undelivered_for_the_log_scrape() {
+        let _guard = crucible::test_support::env_lock();
+        let dir = crate::testing::tempdir("hard-tools-undelivered");
+        std::fs::write(
+            dir.join("workflow.star"),
+            "t = command(name = \"t\", run = \"echo '{\\\"ok\\\": true}'\")\nworkflow(type = \"playbook\", tasks = [t])\n",
+        )
+        .expect("workflow");
+        std::fs::write(
+            dir.join("crucible.toml"),
+            r#"
+            [repo]
+            path = "."
+            [workspace]
+            dir = "workspace"
+            setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+            [agent]
+            backend = "command"
+            agent_cmd = "true"
+            goal = "mark the session"
+            [workflow]
+            type = "playbook"
+            file = "workflow.star"
+            "#,
+        )
+        .expect("manifest");
+        let manifest = dir.join("crucible.toml");
+        run(
+            None,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            Some(&manifest),
+            RunOpts {
+                ceilings: Ceilings {
+                    usd: Some(1.0),
+                    wall_clock: Some(std::time::Duration::from_secs(60)),
+                    wall_clock_raw: Some("60s".to_string()),
+                },
+                ..Default::default()
+            },
+        )
+        .expect("the playbook reaches a verdict");
+        let state = crate::cli::setup::state_dir(&manifest);
+        let marker = state.join(crucible_contract::RUN_SESSION_UNDELIVERED);
+        assert!(
+            marker.is_file(),
+            "no {} in {}",
+            marker.display(),
+            state.display()
+        );
+        assert!(state.join("session.jsonl").is_file(), "the session itself");
+    }
+
     #[cfg(feature = "agents")]
     #[test]
     fn manifest_plan_run_uploads_its_evidence_to_its_run() {
