@@ -129,3 +129,4 @@
   - [ADR-0076: A launch confirms a value a task output flags](./adr/ADR-0076.md)
   - [ADR-0077: A provider names each model's limits, and the binding carries them to the harness](./adr/ADR-0077.md)
   - [ADR-0078: A Kueue workload's result files leave the pod on an injected sidecar's log](./adr/ADR-0078.md)
+  - [ADR-0079: The hard-tools-only engine build for external clusters](./adr/ADR-0079.md)

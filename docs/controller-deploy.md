@@ -144,6 +144,27 @@ If the controller runs loops in other clusters (spokes):
   `crucible-controller cluster-snapshot` runs on the spoke as a CronJob and posts to the push
   endpoint of the hub with a bearer token that the hub lists in `CONTROLLER_PUSH_TOKENS`.
 
+### External clusters: the hard-tools-only engine
+
+A cluster we do not manage gets a different engine, the **hard-tools-only build**: it runs the
+command-shaped work of a playbook — command, evaluate, report, and output-decided route tasks —
+and refuses everything that asks a model or authenticates as anything (ADR-0078).
+
+- An agent task or a model-decided route is refused at plan load with an error naming the task,
+  `crucible check` reports each as a finding, and the runner refuses again as a backstop, so the
+  build makes no LLM calls and runs no agent turns whatever its environment carries.
+- It reads no inference document and applies no `[agent]` configuration, so it relays no agent
+  credentials.
+- It authenticates to nothing: no run token is read, no decision desk opens (a required
+  human-decided route truncates the plan), no evidence is delivered — a run is fire-and-forget —
+  and an agent server the controller grants, or a pack's `[workflow].servers`, is refused by
+  name. The S3 surface is absent entirely, so not even an ambient cloud credential has a reader.
+
+Build it with `just hard-tools-only`, or package the image the self-contained way with
+`--build-arg ENGINE_FEATURES="--no-default-features --features crucible/hard-tools-only"`. The
+default build is unchanged; a pack with agent tasks still runs wherever the full engine is
+deployed.
+
 ## Agent tokens
 
 The controller can act as the OAuth authorization server for sandboxed agents. An OpenShell

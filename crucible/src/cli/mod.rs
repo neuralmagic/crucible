@@ -155,6 +155,7 @@ pub(crate) enum Cmd {
     /// Download one published object at an exact `s3://bucket/key` URI to a local file, the general
     /// GetObject the controller's artifact proxy shells so no S3 client leaks into
     /// `crucible-controller`. Nothing is appended to the URI; the caller passes the exact key.
+    #[cfg(feature = "publish")]
     Fetch {
         /// The exact `s3://bucket/key` object URI to download (no `session.jsonl` is appended).
         #[arg(long)]

@@ -64,9 +64,14 @@ formal:
 formal-mutants:
     python3 formal/mutate.py
 
-# Lint + test the Rust workspace.
+# Build the external-cluster engine: the hard-tools-only build, which refuses every task that
+# asks a model, reads no agent credentials, and authenticates to nothing (ADR-0078).
+hard-tools-only:
+    cargo build -p crucible --no-default-features --features hard-tools-only --bin crucible
+
+# Lint + test the Rust workspace, the hard-tools-only build included.
 lint:
-    cargo fmt --check && cargo clippy --workspace --all-targets --all-features && cargo clippy -p crucible --all-targets && cargo test --workspace --all-features && cargo test -p crucible
+    cargo fmt --check && cargo clippy --workspace --all-targets --all-features && cargo clippy -p crucible --all-targets && cargo clippy -p crucible --all-targets --no-default-features --features hard-tools-only && cargo test --workspace --all-features && cargo test -p crucible && cargo test -p crucible --bin crucible --no-default-features --features hard-tools-only
 
 # Module dependency graph of one crate (crucible by default; `--root crucible-controller/src`
 # for the controller): cycles, fan-in/out, duplicate item names. `just modgraph --check` fails

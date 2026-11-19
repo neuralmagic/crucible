@@ -20,7 +20,11 @@
 //! (default: auto by TTY).
 //!
 //! The loop, [`scope`], and the loop-only parts of [`control`] and [`report`] build only with the
-//! `autoresearch` feature; without it the binary is the playbook workflow engine.
+//! `autoresearch` feature; without it the binary is the playbook workflow engine. The `agents`
+//! feature (default) carries the agent turns and model-decided routes; the external-cluster build
+//! omits it (`--no-default-features --features hard-tools-only`) for the hard-tools-only engine, which
+//! refuses every task that asks a model, reads no agent credentials, and authenticates to
+//! nothing (ADR-0078).
 //!
 //! Operator ergonomics:
 //!
@@ -33,6 +37,7 @@ mod cli;
 mod control;
 #[cfg(feature = "autoresearch")]
 mod identity;
+#[cfg(feature = "publish")]
 mod object_store;
 mod process;
 mod report;

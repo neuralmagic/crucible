@@ -36,6 +36,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The human credential a person's `crucible plan run --rerun-of <url>` presents when it holds no
 /// run token.
+#[cfg_attr(not(feature = "agents"), allow(dead_code))]
 const HUMAN_TOKEN_ENV: &str = "CONTROLLER_API_TOKEN";
 
 /// What a pod uploads evidence for.
@@ -254,6 +255,8 @@ fn first_line(body: &str) -> String {
         .collect()
 }
 
+/// The hard-tools-only build fetches no parent from the controller: it reads no run token.
+#[cfg_attr(not(feature = "agents"), allow(dead_code))]
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
     #[error("building the evidence client: {0}")]
@@ -278,6 +281,7 @@ pub enum FetchError {
 /// out like that run's state directory: `session.jsonl`, `files/`, and `git-memory/`. Evidence
 /// the controller does not hold is left absent, for the rerun's own read of the parent to name.
 /// The bearer is the run token when this process holds one, else a person's controller token.
+#[cfg_attr(not(feature = "agents"), allow(dead_code))]
 pub fn fetch_parent(parent: &url::Url, dest: &Path) -> Result<(), FetchError> {
     let token =
         non_empty_env(crucible_contract::ENV_POD_TOKEN).or_else(|| non_empty_env(HUMAN_TOKEN_ENV));

@@ -825,6 +825,12 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
         budget_left,
         lane,
     } = job;
+    // Plan admission refuses model-asking tasks first (ADR-0078); the runner refuses again so
+    // no other caller of this build can reach a model surface.
+    #[cfg(not(feature = "agents"))]
+    if let Some(ask) = task.task.model_ask() {
+        return Attempt::failed(0.0, crate::plan::ir::ModelAsk::refusal(&task.name.0, ask));
+    }
     let (prompt, harness, model, effort, sandbox) = match &task.task {
         TaskKind::Agent {
             prompt,
@@ -1366,7 +1372,9 @@ fn task_worktree_name(name: &TaskName) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::plan::exec::{ExecCfg, PlanExit, Substrate};
+    #[cfg(feature = "agents")]
+    use crate::plan::exec::PlanExit;
+    use crate::plan::exec::{ExecCfg, Substrate};
     use crate::plan::harness::*;
     use crucible_contract::session::TaskStatus;
 
@@ -1514,6 +1522,7 @@ mod tests {
         assert_eq!(env_keys(&args).len(), 3);
     }
 
+    #[cfg(feature = "agents")]
     #[test]
     fn an_agent_task_naming_an_undeclared_sandbox_is_a_measured_failure() {
         let t = crate::plan::ir::Task {
@@ -1677,7 +1686,9 @@ mod tests {
         crate::plan::exec::execute(plan, substrate, cfg, runner, on_result)
             .expect("an executor transition its table does not list")
     }
-    use crate::plan::ir::{Join, Plan, Stage};
+    #[cfg(feature = "agents")]
+    use crate::plan::ir::Plan;
+    use crate::plan::ir::{Join, Stage};
 
     fn scratch(tag: &str) -> (std::path::PathBuf, Paths) {
         let dir = std::env::temp_dir().join(format!("crucible-{tag}-{}", std::process::id()));
@@ -1931,6 +1942,7 @@ mod tests {
         (out, runner)
     }
 
+    #[cfg(feature = "agents")]
     /// A launch's `--harness`/`--model` replace the manifest's `[agent]` pair on the runner every
     /// agent task inherits from, and the toolbox lands where that harness discovers skills.
     #[test]
@@ -2002,6 +2014,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "agents")]
     /// A launch's agent settings reach each task's turn through the real setup path:
     /// `*.<setting>` fills what a task leaves unset, `<task>.<setting>` replaces what it sets, and
     /// a run-wide flag still decides what neither a task nor a launch value does.
@@ -2207,6 +2220,7 @@ workflow(type = "playbook", tasks = [plan, review, ship])
         let _ = std::fs::remove_dir_all(&origin.path);
     }
 
+    #[cfg(feature = "agents")]
     /// A serial producer's declared file has to reach an isolated consumer, whose worktree is a
     /// clone that cannot carry `inputs/` (it is excluded from the workspace's git memory on
     /// purpose), and the whole pack has to stay runnable: the middle task's declared output is a
@@ -2261,6 +2275,7 @@ workflow(type = "playbook", tasks = [write, copy, review])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "agents")]
     /// A wedged agent instance is stopped and retried in a fresh turn while its batch sibling
     /// keeps its own result, so one stuck agent costs a retry rather than the run's deadline.
     #[test]
@@ -2314,6 +2329,7 @@ workflow(type = "playbook", tasks = [stuck, steady])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "agents")]
     /// The file channel says what the JSON channel says. A producer that failed contributes
     /// nothing, including what a previous run of the same pack captured under its name.
     #[test]
@@ -2389,6 +2405,7 @@ workflow(type = "playbook", tasks = [seed, produce, check])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "agents")]
     /// Isolated tasks that are ready together run as one batch, and they do not share an
     /// ancestor set: each one is owed exactly what its own ancestors declared.
     #[test]
@@ -2447,6 +2464,7 @@ workflow(type = "playbook", tasks = [prod_a, prod_b, con_a, con_b])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "agents")]
     /// A batch runs concurrently, and each member runs under its own task's limit: `peer` outlives
     /// the limit of both members that time out and still passes, and neither of them holds it up.
     /// The serial agent proves a turn in the shared workspace ends at its deadline too.
@@ -2506,6 +2524,7 @@ workflow(type = "playbook", tasks = [agent_hang, command_hang, peer, serial_hang
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "agents")]
     /// Staged inputs belong to the task they were staged for. A task that is nobody's descendant
     /// gets nothing on the file channel, whatever the dispatch before it was handed.
     #[test]
@@ -2611,6 +2630,7 @@ workflow(type = "playbook", tasks = [prod, cons, serial_stranger, isolated_stran
         );
     }
 
+    #[cfg(feature = "agents")]
     /// The counter litmus, plan-shaped: agent tasks run through the REAL `run_turn` path
     /// (`command` backend: real subprocess, no LLM, no mock), mutating a real git
     /// workspace; the command task measures the real state. Proves the whole harness
@@ -2716,6 +2736,7 @@ workflow(type = "playbook", tasks = [prod, cons, serial_stranger, isolated_stran
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "agents")]
     /// The whole playbook concept, end to end, with no model and no controller: a real graph
     /// compiled from a real pack, real processes for every turn, and a verdict. Only the model
     /// is absent, and it is absent by substitution at the process boundary rather than by
@@ -2885,6 +2906,7 @@ workflow(type = "playbook", tasks = [draft, shape, polish, audit_a, audit_b, rou
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "agents")]
     /// A fan-out over items nobody knew about when the graph was written, run end to end with
     /// no model. The graph has three nodes whatever `discover` returns; only the instance count
     /// is decided at run time, and each instance is named by its item rather than its position.
@@ -3071,6 +3093,7 @@ workflow(type = "playbook", tasks = [discover, audit, roundup])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "agents")]
     /// Typed emits through the real front end, subprocesses, and agent harness: a mapped instance
     /// and a command whose output holds the wrong type each fail where they ran, with a note that
     /// names the field, what arrived, and what was declared.
@@ -3210,6 +3233,7 @@ workflow(type = "playbook", tasks = [discover, audit, tally])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "agents")]
     /// Git memory, per task: what a passing task did becomes a commit, and what a failing task
     /// did is dropped. The second half is what needs proving. Leaving a failed task's edits in
     /// the shared tree does not merely fail to commit them; the next task to pass sweeps them
@@ -3336,6 +3360,7 @@ workflow(type = "playbook", tasks = [good, bad, after])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "agents")]
     /// A playbook runs from its manifest: the pack names its graph, the engine compiles it, and
     /// the ceilings come from whoever launched it. There is no plan file anywhere.
     #[test]
@@ -3467,6 +3492,7 @@ workflow(type = "playbook", tasks = [good, bad, after])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "agents")]
     /// The run's ceiling is the longest limit a task may declare, and it is enforced before any
     /// dispatch; the limit a task does declare reaches the session log before anything runs; and
     /// the ceiling itself ends an attempt still in flight when it falls.
@@ -3551,6 +3577,7 @@ workflow(type = "playbook", tasks = [good, bad, after])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "agents")]
     /// A declared file is part of a task's output, not part of the workspace state isolation
     /// discards, and it reaches every descendant rather than only the next one.
     ///
@@ -3656,6 +3683,7 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "agents")]
     #[test]
     fn a_turn_that_writes_no_result_fails_but_still_advances_the_session() {
         let dir = std::env::temp_dir().join(format!(
@@ -3744,6 +3772,7 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
     /// Copy the shipped `examples/adversarial-review` fixture into a scratch dir, so the
     /// test exercises the EXACT files the example ships (it can't rot) without leaving a
     /// workspace behind in the repo.
+    #[cfg(feature = "agents")]
     fn stage_review_example(tag: &str) -> std::path::PathBuf {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -3771,6 +3800,7 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
         dir
     }
 
+    #[cfg(feature = "agents")]
     fn run_review_plan(dir: &std::path::Path, plan_file: &str) -> crate::plan::exec::PlanOutcome {
         let plan = crate::plan::cli::load(&dir.join(plan_file)).unwrap();
         let mut runner = crate::cli::setup::prep_plan_runner(&dir.join("crucible.toml"))
@@ -3785,6 +3815,7 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
         )
     }
 
+    #[cfg(feature = "agents")]
     #[test]
     fn adversarial_review_gates_a_reward_hack_the_frozen_gate_cannot_see() {
         // 1. Clean implementation: the review approves and the whole chain runs.
@@ -3875,6 +3906,7 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
         let _ = std::fs::remove_dir_all(&hacked);
     }
 
+    #[cfg(feature = "agents")]
     /// One code node splitting into two isolated reviewers, rejoined by a policy gate.
     /// Runs the shipped panel plan against the stand-in manifest. Correct code with sloppy
     /// prose: the advisory reviewer reports defects and the run still reaches `measure`,
@@ -3943,6 +3975,7 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "agents")]
     /// A fan-out in the shared workspace, run end to end with no model. The instances write one
     /// tree and one result file, so each has to be a serial task in its own right: every item is
     /// attributed to the instance that produced it, and the instance that fails takes its own
@@ -4053,6 +4086,7 @@ workflow(type = "playbook", tasks = [discover, audit])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "agents")]
     /// A mapped node's declared files are captured per instance and reach a consumer under the
     /// instance's own namespace. A failed instance has no namespace: its files are not evidence.
     #[test]
@@ -4150,6 +4184,7 @@ workflow(type = "playbook", tasks = [discover, audit, roundup])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "agents")]
     fn write_fanout_manifest(dir: &std::path::Path, fake: &std::path::Path) {
         std::fs::write(
             dir.join("crucible.toml"),
@@ -4177,6 +4212,7 @@ workflow(type = "playbook", tasks = [discover, audit, roundup])
         .unwrap();
     }
 
+    #[cfg(feature = "agents")]
     fn fanout_plan(dir: &std::path::Path) -> crate::plan::ir::ValidPlan {
         let mut manifest = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
         manifest.resolve_workflow(dir).unwrap();
@@ -4386,6 +4422,7 @@ workflow(type = "playbook", tasks = [good, lane, bad_field, after, bad_file, not
     }
 
     /// A pack whose `plan` agent turn is scripted per turn, with the schemas the tests declare.
+    #[cfg(feature = "agents")]
     fn repair_pack(tag: &str, workflow: &str, agents: Value) -> std::path::PathBuf {
         let dir = playbook_pack(tag, workflow);
         std::fs::write(dir.join("agents.json"), agents.to_string()).unwrap();
@@ -4403,6 +4440,7 @@ workflow(type = "playbook", tasks = [good, lane, bad_field, after, bad_file, not
         dir
     }
 
+    #[cfg(feature = "agents")]
     const REPAIRED_PLAN: &str = r#"
 plan = agent(
     name = "plan",
@@ -4413,7 +4451,7 @@ plan = agent(
 )
 workflow(type = "playbook", tasks = [plan])
 "#;
-
+    #[cfg(feature = "agents")]
     #[test]
     fn a_repair_turn_resumes_the_session_and_fixes_the_output_in_place() {
         let log = std::env::temp_dir().join(format!("crucible-repair-log-{}", std::process::id()));
@@ -4485,6 +4523,7 @@ workflow(type = "playbook", tasks = [plan])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "agents")]
     #[test]
     fn repairs_that_never_fix_the_output_fail_the_task_once_with_the_last_note() {
         let dir = repair_pack(
@@ -4520,6 +4559,7 @@ workflow(type = "playbook", tasks = [plan])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "agents")]
     #[test]
     fn mapped_instances_are_repaired_independently() {
         let dir = repair_pack(
@@ -4562,6 +4602,7 @@ workflow(type = "playbook", tasks = [discover, audit])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "agents")]
     #[test]
     fn no_repair_starts_once_the_attempt_has_spent_the_budget_left() {
         let dir = repair_pack(
@@ -4577,6 +4618,7 @@ workflow(type = "playbook", tasks = [discover, audit])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "agents")]
     #[test]
     fn a_repair_turn_runs_under_the_attempts_own_timeout() {
         let dir = repair_pack(
@@ -4703,6 +4745,7 @@ workflow(type = "playbook", tasks = [first, second, report])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "agents")]
     /// The same provenance rule across serial instances of one mapped node, which is where it
     /// bites: they share a workspace and a declared path, so the instance that failed before
     /// writing would otherwise publish its sibling's reading as its own.
@@ -4770,6 +4813,7 @@ workflow(type = "playbook", tasks = [discover, review, report])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "agents")]
     /// The same rule for the veto an agent turn actually has: an instance with no exit code
     /// settles itself failing by returning "status": "fail", and that is its terminal state
     /// before its files are taken, not after.
@@ -4847,6 +4891,7 @@ workflow(type = "playbook", tasks = [discover, review, report])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "agents")]
     /// A task that vetoed itself has already failed, so an absent declared file cannot make it a
     /// different failure: the capture problem joins its own note and the object it vetoed with
     /// still reaches a settled consumer.
@@ -5452,6 +5497,7 @@ workflow(type = "playbook", tasks = [discover, audit])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "agents")]
     /// The proposer is an agent turn resuming one session across rounds; the reviewer is a command
     /// reading the staged draft. Round one's draft carries no verdict and is rejected; round two's
     /// carries it and passes.
@@ -5641,6 +5687,7 @@ workflow(type = "playbook", tasks = [author, repro])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "agents")]
     #[test]
     fn a_real_agent_backend_reads_large_upstream_results_without_a_large_prompt() {
         let dir = playbook_pack(
