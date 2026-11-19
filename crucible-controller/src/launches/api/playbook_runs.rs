@@ -218,6 +218,25 @@ pub struct LaunchRunDto {
     pub cost_usd: Option<f64>,
 }
 
+/// The attempt a launch is currently making: the run people should read, and the labels its pack
+/// declared.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AttemptDto {
+    pub run_id: String,
+    #[schema(value_type = Option<String>)]
+    pub name: Option<crate::runs::names::RunName>,
+    pub status: String,
+    /// The controller-launched work pod; `labels` may name the pod the pack's own job runs.
+    pub pod: Option<String>,
+    pub cluster: String,
+    pub namespace: Option<String>,
+    /// Whatever the pack wants a reader to see, under the keys it chose.
+    #[serde(default)]
+    pub labels: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<FailureLineDto>,
+}
+
 /// One launch in full: the frozen authorization, where its dispatch got to, and the runs it
 /// produced. The launch view renders this; a relaunch prefills from `launch` alone.
 #[derive(Debug, Serialize, ToSchema)]
@@ -231,6 +250,12 @@ pub struct PlaybookLaunchDetailDto {
     pub runs: Vec<LaunchRunDto>,
     /// The finished run this launch reruns, when it is a rerun.
     pub rerun: Option<RerunOfDto>,
+    /// The frozen pack's tree digest; null for a legacy tarball-only launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_digest: Option<String>,
+    /// The launch's current attempt: the newest running run, else the newest run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<AttemptDto>,
 }
 
 /// The run a rerun launch reruns, and the tasks it dispatched again.
@@ -279,6 +304,14 @@ pub(crate) async fn get_playbook_run(
         });
     let runs = crate::launches::store::list_runs_for_launch(state.db.pool(), &key).await?;
     let dispatch = dispatch_state(&state.db.events().read_for_key(&key).await?, &runs);
+    let tree_digest =
+        crate::runs::blob_store::pack_ref(state.db.pool(), &crate::model::sanitize_key(&key))
+            .await?
+            .and_then(|pack| match pack {
+                crate::playbooks::pack_trees::PackRef::Tree(digest) => Some(digest.to_string()),
+                crate::playbooks::pack_trees::PackRef::Legacy(_) => None,
+            });
+    let attempt = current_attempt(&state, &runs).await?;
     let runs = runs
         .into_iter()
         .map(|r| LaunchRunDto {
@@ -298,8 +331,46 @@ pub(crate) async fn get_playbook_run(
         dispatch,
         runs,
         rerun,
+        tree_digest,
+        attempt,
     })
     .into_response())
+}
+
+/// The attempt a launch is currently making: the newest running run, else the newest run. Its
+/// identifiers are the ones the run's pack declared in its task outputs.
+async fn current_attempt(
+    state: &ApiState,
+    runs: &[crate::runs::model::Run],
+) -> ApiResult<Option<AttemptDto>> {
+    let Some(run) = runs
+        .iter()
+        .find(|run| run.status == "running")
+        .or_else(|| runs.first())
+    else {
+        return Ok(None);
+    };
+    let results = crate::runs::task_results::list_task_results(state.db.pool(), &run.run_id)
+        .await
+        .unwrap_or_default();
+    let attempt = crate::runs::declared_attempt::declared(&results);
+    let failed = crate::runs::declared_attempt::run_failed(&results);
+    Ok(Some(AttemptDto {
+        run_id: run.run_id.clone(),
+        name: run.name.clone(),
+        status: run.status.clone(),
+        pod: run.pod.clone(),
+        cluster: run.location.cluster.clone(),
+        namespace: run.location.namespace.clone(),
+        labels: attempt
+            .as_ref()
+            .map(|attempt| attempt.labels.clone())
+            .unwrap_or_default(),
+        failure: attempt
+            .and_then(|attempt| attempt.failure)
+            .filter(|_| failed)
+            .map(Into::into),
+    }))
 }
 
 /// How `update` on a playbook launch was decided.

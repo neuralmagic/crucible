@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, type ReactNode } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { $api } from '../api/client';
 import { formatError } from '../api/errors';
@@ -35,6 +35,7 @@ import {
   originLabel,
   originLinks,
   relaunchPath,
+  treeDigestShort,
 } from './launchView';
 import { AgentProviderTag } from './ProviderIcon';
 import { runLabel } from './runLabel';
@@ -44,6 +45,8 @@ import { RerunSection } from './RerunSection';
 import { LaunchWallTime } from './LaunchWallTime';
 import { RunLinks } from './RunLinks';
 import { RunTaskGraph } from './RunTaskGraph';
+import { EngineLogSection } from './EngineLogSection';
+import { FailureBanner } from '../logs/FailureBanner';
 
 type LaunchDetail = components['schemas']['PlaybookLaunchDetailDto'];
 
@@ -58,7 +61,13 @@ export function PlaybookLaunchDetailPage() {
     'get',
     '/api/playbook-runs/{key}',
     { params: { path: { key } } },
-    { refetchInterval: 15_000 },
+    {
+      // A completed launch's session is large; only a launch still moving is worth re-reading.
+      refetchInterval: (query) => {
+        const status = query.state.data?.launch.status;
+        return status === undefined || status === 'new' || status === 'running' ? 15_000 : false;
+      },
+    },
   );
 
   return (
@@ -109,7 +118,9 @@ function CancelControl({ launchKey }: { launchKey: string }) {
 
 function LaunchView({ detail }: { detail: LaunchDetail }) {
   const { launch, dispatch } = detail;
-  const runId = graphRunId(detail);
+  const attempt = detail.attempt ?? null;
+  const runId = attempt?.run_id ?? graphRunId(detail);
+  const live = attempt?.status === 'running' || detail.runs[0]?.status === 'running';
   const cost = launch.cost_usd ?? null;
   const specs: SpecItem[] =
     cost !== null && cost > 0
@@ -149,6 +160,11 @@ function LaunchView({ detail }: { detail: LaunchDetail }) {
               );
             })}
             {launch.origin !== 'draft' && <span>{originLabel(launch.origin)}</span>}
+            {treeDigestShort(detail.tree_digest) !== null && (
+              <span title={detail.tree_digest ?? undefined}>
+                {treeDigestShort(detail.tree_digest)}
+              </span>
+            )}
             {launch.created_by && <span>by {launch.created_by}</span>}
             {launch.agent_provider && (
               <span>
@@ -182,7 +198,11 @@ function LaunchView({ detail }: { detail: LaunchDetail }) {
 
       <ParamsSection launch={launch} />
 
+      {attempt !== null && <AttemptSection launch={launch} attempt={attempt} />}
+
       {runId !== null && <RunTaskGraph runId={runId} engineBounds />}
+
+      {runId !== null && <EngineLogSection runId={runId} live={live} />}
 
       {runId !== null && detail.runs[0]?.status !== 'running' && (
         <RerunSection detail={detail} runId={runId} />
@@ -216,6 +236,63 @@ function LaunchView({ detail }: { detail: LaunchDetail }) {
         </Section>
       )}
     </>
+  );
+}
+
+/// What this launch is currently running, and the labels its pack declared.
+function AttemptSection({
+  launch,
+  attempt,
+}: {
+  launch: LaunchDetail['launch'];
+  attempt: NonNullable<LaunchDetail['attempt']>;
+}) {
+  const rows: Array<{ label: string; value: ReactNode }> = [
+    {
+      label: 'run',
+      value: (
+        <Link className="text-ink-2 hover:text-ink" to={launchRunPath(launch.key, attempt.run_id)}>
+          {attempt.name ?? attempt.run_id}
+        </Link>
+      ),
+    },
+    {
+      label: 'status',
+      value: <Status status={attempt.status} tone={statusTone(runStatusColor(attempt.status))} />,
+    },
+    {
+      label: 'cluster',
+      value: attempt.namespace === null ? attempt.cluster : `${attempt.cluster} · ${attempt.namespace}`,
+    },
+  ];
+  if (attempt.pod !== null && attempt.pod !== undefined) {
+    rows.push({ label: 'work pod', value: attempt.pod });
+  }
+  for (const [label, value] of Object.entries(attempt.labels ?? {})) {
+    rows.push({ label, value });
+  }
+  return (
+    <Section>
+      <SectionHeader title="Attempt" note={attempt.run_id} />
+      {attempt.failure !== undefined && attempt.failure !== null && (
+        <FailureBanner failure={attempt.failure} />
+      )}
+      <SectionBody>
+        <dl
+          data-testid="launch-attempt"
+          className="m-0 grid grid-cols-[repeat(auto-fill,minmax(16rem,1fr))] gap-x-6 gap-y-1 font-mono text-data"
+        >
+          {rows.map((row) => (
+            <div key={row.label} className="flex min-w-0 items-baseline gap-2">
+              <dt className="flex-none text-ink-3">{row.label}</dt>
+              <dd className="m-0 min-w-0 truncate text-ink-2" title={typeof row.value === 'string' ? row.value : undefined}>
+                {row.value}
+              </dd>
+            </div>
+          ))}
+        </dl>
+      </SectionBody>
+    </Section>
   );
 }
 

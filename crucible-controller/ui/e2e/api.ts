@@ -1033,6 +1033,7 @@ export const ROUTES: Record<string, Json> = {
   },
   '/api/playbook-runs/playbook:survey:0199': {
     launch: PLAYBOOK_RUN,
+    tree_digest: `tree1:${'9f2c'.repeat(16)}`,
     source_exists: true,
     dispatch: {
       state: 'dispatched',

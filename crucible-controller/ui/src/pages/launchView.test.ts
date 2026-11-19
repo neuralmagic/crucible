@@ -16,6 +16,7 @@ import {
   relaunchPath,
   rerunLaunchBody,
   rerunRows,
+  treeDigestShort,
   rerunSummary,
   withTask,
 } from './launchView';
@@ -140,6 +141,15 @@ describe('launchVersion', () => {
     expect(launchVersion({ draft_version: 126, schema_digest: 'sha256:8484c6b8284cf62cf6' })).toBe('draft v126');
     expect(launchVersion({ draft_version: null, schema_digest: 'sha256:8484c6b8284cf62cf6' })).toBe('8484c6b8284c');
     expect(launchVersion({ schema_digest: 'deadbeef' })).toBe('deadbeef');
+  });
+});
+
+describe('treeDigestShort', () => {
+  it('keeps the algorithm and the head of the digest, and marks the cut', () => {
+    expect(treeDigestShort(`tree1:${'9f2c'.repeat(16)}`)).toBe('tree1:9f2c9f…');
+    expect(treeDigestShort('tree1:abc')).toBe('tree1:abc');
+    expect(treeDigestShort(null)).toBeNull();
+    expect(treeDigestShort(undefined)).toBeNull();
   });
 });
 

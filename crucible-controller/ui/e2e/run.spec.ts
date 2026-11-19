@@ -266,6 +266,51 @@ test.describe('the run task graph', () => {
     await expect(body).toHaveCSS('background-color', 'rgb(237, 235, 226)');
   });
 
+  /// A run's task output can interleave several pods; the filter narrows it, and the run's first
+  /// failure pins the pod that printed it. The attribution is the server's read of the declared
+  /// attempts, not a second one here.
+  test('pins the failing pod and filters the engine log by pod', async ({ page }) => {
+    await stubApi(page);
+    const text = [
+      '[pod/workload-7f9f-runner/runner] submitted job/overlay-p1',
+      '[pod/workload-7f9f-prep/pre] pulling image',
+      '[pod/workload-7f9f-runner/runner] FATAL: prebuild failed',
+    ].join('\n');
+    await page.route(`**/api/runs/${TRIAGE_RUN}/log`, (route) =>
+      route.fulfill({
+        json: {
+          run_id: TRIAGE_RUN,
+          dispatch: 'pod',
+          text,
+          truncated: false,
+          location: null,
+          failure: {
+            line: '[pod/workload-7f9f-runner/runner] FATAL: prebuild failed',
+            source: 'workload-7f9f-runner',
+            task: 'logs',
+          },
+        },
+      }),
+    );
+    await ready(page, `/runs/${encodeURIComponent(TRIAGE_RUN)}`);
+
+    await expect(page.getByTestId('failure-line')).toContainText('FATAL: prebuild failed');
+    const section = page.getByTestId('run-engine-log');
+    const pods = section.getByTestId('log-pods');
+    await expect(pods.getByRole('button', { name: /workload-7f9f-runner/ })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    );
+    await expect(
+      pods.getByRole('button', { name: /workload-7f9f-prep/ }),
+    ).not.toHaveAttribute('aria-pressed', 'true');
+    await expect(section).not.toContainText('pulling image');
+
+    await pods.getByRole('button', { name: /workload-7f9f-prep/ }).click();
+    await expect(section).toContainText('pulling image');
+    await expect(section).not.toContainText('prebuild failed');
+  });
+
   test('reads a captured log file in the log viewer', async ({ page }) => {
     await stubApi(page);
     const body = '\x1b[31merror\x1b[0m: kernel_selector.h: No such file or directory\n[127/130] Building CUDA object\n';

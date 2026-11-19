@@ -126,7 +126,11 @@ export function TaskEvidence({ runId, task }: { runId: string; task: string }) {
             ) : selected.path === null ? (
               <Prose body={selected.body} testId={CONTENT_TEST_ID[selected.kind]} />
             ) : selected.kind === 'log' ? (
-              <LogView text={selected.body} testId={CONTENT_TEST_ID[selected.kind]} />
+              <LogView
+                text={selected.body}
+                testId={CONTENT_TEST_ID[selected.kind]}
+                failingPod={log.data?.failure?.source ?? null}
+              />
             ) : (
               <CodeSurface
                 path={selected.path}

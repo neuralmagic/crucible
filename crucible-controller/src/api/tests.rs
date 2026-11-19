@@ -7958,6 +7958,15 @@ async fn the_runs_list_carries_the_snapshot_and_every_origin(pool: PgPool) -> Re
     .await;
     assert_eq!(status, StatusCode::CREATED, "{ack}");
     let key = ack["key"].as_str().expect("key").to_string();
+    let tree = ack["tree_digest"]
+        .as_str()
+        .expect("tree digest")
+        .to_string();
+    assert!(tree.starts_with("tree1:"), "{tree}");
+    assert!(
+        ack.get("draft_version").is_none(),
+        "a registered pack pins no draft"
+    );
 
     // A schedule's firing lands the same row with a different origin and the schedule that
     // minted it.
@@ -8048,6 +8057,11 @@ async fn the_runs_list_carries_the_snapshot_and_every_origin(pool: PgPool) -> Re
     assert_eq!(one["dispatch"]["state"], "pending");
     assert_eq!(one["runs"], serde_json::json!([]));
     assert_eq!(one["source_exists"], true);
+    assert_eq!(one["tree_digest"], tree);
+    assert!(
+        one.get("attempt").is_none(),
+        "a launch with no run has no attempt to describe: {one}"
+    );
 
     let (status, scheduled_row) = get_json_value(
         &app,
@@ -8138,6 +8152,14 @@ async fn a_launch_reads_back_its_dispatch_state_and_runs(pool: PgPool) -> Result
     assert_eq!(runs[0]["run_id"], run_id.as_str());
     assert_eq!(runs[0]["dispatch"], "local");
     assert_eq!(runs[0]["cost_usd"], 0.67);
+    assert_eq!(dispatched["attempt"]["run_id"], run_id.as_str());
+    assert_eq!(dispatched["attempt"]["status"], "running");
+    assert!(
+        dispatched["attempt"]["labels"]
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty),
+        "a run with no stored declaration has no labels: {dispatched}"
+    );
 
     // The run reads its way back to the launch, which has no scope row to join through.
     let (status, run) = get_json_value(&app, &format!("/api/runs/{run_id}")).await;
@@ -9947,6 +9969,22 @@ async fn a_draft_launches_with_ceilings_and_freezes_its_version(pool: PgPool) ->
     assert_eq!(status, StatusCode::CREATED, "{ack}");
     let key = ack["key"].as_str().expect("key").to_string();
     assert!(key.starts_with("playbook:studio:"), "{key}");
+    assert_eq!(ack["draft_version"], 2);
+    let tree = ack["tree_digest"].as_str().expect("tree digest");
+    assert!(tree.starts_with("tree1:"), "{tree}");
+
+    let (status, detail) = get_json_value(
+        &app,
+        &format!("/api/playbook-runs/{}", urlencoding_encode(&key)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    assert_eq!(detail["tree_digest"], tree);
+    assert_eq!(detail["launch"]["draft_version"], 2);
+    assert!(
+        detail.get("attempt").is_none(),
+        "a launch that has not dispatched has no attempt: {detail}"
+    );
 
     let issue = crate::issues::store::get_issue(db.pool(), &key)
         .await?
@@ -11249,6 +11287,103 @@ async fn task_evidence_serves_the_payload_note_and_captured_files(pool: PgPool) 
     assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
     let (status, no_run) = get_json_value(&app, "/api/runs/nobody/tasks/scan/evidence").await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{no_run}");
+    Ok(())
+}
+
+/// A pack declares the labels a reader should see and its failure in a task output; the launch's
+/// attempt serves that declaration rather than making a reader infer it from log text.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_declared_attempt_serves_its_labels_and_failure(pool: PgPool) -> Result<()> {
+    let (db, dir) = db_with(pool);
+    let app = app_with_admins(db.clone(), vec!["wren".to_string()]);
+    register_survey(&app, dir.path(), LAUNCH_WORKFLOW).await;
+    let (status, ack) = post_launch(
+        &app,
+        "survey",
+        serde_json::json!({
+            "params": {"topic": "attention sinks", "depth": "deep"},
+            "max_cost": 3.5,
+            "max_time": "30m",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{ack}");
+    let key = ack["key"].as_str().expect("key").to_string();
+    let run_id = format!("{}-1787517814", crate::model::sanitize_key(&key));
+    crate::runs::store::insert_run(
+        db.pool(),
+        &NewRun {
+            run_id: run_id.clone(),
+            scope: None,
+            issue: Some(key.clone()),
+            identity_digest: None,
+            status: "failed".to_string(),
+            pod: Some("crucible-run-abc".to_string()),
+            session_uri: None,
+            best_score: None,
+            cost_usd: None,
+        },
+    )
+    .await?;
+    crate::runs::task_results::upsert_task_result(
+        db.pool(),
+        &run_id,
+        &crate::runs::model::TaskResult {
+            iter: 0,
+            task: "logs".to_string(),
+            status: "fail".to_string(),
+            note: "exit 1".to_string(),
+            cost_usd: None,
+            secs: None,
+            blocked: None,
+            links: Vec::new(),
+            agent: None,
+            repairs: Vec::new(),
+            output: Some(serde_json::json!({
+                "attempt": {
+                    "labels": {
+                        "job": "batch/overlay-p1",
+                        "pod": "overlay-p1-runner",
+                        "artifact-root": "job-results:/workloads/c1"
+                    },
+                    "failure": {
+                        "line": "[pod/overlay-p1-runner/runner] FATAL: prebuild failed",
+                        "source": "overlay-p1-runner",
+                        "task": "logs"
+                    }
+                }
+            })),
+        },
+    )
+    .await?;
+
+    let (status, log) = get_json_value(&app, &format!("/api/runs/{run_id}/log")).await;
+    assert_eq!(status, StatusCode::OK, "{log}");
+    assert_eq!(
+        log["failure"]["line"],
+        "[pod/overlay-p1-runner/runner] FATAL: prebuild failed"
+    );
+
+    let (status, detail) = get_json_value(
+        &app,
+        &format!("/api/playbook-runs/{}", urlencoding_encode(&key)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    let attempt = &detail["attempt"];
+    assert_eq!(attempt["run_id"], run_id.as_str());
+    assert_eq!(attempt["labels"]["job"], "batch/overlay-p1");
+    assert_eq!(attempt["labels"]["pod"], "overlay-p1-runner");
+    assert_eq!(
+        attempt["labels"]["artifact-root"],
+        "job-results:/workloads/c1"
+    );
+    assert_eq!(
+        attempt["failure"]["line"],
+        "[pod/overlay-p1-runner/runner] FATAL: prebuild failed"
+    );
+    assert_eq!(attempt["failure"]["source"], "overlay-p1-runner");
+    assert_eq!(attempt["failure"]["task"], "logs");
     Ok(())
 }
 
