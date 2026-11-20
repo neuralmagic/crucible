@@ -8,8 +8,11 @@ use crucible::plan::decide::DecisionDesk;
 use crucible_contract::decision_request::{OpenRequest, RequestState, RequestStatus};
 
 /// Overrides [`DEFAULT_POLL`].
+#[cfg_attr(not(feature = "agents"), allow(dead_code))]
 pub const POLL_ENV: &str = "CRUCIBLE_DECISION_POLL_SECS";
+#[cfg_attr(not(feature = "agents"), allow(dead_code))]
 const DEFAULT_POLL: Duration = Duration::from_secs(3);
+#[cfg_attr(not(feature = "agents"), allow(dead_code))]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
@@ -25,6 +28,7 @@ pub struct HttpDesk<'a> {
 
 impl<'a> HttpDesk<'a> {
     /// `None` unless the controller handed the run its URL, the run's id and its pod token.
+    #[cfg_attr(not(feature = "agents"), allow(dead_code))]
     pub fn from_env(log: Option<&'a std::fs::File>) -> Option<Self> {
         let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
         let controller = env(crucible_contract::ENV_CONTROLLER_URL)?;

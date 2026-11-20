@@ -559,6 +559,34 @@ struct ResumeNeedsPlaybook {
 
 #[derive(Debug, thiserror::Error)]
 #[error(
+    "this crucible is the hard-tools-only build: it runs no agent turns and makes no model \
+     calls, so --agent-cmd, --harness, and --model have nothing to configure. Rebuild with the \
+     `agents` feature, which the default build carries"
+)]
+#[cfg_attr(feature = "agents", allow(dead_code))]
+struct AgentsNotBuilt;
+
+#[derive(Debug, thiserror::Error)]
+#[error("{}", crucible::plan::ir::ModelAsk::refusal(&self.task, self.ask))]
+#[cfg_attr(feature = "agents", allow(dead_code))]
+struct ModelTaskRefused {
+    task: String,
+    ask: crucible::plan::ir::ModelAsk,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "this crucible is the hard-tools-only build and reaches no remote agent servers, but the \
+     controller granted {servers}. Rebuild with the `agents` feature, or dispatch this run to a \
+     build that reaches them"
+)]
+#[cfg_attr(feature = "agents", allow(dead_code))]
+struct AgentServersNotBuilt {
+    servers: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
     "a playbook needs {missing} from whoever launches it. Its source may not declare a limit its \
      operator set, so the engine will not dispatch a task without one."
 )]
@@ -668,6 +696,11 @@ pub fn run(
         rerun,
         engine,
     } = opts;
+
+    #[cfg(not(feature = "agents"))]
+    if agent_cmd.is_some() || agent.harness.is_some() || agent.model.is_some() {
+        return Err(AgentsNotBuilt.into());
+    }
 
     if let (None, Some(raw)) = (ceilings.wall_clock, ceilings.wall_clock_raw.as_ref()) {
         return Err(BadDuration { raw: raw.clone() }.into());
@@ -813,6 +846,40 @@ pub fn run(
             }
             (None, None) => unreachable!("clap requires --file without --manifest"),
         };
+    // The hard-tools-only build refuses a plan that asks a model before any dispatch or spend;
+    // the runner refuses again as a backstop (ADR-0078).
+    #[cfg(not(feature = "agents"))]
+    if let Some((task, ask)) = crucible::plan::ir::model_asks(plan.tasks_topo()).first() {
+        return Err(ModelTaskRefused {
+            task: task.name.0.clone(),
+            ask: *ask,
+        }
+        .into());
+    }
+    // Remote agent servers stay refused (their tokens are credentials this build holds nowhere),
+    // but the local socket servers are hard tools: buildit and crucible-git serve the run itself
+    // over a unix socket with no token, so they run (ADR-0078).
+    #[cfg(not(feature = "agents"))]
+    {
+        let granted = crate::openshell::agent_servers::AgentServers::from_env()
+            .context("reading the run's agent servers")?;
+        let remote: Vec<String> = granted
+            .iter()
+            .filter(|g| {
+                matches!(
+                    g.server.transport,
+                    crucible_contract::agent_servers::Transport::Remote
+                )
+            })
+            .map(|g| g.server.name.to_string())
+            .collect();
+        if !remote.is_empty() {
+            return Err(AgentServersNotBuilt {
+                servers: remote.join(", "),
+            }
+            .into());
+        }
+    }
     if let Some(ceiling) = ceilings.wall_clock {
         plan.check_timeouts(ceiling)?;
     }
@@ -833,12 +900,22 @@ pub fn run(
     // its last line.
     let events = events.filter(|_| !prior.as_ref().is_some_and(|p| p.shut_down));
     // A run with an ingest surface can open decision requests, which is the `human` capability.
+    // The hard-tools-only build opens no desk: it authenticates to nothing, so a human-decided
+    // route cannot run on it and settles through the missing-capability path instead.
+    #[cfg(feature = "agents")]
     let desk = crate::plan::desk::HttpDesk::from_env(events.as_ref());
+    #[cfg(not(feature = "agents"))]
+    let desk: Option<crate::plan::desk::HttpDesk<'_>> = None;
     let mut caps = caps.clone();
     if desk.is_some() {
         caps.insert(crucible::plan::ir::NEEDS_HUMAN.to_owned());
     }
+    // The hard-tools build never reads the inference document: no binding it could carry makes
+    // a model call reachable, so the decision capability is not this build's to grant.
+    #[cfg(feature = "agents")]
     let substrate = Substrate::detecting(caps, &crucible::inference::from_process_env()?);
+    #[cfg(not(feature = "agents"))]
+    let substrate = Substrate { caps };
     if let Some(f) = &events {
         if let Some(prior) = prior.as_ref().filter(|_| resuming) {
             append(
@@ -1073,6 +1150,9 @@ pub fn run(
             },
         );
     }
+    // Both builds deliver; the hard-tools-only one carries no token, so an open controller takes
+    // its record bare and a guarded one's refusal marks the session for the pod-log scrape
+    // (ADR-0078).
     if let Some(p) = &evidence {
         crate::report::evidence_client::deliver_run_evidence(p);
     }
@@ -1774,9 +1854,142 @@ mod tests {
         (path, body)
     }
 
-    /// The evidence contract a pod-dispatched playbook rides (RFC-0004:C-RUN-EVIDENCE): a
-    /// manifest `plan run` uploads its git memory and then its session to its own run under its
-    /// run token, on the failing path too.
+    /// A command-only playbook pack the hard-tools-only build runs to a valid verdict, and the
+    /// run that takes it there. The two hard-tools evidence tests differ only in what their
+    /// fake controller answers, so they share the pack.
+    #[cfg(not(feature = "agents"))]
+    fn run_hard_tools_pack(tag: &str, goal: &str) -> std::path::PathBuf {
+        let dir = crate::testing::tempdir(tag);
+        std::fs::write(
+            dir.join("workflow.star"),
+            "t = command(name = \"t\", run = \"echo '{\\\"ok\\\": true}'\")\nworkflow(type = \"playbook\", tasks = [t])\n",
+        )
+        .expect("workflow");
+        std::fs::write(
+            dir.join("crucible.toml"),
+            format!(
+                r#"
+                [repo]
+                path = "."
+                [workspace]
+                dir = "workspace"
+                setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+                [agent]
+                backend = "command"
+                agent_cmd = "true"
+                goal = "{goal}"
+                [workflow]
+                type = "playbook"
+                file = "workflow.star"
+                "#
+            ),
+        )
+        .expect("manifest");
+        let manifest = dir.join("crucible.toml");
+        run(
+            None,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            Some(&manifest),
+            RunOpts {
+                ceilings: Ceilings {
+                    usd: Some(1.0),
+                    wall_clock: Some(std::time::Duration::from_secs(60)),
+                    wall_clock_raw: Some("60s".to_string()),
+                },
+                ..Default::default()
+            },
+        )
+        .expect("the playbook reaches a verdict");
+        manifest
+    }
+
+    /// The hard-tools-only build reads no run token: an open controller takes its record bare
+    /// (ADR-0078). The fake controller here stands for one — it answers every PUT with 200 —
+    /// and the test asserts the record arrived with no Authorization header at all.
+    #[cfg(not(feature = "agents"))]
+    #[test]
+    fn an_open_controller_takes_the_run_record_with_no_token() {
+        let _guard = crucible::test_support::env_lock();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let receiver = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            for s in listener.incoming() {
+                let (line, headers, body) =
+                    crate::testing::read_one_request(&mut s.expect("accept"));
+                if line.starts_with("GET /done ") {
+                    break;
+                }
+                got.push((line, headers, body));
+            }
+            got
+        });
+        let _env = ScopedEnv::set(&[
+            (
+                crucible_contract::ENV_CONTROLLER_URL,
+                format!("http://127.0.0.1:{port}/"),
+            ),
+            (crucible_contract::ENV_RUN_NAME, "open_run_1".into()),
+        ]);
+        let manifest = run_hard_tools_pack("hard-tools-open-upload", "deliver the session");
+        drop(_env);
+        reqwest::blocking::get(format!("http://127.0.0.1:{port}/done")).expect("stop");
+        let requests = receiver.join().expect("receiver");
+        assert!(
+            requests
+                .iter()
+                .any(|(l, _, _)| l.starts_with("PUT /api/evidence/runs/open_run_1/run-session")),
+            "the session was uploaded: {requests:?}"
+        );
+        for (_, headers, _) in &requests {
+            assert!(!headers.contains("authorization:"), "{headers}");
+        }
+        let state = crate::cli::setup::state_dir(&manifest);
+        assert!(
+            !state
+                .join(crucible_contract::RUN_SESSION_UNDELIVERED)
+                .is_file(),
+            "the session was delivered, so nothing marks it for the pod-log scrape"
+        );
+    }
+
+    /// A guarded controller refuses the tokenless upload; the run marks its session undelivered
+    /// so the pod wrapper prints it to the pod log, where the controller's completion edge
+    /// collects it (ADR-0078).
+    #[cfg(not(feature = "agents"))]
+    #[test]
+    fn a_refused_upload_marks_the_session_for_the_log_scrape() {
+        let _guard = crucible::test_support::env_lock();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for s in listener.incoming() {
+                let mut s = s.expect("accept");
+                let _ = crate::testing::answer_one_request(&mut s, "401 Unauthorized");
+            }
+        });
+        let _env = ScopedEnv::set(&[
+            (
+                crucible_contract::ENV_CONTROLLER_URL,
+                format!("http://127.0.0.1:{port}/"),
+            ),
+            (crucible_contract::ENV_RUN_NAME, "guarded_run_1".into()),
+        ]);
+        let manifest = run_hard_tools_pack("hard-tools-refused-upload", "mark the session");
+        let state = crate::cli::setup::state_dir(&manifest);
+        let marker = state.join(crucible_contract::RUN_SESSION_UNDELIVERED);
+        assert!(
+            marker.is_file(),
+            "no {} in {}",
+            marker.display(),
+            state.display()
+        );
+        assert!(state.join("session.jsonl").is_file(), "the session itself");
+    }
+
+    #[cfg(feature = "agents")]
     #[test]
     fn manifest_plan_run_uploads_its_evidence_to_its_run() {
         let _guard = crucible::test_support::env_lock();
@@ -2022,6 +2235,7 @@ workflow(type = "playbook", tasks = [pick, gate, a, b, lint, optional, publish])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "agents")]
     #[test]
     fn an_mcp_server_that_fails_to_start_ends_the_run_with_its_stderr() {
         let _env = crucible::test_support::env_lock();

@@ -7,7 +7,9 @@
 //!
 //! The routes carry their own guard, [`require_pod_token_or_human`]: a `crr_` bearer is checked as
 //! a pod token and answers with its [`Grant`], and anything else goes through the human guard
-//! unchanged. Only a pod token uploads, and only its own evidence.
+//! unchanged. Only a pod token uploads, and only its own evidence — except on a controller that
+//! runs open, which already answers every caller as its dev identity and admits their run-record
+//! writes the same way (ADR-0078).
 
 use crate::client::Db;
 use crate::identity::auth::{HumanOrKeyGuard, require_auth_or_api_key};
@@ -90,7 +92,9 @@ fn fetchable(kind: ArtifactKind) -> bool {
 }
 
 /// `PUT /api/evidence/runs/{run_id}/{kind}`: store the gzipped body as the run's `kind`, replacing
-/// any earlier upload. Run token only.
+/// any earlier upload. Run token only — except on a controller that runs open, where every caller
+/// is already the dev identity and a run-record write is no more authority than anything else it
+/// admits (ADR-0078).
 async fn upload(
     grant: Option<Extension<Grant>>,
     State(state): State<EvidenceState>,
@@ -103,17 +107,20 @@ async fn upload(
             format!("{kind} is not run evidence a pod uploads"),
         );
     };
-    let Some(Extension(grant)) = grant else {
-        return refuse(
-            StatusCode::FORBIDDEN,
-            "only the run's own token uploads its evidence".to_string(),
-        );
-    };
-    if !grant.may_write_run(&run_id) {
-        return refuse(
-            StatusCode::FORBIDDEN,
-            "this token does not write that run's evidence".to_string(),
-        );
+    match &grant {
+        Some(Extension(grant)) if !grant.may_write_run(&run_id) => {
+            return refuse(
+                StatusCode::FORBIDDEN,
+                "this token does not write that run's evidence".to_string(),
+            );
+        }
+        None if !state.guard.guard.is_open() => {
+            return refuse(
+                StatusCode::FORBIDDEN,
+                "only the run's own token uploads its evidence".to_string(),
+            );
+        }
+        _ => {}
     }
     let owner = ArtifactOwner::Run {
         run_id: run_id.clone(),
@@ -458,6 +465,50 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(got, gz(b"commits-tar"));
+    }
+
+    /// The evidence routes over an open guard: no token, no issuer, a dev identity that answers
+    /// every caller. A run-record write is admitted the same as everything else the open
+    /// controller admits (ADR-0078).
+    fn open_app(pool: &PgPool, scratch: &Path) -> axum::Router {
+        let guard = BearerGuard::new(None, None)
+            .expect("open guard")
+            .with_dev_identity(Some("elvir".to_string()))
+            .expect("dev identity");
+        router(EvidenceState {
+            db: Db::new(pool.clone()),
+            scratch_dir: scratch.to_path_buf(),
+            guard: HumanOrKeyGuard {
+                guard: Arc::new(guard),
+                pool: pool.clone(),
+            },
+        })
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn an_open_controller_accepts_run_evidence_with_no_token(pool: PgPool) {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let app = open_app(&pool, scratch.path());
+        let body = gz(b"{\"v\":1}\n");
+        let (status, resp) = call(
+            &app,
+            "PUT",
+            "/api/evidence/runs/run-open/run-session",
+            None,
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&resp));
+        let (status, got) = call(
+            &app,
+            "GET",
+            "/api/evidence/runs/run-open/run-session",
+            None,
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(got, body);
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]

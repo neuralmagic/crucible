@@ -144,6 +144,33 @@ If the controller runs loops in other clusters (spokes):
   `crucible-controller cluster-snapshot` runs on the spoke as a CronJob and posts to the push
   endpoint of the hub with a bearer token that the hub lists in `CONTROLLER_PUSH_TOKENS`.
 
+### External clusters: the hard-tools-only engine
+
+A cluster we do not manage gets the **hard-tools-only build** (ADR-0078). It runs command,
+evaluate, and report tasks and routes decided by a dependency's output, and it refuses
+everything that asks a model or holds a credential.
+
+- An agent task or a model-decided route is refused at plan load with an error naming the task.
+  `crucible check` reports each as a finding, and the runner refuses again as a backstop, so the
+  build makes no LLM calls and runs no agent turns whatever its environment carries.
+- It reads no inference document and applies no `[agent]` configuration, so no agent
+  credentials reach the run.
+- It reads no run token. No decision desk opens, so a required human-decided route truncates the
+  plan. A remote agent server the controller grants, or a pack's `[workflow].servers`, is refused
+  by name. The local socket servers run without tokens: buildit and crucible-git serve the run
+  itself over a unix socket. No S3 code is compiled in (`hard-tools-only` carries no `publish`),
+  so an ambient cloud credential has no code that reads it.
+- The run's record still reaches the controller. On a controller running open, the run uploads
+  its full record (session, files, git commits) with no token, and a rerun reads it back the
+  same way. On a guarded controller the tokenless upload is refused, the run marks its session
+  undelivered, and the pod wrapper prints it to the pod log, where the controller's completion
+  edge scrapes it.
+
+Build it with `just hard-tools-only`, or package the image the self-contained way with
+`--build-arg ENGINE_FEATURES="--no-default-features --features crucible/hard-tools-only"`. The
+default build is unchanged. A pack with agent tasks still runs wherever the full engine is
+deployed.
+
 ## Agent tokens
 
 The controller can act as the OAuth authorization server for sandboxed agents. An OpenShell

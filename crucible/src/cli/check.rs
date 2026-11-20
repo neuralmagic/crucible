@@ -208,6 +208,61 @@ fn operator_history_limit() -> Option<String> {
     std::env::var(crucible_contract::history::ENV_HISTORY_MAX_BYTES).ok()
 }
 
+/// What the hard-tools-only build refuses, as check findings, so `check` never passes a pack
+/// the run would refuse (ADR-0078):
+///
+/// - A task that asks a model: an agent turn, a model-decided route, or the scored loop's
+///   propose turn. Plan admission refuses these before any dispatch.
+/// - A required task that needs a human decision. The run truncates that on its own — the
+///   build opens no decision desk, so the `human` capability is never available — and this
+///   finding only makes check agree with the run instead of passing a pack it then refuses.
+/// - A `[workflow].servers` declaration. Setup refuses it: the build mints no task tokens,
+///   so the servers would be unreachable were it to run.
+#[cfg(not(feature = "agents"))]
+fn refused_task_findings(m: &Manifest) -> Vec<String> {
+    let mut findings: Vec<String> = m
+        .workflow
+        .as_ref()
+        .map(|w| {
+            crucible::plan::ir::model_asks(w.tasks.iter())
+                .into_iter()
+                .map(|(task, ask)| crucible::plan::ir::ModelAsk::refusal(&task.name.0, ask))
+                .chain(
+                    w.tasks
+                        .iter()
+                        .filter(|task| {
+                            task.required && task.needs == crucible::plan::ir::NEEDS_HUMAN
+                        })
+                        .map(|task| {
+                            format!(
+                                "task {} needs a human decision, and this crucible is the \
+                                 hard-tools-only build: it opens no decision desk, so the plan \
+                                 truncates at it. Route the decision from a dependency's output, \
+                                 or run the pack on a build with the `agents` feature",
+                                task.name.0
+                            )
+                        }),
+                )
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(workflow) = m.workflow.as_ref()
+        && !workflow.servers.is_empty()
+    {
+        findings.push(format!(
+            "the pack names [workflow].servers ({}), and this crucible is the hard-tools-only \
+             build: it reaches no servers and mints no task tokens",
+            workflow
+                .servers
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    findings
+}
+
 /// The graph of every declared variant other than `selected`, and of the base when a variant
 /// is selected, compiled as the selected one is, so a broken variant fails the check of any.
 fn other_variant_findings(
@@ -225,16 +280,23 @@ fn other_variant_findings(
     std::iter::once(None)
         .chain(declared.iter().map(Some))
         .filter(|other| *other != selected)
-        .filter_map(|other| {
+        .flat_map(|other| {
             let label = other.map_or("the base manifest".to_owned(), |v| format!("[variant.{v}]"));
-            let finding = match Manifest::load_variant(manifest_path, other) {
-                Ok(mut m) => m
-                    .resolve_workflow(manifest_dir)
-                    .err()
-                    .and_then(|e| sandbox_finding(&e)),
-                Err(e) => Some(format!("manifest parse failed: {e:#}")),
-            };
-            finding.map(|finding| format!("{label}: {finding}"))
+            let mut findings = Vec::new();
+            match Manifest::load_variant(manifest_path, other) {
+                Ok(mut m) => {
+                    match m.resolve_workflow(manifest_dir) {
+                        Ok(()) => {}
+                        Err(e) => findings.extend(sandbox_finding(&e)),
+                    }
+                    #[cfg(not(feature = "agents"))]
+                    findings.extend(refused_task_findings(&m));
+                }
+                Err(e) => findings.push(format!("manifest parse failed: {e:#}")),
+            }
+            findings
+                .into_iter()
+                .map(move |finding| format!("{label}: {finding}"))
         })
         .collect()
 }
@@ -271,6 +333,8 @@ fn check_single(manifest_path: &Path, variant: Option<&VariantName>) -> Result<C
             .extend(uninjected_script_warnings(&m, &manifest_dir)),
         Err(e) => out.findings.extend(sandbox_finding(&e)),
     }
+    #[cfg(not(feature = "agents"))]
+    out.findings.extend(refused_task_findings(&m));
     out.findings.extend(other_variant_findings(
         manifest_path,
         &manifest_dir,
@@ -1531,6 +1595,7 @@ workflow(type = "playbook", tasks = [a])
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "agents")]
     /// A variant that replaces `[agent]` without the sandbox the graph names fails the check of
     /// the base too, and checking that variant reports it as its own failure.
     #[test]

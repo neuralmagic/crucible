@@ -105,6 +105,7 @@ pub(crate) fn select_agent(
 
 /// Resolve [`select_agent`] against the process environment and pin the result, with the agent
 /// binding's price, on `args`.
+#[cfg_attr(not(feature = "agents"), allow(dead_code))]
 pub(crate) fn pin_agent(
     args: &mut Args,
     agent: &manifest::AgentCfg,
@@ -136,6 +137,17 @@ pub(crate) struct LaunchSettingTwice {
     setting: Setting,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the pack names [workflow].servers ({servers}), and this crucible is the hard-tools-only \
+     build: it reaches no servers and mints no task tokens. Rebuild with the `agents` feature, \
+     or drop the servers from the pack"
+)]
+#[cfg_attr(feature = "agents", allow(dead_code))]
+struct WorkflowServersNotBuilt {
+    servers: String,
+}
+
 /// A pack asked for sandbox resources on a backend that runs no sandbox, so they would be dropped.
 #[derive(Debug, thiserror::Error)]
 #[error(
@@ -148,6 +160,7 @@ pub(crate) struct ResourcesWithoutSandbox {
 
 /// Fold a manifest's `[agent]` config onto `Args` and, for the openshell backend, spawn the
 /// provisioning broker. Shared by the single-domain and composite run paths.
+#[cfg_attr(not(feature = "agents"), allow(dead_code))]
 pub(crate) fn apply_agent_cfg(
     args: &mut Args,
     agent: &manifest::AgentCfg,
@@ -252,6 +265,7 @@ pub(crate) fn apply_agent_cfg(
 }
 
 /// Start the pack's `[mcp]` servers for the openshell backend.
+#[cfg_attr(not(feature = "agents"), allow(dead_code))]
 pub(crate) fn start_mcp(
     args: &mut Args,
     table: &std::collections::BTreeMap<String, manifest::McpCfg>,
@@ -273,6 +287,7 @@ pub(crate) struct EndedAtSetup;
 /// End the run on an `[mcp]` server that could not start: append an `error` shutdown carrying the
 /// cause to the session log and deliver the log as a finished run does. Any other error passes
 /// through untouched.
+#[cfg_attr(not(feature = "agents"), allow(dead_code))]
 fn end_run_at_setup(p: &crate::args::Paths, error: anyhow::Error) -> anyhow::Error {
     if !error.is::<crate::control::mcp::StartError>() {
         return error;
@@ -479,6 +494,22 @@ pub(crate) fn prep_plan_runner_with_params(
     let manifest_dir = manifest::manifest_dir(manifest_path);
     m.resolve_workflow_with(&manifest_dir, params)?;
     warn_inherited_env(crate::exposure::inherits_engine_env(&m));
+    // The hard-tools-only build mints no task tokens, so a pack naming `[workflow].servers`
+    // would run its tasks without the servers they reach; refuse it before any work (ADR-0078).
+    #[cfg(not(feature = "agents"))]
+    if let Some(workflow) = m.workflow.as_ref()
+        && !workflow.servers.is_empty()
+    {
+        return Err(WorkflowServersNotBuilt {
+            servers: workflow
+                .servers
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        }
+        .into());
+    }
     if let Some(all) = m.launch.all() {
         for (setting, flag, value) in [
             (
@@ -498,6 +529,7 @@ pub(crate) fn prep_plan_runner_with_params(
     let skills = m.agent.toolbox_dir.as_ref().map(|d| manifest_dir.join(d));
     let p = crate::args::Paths::for_manifest(workspace.clone(), state, &manifest_dir, skills);
     // Before the workspace clone: crucible-git reads the draft-pr bound to authorize it.
+    #[cfg_attr(not(feature = "agents"), allow(unused_variables))]
     let frozen = frozen_projection(
         &m,
         m.publish.as_ref().and_then(|p| p.pr_repo.as_deref()),
@@ -544,16 +576,22 @@ pub(crate) fn prep_plan_runner_with_params(
     args.engine = engine;
     args.manifest = Some(manifest_path.to_path_buf());
     args.compute_driver = compute_driver;
-    args.harness = agent.harness;
-    args.model = agent.model;
-    let harness = pin_agent(&mut args, &m.agent)?;
-    crate::cli::workspace::install_toolbox(
-        &p,
-        &m.agent.toolbox_exclude,
-        harness.spec().skills_dir,
-    )?;
-    apply_agent_cfg(&mut args, &m.agent, &m.secrets, &p.workspace, &frozen)?;
-    start_mcp(&mut args, &m.mcp).map_err(|e| end_run_at_setup(&p, e))?;
+    // The hard-tools-only build applies no `[agent]` configuration: no harness pinning, no skills
+    // toolbox, no agent env/secret relay, no MCP servers (ADR-0078). Its runs carry no agent
+    // credentials to relay.
+    #[cfg(feature = "agents")]
+    {
+        args.harness = agent.harness;
+        args.model = agent.model;
+        let harness = pin_agent(&mut args, &m.agent)?;
+        crate::cli::workspace::install_toolbox(
+            &p,
+            &m.agent.toolbox_exclude,
+            harness.spec().skills_dir,
+        )?;
+        apply_agent_cfg(&mut args, &m.agent, &m.secrets, &p.workspace, &frozen)?;
+        start_mcp(&mut args, &m.mcp).map_err(|e| end_run_at_setup(&p, e))?;
+    }
     args.workflow_frozen_injects = m.frozen_inject_pairs(&manifest_dir)?;
     args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
     args.workflow_env = m

@@ -565,9 +565,11 @@ mod tests {
         let a = args(&[]);
         let p = workspace("deadline");
         let src = AgentSource::Command("echo started; sleep 30 & wait".to_string());
+        // The window must give the child time to be scheduled and write before the kill: a
+        // loaded runner can starve a freshly forked shell for most of a second.
         let deadline = crucible::deadline::Deadline::for_attempt(
             std::time::Instant::now(),
-            Some("0.5s".parse().unwrap()),
+            Some("3s".parse().unwrap()),
             None,
         );
         let started = std::time::Instant::now();
@@ -589,7 +591,7 @@ mod tests {
                 assert_eq!(*at, expected);
                 assert_eq!(
                     outcome.failure().map(ToString::to_string).as_deref(),
-                    Some("timed out: the task ran past its 0.5s limit")
+                    Some("timed out: the task ran past its 3s limit")
                 );
             }
             other => panic!("expected the deadline to end the turn, got {other:?}"),

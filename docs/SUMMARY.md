@@ -128,3 +128,4 @@
   - [ADR-0075: Workflow tasks reach the run's MCP servers with controller-minted task tokens](./adr/ADR-0075.md)
   - [ADR-0076: A launch confirms a value a task output flags](./adr/ADR-0076.md)
   - [ADR-0077: A provider names each model's limits, and the binding carries them to the harness](./adr/ADR-0077.md)
+  - [ADR-0078: The hard-tools-only engine build for external clusters](./adr/ADR-0078.md)

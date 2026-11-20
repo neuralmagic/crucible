@@ -121,6 +121,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
     if let Some(Cmd::Flow(args)) = &cli.command {
         return flow_cmd(args);
     }
+    #[cfg(feature = "publish")]
     if let Some(Cmd::Fetch { uri, out }) = &cli.command {
         // The engine runtime the S3 GetObject block_ons on (for `object_store::fetch_object`).
         let engine = crate::agent::engine::EngineCtx::new()?;

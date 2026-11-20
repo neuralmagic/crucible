@@ -23,11 +23,14 @@ pub fn safe_segment(seg: &str) -> bool {
     !seg.is_empty() && seg != "." && seg != ".." && !seg.contains(['/', '\\', '\0'])
 }
 
-/// The directory a local run unpacks itself into: `<scratch>/local-runs/<sanitized run id>`.
+/// The directory a local run unpacks itself into: `<scratch>/local-runs/<hash of the run id>`.
+/// A run id names a directory far too long for the paths beneath: a run's buildit socket is a
+/// unix socket, and its path must stay under the kernel's 108-byte `sun_path` cap.
 pub fn run_dir(scratch_root: &Path, run_id: &str) -> PathBuf {
-    scratch_root
-        .join("local-runs")
-        .join(crate::model::sanitize_key(run_id))
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(run_id.as_bytes());
+    let name: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    scratch_root.join("local-runs").join(name)
 }
 
 /// Where the supervisor mirrors a local run's engine output.
