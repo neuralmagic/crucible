@@ -2425,7 +2425,24 @@ impl Plan {
                 };
             if matches!(t.task, TaskKind::TopK { .. }) {
                 for d in &t.depends_on {
-                    match score(d) {
+                    // Engine tasks cannot declare emits, but propose (`{"cost_usd"}`) and
+                    // apply (`{}`) have fixed outputs with no score, so read those as an
+                    // omitted score too.
+                    let fixed_without_score = index.get(d).is_some_and(|&i| {
+                        matches!(
+                            self.tasks[i].task,
+                            TaskKind::Engine {
+                                op: EngineOp::Propose | EngineOp::Apply,
+                                ..
+                            }
+                        )
+                    });
+                    let declared = if fixed_without_score {
+                        Declared::Omitted
+                    } else {
+                        score(d)
+                    };
+                    match declared {
                         Declared::Omitted => {
                             return Err(PlanError::TopKSourceOmitsScore {
                                 task: task(),
@@ -4097,6 +4114,38 @@ mod tests {
         // Empty emits = undeclared = unchecked.
         assert!(
             plan(vec![agent("m", &[]), top_k("pick", &["m"])])
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn top_k_dependency_on_an_engine_task_without_a_score_is_rejected() {
+        let engine = |name: &str, op: EngineOp| {
+            let mut t = agent(name, &[]);
+            t.task = TaskKind::Engine {
+                op,
+                source: None,
+                tiebreak: None,
+            };
+            t
+        };
+        for op in [EngineOp::Propose, EngineOp::Apply] {
+            let err = plan(vec![engine("e", op), top_k("pick", &["e"])])
+                .validate()
+                .unwrap_err();
+            assert_eq!(
+                err,
+                PlanError::TopKSourceOmitsScore {
+                    task: "pick".to_owned(),
+                    dependency: "e".to_owned(),
+                },
+                "{op:?}"
+            );
+        }
+        // Measure reports a score, so it stays a valid top_k input.
+        assert!(
+            plan(vec![engine("e", EngineOp::Measure), top_k("pick", &["e"])])
                 .validate()
                 .is_ok()
         );
