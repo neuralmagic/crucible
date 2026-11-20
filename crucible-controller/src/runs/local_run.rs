@@ -43,10 +43,10 @@ pub struct LocalRun {
     deadline: Duration,
 }
 
-/// The process group a local run's engine leads, holding everything it spawned. Dropped armed, it
-/// SIGKILLs the group, so a run whose supervisor goes away (a controller shutdown, a run row that
-/// never committed) leaves no process behind.
-struct ProcessGroup(Option<nix::unistd::Pid>);
+/// The process group a local run's engine leads, holding everything it spawned. Its Drop kills
+/// the group however the run ended: the engine's per-run servers bind ports the profile fixes
+/// (buildit's), so a survivor would block the next run's server from starting.
+struct ProcessGroup(nix::unistd::Pid);
 
 impl ProcessGroup {
     fn led_by(child: &tokio::process::Child) -> Result<Self> {
@@ -54,23 +54,16 @@ impl ProcessGroup {
             .id()
             .context("the spawned engine was reaped before its process group was recorded")?;
         let pid = i32::try_from(pid).with_context(|| format!("engine pid {pid} is not a pid_t"))?;
-        Ok(Self(Some(nix::unistd::Pid::from_raw(pid))))
-    }
-
-    /// Leave the group running: the engine exited on its own, and whatever it left behind is its
-    /// business.
-    fn release(mut self) {
-        self.0 = None;
+        Ok(Self(nix::unistd::Pid::from_raw(pid)))
     }
 }
 
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
-        let Some(pgid) = self.0 else { return };
-        match nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL) {
+        match nix::sys::signal::killpg(self.0, nix::sys::signal::Signal::SIGKILL) {
             Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
             Err(e) => {
-                tracing::warn!(%pgid, error = %e, "killing a local run's process group failed")
+                tracing::warn!(pgid = %self.0, error = %e, "killing a local run's process group failed")
             }
         }
     }
@@ -330,7 +323,7 @@ pub async fn supervise(db: Db, key: String, run: LocalRun) {
 
     let outcome = match tokio::time::timeout(deadline, child.wait()).await {
         Ok(Ok(status)) => {
-            group.release();
+            drop(group);
             format!("engine exited {status}")
         }
         Ok(Err(e)) => {
@@ -347,8 +340,8 @@ pub async fn supervise(db: Db, key: String, run: LocalRun) {
         }
     };
     // The pipes are drained to keep a chatty run from filling a buffer, not to capture output
-    // the engine never wrote: a server the engine spawned with an inherited stderr (buildit)
-    // holds the pipe open past the engine's exit, so the join is bounded rather than waited out.
+    // the engine never wrote. The group is dead by here, closing what inherited the pipes; the
+    // bound backstops a holder the kill missed.
     let _ = tokio::time::timeout(PIPE_DRAIN_GRACE, async {
         while let Some(joined) = streams.join_next().await {
             if let Ok(lines) = joined {
@@ -776,9 +769,14 @@ mod tests {
         assert_eq!(still, vec!["tail"], "output still reaches the failure tail");
     }
 
-    fn spawn_group_with_straggler() -> (tokio::process::Child, ProcessGroup) {
+    fn spawn_group_with_straggler(leader_waits: bool) -> (tokio::process::Child, ProcessGroup) {
+        let script = if leader_waits {
+            "sleep 300 & echo $!; wait"
+        } else {
+            "sleep 300 & echo $!"
+        };
         let child = tokio::process::Command::new("sh")
-            .args(["-c", "sleep 300 & echo $!; wait"])
+            .args(["-c", script])
             .stdout(Stdio::piped())
             .process_group(0)
             .kill_on_drop(true)
@@ -805,34 +803,35 @@ mod tests {
     /// not just the direct child.
     #[tokio::test]
     async fn dropping_an_armed_process_group_kills_what_the_engine_spawned() {
-        let (mut child, group) = spawn_group_with_straggler();
+        let (mut child, group) = spawn_group_with_straggler(true);
         let straggler = straggler_pid(&mut child).await;
         assert!(alive(straggler), "the background sleep is running");
         drop(group);
         child.wait().await.expect("reap the killed leader");
+        until_dead(straggler).await;
+    }
+
+    /// The engine exiting on its own takes the group with it: buildit binds a port fixed by the
+    /// profile, and a survivor blocks the next run's server from starting.
+    #[tokio::test]
+    async fn an_engine_that_exits_normally_still_takes_its_straggler() {
+        let (mut child, group) = spawn_group_with_straggler(false);
+        let straggler = straggler_pid(&mut child).await;
+        child.wait().await.expect("the leader exits on its own");
+        assert!(alive(straggler), "the background sleep outlived its leader");
+        drop(group);
+        until_dead(straggler).await;
+    }
+
+    async fn until_dead(pid: nix::unistd::Pid) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while alive(straggler) {
+        while alive(pid) {
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "pid {straggler} outlived its process group's kill"
+                "pid {pid} outlived its process group's kill"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-    }
-
-    #[tokio::test]
-    async fn a_released_process_group_is_left_running() {
-        let (mut child, group) = spawn_group_with_straggler();
-        let straggler = straggler_pid(&mut child).await;
-        group.release();
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(alive(straggler), "a released group is not signalled");
-        nix::sys::signal::killpg(
-            nix::unistd::Pid::from_raw(i32::try_from(child.id().expect("running")).expect("pid")),
-            nix::sys::signal::Signal::SIGKILL,
-        )
-        .expect("clean up the group");
-        child.wait().await.expect("reap");
     }
 
     /// A run directory is per launch and safe to build from a run id, which carries the launch
