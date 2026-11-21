@@ -295,3 +295,56 @@ fn a_source_declaring_nothing_binds_nothing() {
             .contains("repo")
     );
 }
+
+#[test]
+fn a_string_list_with_choices_binds_a_subset_and_offers_checkboxes() {
+    let source = r#"
+params = {
+    "workloads": {"type": "list<string>", "default": ["chat", "agentic"], "choices": ["chat", "agentic"]},
+}
+"#;
+    let params = read_params(source, Path::new("workflow.star")).expect("read declarations");
+    let schema = params.json_schema();
+    assert_eq!(
+        schema["properties"]["workloads"]["items"],
+        serde_json::json!({"type": "string", "enum": ["chat", "agentic"]})
+    );
+    assert_eq!(schema["properties"]["workloads"]["uniqueItems"], true);
+    assert!(schema["properties"]["workloads"].get("enum").is_none());
+
+    let bound = params
+        .bind(&supplied(&[("workloads", r#"["agentic"]"#)]))
+        .expect("bind a subset");
+    assert_eq!(
+        bound["workloads"],
+        ParamValue::StringList(vec!["agentic".into()])
+    );
+    let none = params
+        .bind(&supplied(&[("workloads", "[]")]))
+        .expect("bind none");
+    assert_eq!(none["workloads"], ParamValue::StringList(Vec::new()));
+
+    let refused = |raw: &str| {
+        params
+            .bind(&supplied(&[("workloads", raw)]))
+            .expect_err("refused")
+            .to_string()
+    };
+    assert!(refused("chat,batch").contains("chat, agentic"));
+    assert!(refused("chat,chat").contains("once"));
+}
+
+#[test]
+fn a_string_list_cannot_take_free_text_beside_its_choices() {
+    let refused = read_params(
+        r#"
+params = {
+    "workloads": {"type": "list<string>", "default": [], "choices": ["chat"], "allow_other": True},
+}
+"#,
+        Path::new("workflow.star"),
+    )
+    .expect_err("allow_other on a list")
+    .to_string();
+    assert!(refused.contains("allow_other"), "{refused}");
+}
