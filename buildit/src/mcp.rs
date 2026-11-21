@@ -2374,22 +2374,22 @@ impl Broker {
         let wait = Duration::from_secs(p.wait_seconds.unwrap_or(0).min(MAX_STATUS_WAIT_S));
         let started = Instant::now();
         loop {
-            let mut seen = Vec::with_capacity(ids.len());
-            for id in &ids {
-                seen.push(
-                    self.seen(sandbox, id, LogName::Build)
-                        .await?
-                        .ok_or_else(|| anyhow!("no build {}; build again", id.0))?,
-                );
-            }
+            let seen = futures_util::future::try_join_all(ids.iter().map(|id| async move {
+                self.seen(sandbox, id, LogName::Build)
+                    .await?
+                    .ok_or_else(|| anyhow!("no build {}; build again", id.0))
+            }))
+            .await?;
             let running = seen
                 .iter()
                 .any(|s| matches!(s.snap.state, step::State::Running));
             if !running || started.elapsed() + STATUS_WAIT_POLL > wait {
-                let mut builds = Vec::with_capacity(ids.len());
-                for (id, seen) in ids.iter().zip(&seen) {
-                    builds.push(self.build_status(sandbox, id, seen).await?);
-                }
+                let builds = futures_util::future::try_join_all(
+                    ids.iter()
+                        .zip(&seen)
+                        .map(|(id, seen)| self.build_status(sandbox, id, seen)),
+                )
+                .await?;
                 return Ok(WaitReply { builds });
             }
             tokio::time::sleep(STATUS_WAIT_POLL).await;

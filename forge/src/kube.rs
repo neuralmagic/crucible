@@ -655,14 +655,12 @@ pub fn free_gpus() -> Result<u32> {
         let c = client().await?;
         let nodes: Api<Node> = Api::all(c.clone());
         let pods: Api<Pod> = Api::all(c);
-        let nodes = nodes
-            .list(&ListParams::default())
-            .await
-            .context("listing nodes")?;
-        let running = pods
-            .list(&ListParams::default().fields("status.phase=Running"))
-            .await
-            .context("listing running pods")?;
+        let all = ListParams::default();
+        let running = ListParams::default().fields("status.phase=Running");
+        let (nodes, running) = tokio::try_join!(
+            async { nodes.list(&all).await.context("listing nodes") },
+            async { pods.list(&running).await.context("listing running pods") },
+        )?;
         Ok(sum_node_gpus(&nodes.items).saturating_sub(sum_pod_gpu_requests(&running.items)))
     })?
 }

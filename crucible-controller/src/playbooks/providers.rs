@@ -1044,36 +1044,45 @@ pub const USAGE_SAMPLE: i64 = 5;
 /// one of those dispatches erroring at resolution with no API left to clear the pin.
 #[tracing::instrument(name = "db.provider_usage", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", provider = %id), err)]
 pub async fn usage(pool: &PgPool, id: &str) -> Result<ProviderUsage> {
-    let issues =
-        sqlx::query("SELECT key FROM issues WHERE agent_provider = $1 ORDER BY key LIMIT $2")
+    let (issues, issue_count, schedules, schedule_count) = tokio::try_join!(
+        async {
+            sqlx::query("SELECT key FROM issues WHERE agent_provider = $1 ORDER BY key LIMIT $2")
+                .bind(id)
+                .bind(USAGE_SAMPLE)
+                .fetch_all(pool)
+                .await
+                .context("issues pinned to a provider")
+        },
+        async {
+            sqlx::query("SELECT count(*) AS n FROM issues WHERE agent_provider = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .context("counting issues pinned to a provider")
+        },
+        async {
+            sqlx::query(
+                "SELECT id FROM playbook_standing_launches WHERE agent_provider = $1 \
+                 ORDER BY id LIMIT $2",
+            )
             .bind(id)
             .bind(USAGE_SAMPLE)
             .fetch_all(pool)
             .await
-            .context("issues pinned to a provider")?;
-    let issue_count: i64 =
-        sqlx::query("SELECT count(*) AS n FROM issues WHERE agent_provider = $1")
+            .context("schedules pinned to a provider")
+        },
+        async {
+            sqlx::query(
+                "SELECT count(*) AS n FROM playbook_standing_launches WHERE agent_provider = $1",
+            )
             .bind(id)
             .fetch_one(pool)
             .await
-            .context("counting issues pinned to a provider")?
-            .try_get("n")?;
-    let schedules = sqlx::query(
-        "SELECT id FROM playbook_standing_launches WHERE agent_provider = $1 ORDER BY id LIMIT $2",
-    )
-    .bind(id)
-    .bind(USAGE_SAMPLE)
-    .fetch_all(pool)
-    .await
-    .context("schedules pinned to a provider")?;
-    let schedule_count: i64 = sqlx::query(
-        "SELECT count(*) AS n FROM playbook_standing_launches WHERE agent_provider = $1",
-    )
-    .bind(id)
-    .fetch_one(pool)
-    .await
-    .context("counting schedules pinned to a provider")?
-    .try_get("n")?;
+            .context("counting schedules pinned to a provider")
+        },
+    )?;
+    let issue_count: i64 = issue_count.try_get("n")?;
+    let schedule_count: i64 = schedule_count.try_get("n")?;
     Ok(ProviderUsage {
         issues: issues
             .iter()

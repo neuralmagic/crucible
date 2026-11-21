@@ -114,10 +114,21 @@ pub(crate) async fn get_run(
     State(state): State<ApiState>,
     Path(run_id): Path<String>,
 ) -> ApiResult<Response> {
-    let Some(run) = crate::runs::store::get_run(state.db.pool(), &run_id).await? else {
+    let (run, (issue_key, repo), candidates, transport_losses, agent_tools) = tokio::try_join!(
+        crate::runs::store::get_run(state.db.pool(), &run_id),
+        crate::runs::store::run_issue_repo(state.db.pool(), &run_id),
+        crate::runs::store::list_candidates_for_run(state.db.pool(), &run_id),
+        crate::runs::task_results::count_transport_losses(state.db.pool(), &run_id),
+        async {
+            match state.agent_tools {
+                true => crate::runs::agent_tools::for_run(state.db.pool(), &run_id).await,
+                false => Ok(Vec::new()),
+            }
+        },
+    )?;
+    let Some(run) = run else {
         return Ok(not_found(format!("run not found: {run_id}")));
     };
-    let (issue_key, repo) = crate::runs::store::run_issue_repo(state.db.pool(), &run_id).await?;
     let agent = match issue_key.as_deref() {
         Some(key) => crate::issues::store::get_issue(state.db.pool(), key)
             .await?
@@ -125,13 +136,6 @@ pub(crate) async fn get_run(
             .map(AgentPinDto::of)
             .unwrap_or_default(),
         None => AgentPinDto::default(),
-    };
-    let candidates = crate::runs::store::list_candidates_for_run(state.db.pool(), &run_id).await?;
-    let transport_losses =
-        crate::runs::task_results::count_transport_losses(state.db.pool(), &run_id).await?;
-    let agent_tools = match state.agent_tools {
-        true => crate::runs::agent_tools::for_run(state.db.pool(), &run_id).await?,
-        false => Vec::new(),
     };
     let detail = RunDetail {
         run: RunDto::from_parts(run, issue_key, repo, agent, transport_losses),
@@ -196,18 +200,20 @@ pub(crate) async fn get_run_graph(
     State(state): State<ApiState>,
     Path(run_id): Path<String>,
 ) -> ApiResult<Response> {
-    let Some(plan) = crate::runs::task_results::latest_run_plan(state.db.pool(), &run_id).await?
-    else {
+    let (plan, results, (issue_key, _)) = tokio::try_join!(
+        crate::runs::task_results::latest_run_plan(state.db.pool(), &run_id),
+        crate::runs::task_results::list_task_results(state.db.pool(), &run_id),
+        crate::runs::store::run_issue_repo(state.db.pool(), &run_id),
+    )?;
+    let Some(plan) = plan else {
         return Ok(not_found(format!("no task graph for run: {run_id}")));
     };
     let tasks: Vec<crucible_contract::session::PlanTaskWire> =
         serde_json::from_str(&plan.graph_json)
             .with_context(|| format!("decoding the stored task graph for run {run_id}"))?;
-    let results = crate::runs::task_results::list_task_results(state.db.pool(), &run_id).await?;
     let tasks: Vec<PlanTaskDto> = tasks.into_iter().map(PlanTaskDto::from).collect();
     // `None` here is a revision that stored no exposure, which the wire has to keep distinct from
     // a pack that declares no outputs.
-    let (issue_key, _) = crate::runs::store::run_issue_repo(state.db.pool(), &run_id).await?;
     let exposure = match issue_key.as_deref() {
         Some(key) => {
             match crate::launches::store::exposure_for_issue(state.db.pool(), key).await? {

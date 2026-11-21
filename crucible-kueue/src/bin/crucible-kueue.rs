@@ -308,13 +308,19 @@ async fn main() -> anyhow::Result<()> {
             .context("inferring kube config")?,
     };
     let client = kube::Client::try_from(kube_config).context("building kube client")?;
-    let kueue = crucible_kueue::kueue::KueueVersion::discover(&client)
-        .await
-        .context("discovering the cluster's Kueue API version")?;
+    let (kueue, kinds) = tokio::try_join!(
+        async {
+            crucible_kueue::kueue::KueueVersion::discover(&client)
+                .await
+                .context("discovering the cluster's Kueue API version")
+        },
+        async {
+            crucible_kueue::kinds::installed(&client)
+                .await
+                .context("discovering the served kinds the cluster installs")
+        },
+    )?;
     tracing::info!(version = kueue.as_str(), "kueue api");
-    let kinds = crucible_kueue::kinds::installed(&client)
-        .await
-        .context("discovering the served kinds the cluster installs")?;
     tracing::info!(
         kinds = ?kinds.iter().map(|k| k.kind()).collect::<Vec<_>>(),
         ownership = ?config.ownership,

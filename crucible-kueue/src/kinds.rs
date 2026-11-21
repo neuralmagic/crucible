@@ -9,9 +9,15 @@ use serde_json::Value;
 /// The served kinds whose API the cluster serves. A kind whose group is missing is left out; a
 /// discovery failure other than not-found is returned.
 pub async fn installed(client: &kube::Client) -> Result<Vec<WorkloadKind>, kube::Error> {
+    let listed = futures_util::future::join_all(
+        WorkloadKind::ALL
+            .into_iter()
+            .map(|kind| async move { client.list_api_group_resources(kind.api_version()).await }),
+    )
+    .await;
     let mut out = Vec::new();
-    for kind in WorkloadKind::ALL {
-        let resources = match client.list_api_group_resources(kind.api_version()).await {
+    for (kind, resources) in WorkloadKind::ALL.into_iter().zip(listed) {
+        let resources = match resources {
             Ok(list) => list,
             Err(kube::Error::Api(s)) if s.code == 404 => continue,
             Err(e) => return Err(e),

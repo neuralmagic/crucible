@@ -516,17 +516,19 @@ pub(crate) async fn get_playbook_draft(
         Ok(draft) => draft,
         Err(refused) => return Ok(refused),
     };
-    let actions = crate::authz::owner::actions_on(
-        &state,
-        &caller,
-        crate::authz::decision::Resource::new(
-            crate::authz::action::ResourceType::PlaybookDraft,
-            &id,
-            draft.owner.clone(),
+    let (actions, versions, placeholders) = tokio::try_join!(
+        crate::authz::owner::actions_on(
+            &state,
+            &caller,
+            crate::authz::decision::Resource::new(
+                crate::authz::action::ResourceType::PlaybookDraft,
+                &id,
+                draft.owner.clone(),
+            ),
         ),
-    )
-    .await?;
-    let versions = crate::playbooks::drafts::versions(state.db.pool(), &id).await?;
+        crate::playbooks::drafts::versions(state.db.pool(), &id),
+        crate::playbooks::blueprints::placeholders(state.db.pool(), &id),
+    )?;
     let latest = versions.first();
     let summary = DraftSummary {
         latest_version: latest.map_or(0, |v| v.version),
@@ -534,7 +536,6 @@ pub(crate) async fn get_playbook_draft(
         diagnostics: latest.map_or(0, |v| v.diagnostics.len()),
         draft,
     };
-    let placeholders = crate::playbooks::blueprints::placeholders(state.db.pool(), &id).await?;
     Ok(Json(PlaybookDraftDetail {
         draft: PlaybookDraftDto::new(summary, actions),
         versions: versions.into_iter().map(DraftVersionDto::from).collect(),

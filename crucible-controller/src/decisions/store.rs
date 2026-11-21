@@ -216,11 +216,6 @@ pub(crate) async fn withdraw_run(pool: &PgPool, run_id: &str) -> Result<Vec<Deci
     .bind(run_id)
     .fetch_all(pool)
     .await?;
-    let mut withdrawn = Vec::with_capacity(ids.len());
-    for id in ids {
-        if let Some(d) = get(pool, &id).await? {
-            withdrawn.push(d);
-        }
-    }
-    Ok(withdrawn)
+    let withdrawn = futures_util::future::try_join_all(ids.iter().map(|id| get(pool, id))).await?;
+    Ok(withdrawn.into_iter().flatten().collect())
 }

@@ -22,14 +22,15 @@ pub async fn idle_nodes(client: kube::Client) -> Vec<String> {
 async fn try_idle_nodes(client: kube::Client) -> Result<Vec<String>> {
     let nodes: Api<Node> = Api::all(client.clone());
     let pods: Api<Pod> = Api::all(client);
-    let node_list = nodes
-        .list(&ListParams::default())
-        .await
-        .context("listing nodes")?;
-    let pod_list = pods
-        .list(&ListParams::default())
-        .await
-        .context("listing pods cluster-wide")?;
+    let params = ListParams::default();
+    let (node_list, pod_list) = tokio::try_join!(
+        async { nodes.list(&params).await.context("listing nodes") },
+        async {
+            pods.list(&params)
+                .await
+                .context("listing pods cluster-wide")
+        },
+    )?;
 
     let mut gpus_in_use: BTreeMap<String, u64> = BTreeMap::new();
     for pod in &pod_list.items {

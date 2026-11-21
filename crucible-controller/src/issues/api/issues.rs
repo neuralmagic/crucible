@@ -102,8 +102,10 @@ pub(crate) async fn list_issues(
             return Ok(bad_request(msg));
         }
     };
-    let rows = crate::issues::store::list_issues_filtered(state.db.pool(), &q).await?;
-    let mut pr_urls = crate::issues::store::latest_kept_pr_urls(state.db.pool()).await?;
+    let (rows, mut pr_urls) = tokio::try_join!(
+        crate::issues::store::list_issues_filtered(state.db.pool(), &q),
+        crate::issues::store::latest_kept_pr_urls(state.db.pool()),
+    )?;
     let dtos: Vec<IssueDto> = rows
         .into_iter()
         .map(|i| {
@@ -162,13 +164,6 @@ pub(crate) async fn issue_facets(
     };
 
     let pool = state.db.pool();
-    let total = i64::try_from(
-        crate::issues::store::list_issues_filtered(pool, &base)
-            .await?
-            .len(),
-    )
-    .unwrap_or(i64::MAX);
-
     let without_kind = IssueQuery {
         kind: None,
         ..base.clone()
@@ -190,36 +185,20 @@ pub(crate) async fn issue_facets(
         ..base.clone()
     };
 
-    let kind = tally(
-        crate::issues::store::list_issues_filtered(pool, &without_kind)
-            .await?
-            .iter()
-            .map(|i| i.kind.tag().to_string()),
-    );
-    let status = tally(
-        crate::issues::store::list_issues_filtered(pool, &without_status)
-            .await?
-            .iter()
-            .map(|i| i.status.as_str().to_string()),
-    );
-    let tier = tally(
-        crate::issues::store::list_issues_filtered(pool, &without_tier)
-            .await?
-            .into_iter()
-            .filter_map(|i| i.tier),
-    );
-    let affinity = tally(
-        crate::issues::store::list_issues_filtered(pool, &without_affinity)
-            .await?
-            .into_iter()
-            .filter_map(|i| i.affinity),
-    );
-    let repo = tally(
-        crate::issues::store::list_issues_filtered(pool, &without_repo)
-            .await?
-            .into_iter()
-            .map(|i| i.repo),
-    );
+    let (all, by_kind, by_status, by_tier, by_affinity, by_repo) = tokio::try_join!(
+        crate::issues::store::list_issues_filtered(pool, &base),
+        crate::issues::store::list_issues_filtered(pool, &without_kind),
+        crate::issues::store::list_issues_filtered(pool, &without_status),
+        crate::issues::store::list_issues_filtered(pool, &without_tier),
+        crate::issues::store::list_issues_filtered(pool, &without_affinity),
+        crate::issues::store::list_issues_filtered(pool, &without_repo),
+    )?;
+    let total = i64::try_from(all.len()).unwrap_or(i64::MAX);
+    let kind = tally(by_kind.iter().map(|i| i.kind.tag().to_string()));
+    let status = tally(by_status.iter().map(|i| i.status.as_str().to_string()));
+    let tier = tally(by_tier.into_iter().filter_map(|i| i.tier));
+    let affinity = tally(by_affinity.into_iter().filter_map(|i| i.affinity));
+    let repo = tally(by_repo.into_iter().map(|i| i.repo));
 
     Ok(Json(IssueFacetsDto {
         total,

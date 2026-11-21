@@ -233,10 +233,14 @@ pub(crate) async fn authorize_image(
     let Some(agent) = agent else {
         return Ok(Default::default());
     };
-    let resolved = crate::playbooks::preflight::resolve_harness(state.db.pool(), provider, domain)
-        .await
-        .map_err(|e| ApiError::from(e).into_response())?;
-    let catalog = catalog(state).await?;
+    let (resolved, catalog) = tokio::try_join!(
+        async {
+            crate::playbooks::preflight::resolve_harness(state.db.pool(), provider, domain)
+                .await
+                .map_err(|e| ApiError::from(e).into_response())
+        },
+        catalog(state),
+    )?;
     let verdict = crate::playbooks::preflight::preflight_pack(agent, resolved.as_ref(), &catalog);
     if verdict.refused() {
         return Err(refused(
@@ -496,7 +500,10 @@ pub(crate) async fn list_playbooks(
     State(state): State<ApiState>,
     caller: crate::authz::Caller,
 ) -> Result<Json<Vec<PlaybookDto>>, ApiError> {
-    let rows = crate::playbooks::registry::list(state.db.pool()).await?;
+    let (rows, catalog) = tokio::try_join!(
+        crate::playbooks::registry::list(state.db.pool()),
+        crate::images::store::list_images(state.db.pool()),
+    )?;
     let rows = crate::authz::owner::readable_with_actions(
         &state,
         &caller,
@@ -505,7 +512,6 @@ pub(crate) async fn list_playbooks(
         crate::playbooks::registry::PlaybookRow::resource,
     )
     .await?;
-    let catalog = crate::images::store::list_images(state.db.pool()).await?;
     Ok(Json(
         rows.into_iter()
             .map(|(r, actions)| PlaybookDto::from_row(r, actions, &state.dispatch, &catalog))
@@ -533,11 +539,14 @@ pub(crate) async fn get_playbook(
         Ok(row) => row,
         Err(refused) => return Ok(refused),
     };
-    let Some(files) = crate::playbooks::registry::files(state.db.pool(), &id).await? else {
+    let (files, actions, catalog) = tokio::try_join!(
+        crate::playbooks::registry::files(state.db.pool(), &id),
+        crate::authz::owner::actions_on(&state, &caller, row.resource()),
+        crate::images::store::list_images(state.db.pool()),
+    )?;
+    let Some(files) = files else {
         return Ok(not_found(format!("no playbook {id:?}")));
     };
-    let actions = crate::authz::owner::actions_on(&state, &caller, row.resource()).await?;
-    let catalog = crate::images::store::list_images(state.db.pool()).await?;
     Ok(Json(PlaybookDetailDto {
         playbook: PlaybookDto::from_row(row, actions, &state.dispatch, &catalog),
         files,

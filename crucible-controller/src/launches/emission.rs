@@ -166,13 +166,13 @@ pub(crate) async fn emit_for_completed_run(
     run_id: &str,
     pr_links: &[PrLink],
 ) -> Result<EmitOutcome> {
-    let scope = crate::issues::store::get_scope_by_id(db.pool(), scope_id)
-        .await?
-        .with_context(|| format!("emission: no scope row {scope_id}"))?;
+    let (scope, issue) = tokio::try_join!(
+        crate::issues::store::get_scope_by_id(db.pool(), scope_id),
+        crate::issues::store::get_issue(db.pool(), issue_key),
+    )?;
+    let scope = scope.with_context(|| format!("emission: no scope row {scope_id}"))?;
     let pack_digest = scope.pack_digest.as_deref().unwrap_or("unpinned");
-    let issue = crate::issues::store::get_issue(db.pool(), issue_key)
-        .await?
-        .with_context(|| format!("emission: no issue row {issue_key}"))?;
+    let issue = issue.with_context(|| format!("emission: no issue row {issue_key}"))?;
     let title = issue.title.as_deref().unwrap_or(issue_key);
     emit_pr_reviews(
         db,

@@ -193,26 +193,26 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
         }
     };
     let agent = crate::playbooks::providers::AgentSelection::from_resolved(dispatch.as_ref());
-    let decision = crate::playbooks::providers::resolve_decision(
-        db.pool(),
-        Some(&issue.repo),
-        WorkloadClass::Playbook,
-    )
-    .await?;
+    let (decision, exposure, launcher) = tokio::try_join!(
+        crate::playbooks::providers::resolve_decision(
+            db.pool(),
+            Some(&issue.repo),
+            WorkloadClass::Playbook,
+        ),
+        crate::launches::store::launch_exposure(db.pool(), &issue.key, &launch),
+        crate::authz::resolve::dispatch_principals(
+            db.pool(),
+            launch.created_by.as_deref(),
+            &launch.launcher_groups,
+        ),
+    )?;
+    let exposure = exposure?;
     let inference = dispatch
         .iter()
         .map(|d| d.inference())
         .chain(decision)
         .collect();
-    let exposure =
-        crate::launches::store::launch_exposure(db.pool(), &issue.key, &launch).await??;
     let scope = crate::secrets::launch::Scope::playbook(&launch.playbook);
-    let launcher = crate::authz::resolve::dispatch_principals(
-        db.pool(),
-        launch.created_by.as_deref(),
-        &launch.launcher_groups,
-    )
-    .await?;
     let secrets = Some(crate::runs::workpod::LaunchSecrets {
         scope,
         launcher,

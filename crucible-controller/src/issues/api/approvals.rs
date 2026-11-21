@@ -22,10 +22,10 @@ pub(crate) async fn get_approvals(
     let imports = crate::playbooks::imports::pending(state.db.pool()).await?;
     #[cfg(feature = "autoresearch")]
     let (awaiting, prs) = if crate::authz::entitlement::autoresearch(&state, &caller) {
-        (
-            crate::issues::store::awaiting_approval_scopes(state.db.pool()).await?,
-            crate::runs::store::kept_candidate_prs(state.db.pool()).await?,
-        )
+        tokio::try_join!(
+            crate::issues::store::awaiting_approval_scopes(state.db.pool()),
+            crate::runs::store::kept_candidate_prs(state.db.pool()),
+        )?
     } else {
         (Vec::new(), Vec::new())
     };

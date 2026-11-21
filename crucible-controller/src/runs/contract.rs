@@ -323,12 +323,11 @@ impl ContractRegistry {
         record
     }
 
-    /// Check every target in turn. Each read is bounded by [`READ_TIMEOUT`], so the whole sweep is
-    /// bounded by the target count; it still must not sit on the path to binding a listener.
+    /// Check every target at once. Each read is bounded by [`READ_TIMEOUT`], and so is the whole
+    /// sweep; it still must not sit on the path to binding a listener.
     pub async fn check_all(&self, targets: impl IntoIterator<Item = DispatchTarget>) {
-        for target in targets {
-            self.check(&target).await;
-        }
+        let targets: Vec<DispatchTarget> = targets.into_iter().collect();
+        futures_util::future::join_all(targets.iter().map(|target| self.check(target))).await;
     }
 
     /// The record for `target`: cached, unless there is none or the cached read failed.
