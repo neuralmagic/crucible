@@ -163,52 +163,55 @@ pub(crate) async fn issue_facets(
         }
     };
 
-    let pool = state.db.pool();
-    let without_kind = IssueQuery {
+    let unfaceted = IssueQuery {
         kind: None,
-        ..base.clone()
-    };
-    let without_status = IssueQuery {
         status: None,
-        ..base.clone()
-    };
-    let without_tier = IssueQuery {
         tier: None,
-        ..base.clone()
-    };
-    let without_affinity = IssueQuery {
         affinity: None,
-        ..base.clone()
-    };
-    let without_repo = IssueQuery {
         repo: None,
         ..base.clone()
     };
+    let rows = crate::issues::store::list_issues_filtered(state.db.pool(), &unfaceted).await?;
+    Ok(Json(facets(&base, &rows)).into_response())
+}
 
-    let (all, by_kind, by_status, by_tier, by_affinity, by_repo) = tokio::try_join!(
-        crate::issues::store::list_issues_filtered(pool, &base),
-        crate::issues::store::list_issues_filtered(pool, &without_kind),
-        crate::issues::store::list_issues_filtered(pool, &without_status),
-        crate::issues::store::list_issues_filtered(pool, &without_tier),
-        crate::issues::store::list_issues_filtered(pool, &without_affinity),
-        crate::issues::store::list_issues_filtered(pool, &without_repo),
-    )?;
-    let total = i64::try_from(all.len()).unwrap_or(i64::MAX);
-    let kind = tally(by_kind.iter().map(|i| i.kind.tag().to_string()));
-    let status = tally(by_status.iter().map(|i| i.status.as_str().to_string()));
-    let tier = tally(by_tier.into_iter().filter_map(|i| i.tier));
-    let affinity = tally(by_affinity.into_iter().filter_map(|i| i.affinity));
-    let repo = tally(by_repo.into_iter().map(|i| i.repo));
+#[derive(Clone, Copy, PartialEq)]
+enum Facet {
+    Kind,
+    Status,
+    Tier,
+    Affinity,
+    Repo,
+}
 
-    Ok(Json(IssueFacetsDto {
-        total,
-        kind,
-        status,
-        tier,
-        affinity,
-        repo,
-    })
-    .into_response())
+/// Whether `issue` passes every facet filter of `q` other than `skip`.
+fn passes(q: &IssueQuery, issue: &crate::issues::model::Issue, skip: Option<Facet>) -> bool {
+    let on = |facet| skip != Some(facet);
+    (!on(Facet::Kind) || q.kind.is_none_or(|k| issue.kind.tag() == k.tag()))
+        && (!on(Facet::Status) || q.status.is_none_or(|s| issue.status == s))
+        && (!on(Facet::Tier)
+            || q.tier
+                .as_ref()
+                .is_none_or(|t| issue.tier.as_ref() == Some(t)))
+        && (!on(Facet::Affinity)
+            || q.affinity
+                .as_ref()
+                .is_none_or(|a| issue.affinity.as_ref() == Some(a)))
+        && (!on(Facet::Repo) || q.repo.as_ref().is_none_or(|r| &issue.repo == r))
+}
+
+/// Each facet's option counts over the rows that pass the other facets' filters.
+fn facets(q: &IssueQuery, rows: &[crate::issues::model::Issue]) -> IssueFacetsDto {
+    let over = |facet| rows.iter().filter(move |i| passes(q, i, Some(facet)));
+    IssueFacetsDto {
+        total: i64::try_from(rows.iter().filter(|i| passes(q, i, None)).count())
+            .unwrap_or(i64::MAX),
+        kind: tally(over(Facet::Kind).map(|i| i.kind.tag().to_string())),
+        status: tally(over(Facet::Status).map(|i| i.status.as_str().to_string())),
+        tier: tally(over(Facet::Tier).filter_map(|i| i.tier.clone())),
+        affinity: tally(over(Facet::Affinity).filter_map(|i| i.affinity.clone())),
+        repo: tally(over(Facet::Repo).map(|i| i.repo.clone())),
+    }
 }
 
 #[utoipa::path(
