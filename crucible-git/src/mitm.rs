@@ -18,8 +18,7 @@ use rcgen::{
 };
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
-use tokio::sync::watch;
+use std::sync::{Arc, Mutex};
 
 use crucible_contract::git::GITHUB_HOSTS as INTERCEPTED;
 
@@ -30,11 +29,15 @@ const SYSTEM_ROOTS: [&str; 3] = [
     "/etc/ssl/cert.pem",
 ];
 
+#[derive(Debug, thiserror::Error)]
+#[error("the certificate cache lock is poisoned")]
+struct CachePoisoned;
+
 /// The run's CA and the server configs it has issued, one per intercepted host.
 pub struct Mitm {
     ca: CertifiedIssuer<'static, KeyPair>,
     provider: Arc<rustls::crypto::CryptoProvider>,
-    configs: watch::Sender<HashMap<String, Arc<rustls::ServerConfig>>>,
+    configs: Mutex<HashMap<String, Arc<rustls::ServerConfig>>>,
     relay: Arc<Relay>,
 }
 
@@ -51,7 +54,7 @@ impl Mitm {
         Ok(Self {
             ca,
             provider: Arc::new(rustls::crypto::ring::default_provider()),
-            configs: watch::Sender::default(),
+            configs: Mutex::new(HashMap::new()),
             relay,
         })
     }
@@ -79,9 +82,9 @@ impl Mitm {
     }
 
     fn server_config(&self, host: &str) -> Result<Arc<rustls::ServerConfig>> {
-        let cached = self.configs.borrow().get(host).cloned();
-        if let Some(config) = cached {
-            return Ok(config);
+        let mut configs = self.configs.lock().map_err(|_| CachePoisoned)?;
+        if let Some(config) = configs.get(host) {
+            return Ok(config.clone());
         }
         let mut params = CertificateParams::default();
         let mut dn = DistinguishedName::new();
@@ -102,13 +105,8 @@ impl Mitm {
             .with_no_client_auth()
             .with_single_cert(chain, key)?;
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        let mut config = Arc::new(config);
-        self.configs.send_modify(|configs| {
-            config = configs
-                .entry(host.to_string())
-                .or_insert(config.clone())
-                .clone();
-        });
+        let config = Arc::new(config);
+        configs.insert(host.to_string(), config.clone());
         Ok(config)
     }
 }

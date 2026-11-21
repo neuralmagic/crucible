@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub const DCR_ENV: &str = "CONTROLLER_PEOPLE_DCR";
@@ -272,7 +272,7 @@ impl Limiter {
 pub struct Dcr {
     pool: PgPool,
     policy: DcrPolicy,
-    limiter: tokio::sync::watch::Sender<Limiter>,
+    limiter: Mutex<Limiter>,
 }
 
 fn at(secs: u64) -> Result<i64, RegistrationError> {
@@ -297,7 +297,7 @@ impl Dcr {
         Self {
             pool,
             policy,
-            limiter: tokio::sync::watch::Sender::new(Limiter::default()),
+            limiter: Mutex::new(Limiter::default()),
         }
     }
 
@@ -314,10 +314,11 @@ impl Dcr {
         now: u64,
     ) -> Result<Registered, RegistrationError> {
         let checked = check(req)?;
-        let source = source.unwrap_or(IpAddr::from([0, 0, 0, 0]));
-        let mut admitted = false;
-        self.limiter
-            .send_modify(|limiter| admitted = limiter.admit(source, now, &self.policy));
+        let admitted = {
+            let mut limiter = self.limiter.lock().unwrap_or_else(|e| e.into_inner());
+            let source = source.unwrap_or(IpAddr::from([0, 0, 0, 0]));
+            limiter.admit(source, now, &self.policy)
+        };
         if !admitted {
             return Err(RegistrationError::RateLimited);
         }

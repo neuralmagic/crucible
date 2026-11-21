@@ -1144,7 +1144,7 @@ mod tests {
             "a GitHub login nobody paired with a crucible login records no dispatcher"
         );
         assert_eq!(
-            queue.pending().await.plain,
+            queue.pending().plain,
             vec!["owner/repo#1"],
             "key enqueued for launch"
         );
@@ -1339,7 +1339,7 @@ mod tests {
             .await?
             .unwrap();
         assert!(!scope.is_approved(), "approved_at stays null");
-        assert!(queue.pending().await.plain.is_empty(), "nothing enqueued");
+        assert!(queue.pending().plain.is_empty(), "nothing enqueued");
         Ok(())
     }
 
@@ -1378,7 +1378,7 @@ mod tests {
         let queue = WorkQueue::new();
         poll.poll(queue.clone()).await?;
         assert!(
-            queue.pending().await.plain.is_empty(),
+            queue.pending().plain.is_empty(),
             "nothing watched yet, nothing enqueued"
         );
 
@@ -1397,7 +1397,7 @@ mod tests {
         }
 
         assert_eq!(
-            queue.pending().await.plain,
+            queue.pending().plain,
             vec!["owner/repo#1".to_string()],
             "the newly-watched repo is discovered on the very next sweep"
         );

@@ -4449,7 +4449,7 @@ async fn collection_drains_the_eldest_queued_rows_issue(pool: sqlx::PgPool) -> R
 
     assert!(matches!(out, DispatchOutcome::Verdict(_)), "{out:?}");
     assert_eq!(
-        queue.pending().await.plain,
+        queue.pending().plain,
         ["owner/repo#2"],
         "the freed slot re-drives the ELDEST queued row's issue (FIFO), not the younger one"
     );
@@ -4573,7 +4573,7 @@ async fn drain_skips_and_purges_a_parked_issue_queued_row(pool: sqlx::PgPool) ->
         "the parked-issue queued row is purged, not left to wedge the drain"
     );
     assert_eq!(
-        queue.pending().await.plain,
+        queue.pending().plain,
         ["owner/repo#8"],
         "the drain skips the parked row and re-drives the next drainable issue"
     );

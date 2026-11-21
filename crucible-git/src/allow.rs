@@ -7,8 +7,9 @@ use crucible_contract::git::Bounds;
 use crucible_contract::outputs::{BoundViolation, OutputKind, ResolvedOutput, resolve_target};
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
-use tokio::sync::{OnceCell, watch};
+use tokio::sync::OnceCell;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Refused {
@@ -38,7 +39,7 @@ pub struct Allow {
     file: PathBuf,
     loaded: OnceCell<Option<Loaded>>,
     opened: AtomicU32,
-    created: watch::Sender<Created>,
+    created: Mutex<Created>,
 }
 
 /// The pull requests this run opened, the only ones its follow-up writes may touch.
@@ -54,7 +55,7 @@ impl Allow {
             file,
             loaded: OnceCell::new(),
             opened: AtomicU32::new(0),
-            created: watch::Sender::default(),
+            created: Mutex::new(Created::default()),
         }
     }
 
@@ -123,26 +124,25 @@ impl Allow {
 
     /// Remember a pull request this run opened on `repo`.
     pub fn record(&self, repo: &str, number: Option<u64>, node: Option<&str>) {
-        self.created.send_modify(|created| {
+        if let Ok(mut created) = self.created.lock() {
             if let Some(n) = number {
                 created.numbers.insert((repo.to_ascii_lowercase(), n));
             }
             if let Some(id) = node {
                 created.nodes.insert(id.to_string());
             }
-        });
+        }
     }
 
     /// Whether this run opened pull request `number` on `repo`.
     pub fn opened_number(&self, repo: &str, number: u64) -> bool {
         self.created
-            .borrow()
-            .numbers
-            .contains(&(repo.to_ascii_lowercase(), number))
+            .lock()
+            .is_ok_and(|c| c.numbers.contains(&(repo.to_ascii_lowercase(), number)))
     }
 
     /// Whether this run opened the pull request with GraphQL node id `id`.
     pub fn opened_node(&self, id: &str) -> bool {
-        self.created.borrow().nodes.contains(id)
+        self.created.lock().is_ok_and(|c| c.nodes.contains(id))
     }
 }

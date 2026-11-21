@@ -140,18 +140,18 @@ async fn launch_approved_run(
     // The digests the scope's builds pinned, keyed by image repo — the loop-pod render rewrites
     // any matching container image to `repo@sha256:…` so the run consumes the built image, not the
     // static manifest one. Empty for a build-free pack (the common case).
-    let (builds, dispatch) = tokio::try_join!(
-        crate::builds::store::builds_for_scope(db.pool(), scope.id),
-        crate::playbooks::providers::resolve_for_issue(
-            db.pool(),
-            issue,
-            crate::playbooks::providers::WorkloadClass::Autoresearch,
-        ),
-    )?;
-    let build_digests: std::collections::BTreeMap<String, String> = builds
-        .into_iter()
-        .filter_map(|b| b.digest_ref.map(|d| (b.image, d)))
-        .collect();
+    let build_digests: std::collections::BTreeMap<String, String> =
+        crate::builds::store::builds_for_scope(db.pool(), scope.id)
+            .await?
+            .into_iter()
+            .filter_map(|b| b.digest_ref.map(|d| (b.image, d)))
+            .collect();
+    let dispatch = crate::playbooks::providers::resolve_for_issue(
+        db.pool(),
+        issue,
+        crate::playbooks::providers::WorkloadClass::Autoresearch,
+    )
+    .await?;
     let claim = crate::runs::claim::RunClaim {
         key: &issue.key,
         from,

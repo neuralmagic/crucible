@@ -526,7 +526,7 @@ mod tests {
             })
             .await?;
         assert_eq!(
-            standby_queue.pending().await.urgent,
+            standby_queue.pending().urgent,
             vec!["owner/repo#1".to_string()]
         );
 
@@ -536,7 +536,7 @@ mod tests {
         let pass = source.pass(leader_queue.clone(), vec![]).await?;
         assert_eq!(pass.held, vec!["owner/repo#1".to_string()]);
         assert_eq!(
-            leader_queue.pending().await.urgent,
+            leader_queue.pending().urgent,
             vec!["owner/repo#1".to_string()]
         );
 

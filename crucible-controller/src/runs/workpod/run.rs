@@ -1403,11 +1403,12 @@ pub(crate) async fn dispatch_grounded_rank(
     // Resolve the overridable caps once (default < env < override).
     let eff = cfg.effective();
     // Cap + budget check, layered under the global ceiling the reconcile already enforced.
+    let active =
+        crate::runs::work_pods::count_active_work_pods(db.pool(), kind.label_value()).await?;
     let today = crate::clock::today_utc();
-    let (active, turns_today) = tokio::try_join!(
-        crate::runs::work_pods::count_active_work_pods(db.pool(), kind.label_value()),
-        crate::runs::work_pods::count_work_pod_turns_on_day(db.pool(), kind.label_value(), &today),
-    )?;
+    let turns_today =
+        crate::runs::work_pods::count_work_pod_turns_on_day(db.pool(), kind.label_value(), &today)
+            .await?;
 
     let cluster = crate::runs::workpod::issue_dispatch_cluster(db, cfg, issue_key).await?;
     // An earlier over-cap dispatch may have left a queued row for this issue: reuse its reserved

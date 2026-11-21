@@ -7,9 +7,8 @@ use std::fs::File;
 use std::io::Write;
 use std::num::NonZeroUsize;
 use std::panic::AssertUnwindSafe;
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Instant;
-use tokio::sync::watch;
 
 use crucible_contract::event::AgentEvent;
 use crucible_contract::session::SessionEvent;
@@ -23,29 +22,24 @@ use crate::plan::machine::BlockedReason;
 /// task took: the time at least one of its attempts, instances or rounds was running. Gaps while
 /// other tasks ran, such as between a revise loop's rounds, do not count.
 #[derive(Debug, Default)]
-pub struct TaskClock(watch::Sender<HashMap<String, Vec<Run>>>);
+pub struct TaskClock(Mutex<HashMap<String, Vec<Run>>>);
 
 /// One attempt's start, and its end once it settled.
 type Run = (Instant, Option<Instant>);
 
 impl TaskClock {
     fn started(&self, task: &TaskName) -> usize {
-        let mut run = 0;
-        self.0.send_modify(|spans| {
-            let runs = spans.entry(task.0.clone()).or_default();
-            runs.push((Instant::now(), None));
-            run = runs.len() - 1;
-        });
-        run
+        let mut spans = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let runs = spans.entry(task.0.clone()).or_default();
+        runs.push((Instant::now(), None));
+        runs.len() - 1
     }
 
     fn finished(&self, task: &TaskName, run: usize) {
-        self.0.send_modify(|spans| {
-            if let Some((_, end @ None)) = spans.get_mut(&task.0).and_then(|runs| runs.get_mut(run))
-            {
-                *end = Some(Instant::now());
-            }
-        });
+        let mut spans = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, end @ None)) = spans.get_mut(&task.0).and_then(|runs| runs.get_mut(run)) {
+            *end = Some(Instant::now());
+        }
     }
 
     /// Seconds `task`, or any of its instances, had an attempt running; zero when none started.
@@ -59,7 +53,8 @@ impl TaskClock {
         let now = Instant::now();
         let mut runs: Vec<(Instant, Instant)> = self
             .0
-            .borrow()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
             .iter()
             .filter(|(name, _)| **name == task.0 || name.starts_with(&instance))
             .flat_map(|(_, runs)| runs.iter().map(|(start, end)| (*start, end.unwrap_or(now))))
@@ -140,7 +135,7 @@ pub struct Admission<'j> {
     budget: f64,
     run_ceiling: Option<RunCeiling>,
     width: NonZeroUsize,
-    tally: watch::Sender<Tally>,
+    tally: Mutex<Tally>,
     journal: Option<&'j File>,
     /// Lanes on several threads append to the one journal; this keeps their lines whole.
     journal_lock: Mutex<()>,
@@ -205,19 +200,16 @@ impl Lane<'_> {
         if !usd.is_finite() {
             return;
         }
-        self.admission.tally.send_modify(|tally| {
-            if let Some(live) = tally.live.get_mut(&self.id) {
-                *live = live.max(usd);
-            }
-        });
+        let mut tally = self.admission.tally();
+        if let Some(live) = tally.live.get_mut(&self.id) {
+            *live = live.max(usd);
+        }
     }
 }
 
 impl Drop for Lane<'_> {
     fn drop(&mut self) {
-        self.admission.tally.send_modify(|tally| {
-            tally.live.remove(&self.id);
-        });
+        self.admission.tally().live.remove(&self.id);
         if let (Some(clock), Some(run)) = (self.admission.clock, self.run) {
             clock.finished(&self.task, run);
         }
@@ -236,7 +228,7 @@ impl<'j> Admission<'j> {
             budget,
             run_ceiling,
             width,
-            tally: watch::Sender::new(Tally {
+            tally: Mutex::new(Tally {
                 settled: spent,
                 ..Tally::default()
             }),
@@ -267,26 +259,25 @@ impl<'j> Admission<'j> {
         journal(file, event, sync)
     }
 
+    fn tally(&self) -> MutexGuard<'_, Tally> {
+        self.tally.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn admit(&self, lane: &BatchItem<'_>) -> Result<Lane<'_>, Refusal> {
         let task = lane.task;
         if self.run_ceiling.is_some_and(|ceiling| ceiling.reached()) {
             return Err(Refusal::WallClockCeiling);
         }
+        let mut tally = self.tally();
         let spends = task.task.spends();
-        let mut admitted = None;
-        self.tally.send_modify(|tally| {
-            if spends && (tally.closed || tally.reached(self.budget)) {
-                tally.closed = true;
-                return;
-            }
-            let id = tally.next;
-            tally.next += 1;
-            tally.live.insert(id, 0.0);
-            admitted = Some(id);
-        });
-        let Some(id) = admitted else {
+        if spends && (tally.closed || tally.reached(self.budget)) {
+            tally.closed = true;
             return Err(Refusal::CostCeiling);
-        };
+        }
+        let id = tally.next;
+        tally.next += 1;
+        tally.live.insert(id, 0.0);
+        drop(tally);
         let run = self.clock.map(|clock| clock.started(&task.name));
         // Synced, so a resumed run can charge an attempt whose process died before it settled
         // (RFC-0002:C-PLAYBOOK-RESUME).
@@ -313,10 +304,9 @@ impl<'j> Admission<'j> {
 
     /// Count what an admitted lane cost and retire its running figure.
     fn settle(&self, lane: Lane<'_>, attempt: &Attempt) {
-        self.tally.send_modify(|tally| {
-            tally.live.remove(&lane.id);
-            tally.settled += attempt.cost_usd;
-        });
+        let mut tally = self.tally();
+        tally.live.remove(&lane.id);
+        tally.settled += attempt.cost_usd;
     }
 
     /// Run `item` if the ceilings admit it, and count what it cost.

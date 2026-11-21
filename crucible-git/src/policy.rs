@@ -20,7 +20,7 @@ use crate::github::GitHub;
 use crate::graphql::{Field, Kind};
 use axum::http::{Method, StatusCode};
 use std::collections::HashMap;
-use tokio::sync::watch;
+use std::sync::Mutex;
 
 pub enum Verdict {
     /// Lend the run's token, to a caller holding `scope`.
@@ -45,8 +45,8 @@ const WRITE: Verdict = Verdict::Allow {
 /// the bound repositories.
 #[derive(Default)]
 pub struct State {
-    public: watch::Sender<HashMap<String, bool>>,
-    node_ids: watch::Sender<HashMap<String, String>>,
+    public: Mutex<HashMap<String, bool>>,
+    node_ids: Mutex<HashMap<String, String>>,
 }
 
 /// Visibility lookups kept before the cache starts over, so a caller naming endless repositories
@@ -285,17 +285,17 @@ async fn readable(state: &State, gh: &GitHub, allow: &Allow, repo: &str) -> Verd
         return READ;
     }
     let key = repo.to_ascii_lowercase();
-    let cached = state.public.borrow().get(&key).copied();
+    let cached = state.public.lock().ok().and_then(|m| m.get(&key).copied());
     let public = match cached {
         Some(p) => p,
         None => {
             let p = gh.is_public(repo).await.unwrap_or(false);
-            state.public.send_modify(|m| {
+            if let Ok(mut m) = state.public.lock() {
                 if m.len() >= PUBLIC_CACHE_LIMIT {
                     m.clear();
                 }
                 m.insert(key, p);
-            });
+            }
             p
         }
     };
@@ -482,13 +482,17 @@ pub async fn record_created(
 }
 
 async fn node_id(state: &State, gh: &GitHub, repo: &str) -> anyhow::Result<String> {
-    let cached = state.node_ids.borrow().get(repo).cloned();
-    if let Some(id) = cached {
+    if let Some(id) = state
+        .node_ids
+        .lock()
+        .ok()
+        .and_then(|m| m.get(repo).cloned())
+    {
         return Ok(id);
     }
     let id = gh.node_id(repo).await?;
-    state.node_ids.send_modify(|m| {
+    if let Ok(mut m) = state.node_ids.lock() {
         m.insert(repo.to_string(), id.clone());
-    });
+    }
     Ok(id)
 }

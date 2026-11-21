@@ -17,7 +17,7 @@ crucible-contract = { path = "../crucible-contract" }
 starlark = "0.14.2"
 starlark_syntax = "0.14.2"
 tower-lsp-server = "0.23"
-tokio = { workspace = true, features = ["io-std", "sync"] }
+tokio = { workspace = true, features = ["io-std"] }
 serde_json.workspace = true
 # Reads `[agent.sandbox.<name>]` keys out of the pack's crucible.toml.
 toml = "1.1"

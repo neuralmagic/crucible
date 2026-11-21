@@ -10,16 +10,13 @@
 #![allow(clippy::disallowed_macros)]
 
 use anyhow::Result;
-use futures_util::FutureExt;
-use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
-use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::Notify;
 
 /// An opaque unique `issues.key`, the queue's only unit of work (frozen): `owner/repo#N` for a
 /// GitHub issue, `scenario:{id}` for an adopted scenario — see [`crate::issues::model::InputKind`].
@@ -70,7 +67,6 @@ impl QueueConfig {
 /// The client-go/controller-runtime workqueue shape: `order` is FIFO, `dirty` is every key
 /// pending-or-in-flight (dedup), `processing` is the key(s) currently being reconciled (one, with
 /// a single worker, but the set generalizes cleanly if workers are later sharded).
-#[derive(Default)]
 struct QueueState {
     order: VecDeque<String>,
     /// How many keys at the front of `order` were added urgent. They run FIFO among themselves.
@@ -79,18 +75,33 @@ struct QueueState {
     processing: HashSet<String>,
 }
 
-impl QueueState {
+struct Inner {
+    state: Mutex<QueueState>,
+    notify: Notify,
+    shutdown: AtomicBool,
+}
+
+impl Inner {
+    fn state(&self) -> std::sync::MutexGuard<'_, QueueState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// `add`: if `key` is already dirty (queued or marked to re-run after the in-flight reconcile
     /// finishes), do nothing — this is the coalescing step. Otherwise mark it dirty and, unless
     /// it's currently processing, push it onto the FIFO.
-    fn add(&mut self, key: String) {
-        if !self.dirty.insert(key.clone()) {
+    fn add(&self, key: String) {
+        let mut st = self.state();
+        if !st.dirty.insert(key.clone()) {
             return;
         }
-        if self.processing.contains(&key) {
+        if st.processing.contains(&key) {
             return;
         }
-        self.order.push_back(key);
+        st.order.push_back(key);
+        drop(st);
+        self.notify.notify_one();
     }
 
     /// Add operator-directed work ahead of the ordinary discovery/startup backlog, behind any
@@ -98,221 +109,81 @@ impl QueueState {
     /// instead of letting FIFO dedup hide the human override behind every older key. An in-flight
     /// key keeps the normal dirty-bit follow-up semantics: it cannot be interrupted safely, so it
     /// reruns immediately after completion.
-    fn add_urgent(&mut self, key: String) {
-        if self.processing.contains(&key) {
-            self.dirty.insert(key);
+    fn add_urgent(&self, key: String) {
+        let mut st = self.state();
+        if st.processing.contains(&key) {
+            st.dirty.insert(key);
             return;
         }
-        if !self.dirty.insert(key.clone()) {
-            match self.order.iter().position(|queued| queued == &key) {
-                Some(position) if position < self.urgent => return,
+        if !st.dirty.insert(key.clone()) {
+            match st.order.iter().position(|queued| queued == &key) {
+                Some(position) if position < st.urgent => return,
                 Some(position) => {
-                    self.order.remove(position);
+                    st.order.remove(position);
                 }
                 None => return,
             }
         }
-        let at = self.urgent;
-        self.order.insert(at, key);
-        self.urgent += 1;
+        let at = st.urgent;
+        st.order.insert(at, key);
+        st.urgent += 1;
+        drop(st);
+        self.notify.notify_one();
     }
 
-    /// The next key to reconcile, now processing.
-    fn next(&mut self) -> Option<String> {
-        let key = self.order.pop_front()?;
-        self.urgent = self.urgent.saturating_sub(1);
-        self.dirty.remove(&key);
-        self.processing.insert(key.clone());
-        Some(key)
+    /// Block until a key is ready or the queue is shut down. Registers the `Notified` future
+    /// before re-checking state so a concurrent `add`/`shutdown` between the check and the await
+    /// can't be missed (the standard Tokio `Notify` wait-loop pattern).
+    async fn get_next(&self) -> Option<String> {
+        loop {
+            let notified = self.notify.notified();
+            {
+                let mut st = self.state();
+                if let Some(key) = st.order.pop_front() {
+                    st.urgent = st.urgent.saturating_sub(1);
+                    st.dirty.remove(&key);
+                    st.processing.insert(key.clone());
+                    return Some(key);
+                }
+                if self.shutdown.load(Ordering::SeqCst) {
+                    return None;
+                }
+            }
+            notified.await;
+        }
     }
 
     /// The reconcile for `key` finished (success or a not-yet-parked failure): it's no longer
     /// processing, and if something re-`add`ed it meanwhile, it goes back on the FIFO now.
-    fn done(&mut self, key: &str) {
-        self.processing.remove(key);
-        if self.dirty.contains(key) {
-            self.order.push_back(key.to_string());
+    fn done(&self, key: &str) {
+        let mut st = self.state();
+        st.processing.remove(key);
+        if st.dirty.contains(key) {
+            st.order.push_back(key.to_string());
         }
+        drop(st);
+        self.notify.notify_one();
     }
 
     /// The reconcile for `key` is being parked: no further requeue even if it was re-`add`ed
     /// while in flight — parking means "stop looking at this until something revives it."
-    fn done_parking(&mut self, key: &str) {
-        self.processing.remove(key);
-        self.dirty.remove(key);
+    fn done_parking(&self, key: &str) {
+        let mut st = self.state();
+        st.processing.remove(key);
+        st.dirty.remove(key);
     }
 
-    #[cfg(test)]
-    fn pending(&self) -> Pending {
-        let order: Vec<String> = self.order.iter().cloned().collect();
-        let (urgent, plain) = order.split_at(self.urgent.min(order.len()));
-        Pending {
-            urgent: urgent.to_vec(),
-            plain: plain.to_vec(),
-        }
-    }
-}
-
-type Panic = Box<dyn Any + Send>;
-
-enum Msg {
-    Add(String),
-    AddUrgent(String),
-    Run(Worker, oneshot::Sender<Panic>),
-    ShutDown,
-    #[cfg(test)]
-    Pending(oneshot::Sender<Pending>),
-}
-
-struct Worker {
-    reconcile: ReconcileFn,
-    park: ParkFn,
-    cfg: QueueConfig,
-    sync: Option<Arc<TestSyncMarker>>,
-}
-
-/// A [`WorkQueue::run`] call the actor is serving.
-struct Running {
-    worker: Worker,
-    panicked: oneshot::Sender<Panic>,
-    failures: HashMap<String, u32>,
-    in_flight: Option<(String, BoxFuture<std::thread::Result<Result<()>>>)>,
-}
-
-/// The task that owns the queue. It applies the handles' messages and, while a
-/// [`WorkQueue::run`] call is waiting on it, reconciles one key at a time.
-struct Actor {
-    inbox: mpsc::UnboundedReceiver<Msg>,
-    handle: mpsc::WeakUnboundedSender<Msg>,
-    state: QueueState,
-    shutdown: bool,
-    running: Option<Running>,
-}
-
-impl Actor {
-    async fn run(mut self) {
-        loop {
-            self.start_next();
-            let msg = match self.running.as_mut().and_then(|r| r.in_flight.as_mut()) {
-                Some((_, reconcile)) => tokio::select! {
-                    biased;
-                    msg = self.inbox.recv() => msg,
-                    result = reconcile => {
-                        self.settle(result);
-                        continue;
-                    }
-                },
-                None => self.inbox.recv().await,
-            };
-            match msg {
-                Some(msg) => self.apply(msg),
-                None => return,
-            }
-        }
-    }
-
-    fn apply(&mut self, msg: Msg) {
-        match msg {
-            Msg::Add(key) => self.state.add(key),
-            Msg::AddUrgent(key) => self.state.add_urgent(key),
-            Msg::Run(..) if self.running.is_some() => {}
-            Msg::Run(worker, panicked) => {
-                self.running = Some(Running {
-                    worker,
-                    panicked,
-                    failures: HashMap::new(),
-                    in_flight: None,
-                });
-            }
-            Msg::ShutDown => self.shutdown = true,
-            #[cfg(test)]
-            Msg::Pending(reply) => {
-                let _ = reply.send(self.state.pending());
-            }
-        }
-    }
-
-    fn start_next(&mut self) {
-        let Some(running) = self.running.as_mut() else {
-            return;
-        };
-        if running.in_flight.is_some() {
-            return;
-        }
-        match self.state.next() {
-            Some(key) => {
-                let reconcile = running.worker.reconcile.clone();
-                let issue = IssueKey(key.clone());
-                let attempt =
-                    AssertUnwindSafe(async move { reconcile(issue).await }).catch_unwind();
-                running.in_flight = Some((key, Box::pin(attempt)));
-            }
-            None if self.shutdown => self.running = None,
-            None => {}
-        }
-    }
-
-    /// Clear the reconciled key, requeue it after backoff, or park it after
-    /// `cfg.park_after` consecutive failures.
-    fn settle(&mut self, result: std::thread::Result<Result<()>>) {
-        let Some(mut running) = self.running.take() else {
-            return;
-        };
-        let Some((key, _)) = running.in_flight.take() else {
-            self.running = Some(running);
-            return;
-        };
-        let result = match result {
-            Ok(result) => result,
-            Err(panic) => {
-                self.state.done(&key);
-                let _ = running.panicked.send(panic);
-                return;
-            }
-        };
-        match result {
-            Ok(()) => {
-                running.failures.remove(&key);
-                self.state.done(&key);
-            }
-            Err(err) => {
-                let n = {
-                    let count = running.failures.entry(key.clone()).or_insert(0);
-                    *count += 1;
-                    *count
-                };
-                if n >= running.worker.cfg.park_after {
-                    running.failures.remove(&key);
-                    self.state.done_parking(&key);
-                    (running.worker.park)(
-                        IssueKey(key.clone()),
-                        crate::model::truncate_chain(&format!("{err:#}")),
-                    );
-                } else {
-                    self.state.done(&key);
-                    let backoff = running.worker.cfg.backoff_for(n);
-                    let handle = self.handle.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(backoff).await;
-                        if let Some(inbox) = handle.upgrade() {
-                            let _ = inbox.send(Msg::Add(key));
-                        }
-                    });
-                }
-            }
-        }
-        if let Some(marker) = &running.worker.sync {
-            marker.mark();
-        }
-        self.running = Some(running);
+    fn shut_down(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
     }
 }
 
 /// The queue handle: what every source enqueues through, and what drives the worker loop via
-/// [`WorkQueue::run`]. Cheap to clone (a channel sender inside).
+/// [`WorkQueue::run`]. Cheap to clone (an `Arc` inside).
 #[derive(Clone)]
 pub struct WorkQueue {
-    inbox: mpsc::UnboundedSender<Msg>,
+    inner: Arc<Inner>,
 }
 
 impl Default for WorkQueue {
@@ -322,24 +193,19 @@ impl Default for WorkQueue {
 }
 
 impl WorkQueue {
-    /// Spawns the queue's task, so it must be called inside a Tokio runtime.
     pub fn new() -> Self {
-        let (inbox, messages) = mpsc::unbounded_channel();
-        tokio::spawn(
-            Actor {
-                inbox: messages,
-                handle: inbox.downgrade(),
-                state: QueueState::default(),
-                shutdown: false,
-                running: None,
-            }
-            .run(),
-        );
-        WorkQueue { inbox }
-    }
-
-    fn send(&self, msg: Msg) {
-        let _ = self.inbox.send(msg);
+        WorkQueue {
+            inner: Arc::new(Inner {
+                state: Mutex::new(QueueState {
+                    order: VecDeque::new(),
+                    urgent: 0,
+                    dirty: HashSet::new(),
+                    processing: HashSet::new(),
+                }),
+                notify: Notify::new(),
+                shutdown: AtomicBool::new(false),
+            }),
+        }
     }
 
     /// Startup re-enqueue: the caller fetches `Db::non_terminal_keys` and hands
@@ -347,39 +213,43 @@ impl WorkQueue {
     /// work.
     pub(crate) fn reenqueue_startup(&self, keys: Vec<String>) {
         for key in keys {
-            self.send(Msg::Add(key));
+            self.inner.add(key);
         }
     }
 
     /// Sources (the discovery timer, the approval signal, the pod watch, the review-comment poll)
     /// only ever call this — they never touch the database or act directly (frozen).
     pub fn enqueue(&self, key: IssueKey) {
-        self.send(Msg::Add(key.0));
+        self.inner.add(key.0);
     }
 
     /// Put newly authorized or human-directed work ahead of discovery backlog.
     pub fn enqueue_urgent(&self, key: IssueKey) {
-        self.send(Msg::AddUrgent(key.0));
+        self.inner.add_urgent(key.0);
     }
 
     /// Stop accepting new work and wake the worker so it exits `run` once the queue drains: drop
     /// every queue handle / source, then call this, then join the worker task.
     pub(crate) fn shut_down(&self) {
-        self.send(Msg::ShutDown);
+        self.inner.shut_down();
     }
 
     /// The keys waiting to be dequeued, urgent ones first, in the order they will run.
     #[cfg(test)]
-    pub(crate) async fn pending(&self) -> Pending {
-        let (reply, pending) = oneshot::channel();
-        self.send(Msg::Pending(reply));
-        pending.await.unwrap_or_default()
+    pub(crate) fn pending(&self) -> Pending {
+        let st = self.inner.state();
+        let order: Vec<String> = st.order.iter().cloned().collect();
+        let (urgent, plain) = order.split_at(st.urgent.min(order.len()));
+        Pending {
+            urgent: urgent.to_vec(),
+            plain: plain.to_vec(),
+        }
     }
 
     /// The worker loop: dequeue a key, reconcile it, and either clear it, requeue it after
     /// backoff, or park it after `cfg.park_after` consecutive failures. Runs until [`shut_down`]
     /// is called and the queue is empty. `sync` marks completion of each processed item so tests
-    /// can await real drain instead of sleeping. One call at a time: a second returns at once.
+    /// can await real drain instead of sleeping.
     pub(crate) async fn run(
         &self,
         reconcile: ReconcileFn,
@@ -387,25 +257,53 @@ impl WorkQueue {
         cfg: QueueConfig,
         sync: Option<Arc<TestSyncMarker>>,
     ) {
-        let (panicked, worker_panicked) = oneshot::channel();
-        self.send(Msg::Run(
-            Worker {
-                reconcile,
-                park,
-                cfg,
-                sync,
-            },
-            panicked,
-        ));
-        if let Ok(panic) = worker_panicked.await {
-            std::panic::resume_unwind(panic);
+        let mut failures: HashMap<String, u32> = HashMap::new();
+        loop {
+            let key = match self.inner.get_next().await {
+                Some(k) => k,
+                None => break,
+            };
+            let result = reconcile(IssueKey(key.clone())).await;
+            match result {
+                Ok(()) => {
+                    failures.remove(&key);
+                    self.inner.done(&key);
+                }
+                Err(err) => {
+                    let n = {
+                        let count = failures.entry(key.clone()).or_insert(0);
+                        *count += 1;
+                        *count
+                    };
+                    if n >= cfg.park_after {
+                        failures.remove(&key);
+                        self.inner.done_parking(&key);
+                        park(
+                            IssueKey(key.clone()),
+                            crate::model::truncate_chain(&format!("{err:#}")),
+                        );
+                    } else {
+                        self.inner.done(&key);
+                        let backoff = cfg.backoff_for(n);
+                        let inner = self.inner.clone();
+                        let requeue_key = key.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(backoff).await;
+                            inner.add(requeue_key);
+                        });
+                    }
+                }
+            }
+            if let Some(marker) = &sync {
+                marker.mark();
+            }
         }
     }
 }
 
 /// What a queue holds, split the way it will dequeue.
 #[cfg(test)]
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Pending {
     pub(crate) urgent: Vec<String>,
     pub(crate) plain: Vec<String>,
@@ -665,16 +563,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_urgent_count_drains_so_later_urgent_keys_still_go_first() {
-        let mut state = QueueState::default();
-        state.add_urgent("u1".into());
-        assert_eq!(state.next().as_deref(), Some("u1"));
-        state.done("u1");
-        state.add("plain".into());
-        state.add_urgent("u2".into());
-        assert_eq!(state.next().as_deref(), Some("u2"));
-        assert_eq!(state.next().as_deref(), Some("plain"));
+    #[tokio::test]
+    async fn the_urgent_count_drains_so_later_urgent_keys_still_go_first() {
+        let queue = WorkQueue::new();
+        queue.enqueue_urgent(IssueKey("u1".into()));
+        assert_eq!(queue.inner.get_next().await.as_deref(), Some("u1"));
+        queue.inner.done("u1");
+        queue.enqueue(IssueKey("plain".into()));
+        queue.enqueue_urgent(IssueKey("u2".into()));
+        assert_eq!(queue.inner.get_next().await.as_deref(), Some("u2"));
+        assert_eq!(queue.inner.get_next().await.as_deref(), Some("plain"));
     }
 
     #[tokio::test]

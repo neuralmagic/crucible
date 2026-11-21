@@ -334,18 +334,13 @@ impl crate::daemon::queue::DiscoverySource for RunPodResync {
     ) -> crate::daemon::queue::BoxFuture<Result<()>> {
         let db = self.db.clone();
         Box::pin(async move {
-            let (rows, runs) = tokio::try_join!(
-                async {
-                    crate::runs::work_pods::work_pods_in_states(db.pool(), &[WorkPodState::Running])
-                        .await
-                        .context("reading running work pods for the run pod resync")
-                },
-                async {
-                    crate::runs::store::running_pod_run_issues(db.pool())
-                        .await
-                        .context("reading running pod runs for the run pod resync")
-                },
-            )?;
+            let rows =
+                crate::runs::work_pods::work_pods_in_states(db.pool(), &[WorkPodState::Running])
+                    .await
+                    .context("reading running work pods for the run pod resync")?;
+            let runs = crate::runs::store::running_pod_run_issues(db.pool())
+                .await
+                .context("reading running pod runs for the run pod resync")?;
             let mut keys = run_pod_resync_keys(&rows);
             for key in runs {
                 if !keys.contains(&key) {

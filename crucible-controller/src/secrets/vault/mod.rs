@@ -38,10 +38,9 @@ use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
-use tokio::sync::{OnceCell, mpsc, oneshot, watch};
 
 /// How long any single Vault call may take before it counts as unreachable.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -280,38 +279,13 @@ struct UnwrappedSecret {
 struct Inner {
     http: reqwest::Client,
     cfg: VaultCfg,
-    /// One login shared by every caller. Only the login task writes it.
-    token: watch::Sender<Option<TokenState>>,
+    /// One login shared by every caller. The lock is held across a login/renew round trip, which
+    /// coalesces a stampede into a single mint.
+    token: tokio::sync::Mutex<Option<TokenState>>,
     /// The result of the last unwrap, so a second login does not replay a single-use token.
-    unwrapped: watch::Sender<Option<UnwrappedSecret>>,
-    /// The task that logs in and renews, started on first use. It answers one request at a
-    /// time, which coalesces a stampede into a single mint.
-    login_requests: OnceCell<mpsc::UnboundedSender<LoginRequest>>,
+    unwrapped: tokio::sync::Mutex<Option<UnwrappedSecret>>,
     logins: AtomicU64,
     renewals: AtomicU64,
-}
-
-enum LoginRequest {
-    Token(oneshot::Sender<Result<VaultToken, VaultError>>),
-    Relogin(VaultToken, oneshot::Sender<Result<VaultToken, VaultError>>),
-}
-
-/// Answer token requests in order until every client is gone.
-async fn keep_login(inner: Weak<Inner>, mut requests: mpsc::UnboundedReceiver<LoginRequest>) {
-    while let Some(request) = requests.recv().await {
-        let Some(inner) = inner.upgrade() else {
-            return;
-        };
-        let client = VaultClient { inner };
-        match request {
-            LoginRequest::Token(reply) => {
-                let _ = reply.send(client.current_token().await);
-            }
-            LoginRequest::Relogin(stale, reply) => {
-                let _ = reply.send(client.replace_token(&stale).await);
-            }
-        }
-    }
 }
 
 /// The hub's Vault client. Cloning shares the login and the connection pool.
@@ -353,9 +327,8 @@ impl VaultClient {
             inner: Arc::new(Inner {
                 http,
                 cfg,
-                token: watch::Sender::new(None),
-                unwrapped: watch::Sender::new(None),
-                login_requests: OnceCell::new(),
+                token: tokio::sync::Mutex::new(None),
+                unwrapped: tokio::sync::Mutex::new(None),
                 logins: AtomicU64::new(0),
                 renewals: AtomicU64::new(0),
             }),
@@ -639,63 +612,23 @@ impl VaultClient {
         ))
     }
 
-    /// Ask the login task, starting it on first use.
-    async fn ask_login(
-        &self,
-        request: impl FnOnce(oneshot::Sender<Result<VaultToken, VaultError>>) -> LoginRequest,
-    ) -> Result<VaultToken, VaultError> {
-        let requests = self
-            .inner
-            .login_requests
-            .get_or_init(|| async {
-                let (requests, inbox) = mpsc::unbounded_channel();
-                tokio::spawn(keep_login(Arc::downgrade(&self.inner), inbox));
-                requests
-            })
-            .await;
-        let (reply, answer) = oneshot::channel();
-        let _ = requests.send(request(reply));
-        answer.await.unwrap_or_else(|_| {
-            Err(VaultError::Unexpected {
-                op: "reading the vault token".to_string(),
-                detail: "the login task stopped".to_string(),
-            })
-        })
-    }
-
     /// The current login token, renewing or re-minting as needed.
     async fn token(&self) -> Result<VaultToken, VaultError> {
-        self.ask_login(LoginRequest::Token).await
-    }
-
-    /// Mint a fresh token because `stale` was denied. If another caller already replaced it, use
-    /// theirs instead of logging in a second time.
-    async fn relogin(&self, stale: &VaultToken) -> Result<VaultToken, VaultError> {
-        self.ask_login(|reply| LoginRequest::Relogin(stale.clone(), reply))
-            .await
-    }
-
-    async fn current_token(&self) -> Result<VaultToken, VaultError> {
+        let mut guard = self.inner.token.lock().await;
         let threshold = self.inner.cfg.renew_threshold;
-        let held = self.inner.token.borrow().as_ref().map(|state| {
-            (
-                state.token.clone(),
-                state.renewable,
-                state.needs_refresh(Instant::now(), threshold),
-            )
-        });
-        if let Some((held, renewable, needs_refresh)) = held {
-            if !needs_refresh {
-                return Ok(held);
+        if let Some(state) = guard.as_ref() {
+            let now = Instant::now();
+            if !state.needs_refresh(now, threshold) {
+                return Ok(state.token.clone());
             }
-            if renewable {
-                match self.renew(&held).await {
+            if state.renewable {
+                match self.renew(&state.token).await {
                     // A renewal that lands the token straight back inside the threshold means
                     // Vault has stopped extending it (a max TTL); log in again rather than renew
                     // on every call from here on.
                     Ok(renewed) if !renewed.needs_refresh(Instant::now(), threshold) => {
                         let token = renewed.token.clone();
-                        self.inner.token.send_replace(Some(renewed));
+                        *guard = Some(renewed);
                         return Ok(token);
                     }
                     Ok(_) => {
@@ -711,25 +644,22 @@ impl VaultClient {
         }
         let state = self.login().await?;
         let token = state.token.clone();
-        self.inner.token.send_replace(Some(state));
+        *guard = Some(state);
         Ok(token)
     }
 
-    async fn replace_token(&self, stale: &VaultToken) -> Result<VaultToken, VaultError> {
-        let held = self
-            .inner
-            .token
-            .borrow()
-            .as_ref()
-            .map(|state| state.token.clone());
-        if let Some(held) = held
-            && &held != stale
+    /// Mint a fresh token because `stale` was denied. If another caller already replaced it, use
+    /// theirs instead of logging in a second time.
+    async fn relogin(&self, stale: &VaultToken) -> Result<VaultToken, VaultError> {
+        let mut guard = self.inner.token.lock().await;
+        if let Some(state) = guard.as_ref()
+            && &state.token != stale
         {
-            return Ok(held);
+            return Ok(state.token.clone());
         }
         let state = self.login().await?;
         let token = state.token.clone();
-        self.inner.token.send_replace(Some(state));
+        *guard = Some(state);
         Ok(token)
     }
 
@@ -822,21 +752,17 @@ impl VaultClient {
         if !wrapped {
             return Ok(configured);
         }
-        let spent = self
-            .inner
-            .unwrapped
-            .borrow()
-            .as_ref()
-            .filter(|spent| spent.wrapping == configured)
-            .map(|spent| spent.secret_id.clone());
-        if let Some(secret_id) = spent {
-            return Ok(secret_id);
+        let mut guard = self.inner.unwrapped.lock().await;
+        if let Some(spent) = guard.as_ref()
+            && spent.wrapping == configured
+        {
+            return Ok(spent.secret_id.clone());
         }
         let secret_id = self.unwrap_secret_id(&configured).await?;
-        self.inner.unwrapped.send_replace(Some(UnwrappedSecret {
+        *guard = Some(UnwrappedSecret {
             wrapping: configured,
             secret_id: secret_id.clone(),
-        }));
+        });
         Ok(secret_id)
     }
 

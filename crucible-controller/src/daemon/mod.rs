@@ -636,16 +636,27 @@ pub async fn run_led(
 
     // A pod completion wakes the launch loop once its reconcile has freed the slot.
     let launch_wake = Arc::new(tokio::sync::Notify::new());
-    let (reconciled, mut reconciles) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let reconcile: ReconcileFn = Arc::new(move |key: IssueKey| {
-        let reconciled = reconciled.clone();
-        let reconciling = reconcile(key.clone());
-        Box::pin(async move {
-            let result = reconciling.await;
-            let _ = reconciled.send(key.0);
-            result
+    let completed: Arc<std::sync::Mutex<std::collections::HashSet<String>>> = Arc::default();
+    let reconcile: ReconcileFn = {
+        let completed = completed.clone();
+        let wake = launch_wake.clone();
+        Arc::new(move |key: IssueKey| {
+            let completed = completed.clone();
+            let wake = wake.clone();
+            let reconciled = reconcile(key.clone());
+            Box::pin(async move {
+                let result = reconciled.await;
+                if completed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&key.0)
+                {
+                    wake.notify_one();
+                }
+                result
+            })
         })
-    });
+    };
 
     let worker_queue = queue.clone();
     let worker = tokio::spawn(async move {
@@ -654,24 +665,15 @@ pub async fn run_led(
 
     let mut sources = tokio::task::JoinSet::new();
     let completion_queue = queue.clone();
-    let completion_wake = launch_wake.clone();
     sources.spawn(async move {
         use futures_util::StreamExt;
-        let mut completions = completions.fuse();
-        let mut completed = std::collections::HashSet::new();
-        loop {
-            tokio::select! {
-                Some(key) = completions.next() => {
-                    completed.insert(key.0.clone());
-                    completion_queue.enqueue(key);
-                }
-                Some(key) = reconciles.recv() => {
-                    if completed.remove(&key) {
-                        completion_wake.notify_one();
-                    }
-                }
-                else => break,
-            }
+        let mut completions = completions;
+        while let Some(key) = completions.next().await {
+            completed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key.0.clone());
+            completion_queue.enqueue(key);
         }
     });
     if let Some(launches) = launches {

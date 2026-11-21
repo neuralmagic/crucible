@@ -17,7 +17,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::watch;
 
 const RESULT_SENTINEL: &str = "___CRUCIBLE_RESULT___";
 const JOB_OUT_PATH: &str = "/tmp/codegen-out.json";
@@ -59,19 +58,19 @@ const JOB_RING_CAP: usize = 20;
 /// Shared across per-request server instances (stateless mode rebuilds `McpServer` per request);
 /// constructed once from env at startup.
 pub struct CodegenState {
-    memo: watch::Sender<HashMap<String, Cached>>,
+    memo: Mutex<HashMap<String, Cached>>,
     /// Digests this broker's own `build()` produced; measures refuse anything else, since the frozen
     /// command is no protection inside an agent-chosen image.
-    built: watch::Sender<HashSet<String>>,
+    built: Mutex<HashSet<String>>,
     /// The durable tier under `memo`/`built`, which die with the pod.
     steps: forge::steps::StepLedger,
     budget: Budget,
     logs: LogStore,
     /// The GPU jobs THIS broker submitted (a bounded ring), the only jobs `codegen_jobs` reports.
-    jobs: watch::Sender<VecDeque<TrackedJob>>,
+    jobs: Mutex<VecDeque<TrackedJob>>,
     /// Measure/profile jobs a worker thread is still driving, keyed by memo key: an identical
     /// re-issued call attaches here instead of submitting a duplicate Kueue job.
-    inflight: watch::Sender<HashMap<String, Arc<InflightJob>>>,
+    inflight: Mutex<HashMap<String, Arc<InflightJob>>>,
 }
 
 /// One detached measure/profile job between "the call stopped waiting" and "the worker collected
@@ -163,42 +162,41 @@ impl CodegenState {
 
     fn with_steps(steps: forge::steps::StepLedger) -> Self {
         Self {
-            memo: watch::Sender::default(),
-            built: watch::Sender::default(),
+            memo: Mutex::new(HashMap::new()),
+            built: Mutex::new(HashSet::new()),
             steps,
             budget: Budget::from_env(),
             logs: LogStore::from_env(),
-            jobs: watch::Sender::default(),
-            inflight: watch::Sender::default(),
+            jobs: Mutex::new(VecDeque::new()),
+            inflight: Mutex::new(HashMap::new()),
         }
     }
     fn inflight_get(&self, key: &str) -> Option<Arc<InflightJob>> {
-        self.inflight.borrow().get(key).cloned()
+        self.inflight.lock().ok().and_then(|m| m.get(key).cloned())
     }
     fn inflight_insert(&self, key: String, job: Arc<InflightJob>) {
-        self.inflight.send_modify(|m| {
+        if let Ok(mut m) = self.inflight.lock() {
             m.insert(key, job);
-        });
+        }
     }
     fn inflight_remove(&self, key: &str) {
-        self.inflight.send_modify(|m| {
+        if let Ok(mut m) = self.inflight.lock() {
             m.remove(key);
-        });
+        }
     }
     /// Memo first, then the ledger: a hit there is work a previous broker process finished, so it
     /// is rehydrated into the memo (and into the provenance set, for a build) before it is served.
     fn get(&self, key: &str) -> Option<Cached> {
-        let hit = self.memo.borrow().get(key).cloned();
-        if let Some(hit) = hit {
+        if let Some(hit) = self.memo.lock().ok().and_then(|m| m.get(key).cloned()) {
             return Some(hit);
         }
         let recorded: Cached = self.steps.lookup(&crate::steps::key(key))?;
         if let Cached::Build { digest, .. } = &recorded {
             self.mark_built(digest);
         }
-        self.memo.send_modify(|m| {
+        if let Ok(mut m) = self.memo.lock() {
             m.insert(key.to_string(), recorded.clone());
-        });
+        }
         Some(recorded)
     }
     /// Record before the memo: the caller consumes the value the moment this returns, and a
@@ -207,19 +205,19 @@ impl CodegenState {
         if let Err(e) = self.steps.record(&crate::steps::key(key.clone()), &val) {
             eprintln!("warning: recording step {key:?} failed: {e:#}");
         }
-        self.memo.send_modify(|m| {
+        if let Ok(mut m) = self.memo.lock() {
             m.insert(key, val);
-        });
+        }
     }
     fn mark_built(&self, digest: &str) {
-        self.built.send_modify(|s| {
+        if let Ok(mut s) = self.built.lock() {
             s.insert(digest.to_string());
-        });
+        }
     }
     /// Ours if this process built it or the ledger says a broker did. Without the ledger
     /// half, a restarted broker forces a rebuild before it will measure a pushed digest.
     fn is_built(&self, digest: &str) -> bool {
-        if self.built.borrow().contains(digest) {
+        if self.built.lock().is_ok_and(|s| s.contains(digest)) {
             return true;
         }
         let recorded = self
@@ -233,23 +231,26 @@ impl CodegenState {
         recorded
     }
     fn record_job(&self, job: TrackedJob) {
-        self.jobs.send_modify(|ring| {
+        if let Ok(mut ring) = self.jobs.lock() {
             ring.push_back(job);
             while ring.len() > JOB_RING_CAP {
                 ring.pop_front();
             }
-        });
+        }
     }
     fn finish_job(&self, name: &str, result: JobResult) {
-        self.jobs.send_modify(|ring| {
-            if let Some(job) = ring.iter_mut().find(|j| j.name == name) {
-                job.result = Some(result);
-            }
-        });
+        if let Ok(mut ring) = self.jobs.lock()
+            && let Some(job) = ring.iter_mut().find(|j| j.name == name)
+        {
+            job.result = Some(result);
+        }
     }
     /// Newest first (the job the agent is waiting on tops the list).
     fn jobs_snapshot(&self) -> Vec<TrackedJob> {
-        self.jobs.borrow().iter().rev().cloned().collect()
+        self.jobs
+            .lock()
+            .map(|ring| ring.iter().rev().cloned().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -1413,7 +1414,7 @@ const PHASE_TICK: Duration = Duration::from_millis(250);
 struct PhaseWatcher {
     stop: Arc<AtomicBool>,
     saw_logs: Arc<AtomicBool>,
-    spans: Arc<watch::Sender<PhaseSpans>>,
+    spans: Arc<Mutex<PhaseSpans>>,
 }
 
 impl PhaseWatcher {
@@ -1428,7 +1429,7 @@ impl PhaseWatcher {
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let saw_logs = Arc::new(AtomicBool::new(false));
-        let spans = Arc::new(watch::Sender::new(PhaseSpans::new()));
+        let spans = Arc::new(Mutex::new(PhaseSpans::new()));
         let (thread_stop, thread_logs, thread_spans) =
             (Arc::clone(&stop), Arc::clone(&saw_logs), Arc::clone(&spans));
         // tracing's subscriber is a thread-local a fresh thread does not inherit.
@@ -1438,9 +1439,11 @@ impl PhaseWatcher {
             .spawn(move || {
                 let _dispatch = tracing::dispatcher::set_default(&dispatch);
                 let mut phase = JobPhase::Submitted;
-                // The spans are only ever held for the swap, never across a cluster read, so
-                // the owner's Drop can always reach them promptly.
-                thread_spans.send_modify(|spans| spans.advance(&parent, phase));
+                // The lock is only ever held for the span swap, never across a cluster read, so
+                // the owner's Drop can always take it promptly.
+                if let Ok(mut spans) = thread_spans.lock() {
+                    spans.advance(&parent, phase);
+                }
                 while sleep_until_poll(&thread_stop) {
                     let admitted = forge::kube::workload_statuses(&target, &namespace)
                         .ok()
@@ -1452,7 +1455,9 @@ impl PhaseWatcher {
                     let seen =
                         phase_for(admitted, pod_running, thread_logs.load(Ordering::Relaxed));
                     if seen > phase {
-                        thread_spans.send_modify(|spans| spans.advance(&parent, seen));
+                        if let Ok(mut spans) = thread_spans.lock() {
+                            spans.advance(&parent, seen);
+                        }
                         phase = seen;
                     }
                 }
@@ -1477,7 +1482,9 @@ impl PhaseWatcher {
 impl Drop for PhaseWatcher {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        self.spans.send_modify(|spans| spans.close());
+        if let Ok(mut spans) = self.spans.lock() {
+            spans.close();
+        }
     }
 }
 

@@ -13,7 +13,7 @@ use crucible_contract::session::{SessionEvent, encode};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
-use tokio::sync::watch;
+use std::sync::Mutex;
 
 /// The run's resolved bounds plus the per-kind tally already spent.
 pub struct Bounds {
@@ -22,7 +22,7 @@ pub struct Bounds {
     params: BTreeMap<String, String>,
     /// Where a refusal row is appended. `None` = no session log was projected.
     session_log: Option<PathBuf>,
-    spent: watch::Sender<BTreeMap<OutputKind, u32>>,
+    spent: Mutex<BTreeMap<OutputKind, u32>>,
 }
 
 impl Bounds {
@@ -37,7 +37,7 @@ impl Bounds {
             resolved,
             params,
             session_log,
-            spent: watch::Sender::default(),
+            spent: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -68,7 +68,7 @@ impl Bounds {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .map(PathBuf::from),
-            spent: watch::Sender::default(),
+            spent: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -130,20 +130,25 @@ impl Bounds {
             .get(kind)
             .ok_or(BoundViolation::NoTarget { kind })?;
         let target = resolve_target(bound, requested, &self.params)?;
-        let mut granted = false;
-        self.spent.send_modify(|spent| {
-            let used = spent.entry(kind).or_insert(0);
-            if *used < bound.count {
-                *used += 1;
-                granted = true;
+        let mut spent = match self.spent.lock() {
+            Ok(g) => g,
+            // A poisoned tally cannot be trusted to be under the count, so refuse rather than
+            // let an unbounded number of writes through.
+            Err(_) => {
+                return Err(BoundViolation::CountExhausted {
+                    kind,
+                    count: bound.count,
+                });
             }
-        });
-        if !granted {
+        };
+        let used = spent.entry(kind).or_insert(0);
+        if *used >= bound.count {
             return Err(BoundViolation::CountExhausted {
                 kind,
                 count: bound.count,
             });
         }
+        *used += 1;
         Ok(target)
     }
 

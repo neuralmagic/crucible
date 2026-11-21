@@ -294,11 +294,8 @@ pub async fn read_local(scratch_root: &Path, run_id: &str, key: &str) -> Option<
     let path = root.join(key);
     // The key is already component-checked, but resolve anyway: a symlinked capture directory
     // must not read outside the run's own root.
-    let (resolved, root) = tokio::try_join!(
-        tokio::fs::canonicalize(&path),
-        tokio::fs::canonicalize(&root)
-    )
-    .ok()?;
+    let resolved = tokio::fs::canonicalize(&path).await.ok()?;
+    let root = tokio::fs::canonicalize(&root).await.ok()?;
     if !resolved.starts_with(&root) {
         return None;
     }

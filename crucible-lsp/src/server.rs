@@ -8,8 +8,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
@@ -40,7 +40,7 @@ use crate::text::Text;
 pub struct Backend {
     client: Client,
     reference: Reference,
-    state: tokio::sync::watch::Sender<State>,
+    state: Mutex<State>,
     snippets: AtomicBool,
 }
 
@@ -83,13 +83,13 @@ impl Backend {
         Backend {
             client,
             reference: Reference::new(),
-            state: tokio::sync::watch::Sender::default(),
+            state: Mutex::new(State::default()),
             snippets: AtomicBool::new(false),
         }
     }
 
-    fn state(&self) -> tokio::sync::watch::Ref<'_, State> {
-        self.state.borrow()
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Open documents' text by canonical path, falling back to disk.
@@ -139,16 +139,13 @@ impl Backend {
         else {
             return;
         };
-        let mut current = false;
-        self.state.send_modify(|state| {
+        {
+            let mut state = self.state();
             let packs = state.packs.entry(pack.clone()).or_default();
-            if packs.generation == generation {
-                packs.compiled = found;
-                current = true;
+            if packs.generation != generation {
+                return;
             }
-        });
-        if !current {
-            return;
+            packs.compiled = found;
         }
         self.publish_pack(&pack).await;
     }
@@ -162,42 +159,38 @@ impl Backend {
         };
         let read = self.reader();
         let analysis = analyze::analyze(&self.reference, path.as_deref(), text.as_str(), &read);
-        let mut job = None;
-        self.state.send_modify(|state| {
-            job = (|| {
-                let doc = state.docs.get_mut(uri)?;
-                if doc.version != version {
-                    return None;
-                }
-                doc.local = analysis.local;
-                doc.parse_failed = analysis.index.is_none();
-                match analysis.index {
-                    Some(index) => {
-                        doc.parsed = Some((Arc::new(index), text));
-                        doc.context = Arc::new(analysis.context);
-                    }
-                    None if doc.context.pack.is_none() => doc.context = Arc::new(analysis.context),
-                    None => {}
-                }
-                let compile = analysis.compile?;
-                let packs = state.packs.entry(compile.pack.clone()).or_default();
-                packs.generation += 1;
-                Some(CompileJob {
-                    pack: compile.pack,
-                    entry: compile.entry,
-                    source: compile.source,
-                    generation: packs.generation,
-                })
-            })();
-        });
-        job
+        let mut state = self.state();
+        let doc = state.docs.get_mut(uri)?;
+        if doc.version != version {
+            return None;
+        }
+        doc.local = analysis.local;
+        doc.parse_failed = analysis.index.is_none();
+        match analysis.index {
+            Some(index) => {
+                doc.parsed = Some((Arc::new(index), text));
+                doc.context = Arc::new(analysis.context);
+            }
+            None if doc.context.pack.is_none() => doc.context = Arc::new(analysis.context),
+            None => {}
+        }
+        let compile = analysis.compile?;
+        let packs = state.packs.entry(compile.pack.clone()).or_default();
+        packs.generation += 1;
+        Some(CompileJob {
+            pack: compile.pack,
+            entry: compile.entry,
+            source: compile.source,
+            generation: packs.generation,
+        })
     }
 
     /// Publish every file of `pack` that has, or had, a diagnostic.
     async fn publish_pack(&self, pack: &Path) {
         let read = self.reader();
-        let mut batches: Vec<(Uri, Vec<Diagnostic>)> = Vec::new();
-        self.state.send_modify(|state| {
+        let batches: Vec<(Uri, Vec<Diagnostic>)> = {
+            let mut state = self.state();
+            let state = &mut *state;
             let packs = state.packs.entry(pack.to_path_buf()).or_default();
             let mut files: BTreeSet<PathBuf> = packs.compiled.keys().cloned().collect();
             files.extend(packs.published.iter().cloned());
@@ -208,7 +201,7 @@ impl Backend {
                 .collect();
             files.extend(open.iter().filter_map(|(_, doc)| doc.canonical.clone()));
             let mut published = BTreeSet::new();
-            batches = files
+            let batches = files
                 .into_iter()
                 .filter_map(|file| {
                     let doc = open
@@ -239,7 +232,8 @@ impl Backend {
                 })
                 .collect();
             packs.published = published;
-        });
+            batches
+        };
         for (uri, diagnostics) in batches {
             self.client
                 .publish_diagnostics(uri, diagnostics, None)
@@ -344,9 +338,7 @@ impl LanguageServer for Backend {
             parse_failed: false,
             context: Arc::default(),
         };
-        self.state.send_modify(|state| {
-            state.docs.insert(document.uri.clone(), doc);
-        });
+        self.state().docs.insert(document.uri.clone(), doc);
         self.refresh(document.uri).await;
     }
 
@@ -355,8 +347,8 @@ impl LanguageServer for Backend {
         let Some(change) = params.content_changes.into_iter().last() else {
             return;
         };
-        let mut changed = false;
-        self.state.send_modify(|state| {
+        {
+            let mut state = self.state();
             let Some(doc) = state.docs.get_mut(&uri) else {
                 return;
             };
@@ -365,10 +357,6 @@ impl LanguageServer for Backend {
             }
             doc.version = params.text_document.version;
             doc.text = Arc::new(Text::new(change.text));
-            changed = true;
-        });
-        if !changed {
-            return;
         }
         self.refresh(uri).await;
     }
@@ -400,10 +388,11 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
-        let mut closed = None;
-        self.state
-            .send_modify(|state| closed = state.docs.remove(&uri));
-        let pack = closed.and_then(|doc| Some(doc.context.pack.as_ref()?.dir.clone()));
+        let pack = self
+            .state()
+            .docs
+            .remove(&uri)
+            .and_then(|doc| Some(doc.context.pack.as_ref()?.dir.clone()));
         match pack {
             Some(pack) => self.publish_pack(&pack).await,
             None => self.client.publish_diagnostics(uri, Vec::new(), None).await,

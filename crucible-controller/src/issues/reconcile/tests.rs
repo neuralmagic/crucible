@@ -8212,7 +8212,7 @@ async fn resync_tick(db: &Db) -> Result<Vec<String>> {
     crate::runs::workpod::RunPodResync::new(db.clone())
         .poll(queue.clone())
         .await?;
-    Ok(queue.pending().await.plain)
+    Ok(queue.pending().plain)
 }
 
 /// Install `dispatcher`, run one resync tick and reconcile every key it enqueued, the way the
