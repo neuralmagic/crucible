@@ -542,6 +542,63 @@ export function CheckField({ id, label, checked, onChange, description, required
   );
 }
 
+export interface CheckGroupFieldProps {
+  id: string;
+  label: ReactNode;
+  options: readonly string[];
+  checked: readonly string[];
+  onToggle: (value: string, on: boolean) => void;
+  required?: boolean;
+  disabled?: boolean;
+  hint?: ReactNode;
+  error?: string | null;
+}
+
+export function CheckGroupField({
+  id,
+  label,
+  options,
+  checked,
+  onToggle,
+  required = false,
+  disabled = false,
+  hint,
+  error,
+}: CheckGroupFieldProps) {
+  const stale = checked.filter((value) => !options.includes(value));
+  return (
+    <fieldset className="m-0 grid gap-1.5 border-0 p-0" disabled={disabled}>
+      <legend className={cn(LABEL, 'mb-1.5 p-0')}>
+        {label}
+        {required && <span className="ml-1 text-red">*</span>}
+      </legend>
+      {hint !== undefined && <p className={cn(HINT, 'm-0')}>{hint}</p>}
+      <div className="grid gap-1.5">
+        {[...options, ...stale].map((value, index) => (
+          <div key={value} className="flex items-center gap-2">
+            <Check
+              id={`${id}-${String(index)}`}
+              label={value}
+              checked={checked.includes(value)}
+              onChange={(on) => {
+                onToggle(value, on);
+              }}
+            />
+            <label htmlFor={`${id}-${String(index)}`} className="cursor-pointer font-mono text-data-lg text-ink">
+              {stale.includes(value) ? `${value} (not offered)` : value}
+            </label>
+          </div>
+        ))}
+      </div>
+      {error ? (
+        <p role="alert" className="m-0 max-w-[66ch] text-data-lg text-red">
+          {error}
+        </p>
+      ) : null}
+    </fieldset>
+  );
+}
+
 export interface NumberFieldProps {
   id: string;
   label: ReactNode;

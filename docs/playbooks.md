@@ -378,6 +378,15 @@ crucible plan run --manifest crucible.toml --param topic=slag --max-cost 1 --max
 A string parameter that sets `"multiline": True` takes its value in a text area on the control
 plane's launch, schedule and ask forms. The value is still one string.
 
+A `list<string>` parameter with `choices` takes any subset of them, shown as one checkbox per
+choice on those forms. An entry outside the choices, or one picked twice, is refused:
+
+```python
+params = {
+    "workloads": {"type": "list<string>", "default": ["chat", "agentic"], "choices": ["chat", "agentic"]},
+}
+```
+
 A string parameter can take its choices from a task's output instead of a written list:
 
 ```python

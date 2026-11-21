@@ -204,9 +204,11 @@ impl ParamSpec {
             ParamType::Int => ParamValue::Int(number(true) as i32),
             ParamType::Number => ParamValue::Number(number(false)),
             ParamType::Bool => ParamValue::Bool(second),
-            ParamType::StringList => {
-                ParamValue::StringList(if second { vec![text()] } else { Vec::new() })
-            }
+            ParamType::StringList => ParamValue::StringList(match (second, self.choices.first()) {
+                (false, _) => Vec::new(),
+                (true, Some(choice)) => vec![choice.clone()],
+                (true, None) => vec![text()],
+            }),
         }
     }
 }
@@ -410,7 +412,13 @@ impl Params {
             if let Some(max) = spec.max {
                 property.insert("maximum".into(), serde_json::json!(max));
             }
-            if !spec.choices.is_empty() {
+            if !spec.choices.is_empty() && spec.ty == ParamType::StringList {
+                property.insert(
+                    "items".into(),
+                    serde_json::json!({"type": "string", "enum": spec.choices}),
+                );
+                property.insert("uniqueItems".into(), serde_json::json!(true));
+            } else if !spec.choices.is_empty() {
                 let key = if spec.allow_other {
                     "x-choices"
                 } else {
@@ -540,7 +548,7 @@ fn spec(name: &str, expression: &Expr) -> Result<ParamSpec> {
         .map(|e| literal_strings(e, name))
         .transpose()?
         .unwrap_or_default();
-    if !choices.is_empty() && ty != ParamType::String {
+    if !choices.is_empty() && !matches!(ty, ParamType::String | ParamType::StringList) {
         return Err(CompileError::ParamConstraintMismatch {
             param: name.to_owned(),
             constraint: "choices",
@@ -577,6 +585,13 @@ fn spec(name: &str, expression: &Expr) -> Result<ParamSpec> {
     if allow_other && choices.is_empty() && choices_from.is_none() {
         return Err(CompileError::ParamAllowOtherWithoutChoices {
             param: name.to_owned(),
+        });
+    }
+    if allow_other && ty != ParamType::String {
+        return Err(CompileError::ParamConstraintMismatch {
+            param: name.to_owned(),
+            constraint: "allow_other",
+            ty: ty.as_str(),
         });
     }
     let placeholder_from = field(
@@ -797,6 +812,26 @@ fn check(spec: &ParamSpec, value: &ParamValue) -> Result<()> {
                     param: spec.name.clone(),
                     got: s.clone(),
                     detail: format!("must be one of {}", spec.choices.join(", ")),
+                });
+            }
+        }
+        ParamValue::StringList(items) if !spec.choices.is_empty() => {
+            if let Some(item) = items.iter().find(|item| !spec.choices.contains(item)) {
+                return Err(CompileError::ParamConstraintFailed {
+                    param: spec.name.clone(),
+                    got: item.clone(),
+                    detail: format!("each entry must be one of {}", spec.choices.join(", ")),
+                });
+            }
+            if let Some(item) = items
+                .iter()
+                .enumerate()
+                .find_map(|(i, item)| items[..i].contains(item).then_some(item))
+            {
+                return Err(CompileError::ParamConstraintFailed {
+                    param: spec.name.clone(),
+                    got: item.clone(),
+                    detail: "each entry may be picked once".to_string(),
                 });
             }
         }
