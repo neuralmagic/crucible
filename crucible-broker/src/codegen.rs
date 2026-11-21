@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::watch;
 
 const RESULT_SENTINEL: &str = "___CRUCIBLE_RESULT___";
 const JOB_OUT_PATH: &str = "/tmp/codegen-out.json";
@@ -58,19 +59,19 @@ const JOB_RING_CAP: usize = 20;
 /// Shared across per-request server instances (stateless mode rebuilds `McpServer` per request);
 /// constructed once from env at startup.
 pub struct CodegenState {
-    memo: Mutex<HashMap<String, Cached>>,
+    memo: watch::Sender<HashMap<String, Cached>>,
     /// Digests this broker's own `build()` produced; measures refuse anything else, since the frozen
     /// command is no protection inside an agent-chosen image.
-    built: Mutex<HashSet<String>>,
+    built: watch::Sender<HashSet<String>>,
     /// The durable tier under `memo`/`built`, which die with the pod.
     steps: forge::steps::StepLedger,
     budget: Budget,
     logs: LogStore,
     /// The GPU jobs THIS broker submitted (a bounded ring), the only jobs `codegen_jobs` reports.
-    jobs: Mutex<VecDeque<TrackedJob>>,
+    jobs: watch::Sender<VecDeque<TrackedJob>>,
     /// Measure/profile jobs a worker thread is still driving, keyed by memo key: an identical
     /// re-issued call attaches here instead of submitting a duplicate Kueue job.
-    inflight: Mutex<HashMap<String, Arc<InflightJob>>>,
+    inflight: watch::Sender<HashMap<String, Arc<InflightJob>>>,
 }
 
 /// One detached measure/profile job between "the call stopped waiting" and "the worker collected
@@ -162,41 +163,42 @@ impl CodegenState {
 
     fn with_steps(steps: forge::steps::StepLedger) -> Self {
         Self {
-            memo: Mutex::new(HashMap::new()),
-            built: Mutex::new(HashSet::new()),
+            memo: watch::Sender::default(),
+            built: watch::Sender::default(),
             steps,
             budget: Budget::from_env(),
             logs: LogStore::from_env(),
-            jobs: Mutex::new(VecDeque::new()),
-            inflight: Mutex::new(HashMap::new()),
+            jobs: watch::Sender::default(),
+            inflight: watch::Sender::default(),
         }
     }
     fn inflight_get(&self, key: &str) -> Option<Arc<InflightJob>> {
-        self.inflight.lock().ok().and_then(|m| m.get(key).cloned())
+        self.inflight.borrow().get(key).cloned()
     }
     fn inflight_insert(&self, key: String, job: Arc<InflightJob>) {
-        if let Ok(mut m) = self.inflight.lock() {
+        self.inflight.send_modify(|m| {
             m.insert(key, job);
-        }
+        });
     }
     fn inflight_remove(&self, key: &str) {
-        if let Ok(mut m) = self.inflight.lock() {
+        self.inflight.send_modify(|m| {
             m.remove(key);
-        }
+        });
     }
     /// Memo first, then the ledger: a hit there is work a previous broker process finished, so it
     /// is rehydrated into the memo (and into the provenance set, for a build) before it is served.
     fn get(&self, key: &str) -> Option<Cached> {
-        if let Some(hit) = self.memo.lock().ok().and_then(|m| m.get(key).cloned()) {
+        let hit = self.memo.borrow().get(key).cloned();
+        if let Some(hit) = hit {
             return Some(hit);
         }
         let recorded: Cached = self.steps.lookup(&crate::steps::key(key))?;
         if let Cached::Build { digest, .. } = &recorded {
             self.mark_built(digest);
         }
-        if let Ok(mut m) = self.memo.lock() {
+        self.memo.send_modify(|m| {
             m.insert(key.to_string(), recorded.clone());
-        }
+        });
         Some(recorded)
     }
     /// Record before the memo: the caller consumes the value the moment this returns, and a
@@ -205,19 +207,19 @@ impl CodegenState {
         if let Err(e) = self.steps.record(&crate::steps::key(key.clone()), &val) {
             eprintln!("warning: recording step {key:?} failed: {e:#}");
         }
-        if let Ok(mut m) = self.memo.lock() {
+        self.memo.send_modify(|m| {
             m.insert(key, val);
-        }
+        });
     }
     fn mark_built(&self, digest: &str) {
-        if let Ok(mut s) = self.built.lock() {
+        self.built.send_modify(|s| {
             s.insert(digest.to_string());
-        }
+        });
     }
     /// Ours if this process built it or the ledger says a broker did. Without the ledger
     /// half, a restarted broker forces a rebuild before it will measure a pushed digest.
     fn is_built(&self, digest: &str) -> bool {
-        if self.built.lock().is_ok_and(|s| s.contains(digest)) {
+        if self.built.borrow().contains(digest) {
             return true;
         }
         let recorded = self
@@ -231,26 +233,23 @@ impl CodegenState {
         recorded
     }
     fn record_job(&self, job: TrackedJob) {
-        if let Ok(mut ring) = self.jobs.lock() {
+        self.jobs.send_modify(|ring| {
             ring.push_back(job);
             while ring.len() > JOB_RING_CAP {
                 ring.pop_front();
             }
-        }
+        });
     }
     fn finish_job(&self, name: &str, result: JobResult) {
-        if let Ok(mut ring) = self.jobs.lock()
-            && let Some(job) = ring.iter_mut().find(|j| j.name == name)
-        {
-            job.result = Some(result);
-        }
+        self.jobs.send_modify(|ring| {
+            if let Some(job) = ring.iter_mut().find(|j| j.name == name) {
+                job.result = Some(result);
+            }
+        });
     }
     /// Newest first (the job the agent is waiting on tops the list).
     fn jobs_snapshot(&self) -> Vec<TrackedJob> {
-        self.jobs
-            .lock()
-            .map(|ring| ring.iter().rev().cloned().collect())
-            .unwrap_or_default()
+        self.jobs.borrow().iter().rev().cloned().collect()
     }
 }
 

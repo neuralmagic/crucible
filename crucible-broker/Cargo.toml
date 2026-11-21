@@ -30,7 +30,7 @@ rmcp = { workspace = true, features = [
 # axum hosts the streamable-http tower service (`StreamableHttpService` is a `tower::Service`).
 # Pinned to rmcp's own axum (0.8, http1+tokio) so the body/Service bounds line up.
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "signal", "sync"] }
 # The gateway's native gRPC API for sandbox exec (tree hashing). Workspace pin — shared with the
 # engine; the broker builds its own channel from the in-pod certs. Upload/download have no RPC.
 openshell-core.workspace = true
