@@ -232,33 +232,42 @@ pub(crate) async fn list_playbook_runs(
 ) -> Result<Vec<PlaybookRun>> {
     let rows = sqlx::query!(
         r#"
-        SELECT pl.key AS "key!", pl.playbook AS "playbook!", p.description AS "description?",
-               pl.params AS "params!", pl.schema_digest AS "schema_digest!",
-               p.schema_digest AS "current_schema_digest?", pl.max_cost AS "max_cost!",
-               pl.max_time AS "max_time!", pl.advance_dedupe AS "advance_dedupe!",
-               pl.origin AS "origin!", pl.draft_version, pl.dedupe_schedule,
-               i.status AS "status!", i.parked_reason, i.agent_provider, i.agent_model,
+        SELECT page.key AS "key!", page.playbook AS "playbook!", p.description AS "description?",
+               page.params AS "params!", page.schema_digest AS "schema_digest!",
+               p.schema_digest AS "current_schema_digest?", page.max_cost AS "max_cost!",
+               page.max_time AS "max_time!", page.advance_dedupe AS "advance_dedupe!",
+               page.origin AS "origin!", page.draft_version AS "draft_version?",
+               page.dedupe_schedule AS "dedupe_schedule?",
+               page.status AS "status!", page.parked_reason AS "parked_reason?",
+               page.agent_provider AS "agent_provider?", page.agent_model AS "agent_model?",
                c.cost_usd AS "cost_usd?", c.runs AS "runs!: i64",
                c.transport_losses AS "transport_losses!: i64",
-               pl.created_by, pl.created_at AS "created_at!"
-        FROM playbook_launches pl
-        JOIN issues i ON i.key = pl.key
-        LEFT JOIN playbooks p ON p.id = pl.playbook
+               page.created_by AS "created_by?", page.created_at AS "created_at!"
+        FROM (
+            SELECT pl.key, pl.playbook, pl.params, pl.schema_digest, pl.max_cost, pl.max_time,
+                   pl.advance_dedupe, pl.origin, pl.draft_version, pl.dedupe_schedule,
+                   pl.created_by, pl.created_at,
+                   i.status, i.parked_reason, i.agent_provider, i.agent_model
+            FROM playbook_launches pl
+            JOIN issues i ON i.key = pl.key
+            WHERE ($1::text IS NULL OR pl.key = $1)
+              AND ($2::text IS NULL OR i.status = $2)
+              AND ($3::text IS NULL OR pl.playbook = $3)
+              AND ($4::text IS NULL OR pl.origin = $4)
+              AND ($5::text IS NULL OR pl.dedupe_schedule = $5)
+            ORDER BY pl.created_at DESC, pl.key DESC
+            LIMIT $6
+        ) page
+        LEFT JOIN playbooks p ON p.id = page.playbook
         LEFT JOIN LATERAL (
             SELECT SUM(r.cost_usd) AS cost_usd, COUNT(*) AS runs,
                    COALESCE(SUM((SELECT COUNT(*) FROM run_task_results t
                                  WHERE t.run_id = r.run_id AND t.status = 'transport')), 0)::bigint
                        AS transport_losses
             FROM runs r
-            WHERE r.issue = pl.key
+            WHERE r.issue = page.key
         ) c ON TRUE
-        WHERE ($1::text IS NULL OR pl.key = $1)
-          AND ($2::text IS NULL OR i.status = $2)
-          AND ($3::text IS NULL OR pl.playbook = $3)
-          AND ($4::text IS NULL OR pl.origin = $4)
-          AND ($5::text IS NULL OR pl.dedupe_schedule = $5)
-        ORDER BY pl.created_at DESC, pl.key DESC
-        LIMIT $6
+        ORDER BY page.created_at DESC, page.key DESC
         "#,
         filter.key.as_deref(),
         filter.status.map(Status::as_str),

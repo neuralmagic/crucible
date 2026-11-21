@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT pl.key AS \"key!\", pl.playbook AS \"playbook!\", p.description AS \"description?\",\n               pl.params AS \"params!\", pl.schema_digest AS \"schema_digest!\",\n               p.schema_digest AS \"current_schema_digest?\", pl.max_cost AS \"max_cost!\",\n               pl.max_time AS \"max_time!\", pl.advance_dedupe AS \"advance_dedupe!\",\n               pl.origin AS \"origin!\", pl.draft_version, pl.dedupe_schedule,\n               i.status AS \"status!\", i.parked_reason, i.agent_provider, i.agent_model,\n               c.cost_usd AS \"cost_usd?\", c.runs AS \"runs!: i64\",\n               c.transport_losses AS \"transport_losses!: i64\",\n               pl.created_by, pl.created_at AS \"created_at!\"\n        FROM playbook_launches pl\n        JOIN issues i ON i.key = pl.key\n        LEFT JOIN playbooks p ON p.id = pl.playbook\n        LEFT JOIN LATERAL (\n            SELECT SUM(r.cost_usd) AS cost_usd, COUNT(*) AS runs,\n                   COALESCE(SUM((SELECT COUNT(*) FROM run_task_results t\n                                 WHERE t.run_id = r.run_id AND t.status = 'transport')), 0)::bigint\n                       AS transport_losses\n            FROM runs r\n            WHERE r.issue = pl.key\n        ) c ON TRUE\n        WHERE ($1::text IS NULL OR pl.key = $1)\n          AND ($2::text IS NULL OR i.status = $2)\n          AND ($3::text IS NULL OR pl.playbook = $3)\n          AND ($4::text IS NULL OR pl.origin = $4)\n          AND ($5::text IS NULL OR pl.dedupe_schedule = $5)\n        ORDER BY pl.created_at DESC, pl.key DESC\n        LIMIT $6\n        ",
+  "query": "\n        SELECT page.key AS \"key!\", page.playbook AS \"playbook!\", p.description AS \"description?\",\n               page.params AS \"params!\", page.schema_digest AS \"schema_digest!\",\n               p.schema_digest AS \"current_schema_digest?\", page.max_cost AS \"max_cost!\",\n               page.max_time AS \"max_time!\", page.advance_dedupe AS \"advance_dedupe!\",\n               page.origin AS \"origin!\", page.draft_version AS \"draft_version?\",\n               page.dedupe_schedule AS \"dedupe_schedule?\",\n               page.status AS \"status!\", page.parked_reason AS \"parked_reason?\",\n               page.agent_provider AS \"agent_provider?\", page.agent_model AS \"agent_model?\",\n               c.cost_usd AS \"cost_usd?\", c.runs AS \"runs!: i64\",\n               c.transport_losses AS \"transport_losses!: i64\",\n               page.created_by AS \"created_by?\", page.created_at AS \"created_at!\"\n        FROM (\n            SELECT pl.key, pl.playbook, pl.params, pl.schema_digest, pl.max_cost, pl.max_time,\n                   pl.advance_dedupe, pl.origin, pl.draft_version, pl.dedupe_schedule,\n                   pl.created_by, pl.created_at,\n                   i.status, i.parked_reason, i.agent_provider, i.agent_model\n            FROM playbook_launches pl\n            JOIN issues i ON i.key = pl.key\n            WHERE ($1::text IS NULL OR pl.key = $1)\n              AND ($2::text IS NULL OR i.status = $2)\n              AND ($3::text IS NULL OR pl.playbook = $3)\n              AND ($4::text IS NULL OR pl.origin = $4)\n              AND ($5::text IS NULL OR pl.dedupe_schedule = $5)\n            ORDER BY pl.created_at DESC, pl.key DESC\n            LIMIT $6\n        ) page\n        LEFT JOIN playbooks p ON p.id = page.playbook\n        LEFT JOIN LATERAL (\n            SELECT SUM(r.cost_usd) AS cost_usd, COUNT(*) AS runs,\n                   COALESCE(SUM((SELECT COUNT(*) FROM run_task_results t\n                                 WHERE t.run_id = r.run_id AND t.status = 'transport')), 0)::bigint\n                       AS transport_losses\n            FROM runs r\n            WHERE r.issue = page.key\n        ) c ON TRUE\n        ORDER BY page.created_at DESC, page.key DESC\n        ",
   "describe": {
     "columns": [
       {
@@ -115,7 +115,7 @@
       },
       {
         "ordinal": 10,
-        "name": "draft_version",
+        "name": "draft_version?",
         "type_info": "Int8",
         "origin": {
           "Table": {
@@ -126,7 +126,7 @@
       },
       {
         "ordinal": 11,
-        "name": "dedupe_schedule",
+        "name": "dedupe_schedule?",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -148,7 +148,7 @@
       },
       {
         "ordinal": 13,
-        "name": "parked_reason",
+        "name": "parked_reason?",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -159,7 +159,7 @@
       },
       {
         "ordinal": 14,
-        "name": "agent_provider",
+        "name": "agent_provider?",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -170,7 +170,7 @@
       },
       {
         "ordinal": 15,
-        "name": "agent_model",
+        "name": "agent_model?",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -199,7 +199,7 @@
       },
       {
         "ordinal": 19,
-        "name": "created_by",
+        "name": "created_by?",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -233,10 +233,10 @@
     "nullable": [
       false,
       false,
+      true,
       false,
       false,
-      false,
-      false,
+      true,
       false,
       false,
       false,
@@ -254,5 +254,5 @@
       false
     ]
   },
-  "hash": "4faa0f6c6110101344b359920b83650cf19b8dc46e864cdb81131fda7967f4cc"
+  "hash": "3f27ccd0846a4a7ebaf743e56165abe63ea9b5b6e223124244b184d67f0bfe7d"
 }
