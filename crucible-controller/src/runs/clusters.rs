@@ -17,7 +17,6 @@
 #![allow(clippy::disallowed_macros)]
 
 use anyhow::{Context, Result, bail};
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -83,7 +82,7 @@ impl RegistryKubeconfigs {
 /// The shared client registry; clients are built lazily. Shared via [`std::sync::Arc`].
 pub struct ClusterClients {
     clusters_dir: Option<PathBuf>,
-    cache: tokio::sync::RwLock<HashMap<String, kube::Client>>,
+    cache: moka::future::Cache<String, kube::Client>,
     /// How a `personal:` target's kubeconfig is fetched. `None` on a deployment with no secrets
     /// registry, where personal targets cannot exist at all.
     personal: Option<RegistryKubeconfigs>,
@@ -93,7 +92,7 @@ impl ClusterClients {
     pub fn new(clusters_dir: Option<PathBuf>) -> Self {
         Self {
             clusters_dir,
-            cache: tokio::sync::RwLock::new(HashMap::new()),
+            cache: moka::future::Cache::builder().build(),
             personal: None,
         }
     }
@@ -110,26 +109,24 @@ impl ClusterClients {
     /// target is revoked or its kubeconfig rotated: without this, a cached client would keep
     /// working off credentials the registry no longer holds.
     pub async fn evict(&self, cluster: &str) {
-        self.cache.write().await.remove(cluster);
+        self.cache.invalidate(cluster).await;
     }
 
-    /// The client for `cluster`, building and caching it on first use.
+    /// The client for `cluster`, building and caching it on first use. Concurrent first uses
+    /// share one build.
     pub async fn client(&self, cluster: &str) -> Result<kube::Client> {
-        if let Some(c) = self.cache.read().await.get(cluster) {
-            return Ok(c.clone());
-        }
-        crate::install_crypto_provider();
-        let client = match personal_secret_id(cluster) {
-            Some(_) => self.personal_client(cluster).await?,
-            None => self
-                .target(cluster)?
-                .client()
-                .await
-                .with_context(|| format!("building the kube client for cluster `{cluster}`"))?,
-        };
-        let mut cache = self.cache.write().await;
-        // Two tasks can build concurrently; the first insert wins so all callers share one client.
-        Ok(cache.entry(cluster.to_string()).or_insert(client).clone())
+        self.cache
+            .try_get_with_by_ref(cluster, async {
+                crate::install_crypto_provider();
+                match personal_secret_id(cluster) {
+                    Some(_) => self.personal_client(cluster).await,
+                    None => self.target(cluster)?.client().await.with_context(|| {
+                        format!("building the kube client for cluster `{cluster}`")
+                    }),
+                }
+            })
+            .await
+            .map_err(|e: std::sync::Arc<anyhow::Error>| anyhow::anyhow!("{e:#}"))
     }
 
     /// Whether the controller has a client of its own for `cluster`: the hub, a personal target, or
