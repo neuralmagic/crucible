@@ -20,8 +20,7 @@ use kube::api::{Api, ApiResource, DynamicObject, ListParams, PostParams};
 use kube::core::GroupVersionKind;
 use serde_json::Value;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use std::time::Duration;
 
 /// Claim naming the caller's Kubernetes user.
 pub const USER_CLAIM: &str = "kube_user";
@@ -63,7 +62,7 @@ pub enum KubeIdentityError {
     #[error("{GROUPS_CLAIM} must be a list of strings")]
     Groups,
     #[error("listing OpenShift groups: {0}")]
-    GroupLookup(#[source] kube::Error),
+    GroupLookup(#[source] Arc<kube::Error>),
     #[error("creating the SubjectAccessReview: {0}")]
     Review(#[source] kube::Error),
 }
@@ -199,13 +198,8 @@ pub struct SubjectAccessReviewer {
     client: kube::Client,
     groups: GroupSource,
     allowed: moka::future::Cache<DecisionKey, ()>,
-    openshift_groups: Mutex<Option<GroupCache>>,
-}
-
-/// The Group objects last listed, and when.
-struct GroupCache {
-    at: Instant,
-    items: Arc<Vec<DynamicObject>>,
+    /// The Group objects last listed, kept [`GROUPS_TTL`].
+    openshift_groups: moka::future::Cache<(), Arc<Vec<DynamicObject>>>,
 }
 
 impl SubjectAccessReviewer {
@@ -217,7 +211,10 @@ impl SubjectAccessReviewer {
                 .time_to_live(ALLOW_TTL)
                 .max_capacity(10_000)
                 .build(),
-            openshift_groups: Mutex::new(None),
+            openshift_groups: moka::future::Cache::builder()
+                .time_to_live(GROUPS_TTL)
+                .max_capacity(1)
+                .build(),
         }
     }
 
@@ -237,25 +234,16 @@ impl SubjectAccessReviewer {
     }
 
     async fn all_openshift_groups(&self) -> Result<Arc<Vec<DynamicObject>>, KubeIdentityError> {
-        let mut cached = self.openshift_groups.lock().await;
-        if let Some(groups) = cached.as_ref()
-            && groups.at.elapsed() < GROUPS_TTL
-        {
-            return Ok(Arc::clone(&groups.items));
-        }
-        let gvk = GroupVersionKind::gvk("user.openshift.io", "v1", "Group");
-        let api: Api<DynamicObject> =
-            Api::all_with(self.client.clone(), &ApiResource::from_gvk(&gvk));
-        let listed = api
-            .list(&ListParams::default())
+        self.openshift_groups
+            .try_get_with((), async {
+                let gvk = GroupVersionKind::gvk("user.openshift.io", "v1", "Group");
+                let api: Api<DynamicObject> =
+                    Api::all_with(self.client.clone(), &ApiResource::from_gvk(&gvk));
+                let listed = api.list(&ListParams::default()).await?;
+                Ok::<_, kube::Error>(Arc::new(listed.items))
+            })
             .await
-            .map_err(KubeIdentityError::GroupLookup)?;
-        let items = Arc::new(listed.items);
-        *cached = Some(GroupCache {
-            at: Instant::now(),
-            items: Arc::clone(&items),
-        });
-        Ok(items)
+            .map_err(KubeIdentityError::GroupLookup)
     }
 
     /// Allowed decisions are cached for 30 seconds; denials never are, so a new RoleBinding takes

@@ -13,7 +13,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{OnceCell, mpsc, oneshot, watch};
 use url::Url;
 
 /// Largest key set accepted.
@@ -119,12 +119,21 @@ struct Cache {
     attempted_at: Option<Instant>,
 }
 
+/// One lookup the refresh task answers.
+type Lookup = (String, oneshot::Sender<Result<VerificationKey, JwksError>>);
+
 pub struct Jwks {
+    refresh: Arc<Refresh>,
+    /// The task that fetches, started on the first lookup the cache cannot answer.
+    lookups: OnceCell<mpsc::UnboundedSender<Lookup>>,
+}
+
+/// What a lookup reads and a refetch replaces.
+struct Refresh {
     source: Arc<dyn KeySource>,
     max_age: Duration,
     min_refetch: Duration,
-    cache: RwLock<Cache>,
-    fetching: Mutex<()>,
+    cache: watch::Sender<Cache>,
 }
 
 impl Jwks {
@@ -135,54 +144,95 @@ impl Jwks {
 
     pub fn from_source(source: Arc<dyn KeySource>) -> Self {
         Self {
-            source,
-            max_age: Duration::from_secs(600),
-            min_refetch: Duration::from_secs(30),
-            cache: RwLock::new(Cache::default()),
-            fetching: Mutex::new(()),
+            refresh: Arc::new(Refresh {
+                source,
+                max_age: Duration::from_secs(600),
+                min_refetch: Duration::from_secs(30),
+                cache: watch::Sender::default(),
+            }),
+            lookups: OnceCell::new(),
         }
     }
 
-    pub fn with_timing(mut self, max_age: Duration, min_refetch: Duration) -> Self {
-        self.max_age = max_age;
-        self.min_refetch = min_refetch;
-        self
+    pub fn with_timing(self, max_age: Duration, min_refetch: Duration) -> Self {
+        Self {
+            refresh: Arc::new(Refresh {
+                source: self.refresh.source.clone(),
+                max_age,
+                min_refetch,
+                cache: watch::Sender::default(),
+            }),
+            lookups: OnceCell::new(),
+        }
     }
 
     pub async fn key(&self, kid: &str) -> Result<VerificationKey, JwksError> {
-        if let Some(key) = self.fresh(kid).await {
+        if let Some(key) = self.refresh.fresh(kid) {
             return Ok(key);
         }
-        let _fetching = self.fetching.lock().await;
-        if let Some(key) = self.fresh(kid).await {
+        let lookups = self
+            .lookups
+            .get_or_init(|| async {
+                let (lookups, inbox) = mpsc::unbounded_channel();
+                tokio::spawn(self.refresh.clone().serve(inbox));
+                lookups
+            })
+            .await;
+        let (reply, answer) = oneshot::channel();
+        let _ = lookups.send((kid.to_string(), reply));
+        match answer.await {
+            Ok(answer) => answer,
+            Err(_) => self.refresh.lookup(kid).await,
+        }
+    }
+}
+
+impl Refresh {
+    /// Answer lookups one at a time, so concurrent misses share one fetch.
+    async fn serve(self: Arc<Self>, mut lookups: mpsc::UnboundedReceiver<Lookup>) {
+        while let Some((kid, reply)) = lookups.recv().await {
+            let _ = reply.send(self.lookup(&kid).await);
+        }
+    }
+
+    async fn lookup(&self, kid: &str) -> Result<VerificationKey, JwksError> {
+        if let Some(key) = self.fresh(kid) {
             return Ok(key);
         }
         let (stale, attempted_at) = {
-            let cache = self.cache.read().await;
+            let cache = self.cache.borrow();
             (cache.keys.get(kid).cloned(), cache.attempted_at)
         };
         if attempted_at.is_none_or(|at| at.elapsed() >= self.min_refetch) {
             let fetched = self.fetch().await;
-            let mut cache = self.cache.write().await;
-            cache.attempted_at = Some(Instant::now());
+            let attempted_at = Some(Instant::now());
             match fetched {
                 Ok(keys) => {
                     let found = keys.get(kid).cloned();
-                    cache.keys = keys;
-                    cache.fetched_at = cache.attempted_at;
+                    self.cache.send_modify(|cache| {
+                        cache.attempted_at = attempted_at;
+                        cache.fetched_at = attempted_at;
+                        cache.keys = keys;
+                    });
                     return found.ok_or_else(|| JwksError::UnknownKid(kid.to_string()));
                 }
-                Err(error) if stale.is_some() => {
-                    tracing::warn!(%error, kid, "JWKS refresh failed; keeping the cached key");
+                Err(error) => {
+                    self.cache
+                        .send_modify(|cache| cache.attempted_at = attempted_at);
+                    match stale {
+                        Some(_) => {
+                            tracing::warn!(%error, kid, "JWKS refresh failed; keeping the cached key");
+                        }
+                        None => return Err(error),
+                    }
                 }
-                Err(error) => return Err(error),
             }
         }
         stale.ok_or_else(|| JwksError::UnknownKid(kid.to_string()))
     }
 
-    async fn fresh(&self, kid: &str) -> Option<VerificationKey> {
-        let cache = self.cache.read().await;
+    fn fresh(&self, kid: &str) -> Option<VerificationKey> {
+        let cache = self.cache.borrow();
         let at = cache.fetched_at?;
         if at.elapsed() >= self.max_age {
             return None;

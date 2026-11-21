@@ -41,7 +41,7 @@ use openidconnect::{
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// How long a discovery document and a JWKS are reused before they are fetched again. Short enough
@@ -255,7 +255,7 @@ pub struct OidcProvider {
     http: reqwest::Client,
     discovery: moka::future::Cache<(), Arc<Discovered>>,
     jwks: moka::future::Cache<(), Arc<jsonwebtoken::jwk::JwkSet>>,
-    forced_jwks_refresh: Mutex<Option<Instant>>,
+    forced_jwks_refresh: tokio::sync::watch::Sender<Option<Instant>>,
 }
 
 /// The HTTP bridge's error. Distinct from [`OidcError`] because `openidconnect` needs a
@@ -313,7 +313,7 @@ impl OidcProvider {
                 .max_capacity(1)
                 .time_to_live(DISCOVERY_TTL)
                 .build(),
-            forced_jwks_refresh: Mutex::new(None),
+            forced_jwks_refresh: tokio::sync::watch::Sender::new(None),
         })
     }
 
@@ -408,17 +408,14 @@ impl OidcProvider {
     /// [`JWKS_MIN_REFRESH_INTERVAL`]. Taking it stamps the clock whether or not the fetch that
     /// follows succeeds: the limit bounds requests sent, not requests answered.
     fn claim_forced_jwks_refresh(&self, now: Instant) -> bool {
-        let mut last = self
-            .forced_jwks_refresh
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match *last {
-            Some(at) if now.duration_since(at) < JWKS_MIN_REFRESH_INTERVAL => false,
-            _ => {
-                *last = Some(now);
-                true
-            }
-        }
+        self.forced_jwks_refresh
+            .send_if_modified(|last| match *last {
+                Some(at) if now.duration_since(at) < JWKS_MIN_REFRESH_INTERVAL => false,
+                _ => {
+                    *last = Some(now);
+                    true
+                }
+            })
     }
 
     /// The issuer's RP-initiated logout endpoint, when it publishes one.
