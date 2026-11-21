@@ -174,6 +174,17 @@ export function spellingOf(valueType: ParamValueType): string | null {
   }
 }
 
+/// The entries a list value names, read the way the engine reads it: a JSON array, or comma-separated.
+export function listEntries(text: string): string[] {
+  if (!text.trimStart().startsWith('[')) return text.split(',').map((item) => item.trim());
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return isStringList(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
 /// Whether `text` reads as `valueType`, mirroring the engine's reader. The endpoint checks again with
 /// the reader itself.
 function readsAs(valueType: ParamValueType, text: string): boolean {
@@ -246,9 +257,12 @@ export function parseParamsSchema(schema: unknown): ParsedParamsSchema {
       return { kind: 'unrenderable', reason: `param ${name} is multiline but not a string` };
     }
     let choices: string[] | null = valueType === 'boolean' ? ['true', 'false'] : null;
-    const listed: unknown = raw.enum ?? raw['x-choices'];
+    const listed: unknown =
+      valueType === 'list' ? (isRecord(raw.items) ? raw.items.enum : undefined) : (raw.enum ?? raw['x-choices']);
     if (listed !== undefined) {
-      const spelled = Array.isArray(listed) && valueType !== 'list' ? listed.map((item) => defaultText(item, valueType)) : [];
+      const spelled = Array.isArray(listed)
+        ? listed.map((item) => defaultText(item, valueType === 'list' ? 'string' : valueType))
+        : [];
       if (spelled.length === 0 || spelled.some((item) => !item.ok || item.value === null)) {
         return { kind: 'unrenderable', reason: `param ${name} has choices that are not a nonempty list of its type` };
       }
@@ -451,6 +465,13 @@ export function validateParam(
     return `${spec.name} must be ${spellingOf(spec.valueType) ?? 'text'}`;
   }
   const offered = spec.allowOther ? null : offeredChoices(spec, values ?? {});
+  if (offered !== null && spec.valueType === 'list') {
+    const entries = listEntries(trimmed);
+    const outside = entries.find((entry) => !offered.includes(entry));
+    if (outside !== undefined) return `${spec.name} entries must be among ${offered.join(', ')}`;
+    if (new Set(entries).size !== entries.length) return `${spec.name} lists an entry twice`;
+    return null;
+  }
   if (offered !== null && !offered.includes(spec.valueType === 'boolean' ? trimmed.toLowerCase() : trimmed)) {
     return offered.length === 0
       ? `${spec.name} has no options for this ${spec.choicesFrom?.keyedBy ?? 'launch'}`

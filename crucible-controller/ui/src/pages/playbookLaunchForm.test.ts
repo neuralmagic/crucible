@@ -148,6 +148,28 @@ describe('parseParamsSchema', () => {
     expect(validateParam(release, '3.7 EA')).toBe('release must be one of 3.6.0 GA, 3.7 Fast-1');
   });
 
+  it('offers a string list with choices as checkboxes and checks each entry', () => {
+    const [workloads, labels] = specsOf({
+      type: 'object',
+      properties: {
+        workloads: {
+          type: 'array',
+          items: { type: 'string', enum: ['chat', 'agentic'] },
+          uniqueItems: true,
+          default: ['chat', 'agentic'],
+        },
+        labels: { type: 'array', items: { type: 'string' } },
+      },
+    });
+    if (!workloads || !labels) throw new Error('two specs');
+    expect([workloads.choices, labels.choices]).toEqual([['chat', 'agentic'], null]);
+    expect(workloads.defaultValue).toBe('["chat","agentic"]');
+    expect(validateParam(workloads, '["agentic"]')).toBeNull();
+    expect(validateParam(workloads, '[]')).toBeNull();
+    expect(validateParam(workloads, 'chat,batch')).toBe('workloads entries must be among chat, agentic');
+    expect(validateParam(workloads, '["chat","chat"]')).toBe('workloads lists an entry twice');
+  });
+
   it('refuses choices that are not a nonempty list of the param type', () => {
     for (const choices of [[], [1, 2], 'a', ['a', null]]) {
       expect(parseParamsSchema({ type: 'object', properties: { p: { type: 'string', enum: choices } } }).kind).toBe('unrenderable');

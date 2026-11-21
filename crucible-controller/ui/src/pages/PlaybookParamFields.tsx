@@ -1,9 +1,10 @@
 import { useState } from 'react';
 import { Mono } from '../ui';
-import { CheckField, FormGrid, SelectField, TextAreaField, TextField } from './formControls';
+import { CheckField, CheckGroupField, FormGrid, SelectField, TextAreaField, TextField } from './formControls';
 import {
   confirmation,
   isEnabled,
+  listEntries,
   offeredChoices,
   paramBlocks,
   placeholderFor,
@@ -85,6 +86,27 @@ export function PlaybookParamFields({
     }
     const offered = offeredChoices(spec, values);
     const placeholder = placeholderFor(spec, values) ?? undefined;
+    if (offered !== null && spec.valueType === 'list') {
+      const text = field.value.trim();
+      const checked = text === '' ? [] : listEntries(text);
+      return (
+        <CheckGroupField
+          key={spec.name}
+          id={field.id}
+          label={field.label}
+          required={field.required}
+          disabled={field.disabled}
+          hint={spec.description ?? undefined}
+          error={field.error}
+          options={offered}
+          checked={checked}
+          onToggle={(choice, on) => {
+            const next = on ? [...checked, choice] : checked.filter((entry) => entry !== choice);
+            onChange(spec.name, JSON.stringify(offered.filter((entry) => next.includes(entry))));
+          }}
+        />
+      );
+    }
     if (offered !== null) {
       const value = field.value;
       const listed = offered.includes(value);
