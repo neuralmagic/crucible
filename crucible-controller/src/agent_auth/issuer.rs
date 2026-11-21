@@ -659,7 +659,7 @@ pub struct AgentIssuer {
     stated: Vec<Arc<TrustedSpire>>,
     /// The SPIRE discovery has read, a verifier for each made on first use from `keys`.
     directory: SpireDirectory,
-    discovered: std::sync::Mutex<Vec<Arc<TrustedSpire>>>,
+    discovered: tokio::sync::watch::Sender<Vec<Arc<TrustedSpire>>>,
     keys: Option<KeySource>,
     audiences: Vec<Audience>,
 }
@@ -737,17 +737,20 @@ impl AgentIssuer {
             .ready()
             .into_iter()
             .find(|s| s.svid_issuer == svid_issuer)?;
-        let mut cache = self
-            .discovered
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(cached) = cache.iter().find(|t| t.spire == found) {
-            return Some(cached.clone());
-        }
-        let fresh = trusted(&found, self.keys.as_deref()?);
-        cache.retain(|t| t.spire.cluster != found.cluster);
-        cache.push(fresh.clone());
-        Some(fresh)
+        let keys = self.keys.as_deref()?;
+        let mut verifier = None;
+        self.discovered.send_modify(|cache| {
+            verifier = Some(match cache.iter().find(|t| t.spire == found) {
+                Some(cached) => cached.clone(),
+                None => {
+                    let fresh = trusted(&found, keys);
+                    cache.retain(|t| t.spire.cluster != found.cluster);
+                    cache.push(fresh.clone());
+                    fresh
+                }
+            });
+        });
+        verifier
     }
 
     /// The SPIRE that signed the JWT-SVID `assertion`, and its subject. The SVID must verify

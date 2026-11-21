@@ -25,7 +25,8 @@ use crate::model::ParkReason;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use tokio::sync::watch;
 use utoipa::ToSchema;
 
 /// The contract version this controller build was compiled against.
@@ -285,14 +286,14 @@ impl ContractRejection {
 /// Every dispatch target's contract record, keyed by reference.
 pub struct ContractRegistry {
     reader: Arc<dyn ContractReader>,
-    records: RwLock<BTreeMap<String, DispatchContract>>,
+    records: watch::Sender<BTreeMap<String, DispatchContract>>,
 }
 
 impl ContractRegistry {
     pub fn new(reader: Arc<dyn ContractReader>) -> Self {
         Self {
             reader,
-            records: RwLock::new(BTreeMap::new()),
+            records: watch::channel(BTreeMap::new()).0,
         }
     }
 
@@ -316,10 +317,9 @@ impl ContractRegistry {
                 "dispatch target contract version does not match this controller"
             );
         }
-        self.records
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(record.reference.clone(), record.clone());
+        self.records.send_modify(|records| {
+            records.insert(record.reference.clone(), record.clone());
+        });
         record
     }
 
@@ -332,12 +332,7 @@ impl ContractRegistry {
 
     /// The record for `target`: cached, unless there is none or the cached read failed.
     pub async fn record(&self, target: &DispatchTarget) -> DispatchContract {
-        let cached = self
-            .records
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&target.reference())
-            .cloned();
+        let cached = self.records.borrow().get(&target.reference()).cloned();
         match cached {
             Some(r) if r.error.is_none() => r,
             _ => self.check(target).await,
@@ -384,13 +379,7 @@ impl ContractRegistry {
     pub fn snapshot(&self) -> ContractDto {
         ContractDto {
             controller_version: CONTROLLER_CONTRACT_VERSION.to_string(),
-            images: self
-                .records
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .values()
-                .cloned()
-                .collect(),
+            images: self.records.borrow().values().cloned().collect(),
         }
     }
 }
