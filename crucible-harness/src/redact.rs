@@ -7,7 +7,8 @@ use kingfisher_scanner::{RulesDatabase, Scanner, get_builtin_rules};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::ops::Range;
-use std::sync::{Arc, OnceLock, PoisonError, RwLock};
+use std::sync::{Arc, OnceLock};
+use tokio::sync::watch;
 
 /// What a scrubbed secret reads as.
 pub const MASK: &str = "[REDACTED]";
@@ -89,7 +90,7 @@ impl SecretRules {
 /// scrubbed there too.
 #[derive(Clone, Default)]
 pub struct Redactor {
-    secrets: Arc<RwLock<Vec<Box<str>>>>,
+    secrets: Arc<watch::Sender<Vec<Box<str>>>>,
     rules: Option<SecretRules>,
 }
 
@@ -121,17 +122,18 @@ impl Redactor {
         let escaped = serde_json::to_string(secret)
             .ok()
             .and_then(|quoted| Some(quoted.strip_prefix('"')?.strip_suffix('"')?.to_string()));
-        let mut secrets = self.secrets.write().unwrap_or_else(PoisonError::into_inner);
-        for value in std::iter::once(secret).chain(escaped.as_deref()) {
-            if !secrets.iter().any(|s| &**s == value) {
-                secrets.push(value.into());
+        self.secrets.send_modify(|secrets| {
+            for value in std::iter::once(secret).chain(escaped.as_deref()) {
+                if !secrets.iter().any(|s| &**s == value) {
+                    secrets.push(value.into());
+                }
             }
-        }
-        secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+            secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        });
     }
 
-    fn read(&self) -> std::sync::RwLockReadGuard<'_, Vec<Box<str>>> {
-        self.secrets.read().unwrap_or_else(PoisonError::into_inner)
+    fn read(&self) -> watch::Ref<'_, Vec<Box<str>>> {
+        self.secrets.borrow()
     }
 
     /// Whether `text` can change nothing: no values registered and no rules.

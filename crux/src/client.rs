@@ -113,7 +113,7 @@ pub const ACT_AS_HEADER: &str = "x-crucible-act-as";
 #[derive(Debug, Clone)]
 pub struct ActAs {
     team: String,
-    refused: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    refused: std::sync::Arc<std::sync::OnceLock<String>>,
 }
 
 impl ActAs {
@@ -131,7 +131,7 @@ impl ActAs {
 
     /// The controller's reason, once a response has refused the team.
     pub fn refused(&self) -> Option<String> {
-        self.refused.lock().ok().and_then(|reason| reason.clone())
+        self.refused.get().cloned()
     }
 
     fn note_refusal(&self, body: &str) {
@@ -139,9 +139,7 @@ impl ActAs {
             .ok()
             .and_then(|body| body.get("error")?.as_str().map(str::to_string))
             .unwrap_or_else(|| format!("the controller refused to act as {}", self.team));
-        if let Ok(mut slot) = self.refused.lock() {
-            *slot = Some(reason);
-        }
+        let _ = self.refused.set(reason);
     }
 }
 
