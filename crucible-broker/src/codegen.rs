@@ -1413,7 +1413,7 @@ const PHASE_TICK: Duration = Duration::from_millis(250);
 struct PhaseWatcher {
     stop: Arc<AtomicBool>,
     saw_logs: Arc<AtomicBool>,
-    spans: Arc<Mutex<PhaseSpans>>,
+    spans: Arc<watch::Sender<PhaseSpans>>,
 }
 
 impl PhaseWatcher {
@@ -1428,7 +1428,7 @@ impl PhaseWatcher {
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let saw_logs = Arc::new(AtomicBool::new(false));
-        let spans = Arc::new(Mutex::new(PhaseSpans::new()));
+        let spans = Arc::new(watch::Sender::new(PhaseSpans::new()));
         let (thread_stop, thread_logs, thread_spans) =
             (Arc::clone(&stop), Arc::clone(&saw_logs), Arc::clone(&spans));
         // tracing's subscriber is a thread-local a fresh thread does not inherit.
@@ -1438,11 +1438,9 @@ impl PhaseWatcher {
             .spawn(move || {
                 let _dispatch = tracing::dispatcher::set_default(&dispatch);
                 let mut phase = JobPhase::Submitted;
-                // The lock is only ever held for the span swap, never across a cluster read, so
-                // the owner's Drop can always take it promptly.
-                if let Ok(mut spans) = thread_spans.lock() {
-                    spans.advance(&parent, phase);
-                }
+                // The spans are only ever held for the swap, never across a cluster read, so
+                // the owner's Drop can always reach them promptly.
+                thread_spans.send_modify(|spans| spans.advance(&parent, phase));
                 while sleep_until_poll(&thread_stop) {
                     let admitted = forge::kube::workload_statuses(&target, &namespace)
                         .ok()
@@ -1454,9 +1452,7 @@ impl PhaseWatcher {
                     let seen =
                         phase_for(admitted, pod_running, thread_logs.load(Ordering::Relaxed));
                     if seen > phase {
-                        if let Ok(mut spans) = thread_spans.lock() {
-                            spans.advance(&parent, seen);
-                        }
+                        thread_spans.send_modify(|spans| spans.advance(&parent, seen));
                         phase = seen;
                     }
                 }
@@ -1481,9 +1477,7 @@ impl PhaseWatcher {
 impl Drop for PhaseWatcher {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Ok(mut spans) = self.spans.lock() {
-            spans.close();
-        }
+        self.spans.send_modify(|spans| spans.close());
     }
 }
 
