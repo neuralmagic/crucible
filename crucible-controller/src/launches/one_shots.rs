@@ -637,7 +637,7 @@ mod tests {
             .poll(queue.clone())
             .await?;
 
-        let keys = queue.pending().urgent;
+        let keys = queue.pending().await.urgent;
         assert_eq!(keys.len(), 2, "{keys:?}");
         assert!(
             keys.iter().all(|k| k.starts_with("playbook:survey:")),
@@ -696,8 +696,8 @@ mod tests {
         let pass = DueSource::pass(&sweep, queue.clone(), vec![held.id.clone()]).await?;
         assert_eq!(pass.claimed, 2);
         assert!(pass.held.is_empty());
-        assert_eq!(queue.pending().urgent.len(), 2);
-        assert!(queue.pending().plain.is_empty());
+        assert_eq!(queue.pending().await.urgent.len(), 2);
+        assert!(queue.pending().await.plain.is_empty());
         assert_eq!(
             sweep.next_due(vec![]).await?,
             Some("2020-01-01T00:00:00Z".parse()?),

@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, oneshot};
 
 /// The extended resource name GPUs are scheduled under.
 const GPU_RESOURCE: &str = "nvidia.com/gpu";
@@ -95,11 +96,93 @@ pub struct ClusterSnapshot {
 
 /// The TTL cache over per-cluster fetches, plus the store of pushed snapshots from clusters the
 /// hub cannot reach (corp-internal spokes push through [`crate::runs::cluster_push`]). Shared via
-/// [`Arc`]; one entry per cluster name.
+/// [`Arc`]; one entry per cluster name. Both maps live in a task this handle sends to.
 pub struct ClusterStats {
     clients: Arc<ClusterClients>,
-    cache: tokio::sync::Mutex<HashMap<String, CachedFetch>>,
-    pushed: tokio::sync::Mutex<HashMap<String, PushedSnapshot>>,
+    store: mpsc::UnboundedSender<Msg>,
+}
+
+enum Msg {
+    Fresh {
+        cluster: String,
+        reply: oneshot::Sender<Option<ClusterSnapshot>>,
+    },
+    Fetched {
+        cluster: String,
+        outcome: Result<Fetched, String>,
+        reply: oneshot::Sender<ClusterSnapshot>,
+    },
+    Pushed {
+        cluster: String,
+        snapshot: ClusterSnapshot,
+    },
+    PushedBeyond {
+        clusters: Vec<String>,
+        reply: oneshot::Sender<Vec<ClusterSnapshot>>,
+    },
+}
+
+#[derive(Default)]
+struct Store {
+    cache: HashMap<String, CachedFetch>,
+    pushed: HashMap<String, PushedSnapshot>,
+}
+
+impl Store {
+    async fn run(mut self, mut inbox: mpsc::UnboundedReceiver<Msg>) {
+        while let Some(msg) = inbox.recv().await {
+            match msg {
+                Msg::Fresh { cluster, reply } => {
+                    let _ = reply.send(self.fresh(&cluster));
+                }
+                Msg::Fetched {
+                    cluster,
+                    outcome,
+                    reply,
+                } => {
+                    let _ = reply.send(apply_fetch(
+                        &mut self.cache,
+                        &cluster,
+                        outcome,
+                        Instant::now(),
+                    ));
+                }
+                Msg::Pushed { cluster, snapshot } => {
+                    self.pushed.insert(
+                        cluster,
+                        PushedSnapshot {
+                            at: Instant::now(),
+                            snapshot,
+                        },
+                    );
+                }
+                Msg::PushedBeyond { clusters, reply } => {
+                    let mut extra: Vec<ClusterSnapshot> = self
+                        .pushed
+                        .iter()
+                        .filter(|(name, _)| !clusters.contains(name))
+                        .map(|(_, p)| render_pushed(p, Instant::now()))
+                        .collect();
+                    extra.sort_by(|a, b| a.cluster.cmp(&b.cluster));
+                    let _ = reply.send(extra);
+                }
+            }
+        }
+    }
+
+    /// The cached snapshot, only while it is younger than [`SNAPSHOT_TTL`].
+    fn fresh(&self, cluster: &str) -> Option<ClusterSnapshot> {
+        let cached = self.cache.get(cluster)?;
+        let age = cached.at.elapsed();
+        (age < SNAPSHOT_TTL).then(|| ClusterSnapshot {
+            cluster: cluster.to_string(),
+            reachable: true,
+            age_secs: age.as_secs(),
+            pools: cached.fetched.pools.clone(),
+            kueue: cached.fetched.kueue.clone(),
+            error: None,
+        })
+    }
 }
 
 /// One pushed snapshot and when the hub received it.
@@ -122,12 +205,11 @@ struct CachedFetch {
 }
 
 impl ClusterStats {
+    /// Spawns the task that holds the maps, so it must be called inside a Tokio runtime.
     pub fn new(clients: Arc<ClusterClients>) -> Self {
-        Self {
-            clients,
-            cache: tokio::sync::Mutex::new(HashMap::new()),
-            pushed: tokio::sync::Mutex::new(HashMap::new()),
-        }
+        let (store, inbox) = mpsc::unbounded_channel();
+        tokio::spawn(Store::default().run(inbox));
+        Self { clients, store }
     }
 
     /// Snapshots for every named cluster (fetched concurrently), then every pushed cluster the
@@ -136,14 +218,12 @@ impl ClusterStats {
     pub async fn snapshots(&self, clusters: &[String]) -> Vec<ClusterSnapshot> {
         let mut out =
             futures_util::future::join_all(clusters.iter().map(|c| self.snapshot(c))).await;
-        let pushed = self.pushed.lock().await;
-        let mut extra: Vec<ClusterSnapshot> = pushed
-            .iter()
-            .filter(|(name, _)| !clusters.contains(name))
-            .map(|(_, p)| render_pushed(p, Instant::now()))
-            .collect();
-        extra.sort_by(|a, b| a.cluster.cmp(&b.cluster));
-        out.extend(extra);
+        let (reply, extra) = oneshot::channel();
+        let _ = self.store.send(Msg::PushedBeyond {
+            clusters: clusters.to_vec(),
+            reply,
+        });
+        out.extend(extra.await.unwrap_or_default());
         out
     }
 
@@ -154,13 +234,10 @@ impl ClusterStats {
         snapshot.reachable = true;
         snapshot.age_secs = 0;
         snapshot.error = None;
-        self.pushed.lock().await.insert(
-            cluster.to_string(),
-            PushedSnapshot {
-                at: Instant::now(),
-                snapshot,
-            },
-        );
+        let _ = self.store.send(Msg::Pushed {
+            cluster: cluster.to_string(),
+            snapshot,
+        });
     }
 
     /// One cluster's snapshot: the cached pools when fresh, else a bounded re-fetch that falls
@@ -178,23 +255,25 @@ impl ClusterStats {
                 FETCH_TIMEOUT.as_secs()
             )),
         };
-        let mut cache = self.cache.lock().await;
-        apply_fetch(&mut cache, cluster, outcome, Instant::now())
+        let (reply, stored) = oneshot::channel();
+        let _ = self.store.send(Msg::Fetched {
+            cluster: cluster.to_string(),
+            outcome: outcome.clone(),
+            reply,
+        });
+        match stored.await {
+            Ok(snapshot) => snapshot,
+            Err(_) => apply_fetch(&mut HashMap::new(), cluster, outcome, Instant::now()),
+        }
     }
 
-    /// The cached snapshot, only while it is younger than [`SNAPSHOT_TTL`].
     async fn fresh(&self, cluster: &str) -> Option<ClusterSnapshot> {
-        let cache = self.cache.lock().await;
-        let cached = cache.get(cluster)?;
-        let age = cached.at.elapsed();
-        (age < SNAPSHOT_TTL).then(|| ClusterSnapshot {
+        let (reply, fresh) = oneshot::channel();
+        let _ = self.store.send(Msg::Fresh {
             cluster: cluster.to_string(),
-            reachable: true,
-            age_secs: age.as_secs(),
-            pools: cached.fetched.pools.clone(),
-            kueue: cached.fetched.kueue.clone(),
-            error: None,
-        })
+            reply,
+        });
+        fresh.await.ok().flatten()
     }
 
     /// The list calls against one cluster (see [`gather`]).
@@ -223,15 +302,15 @@ fn render_pushed(p: &PushedSnapshot, now: Instant) -> ClusterSnapshot {
 /// the spoke-side push agent (`crucible-controller cluster-snapshot`), which runs it against
 /// its own cluster's ambient identity.
 pub async fn gather(client: kube::Client, cluster: &str) -> anyhow::Result<Fetched> {
-    let nodes = Api::<Node>::all(client.clone())
-        .list(&ListParams::default())
-        .await?
-        .items;
-    let pods = Api::<Pod>::all(client.clone())
-        .list(&ListParams::default())
-        .await?
-        .items;
-    let kueue = fetch_cluster_queues(client, cluster).await;
+    let nodes = Api::<Node>::all(client.clone());
+    let pods = Api::<Pod>::all(client.clone());
+    let params = ListParams::default();
+    let (nodes, pods, kueue) = tokio::join!(
+        nodes.list(&params),
+        pods.list(&params),
+        fetch_cluster_queues(client, cluster),
+    );
+    let (nodes, pods) = (nodes?.items, pods?.items);
     Ok(Fetched {
         pools: aggregate_pools(&nodes, &pods),
         kueue,

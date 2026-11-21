@@ -3211,7 +3211,7 @@ mod tests {
         .poll(queue.clone())
         .await?;
 
-        let keys = queue.pending().urgent;
+        let keys = queue.pending().await.urgent;
         assert_eq!(keys.len(), 2, "{keys:?}");
         assert!(
             keys.iter().all(|k| k.starts_with("playbook:survey:")),

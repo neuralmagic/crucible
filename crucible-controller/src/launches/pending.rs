@@ -141,8 +141,8 @@ mod tests {
         let pass = source.pass(queue.clone(), vec![]).await.expect("pass");
 
         let pending = vec!["playbook:a:1".to_string(), "playbook:b:2".to_string()];
-        assert_eq!(queue.pending().urgent, pending);
-        assert!(queue.pending().plain.is_empty());
+        assert_eq!(queue.pending().await.urgent, pending);
+        assert!(queue.pending().await.plain.is_empty());
         assert_eq!(
             pass,
             Pass {
@@ -180,7 +180,10 @@ mod tests {
         );
         let queue = WorkQueue::new();
         source.pass(queue.clone(), held).await.expect("pass");
-        assert_eq!(queue.pending().urgent, vec!["playbook:b:2".to_string()]);
+        assert_eq!(
+            queue.pending().await.urgent,
+            vec!["playbook:b:2".to_string()]
+        );
         assert_eq!(
             source
                 .next_due(vec!["playbook:a:1".into(), "playbook:b:2".into()])
@@ -205,8 +208,8 @@ mod tests {
         let queue = WorkQueue::new();
         let pass = source.pass(queue.clone(), vec![]).await.expect("pass");
         assert_eq!(pass, Pass::default());
-        assert!(queue.pending().urgent.is_empty());
-        assert!(queue.pending().plain.is_empty());
+        assert!(queue.pending().await.urgent.is_empty());
+        assert!(queue.pending().await.plain.is_empty());
     }
 
     fn at(stamp: &str) -> jiff::Timestamp {

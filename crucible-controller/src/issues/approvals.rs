@@ -114,20 +114,12 @@ impl ApprovalPoll {
         let pr = parse_pr_url(&row.approval_pr)
             .with_context(|| format!("approval_pr is not a GitHub PR url: {}", row.approval_pr))?;
         let slug = pr.repo_slug();
-        let reviews: Vec<Review> = self
-            .record_github(github::get_json(
-                api_base,
-                token,
-                &format!("repos/{slug}/pulls/{}/reviews", pr.number),
-            ))
-            .await?;
-        let comments: Vec<Comment> = self
-            .record_github(github::get_json(
-                api_base,
-                token,
-                &format!("repos/{slug}/issues/{}/comments", pr.number),
-            ))
-            .await?;
+        let reviews_path = format!("repos/{slug}/pulls/{}/reviews", pr.number);
+        let comments_path = format!("repos/{slug}/issues/{}/comments", pr.number);
+        let (reviews, comments): (Vec<Review>, Vec<Comment>) = tokio::try_join!(
+            self.record_github(github::get_json(api_base, token, &reviews_path)),
+            self.record_github(github::get_json(api_base, token, &comments_path)),
+        )?;
         let Some(approval) = detect_approval(&reviews, &comments, &self.authz) else {
             return Ok(false);
         };
@@ -1153,7 +1145,7 @@ mod tests {
             "a GitHub login nobody paired with a crucible login records no dispatcher"
         );
         assert_eq!(
-            queue.pending().plain,
+            queue.pending().await.plain,
             vec!["owner/repo#1"],
             "key enqueued for launch"
         );
@@ -1348,7 +1340,7 @@ mod tests {
             .await?
             .unwrap();
         assert!(!scope.is_approved(), "approved_at stays null");
-        assert!(queue.pending().plain.is_empty(), "nothing enqueued");
+        assert!(queue.pending().await.plain.is_empty(), "nothing enqueued");
         Ok(())
     }
 
@@ -1387,7 +1379,7 @@ mod tests {
         let queue = WorkQueue::new();
         poll.poll(queue.clone()).await?;
         assert!(
-            queue.pending().plain.is_empty(),
+            queue.pending().await.plain.is_empty(),
             "nothing watched yet, nothing enqueued"
         );
 
@@ -1406,7 +1398,7 @@ mod tests {
         }
 
         assert_eq!(
-            queue.pending().plain,
+            queue.pending().await.plain,
             vec!["owner/repo#1".to_string()],
             "the newly-watched repo is discovered on the very next sweep"
         );
