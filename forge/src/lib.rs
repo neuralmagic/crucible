@@ -402,7 +402,6 @@ fn run_streaming_traced(
     log: &Path,
 ) -> Result<std::process::ExitStatus> {
     use std::io::{Read, Write};
-    use std::sync::{Arc, Mutex};
 
     if let Some(parent) = log.parent() {
         std::fs::create_dir_all(parent)
@@ -413,7 +412,9 @@ fn run_streaming_traced(
         .append(true)
         .open(log)
         .with_context(|| format!("opening live log {}", log.display()))?;
-    let file = Arc::new(Mutex::new(file));
+    let mut stderr_file = file
+        .try_clone()
+        .with_context(|| format!("opening live log {}", log.display()))?;
 
     let mut child = Command::new(program)
         .args(args)
@@ -426,7 +427,6 @@ fn run_streaming_traced(
     // tool-call span) so step spans parent onto the build instead of forming orphan traces.
     let build_span = tracing::Span::current();
 
-    let stderr_file = Arc::clone(&file);
     let stderr_thread = child.stderr.take().map(|mut err| {
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
@@ -434,15 +434,13 @@ fn run_streaming_traced(
                 if n == 0 {
                     break;
                 }
-                if let Ok(mut f) = stderr_file.lock() {
-                    let _ = f.write_all(&buf[..n]);
-                }
+                let _ = stderr_file.write_all(&buf[..n]);
             }
         })
     });
 
     let stdout_thread = child.stdout.take().map(|mut out| {
-        let file = Arc::clone(&file);
+        let mut file = file;
         std::thread::spawn(move || {
             // Raw chunks, never `read_line`. A build's stdout is arbitrary bytes — a latin-1 path
             // in vendored source, nvcc's ANSI noise — and `read_line` returns InvalidData on the
@@ -481,9 +479,7 @@ fn run_streaming_traced(
                     Err(_) => break,
                 };
                 let chunk = &buf[..n];
-                if let Ok(mut f) = file.lock() {
-                    let _ = f.write_all(chunk);
-                }
+                let _ = file.write_all(chunk);
                 for &b in chunk {
                     if b == b'\n' || b == b'\r' {
                         on_line(&pending, &mut step_span);

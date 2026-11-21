@@ -16,8 +16,8 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
@@ -174,9 +174,9 @@ impl OtelForward {
 
 /// Server-side state shared across handlers.
 struct CollectorState {
-    log: Mutex<std::fs::File>,
+    log: std::fs::File,
     meters: LiveMeters,
-    window: Mutex<RateWindow>,
+    window: tokio::sync::watch::Sender<RateWindow>,
     start: Instant,
     forward: Option<OtelForward>,
     /// `None` when the client could not be built: forwarding is then off for the run's life.
@@ -221,9 +221,9 @@ impl OtelCollector {
 
         let meters = LiveMeters::default();
         let state = Arc::new(CollectorState {
-            log: Mutex::new(file),
+            log: file,
             meters: meters.clone(),
-            window: Mutex::new(RateWindow::new()),
+            window: tokio::sync::watch::Sender::new(RateWindow::new()),
             start: Instant::now(),
             forward,
             client: reqwest::Client::builder()
@@ -408,18 +408,15 @@ async fn ingest(State(state): State<Arc<CollectorState>>, req: Request) -> Respo
         "path": path,
         "payload": payload,
     });
-    if let Ok(mut f) = state.log.lock() {
-        // A write failure must never fail the export (evidence-only).
-        let _ = writeln!(f, "{record}");
-    }
+    // A write failure must never fail the export (evidence-only).
+    let _ = (&state.log).write_all(format!("{record}\n").as_bytes());
 
     if path.contains("/v1/metrics") {
         let total = sum_token_usage(&payload);
         let now_secs = state.start.elapsed().as_secs_f64();
-        if let Ok(mut w) = state.window.lock() {
-            let rate = w.update(now_secs, total);
-            state.meters.rate.store(rate);
-        }
+        state
+            .window
+            .send_modify(|w| state.meters.rate.store(w.update(now_secs, total)));
         state.meters.cost.add(sum_cost_usage(&payload));
     }
 
