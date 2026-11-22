@@ -26,7 +26,7 @@
 //!
 //! ## The cache + the watch
 //!
-//! Reads are cheap: the live [`OverrideSet`] sits behind an `RwLock<Arc<_>>` (the same "atomic-ish
+//! Reads are cheap: the live [`OverrideSet`] sits in a `watch` channel as an `Arc` (the same "atomic-ish
 //! swap, cheap clone-on-read" shape [`crate::daemon::autopilot_flag`] uses for its `AtomicBool`, one type up
 //! because an `OverrideSet` isn't a single word). A re-list poll loop ([`watch_loop`]) re-reads the
 //! ConfigMap on an interval, parses + validates, and swaps the cache on success. Invalid content
@@ -41,8 +41,9 @@ use crate::metrics::Metrics;
 use anyhow::{Context, Result};
 use crucible_contract::Tier;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
 
 /// The single ConfigMap key the override JSON lives under.
 const OVERRIDES_KEY: &str = "overrides.json";
@@ -374,7 +375,7 @@ pub struct BaseConfig {
 }
 
 /// The resolved effective values the reconcile/dispatch paths read per cycle — `default < env <
-/// override` already folded per field. Cheap to build (an `RwLock` read + a field copy), so the hot
+/// override` already folded per field. Cheap to build (an `Arc` clone + a field copy), so the hot
 /// path calls [`ControllerCfg::effective`] freely.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EffectiveConfig {
@@ -577,7 +578,7 @@ impl ReloadOutcome {
 }
 
 /// The runtime override store: the immutable defaults snapshot + env-source map, the live override
-/// cache behind an `RwLock<Arc<_>>`, and the ConfigMap coordinates + kube boundary the watch/write
+/// cache in a `watch` channel, and the ConfigMap coordinates + kube boundary the watch/write
 /// use. Cloneable (an `Arc` inside) so it threads onto [`ControllerCfg`] and into [`crate::api`]
 /// without a global.
 #[derive(Clone)]
@@ -586,7 +587,7 @@ pub struct ConfigStore(Arc<Inner>);
 struct Inner {
     base: BaseConfig,
     env: EnvSources,
-    cache: RwLock<Arc<OverrideSet>>,
+    cache: watch::Sender<Arc<OverrideSet>>,
     policy_gate: Arc<tokio::sync::RwLock<()>>,
     cm_name: String,
     cm_namespace: String,
@@ -621,7 +622,7 @@ impl ConfigStore {
         let store = ConfigStore(Arc::new(Inner {
             base,
             env: EnvSources::detect(),
-            cache: RwLock::new(Arc::new(OverrideSet::default())),
+            cache: watch::channel(Arc::new(OverrideSet::default())).0,
             policy_gate: Arc::new(tokio::sync::RwLock::new(())),
             cm_name,
             cm_namespace,
@@ -633,14 +634,9 @@ impl ConfigStore {
         store
     }
 
-    /// The current override set (a cheap `Arc` clone). Never blocks a writer for long — reads take
-    /// the lock only to clone the `Arc`.
+    /// The current override set (a cheap `Arc` clone).
     pub(crate) fn current(&self) -> Arc<OverrideSet> {
-        self.0
-            .cache
-            .read()
-            .map(|g| g.clone())
-            .unwrap_or_else(|p| p.into_inner().clone())
+        self.0.cache.borrow().clone()
     }
 
     /// The resolved effective config (the hot read path).
@@ -687,10 +683,7 @@ impl ConfigStore {
 
     /// Swap the live override set + refresh the override-active gauge. The one place the cache moves.
     fn swap(&self, next: Arc<OverrideSet>) {
-        match self.0.cache.write() {
-            Ok(mut g) => *g = next,
-            Err(p) => *p.into_inner() = next,
-        }
+        self.0.cache.send_replace(next);
         self.refresh_active_gauge();
     }
 

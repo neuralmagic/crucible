@@ -941,17 +941,22 @@ impl KueueMcp {
             source,
         })?;
         let api: Api<Pod> = Api::namespaced(self.client.clone(), ns);
+        let api = &api;
+        let lists = futures_util::future::try_join_all(
+            kinds::pod_selectors(kind, &object)
+                .into_iter()
+                .map(|selector| async move {
+                    let lp = ListParams::default().labels(&selector.to_string());
+                    api.list(&lp)
+                        .await
+                        .map_err(|source| KubeError::api("list", format!("pods of {name}"), source))
+                }),
+        )
+        .await?;
         let mut pods: Vec<Pod> = Vec::new();
-        for selector in kinds::pod_selectors(kind, &object) {
-            let lp = ListParams::default().labels(&selector.to_string());
-            let found = api
-                .list(&lp)
-                .await
-                .map_err(|source| KubeError::api("list", format!("pods of {name}"), source))?;
-            for p in found.items {
-                if !pods.iter().any(|q| q.metadata.uid == p.metadata.uid) {
-                    pods.push(p);
-                }
+        for p in lists.into_iter().flat_map(|found| found.items) {
+            if !pods.iter().any(|q| q.metadata.uid == p.metadata.uid) {
+                pods.push(p);
             }
         }
         Ok(pods)
@@ -1038,8 +1043,8 @@ impl KueueMcp {
             return Ok(Vec::new());
         };
         let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
-        let mut sources = Vec::with_capacity(n.pull_copies.len());
-        for copy in &n.pull_copies {
+        let secrets = &secrets;
+        futures_util::future::try_join_all(n.pull_copies.iter().map(|copy| async move {
             let gone = || ToolError::PullSecretGone {
                 name: copy.source.clone(),
             };
@@ -1052,9 +1057,9 @@ impl KueueMcp {
                 what: format!("Secret {}", copy.source),
                 source,
             })?;
-            sources.push(manifest::docker_config(&secret).cloned().ok_or_else(gone)?);
-        }
-        Ok(sources)
+            manifest::docker_config(&secret).cloned().ok_or_else(gone)
+        }))
+        .await
     }
 
     /// Copy `sources`, as [`Self::pull_sources`] read them, into the caller's namespace under
@@ -1433,11 +1438,13 @@ impl KueueMcp {
                 .collect(),
             false => Vec::new(),
         };
-        let (queue_position, position) = self.queue_positions(ns, &pending).await;
-        let fit = match (workloads_read, head.phase) {
-            (true, Phase::Pending) => Some(self.refit(c, kind, snap).await),
-            _ => None,
-        };
+        let ((queue_position, position), fit) =
+            tokio::join!(self.queue_positions(ns, &pending), async {
+                match (workloads_read, head.phase) {
+                    (true, Phase::Pending) => Some(self.refit(c, kind, snap).await),
+                    _ => None,
+                }
+            });
         let problems = match pods_read {
             true => report::problem_pods(kind, &snap.pods),
             false => Vec::new(),
@@ -1790,17 +1797,17 @@ impl KueueMcp {
                     Some(p) => self.namespaces.usable(p).await,
                     None => Vec::new(),
                 };
+                let local_queues = self.kueue.local_queues();
+                let params = ListParams::default();
+                let listed = futures_util::future::join_all(usable.iter().map(|ns| {
+                    kueue::list::<LocalQueue>(&self.client, &local_queues, Some(ns), &params)
+                }))
+                .await;
                 let mut queues = serde_json::Map::new();
-                for ns in &usable {
-                    let names: Vec<String> = kueue::list::<LocalQueue>(
-                        &self.client,
-                        &self.kueue.local_queues(),
-                        Some(ns),
-                        &ListParams::default(),
-                    )
-                    .await
-                    .map(|qs| qs.into_iter().map(|q| q.metadata.name).collect())
-                    .unwrap_or_default();
+                for (ns, listed) in usable.iter().zip(listed) {
+                    let names: Vec<String> = listed
+                        .map(|qs| qs.into_iter().map(|q| q.metadata.name).collect())
+                        .unwrap_or_default();
                     queues.insert(ns.clone(), json!(names));
                 }
                 Ok(json!({
@@ -1962,19 +1969,31 @@ impl KueueMcp {
             self.explain(&parts, requested.as_deref(), async {
                 let c = self.served_caller(&parts, args.namespace.as_deref()).await?;
                 let lq = self.local_queue(&c, &args.queue).await?;
-                let cq = self.cluster_queue(&lq).await?;
-                let nodes: Vec<Node> = Api::<Node>::all(self.client.clone())
-                    .list(&ListParams::default())
-                    .await
-                    .map_err(|source| KubeError::api("list", "nodes", source))?
-                    .items;
-                let mut flavors = Vec::new();
-                for group in &cq.spec.resource_groups {
-                    for f in &group.flavors {
-                        let rf: ResourceFlavor = kueue::get(&self.client, &self.kueue.resource_flavors(), None, &f.name).await?;
-                        flavors.push(hardware::describe(&rf, &group.covered_resources, &nodes, &self.config.hardware));
-                    }
-                }
+                let (cq, nodes) = tokio::try_join!(self.cluster_queue(&lq), async {
+                    Api::<Node>::all(self.client.clone())
+                        .list(&ListParams::default())
+                        .await
+                        .map_err(|source| ToolError::from(KubeError::api("list", "nodes", source)))
+                })?;
+                let nodes: Vec<Node> = nodes.items;
+                let resource_flavors = self.kueue.resource_flavors();
+                let wanted: Vec<_> = cq
+                    .spec
+                    .resource_groups
+                    .iter()
+                    .flat_map(|group| group.flavors.iter().map(move |f| (group, f)))
+                    .collect();
+                let fetched = futures_util::future::try_join_all(wanted.iter().map(|(_, f)| {
+                    kueue::get::<ResourceFlavor>(&self.client, &resource_flavors, None, &f.name)
+                }))
+                .await?;
+                let flavors: Vec<_> = wanted
+                    .iter()
+                    .zip(&fetched)
+                    .map(|((group, _), rf)| {
+                        hardware::describe(rf, &group.covered_resources, &nodes, &self.config.hardware)
+                    })
+                    .collect();
                 Ok(json!({"queue": lq.metadata.name, "cluster_queue": cq.metadata.name, "flavors": flavors}))
             }
             .await)
@@ -2197,12 +2216,13 @@ impl KueueMcp {
                 let ns = c.namespace.as_str();
                 let labels = &self.config.labels;
                 let selector = list_selector(args.filter.unwrap_or_default(), labels, &c);
-                let workloads = self.namespace_workloads(ns).await?;
-                let pods: Vec<Pod> = Api::<Pod>::namespaced(self.client.clone(), ns)
-                    .list(&ListParams::default())
-                    .await
-                    .map_err(|source| KubeError::api("list", "pods", source))?
-                    .items;
+                let (workloads, pods) = tokio::try_join!(self.namespace_workloads(ns), async {
+                    Api::<Pod>::namespaced(self.client.clone(), ns)
+                        .list(&ListParams::default())
+                        .await
+                        .map_err(|source| ToolError::from(KubeError::api("list", "pods", source)))
+                })?;
+                let pods: Vec<Pod> = pods.items;
                 let mut rows = Vec::new();
                 for &kind in self.kinds.iter() {
                     let objs = match self.dynamic(kind, ns).list(&ListParams::default().labels(&selector)).await {

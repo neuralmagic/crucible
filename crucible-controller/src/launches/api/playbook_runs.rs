@@ -262,23 +262,28 @@ pub(crate) async fn get_playbook_run(
     let Some(row) = rows.into_iter().next() else {
         return Ok(not_found(format!("no playbook launch {key:?}")));
     };
-    let source_exists = match row.draft_version {
-        Some(_) => crate::playbooks::drafts::get(state.db.pool(), &row.playbook)
-            .await?
-            .is_some(),
-        None => crate::playbooks::registry::get(state.db.pool(), &row.playbook)
-            .await?
-            .is_some(),
-    };
-    let rerun = crate::launches::store::get_playbook_launch(state.db.pool(), &key)
-        .await?
+    let (source_exists, launch, runs, events) = tokio::try_join!(
+        async {
+            anyhow::Ok(match row.draft_version {
+                Some(_) => crate::playbooks::drafts::get(state.db.pool(), &row.playbook)
+                    .await?
+                    .is_some(),
+                None => crate::playbooks::registry::get(state.db.pool(), &row.playbook)
+                    .await?
+                    .is_some(),
+            })
+        },
+        crate::launches::store::get_playbook_launch(state.db.pool(), &key),
+        crate::launches::store::list_runs_for_launch(state.db.pool(), &key),
+        state.db.events().read_for_key(&key),
+    )?;
+    let rerun = launch
         .and_then(|launch| launch.rerun)
         .map(|rerun| RerunOfDto {
             run_id: rerun.run,
             from: rerun.from,
         });
-    let runs = crate::launches::store::list_runs_for_launch(state.db.pool(), &key).await?;
-    let dispatch = dispatch_state(&state.db.events().read_for_key(&key).await?, &runs);
+    let dispatch = dispatch_state(&events, &runs);
     let runs = runs
         .into_iter()
         .map(|r| LaunchRunDto {

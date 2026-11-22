@@ -17,10 +17,9 @@ use crate::runs::workpod::RunRenderOpts;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 
 /// How long past its own wall-clock ceiling a run's subprocess is given before the supervisor
 /// kills it. The engine enforces `--max-time` itself; this is the backstop for a process that
@@ -295,17 +294,17 @@ pub async fn supervise(db: Db, key: String, run: LocalRun) {
     } = run;
     let mut tail = Vec::new();
     let mut streams = tokio::task::JoinSet::new();
-    let log = open_engine_log(&dir).await;
+    let log = EngineLog::open(&dir, &run_id).await;
     // Both pipes are drained concurrently with the wait, so a chatty run can never fill a pipe
     // buffer and wedge the engine.
     if let Some(out) = child.stdout.take() {
         let run_id = run_id.clone();
-        let log = log.clone();
+        let log = log.as_ref().map(EngineLog::sink);
         streams.spawn(async move { pump(BufReader::new(out), &run_id, "stdout", log).await });
     }
     if let Some(err) = child.stderr.take() {
         let run_id = run_id.clone();
-        let log = log.clone();
+        let log = log.as_ref().map(EngineLog::sink);
         streams.spawn(async move { pump(BufReader::new(err), &run_id, "stderr", log).await });
     }
 
@@ -331,6 +330,9 @@ pub async fn supervise(db: Db, key: String, run: LocalRun) {
         if let Ok(lines) = joined {
             tail.extend(lines);
         }
+    }
+    if let Some(log) = log {
+        log.close().await;
     }
 
     let session = std::fs::read_to_string(session_log(&dir)).unwrap_or_default();
@@ -414,17 +416,57 @@ pub async fn adopt_orphans(db: &Db, cfg: &ControllerCfg) -> Result<()> {
     Ok(())
 }
 
-/// The file both pipes are mirrored into, served by `GET /api/runs/{run_id}/log`. A log that
-/// cannot be opened is no reason to refuse the run: the output still reaches the tracing subscriber
-/// and the failure tail.
-async fn open_engine_log(dir: &Path) -> Option<Arc<Mutex<tokio::fs::File>>> {
-    let path = engine_log(dir);
-    match tokio::fs::File::create(&path).await {
-        Ok(file) => Some(Arc::new(Mutex::new(file))),
-        Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "keeping no engine log for a local run");
-            None
+/// How many lines may wait on the engine log's writer before a pump waits with them.
+const ENGINE_LOG_BACKLOG: usize = 64;
+
+/// The file both pipes are mirrored into, served by `GET /api/runs/{run_id}/log`. One task owns
+/// the file and writes the lines the pumps send it.
+struct EngineLog {
+    lines: mpsc::Sender<String>,
+    writer: tokio::task::JoinHandle<()>,
+}
+
+impl EngineLog {
+    /// A log that cannot be opened is no reason to refuse the run: the output still reaches the
+    /// tracing subscriber and the failure tail.
+    async fn open(dir: &Path, run_id: &str) -> Option<Self> {
+        let path = engine_log(dir);
+        match tokio::fs::File::create(&path).await {
+            Ok(file) => {
+                let (lines, inbox) = mpsc::channel(ENGINE_LOG_BACKLOG);
+                let writer = tokio::spawn(write_engine_log(file, inbox, run_id.to_owned()));
+                Some(EngineLog { lines, writer })
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "keeping no engine log for a local run");
+                None
+            }
         }
+    }
+
+    fn sink(&self) -> mpsc::Sender<String> {
+        self.lines.clone()
+    }
+
+    /// Wait until every line sent so far is in the file. Returns once every sink is dropped.
+    async fn close(self) {
+        drop(self.lines);
+        let _ = self.writer.await;
+    }
+}
+
+async fn write_engine_log(
+    mut file: tokio::fs::File,
+    mut lines: mpsc::Receiver<String>,
+    run_id: String,
+) {
+    while let Some(line) = lines.recv().await {
+        if let Err(e) = file.write_all(format!("{line}\n").as_bytes()).await {
+            tracing::debug!(%run_id, error = %e, "writing the engine log failed");
+        }
+    }
+    if let Err(e) = file.flush().await {
+        tracing::debug!(%run_id, error = %e, "flushing the engine log failed");
     }
 }
 
@@ -464,7 +506,7 @@ async fn pump<R>(
     reader: BufReader<R>,
     run_id: &str,
     stream: &str,
-    log: Option<Arc<Mutex<tokio::fs::File>>>,
+    log: Option<mpsc::Sender<String>>,
 ) -> Vec<String>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -473,14 +515,8 @@ where
     let mut kept = Vec::new();
     while let Ok(Some(line)) = lines.next_line().await {
         tracing::debug!(%run_id, %stream, "{line}");
-        if let Some(log) = &log
-            && let Err(e) = log
-                .lock()
-                .await
-                .write_all(format!("{line}\n").as_bytes())
-                .await
-        {
-            tracing::debug!(%run_id, error = %e, "writing the engine log failed");
+        if let Some(log) = &log {
+            let _ = log.send(line.clone()).await;
         }
         kept.push(line);
         if kept.len() > TAIL_LINES * 4 {
@@ -721,33 +757,32 @@ mod tests {
     #[tokio::test]
     async fn pumped_output_is_mirrored_into_the_engine_log() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let log = open_engine_log(dir.path()).await;
-        assert!(log.is_some(), "the log opens in a real directory");
+        let log = EngineLog::open(dir.path(), "r1")
+            .await
+            .expect("the log opens in a real directory");
         let out = pump(
             BufReader::new(&b"line one\nline two\n"[..]),
             "r1",
             "stdout",
-            log.clone(),
+            Some(log.sink()),
         )
         .await;
         let err = pump(
             BufReader::new(&b"complaint\n"[..]),
             "r1",
             "stderr",
-            log.clone(),
+            Some(log.sink()),
         )
         .await;
         assert_eq!(out, vec!["line one", "line two"]);
         assert_eq!(err, vec!["complaint"]);
-        if let Some(log) = log {
-            log.lock().await.flush().await.expect("flush");
-        }
+        log.close().await;
         let written = std::fs::read_to_string(engine_log(dir.path())).expect("the mirror exists");
         assert_eq!(written, "line one\nline two\ncomplaint\n");
 
-        let gone = open_engine_log(&dir.path().join("missing")).await;
+        let gone = EngineLog::open(&dir.path().join("missing"), "r1").await;
         assert!(gone.is_none(), "an unwritable dir keeps no log");
-        let still = pump(BufReader::new(&b"tail\n"[..]), "r1", "stdout", gone).await;
+        let still = pump(BufReader::new(&b"tail\n"[..]), "r1", "stdout", None).await;
         assert_eq!(still, vec!["tail"], "output still reaches the failure tail");
     }
 

@@ -8,6 +8,7 @@ use crucible_contract::outputs::{BoundViolation, OutputKind, ResolvedOutput, res
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::OnceCell;
 
 #[derive(Debug, thiserror::Error)]
@@ -37,7 +38,7 @@ struct Loaded {
 pub struct Allow {
     file: PathBuf,
     loaded: OnceCell<Option<Loaded>>,
-    opened: Mutex<u32>,
+    opened: AtomicU32,
     created: Mutex<Created>,
 }
 
@@ -53,7 +54,7 @@ impl Allow {
         Self {
             file,
             loaded: OnceCell::new(),
-            opened: Mutex::new(0),
+            opened: AtomicU32::new(0),
             created: Mutex::new(Created::default()),
         }
     }
@@ -106,25 +107,19 @@ impl Allow {
     pub async fn open(&self, repo: &str) -> Result<(), Refused> {
         let loaded = self.load().await?;
         resolve_target(&loaded.bound, Some(repo), &loaded.params)?;
-        let mut opened = match self.opened.lock() {
-            Ok(g) => g,
-            Err(_) => {
-                return Err(BoundViolation::CountExhausted {
+        let count = loaded.bound.count;
+        self.opened
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |opened| {
+                (opened < count).then_some(opened + 1)
+            })
+            .map(|_| ())
+            .map_err(|_| {
+                BoundViolation::CountExhausted {
                     kind: OutputKind::DraftPr,
-                    count: loaded.bound.count,
+                    count,
                 }
-                .into());
-            }
-        };
-        if *opened >= loaded.bound.count {
-            return Err(BoundViolation::CountExhausted {
-                kind: OutputKind::DraftPr,
-                count: loaded.bound.count,
-            }
-            .into());
-        }
-        *opened += 1;
-        Ok(())
+                .into()
+            })
     }
 
     /// Remember a pull request this run opened on `repo`.

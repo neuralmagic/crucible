@@ -10,8 +10,7 @@ use crucible_mcp_auth::principal::Principal;
 use kube::api::ListParams;
 use serde_json::Value;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use std::time::Duration;
 
 const DISCOVERY_TTL: Duration = Duration::from_secs(60);
 /// How long a caller's usable namespaces are reused; a new RoleBinding shows within this.
@@ -22,7 +21,7 @@ pub struct Namespaces {
     kueue: KueueVersion,
     configured: Vec<String>,
     reviewer: Option<Arc<dyn AccessReview>>,
-    discovered: Mutex<Option<(Instant, Vec<String>)>>,
+    discovered: moka::future::Cache<(), Vec<String>>,
     /// Each identity's usable namespaces, so a call that names none does not review every served
     /// namespace again.
     usable: moka::future::Cache<String, Vec<String>>,
@@ -40,7 +39,10 @@ impl Namespaces {
             kueue,
             configured,
             reviewer,
-            discovered: Mutex::new(None),
+            discovered: moka::future::Cache::builder()
+                .max_capacity(1)
+                .time_to_live(DISCOVERY_TTL)
+                .build(),
             usable: moka::future::Cache::builder()
                 .max_capacity(10_000)
                 .time_to_live(USABLE_TTL)
@@ -55,36 +57,32 @@ impl Namespaces {
         if !self.configured.is_empty() {
             return self.configured.clone();
         }
-        let mut cached = self.discovered.lock().await;
-        if let Some((at, found)) = cached.as_ref()
-            && at.elapsed() < DISCOVERY_TTL
-        {
-            return found.clone();
-        }
-        let found = match kueue::list::<LocalQueue>(
-            &self.client,
-            &self.kueue.local_queues(),
-            None,
-            &ListParams::default(),
-        )
-        .await
-        {
-            Ok(queues) => {
-                let mut ns: Vec<String> = queues
-                    .into_iter()
-                    .filter_map(|q| q.metadata.namespace)
-                    .collect();
-                ns.sort();
-                ns.dedup();
-                ns
-            }
-            Err(error) => {
-                tracing::debug!(%error, "cannot discover served namespaces; configure --namespace");
-                Vec::new()
-            }
-        };
-        *cached = Some((Instant::now(), found.clone()));
-        found
+        self.discovered
+            .get_with((), async {
+                match kueue::list::<LocalQueue>(
+                    &self.client,
+                    &self.kueue.local_queues(),
+                    None,
+                    &ListParams::default(),
+                )
+                .await
+                {
+                    Ok(queues) => {
+                        let mut ns: Vec<String> = queues
+                            .into_iter()
+                            .filter_map(|q| q.metadata.namespace)
+                            .collect();
+                        ns.sort();
+                        ns.dedup();
+                        ns
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "cannot discover served namespaces; configure --namespace");
+                        Vec::new()
+                    }
+                }
+            })
+            .await
     }
 
     /// The reviewer callers' Kubernetes access is checked with, if this server has one.

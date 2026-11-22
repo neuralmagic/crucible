@@ -329,10 +329,9 @@ pub async fn compile(
     id: &str,
     params: BTreeMap<String, String>,
 ) -> Result<PackPreview, ImportError> {
-    let tree = pack(pool, id)
-        .await?
-        .ok_or_else(|| ImportError::NotFound(format!("no pack import {id:?}")))?;
-    let variant = get(pool, id).await?.and_then(|import| import.variant);
+    let (tree, import) = tokio::try_join!(pack(pool, id), get(pool, id))?;
+    let tree = tree.ok_or_else(|| ImportError::NotFound(format!("no pack import {id:?}")))?;
+    let variant = import.and_then(|import| import.variant);
     let preview = tokio::task::spawn_blocking(move || {
         let pack = crate::playbooks::packs::materialize_tree(&tree)
             .context("writing the frozen import to scratch")

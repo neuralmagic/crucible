@@ -288,10 +288,13 @@ pub(crate) async fn list_my_cluster_identities(
         login: &login,
         email: email.as_deref(),
     };
-    let mut out = Vec::new();
-    for (cluster, rule) in rules(&state).await? {
-        out.push(identity_of(&state, &cluster, &rule, person).await?);
-    }
+    let rules = rules(&state).await?;
+    let out = futures_util::future::try_join_all(
+        rules
+            .iter()
+            .map(|(cluster, rule)| identity_of(&state, cluster, rule, person)),
+    )
+    .await?;
     Ok(Json(out).into_response())
 }
 

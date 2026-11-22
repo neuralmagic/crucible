@@ -141,8 +141,14 @@ async fn plan(
         .map_err(|e| ApiError::from(e).into_response())?;
     let mut carried = Vec::new();
     let mut refused = Vec::new();
-    for (binding, secret) in bound {
-        match carries(state, caller, blueprint, &binding, &secret, mode).await? {
+    let verdicts = futures_util::future::try_join_all(
+        bound
+            .iter()
+            .map(|(binding, secret)| carries(state, caller, blueprint, binding, secret, mode)),
+    )
+    .await?;
+    for ((binding, secret), verdict) in bound.into_iter().zip(verdicts) {
+        match verdict {
             Ok(()) => carried.push((binding, secret)),
             Err(reason) => refused.push((binding, reason)),
         }

@@ -139,11 +139,14 @@ fn adversary_summary(rounds: &[RoundRecord]) -> &'static str {
 /// 404s). The `scoped` step's refine trail comes off the stored pack tarball's `SCOPE.md` (the
 /// same read the approval-evidence endpoint makes).
 pub(crate) async fn assemble_journey(db: &Db, key: &str) -> Result<Option<JourneyDto>> {
-    let Some(issue) = crate::issues::store::get_issue(db.pool(), key).await? else {
+    let (issue, events, scopes) = tokio::try_join!(
+        crate::issues::store::get_issue(db.pool(), key),
+        db.events().read_for_key(key),
+        crate::issues::store::list_scopes_for_issue(db.pool(), key),
+    )?;
+    let Some(issue) = issue else {
         return Ok(None);
     };
-    let events = db.events().read_for_key(key).await?;
-    let scopes = crate::issues::store::list_scopes_for_issue(db.pool(), key).await?;
 
     let is_stale = issue.status == Status::Parked
         && issue.park_reason().is_some_and(|r| {
@@ -234,12 +237,15 @@ pub(crate) async fn assemble_journey(db: &Db, key: &str) -> Result<Option<Journe
 
     // 7. Runs + their kept PRs. Gather every run across the issue's scopes, oldest first, and emit
     //    each run followed by the distinct kept-candidate PRs it opened.
-    let mut runs = Vec::new();
-    for scope in &scopes {
-        for run in crate::runs::store::list_runs_for_scope(db.pool(), scope.id).await? {
-            runs.push(run);
-        }
-    }
+    let mut runs: Vec<_> = futures_util::future::try_join_all(
+        scopes
+            .iter()
+            .map(|scope| crate::runs::store::list_runs_for_scope(db.pool(), scope.id)),
+    )
+    .await?
+    .into_iter()
+    .flatten()
+    .collect();
     runs.sort_by(|a, b| a.created_at.cmp(&b.created_at));
     for run in &runs {
         let live = run.status == "running";

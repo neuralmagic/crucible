@@ -79,11 +79,14 @@ pub(crate) async fn get_task_evidence(
             "a run id is one path segment, and a task name names a directory of one",
         ));
     }
-    let Some(run) = crate::runs::store::get_run(state.db.pool(), &run_id).await? else {
+    let (run, results) = tokio::try_join!(
+        crate::runs::store::get_run(state.db.pool(), &run_id),
+        crate::runs::task_results::list_task_results(state.db.pool(), &run_id),
+    )?;
+    let Some(run) = run else {
         return Ok(not_found(format!("run not found: {run_id}")));
     };
 
-    let results = crate::runs::task_results::list_task_results(state.db.pool(), &run_id).await?;
     let mine: Vec<&crate::runs::model::TaskResult> =
         results.iter().filter(|r| r.task == task).collect();
     if mine.is_empty() && !planned(state.db.pool(), &run_id, &task).await? {
@@ -91,17 +94,18 @@ pub(crate) async fn get_task_evidence(
     }
     let latest = mine.iter().max_by_key(|r| r.iter);
 
-    let session = task_evidence::run_session(state.db.pool(), &state.scratch_dir, &run_id).await?;
+    let (session, bundle) = tokio::try_join!(
+        task_evidence::run_session(state.db.pool(), &state.scratch_dir, &run_id),
+        crate::runs::blob_store::get_run_bundle(
+            state.db.pool(),
+            &run_id,
+            crucible_contract::ArtifactKind::RunFiles,
+        ),
+    )?;
     let from_session = session
         .as_deref()
         .and_then(|s| task_evidence::session_result(s, &task));
 
-    let bundle = crate::runs::blob_store::get_run_bundle(
-        state.db.pool(),
-        &run_id,
-        crucible_contract::ArtifactKind::RunFiles,
-    )
-    .await?;
     let files = crate::runs::run_files::captured_files(
         bundle.as_deref(),
         &state.scratch_dir,

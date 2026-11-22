@@ -381,20 +381,22 @@ pub(crate) async fn list_decisions(State(state): State<ApiState>, caller: Caller
         Ok(open) => open,
         Err(e) => return ApiError::from(e).into_response(),
     };
-    let mut answerable = Vec::new();
-    for d in open {
-        if may_answer(&state, &caller, &d).await {
-            answerable.push(DecisionSummaryDto {
-                questions: d.questions.keys().map(QuestionId::to_string).collect(),
-                id: d.id,
-                run_id: d.run_id,
-                task: d.task,
-                launch_key: d.launch_key,
-                opened_at: d.opened_at,
-                expires_at: d.expires_at,
-            });
-        }
-    }
+    let allowed =
+        futures_util::future::join_all(open.iter().map(|d| may_answer(&state, &caller, d))).await;
+    let answerable = open
+        .into_iter()
+        .zip(allowed)
+        .filter(|(_, allowed)| *allowed)
+        .map(|(d, _)| DecisionSummaryDto {
+            questions: d.questions.keys().map(QuestionId::to_string).collect(),
+            id: d.id,
+            run_id: d.run_id,
+            task: d.task,
+            launch_key: d.launch_key,
+            opened_at: d.opened_at,
+            expires_at: d.expires_at,
+        })
+        .collect();
     Json(DecisionsDto { open: answerable }).into_response()
 }
 

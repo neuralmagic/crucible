@@ -42,30 +42,27 @@ pub(crate) async fn gauge_state(
     ceiling: Option<f64>,
 ) -> anyhow::Result<crate::metrics::GaugeState> {
     let today = crate::clock::today_utc();
-    let daily_spend_usd = crate::ledger::ledger_day_total(db.pool(), &today).await?;
-    let rows = crate::runs::work_pods::work_pods_in_states(
-        db.pool(),
-        &[
-            crate::runs::workpod::WorkPodState::Queued,
-            crate::runs::workpod::WorkPodState::Running,
-            crate::runs::workpod::WorkPodState::Succeeded,
-            crate::runs::workpod::WorkPodState::Failed,
-            crate::runs::workpod::WorkPodState::Collected,
-            crate::runs::workpod::WorkPodState::Swept,
-        ],
-    )
-    .await?;
+    let (daily_spend_usd, rows, awaiting) = tokio::try_join!(
+        crate::ledger::ledger_day_total(db.pool(), &today),
+        crate::runs::work_pods::work_pods_in_states(
+            db.pool(),
+            &[
+                crate::runs::workpod::WorkPodState::Queued,
+                crate::runs::workpod::WorkPodState::Running,
+                crate::runs::workpod::WorkPodState::Succeeded,
+                crate::runs::workpod::WorkPodState::Failed,
+                crate::runs::workpod::WorkPodState::Collected,
+                crate::runs::workpod::WorkPodState::Swept,
+            ],
+        ),
+        crate::issues::store::awaiting_approval_scopes(db.pool()),
+    )?;
     let mut workpods: std::collections::BTreeMap<(String, &'static str), i64> =
         std::collections::BTreeMap::new();
     for row in rows {
         *workpods.entry((row.kind, row.state.as_str())).or_insert(0) += 1;
     }
-    let approvals_pending = i64::try_from(
-        crate::issues::store::awaiting_approval_scopes(db.pool())
-            .await?
-            .len(),
-    )
-    .unwrap_or(i64::MAX);
+    let approvals_pending = i64::try_from(awaiting.len()).unwrap_or(i64::MAX);
     #[cfg(feature = "autoresearch")]
     let builds = build_gauges(db).await?;
     #[cfg(not(feature = "autoresearch"))]

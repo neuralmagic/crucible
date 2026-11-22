@@ -223,15 +223,15 @@ fn render_pushed(p: &PushedSnapshot, now: Instant) -> ClusterSnapshot {
 /// the spoke-side push agent (`crucible-controller cluster-snapshot`), which runs it against
 /// its own cluster's ambient identity.
 pub async fn gather(client: kube::Client, cluster: &str) -> anyhow::Result<Fetched> {
-    let nodes = Api::<Node>::all(client.clone())
-        .list(&ListParams::default())
-        .await?
-        .items;
-    let pods = Api::<Pod>::all(client.clone())
-        .list(&ListParams::default())
-        .await?
-        .items;
-    let kueue = fetch_cluster_queues(client, cluster).await;
+    let nodes = Api::<Node>::all(client.clone());
+    let pods = Api::<Pod>::all(client.clone());
+    let params = ListParams::default();
+    let (nodes, pods, kueue) = tokio::join!(
+        nodes.list(&params),
+        pods.list(&params),
+        fetch_cluster_queues(client, cluster),
+    );
+    let (nodes, pods) = (nodes?.items, pods?.items);
     Ok(Fetched {
         pools: aggregate_pools(&nodes, &pods),
         kueue,

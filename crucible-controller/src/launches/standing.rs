@@ -1113,9 +1113,13 @@ impl DueSource for TriggerSweep {
         let db = self.db.clone();
         let triggers = self.triggers.clone();
         Box::pin(async move {
+            let probes = futures_util::future::join_all(
+                triggers.iter().map(|trigger| trigger.next_due(&db, &held)),
+            )
+            .await;
             let mut earliest: Option<Timestamp> = None;
-            for trigger in &triggers {
-                match trigger.next_due(&db, &held).await {
+            for (trigger, probe) in triggers.iter().zip(probes) {
+                match probe {
                     Ok(Some(due)) => earliest = Some(earliest.map_or(due, |e| e.min(due))),
                     Ok(None) => {}
                     Err(e) => tracing::error!(

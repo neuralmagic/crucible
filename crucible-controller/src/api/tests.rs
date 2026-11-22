@@ -10298,13 +10298,15 @@ async fn a_launch_of_a_tampered_tree_is_refused_naming_the_tree(pool: PgPool) ->
 /// Put a recording `git` and `gh` on PATH for the duration of a body: graduation's push and PR
 /// open are the two shells, and this is what proves which refs it pushed. The `git` stub delegates
 /// everything but `push` to the real binary, so a test running beside this one still gets git.
-async fn with_forge_stubs<F, Fut, T>(dir: &std::path::Path, f: F) -> (T, String)
+/// The stubs are never deleted: a test beside this one can resolve `git` to the stub just before
+/// PATH is restored and run it afterwards.
+async fn with_forge_stubs<F, Fut, T>(f: F) -> (T, String)
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = T>,
 {
-    let bin = dir.join("forge-bin");
-    std::fs::create_dir_all(&bin).expect("mkdir");
+    let _g = crate::ENV_LOCK.lock().await;
+    let bin = tempfile::tempdir().expect("stub dir").keep();
     let log = bin.join("calls.log");
     let write = |name: &str, body: String| {
         let path = bin.join(name);
@@ -10334,7 +10336,6 @@ where
         ),
     );
 
-    let _g = crate::ENV_LOCK.lock().await;
     let original = std::env::var("PATH").unwrap_or_default();
     unsafe {
         std::env::set_var("PATH", format!("{}:{original}", bin.display()));
@@ -10383,7 +10384,7 @@ async fn seed_registry_secret(
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn graduating_as_yourself_pushes_with_your_own_github_token(pool: PgPool) -> Result<()> {
     use crate::secrets::SecretKind;
-    let (db, dir) = db_with(pool);
+    let (db, _dir) = db_with(pool);
     let app = router(ApiState {
         roles: crate::identity::auth::Roles::new(vec!["wren".to_string()], vec![], vec![]),
         secret_provider: Some(Arc::new(crate::secrets::provider::MapProvider::new([
@@ -10432,7 +10433,7 @@ async fn graduating_as_yourself_pushes_with_your_own_github_token(pool: PgPool) 
 
     let uri = "/api/playbook-drafts/studio/graduate";
     let with = |secret: &str| serde_json::json!({"repo": "owner/packs", "path": "packs/studio", "github_secret_id": secret});
-    let (outcomes, log) = with_forge_stubs(dir.path(), || async {
+    let (outcomes, log) = with_forge_stubs(|| async {
         let mut outcomes = Vec::new();
         for secret in ["s-notes", "s-bob-pat", "s-missing", "s-wren-pat"] {
             outcomes.push((secret, post_admin(&app, uri, with(secret)).await));
@@ -10501,7 +10502,7 @@ async fn graduation_opens_a_pr_and_the_import_retires_the_draft(pool: PgPool) ->
     };
     assert_eq!(created.0, StatusCode::CREATED, "{}", created.1);
 
-    let ((first, second), log) = with_forge_stubs(dir.path(), || async {
+    let ((first, second), log) = with_forge_stubs(|| async {
         let first = post_admin(
             &app,
             "/api/playbook-drafts/studio/graduate",
@@ -10619,7 +10620,7 @@ async fn graduation_opens_a_pr_and_the_import_retires_the_draft(pool: PgPool) ->
 /// graduates or deletes it, and a caller outside the team is told it does not exist.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn a_team_with_no_platform_role_authors_and_launches_its_draft(pool: PgPool) -> Result<()> {
-    let (db, dir) = db_with(pool);
+    let (db, _dir) = db_with(pool);
     let app = app_with_playbook_caps(
         db.clone(),
         vec![],
@@ -10725,7 +10726,7 @@ async fn a_team_with_no_platform_role_authors_and_launches_its_draft(pool: PgPoo
 
     let graduate_uri = "/api/playbook-drafts/studio/graduate";
     let target = serde_json::json!({"repo": "owner/packs", "path": "packs/studio"});
-    let (refusals, log) = with_forge_stubs(dir.path(), || async {
+    let (refusals, log) = with_forge_stubs(|| async {
         let mut refusals = Vec::new();
         for user in ["kim", "mallory"] {
             refusals.push((
@@ -10754,10 +10755,8 @@ async fn a_team_with_no_platform_role_authors_and_launches_its_draft(pool: PgPoo
         }
     }
     assert!(log.is_empty(), "a refused graduation pushes nothing: {log}");
-    let ((status, body), log) = with_forge_stubs(dir.path(), || {
-        send_as(&app, "POST", graduate_uri, "dana", target.clone())
-    })
-    .await;
+    let ((status, body), log) =
+        with_forge_stubs(|| send_as(&app, "POST", graduate_uri, "dana", target.clone())).await;
     assert_eq!(status, StatusCode::OK, "a maintainer graduates: {body}");
     assert_eq!(body["pr_url"], "https://github.com/owner/packs/pull/7");
     assert!(log.contains("crucible-pack/draft_studio"), "{log}");

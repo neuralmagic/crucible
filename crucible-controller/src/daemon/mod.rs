@@ -298,9 +298,13 @@ impl DueSource for MultiDue {
     fn next_due(&self, held: Vec<String>) -> BoxFuture<Result<Option<jiff::Timestamp>>> {
         let sources = self.sources.clone();
         Box::pin(async move {
+            let probes = futures_util::future::join_all(
+                sources.iter().map(|src| src.next_due(held.clone())),
+            )
+            .await;
             let mut earliest: Option<jiff::Timestamp> = None;
-            for src in &sources {
-                match src.next_due(held.clone()).await {
+            for probe in probes {
+                match probe {
                     Ok(Some(due)) => earliest = Some(earliest.map_or(due, |e| e.min(due))),
                     Ok(None) => {}
                     Err(e) => tracing::warn!(

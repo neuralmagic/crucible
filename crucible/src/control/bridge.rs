@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::watch;
 
 type Client = Arc<Mutex<TcpStream>>;
 
@@ -115,18 +116,18 @@ impl Hub {
 pub(crate) struct ControlState {
     paused: AtomicBool,
     next_seq: AtomicU64,
-    live_max_cost: Mutex<Option<f64>>,
-    status: Mutex<StatusSnapshot>,
+    live_max_cost: watch::Sender<Option<f64>>,
+    status: watch::Sender<StatusSnapshot>,
     /// Pending re-scope, drained by the loop at the next iteration head. The key travels
     /// with the regime so the loop can settle the admission where it applies it.
-    rescope: Mutex<Option<(AdmissionKey, String)>>,
+    rescope: watch::Sender<Option<(AdmissionKey, String)>>,
     /// The regime an open approval would grant (attended path): the loop records it from the agent's
     /// pending marker so an operator `approve` keystroke can turn it into a `rescope` without naming
     /// the regime. `None` when there's no approval awaiting an operator.
-    pending_regime: Mutex<Option<String>>,
+    pending_regime: watch::Sender<Option<String>>,
     /// A rejected pending approval, drained by the park as the terminal "not granted"
     /// outcome.
-    deny: Mutex<Option<(AdmissionKey, String)>>,
+    deny: watch::Sender<Option<(AdmissionKey, String)>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -160,47 +161,39 @@ impl ControlState {
     }
 
     pub(crate) fn live_max_cost(&self) -> Option<f64> {
-        self.live_max_cost.lock().ok().and_then(|g| *g)
+        *self.live_max_cost.borrow()
     }
 
     /// Drained by the loop at the iteration head, which re-baselines and settles it.
     pub(crate) fn take_rescope(&self) -> Option<(AdmissionKey, String)> {
-        self.rescope.lock().ok()?.take()
+        self.rescope.send_replace(None)
     }
 
     /// Non-consuming peek: is a re-scope pending? The park polls this so the drain
     /// ([`take_rescope`](Self::take_rescope)) stays the single place that re-baselines.
     pub(crate) fn has_rescope(&self) -> bool {
-        self.rescope.lock().is_ok_and(|g| g.is_some())
+        self.rescope.borrow().is_some()
     }
 
     #[cfg(test)]
     pub(crate) fn phase(&self) -> LoopPhase {
-        self.status
-            .lock()
-            .map(|s| s.phase)
-            .unwrap_or(LoopPhase::Starting)
+        self.status.borrow().phase
     }
 
     pub(crate) fn set_phase(&self, phase: LoopPhase) {
-        if let Ok(mut status) = self.status.lock() {
-            status.phase = phase;
-        }
+        self.status.send_modify(|status| status.phase = phase);
     }
 
     pub(crate) fn set_progress(&self, iter: u32, best_score: Option<f64>, spend: f64) {
-        let Ok(mut status) = self.status.lock() else {
-            return;
-        };
-        status.iter = iter;
-        status.best_score = best_score;
-        status.spend = spend;
+        self.status.send_modify(|status| {
+            status.iter = iter;
+            status.best_score = best_score;
+            status.spend = spend;
+        });
     }
 
     pub(crate) fn set_spend(&self, spend: f64) {
-        if let Ok(mut status) = self.status.lock() {
-            status.spend = spend;
-        }
+        self.status.send_modify(|status| status.spend = spend);
     }
 
     pub(crate) fn pause(&self) {
@@ -212,58 +205,46 @@ impl ControlState {
     }
 
     pub(crate) fn set_live_max_cost(&self, usd: f64) {
-        if let Ok(mut cap) = self.live_max_cost.lock() {
-            *cap = Some(usd);
-        }
+        self.live_max_cost.send_replace(Some(usd));
     }
 
     /// Arm the re-scope the next iteration head drains. Returns the key of an undrained
     /// re-scope this displaced, which the caller settles as superseded.
     pub(crate) fn set_rescope(&self, key: AdmissionKey, regime: String) -> Option<AdmissionKey> {
-        let Ok(mut slot) = self.rescope.lock() else {
-            return None;
-        };
-        slot.replace((key, regime)).map(|(old, _)| old)
+        self.rescope
+            .send_replace(Some((key, regime)))
+            .map(|(old, _)| old)
     }
 
     /// Record the regime an open approval would grant, so an operator `approve` can resolve it.
     /// The loop sets this when it reads the agent's pending-provisioning marker.
     pub(crate) fn set_pending_regime(&self, regime: String) {
-        if let Ok(mut slot) = self.pending_regime.lock() {
-            *slot = Some(regime);
-        }
+        self.pending_regime.send_replace(Some(regime));
     }
 
     /// Take the regime an open approval would grant. The caller admits the derived
     /// re-scope BEFORE arming it, and hands the regime back if the record can't be
     /// written.
     pub(crate) fn take_pending_regime(&self) -> Option<String> {
-        self.pending_regime.lock().ok()?.take()
+        self.pending_regime.send_replace(None)
     }
 
     /// Record a denial, clearing any pending regime so a later `approve` can't resurrect
     /// a denied ask. Returns the key of an undrained denial this displaced.
     pub(crate) fn set_deny(&self, key: AdmissionKey, reason: String) -> Option<AdmissionKey> {
-        if let Ok(mut pending) = self.pending_regime.lock() {
-            *pending = None;
-        }
-        let Ok(mut slot) = self.deny.lock() else {
-            return None;
-        };
-        slot.replace((key, reason)).map(|(old, _)| old)
+        self.pending_regime.send_replace(None);
+        self.deny
+            .send_replace(Some((key, reason)))
+            .map(|(old, _)| old)
     }
 
     /// Drain a denial if one arrived (the terminal "not granted" outcome the park waits on).
     pub(crate) fn take_deny(&self) -> Option<(AdmissionKey, String)> {
-        self.deny.lock().ok()?.take()
+        self.deny.send_replace(None)
     }
 
     fn snapshot(&self) -> StatusSnapshot {
-        let mut status = self
-            .status
-            .lock()
-            .map(|s| s.clone())
-            .unwrap_or_else(|_| StatusSnapshot::default());
+        let mut status = self.status.borrow().clone();
         status.paused = self.is_paused();
         status.max_cost = self.live_max_cost();
         status

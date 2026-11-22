@@ -172,10 +172,13 @@ pub(crate) async fn list_issue_builds(
     State(state): State<ApiState>,
     Path(key): Path<String>,
 ) -> ApiResult<Response> {
-    let Some(issue) = crate::issues::store::get_issue(state.db.pool(), &key).await? else {
+    let (issue, rows) = tokio::try_join!(
+        crate::issues::store::get_issue(state.db.pool(), &key),
+        crate::builds::store::builds_for_issue(state.db.pool(), &key),
+    )?;
+    let Some(issue) = issue else {
         return Ok(not_found(format!("issue not found: {key}")));
     };
-    let rows = crate::builds::store::builds_for_issue(state.db.pool(), &key).await?;
     let dtos: Vec<BuildDto> = rows
         .into_iter()
         .map(|row| BuildDto::from_row(row, Some(issue.key.clone()), Some(issue.repo.clone())))

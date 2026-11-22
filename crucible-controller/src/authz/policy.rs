@@ -10,7 +10,8 @@ use cedar_policy::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use tokio::sync::watch;
 
 /// The default policy set shipped with the controller (RFC-0003 C-POLICY).
 pub const DEFAULT_POLICY: &str = include_str!("default.cedar");
@@ -340,7 +341,7 @@ fn cedar_string(raw: &str) -> String {
 
 /// The engine in force, swapped whole by `activate`.
 #[derive(Clone)]
-pub struct ActivePolicy(Arc<RwLock<Arc<Engine>>>);
+pub struct ActivePolicy(Arc<watch::Sender<Arc<Engine>>>);
 
 impl std::fmt::Debug for ActivePolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -352,7 +353,7 @@ impl std::fmt::Debug for ActivePolicy {
 
 impl ActivePolicy {
     pub fn new(engine: Engine) -> Self {
-        ActivePolicy(Arc::new(RwLock::new(Arc::new(engine))))
+        ActivePolicy(Arc::new(watch::channel(Arc::new(engine)).0))
     }
 
     /// The shipped default, which a test proves loads.
@@ -361,18 +362,11 @@ impl ActivePolicy {
     }
 
     pub fn current(&self) -> Arc<Engine> {
-        match self.0.read() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        }
+        self.0.borrow().clone()
     }
 
     pub fn swap(&self, engine: Engine) {
-        let engine = Arc::new(engine);
-        match self.0.write() {
-            Ok(mut guard) => *guard = engine,
-            Err(poisoned) => *poisoned.into_inner() = engine,
-        }
+        self.0.send_replace(Arc::new(engine));
     }
 }
 

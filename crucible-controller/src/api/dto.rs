@@ -909,15 +909,20 @@ pub async fn issue_detail(
     key: &str,
     agent_tools: bool,
 ) -> anyhow::Result<Option<IssueDetail>> {
-    let Some(issue) = crate::issues::store::get_issue(db.pool(), key).await? else {
+    let (issue, scopes) = tokio::try_join!(
+        crate::issues::store::get_issue(db.pool(), key),
+        crate::issues::store::list_scopes_for_issue(db.pool(), key),
+    )?;
+    let Some(issue) = issue else {
         return Ok(None);
     };
-    let scopes = crate::issues::store::list_scopes_for_issue(db.pool(), key).await?;
-    let mut scope_runs = Vec::with_capacity(scopes.len());
-    for scope in scopes {
-        let runs = crate::runs::store::list_runs_for_scope(db.pool(), scope.id).await?;
-        scope_runs.push((scope, runs));
-    }
+    let runs = futures_util::future::try_join_all(
+        scopes
+            .iter()
+            .map(|scope| crate::runs::store::list_runs_for_scope(db.pool(), scope.id)),
+    )
+    .await?;
+    let scope_runs: Vec<_> = scopes.into_iter().zip(runs).collect();
     let mut tools = match agent_tools {
         true => {
             let run_ids: Vec<String> = scope_runs
@@ -935,8 +940,10 @@ pub async fn issue_detail(
     for (scope, runs) in scope_runs {
         let mut run_details = Vec::with_capacity(runs.len());
         for run in runs {
-            let candidates =
-                crate::runs::store::list_candidates_for_run(db.pool(), &run.run_id).await?;
+            let (candidates, transport_losses) = tokio::try_join!(
+                crate::runs::store::list_candidates_for_run(db.pool(), &run.run_id),
+                crate::runs::task_results::count_transport_losses(db.pool(), &run.run_id),
+            )?;
             for c in &candidates {
                 if c.decision.as_deref() == Some("keep")
                     && let Some(url) = &c.pr_url
@@ -945,8 +952,6 @@ pub async fn issue_detail(
                     kept_pr = Some((run.run_id.clone(), url.clone()));
                 }
             }
-            let transport_losses =
-                crate::runs::task_results::count_transport_losses(db.pool(), &run.run_id).await?;
             let agent_tools = tools.remove(&run.run_id).unwrap_or_default();
             run_details.push(RunDetail {
                 run: RunDto::from_parts(
@@ -965,27 +970,21 @@ pub async fn issue_detail(
             runs: run_details,
         });
     }
-    let events = db
-        .events()
-        .read_for_key(key)
-        .await?
-        .into_iter()
-        .map(EventDto::from)
-        .collect();
-    let comments = crate::issues::store::list_issue_comments(db.pool(), key)
-        .await?
-        .into_iter()
-        .map(IssueCommentDto::from)
-        .collect();
+    let (events, comments, scenario) = tokio::try_join!(
+        db.events().read_for_key(key),
+        crate::issues::store::list_issue_comments(db.pool(), key),
+        // Only a scenario has a sidecar row; skip the query for every GitHub issue.
+        async {
+            match issue.kind.has_upstream() {
+                true => Ok(None),
+                false => crate::issues::store::get_scenario(db.pool(), key).await,
+            }
+        },
+    )?;
+    let events = events.into_iter().map(EventDto::from).collect();
+    let comments = comments.into_iter().map(IssueCommentDto::from).collect();
+    let scenario = scenario.map(ScenarioDetailDto::from);
     let body = issue.body.clone();
-    // Only a scenario has a sidecar row; skip the query for every GitHub issue.
-    let scenario = if !issue.kind.has_upstream() {
-        crate::issues::store::get_scenario(db.pool(), key)
-            .await?
-            .map(ScenarioDetailDto::from)
-    } else {
-        None
-    };
     Ok(Some(IssueDetail {
         issue: IssueDto::from_parts(issue, kept_pr.map(|(_, url)| url)),
         body,
@@ -1021,11 +1020,13 @@ pub async fn ledger_summary_dto(db: &Db) -> anyhow::Result<LedgerSummaryDto> {
 /// Assemble the overview dashboard DTO for `GET /api/overview`.
 pub async fn overview_dto(db: &Db, caps: Option<&Caps>) -> anyhow::Result<Overview> {
     let today = crate::clock::today_utc();
-    let statuses_raw = crate::issues::store::status_counts(db.pool()).await?;
-    let tiers_raw = crate::issues::store::tier_counts(db.pool()).await?;
-    let running_count = crate::runs::store::count_running(db.pool()).await?;
-    let scopes_count = crate::issues::store::count_scopes_on_day(db.pool(), &today).await?;
-    let cost = crate::ledger::ledger_day_total(db.pool(), &today).await?;
+    let (statuses_raw, tiers_raw, running_count, scopes_count, cost) = tokio::try_join!(
+        crate::issues::store::status_counts(db.pool()),
+        crate::issues::store::tier_counts(db.pool()),
+        crate::runs::store::count_running(db.pool()),
+        crate::issues::store::count_scopes_on_day(db.pool(), &today),
+        crate::ledger::ledger_day_total(db.pool(), &today),
+    )?;
 
     let statuses = statuses_raw
         .into_iter()

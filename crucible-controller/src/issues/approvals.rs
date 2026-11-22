@@ -35,7 +35,7 @@ use crate::model::{ParkReason, ParkedBy};
 use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 // --- approval detection ----------------------------------------------------------------------
 
@@ -114,20 +114,12 @@ impl ApprovalPoll {
         let pr = parse_pr_url(&row.approval_pr)
             .with_context(|| format!("approval_pr is not a GitHub PR url: {}", row.approval_pr))?;
         let slug = pr.repo_slug();
-        let reviews: Vec<Review> = self
-            .record_github(github::get_json(
-                api_base,
-                token,
-                &format!("repos/{slug}/pulls/{}/reviews", pr.number),
-            ))
-            .await?;
-        let comments: Vec<Comment> = self
-            .record_github(github::get_json(
-                api_base,
-                token,
-                &format!("repos/{slug}/issues/{}/comments", pr.number),
-            ))
-            .await?;
+        let reviews_path = format!("repos/{slug}/pulls/{}/reviews", pr.number);
+        let comments_path = format!("repos/{slug}/issues/{}/comments", pr.number);
+        let (reviews, comments): (Vec<Review>, Vec<Comment>) = tokio::try_join!(
+            self.record_github(github::get_json(api_base, token, &reviews_path)),
+            self.record_github(github::get_json(api_base, token, &comments_path)),
+        )?;
         let Some(approval) = detect_approval(&reviews, &comments, &self.authz) else {
             return Ok(false);
         };
@@ -688,7 +680,7 @@ pub struct ReviewCommentPoll {
     /// Per-PR seen-comment ids, baselined on first sight (no replay of pre-existing review), like
     /// `pr_watch`'s continuous mode. `Arc` so the source's `&self` poll can share it into the
     /// `'static` future and have later polls see the updates.
-    seen: Arc<Mutex<HashMap<String, HashSet<u64>>>>,
+    seen: Arc<tokio::sync::watch::Sender<HashMap<String, HashSet<u64>>>>,
 }
 
 impl ReviewCommentPoll {
@@ -697,7 +689,7 @@ impl ReviewCommentPoll {
             db,
             authz,
             bot_user,
-            seen: Arc::new(Mutex::new(HashMap::new())),
+            seen: Arc::new(tokio::sync::watch::channel(HashMap::new()).0),
         }
     }
 
@@ -718,30 +710,28 @@ impl ReviewCommentPoll {
         .await?;
 
         // First sight of this PR: baseline everything (don't replay old review), then return.
-        let first_sight = {
-            let mut seen = self.seen.lock().expect("seen lock");
+        let mut first_sight = false;
+        self.seen.send_modify(|seen| {
             let entry = seen.entry(kept.pr_url.clone()).or_default();
             if entry.is_empty() && !comments.is_empty() {
-                for c in &comments {
-                    entry.insert(c.id);
-                }
-                true
-            } else {
-                false
+                entry.extend(comments.iter().map(|c| c.id));
+                first_sight = true;
             }
-        };
+        });
         if first_sight {
             return Ok(());
         }
 
-        let fresh: Vec<Comment> = {
-            let seen = self.seen.lock().expect("seen lock");
-            let s = seen.get(&kept.pr_url).cloned().unwrap_or_default();
-            fresh_comments(&comments, &s, &self.bot_user)
-                .into_iter()
-                .cloned()
-                .collect()
-        };
+        let seen = self
+            .seen
+            .borrow()
+            .get(&kept.pr_url)
+            .cloned()
+            .unwrap_or_default();
+        let fresh: Vec<Comment> = fresh_comments(&comments, &seen, &self.bot_user)
+            .into_iter()
+            .cloned()
+            .collect();
 
         let slug = crate::model::sanitize_key(&kept.issue);
         for c in &fresh {
@@ -773,11 +763,11 @@ impl ReviewCommentPoll {
             }
         }
         // Mark every comment seen (authorized or not) so we don't re-evaluate it next poll.
-        let mut seen = self.seen.lock().expect("seen lock");
-        let entry = seen.entry(kept.pr_url.clone()).or_default();
-        for c in &comments {
-            entry.insert(c.id);
-        }
+        self.seen.send_modify(|seen| {
+            seen.entry(kept.pr_url.clone())
+                .or_default()
+                .extend(comments.iter().map(|c| c.id));
+        });
         Ok(())
     }
 }
@@ -817,6 +807,7 @@ impl crate::daemon::queue::DiscoverySource for ReviewCommentPoll {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     // --- detect_approval ---
     fn review(login: &str, state: &str, assoc: &str) -> Review {

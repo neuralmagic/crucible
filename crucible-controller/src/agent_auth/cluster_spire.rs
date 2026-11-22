@@ -4,7 +4,8 @@
 
 use crucible::deploy::profile::{KubeName, check_cluster_name};
 use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use tokio::sync::watch;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SpireError {
@@ -178,14 +179,14 @@ pub enum SpireState {
 /// The SPIRE of every agent cluster, as discovery last found it, shared by the issuer, dispatch
 /// and the API. Clones share one map.
 #[derive(Debug, Clone, Default)]
-pub struct SpireDirectory(Arc<RwLock<Directory>>);
+pub struct SpireDirectory(Arc<watch::Sender<Directory>>);
 
 impl PartialEq for SpireDirectory {
     fn eq(&self, other: &Self) -> bool {
         if Arc::ptr_eq(&self.0, &other.0) {
             return true;
         }
-        let (a, b) = (self.read(), other.read());
+        let (a, b) = (self.0.borrow(), other.0.borrow());
         a.enabled == b.enabled && a.clusters == b.clusters
     }
 }
@@ -200,44 +201,36 @@ struct Directory {
 }
 
 impl SpireDirectory {
-    fn read(&self) -> std::sync::RwLockReadGuard<'_, Directory> {
-        self.0
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Directory> {
-        self.0
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
     /// Agent tokens are configured for `clusters`, each pending until discovery reads it.
     pub fn enable(&self, clusters: impl IntoIterator<Item = String>) {
-        let mut d = self.write();
-        d.enabled = true;
-        for cluster in clusters {
-            d.clusters.entry(cluster).or_insert(SpireState::Pending);
-        }
+        self.0.send_modify(|d| {
+            d.enabled = true;
+            for cluster in clusters {
+                d.clusters.entry(cluster).or_insert(SpireState::Pending);
+            }
+        });
     }
 
     /// Whether agent tokens are configured, read or not.
     pub fn enabled(&self) -> bool {
-        self.read().enabled
+        self.0.borrow().enabled
     }
 
     pub fn set(&self, cluster: &str, state: SpireState) {
-        self.write().clusters.insert(cluster.to_string(), state);
+        self.0.send_modify(|d| {
+            d.clusters.insert(cluster.to_string(), state);
+        });
     }
 
     /// Every cluster's state, by cluster.
     pub fn states(&self) -> BTreeMap<String, SpireState> {
-        self.read().clusters.clone()
+        self.0.borrow().clusters.clone()
     }
 
     /// The SPIRE of each cluster discovery has read.
     pub fn ready(&self) -> Vec<ClusterSpire> {
-        self.read()
+        self.0
+            .borrow()
             .clusters
             .values()
             .filter_map(|s| match s {
@@ -249,7 +242,8 @@ impl SpireDirectory {
 
     /// The clusters not read yet or found wanting.
     pub fn unread(&self) -> Vec<String> {
-        self.read()
+        self.0
+            .borrow()
             .clusters
             .iter()
             .filter(|(_, s)| !matches!(s, SpireState::Ready(_)))

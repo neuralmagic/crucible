@@ -247,8 +247,7 @@ fn check_members(
 
 async fn team_dto(state: &ApiState, caller: &Caller, team: TeamRow) -> anyhow::Result<TeamDto> {
     let pool = state.db.pool();
-    let all = store::all_members(pool).await?;
-    let users = store::known_users(pool).await?;
+    let (all, users) = tokio::try_join!(store::all_members(pool), store::known_users(pool))?;
     Ok(assemble(caller, team, &all, &users))
 }
 
@@ -300,9 +299,11 @@ pub(crate) async fn list_teams(
         ));
     }
     let pool = state.db.pool();
-    let teams = store::list_teams(pool).await?;
-    let all = store::all_members(pool).await?;
-    let users = store::known_users(pool).await?;
+    let (teams, all, users) = tokio::try_join!(
+        store::list_teams(pool),
+        store::all_members(pool),
+        store::known_users(pool),
+    )?;
     let dtos: Vec<TeamDto> = teams
         .into_iter()
         .map(|t| assemble(&caller, t, &all, &users))

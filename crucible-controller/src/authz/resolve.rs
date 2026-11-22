@@ -155,11 +155,15 @@ pub async fn teams_for(
     groups: &[String],
     proves_groups: bool,
 ) -> anyhow::Result<std::collections::BTreeMap<TeamSlug, Membership>> {
-    let email = match (login, proves_groups) {
-        (Some(login), true) => crate::authz::store::email_of(pool, login).await?,
-        _ => None,
-    };
-    let members = crate::authz::store::all_members(pool).await?;
+    let (email, members) = tokio::try_join!(
+        async {
+            match (login, proves_groups) {
+                (Some(login), true) => crate::authz::store::email_of(pool, login).await,
+                _ => Ok(None),
+            }
+        },
+        crate::authz::store::all_members(pool),
+    )?;
     let claims = Claims {
         login,
         email: email.as_deref(),
