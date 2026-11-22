@@ -226,3 +226,29 @@ def test_exposing_ports_is_part_of_the_plan(
     with pytest.raises(ToolError) as batch:
         client.workload_plan("gpu", job, expose=[8000])
     assert batch.value.status == "error", "the queue is read before the manifest"
+
+
+def test_results_from_a_server_that_collects_none_are_refused(
+    served: Served, tmp_path: Path
+) -> None:
+    dest = tmp_path / "out"
+    client = Client(url=served.url, token=served.token)
+
+    with pytest.raises(ToolError) as refused:
+        client.results("Job", "bench", dest)
+    assert refused.value.status == "refused"
+    assert refused.value.body["error"].startswith("this server collects no results")
+
+    with pytest.raises(ToolError) as listed:
+        client.workload_results("Job", "bench", all=True, namespace="team-b")
+    assert "access check pod-logs" in listed.value.body["error"]
+
+    async def task() -> ToolError:
+        with pytest.raises(ToolError) as refused:
+            await AsyncClient(url=served.url, token=served.token).results(
+                "Job", "bench", dest, pod="bench-abcde"
+            )
+        return refused.value
+
+    assert asyncio.run(task()).status == "refused"
+    assert not dest.exists()

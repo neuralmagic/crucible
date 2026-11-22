@@ -238,6 +238,22 @@ pub struct Caller {
 }
 
 #[cfg(test)]
+impl Caller {
+    /// Run `run-7` in namespace `team-a`, launched by `alice`.
+    pub fn for_test() -> Self {
+        Self {
+            owner: OwnerKind::Run,
+            run_id: RunId::parse("run-7").unwrap(),
+            namespace: Namespace::parse("team-a").unwrap(),
+            launched_by: Launcher::parse("alice").unwrap(),
+            kube_user: "alice-k8s".into(),
+            pull_secrets: Vec::new(),
+            served: Served::for_test(),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use crate::caller::*;
 

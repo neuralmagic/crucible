@@ -2,6 +2,7 @@ use anyhow::Context;
 use clap::{ArgAction, Parser};
 use crucible_kueue::access::{SCOPE_READ, SCOPE_SUBMIT};
 use crucible_kueue::caller::Manager;
+use crucible_kueue::collector::{self, Collector};
 use crucible_kueue::config::{
     self, ClaimMap, Config, Hardware, Labels, Lifetimes, Ownership, PullSecret, QueueVerb,
 };
@@ -14,7 +15,10 @@ use std::sync::Arc;
 
 /// Serve the crucible-kueue MCP endpoint.
 #[derive(Parser)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
     /// Listen address.
     #[arg(long, env = "CRUCIBLE_KUEUE_BIND", default_value = "0.0.0.0:8850")]
     bind: String,
@@ -207,6 +211,31 @@ struct Cli {
         value_delimiter = ','
     )]
     accelerator_product_labels: Vec<String>,
+    /// An image holding this binary. The server runs it as `collect` beside a Job planned with
+    /// `results`, and workload_results reads the files it writes. Unset, `results` is refused.
+    #[arg(long, env = "CRUCIBLE_KUEUE_RESULTS_IMAGE")]
+    results_image: Option<String>,
+    /// The most bytes of files collected from one pod; past it the files are listed and not
+    /// collected.
+    #[arg(
+        long,
+        env = "CRUCIBLE_KUEUE_RESULTS_MAX_BYTES",
+        default_value_t = collector::DEFAULT_MAX_BYTES
+    )]
+    results_max_bytes: u64,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Run in a workload's pod: wait for SIGTERM, then write the files under a directory to
+    /// stdout for workload_results to read.
+    Collect {
+        #[arg(long)]
+        dir: PathBuf,
+        /// Write the files' names and sizes alone when they total more than this.
+        #[arg(long)]
+        max_bytes: u64,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -272,6 +301,10 @@ impl Cli {
             run_pull_secret_namespace: self.run_pull_secrets_namespace.clone(),
             storage_classes: self.storage_classes.iter().cloned().collect(),
             cluster_domain: self.cluster_domain.clone(),
+            results: self.results_image.clone().map(|image| Collector {
+                image,
+                max_bytes: self.results_max_bytes,
+            }),
         })
     }
 }
@@ -284,6 +317,12 @@ enum KubeAuthz {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    if let Some(Command::Collect { dir, max_bytes }) = &cli.command {
+        return collector::collect(dir.clone(), *max_bytes)
+            .await
+            .context("collecting results");
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -292,8 +331,7 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .with_ansi(std::io::stderr().is_terminal())
         .init();
-    let cli = Cli::parse();
-    let config = cli.config()?;
+    let mut config = cli.config()?;
     crucible_kueue::install_tls_provider();
     let options = kube::config::KubeConfigOptions {
         context: cli.context.clone(),
@@ -312,6 +350,19 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("discovering the cluster's Kueue API version")?;
     tracing::info!(version = kueue.as_str(), "kueue api");
+    if config.results.is_some() {
+        let version = client
+            .apiserver_version()
+            .await
+            .context("reading the cluster's Kubernetes version")?;
+        if !collector::runs_sidecars(&version.major, &version.minor) {
+            tracing::warn!(
+                version = %version.git_version,
+                "results need the sidecar containers of Kubernetes 1.29; refusing them"
+            );
+            config.results = None;
+        }
+    }
     let kinds = crucible_kueue::kinds::installed(&client)
         .await
         .context("discovering the served kinds the cluster installs")?;
@@ -473,6 +524,25 @@ mod tests {
         assert_eq!(got.hardware, want.hardware);
         assert_eq!(got.namespaces, want.namespaces);
         assert_eq!(got.pull_secrets, want.pull_secrets);
+        assert_eq!(got.results, want.results);
+    }
+
+    #[test]
+    fn collect_is_a_subcommand_that_needs_no_server_flags() {
+        let cli = Cli::try_parse_from([
+            "crucible-kueue",
+            "collect",
+            "--dir",
+            "/crucible-results",
+            "--max-bytes",
+            "4096",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Collect { dir, max_bytes: 4096 }) if dir.as_os_str() == "/crucible-results"
+        ));
+        assert!(Cli::try_parse_from(["crucible-kueue", "collect"]).is_err());
     }
 
     #[test]
@@ -558,9 +628,20 @@ mod tests {
             "gpu-local,shared",
             "--storage-class",
             "gpu-local",
+            "--results-image",
+            "quay.io/example/crucible-kueue:1",
+            "--results-max-bytes",
+            "1048576",
         ])
         .unwrap();
         let c = cli.config().unwrap();
+        assert_eq!(
+            c.results,
+            Some(Collector {
+                image: "quay.io/example/crucible-kueue:1".into(),
+                max_bytes: 1_048_576,
+            })
+        );
         assert_eq!(c.labels.run_id, "kueue-mcp.example.com/run-id");
         assert_eq!(c.ownership, Ownership::Rbac);
         assert_eq!(c.profile, Profile::tenant());

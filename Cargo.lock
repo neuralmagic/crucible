@@ -2258,8 +2258,11 @@ version = "0.7.2"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.23.1",
  "clap",
+ "crucible-kueue-client",
  "crucible-mcp-auth",
+ "flate2",
  "futures-util",
  "hex",
  "http",
@@ -2274,6 +2277,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tar",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "toml 0.8.23",
@@ -2288,6 +2293,7 @@ name = "crucible-kueue-client"
 version = "0.7.2"
 dependencies = [
  "axum",
+ "base64 0.23.1",
  "crucible-contract",
  "crucible-kueue",
  "crucible-mcp-auth",

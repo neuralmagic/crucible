@@ -100,3 +100,37 @@ async fn a_tool_the_server_does_not_declare_is_refused() {
     };
     assert_eq!((status.as_str(), *retryable), ("refused", false));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn results_from_a_server_that_collects_none_are_refused_and_nothing_is_written() {
+    let url = serve().await;
+    let client = Client::new(&url, Token::Static(task_token())).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out");
+
+    let refused = client
+        .results("Job", "bench", &dest, None, None)
+        .await
+        .unwrap_err();
+    let Error::Tool { status, body, .. } = &refused else {
+        panic!("{refused}");
+    };
+    assert_eq!(status, "refused");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("this server collects no results"),
+        "{body}"
+    );
+
+    let elsewhere = client
+        .results("Job", "bench", &dest, Some("team-b"), None)
+        .await
+        .unwrap_err();
+    assert!(
+        elsewhere.to_string().contains("access check pod-logs"),
+        "{elsewhere}"
+    );
+    assert!(!dest.exists());
+}

@@ -5,6 +5,7 @@
 
 use crate::caller::Manager;
 use crate::caller::{Launcher, NameError, RunId};
+use crate::collector::Collector;
 use crate::profile::Profile;
 use crucible_mcp_auth::kube::{GROUPS_CLAIM, USER_CLAIM};
 use crucible_mcp_auth::principal::Principal;
@@ -47,6 +48,8 @@ pub struct Config {
     pub storage_classes: BTreeSet<String>,
     /// The cluster's DNS domain, for the host an exposed workload's Service is reached at.
     pub cluster_domain: String,
+    /// The collector added to a Job planned with `results`. `None`: `results` is refused.
+    pub results: Option<Collector>,
 }
 
 /// The DNS domain of a cluster that names none.
@@ -166,6 +169,7 @@ impl Default for Config {
             run_pull_secret_namespace: None,
             storage_classes: BTreeSet::new(),
             cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
+            results: None,
         }
     }
 }

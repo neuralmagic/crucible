@@ -7,8 +7,8 @@ configuration it is crucible's server; [Generic Kueue MCP](#generic-kueue-mcp) r
 cluster with a stock OIDC provider and plain RBAC.
 
 Tools: `whoami`, `queues_list`, `queue_describe`, `hardware_describe`, `workload_plan`,
-`workload_submit`, `workload_status`, `workload_list`, `workload_logs`, `workload_stop`,
-`workload_resume`, `workload_scale`, `workload_delete`.
+`workload_submit`, `workload_status`, `workload_list`, `workload_logs`, `workload_results`,
+`workload_stop`, `workload_resume`, `workload_scale`, `workload_delete`.
 
 Submittable kinds: batch/v1 Job, ray.io/v1 RayJob, leaderworkerset.x-k8s.io/v1 LeaderWorkerSet,
 apps/v1 Deployment, apps/v1 StatefulSet, jobset.x-k8s.io/v1alpha2 JobSet, kubeflow.org/v1
@@ -63,6 +63,26 @@ it was written. `follow_seconds` (max 50) keeps every selected pod's log open th
 answers what was written by then, so a pod that crashes and is deleted during the call is read to
 its end. A caller that repeats the call with `since_time` set to the last time it saw reads a log
 as it is written.
+
+`workload_plan` and `workload_submit` take `results`, an absolute directory path in a Job's
+containers. The server mounts an `emptyDir` there in each of them and adds a `crucible-results`
+sidecar (an init container that restarts always, Kubernetes 1.29 and later) running this
+server's image as `crucible-kueue collect`. When the Job's containers exit, passed or failed,
+the kubelet stops the sidecar, which then writes the directory's files to its own log as a
+gzipped tar in base64 with a digest, and exits. Both additions are in the plan's
+`server_changes`, its requests (10m CPU, 32Mi) and its hash. The sidecar runs as the first
+container's `runAsUser` and `runAsGroup` when the manifest sets them. Any other kind is refused.
+
+`workload_results` reads that log with the `pods/log` access `workload_logs` uses. It answers
+`state` (`collected`, `pending` until the Job's containers exit, `withheld`, or `failed`) and,
+once collected, `files` (path and bytes) and `unread` (what the sidecar could not read, and
+why), from the Job's newest pod or the one `pod` names. `paths` or `all` add `contents` within
+`max_bytes` (16 KiB by default): UTF-8 files as `text`, others as `base64`; files past the
+budget are in `omitted`. A directory over `--results-max-bytes` or 4096 files is `withheld`:
+listed, not collected. The files are in the pod's log and are deleted with the pod, so read
+them before `finished_retention_seconds` passes, and before `workload_stop` or
+`workload_delete`. A Job that exceeds its `activeDeadlineSeconds` loses its pods and their
+files. `whoami` answers `results_max_bytes`, or null on a server that collects none.
 
 ## Tasks
 
@@ -167,6 +187,8 @@ crucible-kueue \
 | `--run-pull-secrets-namespace` (`RUN_PULL_SECRETS_NAMESPACE`) | unset | The namespace a run issuer's tokens name their run's own pull secrets in, with a `pull_secrets` claim of `name=registry` entries. For a workload whose image is on such a registry the server reads that Secret (it must be a `kubernetes.io/dockerconfigjson` one) and creates a copy named `<workload>-pull-<n>` beside the workload, owned by it. The server's account needs `secrets` get in this namespace and `secrets` create in the served ones. Unset, the claim is ignored. It is always ignored on a person's token |
 | `--storage-class` (`STORAGE_CLASSES`) | none | StorageClasses a volume claim template may name (repeat for more). With none, `storageClassName` is refused and every claim takes the cluster's default class |
 | `--cluster-domain` (`CLUSTER_DOMAIN`) | `cluster.local` | The cluster's DNS domain, for the host of an exposed workload's Service |
+| `--results-image` (`RESULTS_IMAGE`) | unset | An image holding this binary, run as the collector beside a Job planned with `results`. Workload namespaces must be able to pull it; name its pull secret with `--pull-secret name=registry`. Unset, or on a cluster older than Kubernetes 1.29, `results` is refused |
+| `--results-max-bytes` (`RESULTS_MAX_BYTES`) | `16777216` | The most bytes of files collected from one pod. Past it they are listed and not collected |
 | `--accelerator-resource` (`ACCELERATOR_RESOURCES`) | `nvidia.com/gpu`, `nvidia.com/mig-*`, `amd.com/gpu`, `habana.ai/gaudi`, `google.com/tpu` | Resources `hardware_describe` counts; `*` matches a prefix |
 | `--accelerator-product-label` (`ACCELERATOR_PRODUCT_LABELS`) | `nvidia.com/gpu.product`, `amd.com/gpu.product-name`, `habana.ai/gaudi.product`, `cloud.google.com/gke-tpu-accelerator` | Node labels naming the product |
 
@@ -219,7 +241,8 @@ events (discovery of the kinds needs no grant); cluster-wide it may also create 
 list `groups.user.openshift.io`. The server trusts runs' tokens from `--issuer` (the controller's
 `CONTROLLER_AGENT_ISSUER`) with keys from `run_jwks_uri` (default the issuer's
 `/.well-known/jwks.json`; a plain-http URI adds `--insecure-jwks-http`), and its `--resource` is
-its Service URL. `--allowed-host` is set to the Service DNS name. The image is `docker/Containerfile.kueue`.
+its Service URL. `--allowed-host` is set to the Service DNS name. The image is `docker/Containerfile.kueue`,
+and the render names it as `--results-image` too.
 
 ## Test
 
@@ -237,6 +260,9 @@ CRUCIBLE_KUEUE_E2E_QUEUE=crucible-e2e CRUCIBLE_KUEUE_E2E_KUBE_USER=<user> \
 CRUCIBLE_KUEUE_E2E_KUBE_GROUPS=<groups> CRUCIBLE_KUEUE_E2E_MODE=crucible|tenant \
 cargo test -p crucible-kueue --test cluster_e2e -- --ignored --nocapture
 ```
+
+The results tests also need `CRUCIBLE_KUEUE_E2E_RESULTS_IMAGE`, an image of this checkout's
+`crucible-kueue` the cluster can pull.
 
 The crucible suites that drive the controller's agent token endpoint live in crucible-controller
 (`cargo test -p crucible-controller --test kueue_oidc_e2e` and `--test kueue_gateway_e2e`), so

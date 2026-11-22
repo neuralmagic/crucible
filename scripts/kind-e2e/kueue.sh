@@ -116,6 +116,10 @@ jq -e --arg run "$POD" --arg actor "$ACTOR" --arg queue "$QUEUE" '
     fail "[KQ] the Job is not the run's, by $ACTOR: $(jq -c '{labels: .metadata.labels, annotations: .metadata.annotations, status}' "$WORK/job-KQ.json")"
 kubectl -n "$WORKLOAD_NS" logs job/task-probe | grep -qx "$NONCE" || fail "[KQ] the Job's log does not carry the nonce"
 pass "[KQ] the Job ran on Kueue, labelled with the run, its launcher and the task, and printed the nonce"
+jq -e --arg image "$KUEUE_IMAGE" '.spec.template.spec.initContainers
+    | length == 1 and .[0].name == "crucible-results" and .[0].image == $image and .[0].restartPolicy == "Always"' \
+    "$WORK/job-KQ.json" >/dev/null ||
+    fail "[KQ] the Job carries no collector running the server's image: $(jq -c '.spec.template.spec.initContainers' "$WORK/job-KQ.json")"
 
 grep -F "task token issued" "$WORK/controller-$BOOT.log" | grep -F "crucible:run:$POD" >"$WORK/issued-KQ.log" ||
     fail "[KQ] the controller issued no task token for $POD"
@@ -129,17 +133,21 @@ api GET "/api/runs/$RUN/graph"
 grep -qF "\"kube_user\": \"crucible:run:$POD\"" "$WORK/engine-KQ.log" && grep -qF '"nonce_logged": true' "$WORK/engine-KQ.log" ||
     fail "[KQ] the task's whoami and log read are not in the engine log: $(tail -n 30 "$WORK/engine-KQ.log")"
 pass "[KQ] the task acted as crucible:run:$POD and read the Job's log through the server"
+grep -qF '"collected": ["result.json"]' "$WORK/engine-KQ.log" ||
+    fail "[KQ] the task did not fetch the Job's result file: $(tail -n 30 "$WORK/engine-KQ.log")"
 
 SERVE_HOST="task-serve.$WORKLOAD_NS.svc.cluster.local"
 grep '^\[serve\] {' "$WORK/engine-KQ.log" | sed 's/^\[serve\] //' >"$WORK/serve-KQ.json"
-jq -e --arg host "$SERVE_HOST" --arg expiring "task-expire.$WORKLOAD_NS.svc.cluster.local" '
+jq -e --arg host "$SERVE_HOST" --arg expiring "task-expire.$WORKLOAD_NS.svc.cluster.local" --arg nonce "$NONCE" '
     .url == "http://\($host):8000" and .resubmitted == false
     and .status_service == {name: "task-serve", host: $host, ports: [8000]}
     and .from_task and .from_job and .gone
     and .expired == {host: $expiring, reached: true, gone: true}
     and .ticks == ["tick-1", "tick-2", "tick-3", "tick-4", "tick-5", "tick-6"]
     and .raised.failed.phase == "finished" and (.raised.failed.reason | length > 0)
-    and .raised.failed.reason != "Succeeded" and .raised.stuck.problem_pods >= 1' "$WORK/serve-KQ.json" >/dev/null ||
+    and .raised.failed.reason != "Succeeded" and .raised.stuck.problem_pods >= 1
+    and .raised.failed.results == ["partial.txt"] and .raised.failed.partial == "partial\n"
+    and .probe_result == {nonce: $nonce}' "$WORK/serve-KQ.json" >/dev/null ||
     fail "[KQ] serve did not reach its workload and retire it: $(cat "$WORK/serve-KQ.json"); the engine said: $(tail -n 20 "$WORK/engine-KQ.log")"
 wait_for 60 "the exposed Service to be collected with its Deployment" \
     sh -c "! kubectl -n $WORKLOAD_NS get service task-serve"
@@ -151,6 +159,8 @@ pass "[KQ] a task served an image at $SERVE_HOST, reached it from itself and fro
 pass "[KQ] a Job that served past its activeDeadlineSeconds was deleted by its TTL, and its Service with it"
 pass "[KQ] a task followed a running Job's log in two-second windows and read each line once"
 pass "[KQ] a Job that exits nonzero raised WorkloadFailed ($(jq -r .raised.failed.reason "$WORK/serve-KQ.json")) and one that cannot pull raised WorkloadStuck"
+pass "[KQ] a Job planned with results left a file the task fetched and declared, and a later task read it as that task's output"
+pass "[KQ] a Job that failed still handed back the file it wrote"
 
 # A JWT's header and payload start with base64 of {" .
 jq -s --arg n "$POD" '[.[] | .object | select(.metadata.name == $n)]' "$WORK/pods-KQ.json" >"$WORK/pod-KQ.json"

@@ -248,6 +248,7 @@ dependencies = [
 name = "crucible-kueue-client"
 version = "0.7.2"
 dependencies = [
+ "base64",
  "crucible-contract",
  "reqwest",
  "serde",

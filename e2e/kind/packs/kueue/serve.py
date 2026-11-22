@@ -145,12 +145,19 @@ def one_shot(name: str, image: str, command: str) -> dict:
 
 
 async def failures(kueue: AsyncClient) -> dict:
-    """What a Job that exits nonzero and a Job whose image cannot be pulled raise."""
+    """What a Job that exits nonzero and a Job whose image cannot be pulled raise, and the files
+    the first left behind."""
+    doomed = one_shot("task-fails", "@IMAGE@", "echo partial > /results/partial.txt; exit 3")
     try:
-        await kueue.run("@QUEUE@", one_shot("task-fails", "@IMAGE@", "echo doomed; exit 3"), timeout=240)
+        await kueue.run("@QUEUE@", doomed, timeout=240, results="/results")
         failed = "returned"
     except WorkloadFailed as error:
-        failed = {"reason": error.reason, "phase": error.body["phase"]}
+        failed = {
+            "reason": error.reason,
+            "phase": error.body["phase"],
+            "results": await kueue.results("Job", "task-fails", "failed"),
+            "partial": open("failed/partial.txt").read(),
+        }
     try:
         await kueue.run(
             "@QUEUE@", one_shot("task-unpullable", "localhost:1/nothing:here", "true"), timeout=240
@@ -220,6 +227,7 @@ async def main() -> None:
                 "expired": expired,
                 "ticks": ticks,
                 "raised": raised,
+                "probe_result": json.load(open("inputs/probe/out/result.json")),
                 "gone": retired,
             }
         )

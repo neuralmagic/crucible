@@ -89,7 +89,9 @@
 #      the run, its launcher and the task; the token is in no pod spec, Secret or log; a pack
 #      naming a server the run was not granted fails its task naming the servers it was; a task
 #      serves an image as a Deployment with a port exposed, reaches it by the Service host the
-#      server reports from itself and from a Job, and the Service is deleted with the Deployment
+#      server reports from itself and from a Job, and the Service is deleted with the Deployment;
+#      a Job planned with results leaves files the task fetches and declares, a later task reads
+#      them as that task's output, and a Job that fails still hands back what it wrote
 # The scenarios run in three shards at once, each on its own kind cluster, database, and controller
 # ports, sharing one registry and loop image: store (A P U F C B D L T I W E X Q V M), pods
 # (H R S K Y JP JT), and lease (O J N), in scripts/kind-e2e/<shard>.sh. Arguments name the shards to run.
