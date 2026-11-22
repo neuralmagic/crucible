@@ -81,6 +81,21 @@ Operational notes, all from live failures:
   every pass after it is incremental.
 - A pod restart costs a re-pull of the base and that warm-up pass again.
 
+## benchmark-loader
+
+The nodes need not pull from the build registry at all. After a successful
+build, the packs upload the compiled runtime tree — the vLLM source with its
+`.so` extensions and the `vllm-rs` binary, without `.deps`, the build
+directory, or the Rust target directory — as one digest-pinned blob to the
+registry's blob API, and the run emits its URL alongside the image. A pod on
+the stock release image, which every node can pull from its public registry,
+fetches that blob over the pod network in an init container and runs the tree
+in front of the entrypoint: the import resolves from the fetched tree and the
+compiled extensions load against the same ABI they were built on. Scale the
+pod spec to as many nodes as the benchmark needs — they all read the same
+blob. The one contract: the pod's image must be the exact release image the
+artifact was built on, which the run record names.
+
 ## Setup
 
 1. Register both packs through the import flow (repo, branch, path
