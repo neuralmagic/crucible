@@ -338,7 +338,8 @@ pub fn symbols(index: &Index, text: &Text) -> Vec<DocumentSymbol> {
             }
             _ => continue,
         };
-        if let (Some(name), Some(value)) = (call.declared_name(), call.kwarg("name")) {
+        let name = call.declared_name().filter(|name| !name.trim().is_empty());
+        if let (Some(name), Some(value)) = (name, call.kwarg("name")) {
             found.push(symbol(&call.span, &value.span, name, &call.callee, kind));
         }
     }
@@ -355,7 +356,7 @@ pub fn symbols(index: &Index, text: &Text) -> Vec<DocumentSymbol> {
             SymbolKind::FUNCTION,
         ));
     }
-    for param in &index.params {
+    for param in index.params.iter().filter(|p| !p.name.trim().is_empty()) {
         found.push(symbol(
             &param.span,
             &param.span,
@@ -577,5 +578,16 @@ workflow(type = \"playbook\", tasks = [review, gate, make(param(\"repo\"))])\n";
         .map(|(n, d)| (n.to_owned(), d.map(str::to_owned)))
         .collect();
         assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn the_outline_skips_tasks_and_params_whose_name_is_still_blank() {
+        let source = "params = {\"\": {\"type\": \"string\"}}\ncount = command(name = \"\", run = \"x\")\nspace = command(name = \"  \", run = \"z\")\nkeep = command(name = \"keep\", run = \"y\")\n";
+        let index = Index::build(&parse(source, Path::new("workflow.star")).expect("parses"));
+        let names: Vec<String> = symbols(&index, &Text::new(source.to_owned()))
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, ["keep"]);
     }
 }
