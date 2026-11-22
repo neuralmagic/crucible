@@ -123,12 +123,28 @@ def main():
             "ARG CUDA_ARCH_LIST=10.0\n"
             "ARG MAX_JOBS=64\n"
             f"RUN {run}\n"
+            "ARG ARTIFACT=\"\"\n"
+            "ARG REGISTRY=\"\"\n"
+            "RUN if [ -n \"$ARTIFACT\" ]; then \\\n"
+            "        cd /src/vllm && \\\n"
+            "        tar -cf /tmp/artifact.tar --exclude=.deps --exclude=build --exclude=rust/target . && \\\n"
+            "        d=sha256:$(sha256sum /tmp/artifact.tar | cut -d\" \" -f1) && \\\n"
+            "        loc=$(curl -sf -X POST \"$REGISTRY/v2/artifacts/blobs/uploads/\" -o /dev/null -w \"%header{location}\") && \\\n"
+            "        case \"$loc\" in http*) : ;; /*) loc=\"$REGISTRY$loc\" ;; *) loc=\"$REGISTRY/$loc\" ;; esac && \\\n"
+            "        sep=? && case \"$loc\" in *\\?*) sep=\"&\" ;; esac && \\\n"
+            "        curl -sf -X PUT -H \"Content-Type: application/octet-stream\" -T /tmp/artifact.tar \"$loc${sep}digest=$d\" && \\\n"
+            "        printf '{\"artifact_digest\": \"%s\", \"artifact_bytes\": %s}\\n' \"$d\" \"$(wc -c < /tmp/artifact.tar)\" > /buildit/facts.json && \\\n"
+            "        echo \"artifact $d at $REGISTRY/v2/artifacts\" && \\\n"
+            "        rm -f /tmp/artifact.tar; \\\n"
+            "    fi\n"
         )
         build_args = [
             "-f", "Dockerfile",
             "--build-arg", f"BASE={params['base_image']}",
             "--build-arg", f"CUDA_ARCH_LIST={params['arch_list']}",
             "--build-arg", f"MAX_JOBS={params['max_jobs']}",
+            "--build-arg", f"ARTIFACT={head}.tar",
+            "--build-arg", f"REGISTRY={os.environ['MCP_IMAGE_REPO'].partition('/')[0]}",
             "--builder", "buildah",
             "--ccache",
             "--cache", "vllm-ccache=/root/.cache/ccache",
@@ -159,8 +175,11 @@ def main():
         print(json.dumps({"status": status, "logs": tail})[-6000:])
         sys.exit(f"build {state}")
 
+    facts = status.get("facts") or {}
+    registry = os.environ["MCP_IMAGE_REPO"].partition("/")[0]
     print(json.dumps({
         "image": image_ref(build_id),
+        "artifact": f"{registry}/v2/artifacts/blobs/{facts.get('artifact_digest', '?')}",
         "seconds": round(time.monotonic() - started),
         "patch_files": files,
         "bench": status.get("facts") or None,

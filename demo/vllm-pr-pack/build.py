@@ -58,6 +58,11 @@ def main():
         capture_output=True, text=True, check=True,
     ).stdout.strip()
     print(f"vllm {params['vllm_ref']} at {sha}", flush=True)
+    import hashlib
+    reqs = (src / "requirements" / "build" / "cuda.txt").read_bytes()
+    (Path("build") / "reqlock.key").write_text(
+        f"{params['base_image']}\n{hashlib.sha256(reqs).hexdigest()}\n"
+    )
 
     started = time.monotonic()
     reply = call(
@@ -70,9 +75,13 @@ def main():
         "--cache", "vllm-deps=/src/vllm/.deps:cluster",
         "--cache-key", "vllm-deps=vllm/CMakeLists.txt",
         "--cache-key", "vllm-deps=vllm/cmake/external_projects",
+        "--cache", "vllm-reqlock=/reqlock:cluster",
+        "--cache-key", "vllm-reqlock=reqlock.key",
         "--build-arg", f"BASE={params['base_image']}",
         "--build-arg", f"CUDA_ARCH_LIST={params['arch_list']}",
         "--build-arg", f"MAX_JOBS={params['max_jobs']}",
+        "--build-arg", f"ARTIFACT={sha}.tar",
+        "--build-arg", f"REGISTRY={os.environ['MCP_IMAGE_REPO'].partition('/')[0]}",
         "--timeout", str(params["build_timeout"]),
     )
     build_id = reply["build_id"]
@@ -91,8 +100,11 @@ def main():
         print(json.dumps({"status": status, "logs": tail})[-6000:])
         sys.exit(f"build {state}")
 
+    facts = status.get("facts") or {}
+    registry = os.environ["MCP_IMAGE_REPO"].partition("/")[0]
     print(json.dumps({
         "image": image_ref(build_id),
+        "artifact": f"{registry}/v2/artifacts/blobs/{facts.get('artifact_digest', '?')}",
         "vllm_sha": sha,
         "build_id": build_id,
         "seconds": round(time.monotonic() - started),

@@ -11,8 +11,8 @@ params = {
     },
     "base_image": {
         "type": "string",
-        "default": "docker.io/vllm/vllm-openai:v0.32.0@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34",
-        "doc": "release image the ref compiles on; multi-arch, arm64 resolves on this cluster",
+        "default": "docker.io/vllm/vllm-openai:v0.34.0@sha256:e40eb98263fa13418dda684147d73e8ec4a2b0e056a37e955dc189cd1b11dd16",
+        "doc": "release image the ref compiles on; pick the release nearest the ref's fork point or the dependency sources will not compile against its torch",
     },
     "arch_list": {
         "type": "string",
