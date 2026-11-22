@@ -16,8 +16,10 @@ path = "src/bin/crucible-kueue.rs"
 [dependencies]
 anyhow.workspace = true
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+base64 = "0.23"
 clap.workspace = true
 crucible-mcp-auth = { path = "../crucible-mcp-auth", features = ["kube"] }
+flate2 = "1"
 futures-util = { version = "0.3", features = ["io"] }
 hex = "0.4"
 jiff.workspace = true
@@ -30,6 +32,7 @@ rustls = "0.23"
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
+tar = "0.4"
 toml = "0.8"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["signal"] }
@@ -39,6 +42,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
+crucible-kueue-client = { path = "../crucible-kueue-client" }
+tempfile = "3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "form", "rustls"] }
 crucible-mcp-auth = { path = "../crucible-mcp-auth", features = ["e2e"] }
 tower = { version = "0.5", features = ["util"] }

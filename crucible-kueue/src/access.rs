@@ -9,7 +9,7 @@
 //! | queue_describe, hardware_describe     | kueue.read   | `get` or `use` the localqueue          |
 //! | workload_status, tasks/get            | kueue.read   | `get` the workload                     |
 //! | workload_list                         | kueue.read   | `list` kueue workloads                 |
-//! | workload_logs                         | kueue.read   | `get` pods/log                         |
+//! | workload_logs, workload_results       | kueue.read   | `get` pods/log                         |
 //! | workload_plan, workload_submit        | kueue.submit | `use` (or `get`) the localqueue, `create` the kind, `get` each Secret and PVC it names, `create` services when it exposes ports |
 //! | workload_scale                        | kueue.submit | `update` the workload's scale          |
 //! | workload_stop, workload_resume        | kueue.submit | `update` the workload; `patch` kueue workloads unless it scales |
@@ -111,7 +111,9 @@ impl AccessRules for KueueRules {
         match call {
             Call::Tool { name, .. } => match *name {
                 "whoami" | "queues_list" | "queue_describe" | "hardware_describe"
-                | "workload_status" | "workload_list" | "workload_logs" => Ok(READ),
+                | "workload_status" | "workload_list" | "workload_logs" | "workload_results" => {
+                    Ok(READ)
+                }
                 "workload_plan" | "workload_submit" | "workload_scale" | "workload_stop"
                 | "workload_resume" | "workload_delete" => Ok(SUBMIT),
                 _ => Err(call.unserved()),
@@ -305,7 +307,7 @@ fn tool_checks(
             "list",
             "",
         )],
-        "workload_logs" => vec![c.check(
+        "workload_logs" | "workload_results" => vec![c.check(
             "pod-logs",
             "you may not read pod logs in this namespace",
             ("", "pods", "log"),

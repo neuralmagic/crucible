@@ -149,6 +149,16 @@ pub enum ManifestError {
     ExposeKind { kind: &'static str },
     #[error("expose takes 1 to {MAX_EXPOSED_PORTS} distinct ports from 1 to 65535, got {got:?}")]
     ExposePorts { got: Vec<u16> },
+    #[error("results takes a Job, whose pods end; a {kind}'s files are not collected")]
+    ResultsKind { kind: &'static str },
+    #[error(
+        "results takes an absolute directory path with no . or .. in it, such as /results, got {got:?}"
+    )]
+    ResultsDir { got: String },
+    #[error(
+        "this server collects no results; have the workload print what it found and read workload_logs"
+    )]
+    NoCollector,
     #[error(
         "{api_version}/{kind} is not submittable; allowed: batch/v1 Job, ray.io/v1 RayJob, leaderworkerset.x-k8s.io/v1 LeaderWorkerSet, apps/v1 Deployment, apps/v1 StatefulSet, jobset.x-k8s.io/v1alpha2 JobSet, kubeflow.org/v1 PyTorchJob"
     )]
@@ -276,8 +286,15 @@ impl Normalized {
             });
         }
         self.expose = distinct;
-        self.plan_hash = plan_hash(&json!({"object": self.object, "expose": self.expose}));
+        self.rehash();
         Ok(self)
+    }
+
+    pub(crate) fn rehash(&mut self) {
+        self.plan_hash = match self.expose.is_empty() {
+            true => plan_hash(&self.object),
+            false => plan_hash(&json!({"object": self.object, "expose": self.expose})),
+        };
     }
 
     /// The Secret `copy` names, in `namespace`: `docker_config` under the workload's own labels,
@@ -638,7 +655,7 @@ fn pull_secret_names(kind: WorkloadKind, object: &Value) -> Result<Vec<String>, 
 
 /// Adds each configured pull secret whose registry serves one of the pod's images and that the
 /// pod does not already name, returning a line per addition.
-fn add_pull_secrets(
+pub(crate) fn add_pull_secrets(
     spec: &mut Map<String, Value>,
     path: &str,
     cfg: &Config,
@@ -1620,23 +1637,42 @@ fn check_security_context(
     Ok(())
 }
 
-/// Effective per-pod requests: the sum over containers, raised to the largest init container,
-/// with limits standing in for requests a container leaves unset.
+/// Effective per-pod requests, with limits standing in for requests a container leaves unset:
+/// the sum over containers and sidecars (init containers that restart always), raised to the
+/// largest init container counted with the sidecars started before it.
 fn pod_requests(
     spec: &Map<String, Value>,
     path: &str,
 ) -> Result<BTreeMap<String, ParsedQuantity>, ManifestError> {
-    let mut sum: BTreeMap<String, ParsedQuantity> = BTreeMap::new();
+    let mut sidecars: BTreeMap<String, ParsedQuantity> = BTreeMap::new();
+    let mut init_peak: BTreeMap<String, ParsedQuantity> = BTreeMap::new();
+    for (i, c) in array_at(spec, "initContainers").iter().enumerate() {
+        let requests = container_requests(c, &format!("{path}/initContainers/{i}"))?;
+        if c.get("restartPolicy").and_then(Value::as_str) == Some("Always") {
+            for (k, v) in requests {
+                crate::quantity::add_into(&mut sidecars, &k, v);
+            }
+            continue;
+        }
+        let mut running = sidecars.clone();
+        for (k, v) in requests {
+            crate::quantity::add_into(&mut running, &k, v);
+        }
+        for (k, v) in running {
+            if init_peak.get(&k).is_none_or(|cur| v > *cur) {
+                init_peak.insert(k, v);
+            }
+        }
+    }
+    let mut sum = sidecars;
     for (i, c) in array_at(spec, "containers").iter().enumerate() {
         for (k, v) in container_requests(c, &format!("{path}/containers/{i}"))? {
             crate::quantity::add_into(&mut sum, &k, v);
         }
     }
-    for (i, c) in array_at(spec, "initContainers").iter().enumerate() {
-        for (k, v) in container_requests(c, &format!("{path}/initContainers/{i}"))? {
-            if sum.get(&k).is_none_or(|cur| v > *cur) {
-                sum.insert(k, v);
-            }
+    for (k, v) in init_peak {
+        if sum.get(&k).is_none_or(|cur| v > *cur) {
+            sum.insert(k, v);
         }
     }
     Ok(sum)
@@ -1716,21 +1752,13 @@ fn object_entry<'a>(
 
 #[cfg(test)]
 mod tests {
-    use crate::caller::{Launcher, Namespace, QueueName, RunId};
+    use crate::caller::{Launcher, QueueName};
     use crate::config::PullSecret;
     use crate::manifest::*;
     use serde_json::json;
 
     fn caller() -> Caller {
-        Caller {
-            owner: crate::caller::OwnerKind::Run,
-            run_id: RunId::parse("run-7").unwrap(),
-            namespace: Namespace::parse("team-a").unwrap(),
-            launched_by: Launcher::parse("alice").unwrap(),
-            kube_user: "alice-k8s".into(),
-            pull_secrets: Vec::new(),
-            served: crate::caller::Served::for_test(),
-        }
+        Caller::for_test()
     }
 
     fn queue() -> QueueName {
@@ -2789,6 +2817,26 @@ mod tests {
             .total_requests();
         assert_eq!(total["cpu"], ParsedQuantity::try_from("2").unwrap());
         assert_eq!(total["memory"], ParsedQuantity::try_from("1Gi").unwrap());
+    }
+
+    #[test]
+    fn sidecars_add_to_requests_and_to_the_init_containers_started_after_them() {
+        let total = |init_cpu: &str| {
+            let mut m = job();
+            m["spec"]["parallelism"] = json!(1);
+            m["spec"]["template"]["spec"]["initContainers"] = json!([
+                {"name": "s1", "restartPolicy": "Always", "resources": {"requests": {"cpu": "1", "memory": "32Mi"}}},
+                {"name": "i", "resources": {"requests": {"cpu": init_cpu}}},
+                {"name": "s2", "restartPolicy": "Always", "resources": {"limits": {"cpu": "1"}}},
+            ]);
+            normalize(m, &caller(), &queue(), &Config::default())
+                .unwrap()
+                .total_requests()
+        };
+        let q = |s: &str| ParsedQuantity::try_from(s).unwrap();
+        assert_eq!(total("1")["cpu"], q("2500m"));
+        assert_eq!(total("1")["memory"], q("1056Mi"));
+        assert_eq!(total("4")["cpu"], q("5"));
     }
 
     #[test]

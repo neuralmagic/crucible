@@ -5,6 +5,7 @@
 pub mod access;
 pub mod auth;
 pub mod caller;
+pub mod collector;
 pub mod config;
 pub mod hardware;
 pub mod kinds;
@@ -14,6 +15,7 @@ pub mod namespaces;
 pub mod profile;
 pub mod quantity;
 pub mod report;
+pub mod results;
 pub mod server;
 pub mod status;
 pub mod task;

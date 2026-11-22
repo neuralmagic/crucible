@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 from typing import (
     Any,
     AsyncIterator,
@@ -32,6 +33,7 @@ __all__ = [
     "WorkloadFailed",
     "WorkloadStuck",
     "WaitTimeout",
+    "NoResults",
     "Kind",
     "Until",
 ]
@@ -54,8 +56,9 @@ Json = dict[str, Any]
 class KueueError(Exception):
     """A call that did not answer ``ok``.
 
-    ``kind`` is ``tool``, ``failed``, ``stuck``, ``wait_timeout``, ``refused``,
-    ``rpc``, ``not_granted``, ``token``, ``transport`` or ``protocol``.
+    ``kind`` is ``tool``, ``failed``, ``stuck``, ``wait_timeout``, ``no_results``,
+    ``refused``, ``rpc``, ``not_granted``, ``token``, ``transport``, ``protocol``
+    or ``write``.
     """
 
     def __init__(self, message: str, detail: Json) -> None:
@@ -106,11 +109,26 @@ class WaitTimeout(KueueError):
         self.body: Json = detail["body"]
 
 
+class NoResults(KueueError):
+    """The Job's result files are not collected.
+
+    ``state`` is ``pending`` (its containers have not exited), ``withheld`` (the
+    files were too large or too many) or ``failed``; ``body`` is what
+    ``workload_results`` answered, with the list of files when there is one.
+    """
+
+    def __init__(self, message: str, detail: Json) -> None:
+        super().__init__(message, detail)
+        self.state: str = detail["state"]
+        self.body: Json = detail["body"]
+
+
 _ERRORS: dict[str, type[KueueError]] = {
     "tool": ToolError,
     "failed": WorkloadFailed,
     "stuck": WorkloadStuck,
     "wait_timeout": WaitTimeout,
+    "no_results": NoResults,
 }
 
 
@@ -168,6 +186,7 @@ class _Tools(Generic[R]):
         manifest: Json,
         namespace: Optional[str] = None,
         expose: Optional[list[int]] = None,
+        results: Optional[str] = None,
     ) -> R:
         return self.call(
             "workload_plan",
@@ -175,6 +194,7 @@ class _Tools(Generic[R]):
             manifest=manifest,
             namespace=namespace,
             expose=expose,
+            results=results,
         )
 
     def workload_submit(
@@ -184,6 +204,7 @@ class _Tools(Generic[R]):
         plan_hash: str,
         namespace: Optional[str] = None,
         expose: Optional[list[int]] = None,
+        results: Optional[str] = None,
     ) -> R:
         return self.call(
             "workload_submit",
@@ -192,6 +213,7 @@ class _Tools(Generic[R]):
             plan_hash=plan_hash,
             namespace=namespace,
             expose=expose,
+            results=results,
         )
 
     def workload_status(
@@ -251,6 +273,28 @@ class _Tools(Generic[R]):
             follow_seconds=follow_seconds,
             since_time=since_time,
             timestamps=timestamps,
+        )
+
+    def workload_results(
+        self,
+        kind: Kind,
+        name: str,
+        *,
+        namespace: Optional[str] = None,
+        pod: Optional[str] = None,
+        paths: Optional[list[str]] = None,
+        all: Optional[bool] = None,
+        max_bytes: Optional[int] = None,
+    ) -> R:
+        return self.call(
+            "workload_results",
+            kind=kind,
+            name=name,
+            namespace=namespace,
+            pod=pod,
+            paths=paths,
+            all=all,
+            max_bytes=max_bytes,
         )
 
     def workload_scale(
@@ -313,17 +357,47 @@ class AsyncClient(_Tools[Awaitable[Json]]):
         manifest: Json,
         namespace: Optional[str] = None,
         expose: Optional[list[int]] = None,
+        results: Optional[str] = None,
     ) -> Json:
         """Plan ``manifest`` and submit it under the hash the plan answered.
 
         ``expose`` lists ports of a Job, Deployment, StatefulSet or LeaderWorkerSet
         to reach in the cluster. The reply's ``service`` then holds ``host`` and
         ``ports``; the Service is deleted with the workload.
+
+        ``results`` names a directory in a Job's containers whose files
+        ``results()`` fetches once the Job has finished.
         """
-        plan = await self.workload_plan(queue, manifest, namespace, expose)
+        plan = await self.workload_plan(queue, manifest, namespace, expose, results)
         return await self.workload_submit(
-            queue, manifest, plan["plan_hash"], namespace, expose
+            queue, manifest, plan["plan_hash"], namespace, expose, results
         )
+
+    async def results(
+        self,
+        kind: Kind,
+        name: str,
+        dest: os.PathLike[str] | str,
+        *,
+        namespace: Optional[str] = None,
+        pod: Optional[str] = None,
+    ) -> list[str]:
+        """Write the files a Job left in its results directory below ``dest``.
+
+        Answers their paths relative to ``dest``. The Job must have been
+        submitted with ``results`` and have finished, passed or failed; the
+        files come from its newest pod unless ``pod`` names one. Raises
+        ``NoResults`` when they are not collected. They are deleted with the
+        Job's pods, so fetch them before the Job is deleted.
+        """
+        try:
+            return json.loads(
+                await self._native.results(
+                    kind, name, os.fspath(dest), namespace, pod
+                )
+            )
+        except NativeError as error:
+            raise _raised(error) from None
 
     async def wait(
         self,
@@ -358,14 +432,16 @@ class AsyncClient(_Tools[Awaitable[Json]]):
         timeout: float = 3600.0,
         grep: Optional[str] = None,
         max_bytes: int = _MAX_LOG_BYTES,
+        results: Optional[str] = None,
     ) -> str:
         """Run a Job (or other batch workload) to its end and answer its log.
 
         Raises ``WorkloadFailed`` when it fails, ``WorkloadStuck`` when it cannot
         start and ``WaitTimeout`` when ``timeout`` passes; each carries the last
-        status in ``body``.
+        status in ``body``. With ``results``, ``results()`` then fetches the
+        files a Job left in that directory, whether it passed or failed.
         """
-        job = await self.submit(queue, manifest, namespace)
+        job = await self.submit(queue, manifest, namespace, results=results)
         kind, name = manifest["kind"], job["name"]
         await self.wait(kind, name, "finished", namespace=namespace, timeout=timeout)
         logs = await self.workload_logs(
@@ -474,17 +550,47 @@ class Client(_Tools[Json]):
         manifest: Json,
         namespace: Optional[str] = None,
         expose: Optional[list[int]] = None,
+        results: Optional[str] = None,
     ) -> Json:
         """Plan ``manifest`` and submit it under the hash the plan answered.
 
         ``expose`` lists ports of a Job, Deployment, StatefulSet or LeaderWorkerSet
         to reach in the cluster. The reply's ``service`` then holds ``host`` and
         ``ports``; the Service is deleted with the workload.
+
+        ``results`` names a directory in a Job's containers whose files
+        ``results()`` fetches once the Job has finished.
         """
-        plan = self.workload_plan(queue, manifest, namespace, expose)
+        plan = self.workload_plan(queue, manifest, namespace, expose, results)
         return self.workload_submit(
-            queue, manifest, plan["plan_hash"], namespace, expose
+            queue, manifest, plan["plan_hash"], namespace, expose, results
         )
+
+    def results(
+        self,
+        kind: Kind,
+        name: str,
+        dest: os.PathLike[str] | str,
+        *,
+        namespace: Optional[str] = None,
+        pod: Optional[str] = None,
+    ) -> list[str]:
+        """Write the files a Job left in its results directory below ``dest``.
+
+        Answers their paths relative to ``dest``. The Job must have been
+        submitted with ``results`` and have finished, passed or failed; the
+        files come from its newest pod unless ``pod`` names one. Raises
+        ``NoResults`` when they are not collected. They are deleted with the
+        Job's pods, so fetch them before the Job is deleted.
+        """
+        try:
+            return json.loads(
+                self._native.results_blocking(
+                    kind, name, os.fspath(dest), namespace, pod
+                )
+            )
+        except NativeError as error:
+            raise _raised(error) from None
 
     def wait(
         self,
@@ -517,14 +623,16 @@ class Client(_Tools[Json]):
         timeout: float = 3600.0,
         grep: Optional[str] = None,
         max_bytes: int = _MAX_LOG_BYTES,
+        results: Optional[str] = None,
     ) -> str:
         """Run a Job (or other batch workload) to its end and answer its log.
 
         Raises ``WorkloadFailed`` when it fails, ``WorkloadStuck`` when it cannot
         start and ``WaitTimeout`` when ``timeout`` passes; each carries the last
-        status in ``body``.
+        status in ``body``. With ``results``, ``results()`` then fetches the
+        files a Job left in that directory, whether it passed or failed.
         """
-        job = self.submit(queue, manifest, namespace)
+        job = self.submit(queue, manifest, namespace, results=results)
         kind, name = manifest["kind"], job["name"]
         self.wait(kind, name, "finished", namespace=namespace, timeout=timeout)
         logs = self.workload_logs(

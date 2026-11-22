@@ -30,3 +30,19 @@ class NativeClient:
         namespace: Optional[str],
         timeout_seconds: float,
     ) -> str: ...
+    def results(
+        self,
+        kind: str,
+        name: str,
+        dest: str,
+        namespace: Optional[str],
+        pod: Optional[str],
+    ) -> Awaitable[str]: ...
+    def results_blocking(
+        self,
+        kind: str,
+        name: str,
+        dest: str,
+        namespace: Optional[str],
+        pod: Optional[str],
+    ) -> str: ...

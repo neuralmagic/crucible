@@ -7,6 +7,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+base64 = "0.23"
 crucible-contract = { path = "../crucible-contract" }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 serde = { workspace = true, features = ["derive"] }

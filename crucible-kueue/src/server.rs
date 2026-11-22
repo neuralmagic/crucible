@@ -4,6 +4,7 @@
 
 use crate::access::StatusPart;
 use crate::caller::{ActError, Caller, Identity, NameError, Namespace, QueueName, Refusal};
+use crate::collector::ResultsDir;
 use crate::config::{Config, Labels, Ownership, QUEUE_LABEL};
 use crate::hardware;
 use crate::kinds;
@@ -13,6 +14,7 @@ use crate::kueue::{
 use crate::manifest::{self, ManifestError, Normalized, WorkloadKind};
 use crate::namespaces::{self, Namespaces};
 use crate::report::{self, Detail, Situation, Until, WaitEnd};
+use crate::server::results::ResultsArgs;
 use crate::status::{self, Phase, Readiness, Rollup};
 use crate::task::{self, Outcome, TaskRef};
 use crucible_mcp_auth::access::AccessReview;
@@ -39,6 +41,8 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+mod results;
 
 const MAX_WORKLOADS_SHOWN: usize = 20;
 /// How long a submit waits for a deleted workload's pull Secret to be collected.
@@ -93,6 +97,10 @@ pub enum ToolError {
         name: String,
         existing: String,
     },
+    #[error(
+        "{kind} {name} was not planned with results, so nothing collects its files; plan it with results naming the directory it writes them to"
+    )]
+    NoResults { kind: &'static str, name: String },
     #[error("since_time {got:?} is not an RFC 3339 time: {reason}")]
     SinceTime { got: String, reason: String },
     #[error("since_time and since_seconds both given; a log read starts at one of them")]
@@ -159,6 +167,7 @@ impl ToolError {
             | Self::ServiceTaken { .. }
             | Self::PullSecretTaken { .. }
             | Self::PullSecretGone { .. }
+            | Self::NoResults { .. }
             | Self::SinceTime { .. }
             | Self::TwoSinces
             | Self::NotStopped { .. }
@@ -504,6 +513,13 @@ pub struct PlanArgs {
     /// ttlSecondsAfterFinished.
     #[serde(default)]
     pub expose: Vec<u16>,
+    /// A directory in a Job's containers, as an absolute path, whose files to collect: the
+    /// server mounts an empty volume there and adds a container that writes the files it holds
+    /// to its own log once the Job's containers exit, whether they passed or failed.
+    /// workload_results then lists and returns them. whoami says how many bytes one pod's files
+    /// may total; larger artifacts belong in a registry.
+    #[serde(default)]
+    pub results: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -515,11 +531,14 @@ pub struct SubmitArgs {
     pub queue: String,
     /// The manifest exactly as passed to workload_plan.
     pub manifest: Value,
-    /// plan_hash returned by workload_plan for this queue, manifest and expose.
+    /// plan_hash returned by workload_plan for this queue, manifest, expose and results.
     pub plan_hash: String,
     /// The ports exactly as passed to workload_plan.
     #[serde(default)]
     pub expose: Vec<u16>,
+    /// The results directory exactly as passed to workload_plan.
+    #[serde(default)]
+    pub results: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -998,11 +1017,14 @@ impl KueueMcp {
         queue: &str,
         manifest: Value,
         expose: &[u16],
+        results: Option<&str>,
     ) -> Result<(Normalized, ClusterQueue), ToolError> {
         let lq = self.local_queue(caller, queue).await?;
         let queue = QueueName::parse(queue)?;
-        let normalized =
-            manifest::normalize(manifest, caller, &queue, &self.config)?.exposing(expose)?;
+        let results = results.map(ResultsDir::parse).transpose()?;
+        let normalized = manifest::normalize(manifest, caller, &queue, &self.config)?
+            .collecting(results.as_ref(), &self.config)?
+            .exposing(expose)?;
         let cq = self.cluster_queue(&lq).await?;
         Ok((normalized, cq))
     }
@@ -1813,6 +1835,7 @@ impl KueueMcp {
                     "submittable_kinds": self.kinds.iter().map(|k| format!("{} {}", k.api_version(), k.kind())).collect::<Vec<_>>(),
                     "ownership": self.config.ownership,
                     "allowlist_profile": self.config.profile.name,
+                    "results_max_bytes": self.config.results.as_ref().map(|r| r.max_bytes),
                 }))
             }
             .await)
@@ -1983,7 +2006,7 @@ impl KueueMcp {
     }
 
     #[tool(
-        description = "Validate a workload without creating it: pins it to the namespace and queue, runs a server-side dry run, and estimates whether the queue's quota can admit it (fit: fits_now, waits_for_quota, never_fits). Returns the plan_hash workload_submit requires, how long a finished Job or RayJob is kept (finished_retention_seconds), and server_changes: what the server added, such as the image pull secret an image's registry needs. Planning a workload already submitted with the same plan answers the same plan again; one of that name with other content is refused. With expose, a Job, Deployment, StatefulSet or LeaderWorkerSet also gets a Service of its name for those ports, and service says where it will be reached.",
+        description = "Validate a workload without creating it: pins it to the namespace and queue, runs a server-side dry run, and estimates whether the queue's quota can admit it (fit: fits_now, waits_for_quota, never_fits). Returns the plan_hash workload_submit requires, how long a finished Job or RayJob is kept (finished_retention_seconds), and server_changes: what the server added, such as the image pull secret an image's registry needs. Planning a workload already submitted with the same plan answers the same plan again; one of that name with other content is refused. With expose, a Job, Deployment, StatefulSet or LeaderWorkerSet also gets a Service of its name for those ports, and service says where it will be reached. With results, a Job's files in that directory are collected when its containers exit, for workload_results to return.",
         annotations(
             title = "Plan a workload",
             read_only_hint = true,
@@ -2000,7 +2023,9 @@ impl KueueMcp {
             self.explain(&parts, requested.as_deref(), async {
                 let c = self.served_caller(&parts, args.namespace.as_deref()).await?;
                 let actor = identity(&parts)?.actor.as_deref();
-                let (n, cq) = self.plan(&c, &args.queue, args.manifest, &args.expose).await?;
+                let (n, cq) = self
+                    .plan(&c, &args.queue, args.manifest, &args.expose, args.results.as_deref())
+                    .await?;
                 let pull_sources = self.pull_sources(&n).await?;
                 let (dry_run, service) = match self.create(&c, &n, actor, true).await {
                     Ok(_) => {
@@ -2065,7 +2090,7 @@ impl KueueMcp {
     }
 
     #[tool(
-        description = "Create a planned workload. The manifest, queue and expose must be the ones passed to workload_plan and plan_hash must match. Resubmitting an identical plan is a no-op. service says where an exposed workload is reached once its pods are ready.",
+        description = "Create a planned workload. The manifest, queue, expose and results must be the ones passed to workload_plan and plan_hash must match. Resubmitting an identical plan is a no-op. service says where an exposed workload is reached once its pods are ready.",
         annotations(
             title = "Submit a workload",
             read_only_hint = false,
@@ -2088,7 +2113,9 @@ impl KueueMcp {
                 let parts = parts.ok_or(ToolError::NoCaller)?;
                 let c = self.served_caller(parts, args.namespace.as_deref()).await?;
                 let actor = identity(parts)?.actor.as_deref();
-                let (n, _) = self.plan(&c, &args.queue, args.manifest, &args.expose).await?;
+                let (n, _) = self
+                    .plan(&c, &args.queue, args.manifest, &args.expose, args.results.as_deref())
+                    .await?;
                 let pull_sources = self.pull_sources(&n).await?;
                 if n.plan_hash != args.plan_hash {
                     return Err(ToolError::HashMismatch {
@@ -2410,6 +2437,36 @@ impl KueueMcp {
     }
 
     #[tool(
+        description = "The files a Job planned with results left in its results directory, from its newest pod: their paths and sizes, and, for the paths named or with all, their contents within a byte budget (16 KiB by default). state is collected, pending (the Job's containers have not exited), withheld (too many bytes or files to collect) or failed. A file that is not UTF-8 text comes back as base64. The files last as long as the pod: read them before finished_retention_seconds passes or the Job is stopped or deleted.",
+        annotations(
+            title = "Workload results",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn workload_results(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(args): Parameters<ResultsArgs>,
+    ) -> CallToolResult {
+        let requested = args.namespace.clone();
+        reply(
+            self.explain(
+                &parts,
+                requested.as_deref(),
+                async {
+                    let c = self
+                        .served_caller(&parts, args.namespace.as_deref())
+                        .await?;
+                    self.results(&c, args).await
+                }
+                .await,
+            )
+            .await,
+        )
+    }
+
+    #[tool(
         description = "Set the replica count of a Deployment or StatefulSet this run submitted. New Deployment pods queue individually; a StatefulSet scales only to or from zero.",
         annotations(
             title = "Scale a workload",
@@ -2641,6 +2698,13 @@ pub fn instructions(cfg: &Config, kinds: &[WorkloadKind]) -> String {
             classes.join(", ")
         ),
     };
+    let results = match &cfg.results {
+        Some(collector) => format!(
+            "To get files out of a Job, plan and submit it with results naming the directory it writes them to, then call workload_results once it has finished, passed or failed: it lists the files and returns the ones asked for. One pod's files may total {} bytes; they are deleted with the pod.",
+            collector.max_bytes
+        ),
+        None => "This server collects no files from a workload; what it prints to its log is what comes back.".to_string(),
+    };
     let mut domains: Vec<&str> = vec![cfg.labels.domain.as_str()];
     domains.extend(lists.reserved_domains.iter().map(String::as_str));
     format!(
@@ -2648,6 +2712,7 @@ pub fn instructions(cfg: &Config, kinds: &[WorkloadKind]) -> String {
 Flow: whoami (the namespaces you can use and their queues) -> queues_list -> hardware_describe/queue_describe -> workload_plan -> workload_submit -> workload_status with until=admitted|running|ready|finished, which waits on the server up to 50s per call (or, for a batch workload, tasks/get when the client speaks the tasks extension) -> workload_logs. \
 Every tool answers JSON text with a status: ok; refused (the request is not allowed or not valid: fix it, do not retry it as is); rejected (the API server or an admission webhook refused it); not_found; error (the server could not complete it); failed (a finished task whose workload failed). Anything but ok comes back with isError and a retryable flag: retry a retryable call a few times with a pause, change a non-retryable one. \
 workload_status answers a summary by default with next_action, the pods with problems and their exit messages; detail=full adds every Workload's conditions and every pod. Logs come within a 16 KiB budget, failed pods first; narrow them with grep and since_seconds. \
+{results} \
 {lifetime} {control} \
 Manifests are allowlisted (profile {}): {}, and labels or annotations reserved for {} are refused. {storage} \
 Kueue chooses the node; pin hardware with a nodeSelector only when hardware_describe shows the flavor spans several GPU products.",
@@ -3319,6 +3384,7 @@ mod tests {
             "workload_status",
             "workload_list",
             "workload_logs",
+            "workload_results",
             "workload_plan",
         ];
         let destructive = ["workload_delete", "workload_stop", "workload_scale"];
@@ -3329,7 +3395,7 @@ mod tests {
             "workload_delete",
         ];
         let tools = KueueMcp::tool_router().list_all();
-        assert_eq!(tools.len(), 13);
+        assert_eq!(tools.len(), 14);
         for tool in tools {
             let name = tool.name.as_ref();
             let a = tool
@@ -3386,6 +3452,7 @@ mod tests {
             bounds("workload_logs", "follow_seconds"),
             (Some(1), Some(50))
         );
+        assert_eq!(bounds("workload_results", "max_bytes"), (Some(1), None));
         assert_eq!(bounds("workload_scale", "replicas"), (Some(0), Some(1000)));
         assert_eq!(
             bounds("workload_status", "timeout_seconds"),
@@ -3451,12 +3518,28 @@ mod tests {
             "crucible.dev, kueue.x-k8s.io",
             "PyTorchJob",
             "storageClassName is refused",
+            "collects no files",
         ] {
             assert!(
                 crucible.contains(want),
                 "instructions lack {want:?}: {crucible}"
             );
         }
+        let collecting = Config {
+            results: Some(crate::collector::Collector {
+                image: "quay.io/example/crucible-kueue:1".into(),
+                max_bytes: 4096,
+            }),
+            ..Config::default()
+        };
+        let collecting = instructions(&collecting, &WorkloadKind::ALL);
+        for want in ["workload_results", "may total 4096 bytes"] {
+            assert!(
+                collecting.contains(want),
+                "instructions lack {want:?}: {collecting}"
+            );
+        }
+        assert!(!collecting.contains("collects no files"));
     }
 
     #[test]
@@ -3618,6 +3701,7 @@ mod tests {
             "workload_status",
             "workload_list",
             "workload_logs",
+            "workload_results",
             "workload_stop",
             "workload_resume",
             "workload_scale",

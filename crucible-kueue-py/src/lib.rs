@@ -7,6 +7,7 @@ use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::{future_into_py, get_runtime};
 use serde_json::{Map, Value, json};
+use std::path::PathBuf;
 use std::time::Duration;
 
 pyo3::create_exception!(_native, NativeError, PyException);
@@ -35,7 +36,11 @@ fn raise(error: Error) -> PyErr {
         }
         Error::Token { .. } => json!({"kind": "token"}),
         Error::Client(_) | Error::Http { .. } => json!({"kind": "transport"}),
-        Error::Protocol { .. } => json!({"kind": "protocol"}),
+        Error::Protocol { .. } | Error::ResultsPath { .. } => json!({"kind": "protocol"}),
+        Error::NoResults { state, body, .. } => {
+            json!({"kind": "no_results", "state": state, "body": body})
+        }
+        Error::Write { .. } => json!({"kind": "write"}),
     };
     NativeError::new_err((error.to_string(), detail.to_string()))
 }
@@ -48,6 +53,15 @@ fn object(arguments: &str) -> PyResult<Map<String, Value>> {
             "arguments are not JSON: {e}"
         ))),
     }
+}
+
+/// The written paths as a JSON list of strings.
+fn written(paths: Vec<PathBuf>) -> String {
+    let paths: Vec<String> = paths
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    json!(paths).to_string()
 }
 
 fn timeout(seconds: f64) -> PyResult<Duration> {
@@ -130,6 +144,41 @@ impl NativeClient {
                 .map(|value| value.to_string())
                 .map_err(raise)
         })
+    }
+
+    #[pyo3(signature = (kind, name, dest, namespace, pod))]
+    fn results<'py>(
+        &self,
+        py: Python<'py>,
+        kind: String,
+        name: String,
+        dest: PathBuf,
+        namespace: Option<String>,
+        pod: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.client.clone();
+        future_into_py(py, async move {
+            client
+                .results(&kind, &name, &dest, namespace.as_deref(), pod.as_deref())
+                .await
+                .map(written)
+                .map_err(raise)
+        })
+    }
+
+    #[pyo3(signature = (kind, name, dest, namespace, pod))]
+    fn results_blocking(
+        &self,
+        py: Python<'_>,
+        kind: &str,
+        name: &str,
+        dest: PathBuf,
+        namespace: Option<&str>,
+        pod: Option<&str>,
+    ) -> PyResult<String> {
+        py.detach(|| get_runtime().block_on(self.client.results(kind, name, &dest, namespace, pod)))
+            .map(written)
+            .map_err(raise)
     }
 
     #[pyo3(signature = (kind, name, until, namespace, timeout_seconds))]

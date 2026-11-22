@@ -17,6 +17,8 @@
 //! LocalQueue and the workload verbs the tests exercise in the namespace, and the context's identity
 //! needs `create` on subjectaccessreviews. The pull secret test also has it create, read and
 //! delete Secrets in the namespace, which stands in for the server's source namespace.
+//! The results test also needs CRUCIBLE_KUEUE_E2E_RESULTS_IMAGE=<an image of this checkout's
+//! crucible-kueue the cluster can pull>, which it runs as the collector.
 
 use crucible_mcp_auth::testing::{self, JwksServer};
 use rmcp::ServiceExt;
@@ -488,19 +490,18 @@ fn serving(kind: &str, name: &str, replicas: i64) -> Value {
 }
 
 async fn submit(client: &Client, queue: &str, manifest: &Value) -> Value {
-    let plan = call(
-        client,
-        "workload_plan",
-        json!({"queue": queue, "manifest": manifest}),
-    )
-    .await;
+    submit_with(client, queue, manifest, json!({})).await
+}
+
+/// Plan and submit `manifest` with `extra` arguments on both calls, and return the plan.
+async fn submit_with(client: &Client, queue: &str, manifest: &Value, extra: Value) -> Value {
+    let mut args = extra;
+    args["queue"] = json!(queue);
+    args["manifest"] = manifest.clone();
+    let plan = call(client, "workload_plan", args.clone()).await;
     assert_eq!(plan["status"], "ok", "{plan:#}");
-    let submitted = call(
-        client,
-        "workload_submit",
-        json!({"queue": queue, "manifest": manifest, "plan_hash": plan["plan_hash"]}),
-    )
-    .await;
+    args["plan_hash"] = plan["plan_hash"].clone();
+    let submitted = call(client, "workload_submit", args).await;
     assert_eq!(submitted["status"], "ok", "{submitted:#}");
     plan
 }
@@ -2012,4 +2013,329 @@ async fn a_person_token_claiming_a_crucible_identity_is_refused() {
             .is_some_and(|e| e.contains("reserved")),
         "the refusal names the reserved prefix: {refused:#}"
     );
+}
+
+/// The server on loopback collecting at most `max_bytes` from a pod with the image
+/// `CRUCIBLE_KUEUE_E2E_RESULTS_IMAGE` names.
+async fn serve_collecting(env: &Env, max_bytes: u64) -> String {
+    let image = std::env::var("CRUCIBLE_KUEUE_E2E_RESULTS_IMAGE")
+        .expect("CRUCIBLE_KUEUE_E2E_RESULTS_IMAGE must be set for the results e2e");
+    let mut config = env.config();
+    config.results = Some(crucible_kueue::collector::Collector { image, max_bytes });
+    let callers = match env.mode {
+        Mode::Crucible => crucible_mcp_auth::principal::Callers::Runs,
+        Mode::Tenant => crucible_mcp_auth::principal::Callers::People,
+    };
+    serve_with(env, config, callers).await
+}
+
+/// Plan and submit `manifest` collecting `results`, and return the plan.
+async fn submit_collecting(client: &Client, queue: &str, manifest: &Value, results: &str) -> Value {
+    submit_with(client, queue, manifest, json!({"results": results})).await
+}
+
+fn listed(results: &Value) -> Vec<(&str, u64)> {
+    results["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| (f["path"].as_str().unwrap(), f["bytes"].as_u64().unwrap()))
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "needs a cluster with Kueue; see the module docs"]
+async fn a_jobs_result_files_come_back_whether_it_passed_or_failed() {
+    use base64::Engine;
+    use sha2::Digest;
+    let env = env();
+    let run = unique("e2e-results");
+    let url = serve_collecting(&env, 1024 * 1024).await;
+    let agent = connect(&url, &submitter(&env, &run)).await.unwrap();
+    let me = call(&agent, "whoami", json!({})).await;
+    assert_eq!(me["results_max_bytes"], 1024 * 1024, "{me:#}");
+
+    let passing = unique("ck-e2e-results");
+    let mut manifest = job(
+        &passing,
+        "umask 077; mkdir -p /work/out/runs && printf '{\"p50\": 1.5}' > /work/out/result.json && \
+         head -c 200000 /dev/urandom > /work/out/runs/trace.bin && \
+         sha256sum /work/out/runs/trace.bin | cut -d' ' -f1 && echo main-done",
+    );
+    manifest["spec"]["template"]["spec"]["containers"][0]["securityContext"] =
+        json!({"runAsUser": 1000, "runAsGroup": 1000});
+    let plan = submit_collecting(&agent, &env.queue, &manifest, "/work/out").await;
+    assert!(
+        plan["server_changes"][0]
+            .as_str()
+            .unwrap()
+            .contains("crucible-results volume at /work/out"),
+        "{plan:#}"
+    );
+    assert_eq!(plan["pod_sets"][0]["per_pod"]["cpu"], "110m", "{plan:#}");
+    let without = call(
+        &agent,
+        "workload_submit",
+        json!({"queue": env.queue, "manifest": manifest, "plan_hash": plan["plan_hash"]}),
+    )
+    .await;
+    assert_eq!(without["status"], "refused", "{without:#}");
+
+    let early = call(
+        &agent,
+        "workload_results",
+        json!({"kind": "Job", "name": passing, "all": true}),
+    )
+    .await;
+    assert_eq!(early["state"], "pending", "{early:#}");
+
+    let done = wait_on_server(
+        &agent,
+        "Job",
+        &passing,
+        "finished",
+        Duration::from_secs(300),
+    )
+    .await;
+    assert_eq!(done["reason"], "Succeeded", "{done:#}");
+
+    let logs = call(
+        &agent,
+        "workload_logs",
+        json!({"kind": "Job", "name": passing}),
+    )
+    .await;
+    let log = logs["logs"][0]["log"].as_str().unwrap();
+    assert!(
+        log.contains("main-done") && !log.contains("\"results\""),
+        "{logs:#}"
+    );
+    let digest = log.lines().next().unwrap().trim().to_string();
+
+    let list = call(
+        &agent,
+        "workload_results",
+        json!({"kind": "Job", "name": passing}),
+    )
+    .await;
+    assert_eq!(list["state"], "collected", "{list:#}");
+    assert_eq!(list["phase"], "Succeeded", "{list:#}");
+    assert_eq!(
+        listed(&list),
+        [("result.json", 12), ("runs/trace.bin", 200_000)],
+        "{list:#}"
+    );
+    assert_eq!(list["unread"], json!([]), "{list:#}");
+    assert_eq!(list["total_bytes"], 200_012, "{list:#}");
+    assert!(list.get("contents").is_none(), "{list:#}");
+
+    let one = call(
+        &agent,
+        "workload_results",
+        json!({"kind": "Job", "name": passing, "paths": ["result.json", "absent"]}),
+    )
+    .await;
+    assert_eq!(
+        one["contents"],
+        json!([{"path": "result.json", "bytes": 12, "text": "{\"p50\": 1.5}"}]),
+        "{one:#}"
+    );
+    assert_eq!(one["missing"], json!(["absent"]), "{one:#}");
+
+    let budgeted = call(
+        &agent,
+        "workload_results",
+        json!({"kind": "Job", "name": passing, "all": true}),
+    )
+    .await;
+    assert_eq!(budgeted["truncated"], true, "{budgeted:#}");
+    assert_eq!(
+        budgeted["contents"].as_array().unwrap().len(),
+        1,
+        "{budgeted:#}"
+    );
+    assert_eq!(
+        budgeted["omitted"],
+        json!([{"path": "runs/trace.bin", "bytes": 200_000}]),
+        "{budgeted:#}"
+    );
+
+    let all = call(
+        &agent,
+        "workload_results",
+        json!({"kind": "Job", "name": passing, "all": true, "max_bytes": u64::MAX}),
+    )
+    .await;
+    assert_eq!(all["truncated"], false, "{}", all["state"]);
+    assert_eq!(all["budget_bytes"], 1024 * 1024);
+    let trace = &all["contents"][1];
+    assert_eq!(trace["path"], "runs/trace.bin");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(trace["base64"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(bytes.len(), 200_000);
+    assert_eq!(hex::encode(sha2::Sha256::digest(&bytes)), digest);
+
+    let task = crucible_kueue_client::Client::new(
+        &url,
+        crucible_kueue_client::Token::Static(submitter(&env, &run)),
+    )
+    .unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    let written = task
+        .results("Job", &passing, dest.path(), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        written,
+        ["result.json", "runs/trace.bin"].map(std::path::PathBuf::from)
+    );
+    assert_eq!(
+        std::fs::read(dest.path().join("result.json")).unwrap(),
+        b"{\"p50\": 1.5}"
+    );
+    assert_eq!(
+        std::fs::read(dest.path().join("runs/trace.bin")).unwrap(),
+        bytes
+    );
+
+    let reader = connect(&url, &viewer(&env, &run)).await.unwrap();
+    let read = call(
+        &reader,
+        "workload_results",
+        json!({"kind": "Job", "name": passing}),
+    )
+    .await;
+    assert_eq!(read["state"], "collected", "{read:#}");
+
+    let failing = unique("ck-e2e-results-fail");
+    submit_collecting(
+        &agent,
+        &env.queue,
+        &job(&failing, "echo partial > /out/partial.txt; exit 3"),
+        "/out",
+    )
+    .await;
+    let failed = wait_on_server(
+        &agent,
+        "Job",
+        &failing,
+        "finished",
+        Duration::from_secs(300),
+    )
+    .await;
+    assert_ne!(failed["reason"], "Succeeded", "{failed:#}");
+    assert_eq!(failed["problem_pods"][0]["exit_code"], 3, "{failed:#}");
+    let partial = call(
+        &agent,
+        "workload_results",
+        json!({"kind": "Job", "name": failing, "all": true}),
+    )
+    .await;
+    assert_eq!(partial["state"], "collected", "{partial:#}");
+    assert_eq!(partial["phase"], "Failed", "{partial:#}");
+    assert_eq!(
+        partial["contents"],
+        json!([{"path": "partial.txt", "bytes": 8, "text": "partial\n"}]),
+        "{partial:#}"
+    );
+
+    let plain = unique("ck-e2e-results-none");
+    submit(&agent, &env.queue, &job(&plain, "echo no-results")).await;
+    let none = call(
+        &agent,
+        "workload_results",
+        json!({"kind": "Job", "name": plain}),
+    )
+    .await;
+    assert_eq!(none["status"], "refused", "{none:#}");
+    assert!(
+        none["error"]
+            .as_str()
+            .unwrap()
+            .contains("was not planned with results"),
+        "{none:#}"
+    );
+    let deployment = serving("Deployment", &unique("ck-e2e-results-dep"), 1);
+    let unending = call(
+        &agent,
+        "workload_plan",
+        json!({"queue": env.queue, "manifest": deployment, "results": "/out"}),
+    )
+    .await;
+    assert_eq!(unending["status"], "refused", "{unending:#}");
+
+    for name in [&passing, &failing, &plain] {
+        let deleted = call(
+            &agent,
+            "workload_delete",
+            json!({"kind": "Job", "name": name}),
+        )
+        .await;
+        assert_eq!(deleted["status"], "ok", "{deleted:#}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs a cluster with Kueue; see the module docs"]
+async fn files_over_the_servers_limit_are_listed_and_withheld() {
+    let env = env();
+    let run = unique("e2e-results-big");
+    let url = serve_collecting(&env, 4096).await;
+    let agent = connect(&url, &submitter(&env, &run)).await.unwrap();
+    let name = unique("ck-e2e-results-big");
+    submit_collecting(
+        &agent,
+        &env.queue,
+        &job(
+            &name,
+            "head -c 5000 /dev/urandom > /out/big.bin; echo small > /out/small.txt",
+        ),
+        "/out",
+    )
+    .await;
+    wait_on_server(&agent, "Job", &name, "finished", Duration::from_secs(300)).await;
+    let results = call(
+        &agent,
+        "workload_results",
+        json!({"kind": "Job", "name": name, "all": true}),
+    )
+    .await;
+    assert_eq!(results["status"], "ok", "{results:#}");
+    assert_eq!(results["state"], "withheld", "{results:#}");
+    assert_eq!(
+        listed(&results),
+        [("big.bin", 5000), ("small.txt", 6)],
+        "{results:#}"
+    );
+    assert!(
+        results["note"]
+            .as_str()
+            .unwrap()
+            .starts_with("its files total 5006 bytes, over the 4096 this server collects"),
+        "{results:#}"
+    );
+    assert!(results.get("contents").is_none(), "{results:#}");
+    let task = crucible_kueue_client::Client::new(
+        &url,
+        crucible_kueue_client::Token::Static(submitter(&env, &run)),
+    )
+    .unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    let refused = task
+        .results("Job", &name, dest.path(), None, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&refused, crucible_kueue_client::Error::NoResults { state, .. } if state == "withheld"),
+        "{refused}"
+    );
+    assert_eq!(std::fs::read_dir(dest.path()).unwrap().count(), 0);
+    let deleted = call(
+        &agent,
+        "workload_delete",
+        json!({"kind": "Job", "name": name}),
+    )
+    .await;
+    assert_eq!(deleted["status"], "ok", "{deleted:#}");
 }

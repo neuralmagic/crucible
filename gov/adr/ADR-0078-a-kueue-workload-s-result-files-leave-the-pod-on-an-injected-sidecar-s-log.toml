@@ -1,0 +1,140 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0078"
+title = "A Kueue workload's result files leave the pod on an injected sidecar's log"
+status = "proposed"
+date = "2026-11-21"
+refs = [
+    "RFC-0002:C-TASK-FILES",
+    "ADR-0068",
+    "ADR-0075",
+]
+
+[content]
+context = """
+A run submits a Job through crucible-kueue and the Job writes files: benchmark results, a profile, a report. A task can declare files as output ([[RFC-0002:C-TASK-FILES]]), but only files in its own workspace, and nothing carries a file from the Job's pod to that workspace.
+
+The one channel out of a pod today is `workload_logs`: text, at most 1 MiB, returned as a tool result. An agent that wants files has the Job print a base64 archive and reads it back in pieces, so every byte passes through the model.
+
+Constraints:
+
+- The server's service account reads pods, pod logs and events in a workload namespace. It cannot exec into a pod and it keeps no state.
+- The caller picks the workload's image and command. Anything mounted into the pod is within their reach, and the image may hold no archive tool.
+- A pod that stays up to be read holds its Kueue quota, GPUs included.
+- Results are wanted most when the Job fails partway.
+- A file declared as task output is small: one run's declared files total at most 256 MiB.
+- The manifest allowlist already admits an `emptyDir` and an init container with `restartPolicy: Always` (a native sidecar, Kubernetes 1.29 and later). The kubelet sends such a sidecar SIGTERM once the pod's regular containers have exited, pass or fail, and its exit code does not change the pod's phase or the Job's.
+- The kubelet rotates the log of a running container only. A container that writes and exits leaves its whole log readable until the pod is deleted.
+"""
+decision = """
+`workload_plan` and `workload_submit` take `results`, a directory in the workload's container. The server adds an `emptyDir` mounted there and a native sidecar that mounts it read-only. When the main container exits the sidecar writes one archive of the directory to its own stdout, with a list of the files, their sizes and a digest, and exits. `workload_results` reads that container's log with the access `workload_logs` already needs and answers the list. Asked for file contents, it checks the digest and answers them within a byte budget.
+
+- The sidecar is the server's own image run as a collector, so a cluster mirrors no second image.
+- The added volume and container are part of the plan hash and are reported with the server's other changes to the manifest.
+- The archive is bounded by a server setting, and the list by a fixed number of files. Past either the sidecar writes the list and sizes and no contents.
+- The sidecar runs as the main container's `runAsUser` when the manifest sets one.
+- The client library writes the files to a directory, refusing a path that leaves it. A command or evaluate task then declares them like any other file in its workspace.
+- `results` is taken for a Job. A kind that serves until stopped is refused.
+
+The log is the transport because the server can already read it and the node already keeps it: no new grant, no storage, no route from workload pods to the server, and no credential in a pod the caller controls.
+"""
+consequences = """
+A Job's files reach a task's workspace without passing through a model, from an image that knows nothing about crucible, and from a Job that failed as well as one that passed.
+
+The server stays stateless. Any replica answers `workload_results`, and a restart loses nothing.
+
+Results live as long as the pod. Past `finished_retention_seconds`, or after `workload_stop` deletes the pods, they are gone, so a caller collects before then.
+
+The archive is base64 in a container log, a third larger than the files, and a cluster's log pipeline ingests it. The bound keeps that to megabytes. A larger artifact is pushed to a registry and passed on by its location, which [[RFC-0002:C-TASK-FILES]] already asks of anything that outlives its run.
+
+The sidecar's requests add to the pod's, so the plan's fit and the quota charged include them.
+
+A file the sidecar's user cannot read is listed as unread, not dropped. Where a namespace assigns one UID to every container of a pod this does not arise; elsewhere a manifest that sets no `runAsUser` and writes owner-only files gets a list of unread files.
+
+A sidecar that fails does not fail the Job. `workload_results` says no archive was written, and why when the log shows it.
+
+An agent's own shell still cannot fetch the files: the sandbox carries the token only on the harness's requests ([[ADR-0068]]). An agent sees the list and small files through the tool; a pack that wants the files as task output collects them in a command task ([[ADR-0075]]). A results client among the sandbox binaries the token grant covers would let an agent write them to its workspace, and is not decided here.
+
+A Job with several pods has one archive per pod. A RayJob, JobSet or PyTorchJob has several pod templates, and which of them collect is not decided here.
+
+A cluster older than Kubernetes 1.29 has no native sidecars, and `results` is refused there.
+"""
+
+[[content.alternatives]]
+text = "An injected native sidecar writes an archive of the directory to its own log; the server reads the log"
+status = "accepted"
+pros = [
+    "Uses the pod log access the server already has",
+    "The node's log file is the store, so the server keeps no state",
+    "Collects from a failed Job, and from any image",
+    "The pod ends as soon as the archive is written",
+]
+cons = [
+    "Bounded to megabytes, and base64 in the cluster's log pipeline",
+    "Gone when the pod is deleted",
+    "Needs Kubernetes 1.29",
+]
+
+[[content.alternatives]]
+text = "The sidecar uploads the archive to crucible-kueue, which stores it"
+status = "rejected"
+pros = [
+    "Binary transfer with no log size limit",
+    "Results outlive the pod",
+]
+cons = [
+    "The server needs a volume or object store, and replicas have to share it",
+    "Workload pods need a route to the server and a token to present",
+    "Retention and cleanup become the server's",
+]
+rejection_reason = "It adds storage, a network path and a credential for files that fit in a log."
+
+[[content.alternatives]]
+text = "The sidecar pushes the directory to a registry or object store"
+status = "rejected"
+pros = [
+    "No size limit, and durable",
+    "The location can be handed to a later run",
+]
+cons = [
+    "A push credential in a pod whose image and command the caller picks",
+    "Every cluster needs a store and a place in it per run",
+]
+rejection_reason = "A write credential beside caller-chosen code is the exposure the server exists to avoid. buildit's Jobs archive their output this way, with the credential mounted into the sidecar alone, because buildit writes the whole pod; here the caller writes it, and a pod that shares its process namespace reaches the sidecar. It stays the route for artifacts too large to be task output."
+
+[[content.alternatives]]
+text = "The server copies the files out of the pod with exec"
+status = "rejected"
+pros = ["No sidecar and no change to the manifest"]
+cons = [
+    "The server's service account gains pods/exec in every workload namespace",
+    "The pod has to stay up to be read, holding its quota",
+    "The image needs tar",
+]
+rejection_reason = "Exec on every workload pod is a far wider grant than reading logs, and a waiting pod holds GPUs."
+
+[[content.alternatives]]
+text = "The workload writes to a PersistentVolumeClaim that is read afterwards"
+status = "rejected"
+pros = [
+    "No size limit",
+    "Results outlive the pod",
+]
+cons = [
+    "The strict allowlist refuses volume claims",
+    "Reading the claim takes another pod in the namespace",
+    "Claims have to be created, sized and deleted per workload",
+]
+rejection_reason = "It needs a second pod and a claim lifecycle to move a few files."
+
+[[content.alternatives]]
+text = "Leave it to the workload: print an archive to its own log and read it with workload_logs"
+status = "rejected"
+pros = ["No server change"]
+cons = [
+    "Every image needs an archive tool and a script that runs on failure too",
+    "The archive is interleaved with the program's output and capped at 1 MiB",
+    "An agent reads it through the model",
+]
+rejection_reason = "It is the workaround this replaces."

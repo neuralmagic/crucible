@@ -2,9 +2,11 @@
 //! the server's URL and a token file from the engine in `CRUCIBLE_TASK_SERVERS`; each call is one
 //! `tools/call` request carrying the token the file holds at that moment.
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use crucible_contract::task_servers::{ENV_TASK_SERVERS, TaskServer};
 use serde_json::{Map, Value, json};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// The name the controller grants crucible-kueue under.
@@ -98,6 +100,73 @@ pub enum Error {
         /// The last status report.
         body: Box<Value>,
     },
+    #[error("{workload} has no collected results ({state}){}", detail(.body))]
+    NoResults {
+        /// `<kind>/<name>`.
+        workload: String,
+        /// `pending`, `withheld` or `failed`.
+        state: String,
+        /// What `workload_results` answered.
+        body: Box<Value>,
+    },
+    #[error("the results name {path:?}, which is no file below the destination")]
+    ResultsPath { path: String },
+    #[error("writing {}: {source}", path.display())]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// The `error` or `note` a `workload_results` reply explains itself with.
+fn detail(body: &Value) -> String {
+    ["error", "note"]
+        .iter()
+        .find_map(|key| body.get(key).and_then(Value::as_str))
+        .map(|text| format!(": {text}"))
+        .unwrap_or_default()
+}
+
+/// Writes each file of a `workload_results` reply's `contents` below `dest` and returns their
+/// paths relative to it.
+async fn write_contents(contents: &[Value], dest: &Path) -> Result<Vec<PathBuf>, Error> {
+    let mut written = Vec::new();
+    for file in contents {
+        let path = file.get("path").and_then(Value::as_str).unwrap_or_default();
+        let refused = || Error::ResultsPath {
+            path: path.to_string(),
+        };
+        let relative = Path::new(path);
+        let below = relative
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)));
+        if path.is_empty() || !below {
+            return Err(refused());
+        }
+        let malformed = |reason: &str| Error::Protocol {
+            tool: "workload_results".into(),
+            reason: format!("{path}: {reason}"),
+        };
+        let data = match (file.get("text"), file.get("base64")) {
+            (Some(Value::String(text)), _) => text.clone().into_bytes(),
+            (None, Some(Value::String(encoded))) => STANDARD
+                .decode(encoded)
+                .map_err(|_| malformed("its base64 does not decode"))?,
+            _ => return Err(malformed("neither text nor base64")),
+        };
+        let full = dest.join(relative);
+        let write = |source| Error::Write {
+            path: full.clone(),
+            source,
+        };
+        if let Some(parent) = full.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(write)?;
+        }
+        tokio::fs::write(&full, data).await.map_err(write)?;
+        written.push(relative.to_path_buf());
+    }
+    Ok(written)
 }
 
 /// Where each request's bearer token comes from.
@@ -243,6 +312,45 @@ impl Client {
         Ok(value)
     }
 
+    /// Write the files a Job planned with `results` left in its results directory below `dest`,
+    /// from its newest pod or the one named, and return their paths relative to `dest`. A Job
+    /// whose files are not collected is [`Error::NoResults`]: its containers have not exited,
+    /// its files were too large or too many, or the collector failed.
+    pub async fn results(
+        &self,
+        kind: &str,
+        name: &str,
+        dest: &Path,
+        namespace: Option<&str>,
+        pod: Option<&str>,
+    ) -> Result<Vec<PathBuf>, Error> {
+        let mut arguments = Map::new();
+        arguments.insert("kind".into(), json!(kind));
+        arguments.insert("name".into(), json!(name));
+        arguments.insert("all".into(), json!(true));
+        arguments.insert("max_bytes".into(), json!(u64::MAX));
+        for (key, value) in [("namespace", namespace), ("pod", pod)] {
+            if let Some(value) = value {
+                arguments.insert(key.into(), json!(value));
+            }
+        }
+        let reply = self.call("workload_results", arguments).await?;
+        let state = reply
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let complete = reply.get("truncated").and_then(Value::as_bool) == Some(false);
+        let contents = reply.get("contents").and_then(Value::as_array);
+        match (state, complete, contents) {
+            ("collected", true, Some(contents)) => write_contents(contents, dest).await,
+            _ => Err(Error::NoResults {
+                workload: format!("{kind}/{name}"),
+                state: state.to_string(),
+                body: Box::new(reply),
+            }),
+        }
+    }
+
     /// Dropping the future stops the wait and leaves the workload as it is.
     ///
     /// Poll `workload_status` until the workload reaches `until` (`admitted`, `running`, `ready`
@@ -354,6 +462,80 @@ mod tests {
             Some("{\"a\":1}")
         );
         assert_eq!(last_event(": keep-alive\n\n"), None);
+    }
+
+    #[tokio::test]
+    async fn results_are_written_below_the_destination_as_the_bytes_collected() {
+        let dir = tempfile::tempdir().unwrap();
+        let contents = [
+            json!({"path": "result.json", "bytes": 9, "text": "{\"p50\":1}"}),
+            json!({"path": "runs/a b/trace.bin", "bytes": 3, "base64": "//4A"}),
+            json!({"path": "runs/empty", "bytes": 0, "text": ""}),
+        ];
+        let written = write_contents(&contents, dir.path()).await.unwrap();
+        assert_eq!(
+            written,
+            ["result.json", "runs/a b/trace.bin", "runs/empty"].map(PathBuf::from)
+        );
+        let read = |path: &str| std::fs::read(dir.path().join(path)).unwrap();
+        assert_eq!(read("result.json"), b"{\"p50\":1}");
+        assert_eq!(read("runs/a b/trace.bin"), [0xff, 0xfe, 0x00]);
+        assert_eq!(read("runs/empty"), b"");
+    }
+
+    #[tokio::test]
+    async fn a_result_naming_a_path_outside_the_destination_is_refused_and_not_written() {
+        let outer = tempfile::tempdir().unwrap();
+        let dest = outer.path().join("dest");
+        let absolute = outer.path().join("absolute").display().to_string();
+        for path in [
+            "../escaped",
+            "a/../../escaped",
+            absolute.as_str(),
+            "",
+            "./a",
+        ] {
+            let contents = [json!({"path": path, "bytes": 1, "text": "x"})];
+            let refused = write_contents(&contents, &dest).await.unwrap_err();
+            assert!(
+                matches!(&refused, Error::ResultsPath { path: got } if got == path),
+                "{path}: {refused}"
+            );
+        }
+        for malformed in [
+            json!({"path": "a", "bytes": 1, "base64": "!"}),
+            json!({"path": "a", "bytes": 1}),
+        ] {
+            assert!(matches!(
+                write_contents(&[malformed], &dest).await,
+                Err(Error::Protocol { .. })
+            ));
+        }
+        assert_eq!(std::fs::read_dir(outer.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_job_without_collected_results_says_why() {
+        let error = |state: &str, body: Value| {
+            Error::NoResults {
+                workload: "Job/bench".into(),
+                state: state.into(),
+                body: Box::new(body),
+            }
+            .to_string()
+        };
+        assert_eq!(
+            error("withheld", json!({"note": "its files total 9 bytes"})),
+            "Job/bench has no collected results (withheld): its files total 9 bytes"
+        );
+        assert_eq!(
+            error("failed", json!({"error": "digest", "note": "n"})),
+            "Job/bench has no collected results (failed): digest"
+        );
+        assert_eq!(
+            error("pending", json!({})),
+            "Job/bench has no collected results (pending)"
+        );
     }
 
     #[test]

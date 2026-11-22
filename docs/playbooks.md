@@ -304,7 +304,8 @@ from crucible_kueue import AsyncClient
 
 async def main():
     kueue = AsyncClient()
-    log = await kueue.run("gpu", job, grep="RESULT ")
+    log = await kueue.run("gpu", job, grep="RESULT ", results="/results")
+    files = await kueue.results("Job", job["metadata"]["name"], "out")
     async with kueue.serving("gpu", deployment, 8000) as url:
         ...  # reach the workload at url, from this task or from another Job
 
@@ -312,10 +313,15 @@ asyncio.run(main())
 ```
 
 `run` submits a Job, waits for it to finish and answers its log; it raises when the Job fails.
+With `results` naming a directory in the Job's containers, `results` then writes the files the
+Job left there into a directory of the task's workspace and answers their paths, whether the Job
+passed or failed. Declare them in the task's `emits_files` to make them its output. They are
+deleted with the Job's pods, and a server collects only so many bytes from a pod
+(`whoami`'s `results_max_bytes`); push anything larger to a registry.
 `serving` submits a Job, Deployment, StatefulSet or LeaderWorkerSet with that port exposed, waits
 until it is ready, and deletes it and its Service on the way out. `follow_logs` yields a
 workload's log lines as they are written. Under them are the server's own tools as methods
-(`submit`, `wait`, `workload_status`, `workload_logs`, `workload_delete` and the rest), for
+(`submit`, `wait`, `workload_status`, `workload_logs`, `workload_results`, `workload_delete` and the rest), for
 anything the two do not cover. Cancelling a wait leaves the workload running.
 
 ## MCP servers

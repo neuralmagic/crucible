@@ -245,7 +245,13 @@ fn service_account(cfg: &KueueCfg) -> core::ServiceAccount {
     }
 }
 
-fn args(cfg: &KueueCfg, cluster: &str, issuer: &str, authz: KubeAuthz) -> Result<Vec<String>> {
+fn args(
+    cfg: &KueueCfg,
+    cluster: &str,
+    issuer: &str,
+    authz: KubeAuthz,
+    image: &str,
+) -> Result<Vec<String>> {
     let jwks = cfg
         .run_jwks_uri(issuer)
         .with_context(|| format!("deriving the key set URI of {issuer}"))?;
@@ -295,6 +301,7 @@ fn args(cfg: &KueueCfg, cluster: &str, issuer: &str, authz: KubeAuthz) -> Result
         args.extend(["--storage-class".to_string(), class.clone()]);
     }
     args.extend(["--cluster-domain".to_string(), cfg.cluster_domain.clone()]);
+    args.extend(["--results-image".to_string(), image.to_string()]);
     if cfg.allowlist_profile != crate::deploy::profile::KueueAllowlist::Strict {
         args.extend([
             "--allowlist-profile".to_string(),
@@ -335,7 +342,7 @@ fn deployment(
         name: NAME.to_string(),
         image: Some(image.to_string()),
         image_pull_policy: Some("IfNotPresent".to_string()),
-        args: Some(args(cfg, cluster, issuer, authz)?),
+        args: Some(args(cfg, cluster, issuer, authz, image)?),
         env: Some(vec![env("RUST_LOG", "info".to_string())]),
         ports: Some(vec![core::ContainerPort {
             name: Some(PORT_NAME.to_string()),
@@ -699,8 +706,14 @@ mod tests {
                 "crucible-kueue-e2e",
                 "--cluster-domain",
                 "cluster.local",
+                "--results-image",
+                "registry.example.com/crucible-kueue:latest",
                 "--insecure-jwks-http",
             ]
+        );
+        assert_eq!(
+            deploy["spec"]["template"]["spec"]["containers"][0]["image"],
+            "registry.example.com/crucible-kueue:latest"
         );
         let pulling = crate::deploy::kueue::tests::docs(&PROFILE.replace(
             "[kueue]",
@@ -1406,6 +1419,10 @@ mod tests {
             ("workload_list", serde_json::json!({})),
             (
                 "workload_logs",
+                serde_json::json!({"kind": "Job", "name": "train"}),
+            ),
+            (
+                "workload_results",
                 serde_json::json!({"kind": "Job", "name": "train"}),
             ),
             (
