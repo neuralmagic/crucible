@@ -13,6 +13,7 @@ pub mod cluster_stats;
 pub mod clusters;
 pub mod completion;
 pub mod contract;
+pub(crate) mod declared_attempt;
 pub mod dispatch_target;
 pub mod engine;
 pub(crate) mod evidence_api;

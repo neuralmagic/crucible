@@ -489,6 +489,29 @@ dto! {
     }
 }
 
+/// The failure a pack declared for its attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct FailureLineDto {
+    /// The line as the pack reported it.
+    pub line: String,
+    /// What produced the line: a pod, a host, a remote job id, whatever the pack names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// The task that observed the failure, when the pack named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+}
+
+impl From<crate::runs::declared_attempt::AttemptFailure> for FailureLineDto {
+    fn from(failure: crate::runs::declared_attempt::AttemptFailure) -> Self {
+        Self {
+            line: failure.line,
+            source: failure.source,
+            task: failure.task,
+        }
+    }
+}
+
 /// A run's newest admitted work graph plus every task attempt recorded against the run — the shape
 /// `GET /api/runs/{run_id}/graph` returns.
 #[derive(Debug, Serialize, ToSchema)]
@@ -1307,6 +1330,8 @@ mod tests {
                 ("topic".to_string(), "attention sinks".to_string()),
             ]),
             schema_digest: "sha256:form".to_string(),
+            tree_digest: Some("tree1:9f2c".to_string()),
+            draft_version: Some(4),
             max_cost: 3.5,
             max_time: "30m".to_string(),
             advance_dedupe: false,
@@ -1331,6 +1356,8 @@ mod tests {
         assert_eq!(v["params"]["topic"], "attention sinks");
         assert_eq!(v["params"]["depth"], "deep");
         assert_eq!(v["schema_digest"], "sha256:form");
+        assert_eq!(v["tree_digest"], "tree1:9f2c");
+        assert_eq!(v["draft_version"], 4);
         assert_eq!(v["max_cost"], 3.5);
         assert_eq!(v["max_time"], "30m");
         assert_eq!(v["advance_dedupe"], false);

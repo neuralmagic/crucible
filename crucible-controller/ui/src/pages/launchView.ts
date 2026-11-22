@@ -83,6 +83,16 @@ export function launchVersion(launch: Pick<PlaybookRun, 'draft_version' | 'schem
   return launch.schema_digest.replace(/^sha256:/, '').slice(0, 12);
 }
 
+/// A frozen pack's tree digest, shortened for a header line: `tree1:9f2c…`. Null when the launch
+/// recorded none, which a legacy tarball-only row never did.
+export function treeDigestShort(digest: string | null | undefined): string | null {
+  if (digest === null || digest === undefined) return null;
+  const match = /^tree1:([0-9a-f]+)$/i.exec(digest);
+  if (match === null) return digest;
+  const hex = match[1] ?? '';
+  return `tree1:${hex.slice(0, 6)}${hex.length > 6 ? '…' : ''}`;
+}
+
 /// How long a launch ran, in seconds: from its move into running to the move that took it out of
 /// running. Null while it still runs, or when its trail holds no such pair.
 export function launchWallSecs(events: readonly Pick<IssueEvent, 'from' | 'to' | 'ts'>[]): number | null {

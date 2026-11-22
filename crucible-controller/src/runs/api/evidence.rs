@@ -113,7 +113,6 @@ pub(crate) async fn get_task_evidence(
         let vals: Vec<f64> = mine.iter().filter_map(|r| pick(r)).collect();
         (!vals.is_empty()).then(|| vals.iter().sum())
     };
-
     Ok(Json(TaskEvidenceDto {
         run_id: run_id.clone(),
         task,
@@ -177,6 +176,10 @@ pub struct RunLogDto {
     /// Where the output lives when the controller holds none: the work pod for a pod run, the run's
     /// own directory for a local run that kept no log.
     pub location: Option<String>,
+    /// The failure the pack declared for the attempt, when a task ended in a way a reader needs it
+    /// for. Read from the stored results, so the response window cannot cut it away.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<crate::api::dto::FailureLineDto>,
 }
 
 /// The copy of a run's output a log response was cut from.
@@ -250,6 +253,12 @@ pub(crate) async fn get_run_log(
         crate::runs::model::RunDispatch::Pod => pod_run_log(&state, &run, &run_id).await,
     };
     let source = log.as_ref().map(|(_, source)| *source);
+    let results = crate::runs::task_results::list_task_results(state.db.pool(), &run_id)
+        .await
+        .unwrap_or_default();
+    let failure = crate::runs::declared_attempt::declared_failure(&results)
+        .filter(|_| crate::runs::declared_attempt::run_failed(&results))
+        .map(Into::into);
     let most = task_evidence::LogCap {
         bytes: query.bytes,
         lines: query.lines,
@@ -267,6 +276,7 @@ pub(crate) async fn get_run_log(
         text: window.map(|w| w.text),
         source,
         location,
+        failure,
     })
     .into_response())
 }

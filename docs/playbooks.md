@@ -159,6 +159,11 @@ poem pass
 check pass
 ```
 
+A task that writes diagnostics such as `build.log`, `summary.json`, or
+`failure-diagnostics.json` declares them in `emits_files`, and the run's Files section lists
+them with their content. The engine's declared-file capture is the same path a report or a
+findings file takes; no extra evidence directory is involved.
+
 ## Report a pull request or a pushed branch
 
 If a task makes something outside the run, declare the field that holds its URL as `link`.
@@ -535,6 +540,25 @@ draft is ready, `crux draft-graduate` opens a PR that exports it to a repository
 `crux playbook-import owner/repo --path haiku` proposes to register it from that repository.
 After registration, `crux launch` starts the playbook with parameters, and
 `crux playbook-runs` lists its runs.
+
+A launch's acknowledgement and `crux playbook-run <key>` name the pack actually run: the
+`tree1:` digest it was frozen at and, for a draft, the version it pinned. The same detail names
+the launch's current attempt, from the `attempt` object a task returns on its last stdout line:
+
+```json
+{"pass": false, "note": "[pod/overlay-p1-runner/runner] FATAL: prebuild failed",
+ "attempt": {
+   "labels": {"job": "batch/overlay-p1", "pod": "overlay-p1-runner",
+              "artifact-root": "results:/workloads/c1"},
+   "failure": {"line": "[pod/overlay-p1-runner/runner] FATAL: prebuild failed",
+               "source": "overlay-p1-runner"}}}
+```
+
+`attempt` belongs to this declaration; a task's other output fields are its own. The labels are
+free-form; the pack chooses the keys and values a reader should see. Every field is optional, and
+later tasks may add to what an earlier one reported. The controller reads this object and never
+infers identifiers from log text. The run page shows the labels and filters
+`[pod/<pod>/<container>]` output by pod, pinning the source the declared failure names.
 
 A registration runs one variant of the pack's manifest
 ([variants](crucible-contract.md#1-the-manifest-crucibletoml)). Add `--variant offline` to

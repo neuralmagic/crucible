@@ -2056,6 +2056,12 @@ pub struct LaunchAck {
     pub provider: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    /// The frozen pack's `tree1:` digest; absent on a legacy tarball-only row.
+    #[serde(default)]
+    pub tree_digest: Option<String>,
+    /// The draft version this launch pinned; absent for a registered pack.
+    #[serde(default)]
+    pub draft_version: Option<i64>,
     /// What this launch is allowed to write and reach, recorded before anything executed. Absent
     /// on a registered launch, whose disclosure is the registry revision's.
     #[serde(default)]

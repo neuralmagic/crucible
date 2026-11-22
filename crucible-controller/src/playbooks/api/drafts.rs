@@ -1385,6 +1385,17 @@ pub(crate) async fn launch_playbook_draft(
         Err(e) => return ApiError::from(e).into_response(),
     }
 
+    let tree_digest =
+        match crate::runs::blob_store::pack_ref(state.db.pool(), &crate::model::sanitize_key(&key))
+            .await
+        {
+            Ok(Some(crate::playbooks::pack_trees::PackRef::Tree(digest))) => {
+                Some(digest.to_string())
+            }
+            Ok(_) => None,
+            Err(e) => return ApiError::from(e).into_response(),
+        };
+
     state
         .audit(
             crate::event_log::Event::now(
@@ -1412,6 +1423,8 @@ pub(crate) async fn launch_playbook_draft(
             playbook: id,
             params: body.params,
             schema_digest: head.schema_digest,
+            tree_digest,
+            draft_version: Some(head.version),
             max_cost: body.max_cost,
             max_time: max_time.as_str().to_string(),
             advance_dedupe: false,
