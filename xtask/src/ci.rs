@@ -1546,17 +1546,22 @@ mod tests {
         let engine_jobs = "default_packages=-p crucible -p crucible-controller \
                            controller generated_docs lint kind_e2e ui";
         let engine_and_dependents =
-            format!("packages={engine} doc_packages={engine} {engine_jobs}");
-        let engine_sources =
-            format!("packages={engine} -p xtask doc_packages={engine} {engine_jobs}");
+            format!("packages={engine} -p crucible-runner doc_packages={engine} {engine_jobs}");
+        let engine_sources = format!(
+            "packages={engine} -p crucible-runner -p xtask doc_packages={engine} {engine_jobs}"
+        );
         let controller = "packages=-p crucible-controller doc_packages=-p crucible-controller \
                           default_packages=-p crucible-controller controller lint kind_e2e ui";
-        let forge =
-            "-p crucible -p crucible-broker -p crucible-controller -p crucible-lsp -p forge";
-        let forge_and_dependents = format!("packages={forge} doc_packages={forge} {engine_jobs}");
+        let forge_and_dependents = format!(
+            "packages=-p crucible -p crucible-broker -p crucible-controller -p crucible-lsp \
+             -p crucible-runner -p forge \
+             doc_packages=-p crucible -p crucible-broker -p crucible-controller -p crucible-lsp \
+             -p forge {engine_jobs}"
+        );
         let contract = "packages=-p buildit -p crucible -p crucible-broker -p crucible-contract \
                         -p crucible-controller -p crucible-git -p crucible-harness -p crucible-kueue \
-                        -p crucible-kueue-client -p crucible-lsp -p crucible-mcp-auth -p crux \
+                        -p crucible-kueue-client -p crucible-lsp -p crucible-mcp-auth \
+                        -p crucible-runner -p crux \
                         doc_packages=-p crucible -p crucible-broker -p crucible-contract \
                         -p crucible-controller -p crucible-harness -p crucible-kueue \
                         -p crucible-kueue-client -p crucible-lsp -p crucible-mcp-auth -p crux \

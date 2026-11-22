@@ -2351,6 +2351,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "crucible-runner"
+version = "0.7.2"
+dependencies = [
+ "anyhow",
+ "clap",
+ "crucible",
+ "crucible-contract",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "crucible-vcs"
 version = "0.7.2"
 dependencies = [

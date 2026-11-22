@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crucible",
+    "crucible-runner",
     "crucible-contract",
     "crucible-view",
     "crucible-vcs",
