@@ -8,7 +8,7 @@
 
 #[cfg(feature = "autoresearch")]
 pub(crate) mod console;
-pub(crate) mod evidence_client;
+pub(crate) use crucible::evidence as evidence_client;
 pub(crate) mod flow_dd;
 #[cfg(feature = "autoresearch")]
 pub(crate) mod reporter;

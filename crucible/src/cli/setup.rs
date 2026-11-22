@@ -7,8 +7,11 @@ use crate::control::broker;
 use crate::manifest;
 use crate::manifest::launch::Setting;
 use anyhow::{Context, Result};
-use crucible_vcs::vcs;
 use std::path::Path;
+
+pub(crate) use crate::plan::setup::Start;
+#[cfg(feature = "autoresearch")]
+pub(crate) use crate::plan::setup::warn_inherited_env;
 
 /// What the frozen manifest projects onto a run: the bounds the broker enforces, and the grants
 /// the capability disclosure covers.
@@ -327,145 +330,6 @@ pub(crate) fn prep_plan_runner(
     )
 }
 
-/// Whether a run checks out its own workspace or continues one an earlier run started (a resume
-/// or a rerun), whose recorded commit decides the checkout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Start {
-    Fresh,
-    Continues,
-}
-
-/// A launch ref on a workspace that already exists, which a fresh run would not check out.
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "repo.ref {git_ref} needs a fresh checkout, but {} already exists; remove it or launch \
-     without repo.ref",
-    .workspace.display()
-)]
-pub(crate) struct LaunchRefNeedsFreshWorkspace {
-    git_ref: manifest::GitRef,
-    workspace: std::path::PathBuf,
-}
-
-/// A launched commit that no branch or tag the pack admits contains.
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "repo.ref {commit} is on no branch or tag [repo.overrides].refs admits; the branches and tags \
-     holding it are [{}]",
-    .on.join(", ")
-)]
-pub(crate) struct PinOutsideAllowedRefs {
-    commit: manifest::GitRef,
-    on: Vec<String>,
-}
-
-/// Keep a freshly cloned commit only when a branch or tag the pack admits holds it; otherwise
-/// remove the clone, so no later run reuses it.
-fn check_pinned_commit(
-    workspace: &Path,
-    commit: &manifest::GitRef,
-    gate: &manifest::RepoOverridesCfg,
-) -> Result<()> {
-    let refusal: anyhow::Error = match crate::cli::workspace::refs_containing(workspace, commit) {
-        Ok(on) if on.iter().any(|name| gate.allows(name)) => return Ok(()),
-        Ok(on) => PinOutsideAllowedRefs {
-            commit: commit.clone(),
-            on,
-        }
-        .into(),
-        Err(e) => e.into(),
-    };
-    if let Err(e) = std::fs::remove_dir_all(workspace) {
-        tracing::warn!(workspace = %workspace.display(), error = %e, "removing a refused clone");
-    }
-    Err(refusal)
-}
-
-/// Put a resumed run's workspace back to the commit it started from, with the manifest's injects
-/// laid over it as a fresh checkout would have them.
-pub(crate) fn restore_pristine(
-    manifest_path: &Path,
-    m: &manifest::Manifest,
-    base: &str,
-) -> Result<()> {
-    let manifest_dir = manifest::manifest_dir(manifest_path);
-    let workspace = manifest_dir.join(&m.workspace.dir);
-    crucible_vcs::git_memory::restore(&workspace, base, &[]).with_context(|| {
-        format!("restoring the workspace to the commit the run started from ({base})")
-    })?;
-    for (src, dst, _frozen) in m.resolved_injects(&manifest_dir, &workspace)? {
-        manifest::apply_inject(&src, &dst)
-            .context("applying [workspace].inject to the restored workspace")?;
-    }
-    Ok(())
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "the parent run started from {base}, which this workspace neither has nor matches; a rerun \
-     starts where its parent did"
-)]
-struct RerunBaseUnavailable {
-    base: String,
-}
-
-/// Rebuild a rerun's workspace: the blobs `fetched` names that a partial clone lacks, the commit
-/// its parent started from, or this checkout's `HEAD` when that holds the same tree or the
-/// workspace has no repository of its own, then the reused tasks' commits, then the manifest's
-/// injects. Returns the commit the rerun starts from.
-pub(crate) fn restore_for_rerun(
-    manifest_path: &Path,
-    m: &manifest::Manifest,
-    parent: &crate::plan::resume::RunStart,
-    commits: &[crucible_vcs::git_memory::TaskCommit],
-    fetched: &[String],
-) -> Result<String> {
-    use crucible_vcs::git_memory;
-    let manifest_dir = manifest::manifest_dir(manifest_path);
-    let workspace = manifest_dir.join(&m.workspace.dir);
-    crate::cli::workspace::fetch_blobs(&workspace, fetched)
-        .context("fetching the file contents the parent run's workspace held")?;
-    let base = if git_memory::tree_of(&workspace, &parent.base)?.is_some() {
-        parent.base.clone()
-    } else {
-        let head = vcs::head_sha(&workspace)?;
-        let own_baseline = m.workspace.setup_cmd.is_none() && m.repo.source().is_none();
-        match git_memory::tree_of(&workspace, &head)? {
-            _ if own_baseline => head,
-            Some(tree) if !parent.base_tree.is_empty() && tree == parent.base_tree => head,
-            _ => {
-                return Err(RerunBaseUnavailable {
-                    base: parent.base.clone(),
-                }
-                .into());
-            }
-        }
-    };
-    git_memory::restore(&workspace, &base, &[])
-        .with_context(|| format!("restoring the workspace to the parent's base ({base})"))?;
-    git_memory::replay(&workspace, commits)?;
-    for (src, dst, _frozen) in m.resolved_injects(&manifest_dir, &workspace)? {
-        manifest::apply_inject(&src, &dst)
-            .context("applying [workspace].inject to the rerun's workspace")?;
-    }
-    Ok(base)
-}
-
-/// Say at run start that the pack's host commands inherit the engine's environment.
-pub(crate) fn warn_inherited_env(inherits: bool) {
-    if inherits {
-        eprintln!(
-            "[crucible] WARNING: {}",
-            manifest::edition::INHERITED_ENV_WARNING
-        );
-    }
-}
-
-/// Where a manifest run keeps its state: the session log, captured files, and run records.
-pub(crate) fn state_dir(manifest_path: &Path) -> std::path::PathBuf {
-    manifest::manifest_dir(manifest_path).join("state")
-}
-
 pub(crate) fn prep_plan_runner_with_params(
     manifest_path: &Path,
     variant: Option<&manifest::variant::VariantName>,
@@ -475,10 +339,8 @@ pub(crate) fn prep_plan_runner_with_params(
     engine: Option<tokio::runtime::Handle>,
     start: Start,
 ) -> Result<(crate::plan::harness::HarnessRunner, manifest::Manifest)> {
-    let mut m = manifest::Manifest::load_frozen_variant(manifest_path, variant)?;
-    let manifest_dir = manifest::manifest_dir(manifest_path);
-    m.resolve_workflow_with(&manifest_dir, params)?;
-    warn_inherited_env(crate::exposure::inherits_engine_env(&m));
+    let loaded = crate::plan::setup::load(manifest_path, variant, params)?;
+    let m = &loaded.manifest;
     if let Some(all) = m.launch.all() {
         for (setting, flag, value) in [
             (
@@ -493,51 +355,15 @@ pub(crate) fn prep_plan_runner_with_params(
             }
         }
     }
-    let workspace = manifest_dir.join(&m.workspace.dir);
-    let state = state_dir(manifest_path);
-    let skills = m.agent.toolbox_dir.as_ref().map(|d| manifest_dir.join(d));
-    let p = crate::args::Paths::for_manifest(workspace.clone(), state, &manifest_dir, skills);
+    let p = &loaded.paths;
     // Before the workspace clone: crucible-git reads the draft-pr bound to authorize it.
     let frozen = frozen_projection(
-        &m,
+        m,
         m.publish.as_ref().and_then(|p| p.pr_repo.as_deref()),
         &manifest::launch::split(params).0,
         &p.session_log,
     )?;
-    let launched_ref = m.launch.repo_ref();
-    if workspace.exists() {
-        if let Some(r) = launched_ref
-            && start == Start::Fresh
-        {
-            return Err(LaunchRefNeedsFreshWorkspace {
-                git_ref: r.clone(),
-                workspace,
-            }
-            .into());
-        }
-    } else {
-        crate::cli::workspace::manifest_setup(&m, &manifest_dir, &workspace)?;
-        if let Some(commit) = launched_ref.filter(|r| r.is_commit()) {
-            check_pinned_commit(&workspace, commit, &m.repo.overrides)?;
-        }
-        for (src, dst, _frozen) in m.resolved_injects(&manifest_dir, &workspace)? {
-            manifest::apply_inject(&src, &dst)
-                .context("applying [workspace].inject after setup")?;
-        }
-    }
-    vcs::ensure_repo(&workspace).context("ensuring workspace is a git repo")?;
-    // The harness's own files, plus where a task's staged inputs land. Without this a playbook's
-    // per-task commit sweeps in the toolbox, the results log, and every artifact an ancestor
-    // handed this task, and each task's commit reads as though it produced all of them.
-    let excludes: Vec<String> = m
-        .workspace
-        .carried_paths()
-        .into_iter()
-        .chain(std::iter::once(format!("{}/", crate::plan::STAGED_INPUTS)))
-        .collect();
-    crucible_vcs::git_memory::install_harness_excludes(&workspace, &excludes);
-    std::fs::create_dir_all(&p.state)
-        .with_context(|| format!("creating state dir {}", p.state.display()))?;
+    loaded.checkout(start)?;
     // Default Args (as if `crucible` ran flagless) carrying the launch's own agent flags, then
     // the manifest's [agent] folded on top — the same resolution a loop run does.
     let mut args = Args::defaults().context("constructing default args")?;
@@ -547,49 +373,24 @@ pub(crate) fn prep_plan_runner_with_params(
     args.harness = agent.harness;
     args.model = agent.model;
     let harness = pin_agent(&mut args, &m.agent)?;
-    crate::cli::workspace::install_toolbox(
-        &p,
-        &m.agent.toolbox_exclude,
-        harness.spec().skills_dir,
-    )?;
+    crate::cli::workspace::install_toolbox(p, &m.agent.toolbox_exclude, harness.spec().skills_dir)?;
     apply_agent_cfg(&mut args, &m.agent, &m.secrets, &p.workspace, &frozen)?;
-    start_mcp(&mut args, &m.mcp).map_err(|e| end_run_at_setup(&p, e))?;
-    args.workflow_frozen_injects = m.frozen_inject_pairs(&manifest_dir)?;
+    start_mcp(&mut args, &m.mcp).map_err(|e| end_run_at_setup(p, e))?;
+    args.workflow_frozen_injects = m.frozen_inject_pairs(&loaded.manifest_dir)?;
     args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
-    args.workflow_env = m
-        .workflow
-        .as_ref()
-        .map(crate::plan::workflow::WorkflowCfg::host_env)
-        .transpose()?
-        .unwrap_or_default();
+    args.workflow_env = loaded.host_env()?;
     args.workflow_servers = m
         .workflow
         .as_ref()
         .map(|w| w.servers.clone())
         .unwrap_or_default();
     args.buildit_socket = Some(p.buildit_socket());
-    // A playbook's git memory is per task; the scored loop owns the same repository for
-    // keep/discard of whole candidates and must not find per-task commits inside an iteration.
-    let commit_per_task = m
-        .workflow
-        .as_ref()
-        .is_some_and(|w| w.workflow_type == crate::plan::workflow::WorkflowType::Playbook);
-    Ok((
-        crate::plan::harness::HarnessRunner {
-            args,
-            paths: p,
-            commit_per_task,
-            captured_bytes: std::sync::atomic::AtomicU64::new(0),
-            staged: Default::default(),
-            budget_left: f64::INFINITY,
-        },
-        m,
-    ))
+    loaded.runner(args)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::cli::setup::*;
     use crate::testing::{args_from, manifest_toml, tempdir};
     use std::fs;
 

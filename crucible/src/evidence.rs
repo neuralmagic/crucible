@@ -8,8 +8,8 @@
 //! session for the controller to scrape from the pod log, and a turn's manifest marks the artifact
 //! undelivered.
 
-use crate::args::Paths;
-use crucible::plan::rerun::GIT_MEMORY_DIR;
+use crate::paths::Paths;
+use crate::plan::rerun::GIT_MEMORY_DIR;
 use crucible_contract::ArtifactKind;
 use crucible_contract::artifact::{gzip, tar_gz_dir, untar_gz};
 #[cfg(feature = "autoresearch")]
@@ -47,7 +47,7 @@ enum Target {
 
 /// Where a pod uploads its evidence: the controller, what the evidence belongs to, and the pod's
 /// token.
-pub(crate) struct Upload {
+pub struct Upload {
     base: String,
     target: Target,
     token: String,
@@ -63,7 +63,7 @@ impl Upload {
 
     /// A scope turn pod's upload, keyed by the pod's own name.
     #[cfg(feature = "autoresearch")]
-    pub(crate) fn turn_from_env() -> Option<Self> {
+    pub fn turn_from_env() -> Option<Self> {
         Self::from_env(Target::Turn(non_empty_env(
             crucible_contract::ENV_POD_NAME,
         )?))
@@ -102,7 +102,7 @@ fn non_empty_env(name: &str) -> Option<String> {
 /// Upload the finished run's evidence when the pod carries a controller and a run token: the
 /// captured files, the git memory, and the otel log when the run produced them, and the session
 /// log last, since the controller completes the run off it.
-pub(crate) fn deliver_run_evidence(p: &Paths) {
+pub fn deliver_run_evidence(p: &Paths) {
     let Some(upload) = Upload::run_from_env() else {
         return;
     };
@@ -168,7 +168,7 @@ fn deliver_file(upload: &Upload, kind: ArtifactKind, path: &Path) -> bool {
 /// Upload one of a scope turn's gzipped artifacts. Always returns the [`ArtifactRef`] the turn's
 /// manifest carries, with the digest computed here and whether the controller stored it.
 #[cfg(feature = "autoresearch")]
-pub(crate) fn upload_turn_artifact(upload: &Upload, kind: ArtifactKind, gz: &[u8]) -> ArtifactRef {
+pub fn upload_turn_artifact(upload: &Upload, kind: ArtifactKind, gz: &[u8]) -> ArtifactRef {
     ArtifactRef {
         kind,
         digest: content_digest(gz),
@@ -341,7 +341,7 @@ pub fn fetch_parent(parent: &url::Url, dest: &Path) -> Result<(), FetchError> {
 
 #[cfg(all(test, feature = "autoresearch"))]
 mod tests {
-    use crate::report::evidence_client::{Target, Upload, send, upload_turn_artifact};
+    use crate::evidence::{Target, Upload, send, upload_turn_artifact};
     use crucible_contract::{ArtifactKind, content_digest};
     use std::time::Duration;
 
@@ -354,7 +354,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             for status in &statuses {
                 let (mut s, _) = listener.accept().expect("accept");
-                crate::testing::answer_one_request(&mut s, status);
+                crate::test_fixtures::answer_one_request(&mut s, status);
             }
             statuses.len()
         });
@@ -393,22 +393,19 @@ mod tests {
         let marker = state
             .path()
             .join(crucible_contract::RUN_SESSION_UNDELIVERED);
-        crate::report::evidence_client::mark_session(state.path(), true).expect("no mark yet");
+        crate::evidence::mark_session(state.path(), true).expect("no mark yet");
         assert!(!marker.exists());
-        crate::report::evidence_client::mark_session(state.path(), false).expect("mark");
+        crate::evidence::mark_session(state.path(), false).expect("mark");
         assert!(marker.exists());
-        crate::report::evidence_client::mark_session(state.path(), true).expect("clear");
+        crate::evidence::mark_session(state.path(), true).expect("clear");
         assert!(!marker.exists());
     }
 
     #[test]
     fn an_error_body_is_cut_to_its_first_line() {
         let page = "\n  <html>\n  <body>all pods are down</body>\n</html>";
-        assert_eq!(crate::report::evidence_client::first_line(page), "<html>");
-        assert_eq!(
-            crate::report::evidence_client::first_line(&"x".repeat(500)).len(),
-            200
-        );
+        assert_eq!(crate::evidence::first_line(page), "<html>");
+        assert_eq!(crate::evidence::first_line(&"x".repeat(500)).len(), 200);
     }
 
     fn turn(base: String) -> Upload {
@@ -426,7 +423,7 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().expect("addr"));
         let server = std::thread::spawn(move || {
             let (mut s, _) = listener.accept().expect("accept");
-            crate::testing::read_one_request(&mut s)
+            crate::test_fixtures::read_one_request(&mut s)
         });
         let gz = b"\x1f\x8bpack".to_vec();
         let art = upload_turn_artifact(&turn(base), ArtifactKind::ScopePack, &gz);
@@ -458,7 +455,7 @@ mod tests {
 
     #[test]
     fn a_turn_upload_needs_the_controller_its_name_and_a_token() {
-        let _env = crucible::test_support::env_lock();
+        let _env = crate::test_support::env_lock();
         let vars = [
             crucible_contract::ENV_CONTROLLER_URL,
             crucible_contract::ENV_POD_NAME,

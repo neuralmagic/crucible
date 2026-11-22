@@ -56,23 +56,13 @@ pub struct Granted {
 
 impl Granted {
     fn new(server: AgentServer) -> Result<Self, AgentServersError> {
-        let bad = |reason: &str| AgentServersError::Url {
-            name: server.name.to_string(),
-            url: server.url.clone(),
-            reason: reason.to_string(),
-        };
-        let parsed = url::Url::parse(&server.url).map_err(|e| bad(&e.to_string()))?;
-        if !matches!(parsed.scheme(), "http" | "https") {
-            return Err(bad("the scheme must be http or https"));
-        }
-        let host = parsed
-            .host_str()
-            .filter(|h| !h.is_empty())
-            .ok_or_else(|| bad("it has no host"))?
-            .to_string();
-        let port = parsed
-            .port_or_known_default()
-            .ok_or_else(|| bad("it has no port"))?;
+        let (host, port) = crucible::openshell::http_host_port(&server.url).map_err(|reason| {
+            AgentServersError::Url {
+                name: server.name.to_string(),
+                url: server.url.clone(),
+                reason,
+            }
+        })?;
         Ok(Self { server, host, port })
     }
 

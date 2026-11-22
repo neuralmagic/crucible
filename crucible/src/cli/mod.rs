@@ -9,7 +9,7 @@ pub(crate) mod run;
 pub(crate) mod scored;
 pub(crate) mod selftest;
 pub(crate) mod setup;
-pub(crate) mod workspace;
+pub(crate) use crucible::workspace;
 
 use crate::args::Args;
 #[cfg(feature = "autoresearch")]

@@ -5,11 +5,37 @@ use std::collections::BTreeMap;
 use crucible_broker::decide::{DecideError, Endpoint, decide};
 use crucible_contract::TransportCause;
 use crucible_contract::decision::{CompiledQuestion, QuestionId};
+use crucible_contract::inference::{ENV_INFERENCE, InferenceRole};
 use serde_json::Value;
 
 use crate::plan::attempt::{Attempt, AttemptOutcome};
 use crate::plan::ir::{Task, TaskName};
 use crate::plan::options::asked_questions;
+
+/// What a runner calls for a model-decided route.
+pub type ModelRoute =
+    fn(&Task, &BTreeMap<QuestionId, CompiledQuestion>, f64, &BTreeMap<TaskName, Value>) -> Attempt;
+
+/// A model-decided route answered by the decision binding in the run's inference document.
+pub fn model_attempt_from_env(
+    route: &Task,
+    questions: &BTreeMap<QuestionId, CompiledQuestion>,
+    min_confidence: f64,
+    inputs: &BTreeMap<TaskName, Value>,
+) -> Attempt {
+    let inference = match crate::inference::from_process_env() {
+        Ok(inference) => inference,
+        Err(error) => return Attempt::failed(0.0, error.to_string()),
+    };
+    let Some(binding) = inference.binding(InferenceRole::Decision) else {
+        return Attempt::failed(0.0, format!("{ENV_INFERENCE} holds no decision binding"));
+    };
+    let endpoint = match Endpoint::from_binding(binding, |name| std::env::var(name).ok()) {
+        Ok(endpoint) => endpoint,
+        Err(error) => return Attempt::failed(0.0, error.to_string()),
+    };
+    model_attempt(&endpoint, route, questions, min_confidence, inputs)
+}
 
 pub fn model_attempt(
     endpoint: &Endpoint,

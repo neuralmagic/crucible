@@ -1,8 +1,8 @@
 //! Preparing a manifest's workspace: the setup command or clone, and the toolbox copied into it.
 
-use crate::args::Paths;
 use crate::errors::FileError;
 use crate::manifest::{self, GitRef};
+use crate::paths::Paths;
 use crucible_vcs::cli::{GitError, git};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::RecvTimeoutError;
@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 /// What preparing a workspace can fail on: the setup command, the clone, the toolbox copy.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum WorkspaceError {
+pub enum WorkspaceError {
     #[error("running setup_cmd: {cmd}")]
     SpawnSetupCmd {
         cmd: String,
@@ -85,7 +85,7 @@ pub(crate) enum WorkspaceError {
 /// Prepare the manifest's workspace: run `setup_cmd` (cwd = manifest dir, the one command that
 /// runs there since it *creates* the workspace), else `git clone` `[repo]`, else an empty dir
 /// for a repo-less playbook. Injects land after this, and `ensure_repo` commits the baseline.
-pub(crate) fn manifest_setup(
+pub fn manifest_setup(
     m: &manifest::Manifest,
     manifest_dir: &Path,
     workspace: &Path,
@@ -121,7 +121,7 @@ pub(crate) fn manifest_setup(
 
 /// `git clone <src> <dest>`, then `git_ref` fetched and checked out detached. A clone whose
 /// ref cannot be checked out is removed, so no later run mistakes it for one at that ref.
-pub(crate) fn clone_repo(
+pub fn clone_repo(
     src: &str,
     git_ref: Option<&GitRef>,
     filter: Option<crate::manifest::CloneFilter>,
@@ -265,7 +265,7 @@ fn promisor_remote(workspace: &Path) -> Result<Option<String>, WorkspaceError> {
 
 /// The blobs a partial clone has fetched from origin, by id, sorted: those its checkout needed
 /// and those anything since read. None for a full clone, which holds every blob from the start.
-pub(crate) fn fetched_blobs(workspace: &Path) -> Result<Vec<String>, WorkspaceError> {
+pub fn fetched_blobs(workspace: &Path) -> Result<Vec<String>, WorkspaceError> {
     if promisor_remote(workspace)?.is_none() {
         return Ok(Vec::new());
     }
@@ -322,7 +322,7 @@ pub(crate) fn fetched_blobs(workspace: &Path) -> Result<Vec<String>, WorkspaceEr
 
 /// Fetch those of `blobs` a partial clone does not hold from the remote it was cloned from. A
 /// full clone holds every blob its remote serves, so there is nothing to fetch.
-pub(crate) fn fetch_blobs(workspace: &Path, blobs: &[String]) -> Result<(), WorkspaceError> {
+pub fn fetch_blobs(workspace: &Path, blobs: &[String]) -> Result<(), WorkspaceError> {
     if blobs.is_empty() {
         return Ok(());
     }
@@ -370,7 +370,7 @@ pub(crate) fn fetch_blobs(workspace: &Path, blobs: &[String]) -> Result<(), Work
 }
 
 /// The branches and tags of a fresh clone whose history holds `commit`, by short name.
-pub(crate) fn refs_containing(dest: &Path, commit: &GitRef) -> Result<Vec<String>, WorkspaceError> {
+pub fn refs_containing(dest: &Path, commit: &GitRef) -> Result<Vec<String>, WorkspaceError> {
     let read = |source| WorkspaceError::ReadRefs {
         dest: dest.to_path_buf(),
         source,
@@ -409,7 +409,7 @@ pub(crate) fn refs_containing(dest: &Path, commit: &GitRef) -> Result<Vec<String
 /// never see, see [`manifest::AgentCfg::toolbox_exclude`]. A name in `exclude` that doesn't
 /// exist under the toolbox dir is a manifest bug (the exclusion is silently doing nothing), so
 /// it's an error rather than a warning.
-pub(crate) fn install_toolbox(
+pub fn install_toolbox(
     p: &Paths,
     exclude: &[String],
     skills_dir: &str,
@@ -454,8 +454,8 @@ pub(crate) fn install_toolbox(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::testing::tempdir;
+    use crate::test_fixtures::tempdir;
+    use crate::workspace::*;
     use std::fs;
 
     fn at(raw: &str) -> GitRef {
@@ -464,7 +464,7 @@ mod tests {
 
     #[test]
     fn a_ref_is_fetched_and_checked_out_detached_by_any_name() {
-        let origin = crate::testing::git_origin("clone-refs");
+        let origin = crate::test_fixtures::git_origin("clone-refs");
         let src = origin.path.to_string_lossy().into_owned();
         let clone = |name: &str, r: Option<&str>| {
             let dest = origin.path.with_extension(name);
@@ -474,7 +474,7 @@ mod tests {
 
         let plain = clone("plain", None).expect("clones");
         assert_eq!(
-            crate::testing::checked_out(&plain),
+            crate::test_fixtures::checked_out(&plain),
             (origin.main.clone(), false)
         );
         for (name, r, expected) in [
@@ -486,7 +486,7 @@ mod tests {
         ] {
             let dest = clone(name, Some(r)).unwrap_or_else(|e| panic!("{r}: {e:#}"));
             assert_eq!(
-                crate::testing::checked_out(&dest),
+                crate::test_fixtures::checked_out(&dest),
                 (expected.clone(), true),
                 "{r}"
             );
@@ -506,7 +506,7 @@ mod tests {
 
     #[test]
     fn a_filtered_clone_is_partial_and_keeps_every_commit() {
-        let origin = crate::testing::git_origin("clone-filter");
+        let origin = crate::test_fixtures::git_origin("clone-filter");
         let git = |dir: &std::path::Path, args: &[&str]| {
             std::process::Command::new("git")
                 .arg("-C")
@@ -530,7 +530,7 @@ mod tests {
         )
         .expect("clones");
         assert_eq!(
-            crate::testing::checked_out(&dest),
+            crate::test_fixtures::checked_out(&dest),
             (origin.feature.clone(), true)
         );
         let filter = git(&dest, &["config", "remote.origin.partialclonefilter"]);
@@ -548,7 +548,7 @@ mod tests {
 
     #[test]
     fn a_partial_clone_lists_the_blobs_it_fetched_and_another_fetches_them() {
-        let origin = crate::testing::git_origin("clone-fetched");
+        let origin = crate::test_fixtures::git_origin("clone-fetched");
         let git = |dir: &std::path::Path, args: &[&str]| {
             let out = std::process::Command::new("git")
                 .arg("-C")
@@ -629,7 +629,7 @@ mod tests {
 
     #[test]
     fn listing_and_fetching_carry_more_blobs_than_a_pipe_buffers() {
-        let origin = crate::testing::git_origin("clone-many");
+        let origin = crate::test_fixtures::git_origin("clone-many");
         let git = |dir: &std::path::Path, args: &[&str]| {
             let out = std::process::Command::new("git")
                 .arg("-C")
@@ -692,7 +692,7 @@ mod tests {
 
     #[test]
     fn a_commit_is_held_by_the_branches_and_tags_whose_history_has_it() {
-        let origin = crate::testing::git_origin("clone-contains");
+        let origin = crate::test_fixtures::git_origin("clone-contains");
         let dest = origin.path.with_extension("clone");
         clone_repo(&origin.path.to_string_lossy(), None, None, &dest).expect("clones");
         let held = |commit: &str| refs_containing(&dest, &at(commit)).expect("reads refs");

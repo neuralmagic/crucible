@@ -41,19 +41,22 @@ mod runloop;
 #[cfg(feature = "autoresearch")]
 mod scope;
 #[cfg(test)]
+mod test_fixtures;
+#[cfg(test)]
 mod testing;
 pub(crate) use crucible_harness::stream_json;
 
-use crucible::{deploy, duration, errors, exposure, flow, knobs, manifest, outputs, turn_trace};
+#[cfg(feature = "autoresearch")]
+use crucible::errors;
+use crucible::{deploy, duration, exposure, flow, knobs, manifest, outputs, turn_trace};
 
 /// The OpenShell turn runtime. The gateway client and the egress policy are library code (the
 /// deploy renderer needs their constants); the per-turn flow, provider, and sandbox helpers run
 /// only here.
 mod openshell {
-    pub use crucible::openshell::{gateway, grpc, policy};
+    pub use crucible::openshell::{buildit, gateway, grpc, policy};
 
     pub mod agent_servers;
-    pub mod buildit;
     pub mod git;
     pub mod provider;
     pub mod run;
@@ -63,17 +66,22 @@ mod openshell {
 /// The plan runtime: the CLI and the agent-harness task runner over the library's plan IR,
 /// compiler, and executor.
 mod plan {
+    #[cfg(test)]
+    pub use crucible::plan::resume;
+    #[cfg(feature = "autoresearch")]
+    pub use crucible::plan::worktree;
     pub use crucible::plan::{
-        STAGED_INPUTS, TASK_NAME_ENV, admission, attempt, exec, files, history, ir, machine,
-        record, rerun, resume, runner, starlark, term_img, workflow, worktree,
+        STAGED_INPUTS, TASK_NAME_ENV, admission, attempt, exec, history, ir, machine, route, run,
+        runner, setup, starlark, term_img, workflow, workspace_runner,
     };
+    #[cfg(any(test, feature = "autoresearch"))]
+    pub use crucible::plan::{files, template};
 
     pub mod cli;
     pub mod desk;
     pub mod events;
     pub mod harness;
     pub mod task_tokens;
-    pub mod template;
     pub mod transcript;
     pub mod turn_log;
 }

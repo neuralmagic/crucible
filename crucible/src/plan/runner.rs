@@ -22,7 +22,6 @@ use crate::plan::exec::TaskRunner;
 use crate::plan::ir::{Decider, Task, TaskKind, TaskName};
 use crate::plan::output::{Finished, Output, json_line, run_echoed};
 use crucible_contract::TransportCause;
-use crucible_contract::inference::{ENV_INFERENCE, InferenceRole};
 
 /// Upstream results as JSON, set only while they fit [`INPUTS_ENV_MAX`].
 pub const INPUTS_ENV: &str = "CRUCIBLE_INPUTS";
@@ -52,6 +51,9 @@ pub struct ShellRunner {
     /// The MCP servers command and evaluate tasks reach with the tokens in their files, exported
     /// as [`crucible_contract::task_servers::ENV_TASK_SERVERS`].
     pub task_servers: Vec<crucible_contract::task_servers::TaskServer>,
+    /// What answers a model-decided route. `None` fails one, and leaves the decision client out
+    /// of a binary that never sets it.
+    pub model_route: Option<crate::plan::route::ModelRoute>,
 }
 
 impl TaskRunner for ShellRunner {
@@ -245,30 +247,13 @@ impl ShellRunner {
                 questions,
                 decider: Decider::Model { min_confidence, .. },
             } => {
-                let inference = match crate::inference::from_process_env() {
-                    Ok(inference) => inference,
-                    Err(error) => return Attempt::failed(0.0, error.to_string()),
-                };
-                let Some(binding) = inference.binding(InferenceRole::Decision) else {
+                let Some(decide) = self.model_route else {
                     return Attempt::failed(
                         0.0,
-                        format!("{ENV_INFERENCE} holds no decision binding"),
+                        "model-decided route reached a runner that calls no model".to_string(),
                     );
                 };
-                let endpoint =
-                    match crucible_broker::decide::Endpoint::from_binding(binding, |name| {
-                        std::env::var(name).ok()
-                    }) {
-                        Ok(endpoint) => endpoint,
-                        Err(error) => return Attempt::failed(0.0, error.to_string()),
-                    };
-                return crate::plan::route::model_attempt(
-                    &endpoint,
-                    task,
-                    questions,
-                    *min_confidence,
-                    inputs,
-                );
+                return decide(task, questions, *min_confidence, inputs);
             }
             TaskKind::Route {
                 decider: Decider::Output { .. } | Decider::Human { .. },
@@ -514,6 +499,7 @@ mod tests {
             buildit_socket: None,
             github: false,
             task_servers: Vec::new(),
+            model_route: Some(crate::plan::route::model_attempt_from_env),
         }
     }
 
@@ -1401,6 +1387,7 @@ mod tests {
             buildit_socket: None,
             github: false,
             task_servers: Vec::new(),
+            model_route: Some(crate::plan::route::model_attempt_from_env),
         };
         let a = r.run(&t, 1, &BTreeMap::new(), None);
         match a.outcome {

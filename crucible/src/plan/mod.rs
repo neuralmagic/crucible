@@ -19,10 +19,15 @@ pub mod record;
 pub mod rerun;
 pub mod resume;
 pub mod route;
+pub mod run;
 pub mod runner;
+pub mod session_events;
+pub mod setup;
 pub mod starlark;
+pub mod template;
 pub mod term_img;
 pub mod workflow;
+pub mod workspace_runner;
 pub mod worktree;
 
 /// The exit code of a run that finished with an invalid verdict, or ended at setup. It is not a
