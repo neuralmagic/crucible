@@ -1,0 +1,12 @@
+diff --git a/crates/rune-kit/src/controls/checkbox.rs b/crates/rune-kit/src/controls/checkbox.rs
+--- a/crates/rune-kit/src/controls/checkbox.rs
++++ b/crates/rune-kit/src/controls/checkbox.rs
+@@ -75,7 +75,7 @@ impl Checkbox {
+             State::Disabled => (c.surface_disabled, c.border_disabled),
+             State::Hover => (c.surface_hover, c.border_hover),
+             _ if on => (c.surface_weak, c.std_border),
+-            _ => (Color::TRANSPARENT, c.border_weak),
++            _ => (Color::TRANSPARENT, c.std_border),
+         };
+         let mark = match self.glyph {
+             Some(g) => icon(g, 14.0),
