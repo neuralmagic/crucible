@@ -130,3 +130,4 @@
   - [ADR-0077: A provider names each model's limits, and the binding carries them to the harness](./adr/ADR-0077.md)
   - [ADR-0078: A Kueue workload's result files leave the pod on an injected sidecar's log](./adr/ADR-0078.md)
   - [ADR-0079: A separate engine binary runs a playbook's commands and links no model client](./adr/ADR-0079.md)
+  - [ADR-0080: Images live in one quay.io organisation and clusters pull them with a read-only robot](./adr/ADR-0080.md)

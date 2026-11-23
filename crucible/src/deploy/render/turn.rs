@@ -717,8 +717,12 @@ mod tests {
         assert!(!yaml.contains("BROKER_"), "no broker env on a turn pod");
         assert!(!yaml.contains("kind: NetworkPolicy"));
         assert!(!yaml.contains("kind: RoleBinding"));
-        // No avoid-list in the profile, no affinity stanza.
-        assert!(!yaml.contains("affinity"), "no affinity key: {yaml}");
+        // The default architecture and, with no avoid-list in the profile, nothing else.
+        assert!(yaml.contains("key: kubernetes.io/arch") && yaml.contains("- amd64"));
+        assert!(
+            !yaml.contains("kubernetes.io/hostname"),
+            "no avoid-list: {yaml}"
+        );
         // No controller configured, so the turn uploads nowhere.
         assert!(
             !yaml.contains("CRUCIBLE_CONTROLLER_URL"),

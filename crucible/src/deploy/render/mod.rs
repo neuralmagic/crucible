@@ -14,7 +14,7 @@
 //!
 //! Split into [`kube`] (the loop `Pod`/RBAC/`NetworkPolicy` renderer) and [`turn`] (the one-shot
 //! WorkPod turn renderer), the two share only the profile-derived helpers (`resources`,
-//! `secret_env_vars`, `node_avoid_affinity`) and a handful of mount-path consts.
+//! `secret_env_vars`, `node_affinity`) and a handful of mount-path consts.
 
 pub mod dispatch;
 pub mod gateway;

@@ -159,6 +159,12 @@ ui-types:
 gen-images:
     cargo xtask images gen
 
+# Set up the quay.io organisation the images are pushed to: repositories, the read team, the CI
+# robot and its Actions secrets, and the pull Secret. Prompts for a Quay token and before each
+# change; `just quay-setup --dry-run` only prints them (scripts/quay-setup.sh).
+quay-setup *args:
+    scripts/quay-setup.sh {{args}}
+
 # Regenerate docs/dsl-reference.md from the compiler's DSL tables (the pre-commit hook's job,
 # for when you want it without a commit).
 dsl-docs:
