@@ -486,9 +486,7 @@ slug() {
     echo "${s//:/_}"
 }
 
-# run_dir_name <run id>: a local run's directory name under scratch/local-runs. The controller
-# keys it by the run id's sha256, not the id, so an id's length cannot reach the paths beneath
-# (a run's unix sockets must stay under the kernel's 108-byte sun_path cap).
+# run_dir_name <run id>: a local run's directory name under scratch/local-runs.
 run_dir_name() { printf %s "$1" | shasum -a 256 | cut -d' ' -f1 | cut -c1-16; }
 
 # local_pack <label>: the pack directory of the label's local run, resolved through the run id
