@@ -23,14 +23,20 @@ pub fn safe_segment(seg: &str) -> bool {
     !seg.is_empty() && seg != "." && seg != ".." && !seg.contains(['/', '\\', '\0'])
 }
 
-/// The directory a local run unpacks itself into: `<scratch>/local-runs/<hash of the run id>`.
-/// A run id names a directory far too long for the paths beneath: a run's buildit socket is a
-/// unix socket, and its path must stay under the kernel's 108-byte `sun_path` cap.
+/// The directory a local run unpacks itself into: `<scratch>/local-runs/<hash of the run id>`, or
+/// `<scratch>/local-runs/<sanitized run id>` where an older controller left the run there.
 pub fn run_dir(scratch_root: &Path, run_id: &str) -> PathBuf {
     use sha2::Digest;
+    let runs = scratch_root.join("local-runs");
     let digest = sha2::Sha256::digest(run_id.as_bytes());
     let name: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
-    scratch_root.join("local-runs").join(name)
+    let hashed = runs.join(name);
+    let legacy = runs.join(crate::model::sanitize_key(run_id));
+    if !hashed.exists() && legacy.is_dir() {
+        legacy
+    } else {
+        hashed
+    }
 }
 
 /// Where the supervisor mirrors a local run's engine output.
@@ -365,6 +371,28 @@ mod tests {
         for good in ["triage[1027]", "playbook_triage-local_01a0", "REPORT.md"] {
             assert!(safe_segment(good), "{good:?} is an ordinary name");
         }
+    }
+
+    #[test]
+    fn a_run_left_under_its_sanitized_id_is_still_found() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let scratch = root.path();
+        let run_id = "playbook:fences:0199-1";
+        let hashed = run_dir(scratch, run_id);
+        let legacy = scratch
+            .join("local-runs")
+            .join(crate::model::sanitize_key(run_id));
+        assert_ne!(hashed, legacy);
+
+        std::fs::create_dir_all(&legacy).expect("mkdir");
+        assert_eq!(run_dir(scratch, run_id), legacy);
+        assert_eq!(
+            state_dir(scratch, run_id),
+            legacy.join("pack").join("state")
+        );
+
+        std::fs::create_dir_all(&hashed).expect("mkdir");
+        assert_eq!(run_dir(scratch, run_id), hashed, "a hashed dir wins");
     }
 
     #[tokio::test]
