@@ -29,9 +29,11 @@ const CEILING_SLACK: Duration = Duration::from_secs(120);
 /// How many trailing output lines ride a failure that published no session.
 const TAIL_LINES: usize = 40;
 
-/// How long the supervisor keeps draining the engine's pipes after the engine exits. A server
-/// the engine leaves behind with an inherited stderr holds the pipe open indefinitely.
+/// How long the supervisor keeps draining the engine's pipes after the engine exits.
 const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(10);
+
+/// How long an engine past its ceiling has to stop its own children before its group is killed.
+const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
 
 /// A launch running as a subprocess: the child, its process group, and the directory it runs in.
 pub struct LocalRun {
@@ -42,9 +44,7 @@ pub struct LocalRun {
     deadline: Duration,
 }
 
-/// The process group a local run's engine leads, holding everything it spawned. Its Drop kills
-/// the group however the run ended: the engine's per-run servers bind ports the profile fixes
-/// (buildit's), so a survivor would block the next run's server from starting.
+/// The process group a local run's engine leads. Dropping it SIGKILLs the group.
 struct ProcessGroup(nix::unistd::Pid);
 
 impl ProcessGroup {
@@ -55,16 +55,55 @@ impl ProcessGroup {
         let pid = i32::try_from(pid).with_context(|| format!("engine pid {pid} is not a pid_t"))?;
         Ok(Self(nix::unistd::Pid::from_raw(pid)))
     }
+
+    /// SIGINT the group. The engine answers it by stopping the children it put in groups of
+    /// their own.
+    fn interrupt(&self) {
+        self.signal(nix::sys::signal::Signal::SIGINT);
+    }
+
+    fn signal(&self, signal: nix::sys::signal::Signal) {
+        match nix::sys::signal::killpg(self.0, signal) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+            Err(e) => {
+                tracing::warn!(pgid = %self.0, %signal, error = %e, "signalling a local run's process group failed")
+            }
+        }
+    }
 }
 
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
-        match nix::sys::signal::killpg(self.0, nix::sys::signal::Signal::SIGKILL) {
-            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
-            Err(e) => {
-                tracing::warn!(pgid = %self.0, error = %e, "killing a local run's process group failed")
-            }
+        self.signal(nix::sys::signal::Signal::SIGKILL);
+    }
+}
+
+/// The last [`TAIL_LINES`] lines of a run's output, across both pipes.
+#[derive(Clone, Default)]
+struct Tail(std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>);
+
+impl Tail {
+    fn push(&self, line: String) {
+        let mut lines = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if lines.len() == TAIL_LINES {
+            lines.pop_front();
         }
+        lines.push_back(line);
+    }
+
+    fn text(&self) -> String {
+        let lines = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lines
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
@@ -289,7 +328,7 @@ pub async fn supervise(db: Db, key: String, run: LocalRun) {
         run_id,
         deadline,
     } = run;
-    let mut tail = Vec::new();
+    let tail = Tail::default();
     let mut streams = tokio::task::JoinSet::new();
     let log = EngineLog::open(&dir, &run_id).await;
     // Both pipes are drained concurrently with the wait, so a chatty run can never fill a pipe
@@ -297,12 +336,14 @@ pub async fn supervise(db: Db, key: String, run: LocalRun) {
     if let Some(out) = child.stdout.take() {
         let run_id = run_id.clone();
         let log = log.as_ref().map(EngineLog::sink);
-        streams.spawn(async move { pump(BufReader::new(out), &run_id, "stdout", log).await });
+        let tail = tail.clone();
+        streams.spawn(async move { pump(BufReader::new(out), &run_id, "stdout", log, tail).await });
     }
     if let Some(err) = child.stderr.take() {
         let run_id = run_id.clone();
         let log = log.as_ref().map(EngineLog::sink);
-        streams.spawn(async move { pump(BufReader::new(err), &run_id, "stderr", log).await });
+        let tail = tail.clone();
+        streams.spawn(async move { pump(BufReader::new(err), &run_id, "stderr", log, tail).await });
     }
 
     let outcome = match tokio::time::timeout(deadline, child.wait()).await {
@@ -315,6 +356,8 @@ pub async fn supervise(db: Db, key: String, run: LocalRun) {
             format!("waiting on the engine failed: {e}")
         }
         Err(_) => {
+            group.interrupt();
+            let _ = tokio::time::timeout(INTERRUPT_GRACE, child.wait()).await;
             drop(group);
             let _ = child.wait().await;
             format!(
@@ -323,32 +366,20 @@ pub async fn supervise(db: Db, key: String, run: LocalRun) {
             )
         }
     };
-    // The pipes are drained to keep a chatty run from filling a buffer, not to capture output
-    // the engine never wrote. The group is dead by here, closing what inherited the pipes; the
-    // bound backstops a holder the kill missed.
-    let _ = tokio::time::timeout(PIPE_DRAIN_GRACE, async {
-        while let Some(joined) = streams.join_next().await {
-            if let Ok(lines) = joined {
-                tail.extend(lines);
-            }
-        }
+    let drained = tokio::time::timeout(PIPE_DRAIN_GRACE, async {
+        while streams.join_next().await.is_some() {}
     })
     .await;
+    if drained.is_err() {
+        streams.shutdown().await;
+    }
     if let Some(log) = log {
         log.close().await;
     }
 
     let session = std::fs::read_to_string(session_log(&dir)).unwrap_or_default();
     if session.trim().is_empty() {
-        let tail = tail
-            .iter()
-            .rev()
-            .take(TAIL_LINES)
-            .rev()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n");
-        let detail = format!("{outcome}. Last output:\n{tail}");
+        let detail = format!("{outcome}. Last output:\n{}", tail.text());
         tracing::warn!(%key, %run_id, "{detail}");
         settle_no_session(&db, &key, &run_id, detail).await;
         return;
@@ -510,23 +541,18 @@ async fn pump<R>(
     run_id: &str,
     stream: &str,
     log: Option<mpsc::Sender<String>>,
-) -> Vec<String>
-where
+    tail: Tail,
+) where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut lines = reader.lines();
-    let mut kept = Vec::new();
     while let Ok(Some(line)) = lines.next_line().await {
         tracing::debug!(%run_id, %stream, "{line}");
         if let Some(log) = &log {
             let _ = log.send(line.clone()).await;
         }
-        kept.push(line);
-        if kept.len() > TAIL_LINES * 4 {
-            kept.drain(..TAIL_LINES);
-        }
+        tail.push(line);
     }
-    kept
 }
 
 #[cfg(test)]
@@ -763,30 +789,60 @@ mod tests {
         let log = EngineLog::open(dir.path(), "r1")
             .await
             .expect("the log opens in a real directory");
-        let out = pump(
+        let tail = Tail::default();
+        pump(
             BufReader::new(&b"line one\nline two\n"[..]),
             "r1",
             "stdout",
             Some(log.sink()),
+            tail.clone(),
         )
         .await;
-        let err = pump(
+        pump(
             BufReader::new(&b"complaint\n"[..]),
             "r1",
             "stderr",
             Some(log.sink()),
+            tail.clone(),
         )
         .await;
-        assert_eq!(out, vec!["line one", "line two"]);
-        assert_eq!(err, vec!["complaint"]);
+        assert_eq!(tail.text(), "line one\nline two\ncomplaint");
         log.close().await;
         let written = std::fs::read_to_string(engine_log(dir.path())).expect("the mirror exists");
         assert_eq!(written, "line one\nline two\ncomplaint\n");
 
         let gone = EngineLog::open(&dir.path().join("missing"), "r1").await;
         assert!(gone.is_none(), "an unwritable dir keeps no log");
-        let still = pump(BufReader::new(&b"tail\n"[..]), "r1", "stdout", None).await;
-        assert_eq!(still, vec!["tail"], "output still reaches the failure tail");
+        let still = Tail::default();
+        pump(
+            BufReader::new(&b"tail\n"[..]),
+            "r1",
+            "stdout",
+            None,
+            still.clone(),
+        )
+        .await;
+        assert_eq!(
+            still.text(),
+            "tail",
+            "output still reaches the failure tail"
+        );
+    }
+
+    #[test]
+    fn the_tail_keeps_only_the_last_lines() {
+        let tail = Tail::default();
+        for n in 0..TAIL_LINES + 2 {
+            tail.push(n.to_string());
+        }
+        let text = tail.text();
+        let kept: Vec<&str> = text.lines().collect();
+        assert_eq!(kept.len(), TAIL_LINES);
+        assert_eq!(kept.first().copied(), Some("2"));
+        assert_eq!(
+            kept.last().copied(),
+            Some((TAIL_LINES + 1).to_string().as_str())
+        );
     }
 
     fn spawn_group_with_straggler(leader_waits: bool) -> (tokio::process::Child, ProcessGroup) {
@@ -822,7 +878,7 @@ mod tests {
     /// A shutdown drops the supervisor mid-run: the engine and whatever it started go with it,
     /// not just the direct child.
     #[tokio::test]
-    async fn dropping_an_armed_process_group_kills_what_the_engine_spawned() {
+    async fn dropping_a_process_group_kills_what_the_engine_spawned() {
         let (mut child, group) = spawn_group_with_straggler(true);
         let straggler = straggler_pid(&mut child).await;
         assert!(alive(straggler), "the background sleep is running");
@@ -831,8 +887,7 @@ mod tests {
         until_dead(straggler).await;
     }
 
-    /// The engine exiting on its own takes the group with it: buildit binds a port fixed by the
-    /// profile, and a survivor blocks the next run's server from starting.
+    /// The engine exiting on its own takes the group with it.
     #[tokio::test]
     async fn an_engine_that_exits_normally_still_takes_its_straggler() {
         let (mut child, group) = spawn_group_with_straggler(false);
@@ -852,6 +907,150 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// An engine stand-in: it writes `boom` to stderr, starts a child that leaves the group
+    /// holding its pipes and prints the child's pid, then waits. SIGINT makes it stop the child
+    /// and exit 130, as the engine does; SIGTERM makes it exit and leave the child behind.
+    const ENGINE_WITH_OUTSIDER: &str = r#"
+$| = 1;
+my $outsider;
+$SIG{INT} = sub { kill "TERM", $outsider; exit 130 };
+$SIG{TERM} = sub { exit 0 };
+print STDERR "boom\n";
+$outsider = fork();
+if ($outsider == 0) { setpgrp(0, 0); print "$$\n"; exec "sleep", "300" }
+waitpid($outsider, 0);
+"#;
+
+    async fn local_run_with_outsider(
+        dir: &Path,
+        run_id: &str,
+        deadline: Duration,
+    ) -> (LocalRun, nix::unistd::Pid) {
+        let mut child = tokio::process::Command::new("perl")
+            .args(["-e", ENGINE_WITH_OUTSIDER])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn perl");
+        let outsider = straggler_pid(&mut child).await;
+        let group = ProcessGroup::led_by(&child).expect("the child has a pid");
+        let run = LocalRun {
+            child,
+            group,
+            dir: dir.to_path_buf(),
+            run_id: run_id.to_string(),
+            deadline,
+        };
+        (run, outsider)
+    }
+
+    /// A `running` launch and its local run's row, as dispatch leaves them for the supervisor.
+    async fn running_launch(db: &Db, key: &str, run_id: &str) -> Result<()> {
+        crate::issues::store::upsert_issue(
+            db.pool(),
+            &crate::NewIssue {
+                key: key.to_string(),
+                repo: "o/r".to_string(),
+                priority: 0,
+                evidence_url: None,
+                title: None,
+                author: None,
+                body: None,
+                labels: Vec::new(),
+                upstream_updated_at: None,
+            },
+        )
+        .await?;
+        assert!(
+            crate::issues::store::claim_issue(db.pool(), key, Status::New, Status::Running).await?
+        );
+        crate::runs::store::insert_run(
+            db.pool(),
+            &crate::NewRun {
+                run_id: run_id.to_string(),
+                scope: None,
+                issue: Some(key.to_string()),
+                identity_digest: None,
+                status: "running".to_string(),
+                pod: None,
+                session_uri: None,
+                best_score: None,
+                cost_usd: None,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn parked_reason(db: &Db, key: &str) -> Result<String> {
+        let issue = crate::issues::store::get_issue(db.pool(), key)
+            .await?
+            .context("the launch's issue")?;
+        assert_eq!(issue.status, Status::Parked);
+        Ok(issue.parked_reason.unwrap_or_default())
+    }
+
+    /// A process outside the engine's group that keeps the engine's stderr open does not hold the
+    /// run open, and what the pipe carried before the cut still reaches the park and the log.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_pipe_held_open_outside_the_group_does_not_hold_the_run_open(
+        pool: sqlx::PgPool,
+    ) -> Result<()> {
+        let db = Db::new(pool);
+        let dir = tempfile::tempdir()?;
+        running_launch(&db, "o/r#1", "run-held").await?;
+        let (run, outsider) =
+            local_run_with_outsider(dir.path(), "run-held", Duration::from_secs(60)).await;
+        nix::sys::signal::kill(run.group.0, nix::sys::signal::Signal::SIGTERM)?;
+
+        tokio::time::timeout(
+            PIPE_DRAIN_GRACE * 3,
+            supervise(db.clone(), "o/r#1".to_string(), run),
+        )
+        .await
+        .context("the supervisor waited on a pipe that never closes")?;
+
+        let held = alive(outsider);
+        let _ = nix::sys::signal::kill(outsider, nix::sys::signal::Signal::SIGKILL);
+        assert!(held, "the group's kill missed the pipe's holder");
+        let reason = parked_reason(&db, "o/r#1").await?;
+        assert!(reason.contains("Last output:\nboom"), "{reason}");
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE run_id = $1")
+            .bind("run-held")
+            .fetch_one(db.pool())
+            .await?;
+        assert_eq!(status, "no-session");
+        assert_eq!(std::fs::read_to_string(engine_log(dir.path()))?, "boom\n");
+        Ok(())
+    }
+
+    /// An engine past its ceiling is interrupted before its group is killed, so it stops the
+    /// children that group does not hold.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn an_engine_past_its_ceiling_stops_its_children_outside_the_group(
+        pool: sqlx::PgPool,
+    ) -> Result<()> {
+        let db = Db::new(pool);
+        let dir = tempfile::tempdir()?;
+        running_launch(&db, "o/r#1", "run-late").await?;
+        let (run, outsider) =
+            local_run_with_outsider(dir.path(), "run-late", Duration::from_millis(200)).await;
+
+        tokio::time::timeout(
+            PIPE_DRAIN_GRACE,
+            supervise(db.clone(), "o/r#1".to_string(), run),
+        )
+        .await
+        .context("the engine's child outlived it and held the pipes")?;
+
+        until_dead(outsider).await;
+        let reason = parked_reason(&db, "o/r#1").await?;
+        assert!(reason.contains("outlived its ceiling"), "{reason}");
+        Ok(())
     }
 
     /// A run directory is per launch and safe to build from a run id, which carries the launch
