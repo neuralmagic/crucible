@@ -1,0 +1,21 @@
+[repo]
+path = "."
+[workspace]
+dir = "workspace"
+setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+[[workspace.inject]]
+src = "build.py"
+dst = "build.py"
+[[workspace.inject]]
+src = "Dockerfile"
+dst = "build/Dockerfile"
+[[workspace.inject]]
+src = "gitignore"
+dst = ".gitignore"
+[agent]
+backend = "command"
+agent_cmd = "true"
+goal = "build a vllm pull request branch through buildit"
+[workflow]
+type = "playbook"
+file = "workflow.star"
