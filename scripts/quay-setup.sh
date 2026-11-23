@@ -219,34 +219,51 @@ stage_read_team() {
     local all="$REPOS_PUBLIC $REPOS_PRIVATE $QUAY_PUBLIC_REPOS $QUAY_PRIVATE_REPOS"
     # shellcheck disable=SC2086
     all=$(printf '%s\n' $all | sort -u | tr '\n' ' ')
+    local repo have_team=0 member=0 reads="" missing=""
+    # shellcheck disable=SC2086
+    if contains "$QUAY_READ_TEAM" $TEAMS; then
+        have_team=1
+        call "reading the team's members" GET "/organization/$QUAY_ORG/team/$QUAY_READ_TEAM/members"
+        # shellcheck disable=SC2046
+        ! contains "$QUAY_ORG+$QUAY_PULL_ROBOT" $(field '[.members[]?.name] | join(" ")') || member=1
+        call "reading the team's permissions" GET \
+            "/organization/$QUAY_ORG/team/$QUAY_READ_TEAM/permissions"
+        reads=$(field '[.permissions[]?.repository.name] | join(" ")')
+    fi
+    for repo in $all; do
+        # shellcheck disable=SC2086
+        contains "$repo" $reads || missing="$missing $repo"
+    done
+
     say
     say "2. Read team $QUAY_READ_TEAM"
-    # shellcheck disable=SC2086
-    contains "$QUAY_READ_TEAM" $TEAMS || say "  create team $QUAY_READ_TEAM"
+    if [ "$have_team" -eq 1 ] && [ "$READ_PROTOTYPE" -gt 0 ] && [ "$member" -eq 1 ] && [ -z "$missing" ]; then
+        say "  nothing to change"
+        return
+    fi
+    [ "$have_team" -eq 1 ] || say "  create team $QUAY_READ_TEAM"
     [ "$READ_PROTOTYPE" -gt 0 ] || say "  default permission: new repositories grant it read"
-    # shellcheck disable=SC2086
-    say "  grant it read on $(printf '%s\n' $all | wc -l | tr -d ' ') repositories (every one in the organisation)"
-    say "  add robot $QUAY_ORG+$QUAY_PULL_ROBOT to it"
+    [ -z "$missing" ] || say "  grant it read on:$missing"
+    [ "$member" -eq 1 ] || say "  add robot $QUAY_ORG+$QUAY_PULL_ROBOT to it"
     [ "$DRY_RUN" -eq 0 ] || return 0
     confirm "Apply the read team?" || {
         say "  skipped"
         return
     }
-    # shellcheck disable=SC2086
-    contains "$QUAY_READ_TEAM" $TEAMS ||
+    [ "$have_team" -eq 1 ] ||
         call "creating team $QUAY_READ_TEAM" PUT "/organization/$QUAY_ORG/team/$QUAY_READ_TEAM" \
             '{"role":"member","description":"Reads every repository. Cluster pull robots."}'
     if [ "$READ_PROTOTYPE" -eq 0 ]; then
         call "adding the default permission" POST "/organization/$QUAY_ORG/prototypes" \
             "$(jq -cn --arg team "$QUAY_READ_TEAM" '{role: "read", delegate: {name: $team, kind: "team"}}')"
     fi
-    local repo
-    for repo in $all; do
+    for repo in $missing; do
         call "granting read on $repo" PUT \
             "/repository/$QUAY_ORG/$repo/permissions/team/$QUAY_READ_TEAM" '{"role":"read"}'
     done
-    call "adding $QUAY_PULL_ROBOT to $QUAY_READ_TEAM" PUT \
-        "/organization/$QUAY_ORG/team/$QUAY_READ_TEAM/members/$QUAY_ORG+$QUAY_PULL_ROBOT"
+    [ "$member" -eq 1 ] ||
+        call "adding $QUAY_PULL_ROBOT to $QUAY_READ_TEAM" PUT \
+            "/organization/$QUAY_ORG/team/$QUAY_READ_TEAM/members/$QUAY_ORG+$QUAY_PULL_ROBOT"
     say "  done"
 }
 
