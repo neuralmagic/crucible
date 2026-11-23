@@ -253,9 +253,25 @@ stage_read_team() {
 stage_ci_robot() {
     say
     say "3. CI robot $QUAY_ORG+$QUAY_CI_ROBOT"
+    local repo writes= missing=
     # shellcheck disable=SC2086
-    contains "$QUAY_CI_ROBOT" $ROBOTS || say "  create it"
-    say "  grant it write on: $QUAY_PUBLIC_REPOS $QUAY_PRIVATE_REPOS"
+    if contains "$QUAY_CI_ROBOT" $ROBOTS; then
+        call "reading the robot's permissions" GET \
+            "/organization/$QUAY_ORG/robots/$QUAY_CI_ROBOT/permissions"
+        writes=$(field '[.permissions[]? | select(.role == "write" or .role == "admin")
+            | .repository.name] | join(" ")')
+    else
+        say "  create it"
+    fi
+    for repo in $QUAY_PUBLIC_REPOS $QUAY_PRIVATE_REPOS; do
+        # shellcheck disable=SC2086
+        contains "$repo" $writes || missing="$missing $repo"
+    done
+    if [ -z "$missing" ]; then
+        say "  it already has write on every repository"
+        return
+    fi
+    say "  grant it write on:$missing"
     [ "$DRY_RUN" -eq 0 ] || return 0
     confirm "Apply the CI robot?" || {
         say "  skipped"
@@ -265,8 +281,7 @@ stage_ci_robot() {
     contains "$QUAY_CI_ROBOT" $ROBOTS ||
         call "creating robot $QUAY_CI_ROBOT" PUT "/organization/$QUAY_ORG/robots/$QUAY_CI_ROBOT" \
             "$(jq -cn --arg d "CI push for ${GH_REPO:-this repository}" '{description: $d}')"
-    local repo
-    for repo in $QUAY_PUBLIC_REPOS $QUAY_PRIVATE_REPOS; do
+    for repo in $missing; do
         call "granting write on $repo" PUT \
             "/repository/$QUAY_ORG/$repo/permissions/user/$QUAY_ORG+$QUAY_CI_ROBOT" '{"role":"write"}'
     done
