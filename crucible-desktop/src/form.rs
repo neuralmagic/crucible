@@ -19,7 +19,7 @@ pub enum Kind {
     /// One of these values.
     Choice(Vec<String>),
     /// Any of these values, sent as a list; the answer is its JSON array.
-    Picks(Vec<String>),
+    MultiChoice(Vec<String>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -103,7 +103,9 @@ pub fn fields(schema: &Value) -> Vec<Field> {
                 .and_then(strings);
             let kind = match (listed, prop.get("type").and_then(Value::as_str)) {
                 (_, Some("boolean")) => Kind::Bool,
-                (_, Some("array")) if picks.is_some() => Kind::Picks(picks.unwrap_or_default()),
+                (_, Some("array")) if picks.is_some() => {
+                    Kind::MultiChoice(picks.unwrap_or_default())
+                }
                 (Some(values), _) => Kind::Choice(values.iter().map(text_of).collect()),
                 (None, Some("integer")) => Kind::Integer,
                 (None, Some("number")) => Kind::Number,
@@ -128,7 +130,7 @@ pub fn fields(schema: &Value) -> Vec<Field> {
                     .unwrap_or_else(|| match kind {
                         Kind::Bool => "false".to_string(),
                         Kind::Choice(ref values) => values.first().cloned().unwrap_or_default(),
-                        Kind::Picks(_) => "[]".to_string(),
+                        Kind::MultiChoice(_) => "[]".to_string(),
                         _ => String::new(),
                     }),
                 kind,
@@ -265,7 +267,7 @@ impl Field {
     }
 }
 
-/// The values a `Picks` answer holds; empty when it is not a JSON list of strings.
+/// The values a `MultiChoice` answer holds; empty when it is not a JSON list of strings.
 pub fn picked(answer: &str) -> Vec<String> {
     serde_json::from_str::<Value>(answer)
         .ok()
@@ -274,7 +276,7 @@ pub fn picked(answer: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// A `Picks` answer with `value` flipped, its entries kept in the order of `choices`.
+/// A `MultiChoice` answer with `value` flipped, its entries kept in the order of `choices`.
 pub fn toggled(choices: &[String], answer: &str, value: &str) -> String {
     let mut held = picked(answer);
     if let Some(at) = held.iter().position(|v| v == value) {
@@ -329,7 +331,7 @@ pub fn params(fields: &[Field], answers: &[String]) -> Result<Value, Problems> {
         }
         let value = match &field.kind {
             Kind::Text | Kind::Multiline | Kind::Choice(_) => Value::String(answer.to_string()),
-            Kind::Picks(choices) => {
+            Kind::MultiChoice(choices) => {
                 let held = picked(answer);
                 if field.required && held.is_empty() {
                     problems.push((i, "Pick at least one".to_string()));
@@ -742,7 +744,7 @@ mod tests {
         });
         let f = fields(&schema);
         let picks = vec!["chat".to_string(), "agentic".to_string()];
-        assert_eq!(f[1].kind, Kind::Picks(picks.clone()));
+        assert_eq!(f[1].kind, Kind::MultiChoice(picks.clone()));
         assert_eq!(f[0].kind, Kind::Text, "a list without choices stays typed");
         assert_eq!(picked(&f[1].default), picks);
 

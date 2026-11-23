@@ -384,7 +384,7 @@ fn form(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
                     *edit(app, Slot::Answer(i)) = TextEdit::new(if on { "false" } else { "true" });
                 })
                 .build(p.k),
-            (Kind::Picks(values), _) => {
+            (Kind::MultiChoice(values), _) => {
                 let held = crate::form::picked(answer);
                 let mut boxes = row()
                     .key(format!("launch-picks-{}", field.name))
