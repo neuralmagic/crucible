@@ -878,6 +878,11 @@ pub struct Cluster {
     /// nodeAffinity `NotIn` on `kubernetes.io/hostname` for every pod this profile renders.
     #[serde(default)]
     pub avoid_nodes: Vec<String>,
+    /// The node architectures this deployment's images run on; rendered as a required
+    /// nodeAffinity `In` on `kubernetes.io/arch` for every pod this profile renders. Empty adds
+    /// none.
+    #[serde(default = "default_arches")]
+    pub arches: Vec<Arch>,
     /// The controller's base URL as a pod reaches it, e.g.
     /// `http://crucible-controller.autoresearch.svc:8080`. A run pod gets it as
     /// `CRUCIBLE_CONTROLLER_URL` and uploads its evidence to its run there under the run token
@@ -1033,6 +1038,27 @@ pub const DEFAULT_SANDBOX_SERVICE_ACCOUNT: &str = "crucible-sandbox";
 /// Where supervisors find the SPIFFE Workload API: the SPIRE agent's socket name under both the
 /// upstream chart and the Zero Trust Workload Identity Manager.
 pub const DEFAULT_SPIFFE_SOCKET: &str = "/spiffe-workload-api/spire-agent.sock";
+
+/// A node architecture, as the `kubernetes.io/arch` label names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Arch {
+    Amd64,
+    Arm64,
+}
+
+impl Arch {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Amd64 => "amd64",
+            Self::Arm64 => "arm64",
+        }
+    }
+}
+
+fn default_arches() -> Vec<Arch> {
+    vec![Arch::Amd64]
+}
 
 /// Where the OpenShell image workflow pushes the sandbox runtime image, tagged `sha-<rev>`.
 pub const SANDBOX_RUNTIME_IMAGE_REPO: &str = "ghcr.io/neuralmagic/openshell-sandbox";
@@ -1538,6 +1564,21 @@ mod tests {
             profile.cluster.sandbox_runtime_image().unwrap(),
             "registry.example.com/sandbox:x"
         );
+    }
+
+    #[test]
+    fn arches_default_to_amd64_and_take_a_list() {
+        let arches = |extra: &str| -> Result<Vec<Arch>, toml::de::Error> {
+            let text = BASE.replace("[cluster]", &format!("[cluster]\n{extra}"));
+            Ok(toml::from_str::<DeployProfile>(&text)?.cluster.arches)
+        };
+        assert_eq!(arches("").unwrap(), vec![Arch::Amd64]);
+        assert_eq!(
+            arches("arches = [\"arm64\", \"amd64\"]").unwrap(),
+            vec![Arch::Arm64, Arch::Amd64]
+        );
+        assert!(arches("arches = []").unwrap().is_empty());
+        assert!(arches("arches = [\"riscv64\"]").is_err());
     }
 
     /// Every profile written before `avoid_nodes` existed must keep parsing, with an empty list.

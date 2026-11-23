@@ -2884,8 +2884,12 @@ mod tests {
         assert!(docs[0].contains("app.kubernetes.io/managed-by: crucible"));
         assert!(docs[0].contains("crucible/run: alpha"));
 
-        // No avoid-list in the profile, no affinity stanza, the pre-avoid_nodes output verbatim.
-        assert!(!yaml.contains("affinity"), "no affinity key: {yaml}");
+        // The default architecture and, with no avoid-list in the profile, nothing else.
+        assert!(yaml.contains("key: kubernetes.io/arch") && yaml.contains("- amd64"));
+        assert!(
+            !yaml.contains("kubernetes.io/hostname"),
+            "no avoid-list: {yaml}"
+        );
         // Backward compat: a baked-domain render (no pack) emits NO ConfigMap and no pack-staging.
         assert!(
             !yaml.contains("kind: ConfigMap"),

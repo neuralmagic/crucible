@@ -1,8 +1,9 @@
 name: Docker
 
 # Build the domain-neutral runtime image (docker/Containerfile.runtime: crucible engine +
-# crucible-broker + forge bins on the UBI/OpenShell runtime) and push it to GHCR. Runs on the
-# main line, release tags, and manual dispatch (trusted refs only, never on pull_request).
+# crucible-broker + forge bins on the UBI/OpenShell runtime) and push it to GHCR and to
+# quay.io/crucible-ai under the same names and tags. Runs on the main line, release tags, and
+# manual dispatch (trusted refs only, never on pull_request).
 #
 # The Rust workspace compiles ON THE RUNNER (setup-rust-toolchain's cargo/target cache) and
 # the Containerfile only packages the prebuilt binaries: in-docker compiles recompile the
@@ -17,6 +18,9 @@ name: Docker
 #   sha-<short>   every build, immutable
 #   v<x.y.z>      release tags
 #   stable        crucible-buildit only: the newest release tag's build
+#
+# crucible-kueue (docker/Containerfile.kueue) is pushed to quay.io/crucible-ai alone, with the
+# first three tags.
 on:
   push:
     branches: [main]
@@ -27,12 +31,14 @@ concurrency:
   group: docker-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Read the repo; write packages so we can push to GHCR with the built-in GITHUB_TOKEN.
+# Read the repo; write packages so we can push to GHCR with the built-in GITHUB_TOKEN. Quay
+# takes this repository's push robot.
 permissions:
   contents: read
   packages: write
 
 env:
+  QUAY: quay.io/crucible-ai
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   # Harden cargo against flaky crates.io fetches (see ci.yml).
@@ -118,6 +124,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Log in to Quay
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_CRUCIBLE_AI_PUSH_USER }}
+          password: ${{ secrets.QUAY_CRUCIBLE_AI_PUSH_TOKEN }}
+
       # The gateway/CLI the image ships must be the exact fork rev crucible's gRPC client
       # compiled against: derive it from Cargo.lock and inject it (never hand-pin the
       # Containerfile). The sha-tagged distribution image (ghcr.io/neuralmagic/openshell-gateway)
@@ -143,7 +156,9 @@ jobs:
         id: meta
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: |
+            ghcr.io/${{ github.repository }}
+            ${{ env.QUAY }}/${{ github.event.repository.name }}
           tags: |
             type=sha,format=short
             type=ref,event=tag
@@ -175,7 +190,9 @@ jobs:
         id: buildit-meta
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
-          images: ghcr.io/${{ github.repository }}-buildit
+          images: |
+            ghcr.io/${{ github.repository }}-buildit
+            ${{ env.QUAY }}/${{ github.event.repository.name }}-buildit
           tags: |
             type=sha,format=short
             type=ref,event=tag
@@ -201,6 +218,57 @@ jobs:
           DIGEST: ${{ steps.buildit.outputs.digest }}
         run: |
           echo "buildit image: ghcr.io/${{ github.repository }}-buildit@$DIGEST" >> "$GITHUB_STEP_SUMMARY"
+
+  # The crucible-kueue server. Its Containerfile compiles the crate itself, so this job needs no
+  # staged binaries; the layer cache keeps the toolchain and dependency layers.
+  kueue:
+    runs-on: [self-hosted, linux, x64, beefy, image]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Quay
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_CRUCIBLE_AI_PUSH_USER }}
+          password: ${{ secrets.QUAY_CRUCIBLE_AI_PUSH_TOKEN }}
+
+      - name: Image metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
+        with:
+          images: ${{ env.QUAY }}/${{ github.event.repository.name }}-kueue
+          tags: |
+            type=sha,format=short
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: docker/Containerfile.kueue
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            REVISION=${{ github.sha }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-kueue-cache:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}-kueue-cache:buildcache,mode=max
 
   # The desktop app's browser build, which the controller embeds under /next.
   next-bundle:
@@ -310,11 +378,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Log in to Quay
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_CRUCIBLE_AI_PUSH_USER }}
+          password: ${{ secrets.QUAY_CRUCIBLE_AI_PUSH_TOKEN }}
+
       - name: Image metadata (tags + labels)
         id: meta
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
-          images: ghcr.io/${{ github.repository }}-controller
+          images: |
+            ghcr.io/${{ github.repository }}-controller
+            ${{ env.QUAY }}/${{ github.event.repository.name }}-controller
           tags: |
             type=sha,format=short
             type=ref,event=tag

@@ -1013,8 +1013,8 @@ if has_shard kueue; then
         -f "$FIX/Containerfile.kueue" -t "crucible-e2e-kueue:$ID" "$TOP/kueue-image" >/dev/null
     push_image "crucible-e2e-kueue:$ID"
 fi
-sed "s|@LOOP_IMAGE@|$LOOP_IMAGE|g" "$FIX/profile.toml.in" >"$TOP/profile.toml"
-sed "s|@LOOP_IMAGE@|$MISMATCH_IMAGE|g" "$FIX/profile.toml.in" >"$TOP/profile-mismatch.toml"
+sed -e "s|@LOOP_IMAGE@|$LOOP_IMAGE|g" -e "s|@NODE_ARCH@|$NODE_ARCH|g" "$FIX/profile.toml.in" >"$TOP/profile.toml"
+sed -e "s|@LOOP_IMAGE@|$MISMATCH_IMAGE|g" -e "s|@NODE_ARCH@|$NODE_ARCH|g" "$FIX/profile.toml.in" >"$TOP/profile-mismatch.toml"
 awk '{ print } /^\[cluster\]$/ { print "state_pvc = \"crucible-e2e-state\"" }' "$TOP/profile.toml" >"$TOP/profile-state.toml"
 
 for p in ${BUILD_PIDS[@]+"${BUILD_PIDS[@]}"}; do

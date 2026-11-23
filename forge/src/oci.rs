@@ -121,22 +121,32 @@ fn rewrite_config(
     Ok((bytes, digest, size))
 }
 
-/// The authfile keys that may hold `registry`'s creds. Docker Hub is the special case: `docker login`
-/// historically writes the legacy `https://index.docker.io/v1/` key, so a `docker.io` ref must check
-/// the whole alias family. Other registries get the plain host plus the `https://`-prefixed spelling
-/// some tools write.
-fn authfile_keys(registry: &str) -> Vec<String> {
+/// The authfile keys that may hold creds for `repository` on `registry`, most specific first. An
+/// entry may be scoped to a path under the registry (`quay.io/acme`, `quay.io/acme/img`), as
+/// containers-auth.json has it, so every `registry/path` prefix of the repository comes before the
+/// registry's own keys. Docker Hub is the special case there: `docker login` historically writes
+/// the legacy `https://index.docker.io/v1/` key, so a `docker.io` ref must check the whole alias
+/// family. Other registries get the plain host plus the `https://`-prefixed spelling some tools
+/// write.
+fn authfile_keys(registry: &str, repository: &str) -> Vec<String> {
     const DOCKER_ALIASES: [&str; 4] = [
         "docker.io",
         "index.docker.io",
         "registry-1.docker.io",
         "https://index.docker.io/v1/",
     ];
-    if DOCKER_ALIASES.contains(&registry) {
-        DOCKER_ALIASES.iter().map(|s| s.to_string()).collect()
-    } else {
-        vec![registry.to_string(), format!("https://{registry}")]
+    let mut keys = Vec::new();
+    let mut path = repository;
+    while !path.is_empty() {
+        keys.push(format!("{registry}/{path}"));
+        path = path.rsplit_once('/').map_or("", |(parent, _)| parent);
     }
+    if DOCKER_ALIASES.contains(&registry) {
+        keys.extend(DOCKER_ALIASES.iter().map(|s| s.to_string()));
+    } else {
+        keys.extend([registry.to_string(), format!("https://{registry}")]);
+    }
+    keys
 }
 
 /// The auth in one `auths.<key>` entry: `auth` (base64 `user:pass`, the common form), else explicit
@@ -167,11 +177,11 @@ fn entry_auth(entry: &serde_json::Value) -> Result<Option<RegistryAuth>> {
     Ok(None)
 }
 
-/// Build a [`RegistryAuth`] for `registry` from a docker `config.json`-format authfile (the same file
-/// buildah uses), checking every key alias the registry is known by (`docker.io` creds usually live
-/// under the legacy `https://index.docker.io/v1/`). Returns `Anonymous` if the file or the entry is
-/// absent, so public bases just work.
-fn auth_from_authfile(authfile: &Path, registry: &str) -> Result<RegistryAuth> {
+/// Build a [`RegistryAuth`] for `reference` from a docker `config.json`-format authfile (the same file
+/// buildah uses), checking every key that can hold its creds, the most specific first (see
+/// [`authfile_keys`]). Returns `Anonymous` if the file or the entry is absent, so public bases
+/// just work.
+fn auth_from_authfile(authfile: &Path, reference: &Reference) -> Result<RegistryAuth> {
     let Ok(text) = std::fs::read_to_string(authfile) else {
         return Ok(RegistryAuth::Anonymous);
     };
@@ -180,7 +190,7 @@ fn auth_from_authfile(authfile: &Path, registry: &str) -> Result<RegistryAuth> {
     let Some(auths) = cfg.get("auths").and_then(|v| v.as_object()) else {
         return Ok(RegistryAuth::Anonymous);
     };
-    for key in authfile_keys(registry) {
+    for key in authfile_keys(reference.registry(), reference.repository()) {
         if let Some(entry) = auths.get(&key)
             && let Some(auth) = entry_auth(entry)
                 .with_context(|| format!("authfile entry `{key}` in {}", authfile.display()))?
@@ -191,11 +201,11 @@ fn auth_from_authfile(authfile: &Path, registry: &str) -> Result<RegistryAuth> {
     Ok(RegistryAuth::Anonymous)
 }
 
-/// Resolve creds for `registry` the way docker/crane do: the explicit authfile when given, else the
+/// Resolve creds for `reference` the way docker/crane do: the explicit authfile when given, else the
 /// operator's default (`$REGISTRY_AUTH_FILE` / `~/.docker/config.json`), else anonymous.
-pub fn resolve_auth(authfile: Option<&Path>, registry: &str) -> Result<RegistryAuth> {
+pub fn resolve_auth(authfile: Option<&Path>, reference: &Reference) -> Result<RegistryAuth> {
     match authfile.map(Path::to_path_buf).or_else(default_authfile) {
-        Some(f) => auth_from_authfile(&f, registry),
+        Some(f) => auth_from_authfile(&f, reference),
         None => Ok(RegistryAuth::Anonymous),
     }
 }
@@ -215,7 +225,7 @@ pub fn pin_digest(image_ref: &str, authfile: Option<&Path>) -> Result<String> {
         return Ok(format!("{repo}@{digest}"));
     }
     // A private image needs creds; anonymous HEADs 401.
-    let auth = resolve_auth(authfile, reference.registry())?;
+    let auth = resolve_auth(authfile, &reference)?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -239,14 +249,13 @@ pub fn pin_digest(image_ref: &str, authfile: Option<&Path>) -> Result<String> {
     Ok(format!("{repo}@{digest}"))
 }
 
-/// The registry host of an image ref, parsed per the OCI distribution spec (Docker Hub shorthand like
-/// `ubuntu` resolves to `docker.io`). For keying a per-registry credential lookup off an image ref
-/// with a proper parse instead of string-splitting.
-pub fn registry_of(image_ref: &str) -> Result<String> {
-    let reference: Reference = image_ref
+/// An image ref parsed per the OCI distribution spec (Docker Hub shorthand like `ubuntu` resolves
+/// to `docker.io/library/ubuntu`). For keying a credential lookup off an image ref with a proper
+/// parse instead of string-splitting.
+pub fn reference_of(image_ref: &str) -> Result<Reference> {
+    image_ref
         .parse()
-        .with_context(|| format!("parsing image ref {image_ref}"))?;
-    Ok(reference.registry().to_string())
+        .with_context(|| format!("parsing image ref {image_ref}"))
 }
 
 /// The tag of an image ref, parsed per the OCI spec (`registry/repo:tag` -> `tag`); `latest` when the ref
@@ -708,8 +717,16 @@ mod tests {
 
     #[test]
     fn auth_from_missing_authfile_is_anonymous() {
-        let a = auth_from_authfile(Path::new("/no/such/authfile.json"), "quay.io").unwrap();
+        let a = auth_from_authfile(
+            Path::new("/no/such/authfile.json"),
+            &image("quay.io/acme/img"),
+        )
+        .unwrap();
         assert!(matches!(a, RegistryAuth::Anonymous));
+    }
+
+    fn image(reference: &str) -> Reference {
+        reference_of(reference).unwrap()
     }
 
     /// Write `contents` to a unique temp authfile; the caller keeps the returned guard alive.
@@ -734,11 +751,37 @@ mod tests {
     fn auth_from_authfile_reads_the_plain_registry_key() {
         // "user:pass" -> dXNlcjpwYXNz (padded, the docker-written form).
         let (p, _g) = temp_authfile(r#"{"auths":{"quay.io":{"auth":"dXNlcjpwYXNz"}}}"#);
-        let a = auth_from_authfile(&p, "quay.io").unwrap();
+        let a = auth_from_authfile(&p, &image("quay.io/acme/img")).unwrap();
         assert!(matches!(a, RegistryAuth::Basic(u, pw) if u == "user" && pw == "pass"));
         // A registry with no entry stays anonymous.
-        let a = auth_from_authfile(&p, "ghcr.io").unwrap();
+        let a = auth_from_authfile(&p, &image("ghcr.io/acme/img")).unwrap();
         assert!(matches!(a, RegistryAuth::Anonymous));
+    }
+
+    #[test]
+    fn auth_from_authfile_prefers_the_most_specific_path_key() {
+        // "org:robot", "repo:robot", "host:login".
+        let (p, _g) = temp_authfile(
+            r#"{"auths":{
+                "quay.io":{"auth":"aG9zdDpsb2dpbg=="},
+                "quay.io/acme":{"auth":"b3JnOnJvYm90"},
+                "quay.io/acme/img":{"auth":"cmVwbzpyb2JvdA=="}
+            }}"#,
+        );
+        let user = |reference: &str| match auth_from_authfile(&p, &image(reference)).unwrap() {
+            RegistryAuth::Basic(user, _) => user,
+            other => panic!("{reference}: {other:?}"),
+        };
+        assert_eq!(user("quay.io/acme/img:tag"), "repo");
+        assert_eq!(user("quay.io/acme/other"), "org");
+        assert_eq!(user("quay.io/acme/nested/img"), "org");
+        assert_eq!(user("quay.io/acmecorp/img"), "host");
+        assert_eq!(user("quay.io/elsewhere/img"), "host");
+
+        // An entry scoped to one path is not the registry's.
+        let (scoped, _g) = temp_authfile(r#"{"auths":{"quay.io/acme":{"auth":"b3JnOnJvYm90"}}}"#);
+        let other = auth_from_authfile(&scoped, &image("quay.io/elsewhere/img")).unwrap();
+        assert!(matches!(other, RegistryAuth::Anonymous));
     }
 
     #[test]
@@ -746,7 +789,7 @@ mod tests {
         // `docker login` writes the legacy v1 URL; a docker.io ref must still find it.
         let (p, _g) =
             temp_authfile(r#"{"auths":{"https://index.docker.io/v1/":{"auth":"dXNlcjpwYXNz"}}}"#);
-        let a = auth_from_authfile(&p, "docker.io").unwrap();
+        let a = auth_from_authfile(&p, &image("ubuntu")).unwrap();
         assert!(matches!(a, RegistryAuth::Basic(u, pw) if u == "user" && pw == "pass"));
     }
 
@@ -754,7 +797,7 @@ mod tests {
     fn auth_from_authfile_takes_explicit_username_password_fields() {
         let (p, _g) =
             temp_authfile(r#"{"auths":{"quay.io":{"username":"bob","password":"s3cret"}}}"#);
-        let a = auth_from_authfile(&p, "quay.io").unwrap();
+        let a = auth_from_authfile(&p, &image("quay.io/acme/img")).unwrap();
         assert!(matches!(a, RegistryAuth::Basic(u, pw) if u == "bob" && pw == "s3cret"));
     }
 
@@ -762,10 +805,10 @@ mod tests {
     fn auth_token_decodes_without_padding() {
         // "user:pass" unpadded would be rejected by a canonical-padding decoder; some writers omit it.
         let (p, _g) = temp_authfile(r#"{"auths":{"quay.io":{"auth":"dXNlcjpwYXNz"}}}"#);
-        let padded = auth_from_authfile(&p, "quay.io").unwrap();
+        let padded = auth_from_authfile(&p, &image("quay.io/acme/img")).unwrap();
         // "user:passX" -> dXNlcjpwYXNzWA (unpadded: canonical would be ...WA==).
         let (p2, _g2) = temp_authfile(r#"{"auths":{"quay.io":{"auth":"dXNlcjpwYXNzWA"}}}"#);
-        let unpadded = auth_from_authfile(&p2, "quay.io").unwrap();
+        let unpadded = auth_from_authfile(&p2, &image("quay.io/acme/img")).unwrap();
         assert!(matches!(padded, RegistryAuth::Basic(u, pw) if u == "user" && pw == "pass"));
         assert!(matches!(unpadded, RegistryAuth::Basic(u, pw) if u == "user" && pw == "passX"));
     }
@@ -808,17 +851,24 @@ mod tests {
     }
 
     #[test]
-    fn registry_of_parses_per_spec() {
-        assert_eq!(registry_of("quay.io/acme/img:m4").unwrap(), "quay.io");
+    fn reference_of_parses_per_spec() {
+        let parts = |image_ref: &str| {
+            let reference = reference_of(image_ref).unwrap();
+            (
+                reference.registry().to_string(),
+                reference.repository().to_string(),
+            )
+        };
+        let acme = ("quay.io".to_string(), "acme/img".to_string());
+        assert_eq!(parts("quay.io/acme/img:m4"), acme);
         let pinned = format!("quay.io/acme/img@sha256:{}", "a".repeat(64));
-        assert_eq!(registry_of(&pinned).unwrap(), "quay.io");
-        assert_eq!(
-            registry_of("registry:5000/ns/img:tag").unwrap(),
-            "registry:5000"
-        );
+        assert_eq!(parts(&pinned), acme);
+        assert_eq!(parts("registry:5000/ns/img:tag").0, "registry:5000");
         // Docker Hub shorthand resolves to docker.io.
-        assert_eq!(registry_of("library/ubuntu:24.04").unwrap(), "docker.io");
-        assert_eq!(registry_of("ubuntu").unwrap(), "docker.io");
+        let ubuntu = ("docker.io".to_string(), "library/ubuntu".to_string());
+        assert_eq!(parts("library/ubuntu:24.04"), ubuntu);
+        assert_eq!(parts("ubuntu"), ubuntu);
+        assert!(reference_of("not a ref").is_err());
     }
 
     #[test]
