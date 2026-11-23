@@ -147,7 +147,6 @@ pub(crate) fn init() -> App {
 }
 
 pub(crate) fn setup(app: &mut App, waker: Waker) {
-    rune::zoom::set(app.settings.zoom);
     app.waker = Some(waker.clone());
     let (clicked, clicks) = std::sync::mpsc::channel();
     #[cfg(target_os = "linux")]

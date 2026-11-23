@@ -77,3 +77,11 @@ wasmi = { version = "2", default-features = false, features = ["wat"] }
 hot = ["rune/hot"]
 # The ⌘⇧K panel that tunes effects and layout live. Off, every knob reads its default.
 knobs = ["rune-knobs/panel"]
+
+[patch.crates-io]
+accesskit_macos = { path = "../vendor/rune/vendor/accesskit_macos" }
+accesskit_windows = { path = "../vendor/rune/vendor/accesskit_windows" }
+parley_engine = { path = "../vendor/rune/vendor/parley_engine" }
+sctk-adwaita = { path = "../vendor/rune/vendor/sctk-adwaita" }
+wgpu-hal = { path = "../vendor/rune/vendor/wgpu-hal" }
+winit = { path = "../vendor/rune/vendor/winit" }

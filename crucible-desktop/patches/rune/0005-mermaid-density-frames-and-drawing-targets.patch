@@ -1,123 +1,20 @@
-diff --git a/crates/rune-mermaid/src/canvas.rs b/crates/rune-mermaid/src/canvas.rs
-index aa2c12af..f1669fcb 100644
---- a/crates/rune-mermaid/src/canvas.rs
-+++ b/crates/rune-mermaid/src/canvas.rs
-@@ -108,6 +108,8 @@ pub(crate) struct Canvas {
-     pub(crate) regions: Vec<Vec<[f32; 2]>>,
-     /// Per edge: its ends and its drawing in the hover colour.
-     pub(crate) traces: Vec<Trace>,
-+    /// Subgraph frames by index, outermost first: `[x0, y0, x1, y1]`.
-+    pub(crate) frames: Vec<(usize, [f32; 4])>,
-     pub(crate) hover: Option<(Hover, Color)>,
-     /// Where each node, edge and frame's drawing starts ([`Canvas::part`]), and their names.
-     pub(crate) marks: Vec<Mark>,
-@@ -201,6 +203,7 @@ impl Canvas {
-         self.ops.extend(other.ops);
-         self.labels.extend(other.labels);
-         self.traces.extend(other.traces.into_iter().map(|t| Trace { label: t.label.map(|(i, g)| (i + shift, g)), ..t }));
-+        self.frames.extend(other.frames);
+diff --git a/crates/rune-mermaid/src/canvas/drawing.rs b/crates/rune-mermaid/src/canvas/drawing.rs
+index db5729f4..1622398b 100644
+--- a/crates/rune-mermaid/src/canvas/drawing.rs
++++ b/crates/rune-mermaid/src/canvas/drawing.rs
+@@ -34,7 +34,7 @@ impl DrawingModel {
+     /// Draw with UTF-8 byte ranges local to each label. Keys are the ones returned by
+     /// [`Self::labels`]. A hover copy uses the same marks as the label underneath it.
+     pub fn draw(&self, marks: impl Fn(&str) -> Vec<TextHighlight>) -> Drawing {
+-        let (el, size) = self.scene.drawing(&self.style, Some(&marks));
++        let (el, size) = self.scene.drawing(&self.style, Some(&marks), &|_, spot| spot);
+         Drawing { el, size, surface: self.style.surface, surface_border: self.style.surface_border }
      }
- 
-     /// The bounding box of everything drawn: `[x0, y0, x1, y1]`.
-@@ -343,7 +346,7 @@ impl Scene {
-     }
- 
-     /// The title and drawing without the card around them, and the size they take.
--    pub(crate) fn drawing(&self, paint: &DiagramStyle) -> (El, [f32; 2]) {
-+    pub(crate) fn drawing(&self, paint: &DiagramStyle, decorate: &dyn Fn(&Target, El) -> El) -> (El, [f32; 2]) {
-         let mut size = self.size;
-         let mut out = col().items_center();
-         if let Some(title) = self.title_el(paint, false) {
-@@ -351,7 +354,7 @@ impl Scene {
-             size = [size[0].max(t[0] + 2.0), size[1] + t[1] + TITLE_GAP];
-             out = out.gap(TITLE_GAP).child(title);
-         }
--        (out.child(self.diagram_el(false, &|_, spot| spot)), size)
-+        (out.child(self.diagram_el(false, decorate)), size)
-     }
- 
-     fn title_el(&self, paint: &DiagramStyle, streaming: bool) -> Option<El> {
-@@ -389,6 +392,12 @@ impl Scene {
-         // rebuild drops fades out, unseen, rather than cutting.
-         for s in &self.hovers {
-             let r = s.rect;
-+            if matches!(s.target, Target::Frame(_)) {
-+                // A frame lights nothing, so it is no hover group: only a place to decorate.
-+                let spot = el().key(s.key.clone()).absolute(0.0, 0.0).offset(r[0] * scale, r[1] * scale).size(r[2] * scale, r[3] * scale).transition(Transition::none()).a11y_hidden();
-+                body = body.child(decorate(&s.target, spot));
-+                continue;
-+            }
-             let mut glow = el()
-                 .absolute(-r[0] * scale, -r[1] * scale)
-                 .size(w, h)
-diff --git a/crates/rune-mermaid/src/flowchart.rs b/crates/rune-mermaid/src/flowchart.rs
-index 52b3c790..199d7644 100644
---- a/crates/rune-mermaid/src/flowchart.rs
-+++ b/crates/rune-mermaid/src/flowchart.rs
-@@ -6,7 +6,7 @@ use rune::Color;
- 
- use super::canvas::{Canvas, Scene, measure_balanced};
- use super::layered::{MAX_MINLEN, Spacing};
--use super::layered_draw::{ClusterSpec, Dir, DrawNode, Edge, Head, Line, NodeShape, layered_canvas, node_size};
-+use super::layered_draw::{ClusterSpec, Dir, DrawNode, Edge, Head, Line, NodeShape, layered_canvas, padded_node_size};
- use super::parts::Names;
- use super::{
-     Cur, DiagramStyle, EdgeStyle, Hover, MAX_DEPTH, MAX_ITEMS, NodeStyle, StyleSheet, clean, clean_quoted,
-@@ -675,7 +675,9 @@ pub(crate) fn link(c: &mut Cur) -> Option<Link> {
-     Some(Link { id, line, start, end, minlen, label })
  }
- 
--const SPACING: Spacing = Spacing { node: 36.0, rank: 44.0, cluster: 14.0 };
-+/// [`DiagramStyle::flow_gaps`] unless set: between the nodes of a rank, between ranks, and
-+/// inside a subgraph's frame.
-+pub(crate) const GAPS: [f32; 3] = [36.0, 44.0, 14.0];
- 
- pub(crate) fn draw(f: &Flowchart, paint: &DiagramStyle, hover: Option<(Hover, Color)>) -> Option<Scene> {
-     draw_canvas(f, paint, hover)?.finish_fit(paint)
-@@ -688,12 +690,13 @@ pub(crate) fn draw_canvas(f: &Flowchart, paint: &DiagramStyle, hover: Option<(Ho
-         .iter()
-         .map(|n| {
-             let label = measure_balanced(&n.label, paint.font);
--            DrawNode::Shape { shape: n.shape, size: node_size(n.shape, label.size), label, cluster: n.cluster, style: n.style }
-+            DrawNode::Shape { shape: n.shape, size: padded_node_size(n.shape, label.size, paint.node_pad), label, cluster: n.cluster, style: n.style }
-         })
-         .collect();
-     let clusters: Vec<ClusterSpec> = f.subgraphs.iter().map(|s| ClusterSpec { title: s.title.clone(), parent: s.parent }).collect();
-     let names = names(f);
--    let mut c = layered_canvas(f.dir, &nodes, &names.nodes, &f.edges, &clusters, &SPACING, paint, hover)?;
-+    let [node, rank, cluster] = paint.flow_gaps;
-+    let mut c = layered_canvas(f.dir, &nodes, &names.nodes, &f.edges, &clusters, &Spacing { node, rank, cluster }, paint, hover)?;
-     c.names = names;
-     Some(c)
- }
-diff --git a/crates/rune-mermaid/src/flowchart_tests.rs b/crates/rune-mermaid/src/flowchart_tests.rs
-index bd29aa56..cf16f087 100644
---- a/crates/rune-mermaid/src/flowchart_tests.rs
-+++ b/crates/rune-mermaid/src/flowchart_tests.rs
-@@ -314,3 +314,19 @@ fn boundary_points_sit_on_the_outline() {
-     let e = boundary(NodeShape::Circle, c, [40.0, 40.0], [30.0, 40.0]);
-     assert!((dist(c, e) - 20.0).abs() < 1e-4);
- }
-+
-+#[test]
-+fn node_padding_and_gaps_shrink_a_flowchart_and_key_its_scene() {
-+    let src = "flowchart TD\n  A[first] --> B[second]\n  subgraph G\n    B\n    C[third]\n  end";
-+    let roomy = DiagramStyle::neutral(false);
-+    let mut tight = DiagramStyle::neutral(false);
-+    tight.node_pad = [10.0, 4.0];
-+    tight.flow_gaps = [10.0, 16.0, 6.0];
-+    let size = |style: &DiagramStyle| crate::render_drawing(src, style, crate::Hover::Off, style.text).expect("draws").size;
-+    let (a, b) = (size(&roomy), size(&tight));
-+    assert!(b[0] < a[0] && b[1] < a[1], "{a:?} -> {b:?}");
-+    // The same source under another padding is another scene, not the cached one.
-+    assert_eq!(size(&roomy), a);
-+    assert_eq!(padded_node_size(NodeShape::Rect, [80.0, 18.0], crate::shape::PAD), crate::shape::node_size(NodeShape::Rect, [80.0, 18.0]));
-+    assert_eq!(padded_node_size(NodeShape::Rect, [80.0, 18.0], [10.0, 4.0]), [90.0, 22.0]);
-+}
-diff --git a/crates/rune-mermaid/src/hover.rs b/crates/rune-mermaid/src/hover.rs
-index f644e4ab..06920f73 100644
---- a/crates/rune-mermaid/src/hover.rs
-+++ b/crates/rune-mermaid/src/hover.rs
+diff --git a/crates/rune-mermaid/src/canvas/hover.rs b/crates/rune-mermaid/src/canvas/hover.rs
+index 6fd55be7..bc092a00 100644
+--- a/crates/rune-mermaid/src/canvas/hover.rs
++++ b/crates/rune-mermaid/src/canvas/hover.rs
 @@ -25,11 +25,14 @@ pub enum Hover {
      Neighbours,
  }
@@ -169,10 +66,10 @@ index f644e4ab..06920f73 100644
          let mut budget = ALL_EDGE_HITS;
          for (k, t) in self.traces.iter().enumerate() {
              let edge = key(t.part.clone().unwrap_or(Part::Index(Kind::Edge, k)));
-diff --git a/crates/rune-mermaid/src/hover_tests.rs b/crates/rune-mermaid/src/hover_tests.rs
+diff --git a/crates/rune-mermaid/src/canvas/hover_tests.rs b/crates/rune-mermaid/src/canvas/hover_tests.rs
 index 39ff0a06..f5e96e96 100644
---- a/crates/rune-mermaid/src/hover_tests.rs
-+++ b/crates/rune-mermaid/src/hover_tests.rs
+--- a/crates/rune-mermaid/src/canvas/hover_tests.rs
++++ b/crates/rune-mermaid/src/canvas/hover_tests.rs
 @@ -202,7 +202,7 @@ fn render_with_passes_every_spot_through_decorate() {
      fn view(_: &u32, _: &mut Cx<u32>) -> El {
          let decorate = |t: &Target, spot: El| match t {
@@ -214,80 +111,62 @@ index 39ff0a06..f5e96e96 100644
          rt.pointer_move(x, y);
          rt.frame(0.1);
          rt.pointer_down(x, y);
-diff --git a/crates/rune-mermaid/src/layered_draw.rs b/crates/rune-mermaid/src/layered_draw.rs
-index 1021418c..2207243b 100644
---- a/crates/rune-mermaid/src/layered_draw.rs
-+++ b/crates/rune-mermaid/src/layered_draw.rs
-@@ -10,7 +10,7 @@ use super::layered::{GCluster, GEdge, Graph, Spacing, layout};
- use super::route::Ctx;
- use super::parts::{Kind, Part};
- use super::shape;
--pub(crate) use super::shape::{NodeShape, boundary, node_size, outline};
-+pub(crate) use super::shape::{NodeShape, boundary, node_size, outline, padded_node_size};
- use super::{DiagramStyle, EdgeStyle, Hover, NodeStyle};
- 
- #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-@@ -287,6 +287,7 @@ fn draw_in(dir: Dir, p: &Parts, fonts: Fonts, spacing: &Spacing, paint: &Diagram
-         }
-         let (p0, p1) = (pt([b[0], b[1]]), pt([b[2], b[3]]));
-         c.part(Some(Part::Index(Kind::Frame, i)));
-+        c.frame(i, p0, p1);
-         c.shape(rounded_rect(p0[0], p0[1], p1[0], p1[1], 6.0), paint.cluster_fill, cluster_border, 1.0);
-         let at = [(p0[0] + p1[0] - titles[i].size[0]) / 2.0, p0[1] + TITLE_INSET[1]];
-         c.label_at(&titles[i], at, fonts.title, paint.muted, Align::Center);
-diff --git a/crates/rune-mermaid/src/lib.rs b/crates/rune-mermaid/src/lib.rs
-index 934a8412..f0284d40 100644
---- a/crates/rune-mermaid/src/lib.rs
-+++ b/crates/rune-mermaid/src/lib.rs
-@@ -160,6 +160,11 @@ pub struct DiagramStyle {
-     pub note_border: Color,
-     pub font: TextStyle,
-     pub max_width: f32,
-+    /// A flowchart node's padding around its label, across and down.
-+    pub node_pad: [f32; 2],
-+    /// The room a flowchart leaves between the nodes of a rank, between ranks, and inside a
-+    /// subgraph's frame.
-+    pub flow_gaps: [f32; 3],
-     /// Set with [`Self::min_scale`].
-     min_scale: f32,
- }
-@@ -182,6 +187,8 @@ impl Hash for DiagramStyle {
-         self.font.hash(state);
-         let bits = if self.max_width == 0.0 { 0 } else if self.max_width.is_nan() { f32::NAN.to_bits() } else { self.max_width.to_bits() };
-         bits.hash(state);
-+        self.node_pad.map(f32::to_bits).hash(state);
-+        self.flow_gaps.map(f32::to_bits).hash(state);
-         self.min_scale.to_bits().hash(state);
+diff --git a/crates/rune-mermaid/src/canvas/mod.rs b/crates/rune-mermaid/src/canvas/mod.rs
+index d615ba92..e89f9849 100644
+--- a/crates/rune-mermaid/src/canvas/mod.rs
++++ b/crates/rune-mermaid/src/canvas/mod.rs
+@@ -121,6 +121,8 @@ pub(crate) struct Canvas {
+     pub(crate) regions: Vec<Vec<[f32; 2]>>,
+     /// Per edge: its ends and its drawing in the hover colour.
+     pub(crate) traces: Vec<Trace>,
++    /// Subgraph frames by index, outermost first: `[x0, y0, x1, y1]`.
++    pub(crate) frames: Vec<(usize, [f32; 4])>,
+     pub(crate) hover: Option<(Hover, Color)>,
+     /// Where each node, edge and frame's drawing starts ([`Canvas::part`]), and their names.
+     pub(crate) marks: Vec<Mark>,
+@@ -214,6 +216,7 @@ impl Canvas {
+         self.ops.extend(other.ops);
+         self.labels.extend(other.labels);
+         self.traces.extend(other.traces.into_iter().map(|t| Trace { label: t.label.map(|(i, g)| (i + shift, g)), ..t }));
++        self.frames.extend(other.frames);
      }
- }
-@@ -203,6 +210,8 @@ impl DiagramStyle {
-             note_border: oklch(if dark { 0.4 } else { 0.85 }, 0.08, 80.0),
-             font: TextStyle::new(13.0, 400.0).lh(18.0),
-             max_width: 680.0,
-+            node_pad: shape::PAD,
-+            flow_gaps: flowchart::GAPS,
-             min_scale: 0.6,
-         }
-     }
-@@ -266,8 +275,13 @@ pub struct Drawing {
- /// [`render_with_hover`]'s title and drawing alone, laid out and fitted for `style.max_width`
- /// as its card would be.
- pub fn render_drawing(src: &str, style: &DiagramStyle, hover: Hover, color: Color) -> Option<Drawing> {
-+    render_drawing_with(src, style, hover, color, &|_, spot| spot)
-+}
-+
-+/// [`render_drawing`], with every hover group passed through `decorate` as in [`render_with`].
-+pub fn render_drawing_with(src: &str, style: &DiagramStyle, hover: Hover, color: Color, decorate: &dyn Fn(&Target, El) -> El) -> Option<Drawing> {
-     let hover = (hover != Hover::Off).then_some((hover, color));
--    let (el, size) = scenes::built(src, style, hover, None).0?.drawing(style);
-+    let (el, size) = scenes::built(src, style, hover, None).0?.drawing(style, decorate);
-     Some(Drawing { el, size, surface: style.surface, surface_border: style.surface_border })
- }
  
-diff --git a/crates/rune-mermaid/src/shape.rs b/crates/rune-mermaid/src/shape.rs
-index c0e26152..11b0d5c8 100644
---- a/crates/rune-mermaid/src/shape.rs
-+++ b/crates/rune-mermaid/src/shape.rs
+     /// The bounding box of everything drawn: `[x0, y0, x1, y1]`.
+@@ -356,7 +359,7 @@ impl Scene {
+     }
+ 
+     /// The title and drawing without the card around them, and the size they take.
+-    pub(crate) fn drawing(&self, paint: &DiagramStyle, marks: Marks<'_>) -> (El, [f32; 2]) {
++    pub(crate) fn drawing(&self, paint: &DiagramStyle, marks: Marks<'_>, decorate: &dyn Fn(&Target, El) -> El) -> (El, [f32; 2]) {
+         let mut size = self.size;
+         let mut out = col().items_center();
+         if let Some(title) = self.title_el(paint, false, marks) {
+@@ -364,7 +367,7 @@ impl Scene {
+             size = [size[0].max(t[0] + 2.0), size[1] + t[1] + TITLE_GAP];
+             out = out.gap(TITLE_GAP).child(title);
+         }
+-        (out.child(self.diagram_el(false, marks, &|_, spot| spot)), size)
++        (out.child(self.diagram_el(false, marks, decorate)), size)
+     }
+ 
+     fn title_el(&self, paint: &DiagramStyle, streaming: bool, marks: Marks<'_>) -> Option<El> {
+@@ -402,6 +405,12 @@ impl Scene {
+         // rebuild drops fades out, unseen, rather than cutting.
+         for s in &self.hovers {
+             let r = s.rect;
++            if matches!(s.target, Target::Frame(_)) {
++                // A frame lights nothing, so it is no hover group: only a place to decorate.
++                let spot = el().key(s.key.clone()).absolute(0.0, 0.0).offset(r[0] * scale, r[1] * scale).size(r[2] * scale, r[3] * scale).transition(Transition::none()).a11y_hidden();
++                body = body.child(decorate(&s.target, spot));
++                continue;
++            }
+             let mut glow = el()
+                 .absolute(-r[0] * scale, -r[1] * scale)
+                 .size(w, h)
+diff --git a/crates/rune-mermaid/src/canvas/shape.rs b/crates/rune-mermaid/src/canvas/shape.rs
+index 42f5f071..66fc20a6 100644
+--- a/crates/rune-mermaid/src/canvas/shape.rs
++++ b/crates/rune-mermaid/src/canvas/shape.rs
 @@ -152,14 +152,20 @@ impl NodeShape {
      }
  }
@@ -312,3 +191,137 @@ index c0e26152..11b0d5c8 100644
      match shape {
          S::Rect | S::Round | S::TaggedRect | S::Note => [rect, h],
          S::Stadium | S::Hexagon => [w + h / 2.0, h],
+diff --git a/crates/rune-mermaid/src/graph/flowchart.rs b/crates/rune-mermaid/src/graph/flowchart.rs
+index 2c4333d6..6bfda2d0 100644
+--- a/crates/rune-mermaid/src/graph/flowchart.rs
++++ b/crates/rune-mermaid/src/graph/flowchart.rs
+@@ -6,7 +6,7 @@ use rune::Color;
+ 
+ use crate::canvas::parts::Names;
+ use crate::canvas::{Canvas, Scene, measure_balanced};
+-use crate::layout::draw::{ClusterSpec, Dir, DrawNode, Edge, Head, Line, NodeShape, layered_canvas, node_size};
++use crate::layout::draw::{ClusterSpec, Dir, DrawNode, Edge, Head, Line, NodeShape, layered_canvas, padded_node_size};
+ use crate::layout::layered::{MAX_MINLEN, Spacing};
+ use crate::{
+     Cur, DiagramStyle, EdgeStyle, Hover, MAX_DEPTH, MAX_ITEMS, NodeStyle, StyleSheet, clean, clean_quoted,
+@@ -675,7 +675,9 @@ pub(crate) fn link(c: &mut Cur) -> Option<Link> {
+     Some(Link { id, line, start, end, minlen, label })
+ }
+ 
+-const SPACING: Spacing = Spacing { node: 36.0, rank: 44.0, cluster: 14.0 };
++/// [`DiagramStyle::flow_gaps`] unless set: between the nodes of a rank, between ranks, and
++/// inside a subgraph's frame.
++pub(crate) const GAPS: [f32; 3] = [36.0, 44.0, 14.0];
+ 
+ pub(crate) fn draw(f: &Flowchart, paint: &DiagramStyle, hover: Option<(Hover, Color)>) -> Option<Scene> {
+     draw_canvas(f, paint, hover)?.finish_fit(paint)
+@@ -688,12 +690,13 @@ pub(crate) fn draw_canvas(f: &Flowchart, paint: &DiagramStyle, hover: Option<(Ho
+         .iter()
+         .map(|n| {
+             let label = measure_balanced(&n.label, paint.font);
+-            DrawNode::Shape { shape: n.shape, size: node_size(n.shape, label.size), label, cluster: n.cluster, style: n.style }
++            DrawNode::Shape { shape: n.shape, size: padded_node_size(n.shape, label.size, paint.node_pad), label, cluster: n.cluster, style: n.style }
+         })
+         .collect();
+     let clusters: Vec<ClusterSpec> = f.subgraphs.iter().map(|s| ClusterSpec { title: s.title.clone(), parent: s.parent }).collect();
+     let names = names(f);
+-    let mut c = layered_canvas(f.dir, &nodes, &names.nodes, &f.edges, &clusters, &SPACING, paint, hover)?;
++    let [node, rank, cluster] = paint.flow_gaps;
++    let mut c = layered_canvas(f.dir, &nodes, &names.nodes, &f.edges, &clusters, &Spacing { node, rank, cluster }, paint, hover)?;
+     c.names = names;
+     Some(c)
+ }
+diff --git a/crates/rune-mermaid/src/graph/flowchart_tests.rs b/crates/rune-mermaid/src/graph/flowchart_tests.rs
+index 936c12f6..d7d9d58e 100644
+--- a/crates/rune-mermaid/src/graph/flowchart_tests.rs
++++ b/crates/rune-mermaid/src/graph/flowchart_tests.rs
+@@ -314,3 +314,19 @@ fn boundary_points_sit_on_the_outline() {
+     let e = boundary(NodeShape::Circle, c, [40.0, 40.0], [30.0, 40.0]);
+     assert!((dist(c, e) - 20.0).abs() < 1e-4);
+ }
++
++#[test]
++fn node_padding_and_gaps_shrink_a_flowchart_and_key_its_scene() {
++    let src = "flowchart TD\n  A[first] --> B[second]\n  subgraph G\n    B\n    C[third]\n  end";
++    let roomy = DiagramStyle::neutral(false);
++    let mut tight = DiagramStyle::neutral(false);
++    tight.node_pad = [10.0, 4.0];
++    tight.flow_gaps = [10.0, 16.0, 6.0];
++    let size = |style: &DiagramStyle| crate::render_drawing(src, style, crate::Hover::Off, style.text).expect("draws").size;
++    let (a, b) = (size(&roomy), size(&tight));
++    assert!(b[0] < a[0] && b[1] < a[1], "{a:?} -> {b:?}");
++    // The same source under another padding is another scene, not the cached one.
++    assert_eq!(size(&roomy), a);
++    assert_eq!(padded_node_size(NodeShape::Rect, [80.0, 18.0], crate::canvas::shape::PAD), crate::canvas::shape::node_size(NodeShape::Rect, [80.0, 18.0]));
++    assert_eq!(padded_node_size(NodeShape::Rect, [80.0, 18.0], [10.0, 4.0]), [90.0, 22.0]);
++}
+diff --git a/crates/rune-mermaid/src/layout/draw.rs b/crates/rune-mermaid/src/layout/draw.rs
+index ec7a964f..2f5d74b1 100644
+--- a/crates/rune-mermaid/src/layout/draw.rs
++++ b/crates/rune-mermaid/src/layout/draw.rs
+@@ -8,7 +8,7 @@ use super::layered::{GCluster, GEdge, Graph, Spacing, layout};
+ use super::route::Ctx;
+ use crate::canvas::parts::{Kind, Part};
+ use crate::canvas::shape;
+-pub(crate) use crate::canvas::shape::{NodeShape, boundary, node_size, outline};
++pub(crate) use crate::canvas::shape::{NodeShape, boundary, node_size, outline, padded_node_size};
+ use crate::canvas::{Canvas, Measured, Scene, ellipse, measure_balanced, measure_wrap, over_color, room, rounded_rect};
+ use crate::chart::small;
+ use crate::{DiagramStyle, EdgeStyle, Hover, NodeStyle};
+@@ -287,6 +287,7 @@ fn draw_in(dir: Dir, p: &Parts, fonts: Fonts, spacing: &Spacing, paint: &Diagram
+         }
+         let (p0, p1) = (pt([b[0], b[1]]), pt([b[2], b[3]]));
+         c.part(Some(Part::Index(Kind::Frame, i)));
++        c.frame(i, p0, p1);
+         c.shape(rounded_rect(p0[0], p0[1], p1[0], p1[1], 6.0), paint.cluster_fill, cluster_border, 1.0);
+         let at = [(p0[0] + p1[0] - titles[i].size[0]) / 2.0, p0[1] + TITLE_INSET[1]];
+         c.label_at(&titles[i], at, fonts.title, paint.muted, Align::Center);
+diff --git a/crates/rune-mermaid/src/lib.rs b/crates/rune-mermaid/src/lib.rs
+index fc288e9f..3cb37eaa 100644
+--- a/crates/rune-mermaid/src/lib.rs
++++ b/crates/rune-mermaid/src/lib.rs
+@@ -137,6 +137,11 @@ pub struct DiagramStyle {
+     pub note_border: Color,
+     pub font: TextStyle,
+     pub max_width: f32,
++    /// A flowchart node's padding around its label, across and down.
++    pub node_pad: [f32; 2],
++    /// The room a flowchart leaves between the nodes of a rank, between ranks, and inside a
++    /// subgraph's frame.
++    pub flow_gaps: [f32; 3],
+     /// Set with [`Self::min_scale`].
+     min_scale: f32,
+ }
+@@ -159,6 +164,8 @@ impl Hash for DiagramStyle {
+         self.font.hash(state);
+         let bits = if self.max_width == 0.0 { 0 } else if self.max_width.is_nan() { f32::NAN.to_bits() } else { self.max_width.to_bits() };
+         bits.hash(state);
++        self.node_pad.map(f32::to_bits).hash(state);
++        self.flow_gaps.map(f32::to_bits).hash(state);
+         self.min_scale.to_bits().hash(state);
+     }
+ }
+@@ -180,6 +187,8 @@ impl DiagramStyle {
+             note_border: oklch(if dark { 0.4 } else { 0.85 }, 0.08, 80.0),
+             font: TextStyle::new(13.0, 400.0).lh(18.0),
+             max_width: 680.0,
++            node_pad: canvas::shape::PAD,
++            flow_gaps: graph::flowchart::GAPS,
+             min_scale: 0.6,
+         }
+     }
+@@ -243,8 +252,13 @@ pub struct Drawing {
+ /// [`render_with_hover`]'s title and drawing alone, laid out and fitted for `style.max_width`
+ /// as its card would be.
+ pub fn render_drawing(src: &str, style: &DiagramStyle, hover: Hover, color: Color) -> Option<Drawing> {
++    render_drawing_with(src, style, hover, color, &|_, spot| spot)
++}
++
++/// [`render_drawing`], with every hover group passed through `decorate` as in [`render_with`].
++pub fn render_drawing_with(src: &str, style: &DiagramStyle, hover: Hover, color: Color, decorate: &dyn Fn(&Target, El) -> El) -> Option<Drawing> {
+     let hover = (hover != Hover::Off).then_some((hover, color));
+-    let (el, size) = scenes::built(src, style, hover, None).0?.drawing(style, None);
++    let (el, size) = scenes::built(src, style, hover, None).0?.drawing(style, None, decorate);
+     Some(Drawing { el, size, surface: style.surface, surface_border: style.surface_border })
+ }
+ 

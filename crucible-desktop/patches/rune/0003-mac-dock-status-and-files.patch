@@ -1,21 +1,21 @@
 diff --git a/crates/rune-mac/Cargo.toml b/crates/rune-mac/Cargo.toml
-index fa32d566..8463f0b6 100644
+index 39c0e242..c4783f3b 100644
 --- a/crates/rune-mac/Cargo.toml
 +++ b/crates/rune-mac/Cargo.toml
 @@ -9,6 +9,7 @@ description = "Small macOS helpers for Rune apps: a remembered window frame, ful
- rune-notify = { path = "../rune-notify" }
+ rune-notify = { workspace = true }
  
  [target.'cfg(target_os = "macos")'.dependencies]
-+block2 = "0.5"
- objc2 = "0.5.2"
++block2 = { workspace = true }
+ objc2 = { workspace = true }
  
  [lints]
 diff --git a/crates/rune-mac/src/dock.rs b/crates/rune-mac/src/dock.rs
 new file mode 100644
-index 00000000..0a67f1aa
+index 00000000..97f104dc
 --- /dev/null
 +++ b/crates/rune-mac/src/dock.rs
-@@ -0,0 +1,146 @@
+@@ -0,0 +1,147 @@
 +//! The app's Dock tile: a badge label, and a progress bar drawn over the app's icon.
 +//!
 +//! Call these on the main thread (from `poll` or a handle update). Off macOS they do nothing.
@@ -52,6 +52,7 @@ index 00000000..0a67f1aa
 +}
 +
 +#[cfg(target_os = "macos")]
++#[allow(unsafe_code)]
 +mod mac {
 +    use objc2::runtime::AnyObject;
 +    use objc2::{Encode, Encoding, class, msg_send};
@@ -181,10 +182,10 @@ index 00000000..09c3faf9
 +}
 diff --git a/crates/rune-mac/src/files.rs b/crates/rune-mac/src/files.rs
 new file mode 100644
-index 00000000..85599a21
+index 00000000..fde86177
 --- /dev/null
 +++ b/crates/rune-mac/src/files.rs
-@@ -0,0 +1,199 @@
+@@ -0,0 +1,200 @@
 +//! Files and folders the system opens with the app: dropped on its Dock icon, or opened with it
 +//! from Finder. The bundle declares what it takes (`CFBundleDocumentTypes`).
 +//!
@@ -277,6 +278,7 @@ index 00000000..85599a21
 +}
 +
 +#[cfg(target_os = "macos")]
++#[allow(unsafe_code)]
 +mod mac {
 +    use objc2::runtime::{AnyClass, AnyObject, ClassBuilder, Sel};
 +    use objc2::{class, msg_send, sel};
@@ -328,7 +330,7 @@ index 00000000..85599a21
 +    }
 +
 +    fn target_class() -> &'static AnyClass {
-+        const NAME: &str = "RuneMacOpenDocumentsTarget";
++        const NAME: &std::ffi::CStr = c"RuneMacOpenDocumentsTarget";
 +        if let Some(c) = AnyClass::get(NAME) {
 +            return c;
 +        }
@@ -425,7 +427,7 @@ index 00000000..c646b230
 +    assert!(rx.try_recv().is_err(), "an empty batch is not delivered");
 +}
 diff --git a/crates/rune-mac/src/lib.rs b/crates/rune-mac/src/lib.rs
-index cc0fe436..10fb2bb0 100644
+index 8cd5036f..79999368 100644
 --- a/crates/rune-mac/src/lib.rs
 +++ b/crates/rune-mac/src/lib.rs
 @@ -4,9 +4,13 @@
@@ -444,10 +446,10 @@ index cc0fe436..10fb2bb0 100644
  /// Has AppKit save the app's window frame under `name` and put the next launch's window in the
 diff --git a/crates/rune-mac/src/status.rs b/crates/rune-mac/src/status.rs
 new file mode 100644
-index 00000000..a852a44a
+index 00000000..e2f5e016
 --- /dev/null
 +++ b/crates/rune-mac/src/status.rs
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,209 @@
 +//! A menu bar extra: one `NSStatusItem` with a title and a menu the app rebuilds whole, whose
 +//! picks come back by the id each line was given.
 +//!
@@ -515,6 +517,7 @@ index 00000000..a852a44a
 +}
 +
 +#[cfg(target_os = "macos")]
++#[allow(unsafe_code)]
 +mod mac {
 +    use std::cell::Cell;
 +
@@ -552,7 +555,7 @@ index 00000000..a852a44a
 +    }
 +
 +    fn target_class() -> &'static AnyClass {
-+        const NAME: &str = "RuneMacStatusTarget";
++        const NAME: &std::ffi::CStr = c"RuneMacStatusTarget";
 +        if let Some(c) = AnyClass::get(NAME) {
 +            return c;
 +        }
