@@ -11187,13 +11187,7 @@ async fn evidence_rig(db: &Db, scratch: &std::path::Path) -> Result<()> {
     );
     crate::runs::blob_store::put_run_session(db.pool(), "run-ev", session.as_bytes()).await?;
 
-    let files = scratch
-        .join("local-runs")
-        .join("run-ev")
-        .join("pack")
-        .join("state")
-        .join("files")
-        .join("triage[1027]");
+    let files = crate::runs::task_evidence::files_root(scratch, "run-ev").join("triage[1027]");
     std::fs::create_dir_all(&files)?;
     std::fs::write(
         files.join("TRIAGE.md"),
@@ -11694,9 +11688,8 @@ async fn an_instance_whose_key_holds_a_slash_uploads_lists_and_serves_its_eviden
     assert_eq!(ev["status"], "pass");
     assert_eq!(ev["payload"]["verdict"], "ok");
 
-    let captured = dir
-        .path()
-        .join("local-runs/run-local/pack/state/files/review[llm-d%2Fllm-d-router]");
+    let captured = crate::runs::task_evidence::files_root(dir.path(), "run-local")
+        .join("review[llm-d%2Fllm-d-router]");
     std::fs::create_dir_all(&captured)?;
     std::fs::write(captured.join("REVIEW.md"), "# local\n")?;
     let (status, ev) =
@@ -11748,19 +11741,17 @@ async fn run_log_serves_local_output_and_points_a_pod_run_at_its_pod(pool: PgPoo
     let (status, none) = get_json_value(&app, "/api/runs/run-ev/log").await;
     assert_eq!(status, StatusCode::OK, "{none}");
     assert_eq!(none["text"], serde_json::Value::Null);
+    let run_root = crate::runs::task_evidence::run_dir(dir.path(), "run-ev");
     assert!(
         none["location"]
             .as_str()
             .expect("location")
-            .contains("run-ev"),
+            .contains(&run_root.display().to_string()),
         "{none}"
     );
 
     std::fs::write(
-        dir.path()
-            .join("local-runs")
-            .join("run-ev")
-            .join("engine.log"),
+        crate::runs::task_evidence::engine_log(&run_root),
         "plan run: admitted 3 tasks\nplan run: done\n",
     )?;
     let (status, log) = get_json_value(&app, "/api/runs/run-ev/log").await;

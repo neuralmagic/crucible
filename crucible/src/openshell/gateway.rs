@@ -67,13 +67,20 @@ pub enum GatewayError {
     #[error("gateway register failed within 30s: {last}\n{log_tail}")]
     RegisterTimeout { last: String, log_tail: String },
     #[error(
-        "gateway did not become healthy within 60s\nlast `openshell status`: {last_status}\n{log_tail}"
+        "gateway did not become healthy within {}s\nlast `openshell status`: {last_status}\n{log_tail}",
+        waited.as_secs()
     )]
     HealthTimeout {
+        waited: Duration,
         last_status: String,
         log_tail: String,
     },
 }
+
+/// How long a gateway this process started gets to answer Health.
+const LOCAL_HEALTH_WAIT: Duration = Duration::from_secs(60);
+/// How long a gateway in its own pod gets to answer Health.
+const REMOTE_HEALTH_WAIT: Duration = Duration::from_secs(120);
 
 /// The in-process OTLP collector's bind port for sandboxed turns. Fixed, not OS-assigned: under
 /// the kubernetes driver the loop pod's deny-ingress NetworkPolicy admits sandbox traffic per
@@ -510,16 +517,6 @@ pub fn gateway_toml(
             }
         }
         ComputeDriver::Kubernetes => {
-            // The gateway auto-detects the JWT bundle `generate-certs` writes next to the TLS
-            // bundle and turns on its authenticator chain, and it hard-rejects mTLS *user* auth
-            // under the kubernetes compute driver (the implicit auth the podman path rides via
-            // its singleplayer-driver auto-default). Without this block, crucible's own
-            // bearer-less RPCs bounce UNAUTHENTICATED at the first authenticated method
-            // (CreateProvider). Trust model is unchanged: the socket still requires the
-            // generated client cert (require_client_auth), so possession of the local mTLS
-            // client cert = authorized, exactly what mtls_auth grants under podman. Sandbox
-            // supervisor calls keep using gateway-minted JWTs either way.
-            s.push_str("\n[openshell.gateway.auth]\nallow_unauthenticated_users = true\n");
             let dial_back = dial_back.ok_or(GatewayError::NoDialBack)?;
             let mut cfg = KubernetesDriverConfig::new(images);
             cfg.grpc_endpoint = dial_back.grpc_endpoint.clone();
@@ -838,7 +835,7 @@ async fn await_remote(access: &GatewayAccess, endpoint: &str) -> Result<()> {
         .and_then(|d| crate::openshell::grpc::HealthProbe::new(&d))
     {
         Some(probe) => {
-            let deadline = Instant::now() + Duration::from_secs(120);
+            let deadline = Instant::now() + REMOTE_HEALTH_WAIT;
             loop {
                 if probe.healthy().await {
                     break true;
@@ -853,6 +850,7 @@ async fn await_remote(access: &GatewayAccess, endpoint: &str) -> Result<()> {
     };
     if !healthy {
         return Err(GatewayError::HealthTimeout {
+            waited: REMOTE_HEALTH_WAIT,
             last_status: format!("no healthy answer from {endpoint}"),
             log_tail: remote_log_hint(endpoint),
         }
@@ -1092,7 +1090,7 @@ async fn boot(driver: ComputeDriver, images: &DriverImages) -> Result<()> {
         .and_then(|d| crate::openshell::grpc::HealthProbe::new(&d))
     {
         Some(probe) => {
-            let deadline = Instant::now() + Duration::from_secs(60);
+            let deadline = Instant::now() + LOCAL_HEALTH_WAIT;
             loop {
                 if probe.healthy().await {
                     break true;
@@ -1110,6 +1108,7 @@ async fn boot(driver: ComputeDriver, images: &DriverImages) -> Result<()> {
         // tail, so the timeout is never a bare one-liner.
         let (_, last_status) = status_check();
         return Err(GatewayError::HealthTimeout {
+            waited: LOCAL_HEALTH_WAIT,
             last_status,
             log_tail: tail_gateway_log(&log_path),
         }
@@ -1601,18 +1600,12 @@ mod tests {
         assert!(k8s.get("image_pull_secrets").is_none());
     }
 
-    /// Under kubernetes the gateway's authenticator chain is always on (certgen's JWT bundle)
-    /// and mTLS user auth is rejected, so the rendered config must opt in to unauthenticated
-    /// local users or every authenticated RPC from crucible itself dies UNAUTHENTICATED at
-    /// CreateProvider. Podman must stay untouched: it authenticates via the mTLS
-    /// singleplayer-driver auto-default, and the escape hatch would only widen it.
     #[test]
-    fn kubernetes_rendering_allows_unauthenticated_local_users_podman_does_not() {
-        let parsed = kubernetes_toml(&DriverImages::default());
-        assert_eq!(
-            parsed["openshell"]["gateway"]["auth"]["allow_unauthenticated_users"].as_bool(),
-            Some(true),
-            "{parsed}"
+    fn no_rendering_admits_callers_without_credentials() {
+        let kubernetes = kubernetes_toml(&DriverImages::default());
+        assert!(
+            kubernetes["openshell"]["gateway"].get("auth").is_none(),
+            "{kubernetes}"
         );
 
         let podman = gateway_toml(
@@ -1624,7 +1617,11 @@ mod tests {
             CLIENT_TLS_SECRET,
         )
         .unwrap();
-        assert!(!podman.contains("allow_unauthenticated_users"), "{podman}");
+        let podman: toml::Value = toml::from_str(&podman).unwrap();
+        assert!(
+            podman["openshell"]["gateway"].get("auth").is_none(),
+            "{podman}"
+        );
     }
 
     /// The driver defaults `grpc_endpoint` to "" and passes it verbatim into the supervisor's
@@ -2119,6 +2116,24 @@ mod tests {
                 .get("gateway_id")
                 .is_none(),
             "an in-pod gateway keeps the driver's default id"
+        );
+    }
+
+    #[test]
+    fn a_health_timeout_reports_how_long_each_kind_of_gateway_was_given() {
+        let timeout = |waited| {
+            GatewayError::HealthTimeout {
+                waited,
+                last_status: "no answer".to_string(),
+                log_tail: String::new(),
+            }
+            .to_string()
+        };
+        assert!(
+            timeout(LOCAL_HEALTH_WAIT).starts_with("gateway did not become healthy within 60s\n")
+        );
+        assert!(
+            timeout(REMOTE_HEALTH_WAIT).starts_with("gateway did not become healthy within 120s\n")
         );
     }
 }

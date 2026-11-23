@@ -486,6 +486,15 @@ slug() {
     echo "${s//:/_}"
 }
 
+# run_dir_name <run id>: a local run's directory name under scratch/local-runs.
+run_dir_name() { printf %s "$1" | shasum -a 256 | cut -d' ' -f1 | cut -c1-16; }
+
+# local_pack <label>: the pack directory of the label's local run, resolved through the run id
+# settle recorded in run-<label>.json.
+local_pack() {
+    printf '%s/scratch/local-runs/%s/pack' "$WORK" "$(run_dir_name "$(jq -r '.runs[0].run_id' "$WORK/run-$1.json")")"
+}
+
 # label <key>: the issue-key label a launch's pod carries.
 label() {
     local v="${1//[!A-Za-z0-9_.-]/-}"

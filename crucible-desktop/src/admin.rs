@@ -404,6 +404,8 @@ pub struct AdminView {
     pub shares: Option<(Shared, Loaded<Vec<dto::Share>>)>,
     pub decisions: Loaded<Vec<dto::DecisionSummary>>,
     pub decision: Option<(String, Loaded<dto::Decision>)>,
+    /// The open decision requests read in full, by id, for the notes that announce them.
+    pub details: BTreeMap<String, dto::Decision>,
     /// Scope packs to approve, imports to settle and kept PRs to review.
     pub approvals: Loaded<dto::Approvals>,
     pub keys: Loaded<Vec<dto::ApiKey>>,
@@ -1620,5 +1622,260 @@ mod tests {
         assert_eq!(relative("2026-11-03T12:00:00Z", now), "5d ago");
         assert_eq!(relative("2026-11-08T12:00:30Z", now), "now");
         assert_eq!(relative("soon", now), "");
+    }
+
+    /// The fixture request as `id`, asking only its first question.
+    fn asking_one(id: &str) -> dto::Decision {
+        let mut decision = fixture().expect("fixture");
+        decision.id = id.into();
+        decision.questions.truncate(1);
+        decision
+    }
+
+    /// [`asking_one`] as the controller sends it.
+    fn asking_one_json(id: &str) -> String {
+        let mut decision: serde_json::Value =
+            serde_json::from_str(include_str!("../fixtures/decision.json")).unwrap();
+        decision["id"] = id.into();
+        decision["questions"].as_array_mut().unwrap().truncate(1);
+        decision.to_string()
+    }
+
+    fn queue_json(ids: &[&str]) -> String {
+        let open: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|id| {
+                serde_json::json!({
+                    "id": id,
+                    "run_id": "run-1",
+                    "task": "review_bumps",
+                    "questions": ["ship"],
+                    "opened_at": "2026-11-08T10:00:00Z",
+                    "expires_at": "2026-11-09T10:00:00Z",
+                })
+            })
+            .collect();
+        serde_json::json!({ "open": open }).to_string()
+    }
+
+    #[test]
+    fn a_request_asking_one_single_answer_question_gets_a_button_for_each_label() {
+        let decision = asking_one("d1");
+        assert_eq!(
+            app::answers(&decision, "mpp"),
+            Some(crate::notify::Answers {
+                profile: "mpp".into(),
+                decision: "d1".into(),
+                question: "ship".into(),
+                digest: "sha256:fixture".into(),
+                options: vec!["yes".into(), "no".into()],
+            })
+        );
+        let with = |change: fn(&mut dto::Decision)| {
+            let mut changed = asking_one("d1");
+            change(&mut changed);
+            app::answers(&changed, "mpp")
+        };
+        assert_eq!(app::answers(&fixture().expect("fixture"), "mpp"), None);
+        assert_eq!(with(|d| d.questions[0].multiple = true), None);
+        assert_eq!(with(|d| d.questions[0].options.clear()), None);
+        assert_eq!(with(|d| d.can_answer = false), None);
+        assert_eq!(with(|d| d.state = "answered".into()), None);
+        assert_eq!(
+            with(|d| d.questions[0].options = (0..=app::BUTTONS).map(|n| n.to_string()).collect()),
+            None
+        );
+        assert_eq!(
+            with(|d| d.questions[0].options = (0..app::BUTTONS).map(|n| n.to_string()).collect())
+                .map(|answers| answers.options.len()),
+            Some(app::BUTTONS)
+        );
+    }
+
+    #[test]
+    fn a_request_is_announced_with_buttons_once_it_was_read_in_full() {
+        let decision = asking_one("d1");
+        let plain = app::note(&summary("d1"), None, "mpp");
+        assert_eq!(plain.buttons, crate::notify::Buttons::None);
+        assert_eq!(plain.id, "d1");
+        let asking = app::note(&summary("d1"), Some(&decision), "mpp");
+        assert_eq!(
+            Some(asking.buttons),
+            app::answers(&decision, "mpp").map(crate::notify::Buttons::Answers)
+        );
+        assert_eq!(
+            (asking.title, asking.body, asking.link),
+            (plain.title, plain.body, plain.link)
+        );
+    }
+
+    #[test]
+    fn a_pass_reads_the_first_few_requests_it_has_not_read() {
+        let open: Vec<dto::DecisionSummary> = ["a", "b", "c", "d", "e", "f"]
+            .map(summary)
+            .into_iter()
+            .collect();
+        let read = BTreeMap::from([("b".to_string(), asking_one("b"))]);
+        assert_eq!(client::unread(&open, &read), ["a", "c", "d", "e"]);
+        assert_eq!(client::unread(&open, &read).len(), client::DETAILS);
+        assert!(client::unread(&open[1..2], &read).is_empty());
+    }
+
+    #[test]
+    fn an_answer_sent_from_the_page_drops_its_picks_and_a_refused_one_keeps_them() {
+        let mut desk = Desk::default();
+        desk.pick_decision("a");
+        desk.toggle_pick("ship", "yes", false);
+        assert_eq!(desk.answered(&Err("expired".into())), None);
+        assert_eq!(desk.picks["ship"], ["yes"]);
+        assert_eq!(desk.answered(&Ok("Answered".into())), None);
+        assert!(desk.picks.is_empty());
+    }
+
+    #[test]
+    fn a_notification_answer_leaves_another_requests_picks_and_reports_a_refusal() {
+        let mut desk = Desk::default();
+        desk.pick_decision("a");
+        desk.toggle_pick("ship", "yes", false);
+        desk.quick = Some("b".into());
+        assert_eq!(desk.answered(&Ok("Answered".into())), None);
+        assert_eq!(desk.picks["ship"], ["yes"], "they are for request a");
+        assert_eq!(desk.quick, None);
+
+        desk.quick = Some("b".into());
+        assert_eq!(
+            desk.answered(&Err("expired".into())),
+            Some(("b".to_string(), "expired".to_string()))
+        );
+        assert_eq!(desk.picks["ship"], ["yes"]);
+        assert_eq!(desk.quick, None);
+
+        desk.quick = Some("a".into());
+        assert_eq!(desk.answered(&Ok("Answered".into())), None);
+        assert!(desk.picks.is_empty(), "the request shown was answered");
+    }
+
+    #[test]
+    fn open_requests_are_read_in_full_once_and_forgotten_when_they_close() {
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let closing = Arc::clone(&closed);
+        let (client, requests, _keys) = worker(move |line| match line {
+            ["GET", "/api/decisions"] => {
+                if closing.load(std::sync::atomic::Ordering::SeqCst) {
+                    queue_json(&[])
+                } else {
+                    queue_json(&["d1"])
+                }
+            }
+            ["GET", "/api/decisions/d1"] => asking_one_json("d1"),
+            ["GET", "/api/approvals"] => "{}".into(),
+            _ => "[]".into(),
+        });
+        let watch = Watch {
+            controller: true,
+            ..Watch::default()
+        };
+        client.watch(watch.clone());
+        let view = until(&client, |view| view.details.contains_key("d1"));
+        assert_eq!(view.details["d1"], asking_one("d1"));
+        assert_eq!(
+            view.decisions.map(|open| open.map(|open| open.len())),
+            Some(Ok(1)),
+            "the queue and the request arrive in one view"
+        );
+
+        client.watch(Watch {
+            schedules: true,
+            ..watch.clone()
+        });
+        let again = until(&client, |view| view.schedules.is_some());
+        assert!(again.details.contains_key("d1"));
+        let reads = |requests: &Mutex<Vec<String>>| {
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|line| *line == "GET /api/decisions/d1")
+                .count()
+        };
+        assert_eq!(reads(&requests), 1, "a later pass does not read it again");
+
+        closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        client.watch(watch);
+        until(&client, |view| {
+            view.details.is_empty() && view.decisions == Some(Ok(Vec::new()))
+        });
+    }
+
+    #[test]
+    fn a_notification_button_answers_its_request_over_the_wire() {
+        use crate::notify::{Answer, Clicked};
+
+        let sent = Arc::new(Mutex::new(Vec::<String>::new()));
+        let took = Arc::clone(&sent);
+        let (url, _) = crate::testserver::serve_replies(move |asked| {
+            let line: Vec<&str> = asked.line.split_whitespace().take(2).collect();
+            crate::testserver::Reply::ok(match line.as_slice() {
+                ["GET", "/api/decisions"] => queue_json(&["d1"]),
+                ["GET", "/api/decisions/d1"] => asking_one_json("d1"),
+                ["POST", "/api/decisions/d1/answer"] => {
+                    took.lock().unwrap().push(asked.body.clone());
+                    asking_one_json("d1")
+                }
+                ["GET", "/api/approvals"] => "{}".into(),
+                _ => "[]".into(),
+            })
+        });
+        let keys = tempfile::tempdir().unwrap();
+        let net = crate::net::Net::uncached_for_tests();
+        let target = crate::testserver::target("t", &url, keys.path());
+        let mut remote = crate::remote::Remote::new(target, &net, None, None);
+        remote.admin_client.watch(Watch {
+            controller: true,
+            ..Watch::default()
+        });
+        let view = until(&remote.admin_client, |view| view.details.contains_key("d1"));
+        let open = view.decisions.clone().unwrap().unwrap();
+        let note = app::note(&open[0], view.details.get("d1"), "t");
+        remote.admin = view;
+        let Some(Clicked::Answer(answer)) = crate::notify::freedesktop::asked(&note, "answer:yes")
+        else {
+            panic!("the note has no yes button: {note:?}");
+        };
+
+        let elsewhere = Answer {
+            profile: "another".into(),
+            ..answer.clone()
+        };
+        assert!(
+            !remote.answer(&elsewhere),
+            "it was asked on another profile"
+        );
+        let gone = Answer {
+            decision: "d0".into(),
+            ..answer.clone()
+        };
+        assert!(!remote.answer(&gone), "that request no longer waits");
+        assert!(sent.lock().unwrap().is_empty());
+        assert_eq!(remote.desk.quick, None);
+
+        assert!(remote.answer(&answer));
+        assert_eq!(remote.desk.quick.as_deref(), Some("d1"));
+        assert!(!remote.answer(&answer), "one action at a time");
+        let done = until(&remote.admin_client, |view| view.acted.is_some());
+        assert_eq!(
+            done.acted.map(|acted| (acted.did, acted.result)),
+            Some((Did::Answer, Ok("Answered".to_string())))
+        );
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&sent[0]).unwrap(),
+            serde_json::json!({
+                "labels": { "ship": ["yes"] },
+                "evidence_digest": "sha256:fixture",
+                "note": null,
+            })
+        );
     }
 }

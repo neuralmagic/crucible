@@ -59,6 +59,15 @@ pub trait PodDispatcher: Send + Sync {
     ) -> Result<()> {
         Err(Unsupported::SecretValues.into())
     }
+    /// The `names` that no Secret in `namespace` carries. The default finds none missing.
+    async fn missing_secrets(
+        &self,
+        _cluster: &str,
+        _namespace: &str,
+        _names: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>> {
+        Ok(BTreeSet::new())
+    }
     /// Create a Service, returning it as the API server stored it, its `spec.clusterIP` assigned.
     /// Only an isolated run gateway needs one, so the default refuses.
     async fn create_service(

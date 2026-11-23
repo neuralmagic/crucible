@@ -380,12 +380,10 @@ pub async fn within<T, E: std::fmt::Display>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
-
     use crux::client::Credential;
     use crux::config::Auth;
 
-    use crate::net::{Down, Net, reaching};
+    use crate::net::{Connector, Down, Net, reaching};
     use crate::profile::{Profile, Target};
     use crate::testserver::{serve, target};
 
@@ -428,26 +426,45 @@ mod tests {
 
     #[test]
     fn every_clone_of_a_connector_uses_the_one_connection() {
-        let (url, accepted) = serve(|_| "{}".into());
+        use crate::testserver::{Reply, serve_replies};
+
+        fn key_sent(connector: &Connector) -> serde_json::Value {
+            let c = connector.connection().unwrap();
+            let answer: serde_json::Value = c.call("whoami", c.client.get("/api/whoami")).unwrap();
+            answer["key"].clone()
+        }
+
+        let (url, _) = serve_replies(|asked| {
+            Reply::ok(serde_json::json!({ "key": asked.header("authorization") }).to_string())
+        });
         let keys = tempfile::tempdir().unwrap();
         let net = Net::uncached_for_tests();
-        let connector = net.connector(target("t", &url, keys.path()));
-        for _ in 0..4 {
-            let worker = connector.clone();
-            std::thread::spawn(move || {
-                let c = worker.connection().unwrap();
-                let _: serde_json::Value = c.call("whoami", c.client.get("/api/whoami")).unwrap();
-            })
+        let target = target("t", &url, keys.path());
+        let connector = net.connector(target.clone());
+
+        target.save_key("crk_first".into()).unwrap();
+        let opener = connector.clone();
+        let opened = std::thread::spawn(move || key_sent(&opener))
             .join()
             .unwrap();
-            let c = connector.connection().unwrap();
-            let _: serde_json::Value = c.call("whoami", c.client.get("/api/whoami")).unwrap();
-        }
+        assert_eq!(opened, "Bearer crk_first");
+
+        target.save_key("crk_second".into()).unwrap();
         assert_eq!(
-            accepted.load(Ordering::SeqCst),
-            1,
-            "eight calls from five threads go over one pooled connection"
+            key_sent(&connector),
+            "Bearer crk_first",
+            "the connector a clone opened is open for the original"
         );
+        for _ in 0..3 {
+            let worker = connector.clone();
+            let sent = std::thread::spawn(move || key_sent(&worker))
+                .join()
+                .unwrap();
+            assert_eq!(
+                sent, "Bearer crk_first",
+                "a clone on another thread opens nothing of its own"
+            );
+        }
     }
 
     #[test]

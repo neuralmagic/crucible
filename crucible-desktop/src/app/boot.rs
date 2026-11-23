@@ -84,6 +84,7 @@ pub(crate) fn init() -> App {
         palette: None,
         pane_focus: None,
         notifier: None,
+        rerun_wanted: None,
         clicks: None,
         recorders: HashMap::new(),
         provider_scratch: rune_kit::ComboboxState::default(),
@@ -147,14 +148,13 @@ pub(crate) fn init() -> App {
 }
 
 pub(crate) fn setup(app: &mut App, waker: Waker) {
-    rune::zoom::set(app.settings.zoom);
     app.waker = Some(waker.clone());
     let (clicked, clicks) = std::sync::mpsc::channel();
     #[cfg(target_os = "linux")]
     {
         instance::serve(clicked.clone(), waker.clone());
         if let Some(link) = instance::launch_link(rune::extra_args()) {
-            let _ = clicked.send(link);
+            let _ = clicked.send(notify::Clicked::Open(link));
         }
     }
     app.notifier = Some(notify::Notifier::start(clicked, waker.clone()));
@@ -203,14 +203,21 @@ pub(crate) fn poll(app: &mut App, clock: f64, tx: &mut Tx) -> bool {
         app.apply_admin(view);
         changed = true;
     }
-    while let Some(link) = app
+    while let Some(clicked) = app
         .clicks
         .as_ref()
         .and_then(|clicks| clicks.try_recv().ok())
-        .and_then(|url| Link::parse(&url))
     {
-        app.follow(&link);
-        notify::bring_to_front();
+        match clicked {
+            notify::Clicked::Open(url) => {
+                if let Some(link) = Link::parse(&url) {
+                    app.follow(&link);
+                    notify::bring_to_front();
+                }
+            }
+            notify::Clicked::Answer(answer) => app.answer_from_note(answer),
+            notify::Clicked::Run { link, action } => app.press_run_button(&link, action),
+        }
         changed = true;
     }
     while let Some(paths) = app
@@ -233,6 +240,7 @@ pub(crate) fn poll(app: &mut App, clock: f64, tx: &mut Tx) -> bool {
     if let Some(wait) = app.tick_reports(clock) {
         tx.wake_after(std::time::Duration::try_from_secs_f64(wait).unwrap_or_default());
     }
+    changed |= app.rerun_when_read();
     app.sync_live();
     app.sync_report();
     app.sync_admin();
@@ -294,5 +302,6 @@ pub(crate) fn scene_tab(app: &mut App) {
 pub(crate) fn open_link(app: &mut App, url: &str, _tx: &mut Tx) {
     if let Some(link) = Link::parse(url) {
         app.follow(&link);
+        notify::bring_to_front();
     }
 }

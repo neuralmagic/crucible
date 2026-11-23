@@ -1822,9 +1822,9 @@ dependencies = [
 
 [[package]]
 name = "cookie"
-version = "0.18.2"
+version = "0.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a373e3602691c3cdea496d2f0ee5935151e6168fe87739483c463db1b2f2f87"
+checksum = "d55f2d6c30eeec7d5c6f98bd4395d4abb1895629eab97ee6522d340623615f8a"
 dependencies = [
  "percent-encoding",
  "time",
@@ -2007,7 +2007,7 @@ checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
 name = "crucible"
-version = "0.7.2"
+version = "0.8.2"
 dependencies = [
  "allocative",
  "anyhow",
@@ -2068,7 +2068,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-broker"
-version = "0.7.2"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -2097,7 +2097,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-capability"
-version = "0.7.2"
+version = "0.8.2"
 dependencies = [
  "semver",
  "serde",
@@ -2107,7 +2107,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-contract"
-version = "0.7.2"
+version = "0.8.2"
 dependencies = [
  "flate2",
  "jsonschema",
@@ -2124,7 +2124,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-controller"
-version = "0.7.2"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2210,7 +2210,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-git"
-version = "0.7.2"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "apollo-parser",
@@ -2241,7 +2241,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-harness"
-version = "0.7.2"
+version = "0.8.2"
 dependencies = [
  "axum",
  "crucible-contract",
@@ -2254,7 +2254,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-kueue"
-version = "0.7.2"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -2290,7 +2290,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-kueue-client"
-version = "0.7.2"
+version = "0.8.2"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -2308,7 +2308,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-lsp"
-version = "0.7.2"
+version = "0.8.2"
 dependencies = [
  "crucible",
  "crucible-contract",
@@ -2323,7 +2323,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-mcp-auth"
-version = "0.7.2"
+version = "0.8.2"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2352,7 +2352,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-runner"
-version = "0.7.2"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -2365,7 +2365,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-vcs"
-version = "0.7.2"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "duct",
@@ -2375,7 +2375,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-view"
-version = "0.7.2"
+version = "0.8.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -2390,7 +2390,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "crux"
-version = "0.7.2"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3449,7 +3449,7 @@ checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
 name = "forge"
-version = "0.7.2"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -3484,9 +3484,9 @@ dependencies = [
 
 [[package]]
 name = "form_urlencoded"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
+checksum = "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"
 dependencies = [
  "percent-encoding",
 ]
@@ -7453,9 +7453,9 @@ dependencies = [
 
 [[package]]
 name = "parquet"
-version = "60.0.0"
+version = "60.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8af83d2940bc0510f9aef86d865f56fdc6095f87ab115ac885a80b7c5226d3ba"
+checksum = "6701f0dd63f5ee23a0f1f2865ff76825c301759d6ab649e3e5686cc32d066957"
 dependencies = [
  "ahash",
  "bytes",
@@ -7472,9 +7472,9 @@ dependencies = [
 
 [[package]]
 name = "parquet_derive"
-version = "60.0.0"
+version = "60.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ece3286a358c79054c0527499f3cba1d0cc1e52299e4d71ff117dfabfd74df7f"
+checksum = "d3dd66a154efe0d8dbaf55ba021b3374fa01e544b493fcba95a66180529a12bf"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -10281,7 +10281,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -11273,9 +11273,9 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "url"
-version = "2.5.8"
+version = "2.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
+checksum = "f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a"
 dependencies = [
  "form_urlencoded",
  "idna",
@@ -11970,7 +11970,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.7.2"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "clap",

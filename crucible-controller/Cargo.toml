@@ -175,8 +175,8 @@ mime_guess = "2"
 # On-demand analytics sidecars (`GET /api/export/*.parquet`), replacing the SSG's parquet files so
 # DuckDB keeps reading over the API. Same version/features as `crucible`'s report.rs writer so the
 # on-disk format is identical (schema mirrored from report.rs — see `export.rs`).
-parquet = { version = "60.0.0", default-features = false, features = ["snap"] }
-parquet_derive = "60.0.0"
+parquet = { version = "60.2.0", default-features = false, features = ["snap"] }
+parquet_derive = "60.2.0"
 # Stream a downloaded artifact temp file back through axum without buffering it in memory (the
 # artifact proxy — session.jsonl can be tens of MB).
 tokio-util = { version = "0.7", features = ["io"] }
