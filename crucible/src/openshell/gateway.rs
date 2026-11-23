@@ -67,13 +67,20 @@ pub enum GatewayError {
     #[error("gateway register failed within 30s: {last}\n{log_tail}")]
     RegisterTimeout { last: String, log_tail: String },
     #[error(
-        "gateway did not become healthy within 60s\nlast `openshell status`: {last_status}\n{log_tail}"
+        "gateway did not become healthy within {}s\nlast `openshell status`: {last_status}\n{log_tail}",
+        waited.as_secs()
     )]
     HealthTimeout {
+        waited: Duration,
         last_status: String,
         log_tail: String,
     },
 }
+
+/// How long a gateway this process started gets to answer Health.
+const LOCAL_HEALTH_WAIT: Duration = Duration::from_secs(60);
+/// How long a gateway in its own pod gets to answer Health.
+const REMOTE_HEALTH_WAIT: Duration = Duration::from_secs(120);
 
 /// The in-process OTLP collector's bind port for sandboxed turns. Fixed, not OS-assigned: under
 /// the kubernetes driver the loop pod's deny-ingress NetworkPolicy admits sandbox traffic per
@@ -828,7 +835,7 @@ async fn await_remote(access: &GatewayAccess, endpoint: &str) -> Result<()> {
         .and_then(|d| crate::openshell::grpc::HealthProbe::new(&d))
     {
         Some(probe) => {
-            let deadline = Instant::now() + Duration::from_secs(120);
+            let deadline = Instant::now() + REMOTE_HEALTH_WAIT;
             loop {
                 if probe.healthy().await {
                     break true;
@@ -843,6 +850,7 @@ async fn await_remote(access: &GatewayAccess, endpoint: &str) -> Result<()> {
     };
     if !healthy {
         return Err(GatewayError::HealthTimeout {
+            waited: REMOTE_HEALTH_WAIT,
             last_status: format!("no healthy answer from {endpoint}"),
             log_tail: remote_log_hint(endpoint),
         }
@@ -1082,7 +1090,7 @@ async fn boot(driver: ComputeDriver, images: &DriverImages) -> Result<()> {
         .and_then(|d| crate::openshell::grpc::HealthProbe::new(&d))
     {
         Some(probe) => {
-            let deadline = Instant::now() + Duration::from_secs(60);
+            let deadline = Instant::now() + LOCAL_HEALTH_WAIT;
             loop {
                 if probe.healthy().await {
                     break true;
@@ -1100,6 +1108,7 @@ async fn boot(driver: ComputeDriver, images: &DriverImages) -> Result<()> {
         // tail, so the timeout is never a bare one-liner.
         let (_, last_status) = status_check();
         return Err(GatewayError::HealthTimeout {
+            waited: LOCAL_HEALTH_WAIT,
             last_status,
             log_tail: tail_gateway_log(&log_path),
         }
@@ -2107,6 +2116,24 @@ mod tests {
                 .get("gateway_id")
                 .is_none(),
             "an in-pod gateway keeps the driver's default id"
+        );
+    }
+
+    #[test]
+    fn a_health_timeout_reports_how_long_each_kind_of_gateway_was_given() {
+        let timeout = |waited| {
+            GatewayError::HealthTimeout {
+                waited,
+                last_status: "no answer".to_string(),
+                log_tail: String::new(),
+            }
+            .to_string()
+        };
+        assert!(
+            timeout(LOCAL_HEALTH_WAIT).starts_with("gateway did not become healthy within 60s\n")
+        );
+        assert!(
+            timeout(REMOTE_HEALTH_WAIT).starts_with("gateway did not become healthy within 120s\n")
         );
     }
 }

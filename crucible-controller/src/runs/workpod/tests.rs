@@ -6349,6 +6349,7 @@ struct GatewayDispatcher {
     events: Arc<Mutex<Vec<GatewayEvent>>>,
     fail_network_policy: bool,
     gateways: std::collections::BTreeSet<String>,
+    absent_secrets: std::collections::BTreeSet<String>,
 }
 
 impl GatewayDispatcher {
@@ -6391,6 +6392,15 @@ impl PodDispatcher for GatewayDispatcher {
             secret: Box::new(secret),
         });
         Ok(())
+    }
+    async fn missing_secrets(
+        &self,
+        _cluster: &str,
+        ns: &str,
+        names: &std::collections::BTreeSet<String>,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        assert_eq!(ns, "sandboxes");
+        Ok(names.intersection(&self.absent_secrets).cloned().collect())
     }
     async fn create_service(
         &self,
@@ -6818,6 +6828,61 @@ async fn a_gateway_that_fails_to_start_is_torn_down_with_the_launch(
         .await?
         .expect("row");
     assert_eq!(row.state, WorkPodState::Failed);
+    Ok(())
+}
+
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_sandbox_namespace_without_the_gateways_pull_secret_refuses_the_launch(
+    pool: sqlx::PgPool,
+) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let tmp = tempfile::tempdir()?;
+    let db = Db::new(pool);
+    let profile = isolated_profile(tmp.path());
+    let pull_secret = crucible::deploy::DeployProfile::load(&profile)?
+        .image
+        .pull_secret;
+    let dispatcher = Arc::new(GatewayDispatcher {
+        absent_secrets: [pull_secret.clone()].into(),
+        ..Default::default()
+    });
+    let err = dispatch_isolated(&db, tmp.path(), &profile, dispatcher.clone())
+        .await
+        .expect_err("the launch is refused");
+    let refusal = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::runs::workpod::gateway::DispatchError>())
+        .unwrap_or_else(|| panic!("a typed refusal in {err:#}"));
+    let crate::runs::workpod::gateway::DispatchError::PullSecretsMissing {
+        cluster,
+        namespace,
+        secrets,
+    } = refusal
+    else {
+        panic!("expected missing pull Secrets, got {refusal}");
+    };
+    assert_eq!(namespace, "sandboxes");
+    assert_eq!(cluster, crate::runs::clusters::HUB_CLUSTER);
+    assert_eq!(
+        secrets,
+        &std::collections::BTreeSet::from([pull_secret.clone()])
+    );
+    let message = refusal.to_string();
+    assert!(
+        message.contains(&pull_secret) && message.contains("namespace sandboxes"),
+        "{message}"
+    );
+    let events = dispatcher.events();
+    assert!(
+        !events.iter().any(|e| matches!(e, GatewayEvent::Pod { .. })),
+        "neither a gateway pod that cannot pull nor a loop pod waiting on it: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, GatewayEvent::DeleteSelected { namespace, .. } if namespace == "sandboxes")),
+        "the reserved gateway Service is torn down: {events:?}"
+    );
     Ok(())
 }
 
