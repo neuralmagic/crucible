@@ -1,0 +1,36 @@
+# One benchmark replica: the stock release image from any registry the nodes
+# pull, with the build's runtime artifact fetched over the pod network and
+# loaded in front of the entrypoint. Set ARTIFACT_URL to the blob URL a
+# vllm-pr-build or vllm-iter run emits, and IMAGE to the exact release image
+# the artifact was built on — the compiled extensions carry its ABI.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vllm-benchmark
+spec:
+  restartPolicy: Never
+  initContainers:
+    - name: fetch
+      image: quay.io/buildah/stable:latest
+      command: [/bin/bash, -ceu]
+      args:
+        - curl -sf "$ARTIFACT_URL" | tar -xf - -C /artifact
+      env:
+        - name: ARTIFACT_URL
+          value: http://registry.example.com/v2/artifacts/blobs/sha256:...
+      volumeMounts:
+        - name: artifact
+          mountPath: /artifact
+  containers:
+    - name: vllm
+      image: docker.io/vllm/vllm-openai:v0.34.0
+      command: [/bin/bash, -ceu]
+      args:
+        - cd /artifact && exec python3 -m vllm.entrypoints.openai.api_server "$@"
+      volumeMounts:
+        - name: artifact
+          mountPath: /artifact
+          readOnly: true
+  volumes:
+    - name: artifact
+      emptyDir: {}

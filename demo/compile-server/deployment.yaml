@@ -1,0 +1,45 @@
+# A warm compile pod for sub-minute CUDA-kernel iteration: it holds one
+# unpacked build-base image (the output of demo/vllm-pr-build) and applies
+# patches to its compiled tree on demand. Set BASE to an image reference the
+# pod's network can pull. Privileged is required for buildah's overlay mounts;
+# the ephemeral-storage request keeps the scheduler off full nodes.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-compile
+  labels:
+    app: vllm-compile
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm-compile
+  template:
+    metadata:
+      labels:
+        app: vllm-compile
+    spec:
+      containers:
+        - name: compile
+          image: quay.io/buildah/stable:latest
+          command: [/bin/bash, -ceu]
+          args:
+            - |
+              set -o pipefail
+              base=registry.example.com/vllm/build-base:latest
+              buildah pull --tls-verify=false "$base"
+              buildah from --name vllmwc --pull-never "$base"
+              echo WARM_OK
+              sleep infinity
+          securityContext:
+            privileged: true
+          resources:
+            requests:
+              cpu: 16
+              memory: 32Gi
+              ephemeral-storage: 100Gi
+            limits:
+              cpu: 64
+              memory: 192Gi
