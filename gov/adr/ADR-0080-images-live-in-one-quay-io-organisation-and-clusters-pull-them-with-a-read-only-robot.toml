@@ -72,6 +72,8 @@ Sandbox, supervisor and controller images pull with no credential on a cluster t
 
 The controller's identity on a cluster gains create and update on `secrets` in the namespaces the profile names, to keep `crucible-pull` there. [[ADR-0048]]'s grant already writes Secrets in the loop namespace ([[ADR-0036]]); this extends it to the sandbox, crucible-kueue and workload namespaces.
 
+A controller that reads the Secret as its authfile has to match the `quay.io/crucible-ai` key to an image, which a lookup by registry host does not. forge's lookup takes the most specific `registry/path` key; buildit's still goes by host, so `push_authfile` stays keyed by host until it does too.
+
 The kubelet presents the robot for public repositories in the organisation too. A deleted robot fails those pulls on a node with no cached copy, which is why rotation replaces the robot and deletes the old one last.
 
 A new image's repository has to be created public, or flipped, before anything without the credential can pull it. A first push alone leaves it private.

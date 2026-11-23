@@ -15,7 +15,7 @@ use clap::{Parser, ValueEnum};
 use forge::capture::{
     BindMount, CaptureConfig, ExecutorChoice, RootfsCache, capture_and_push, select_executor,
 };
-use forge::oci::{registry_of, resolve_auth};
+use forge::oci::{reference_of, resolve_auth};
 use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
@@ -125,8 +125,8 @@ fn main() -> Result<()> {
 
     // Per-registry creds, resolved the way docker/crane do (explicit authfile, else the operator's
     // default login, else anonymous). The base gets its own lookup so a private base still pulls.
-    let base_auth = resolve_auth(args.authfile.as_deref(), &registry_of(&args.base)?)?;
-    let target_auth = resolve_auth(args.authfile.as_deref(), &registry_of(&args.push)?)?;
+    let base_auth = resolve_auth(args.authfile.as_deref(), &reference_of(&args.base)?)?;
+    let target_auth = resolve_auth(args.authfile.as_deref(), &reference_of(&args.push)?)?;
 
     // The one runtime for all registry IO; everything below borrows its handle. Multi-thread so
     // Handle::block_on drives IO from sync code.
