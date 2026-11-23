@@ -1696,10 +1696,13 @@ mod tests {
     fn a_request_is_announced_with_buttons_once_it_was_read_in_full() {
         let decision = asking_one("d1");
         let plain = app::note(&summary("d1"), None, "mpp");
-        assert_eq!(plain.answers, None);
+        assert_eq!(plain.buttons, crate::notify::Buttons::None);
         assert_eq!(plain.id, "d1");
         let asking = app::note(&summary("d1"), Some(&decision), "mpp");
-        assert_eq!(asking.answers, app::answers(&decision, "mpp"));
+        assert_eq!(
+            Some(asking.buttons),
+            app::answers(&decision, "mpp").map(crate::notify::Buttons::Answers)
+        );
         assert_eq!(
             (asking.title, asking.body, asking.link),
             (plain.title, plain.body, plain.link)

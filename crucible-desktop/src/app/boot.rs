@@ -84,6 +84,7 @@ pub(crate) fn init() -> App {
         palette: None,
         pane_focus: None,
         notifier: None,
+        rerun_wanted: None,
         clicks: None,
         recorders: HashMap::new(),
         provider_scratch: rune_kit::ComboboxState::default(),
@@ -215,6 +216,7 @@ pub(crate) fn poll(app: &mut App, clock: f64, tx: &mut Tx) -> bool {
                 }
             }
             notify::Clicked::Answer(answer) => app.answer_from_note(answer),
+            notify::Clicked::Run { link, action } => app.press_run_button(&link, action),
         }
         changed = true;
     }
@@ -238,6 +240,7 @@ pub(crate) fn poll(app: &mut App, clock: f64, tx: &mut Tx) -> bool {
     if let Some(wait) = app.tick_reports(clock) {
         tx.wake_after(std::time::Duration::try_from_secs_f64(wait).unwrap_or_default());
     }
+    changed |= app.rerun_when_read();
     app.sync_live();
     app.sync_report();
     app.sync_admin();
@@ -299,5 +302,6 @@ pub(crate) fn scene_tab(app: &mut App) {
 pub(crate) fn open_link(app: &mut App, url: &str, _tx: &mut Tx) {
     if let Some(link) = Link::parse(url) {
         app.follow(&link);
+        notify::bring_to_front();
     }
 }

@@ -69,7 +69,7 @@ impl App {
                 title,
                 body,
                 link,
-                answers: None,
+                buttons: crate::notify::Buttons::None,
             });
         }
     }

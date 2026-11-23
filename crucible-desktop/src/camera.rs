@@ -74,6 +74,12 @@ impl Camera {
         self.set(pan, self.zoom);
     }
 
+    /// Moves so the diagram point `q`, in the pane's points before the camera, shows at `at`.
+    pub fn show_at(&mut self, q: [f32; 2], at: [f32; 2]) {
+        let pan = [at[0] - q[0] * self.zoom, at[1] - q[1] * self.zoom];
+        self.set(pan, self.zoom);
+    }
+
     pub fn reset(&mut self) {
         self.set([0.0, 0.0], 1.0);
     }
@@ -123,6 +129,18 @@ mod tests {
         let before = (camera.pan, camera.zoom);
         camera.zoom_by(f32::NAN, [50.0, 50.0]);
         assert_eq!((camera.pan, camera.zoom), before);
+    }
+
+    #[test]
+    fn a_point_is_shown_where_asked_at_the_zoom_in_use() {
+        let mut camera = Camera::default();
+        camera.pan_by([30.0, -12.0]);
+        camera.zoom_by(1.6, [0.0, 0.0]);
+        let (q, at) = ([-120.0, 340.0], [0.0, 200.0]);
+        camera.show_at(q, at);
+        assert!(near(shown(&camera, q), at));
+        assert!((camera.zoom - 1.6).abs() < 1e-4, "the zoom stays");
+        assert_eq!(camera.pan().get(), camera.pan);
     }
 
     #[test]

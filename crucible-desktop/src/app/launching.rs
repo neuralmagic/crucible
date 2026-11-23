@@ -1,11 +1,32 @@
 //! Launching: the launch form, sending it, and announcing the launches that land.
 
+use crate::link::Link;
 use crate::live::{LivePlaybook, LiveView, Target};
 use crate::model::Verdict;
+use crate::workspace::PaneKind;
 use crate::{
     App, Backend, Launcher, MAX_TIME, Selection, Stage, admin, form, live, notify, runs_on, studio,
 };
 use rune::TextEdit;
+
+/// What to do about a rerun a note's button asked for.
+#[derive(Debug, PartialEq, Eq)]
+enum Due {
+    Wait,
+    Open,
+    Drop,
+}
+
+/// Whether to open the rerun form asked for on a launch: it must still be the one `selected`,
+/// and once it was `read` it either is `rerunnable` or never will be.
+fn rerun_due(selected: bool, read: bool, rerunnable: bool) -> Due {
+    match (selected, read, rerunnable) {
+        (false, _, _) => Due::Drop,
+        (true, _, true) => Due::Open,
+        (true, true, false) => Due::Drop,
+        (true, false, false) => Due::Wait,
+    }
+}
 
 impl App {
     /// Announces launches by the signed-in user that finished since the last snapshot.
@@ -27,7 +48,54 @@ impl App {
                 && !looking
                 && let Some(notifier) = &self.notifier
             {
-                notifier.post(&notify::note(done));
+                notifier.post(&notify::note(done, self.views_on()));
+            }
+        }
+    }
+
+    /// Opens the launch a note's button is on and does what the button says.
+    pub(crate) fn press_run_button(&mut self, url: &str, action: notify::RunAction) {
+        let Some(link @ Link::Launch { .. }) = Link::parse(url) else {
+            return;
+        };
+        self.follow(&link);
+        match action {
+            notify::RunAction::Log => self.show_pane(PaneKind::Log),
+            notify::RunAction::Report => self.show_pane(PaneKind::Report),
+            notify::RunAction::Rerun => {
+                if let Link::Launch { key, .. } = link {
+                    self.rerun_wanted = Some(key);
+                }
+            }
+        }
+        notify::bring_to_front();
+    }
+
+    /// Opens the rerun form a note's button asked for once the launch it is on has been read,
+    /// and forgets the ask when another run shows or this one cannot be rerun. True when the
+    /// form opened.
+    pub(crate) fn rerun_when_read(&mut self) -> bool {
+        let Some(wanted) = self.rerun_wanted.as_deref() else {
+            return false;
+        };
+        let selected = self.page == crate::Page::Runs
+            && matches!(
+                &self.selection,
+                Some(Selection::Live { launch: Some(key), .. }) if key == wanted
+            );
+        let read = self
+            .selected_detail()
+            .is_some_and(|detail| detail.launch.is_some());
+        match rerun_due(selected, read, self.rerunnable().is_some()) {
+            Due::Wait => false,
+            Due::Drop => {
+                self.rerun_wanted = None;
+                false
+            }
+            Due::Open => {
+                self.rerun_wanted = None;
+                self.open_rerun(Vec::new());
+                true
             }
         }
     }
@@ -255,6 +323,30 @@ impl App {
         if pack.verdict != Verdict::Running {
             let name = pack.name.clone();
             self.local.launch(&name, MAX_TIME);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::app::launching::{Due, rerun_due};
+
+    #[test]
+    fn a_rerun_asked_from_a_note_opens_once_its_run_is_read_and_is_dropped_otherwise() {
+        assert_eq!(rerun_due(true, false, false), Due::Wait, "still reading");
+        assert_eq!(rerun_due(true, true, true), Due::Open);
+        assert_eq!(rerun_due(true, false, true), Due::Open);
+        assert_eq!(
+            rerun_due(true, true, false),
+            Due::Drop,
+            "read, and it cannot be rerun"
+        );
+        for (read, rerunnable) in [(false, false), (true, false), (true, true)] {
+            assert_eq!(
+                rerun_due(false, read, rerunnable),
+                Due::Drop,
+                "another run shows"
+            );
         }
     }
 }

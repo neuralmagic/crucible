@@ -2,7 +2,8 @@
 //! opens it. macOS posts through the Notification Center when the app runs from its bundle and
 //! through `osascript` otherwise (no clicks there); Linux posts through the freedesktop
 //! notification service on the session bus. One notification stands for one launch: a later one
-//! replaces it. A decision request that one click can answer carries a button for each answer.
+//! replaces it. A decision request that one click can answer carries a button for each answer,
+//! and a finished launch one for each thing to do next with it.
 
 use std::sync::mpsc::Sender;
 
@@ -19,8 +20,52 @@ pub struct Note {
     pub body: String,
     /// The `crucible-playbooks://` link a click follows.
     pub link: String,
-    /// The answers its buttons give, when one click can answer what it is about.
-    pub answers: Option<Answers>,
+    pub buttons: Buttons,
+}
+
+/// What a note's buttons are for.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum Buttons {
+    #[default]
+    None,
+    /// One for each answer to the decision request the note is about.
+    Answers(Answers),
+    /// One for each thing to do with the finished launch the note is about.
+    Run(Vec<RunAction>),
+}
+
+/// What a button on a finished launch's note does, after opening the launch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunAction {
+    /// Opens the form that reruns what did not pass.
+    Rerun,
+    /// Brings the Log pane forward.
+    Log,
+    /// Brings the Report pane forward.
+    Report,
+}
+
+impl RunAction {
+    const ALL: [RunAction; 3] = [RunAction::Rerun, RunAction::Log, RunAction::Report];
+
+    fn label(self) -> &'static str {
+        match self {
+            RunAction::Rerun => "Rerun",
+            RunAction::Log => "Log",
+            RunAction::Report => "Report",
+        }
+    }
+}
+
+/// The buttons for a launch that stopped as `status`; `views` is whether the Report pane is on.
+pub fn run_actions(status: &LaunchStatus, views: bool) -> Vec<RunAction> {
+    match status {
+        LaunchStatus::New | LaunchStatus::Running => Vec::new(),
+        LaunchStatus::Done if views => vec![RunAction::Report],
+        LaunchStatus::Done => Vec::new(),
+        LaunchStatus::Cancelled => vec![RunAction::Rerun],
+        LaunchStatus::Error | LaunchStatus::Other(_) => vec![RunAction::Rerun, RunAction::Log],
+    }
 }
 
 /// A decision request asking one question that takes one of `options`.
@@ -42,6 +87,11 @@ pub enum Clicked {
     /// Follow this link.
     Open(String),
     Answer(Answer),
+    /// Follow this link to a launch, then do `action` there.
+    Run {
+        link: String,
+        action: RunAction,
+    },
 }
 
 /// The answer a notification's button gives.
@@ -54,16 +104,19 @@ pub struct Answer {
     pub label: String,
 }
 
-/// What a button's id starts with, before the label it answers with.
+/// What an answer button's id starts with, before the label it answers with.
 #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 const ANSWER: &str = "answer:";
+/// What a launch button's id starts with, before its action's label.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+const RUN: &str = "run:";
 
 #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 impl Note {
     /// The strings a click hands back.
     fn info(&self) -> Vec<(&'static str, String)> {
         let mut info = vec![("link", self.link.clone())];
-        if let Some(answers) = &self.answers {
+        if let Buttons::Answers(answers) = &self.buttons {
             info.extend([
                 ("profile", answers.profile.clone()),
                 ("decision", answers.decision.clone()),
@@ -76,11 +129,23 @@ impl Note {
 
     /// Each button's id and label.
     fn buttons(&self) -> Vec<(String, String)> {
-        self.answers
-            .iter()
-            .flat_map(|answers| &answers.options)
-            .map(|label| (format!("{ANSWER}{label}"), label.clone()))
-            .collect()
+        match &self.buttons {
+            Buttons::None => Vec::new(),
+            Buttons::Answers(answers) => answers
+                .options
+                .iter()
+                .map(|label| (format!("{ANSWER}{label}"), label.clone()))
+                .collect(),
+            Buttons::Run(actions) => actions
+                .iter()
+                .map(|action| {
+                    (
+                        format!("{RUN}{}", action.label()),
+                        action.label().to_string(),
+                    )
+                })
+                .collect(),
+        }
     }
 }
 
@@ -88,22 +153,27 @@ impl Note {
 /// from the strings the notification was posted with.
 #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 fn clicked(action: Option<&str>, info: impl Fn(&str) -> Option<String>) -> Option<Clicked> {
-    match action.and_then(|action| action.strip_prefix(ANSWER)) {
-        Some(label) => Some(Clicked::Answer(Answer {
+    let link = || info("link").filter(|link| !link.is_empty());
+    if let Some(label) = action.and_then(|action| action.strip_prefix(ANSWER)) {
+        return Some(Clicked::Answer(Answer {
             profile: info("profile")?,
             decision: info("decision")?,
             question: info("question")?,
             digest: info("digest")?,
             label: label.to_string(),
-        })),
-        None => info("link")
-            .filter(|link| !link.is_empty())
-            .map(Clicked::Open),
+        }));
+    }
+    let run = action
+        .and_then(|action| action.strip_prefix(RUN))
+        .and_then(|label| RunAction::ALL.into_iter().find(|a| a.label() == label));
+    match run {
+        Some(action) => link().map(|link| Clicked::Run { link, action }),
+        None => link().map(Clicked::Open),
     }
 }
 
-/// What a finished launch is announced with.
-pub fn note(finished: &Finished) -> Note {
+/// What a finished launch is announced with; `views` is whether the Report pane is on.
+pub fn note(finished: &Finished, views: bool) -> Note {
     let outcome = match (&finished.status, &finished.why) {
         (LaunchStatus::Done, _) => "Finished".to_string(),
         (LaunchStatus::Cancelled, Some(why)) => capitalized(why),
@@ -124,7 +194,7 @@ pub fn note(finished: &Finished) -> Note {
             task: None,
         }
         .url(),
-        answers: None,
+        buttons: Buttons::Run(run_actions(&finished.status, views)),
     }
 }
 
@@ -353,7 +423,9 @@ mod tests {
     use crate::link::Link;
     use crate::live::{Finished, LaunchStatus};
     use crate::notify::freedesktop::{actions, asked};
-    use crate::notify::{Answer, Answers, Clicked, Note, clicked, note, quoted};
+    use crate::notify::{
+        Answer, Answers, Buttons, Clicked, Note, RunAction, clicked, note, quoted, run_actions,
+    };
 
     fn finished(status: &str, why: Option<&str>, cost: Option<f64>) -> Finished {
         Finished {
@@ -370,12 +442,12 @@ mod tests {
     #[test]
     fn a_cancelled_launch_says_who_cancelled_it() {
         let cancelled = finished("parked", Some("cancelled by weaton"), None);
-        assert_eq!(note(&cancelled).body, "Cancelled by weaton");
+        assert_eq!(note(&cancelled, false).body, "Cancelled by weaton");
     }
 
     #[test]
     fn a_finished_launch_reads_as_its_playbook_outcome_and_spend_and_links_its_run() {
-        let done = note(&finished("done", None, Some(1.234)));
+        let done = note(&finished("done", None, Some(1.234)), false);
         assert_eq!(done.title, "vllm-agent-fanout");
         assert_eq!(done.body, "Finished \u{b7} $1.23");
         assert_eq!(done.id, "playbook:vllm-agent-fanout:01a1");
@@ -388,11 +460,11 @@ mod tests {
             })
         );
         assert_eq!(
-            note(&finished("error", Some("budget ran out"), None)).body,
+            note(&finished("error", Some("budget ran out"), None), false).body,
             "Error \u{2014} budget ran out"
         );
         assert_eq!(
-            note(&finished("cancelled", None, Some(0.0))).body,
+            note(&finished("cancelled", None, Some(0.0)), false).body,
             "Cancelled"
         );
     }
@@ -403,7 +475,7 @@ mod tests {
             title: "Waiting on you \u{b7} review".into(),
             body: "ship".into(),
             link: Link::Decision { id: "d-7".into() }.url(),
-            answers: Some(Answers {
+            buttons: Buttons::Answers(Answers {
                 profile: "mpp".into(),
                 decision: "d-7".into(),
                 question: "ship".into(),
@@ -461,11 +533,83 @@ mod tests {
     #[test]
     fn a_note_without_answers_has_no_buttons_and_answers_nothing() {
         let plain = Note {
-            answers: None,
+            buttons: Buttons::None,
             ..asking()
         };
         assert_eq!(actions(&plain), ["default", "Open"]);
         assert_eq!(asked(&plain, "answer:yes"), None);
+    }
+
+    #[test]
+    fn a_launch_that_did_not_pass_offers_a_rerun_and_its_log() {
+        use RunAction::{Log, Report, Rerun};
+        let buttons = |status: &str, why: Option<&str>, views: bool| {
+            run_actions(&LaunchStatus::parse(status, why), views)
+        };
+        assert_eq!(buttons("error", None, false), [Rerun, Log]);
+        assert_eq!(
+            buttons("parked", Some("budget ran out"), true),
+            [Rerun, Log]
+        );
+        assert_eq!(buttons("stalled", None, false), [Rerun, Log]);
+        assert_eq!(
+            buttons("parked", Some("cancelled by weaton"), true),
+            [Rerun],
+            "a person stopped it"
+        );
+        assert_eq!(buttons("done", None, true), [Report]);
+        assert_eq!(
+            buttons("done", None, false),
+            [],
+            "no Report pane to bring forward"
+        );
+        assert_eq!(buttons("running", None, true), []);
+    }
+
+    #[test]
+    fn a_finished_launchs_buttons_come_back_as_what_to_do_on_its_run() {
+        let failed = note(&finished("error", Some("budget ran out"), None), false);
+        assert_eq!(
+            actions(&failed),
+            ["default", "Open", "run:Rerun", "Rerun", "run:Log", "Log"]
+        );
+        assert_eq!(
+            asked(&failed, "run:Rerun"),
+            Some(Clicked::Run {
+                link: failed.link.clone(),
+                action: RunAction::Rerun,
+            })
+        );
+        assert_eq!(
+            asked(&failed, "run:Log"),
+            Some(Clicked::Run {
+                link: failed.link.clone(),
+                action: RunAction::Log,
+            })
+        );
+        assert_eq!(
+            asked(&failed, "default"),
+            Some(Clicked::Open(failed.link.clone()))
+        );
+        let done = note(&finished("done", None, Some(0.4)), true);
+        assert_eq!(actions(&done), ["default", "Open", "run:Report", "Report"]);
+        assert_eq!(
+            asked(&done, "run:Report"),
+            Some(Clicked::Run {
+                link: done.link.clone(),
+                action: RunAction::Report,
+            })
+        );
+        assert_eq!(
+            asked(&done, "run:Deploy"),
+            Some(Clicked::Open(done.link.clone())),
+            "an action it does not know opens the run"
+        );
+        assert_eq!(
+            clicked(Some("run:Rerun"), |_| None),
+            None,
+            "nothing says which run"
+        );
     }
 
     #[test]

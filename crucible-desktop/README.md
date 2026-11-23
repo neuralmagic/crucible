@@ -210,6 +210,8 @@ The Graph draws a fan-out that has run as a frame holding its instances; the che
 frame's corner folds them away. The wheel or a drag on empty space moves the graph, and a pinch
 or `Cmd` with the wheel zooms it. Its controls zoom, reset the view, fold every fan-out and switch
 between the compact and roomy drawing; `Compact graph` in Settings picks which one a run starts in.
+The magnifier opens a find field: what it holds is marked in every label, Enter moves the graph
+to the next match, and Escape puts the field away.
 
 ## The Pack pane
 
@@ -360,12 +362,18 @@ draft that has never run opens its launch form instead.
 ## The Dock and the menu bar
 
 The menu bar item lists the launches running on every profile, with spend, elapsed time and budget
-used; picking one opens it, switching profile if it runs on another. Pin a launch under "Budget on
+used; picking one opens it, switching profile if it runs on another. The Dock icon's menu lists
+the launches running on the profile in use. Pin a launch under "Budget on
 Dock" to draw its budget used (the larger of spend over its cost cap and time over its time cap)
 as a bar on the Dock icon; it is announced when it finishes. The Dock badge counts the decisions,
 scope packs and pack imports waiting across profiles, and a growing approval count raises a
 notification. Profiles other than the one in use are read once a minute; their tunnels are not
 started for it.
+
+A launch of yours, or the pinned one, is announced when it stops. One that did not pass has a
+Rerun button, which opens the form that reruns what did not pass, and a Log button; one a person
+cancelled has Rerun alone; one that finished has a Report button when views are on. Each opens
+the run first.
 
 A decision request on the profile in use is announced when it opens. When it asks one question
 that takes one of up to four labels, the notification has a button for each label, and pressing

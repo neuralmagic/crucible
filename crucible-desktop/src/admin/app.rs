@@ -51,7 +51,10 @@ pub(in crate::admin) fn note(
             id: decision.id.clone(),
         }
         .url(),
-        answers: detail.and_then(|detail| answers(detail, profile)),
+        buttons: detail.and_then(|detail| answers(detail, profile)).map_or(
+            crate::notify::Buttons::None,
+            crate::notify::Buttons::Answers,
+        ),
     }
 }
 
@@ -65,7 +68,7 @@ fn unsent(decision: &str, why: &str) -> crate::notify::Note {
             id: decision.to_string(),
         }
         .url(),
-        answers: None,
+        buttons: crate::notify::Buttons::None,
     }
 }
 
