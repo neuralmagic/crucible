@@ -293,6 +293,8 @@ stage_actions_secrets() {
 stage_vault() {
     say
     say "5a. Read robot's dockerconfig in Vault (what the hub projects as $PULL_SECRET)"
+    say "  The entry is keyed quay.io/$QUAY_ORG. A controller that reads this Secret as its authfile"
+    say "  must look keys up by registry/path, or it loses the private loop image. Skip if unsure."
     local path key
     path=$(ask "  Vault KV path, empty to skip")
     [ -n "$path" ] || {
@@ -335,6 +337,7 @@ stage_clusters() {
             else
                 say "  $namespace/$PULL_SECRET does not exist"
             fi
+            say "  Skip a namespace whose controller reads $PULL_SECRET as its authfile, as above."
             confirm "  Write $PULL_SECRET in $namespace on $context?" || continue
             dockerconfig "$QUAY_ORG+$QUAY_PULL_ROBOT" "$PULL_TOKEN" |
                 "$kubectl" --context "$context" -n "$namespace" create secret generic "$PULL_SECRET" \
