@@ -45,7 +45,7 @@ expect_parked O-tamper "$LOCAL_TAMPER no longer matches its stored files"
 for key in "$BLOCK" "$LOCAL_KEY" "$KEY"; do
     [ "$(pods_seen O "$key")" = 0 ] || fail "[O] the local executor created a pod for $key"
 done
-LOCAL_PACK=$(ls -d "$WORK/scratch/local-runs/$(slug "$LOCAL_KEY")"-*/pack)
+LOCAL_PACK=$(local_pack O)
 [ "$(cat "$LOCAL_PACK/STEER.md")" = "frozen
 $STEER_STAMP
 kind-steer-marker" ] || fail "[O] the local run's STEER.md is: $(cat "$LOCAL_PACK/STEER.md")"
@@ -90,7 +90,7 @@ expect_finished J
 [ "$(ledger)" = "produce edit check check consume" ] || fail "[J] the rerun dispatched: $(ledger)"
 [ "$(cat "$WORK/rerun-seen")" = kept ] || fail "[J] the reused edit's commit is not in the rerun's workspace"
 [ "$(cat "$WORK/rerun-consumed")" = carried ] || fail "[J] the reused producer's file did not reach consume"
-J_SESSION=$(ls "$WORK/scratch/local-runs/$(slug "$RERUN_KEY")"-*/pack/state/session.jsonl)
+J_SESSION="$(local_pack J)/state/session.jsonl"
 [ "$(jq -sc --arg p "$PARENT_RUN" '[.[] | select(.kind == "task_result" and .reused_from == $p) | .task]' "$J_SESSION")" = '["produce","edit"]' ] ||
     fail "[J] reused rows: $(jq -c 'select(.kind == "task_result")' "$J_SESSION")"
 [ "$(crux playbook-run "$RERUN_KEY" | jq -r '.rerun.run_id')" = "$PARENT_RUN" ] ||
