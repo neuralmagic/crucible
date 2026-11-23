@@ -77,6 +77,8 @@ pub struct Desk {
     pub test_fire: Option<TestFireForm>,
     /// The mint form on the API keys page.
     pub new_key: crate::apikeys::KeyForm,
+    /// The decision request a notification's button answered, until its outcome lands.
+    pub quick: Option<String>,
     /// The decision requests already announced; `None` until the first queue lands.
     seen: Option<HashSet<String>>,
 }
@@ -120,6 +122,7 @@ impl Default for Desk {
             add_member: crate::teams::MemberForm::default(),
             rename_team: None,
             test_fire: None,
+            quick: None,
             seen: None,
         }
     }
@@ -163,6 +166,26 @@ impl Desk {
             picked.push(label.to_string());
         } else {
             *picked = vec![label.to_string()];
+        }
+    }
+
+    /// Takes in an answer's outcome. One that was sent drops the picks it was made from, which
+    /// stay when a notification answered a request other than the one shown. A notification's
+    /// answer that was not sent comes back as its request and why.
+    pub(in crate::admin) fn answered(
+        &mut self,
+        result: &Result<String, String>,
+    ) -> Option<(String, String)> {
+        let quick = self.quick.take();
+        match result {
+            Ok(_) => {
+                if quick.is_none() || quick == self.decision {
+                    self.picks.clear();
+                    self.note = TextEdit::new("");
+                }
+                None
+            }
+            Err(why) => quick.map(|decision| (decision, why.clone())),
         }
     }
 

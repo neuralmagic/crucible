@@ -6,6 +6,8 @@ use std::sync::mpsc::Sender;
 
 use rune::Waker;
 
+use crate::notify::Clicked;
+
 const NAME: &str = "dev.crucible.Playbooks";
 const PATH: &str = "/dev/crucible/Playbooks";
 
@@ -29,7 +31,7 @@ pub fn forward(link: &str) -> bool {
 
 /// Take the bus name and send each link another process hands over to `links`, waking the app.
 /// Holds the name until the process exits.
-pub fn serve(links: Sender<String>, waker: Waker) {
+pub fn serve(links: Sender<Clicked>, waker: Waker) {
     let _ = std::thread::Builder::new()
         .name("crucible-playbooks-instance".into())
         .spawn(move || {
@@ -53,14 +55,14 @@ fn current_thread<T>(work: impl std::future::Future<Output = T>) -> Option<T> {
 }
 
 struct Opener {
-    links: Sender<String>,
+    links: Sender<Clicked>,
     waker: Waker,
 }
 
 #[zbus::interface(name = "dev.crucible.Playbooks")]
 impl Opener {
     fn open(&self, link: String) {
-        if self.links.send(link).is_ok() {
+        if self.links.send(Clicked::Open(link)).is_ok() {
             (self.waker)();
         }
     }
@@ -126,7 +128,7 @@ mod tests {
         }
         assert_eq!(
             received.recv_timeout(Duration::from_secs(5)).unwrap(),
-            "crucible-playbooks://playbook/p"
+            crate::notify::Clicked::Open("crucible-playbooks://playbook/p".into())
         );
         assert_eq!(woken.load(Ordering::SeqCst), 1);
     }

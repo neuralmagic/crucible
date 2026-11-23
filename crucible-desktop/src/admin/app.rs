@@ -5,9 +5,40 @@ use crate::admin::{Action, AdminView, Did, Watch};
 use crux::client::Shared;
 use crux::dto;
 use rune::TextEdit;
+use std::collections::BTreeMap;
 
-/// What a decision request that just opened is announced with.
-fn note(decision: &dto::DecisionSummary) -> crate::notify::Note {
+/// How many answers a notification offers as buttons.
+pub(in crate::admin) const BUTTONS: usize = 4;
+
+/// The answers a notification can give `decision` on `profile`: it is open to this person and
+/// asks one question that takes one of a few labels.
+pub(in crate::admin) fn answers(
+    decision: &dto::Decision,
+    profile: &str,
+) -> Option<crate::notify::Answers> {
+    let [question] = decision.questions.as_slice() else {
+        return None;
+    };
+    let quick = decision.state == "open"
+        && decision.can_answer
+        && !question.multiple
+        && (1..=BUTTONS).contains(&question.options.len());
+    quick.then(|| crate::notify::Answers {
+        profile: profile.to_string(),
+        decision: decision.id.clone(),
+        question: question.id.clone(),
+        digest: decision.evidence_digest.clone(),
+        options: question.options.clone(),
+    })
+}
+
+/// What a decision request that just opened on `profile` is announced with; `detail` is the
+/// request in full, once read.
+pub(in crate::admin) fn note(
+    decision: &dto::DecisionSummary,
+    detail: Option<&dto::Decision>,
+    profile: &str,
+) -> crate::notify::Note {
     let mut body = decision.questions.join(", ");
     if let Some(key) = &decision.launch_key {
         body = format!("{body} \u{b7} {key}");
@@ -20,6 +51,52 @@ fn note(decision: &dto::DecisionSummary) -> crate::notify::Note {
             id: decision.id.clone(),
         }
         .url(),
+        answers: detail.and_then(|detail| answers(detail, profile)),
+    }
+}
+
+/// What says a notification's answer to request `decision` was not sent, and `why`.
+fn unsent(decision: &str, why: &str) -> crate::notify::Note {
+    crate::notify::Note {
+        id: decision.to_string(),
+        title: "Answer not sent".to_string(),
+        body: why.to_string(),
+        link: crate::link::Link::Decision {
+            id: decision.to_string(),
+        }
+        .url(),
+        answers: None,
+    }
+}
+
+impl crate::remote::Remote {
+    /// Hands `action` to the worker and waits on its outcome.
+    pub fn act(&mut self, action: Action) {
+        self.desk.armed = None;
+        self.desk.sent = Some(self.admin.acted.as_ref().map_or(0, |acted| acted.seq));
+        self.desk.outcome = None;
+        self.admin_client.act(action);
+    }
+
+    /// Sends the answer a notification's button gave when its request still waits on this
+    /// profile and no other action is on its way; false when it was not sent.
+    pub fn answer(&mut self, answer: &crate::notify::Answer) -> bool {
+        let waits = self.target.name == answer.profile
+            && !self.desk.busy()
+            && matches!(
+                &self.admin.decisions,
+                Some(Ok(open)) if open.iter().any(|decision| decision.id == answer.decision)
+            );
+        if waits {
+            self.desk.quick = Some(answer.decision.clone());
+            self.act(Action::Answer {
+                id: answer.decision.clone(),
+                labels: BTreeMap::from([(answer.question.clone(), vec![answer.label.clone()])]),
+                digest: answer.digest.clone(),
+                note: None,
+            });
+        }
+        waits
     }
 }
 
@@ -143,16 +220,19 @@ impl crate::App {
     }
 
     pub fn act(&mut self, action: Action) {
-        self.remote.desk.armed = None;
-        self.remote.desk.sent = Some(
-            self.remote
-                .admin
-                .acted
-                .as_ref()
-                .map_or(0, |acted| acted.seq),
-        );
-        self.remote.desk.outcome = None;
-        self.remote.admin_client.act(action);
+        self.remote.act(action);
+    }
+
+    /// Sends the answer a notification's button gave, or shows its request when that cannot be
+    /// sent.
+    pub fn answer_from_note(&mut self, answer: crate::notify::Answer) {
+        if self.backend == crate::Backend::Controller && self.remote.answer(&answer) {
+            return;
+        }
+        self.follow(&crate::link::Link::Decision {
+            id: answer.decision,
+        });
+        crate::notify::bring_to_front();
     }
 
     pub fn apply_admin(&mut self, view: AdminView) {
@@ -160,13 +240,15 @@ impl crate::App {
             && acted.seq > sent
         {
             self.remote.desk.sent = None;
+            if acted.did == Did::Answer
+                && let Some((decision, why)) = self.remote.desk.answered(&acted.result)
+                && let Some(notifier) = &self.notifier
+            {
+                notifier.post(&unsent(&decision, &why));
+            }
             if acted.result.is_ok() {
                 match acted.did {
                     Did::Rotate => self.remote.desk.rotate = None,
-                    Did::Answer => {
-                        self.remote.desk.picks.clear();
-                        self.remote.desk.note = TextEdit::new("");
-                    }
                     Did::Grant => {
                         self.remote.desk.sharing = false;
                         self.remote.desk.grantee = TextEdit::new("");
@@ -234,6 +316,7 @@ impl crate::App {
                         self.remote.desk.test_fire = None;
                     }
                     Did::Enable
+                    | Did::Answer
                     | Did::FireSchedule
                     | Did::Revoke
                     | Did::Unbind
@@ -269,7 +352,11 @@ impl crate::App {
                     && !looking
                     && let Some(notifier) = &self.notifier
                 {
-                    notifier.post(&note(decision));
+                    notifier.post(&note(
+                        decision,
+                        view.details.get(&decision.id),
+                        &self.remote.target.name,
+                    ));
                 }
             }
         }

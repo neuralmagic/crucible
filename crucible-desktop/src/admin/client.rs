@@ -6,8 +6,10 @@ use crate::admin::{Acted, Action, AdminView, InStatus, SecretView, Watch};
 use crate::net::{Connector, Task, within};
 use crux::client::Shared;
 use crux::dto;
+use futures_util::future::join_all;
 use rune::Waker;
 use rune::time::Instant;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -21,6 +23,8 @@ const QUEUE: Duration = Duration::from_secs(30);
 const DELIVERIES: i64 = 20;
 /// How many of the newest transitions the Activity page reads.
 const EVENTS: usize = 200;
+/// How many open decision requests one pass reads in full.
+pub(in crate::admin) const DETAILS: usize = 4;
 
 enum Msg {
     Watch(Watch),
@@ -114,7 +118,25 @@ struct Worker {
 impl Worker {
     async fn refresh(&mut self, watch: &Watch) {
         let read = match self.connector.connect().await {
-            Ok(c) => read(&c.client, watch).await,
+            Ok(c) => {
+                let read = read(&c.client, watch).await;
+                if let Ok(open) = &read.decisions {
+                    let wanted = unread(open, &self.view.details);
+                    let details = join_all(
+                        wanted
+                            .iter()
+                            .map(|id| within("the decision request", c.client.decision(id))),
+                    )
+                    .await;
+                    self.view
+                        .details
+                        .retain(|id, _| open.iter().any(|decision| &decision.id == id));
+                    for decision in details.into_iter().flatten() {
+                        self.view.details.insert(decision.id.clone(), decision);
+                    }
+                }
+                read
+            }
             Err(why) => Read::failed(&why, watch),
         };
         self.view.decisions = Some(read.decisions);
@@ -206,6 +228,18 @@ impl Worker {
             result: result.map(|()| what),
         });
     }
+}
+
+/// The first few of `open` not yet in `details`.
+pub(in crate::admin) fn unread(
+    open: &[dto::DecisionSummary],
+    details: &BTreeMap<String, dto::Decision>,
+) -> Vec<String> {
+    open.iter()
+        .filter(|decision| !details.contains_key(&decision.id))
+        .take(DETAILS)
+        .map(|decision| decision.id.clone())
+        .collect()
 }
 
 /// One pass over what `Watch` asks for, read all at once.

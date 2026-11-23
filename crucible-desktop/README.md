@@ -360,6 +360,11 @@ scope packs and pack imports waiting across profiles, and a growing approval cou
 notification. Profiles other than the one in use are read once a minute; their tunnels are not
 started for it.
 
+A decision request on the profile in use is announced when it opens. When it asks one question
+that takes one of up to four labels, the notification has a button for each label, and pressing
+one answers the request without opening the app. If the answer is refused, a second notification
+says why and opens the request.
+
 Cmd-[ and Cmd-] step back and forward through what the window showed; Cmd-R reads everything again.
 
 ## What the local backend tracks
