@@ -50,6 +50,7 @@ pub fn render(profile: &DeployProfile, opts: &RenderOpts) -> Result<String> {
             namespace,
             &image,
             profile.image.pull_secret.as_str(),
+            crate::deploy::render::pod::node_affinity(profile),
         )),
         yaml(&service(namespace)),
         yaml(&netpol(namespace, buildit.namespace.as_str())),
@@ -102,6 +103,7 @@ fn deployment(
     namespace: &str,
     image: &str,
     pull_secret: &str,
+    affinity: Option<core::Affinity>,
 ) -> apps::Deployment {
     let probe = |initial: i32| core::Probe {
         http_get: Some(core::HTTPGetAction {
@@ -203,6 +205,7 @@ fn deployment(
                     image_pull_secrets: Some(vec![core::LocalObjectReference {
                         name: pull_secret.to_string(),
                     }]),
+                    affinity,
                     containers: vec![container],
                     volumes: Some(vec![
                         core::Volume {
@@ -458,6 +461,28 @@ mod tests {
                 }],
                 "ports": [{ "port": 8850, "protocol": "TCP" }]
             }])
+        );
+    }
+
+    #[test]
+    fn the_cache_schedules_where_the_profile_allows() {
+        let profile: DeployProfile = toml::from_str(&format!(
+            "{}\n[buildit.cache]\ntoken_secret = \"t\"\n",
+            PROFILE.replace("[cluster]", "[cluster]\navoid_nodes = [\"bad-1\"]")
+        ))
+        .unwrap();
+        let yaml = render(&profile, &RenderOpts::default()).unwrap();
+        let docs: Vec<serde_json::Value> = yaml
+            .split("---\n")
+            .map(|d| serde_norway::from_str(d).unwrap())
+            .collect();
+        assert_eq!(
+            kind(&docs, "Deployment")["spec"]["template"]["spec"]["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
+                ["nodeSelectorTerms"][0]["matchExpressions"],
+            serde_json::json!([
+                {"key": "kubernetes.io/arch", "operator": "In", "values": ["amd64"]},
+                {"key": "kubernetes.io/hostname", "operator": "NotIn", "values": ["bad-1"]},
+            ])
         );
     }
 

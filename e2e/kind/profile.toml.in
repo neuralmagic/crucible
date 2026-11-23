@@ -4,6 +4,7 @@ rig_namespace = "crucible-e2e"
 service_account = "crucible-loop"
 supervisor_image = "@LOOP_IMAGE@"
 sandbox_driver = "kubernetes"
+arches = ["@NODE_ARCH@"]
 kubeconfig_configmap = "crucible-e2e-kubeconfig"
 
 [image]
