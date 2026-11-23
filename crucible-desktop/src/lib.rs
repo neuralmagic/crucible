@@ -414,6 +414,12 @@ pub struct RunView {
     pub camera: camera::Camera,
     /// Whether the graph is drawn compact; `None` takes the setting.
     pub compact_graph: Option<bool>,
+    /// Whether the Graph pane shows its find field.
+    pub graph_finding: bool,
+    /// What the Graph pane's find field holds.
+    pub graph_find: rune::TextEdit,
+    /// The match the graph last moved to; `None` until Enter after the query changes.
+    pub graph_found: Option<usize>,
     /// The launch picked to compare against; `None` takes the one before.
     pub compare_to: Option<String>,
     /// The saves the History pane compares, once picked by hand; `None` opens on the save the
@@ -472,8 +478,10 @@ pub struct App {
     pub pane_focus: Option<PaneKind>,
     /// Posts notifications once the app's loop is up.
     notifier: Option<notify::Notifier>,
-    /// Links of clicked notifications, to open.
-    clicks: Option<std::sync::mpsc::Receiver<String>>,
+    /// The launch a notification's Rerun button was pressed on, until its rerun form can open.
+    rerun_wanted: Option<String>,
+    /// What clicked notifications and links handed over by a second launch ask for.
+    clicks: Option<std::sync::mpsc::Receiver<notify::Clicked>>,
     /// Each command's key recorder in Settings, once touched.
     pub recorders: HashMap<keymap::Command, rune_kit::ShortcutRecorderState>,
     /// Where the provider picker's state goes once the launch sheet has closed.

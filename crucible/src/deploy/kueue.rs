@@ -115,7 +115,7 @@ pub fn render(profile: &DeployProfile, opts: &RenderOpts, target: &KueueTarget) 
             authz,
             &image,
             pull_secret,
-            crate::deploy::render::pod::node_avoid_affinity(profile),
+            crate::deploy::render::pod::node_affinity(profile),
         )?),
     )?;
     push("Service", yaml(&service(cfg)))?;
@@ -658,17 +658,31 @@ mod tests {
         let pod = |text: &str| {
             find(&docs(text), "Deployment", "crucible-kueue")["spec"]["template"]["spec"].clone()
         };
-        assert!(pod(PROFILE).get("affinity").is_none());
+        let expressions = |text: &str| {
+            pod(text)["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
+                ["nodeSelectorTerms"][0]["matchExpressions"]
+                .clone()
+        };
+        let amd64 = serde_json::json!(
+            {"key": "kubernetes.io/arch", "operator": "In", "values": ["amd64"]}
+        );
+        assert_eq!(expressions(PROFILE), serde_json::json!([amd64]));
 
         let avoiding = PROFILE.replace(
             "[cluster]",
             "[cluster]\n        avoid_nodes = [\"cpu-07\", \"g12e099\"]",
         );
-        let term = &pod(&avoiding)["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
-            ["nodeSelectorTerms"][0]["matchExpressions"][0];
-        assert_eq!(term["key"], "kubernetes.io/hostname");
-        assert_eq!(term["operator"], "NotIn");
-        assert_eq!(term["values"], serde_json::json!(["cpu-07", "g12e099"]));
+        assert_eq!(
+            expressions(&avoiding),
+            serde_json::json!([amd64, {
+                "key": "kubernetes.io/hostname",
+                "operator": "NotIn",
+                "values": ["cpu-07", "g12e099"],
+            }])
+        );
+
+        let any_arch = PROFILE.replace("[cluster]", "[cluster]\n        arches = []");
+        assert!(pod(&any_arch).get("affinity").is_none());
     }
 
     fn args(docs: &[serde_json::Value]) -> Vec<String> {

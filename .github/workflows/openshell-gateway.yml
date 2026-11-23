@@ -2,7 +2,8 @@ name: OpenShell gateway image
 
 # Build the OpenShell gateway + CLI distribution image, and the supervisor and sandbox runtime
 # images the kubernetes driver pairs with every sandbox, from the EXACT fork rev Cargo.lock
-# pins for openshell-core, all tagged sha-<rev>. The loop images COPY the binaries out of the
+# pins for openshell-core, all tagged sha-<rev>, pushed to GHCR and then copied to
+# quay.io/crucible-ai with their digests unchanged. The loop images COPY the binaries out of the
 # sha-tagged gateway image, and docker.yml passes the same rev as OPENSHELL_REV, so the gateway
 # crucible ships is always the rev its gRPC client compiled against. The component builds
 # mirror upstream's build-images.yml: gateway and supervisor for glibc, sandbox for musl.
@@ -255,3 +256,26 @@ jobs:
           image='ghcr.io/neuralmagic/openshell-sandbox:sha-${{ steps.rev.outputs.rev }}'
           docker run --rm "$image" --version | grep -q '^openshell-sandbox '
           docker push "$image"
+
+      - name: Log in to Quay
+        if: steps.exists.outputs.skip != 'true'
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_CRUCIBLE_AI_PUSH_USER }}
+          password: ${{ secrets.QUAY_CRUCIBLE_AI_PUSH_TOKEN }}
+
+      - name: Copy the three images to Quay
+        if: steps.exists.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          digest() { docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' | jq -r .digest; }
+          tag='sha-${{ steps.rev.outputs.rev }}'
+          for image in openshell-gateway openshell-supervisor openshell-sandbox; do
+            src="ghcr.io/neuralmagic/$image:$tag"
+            dst="quay.io/crucible-ai/$image:$tag"
+            docker buildx imagetools create -t "$dst" "$src"
+            want=$(digest "$src")
+            got=$(digest "$dst")
+            [ "$got" = "$want" ] || { echo "$dst is $got, $src is $want" >&2; exit 1; }
+          done

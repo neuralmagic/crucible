@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use forge::oci::{OverlayFile, derive_layer, registry_of, resolve_auth};
+use forge::oci::{OverlayFile, derive_layer, reference_of, resolve_auth};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -58,8 +58,8 @@ fn main() -> Result<()> {
     // Per-registry creds, resolved the way docker/crane do (explicit authfile, else the operator's
     // default login, else anonymous). The base gets its own lookup so a private base (same-registry
     // mirror or otherwise) pulls with real creds instead of 401ing.
-    let base_auth = resolve_auth(args.authfile.as_deref(), &registry_of(&args.base)?)?;
-    let target_auth = resolve_auth(args.authfile.as_deref(), &registry_of(&args.target)?)?;
+    let base_auth = resolve_auth(args.authfile.as_deref(), &reference_of(&args.base)?)?;
+    let target_auth = resolve_auth(args.authfile.as_deref(), &reference_of(&args.target)?)?;
 
     let rt = tokio::runtime::Runtime::new().context("building the tokio runtime")?;
     let pushed = rt.block_on(derive_layer(

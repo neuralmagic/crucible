@@ -1,0 +1,103 @@
+diff --git a/crates/rune-mermaid/src/canvas/drawing.rs b/crates/rune-mermaid/src/canvas/drawing.rs
+index 1622398b..1e77a924 100644
+--- a/crates/rune-mermaid/src/canvas/drawing.rs
++++ b/crates/rune-mermaid/src/canvas/drawing.rs
+@@ -1,9 +1,9 @@
+ //! Searchable label runs from a laid-out Mermaid diagram, not the syntax that produced it.
+ 
+ use std::rc::Rc;
+-use rune::{Color, TextHighlight};
++use rune::{Color, El, TextHighlight};
+ use super::{Scene, scenes};
+-use crate::{DiagramStyle, Drawing, Hover};
++use crate::{DiagramStyle, Drawing, Hover, Target};
+ 
+ /// One prepared layout. Its title and labels can be indexed once, then drawn again with
+ /// different text highlights without parsing the source or laying the diagram out again.
+@@ -34,7 +34,19 @@ impl DrawingModel {
+     /// Draw with UTF-8 byte ranges local to each label. Keys are the ones returned by
+     /// [`Self::labels`]. A hover copy uses the same marks as the label underneath it.
+     pub fn draw(&self, marks: impl Fn(&str) -> Vec<TextHighlight>) -> Drawing {
+-        let (el, size) = self.scene.drawing(&self.style, Some(&marks), &|_, spot| spot);
++        self.draw_with(marks, &|_, spot| spot)
++    }
++
++    /// [`Self::draw`], with every hover group passed through `decorate` as in
++    /// [`crate::render_with`].
++    pub fn draw_with(&self, marks: impl Fn(&str) -> Vec<TextHighlight>, decorate: &dyn Fn(&Target, El) -> El) -> Drawing {
++        let (el, size) = self.scene.drawing(&self.style, Some(&marks), decorate);
+         Drawing { el, size, surface: self.style.surface, surface_border: self.style.surface_border }
+     }
++
++    /// `(element key, [x, y, w, h])` for each label [`Self::labels`] returns but the title, in
++    /// the points of the drawing [`Self::draw`] returns, from its top left.
++    pub fn places(&self) -> impl Iterator<Item = (&str, [f32; 4])> {
++        self.scene.label_keys.iter().map(|(key, _)| key.as_str()).zip(self.scene.label_rects(&self.style))
++    }
+ }
+diff --git a/crates/rune-mermaid/src/canvas/hover_tests.rs b/crates/rune-mermaid/src/canvas/hover_tests.rs
+index f5e96e96..1923e4d7 100644
+--- a/crates/rune-mermaid/src/canvas/hover_tests.rs
++++ b/crates/rune-mermaid/src/canvas/hover_tests.rs
+@@ -252,3 +252,39 @@ fn a_decorated_node_or_edge_takes_a_press() {
+         assert_eq!(now, said, "{key} at {r:?}");
+     }
+ }
++
++#[test]
++fn a_prepared_drawing_decorates_its_spots_and_says_where_its_labels_are() {
++    let style = DiagramStyle::neutral(false);
++    let src = "flowchart TD\n  A[first] --> B[second]";
++    let model = crate::prepare_drawing(src, &style, Hover::Edges, LIT).expect("draws");
++    let labels: Vec<(&str, &str)> = model.labels().collect();
++    let places: Vec<(&str, [f32; 4])> = model.places().collect();
++    assert_eq!(labels.iter().map(|l| l.1).collect::<Vec<_>>(), ["first", "second"]);
++    assert_eq!(places.iter().map(|p| p.0).collect::<Vec<_>>(), labels.iter().map(|l| l.0).collect::<Vec<_>>());
++    let size = model.draw(|_| Vec::new()).size;
++    for (key, [x, y, w, h]) in &places {
++        assert!(*x >= 0.0 && *y >= 0.0 && x + w <= size[0] && y + h <= size[1], "{key} at {x},{y} {w}x{h} in {size:?}");
++    }
++    assert!(places[1].1[1] > places[0].1[1] + places[0].1[3], "second is under first: {places:?}");
++
++    let titled = format!("---\ntitle: Both\n---\n{src}");
++    let under = crate::prepare_drawing(&titled, &style, Hover::Edges, LIT).expect("draws");
++    let moved: Vec<(&str, [f32; 4])> = under.places().collect();
++    assert_eq!(moved.len(), 2, "the title has no place");
++    assert!(moved[0].1[1] > places[0].1[1], "a title pushes the labels down: {moved:?}");
++
++    fn view(_: &u32, _: &mut Cx<u32>) -> El {
++        let style = DiagramStyle::neutral(false);
++        let model = crate::prepare_drawing("flowchart TD\n  A[first] --> B[second]", &style, Hover::Edges, LIT).expect("draws");
++        let decorate = |t: &Target, spot: El| match t {
++            Target::Node(id) => el().key(format!("pick:{id}")).child(spot),
++            Target::Edge { .. } | Target::Frame(_) => spot,
++        };
++        col().w_full().child(model.draw_with(|_| Vec::new(), &decorate).el)
++    }
++    let mut rt = Runtime::new(0u32, view, (400.0, 400.0), Env::new(false, 1.0));
++    rt.frame(0.0);
++    let keys: Vec<String> = rt.elements().into_iter().filter_map(|e| e.key).filter(|k| k.starts_with("pick:")).collect();
++    assert_eq!(keys.len(), 2, "{keys:?}");
++}
+diff --git a/crates/rune-mermaid/src/canvas/mod.rs b/crates/rune-mermaid/src/canvas/mod.rs
+index e89f9849..29b8bff5 100644
+--- a/crates/rune-mermaid/src/canvas/mod.rs
++++ b/crates/rune-mermaid/src/canvas/mod.rs
+@@ -370,6 +370,17 @@ impl Scene {
+         (out.child(self.diagram_el(false, marks, decorate)), size)
+     }
+ 
++    /// Each label's box in the drawing [`Self::drawing`] returns: `[x, y, w, h]` from its top left.
++    pub(crate) fn label_rects(&self, paint: &DiagramStyle) -> Vec<[f32; 4]> {
++        let mut origin = [0.0, 0.0];
++        if let Some(title) = &self.title {
++            let t = measure(title, title_font(paint)).size;
++            origin = [(t[0] + 2.0 - self.size[0]).max(0.0) / 2.0, t[1] + TITLE_GAP];
++        }
++        let k = self.scale;
++        self.labels.iter().map(|l| [origin[0] + l.at[0] * k, origin[1] + l.at[1] * k, l.size[0] * k, l.size[1] * k]).collect()
++    }
++
+     fn title_el(&self, paint: &DiagramStyle, streaming: bool, marks: Marks<'_>) -> Option<El> {
+         let still = if streaming { Transition::opacity() } else { Transition::none() };
+         self.title.as_ref().map(|title| marked(text(title.clone()).key("title").font(title_font(paint)).color(paint.text).transition(still), "title", marks))

@@ -984,7 +984,7 @@ launch V-blobs draft-launch "$DRAFT-blobs"
 settle V-blobs "$KEY"
 expect_finished V-blobs
 [ "$(launch_tree "$KEY")" = "$U_TREE" ] || fail "[V] the launch ran tree $(launch_tree "$KEY"), not $U_TREE"
-V_BLOBS_PACK=$(ls -d "$WORK/scratch/local-runs/$(slug "$KEY")"-*/pack)
+V_BLOBS_PACK=$(local_pack V-blobs)
 for f in $(cd "$U_PACK" && find . -type f); do
     cmp -s "$U_PACK/$f" "$V_BLOBS_PACK/$f" || fail "[V] the run's $f differs from the saved draft's"
 done

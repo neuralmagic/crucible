@@ -92,6 +92,25 @@ impl PodDispatcher for KubePodDispatcher {
         Ok(())
     }
 
+    async fn missing_secrets(
+        &self,
+        cluster: &str,
+        namespace: &str,
+        names: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>> {
+        let client = self.clusters.client(cluster).await?;
+        let api: kube::Api<Secret> = kube::Api::namespaced(client, namespace);
+        let present: BTreeSet<String> = api
+            .list_metadata(&kube::api::ListParams::default())
+            .await
+            .with_context(|| format!("listing Secrets in {namespace}"))?
+            .items
+            .into_iter()
+            .filter_map(|secret| secret.metadata.name)
+            .collect();
+        Ok(names.difference(&present).cloned().collect())
+    }
+
     async fn create_service(
         &self,
         cluster: &str,

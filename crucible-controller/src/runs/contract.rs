@@ -459,7 +459,7 @@ async fn image_label(
     let parsed: oci_client::Reference = reference
         .parse()
         .map_err(|e| ContractReadError(format!("parsing image ref {reference}: {e}")))?;
-    let auth = forge::oci::resolve_auth(authfile, parsed.registry()).map_err(|e| {
+    let auth = forge::oci::resolve_auth(authfile, &parsed).map_err(|e| {
         ContractReadError(format!("resolving registry auth for {reference}: {e:#}"))
     })?;
     let client = oci_client::Client::new(oci_client::client::ClientConfig {

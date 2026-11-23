@@ -1,69 +1,7 @@
-diff --git a/crates/rune-mermaid/src/canvas.rs b/crates/rune-mermaid/src/canvas.rs
-index cd7bd819..aa2c12af 100644
---- a/crates/rune-mermaid/src/canvas.rs
-+++ b/crates/rune-mermaid/src/canvas.rs
-@@ -3,7 +3,7 @@
- use rune::{Align, Color, El, LineCap, Shape, TextStyle, Transition, canvas, col, el, text};
- 
- use crate::DiagramStyle;
--use crate::hover::{Hover, Spot, Trace};
-+use crate::hover::{Hover, Spot, Target, Trace};
- use crate::parts::{LabelKey, Mark, Names, Piece, pieces};
- 
- /// The card's padding on each side.
-@@ -315,6 +315,11 @@ impl Scene {
-     /// new since the last build comes in on its own ([`crate::parts::Kind::enter`]); otherwise
-     /// everything shows the frame it mounts.
-     pub(crate) fn el(&self, paint: &DiagramStyle, streaming: bool) -> El {
-+        self.el_with(paint, streaming, &|_, spot| spot)
-+    }
-+
-+    /// [`Scene::el`], with each hover group passed through `decorate` with what it is over.
-+    pub(crate) fn el_with(&self, paint: &DiagramStyle, streaming: bool, decorate: &dyn Fn(&Target, El) -> El) -> El {
-         let still = |t: Transition| if streaming { t } else { Transition::none() };
-         let mut card = col()
-             .w_full()
-@@ -334,7 +339,7 @@ impl Scene {
-         if let Some(title) = self.title_el(paint, streaming) {
-             card = card.gap(TITLE_GAP).child(title);
-         }
--        card.child(self.diagram_el(streaming))
-+        card.child(self.diagram_el(streaming, decorate))
-     }
- 
-     /// The title and drawing without the card around them, and the size they take.
-@@ -346,7 +351,7 @@ impl Scene {
-             size = [size[0].max(t[0] + 2.0), size[1] + t[1] + TITLE_GAP];
-             out = out.gap(TITLE_GAP).child(title);
-         }
--        (out.child(self.diagram_el(false)), size)
-+        (out.child(self.diagram_el(false, &|_, spot| spot)), size)
-     }
- 
-     fn title_el(&self, paint: &DiagramStyle, streaming: bool) -> Option<El> {
-@@ -354,7 +359,7 @@ impl Scene {
-         self.title.as_ref().map(|title| text(title.clone()).key("title").font(title_font(paint)).color(paint.text).transition(still))
-     }
- 
--    fn diagram_el(&self, streaming: bool) -> El {
-+    fn diagram_el(&self, streaming: bool, decorate: &dyn Fn(&Target, El) -> El) -> El {
-         let [w, h] = self.full;
-         let still = |t: Transition| if streaming { t } else { Transition::none() };
-         // Fit destinations before springing them. Multiplying a springing canvas size by a
-@@ -399,7 +404,8 @@ impl Scene {
-                 }
-             }
-             let exit = if streaming { Transition { insertion: rune::Effect::IDENTITY, ..Transition::opacity() } } else { Transition::none() };
--            body = body.child(el().key(s.key.clone()).absolute(0.0, 0.0).offset(r[0] * scale, r[1] * scale).size(r[2] * scale, r[3] * scale).hover_group().transition(exit).child(glow).a11y_hidden());
-+            let spot = el().key(s.key.clone()).absolute(0.0, 0.0).offset(r[0] * scale, r[1] * scale).size(r[2] * scale, r[3] * scale).hover_group().transition(exit).child(glow).a11y_hidden();
-+            body = body.child(decorate(&s.target, spot));
-         }
-         el().key("diagram").size(self.size[0], self.size[1]).transition(still(Transition::opacity())).child(body)
-     }
-diff --git a/crates/rune-mermaid/src/hover.rs b/crates/rune-mermaid/src/hover.rs
-index b5940ccc..f644e4ab 100644
---- a/crates/rune-mermaid/src/hover.rs
-+++ b/crates/rune-mermaid/src/hover.rs
+diff --git a/crates/rune-mermaid/src/canvas/hover.rs b/crates/rune-mermaid/src/canvas/hover.rs
+index 8d9f5abf..6fd55be7 100644
+--- a/crates/rune-mermaid/src/canvas/hover.rs
++++ b/crates/rune-mermaid/src/canvas/hover.rs
 @@ -25,6 +25,13 @@ pub enum Hover {
      Neighbours,
  }
@@ -127,10 +65,10 @@ index b5940ccc..f644e4ab 100644
          }
          spots
      }
-diff --git a/crates/rune-mermaid/src/hover_tests.rs b/crates/rune-mermaid/src/hover_tests.rs
+diff --git a/crates/rune-mermaid/src/canvas/hover_tests.rs b/crates/rune-mermaid/src/canvas/hover_tests.rs
 index 446ac354..39ff0a06 100644
---- a/crates/rune-mermaid/src/hover_tests.rs
-+++ b/crates/rune-mermaid/src/hover_tests.rs
+--- a/crates/rune-mermaid/src/canvas/hover_tests.rs
++++ b/crates/rune-mermaid/src/canvas/hover_tests.rs
 @@ -1,4 +1,4 @@
 -use rune::{Color, Cx, El, Env, Runtime, col};
 +use rune::{Color, Cx, El, Env, Runtime, col, el};
@@ -198,19 +136,81 @@ index 446ac354..39ff0a06 100644
 +        assert_eq!(now, said, "{key} at {r:?}");
 +    }
 +}
+diff --git a/crates/rune-mermaid/src/canvas/mod.rs b/crates/rune-mermaid/src/canvas/mod.rs
+index e27d6ab7..d615ba92 100644
+--- a/crates/rune-mermaid/src/canvas/mod.rs
++++ b/crates/rune-mermaid/src/canvas/mod.rs
+@@ -10,7 +10,7 @@ pub(crate) mod shape;
+ use rune::{Align, Color, El, LineCap, Shape, TextHighlight, TextStyle, Transition, canvas, col, el, text};
+ 
+ use crate::DiagramStyle;
+-use hover::{Hover, Spot, Trace};
++use hover::{Hover, Spot, Target, Trace};
+ use parts::{LabelKey, Mark, Names, Piece, pieces};
+ 
+ /// The card's padding on each side.
+@@ -328,6 +328,11 @@ impl Scene {
+     /// new since the last build comes in on its own ([`parts::Kind::enter`]); otherwise
+     /// everything shows the frame it mounts.
+     pub(crate) fn el(&self, paint: &DiagramStyle, streaming: bool) -> El {
++        self.el_with(paint, streaming, &|_, spot| spot)
++    }
++
++    /// [`Scene::el`], with each hover group passed through `decorate` with what it is over.
++    pub(crate) fn el_with(&self, paint: &DiagramStyle, streaming: bool, decorate: &dyn Fn(&Target, El) -> El) -> El {
+         let still = |t: Transition| if streaming { t } else { Transition::none() };
+         let mut card = col()
+             .w_full()
+@@ -347,7 +352,7 @@ impl Scene {
+         if let Some(title) = self.title_el(paint, streaming, None) {
+             card = card.gap(TITLE_GAP).child(title);
+         }
+-        card.child(self.diagram_el(streaming, None))
++        card.child(self.diagram_el(streaming, None, decorate))
+     }
+ 
+     /// The title and drawing without the card around them, and the size they take.
+@@ -359,7 +364,7 @@ impl Scene {
+             size = [size[0].max(t[0] + 2.0), size[1] + t[1] + TITLE_GAP];
+             out = out.gap(TITLE_GAP).child(title);
+         }
+-        (out.child(self.diagram_el(false, marks)), size)
++        (out.child(self.diagram_el(false, marks, &|_, spot| spot)), size)
+     }
+ 
+     fn title_el(&self, paint: &DiagramStyle, streaming: bool, marks: Marks<'_>) -> Option<El> {
+@@ -367,7 +372,7 @@ impl Scene {
+         self.title.as_ref().map(|title| marked(text(title.clone()).key("title").font(title_font(paint)).color(paint.text).transition(still), "title", marks))
+     }
+ 
+-    fn diagram_el(&self, streaming: bool, marks: Marks<'_>) -> El {
++    fn diagram_el(&self, streaming: bool, marks: Marks<'_>, decorate: &dyn Fn(&Target, El) -> El) -> El {
+         let [w, h] = self.full;
+         let still = |t: Transition| if streaming { t } else { Transition::none() };
+         // Fit destinations before springing them. Multiplying a springing canvas size by a
+@@ -413,7 +418,8 @@ impl Scene {
+                 }
+             }
+             let exit = if streaming { Transition { insertion: rune::Effect::IDENTITY, ..Transition::opacity() } } else { Transition::none() };
+-            body = body.child(el().key(s.key.clone()).absolute(0.0, 0.0).offset(r[0] * scale, r[1] * scale).size(r[2] * scale, r[3] * scale).hover_group().transition(exit).child(glow).a11y_hidden());
++            let spot = el().key(s.key.clone()).absolute(0.0, 0.0).offset(r[0] * scale, r[1] * scale).size(r[2] * scale, r[3] * scale).hover_group().transition(exit).child(glow).a11y_hidden();
++            body = body.child(decorate(&s.target, spot));
+         }
+         el().key("diagram").size(self.size[0], self.size[1]).transition(still(Transition::opacity())).child(body)
+     }
 diff --git a/crates/rune-mermaid/src/lib.rs b/crates/rune-mermaid/src/lib.rs
-index 61ae889f..934a8412 100644
+index 67778d88..fc288e9f 100644
 --- a/crates/rune-mermaid/src/lib.rs
 +++ b/crates/rune-mermaid/src/lib.rs
-@@ -143,6 +143,7 @@ use rune::{Color, El, TextStyle, oklch, oklcha, tok};
- 
- use canvas::Scene;
- pub use hover::Hover;
-+pub use hover::Target;
+@@ -120,6 +120,7 @@ use canvas::{Scene, scenes};
+ pub use canvas::drawing::DrawingModel;
+ pub use canvas::drawing::prepare_drawing;
+ pub use canvas::hover::Hover;
++pub use canvas::hover::Target;
  
  /// Colours and type a diagram draws with.
  #[derive(Clone, Copy, Debug, PartialEq)]
-@@ -227,6 +228,14 @@ pub fn render_with_hover(src: &str, style: &DiagramStyle, hover: Hover, color: C
+@@ -204,6 +205,14 @@ pub fn render_with_hover(src: &str, style: &DiagramStyle, hover: Hover, color: C
      render_inner(src, style, hover, color, Mode::Still)
  }
  

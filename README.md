@@ -145,12 +145,12 @@ newest release:
 curl -fsSL https://raw.githubusercontent.com/neuralmagic/crucible/main/scripts/install-desktop.sh | sh
 ```
 
-The script takes a version (`| sh -s 0.7.2`), checks the download against its published
+The script takes a version (`| sh -s 0.8.2`), checks the download against its published
 checksum, and on macOS unpacks the app into `/Applications` (`| APPS=~/Applications sh` puts it
 in yours). By hand, on macOS:
 
 ```bash
-v=0.7.2
+v=0.8.2
 curl -LO "https://github.com/neuralmagic/crucible/releases/download/v$v/Crucible-Playbooks-v$v-aarch64-apple-darwin.zip"
 ditto -x -k "Crucible-Playbooks-v$v-aarch64-apple-darwin.zip" /Applications
 xattr -d com.apple.quarantine "/Applications/Crucible Playbooks.app"
@@ -163,9 +163,19 @@ Settings, Privacy & Security, Open Anyway allows it too.
 And on Fedora (x86_64 or aarch64):
 
 ```bash
-v=0.7.2
+v=0.8.2
 sudo dnf install "https://github.com/neuralmagic/crucible/releases/download/v$v/crucible-playbooks-$v-1.fc45.$(uname -m).rpm"
 ```
+
+The [`nightly`](https://github.com/neuralmagic/crucible/releases/tag/nightly) prerelease is the
+same build of `main`, replaced each night `main` has moved. To install it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/neuralmagic/crucible/main/scripts/install-desktop.sh | sh -s nightly
+```
+
+A nightly installs over a tagged release, has a green icon, and is not offered by the app's
+update check; run the command again for a newer one, or without `nightly` to go back.
 
 From a checkout, `just desktop-install` builds and installs the macOS app into `~/Applications`,
 and `just desktop-linux` builds the RPM in a Fedora container. The app signs in to a controller
@@ -190,7 +200,19 @@ Release binaries and images include the feature.
 
 Put the destination directory on `PATH`. The
 [GitHub releases page](https://github.com/neuralmagic/crucible/releases) lists published
-binaries for the platforms that have them.
+binaries for the platforms that have them: Linux x86_64 and macOS arm64, one tarball each
+holding `crucible`, `crux`, `crucible-lsp`, the forge binaries and the controller.
+
+The nightly build of `main` carries the same tarballs. Its asset names include the build date
+and commit, so fetch it by pattern with the [GitHub CLI](https://cli.github.com/):
+
+```bash
+target=aarch64-apple-darwin   # or x86_64-unknown-linux-gnu
+gh release download nightly --repo neuralmagic/crucible --pattern "crucible-nightly-*-$target.tar.gz*"
+shasum -a 256 -c crucible-nightly-*-"$target".tar.gz.sha256
+mkdir -p ~/.local/bin
+tar -xzf crucible-nightly-*-"$target".tar.gz -C ~/.local/bin
+```
 
 ## Local example
 

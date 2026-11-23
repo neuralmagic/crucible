@@ -16,6 +16,7 @@ mod dock;
 mod files;
 mod finder;
 mod graph;
+mod graph_find;
 mod issues;
 mod keys;
 mod launch;
@@ -236,6 +237,7 @@ fn meter(key: &str, parts: &[(f32, Color)], p: &Paint) -> El {
 }
 
 pub fn view(app: &App, cx: &mut Cx<App>) -> El {
+    cx.zoom(app.settings.zoom);
     let p = palette(app, cx);
     let mut layer = Vec::new();
     let window = row()

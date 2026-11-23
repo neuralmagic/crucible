@@ -6,15 +6,18 @@ use std::collections::{HashMap, HashSet};
 
 use crucible_contract::decision::Answer;
 use crucible_contract::session::TaskStatus;
-use rune::{Color, Drag, El, MagnifyEvent, Tx, WheelEvent, col, el, icon, row, text};
+use rune::{
+    Color, Drag, El, MagnifyEvent, TextHighlight, Tx, WheelEvent, col, el, icon, row, text,
+};
 use rune_kit::{
-    Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, SegmentedControl,
+    Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, SegmentedControl, TextInput,
 };
 use rune_theme_opencode::icons as oc;
 
 use crate::camera;
 use crate::session::{Instance, TaskState, TaskView};
 use crate::ui::detail::empty_run;
+use crate::ui::graph_find::{self, Found};
 use crate::ui::{Paint, Pane};
 use crate::{App, GraphSource};
 
@@ -97,14 +100,38 @@ pub(crate) fn graph_view(pane: &Pane, app: &App, p: &Paint) -> El {
             },
         }
     };
-    let body = match rune_mermaid::render_drawing_with(
+    let model = rune_mermaid::prepare_drawing(
         &source,
         &style,
         rune_mermaid::Hover::Edges,
         style.text.alpha(0.9),
-        &decorate,
-    ) {
-        Some(drawing) => canvas(drawing, pane.tasks, app, p),
+    );
+    let body = match model {
+        Some(model) => {
+            let query = app.run.graph_find.text.trim();
+            let found = graph_find::found(model.labels(), model.places(), query);
+            let at = app.run.graph_found;
+            let marks = |key: &str| {
+                found
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, label)| label.key == key)
+                    .flat_map(|(n, label)| {
+                        label.ranges.iter().map(move |range| {
+                            let mark =
+                                TextHighlight::new(range.clone(), p.c.warning.icon.alpha(0.35));
+                            if at == Some(n) {
+                                mark.ring(p.c.warning.icon, 1.0)
+                            } else {
+                                mark
+                            }
+                        })
+                    })
+                    .collect()
+            };
+            let drawing = model.draw_with(marks, &decorate);
+            canvas(drawing, &found, pane.tasks, app, p)
+        }
         None => col().key("graph-fallback").w_full().padding(24.0).child(
             text("This run's graph did not read as a flowchart.".to_string())
                 .font(p.k.ty.ui)
@@ -133,12 +160,22 @@ const FIT: f32 = 0.6;
 
 /// The diagram under the run's camera, top and centre in the pane and shrunk towards its width,
 /// with the camera's controls over it.
-fn canvas(drawing: rune_mermaid::Drawing, tasks: &[TaskView], app: &App, p: &Paint) -> El {
+fn canvas(
+    drawing: rune_mermaid::Drawing,
+    found: &[Found],
+    tasks: &[TaskView],
+    app: &App,
+    p: &Paint,
+) -> El {
     let [w, h] = drawing.size;
     let pane = rune::memo::layout_size(CANVAS);
     let fit = pane.map_or(1.0, |[across, _]| (across / w.max(1.0)).clamp(FIT, 1.0));
     let half = pane.map_or(0.0, |[across, _]| across / 2.0);
     let middle = [0.0, pane.map_or(0.0, |[_, down]| down / 2.0)];
+    let matches = found
+        .iter()
+        .map(|label| [(label.middle[0] - w / 2.0) * fit, label.middle[1] * fit])
+        .collect();
     let camera = &app.run.camera;
     let fitted = el()
         .key("graph-fit")
@@ -181,11 +218,60 @@ fn canvas(drawing: rune_mermaid::Drawing, tasks: &[TaskView], app: &App, p: &Pai
             tx.live_only();
         })
         .child(world)
-        .child(controls(tasks, app, middle, p))
+        .child(controls(tasks, app, middle, matches, p))
 }
 
-/// Zoom out, zoom in and the first view again, then every fan-out folded or shown.
-fn controls(tasks: &[TaskView], app: &App, middle: [f32; 2], p: &Paint) -> El {
+/// How wide the find field is.
+const FIND: f32 = 150.0;
+
+const FIND_FIELD: &str = "graph-find";
+
+/// Puts the find field away and its text with it.
+fn close_find(app: &mut App) {
+    app.run.graph_finding = false;
+    app.run.graph_find = rune::TextEdit::default();
+    app.run.graph_found = None;
+}
+
+/// The find field while it is open and the button that opens it, then zoom out, zoom in and the
+/// first view again, then every fan-out folded or shown. `matches` are the labels the find
+/// field's text is in, as the camera's points.
+fn controls(
+    tasks: &[TaskView],
+    app: &App,
+    middle: [f32; 2],
+    matches: Vec<[f32; 2]>,
+    p: &Paint,
+) -> El {
+    let find = app.run.graph_finding.then(|| {
+        let mut find = TextInput::new(&app.run.graph_find)
+            .placeholder("Find")
+            .width(Some(FIND))
+            .on_edit(|app: &mut App| &mut app.run.graph_find)
+            .on_change(|app: &mut App, _: &mut Tx| app.run.graph_found = None)
+            .on_key(|app: &mut App, key: &rune::KeyEvent, _: &mut Tx| {
+                let closes = key.key == rune::Key::Escape;
+                if closes {
+                    close_find(app);
+                }
+                closes
+            });
+        if !app.run.graph_find.text.trim().is_empty() {
+            let count = match app.run.graph_found.filter(|at| *at < matches.len()) {
+                Some(at) => format!("{}/{}", at + 1, matches.len()),
+                None => matches.len().to_string(),
+            };
+            find = find.trailing(text(count).font(p.mono(11.0, 400.0)).color(p.c.text_muted));
+        }
+        find.on_submit(move |app: &mut App, _: &mut Tx| {
+            app.run.graph_found = graph_find::next(app.run.graph_found, matches.len());
+            if let Some(shown) = app.run.graph_found.and_then(|at| matches.get(at)) {
+                app.run.camera.show_at(*shown, middle);
+            }
+        })
+        .build(p.k)
+        .key(FIND_FIELD)
+    });
     let button = |icon: &'static rune::Icon, says: &str| {
         IconButton::new(icon)
             .variant(IconButtonVariant::GhostMuted)
@@ -230,6 +316,20 @@ fn controls(tasks: &[TaskView], app: &App, middle: [f32; 2], p: &Paint) -> El {
         .radius(8.0)
         .fill(p.c.layer_02)
         .border(0.5, p.c.border_base)
+        .children(find)
+        .child(
+            button(&oc::MAGNIFYING_GLASS, "Find")
+                .on_press_tx(|app: &mut App, tx: &mut Tx| {
+                    if app.run.graph_finding {
+                        close_find(app);
+                    } else {
+                        app.run.graph_finding = true;
+                        tx.focus_when_shown(FIND_FIELD, false);
+                    }
+                })
+                .build(p.k)
+                .key("graph-find-toggle"),
+        )
         .child(
             button(&oc::OUTLINE_MAGNIFIER_MINUS, "Zoom out")
                 .on_press(move |app: &mut App| app.run.camera.zoom_by(1.0 / camera::STEP, middle))

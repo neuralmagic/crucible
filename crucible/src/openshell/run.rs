@@ -2092,6 +2092,7 @@ mod tests {
     #[test]
     fn an_orchestration_error_is_classified_by_the_typed_error_in_its_chain() {
         let gateway = anyhow::Error::from(gateway::GatewayError::HealthTimeout {
+            waited: std::time::Duration::from_secs(60),
             last_status: String::new(),
             log_tail: String::new(),
         })

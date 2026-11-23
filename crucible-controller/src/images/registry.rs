@@ -99,7 +99,7 @@ impl LiveRegistryReader {
         &self,
         reference: &Reference,
     ) -> Result<oci_client::secrets::RegistryAuth, RegistryError> {
-        forge::oci::resolve_auth(self.authfile.as_deref(), reference.registry()).map_err(|e| {
+        forge::oci::resolve_auth(self.authfile.as_deref(), reference).map_err(|e| {
             RegistryError(format!(
                 "resolving registry auth for {}: {e:#}",
                 reference.whole()

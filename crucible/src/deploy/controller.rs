@@ -389,8 +389,12 @@ mod tests {
         assert!(docs[3].contains("- pods"));
         assert!(docs[3].contains("- create"));
 
-        // No avoid-list in the profile, no affinity stanza.
-        assert!(!yaml.contains("affinity"), "no affinity key: {yaml}");
+        // The default architecture and, with no avoid-list in the profile, nothing else.
+        assert!(yaml.contains("key: kubernetes.io/arch") && yaml.contains("- amd64"));
+        assert!(
+            !yaml.contains("kubernetes.io/hostname"),
+            "no avoid-list: {yaml}"
+        );
     }
 
     /// A profile listing avoid_nodes puts the required NotIn nodeAffinity on the controller's pod

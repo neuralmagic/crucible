@@ -1,0 +1,101 @@
+name: Mirror images to quay.io
+
+# Copy images from ghcr.io/<owner> to quay.io/crucible-ai with their digests unchanged, so a
+# reference pinned by digest moves by changing its registry and nothing else. With no input it
+# copies what this checkout pins: every `ghcr.io/<owner>/<image>@sha256:...` in a tracked file,
+# and the three OpenShell images at the rev Cargo.lock pins.
+#
+# Signatures and SBOMs attached to a copied digest stay on ghcr.io.
+on:
+  workflow_dispatch:
+    inputs:
+      refs:
+        description: Space-separated <image>:<tag> or <image>@sha256:<digest> under ghcr.io/<owner>. Empty copies what this checkout pins.
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  SOURCE: ghcr.io/${{ github.repository_owner }}
+  TARGET: quay.io/crucible-ai
+
+jobs:
+  copy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        if: inputs.refs == ''
+        with:
+          cache: false
+
+      - name: List what to copy
+        id: refs
+        env:
+          REFS: ${{ inputs.refs }}
+        run: |
+          set -euo pipefail
+          if [ -z "$REFS" ]; then
+            rev=$(cargo run --quiet -p xtask -- openshell-rev)
+            REFS=$(
+              git grep -hoE "$SOURCE/[a-z0-9._-]+@sha256:[0-9a-f]{64}" | sed "s|^$SOURCE/||" | sort -u
+              for image in openshell-gateway openshell-supervisor openshell-sandbox; do
+                echo "$image:sha-$rev"
+              done
+            )
+          fi
+          echo "refs=$(printf '%s\n' "$REFS" | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Quay
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_CRUCIBLE_AI_PUSH_USER }}
+          password: ${{ secrets.QUAY_CRUCIBLE_AI_PUSH_TOKEN }}
+
+      # A digest has no tag to copy to, so it lands under ghcr-<digest prefix>.
+      - name: Copy each reference and compare digests
+        env:
+          REFS: ${{ steps.refs.outputs.refs }}
+        run: |
+          set -euo pipefail
+          digest() { docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' | jq -r .digest; }
+          failed=0
+          for ref in $REFS; do
+            case "$ref" in
+              *@sha256:*) image=${ref%@*}; tag="ghcr-$(printf %s "${ref#*@sha256:}" | cut -c1-12)" ;;
+              *:*) image=${ref%:*}; tag=${ref##*:} ;;
+              *) echo "$ref: not <image>:<tag> or <image>@sha256:<digest>" >&2; exit 1 ;;
+            esac
+            src="$SOURCE/$ref"
+            dst="$TARGET/$image:$tag"
+            if ! docker buildx imagetools create -t "$dst" "$src"; then
+              echo "::error::could not copy $src"
+              failed=1
+              continue
+            fi
+            want=$(digest "$src")
+            got=$(digest "$dst")
+            if [ "$got" != "$want" ]; then
+              echo "::error::$dst is $got, $src is $want"
+              failed=1
+              continue
+            fi
+            echo "- \`$TARGET/$image@$got\` (\`$tag\`)" >> "$GITHUB_STEP_SUMMARY"
+          done
+          exit "$failed"

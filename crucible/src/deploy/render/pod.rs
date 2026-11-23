@@ -91,7 +91,7 @@ impl ProfilePod<'_> {
             service_account_name: Some(self.service_account.clone()),
             automount_service_account_token: self.automount_token,
             restart_policy: self.restart.map(|r| r.as_str().to_string()),
-            affinity: node_avoid_affinity(self.profile),
+            affinity: node_affinity(self.profile),
             host_aliases: self.host_aliases.clone(),
             init_containers: init,
             containers,
@@ -125,24 +125,42 @@ pub(in crate::deploy) fn downward(name: &str, field_path: &str) -> core::EnvVar 
     }
 }
 
-/// The profile's node avoid-list as a required nodeAffinity `NotIn` on `kubernetes.io/hostname`
-/// (nodes the operator marked bad, e.g. broken CNI). `None` when the list is empty, so a profile
-/// without one renders byte-identically to before. Shared by every pod the profile renders: the
-/// loop pod, the turn pods, and the controller and crucible-kueue Deployments' templates.
-pub(in crate::deploy) fn node_avoid_affinity(profile: &DeployProfile) -> Option<core::Affinity> {
-    let avoid = &profile.cluster.avoid_nodes;
-    if avoid.is_empty() {
+/// Where the profile lets a pod schedule, as one required nodeAffinity term: `In` on
+/// `kubernetes.io/arch` for `[cluster] arches`, `NotIn` on `kubernetes.io/hostname` for
+/// `[cluster] avoid_nodes`. `None` when both are empty. Shared by every pod the profile renders:
+/// the loop pod, the turn pods, and the controller, crucible-kueue and buildit cache Deployments'
+/// templates.
+pub(in crate::deploy) fn node_affinity(profile: &DeployProfile) -> Option<core::Affinity> {
+    let cluster = &profile.cluster;
+    let mut expressions = Vec::new();
+    if !cluster.arches.is_empty() {
+        expressions.push(core::NodeSelectorRequirement {
+            key: "kubernetes.io/arch".to_string(),
+            operator: "In".to_string(),
+            values: Some(
+                cluster
+                    .arches
+                    .iter()
+                    .map(|a| a.as_str().to_string())
+                    .collect(),
+            ),
+        });
+    }
+    if !cluster.avoid_nodes.is_empty() {
+        expressions.push(core::NodeSelectorRequirement {
+            key: "kubernetes.io/hostname".to_string(),
+            operator: "NotIn".to_string(),
+            values: Some(cluster.avoid_nodes.clone()),
+        });
+    }
+    if expressions.is_empty() {
         return None;
     }
     Some(core::Affinity {
         node_affinity: Some(core::NodeAffinity {
             required_during_scheduling_ignored_during_execution: Some(core::NodeSelector {
                 node_selector_terms: vec![core::NodeSelectorTerm {
-                    match_expressions: Some(vec![core::NodeSelectorRequirement {
-                        key: "kubernetes.io/hostname".to_string(),
-                        operator: "NotIn".to_string(),
-                        values: Some(avoid.clone()),
-                    }]),
+                    match_expressions: Some(expressions),
                     ..Default::default()
                 }],
             }),

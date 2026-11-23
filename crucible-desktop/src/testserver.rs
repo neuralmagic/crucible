@@ -7,10 +7,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::profile::{Profile, Target};
 
-/// A request as the server read it: its first line and its headers, names lowercased.
+/// A request as the server read it: its first line, its headers, names lowercased, and its body.
 pub struct Asked {
     pub line: String,
     pub headers: Vec<(String, String)>,
+    pub body: String,
 }
 
 impl Asked {
@@ -117,6 +118,7 @@ fn request(reader: &mut impl BufRead) -> Option<Asked> {
     Some(Asked {
         line: line.trim().to_string(),
         headers,
+        body: String::from_utf8_lossy(&body).into_owned(),
     })
 }
 

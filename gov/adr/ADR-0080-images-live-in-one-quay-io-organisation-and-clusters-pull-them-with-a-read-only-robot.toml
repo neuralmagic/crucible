@@ -1,0 +1,206 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0080"
+title = "Images live in one quay.io organisation and clusters pull them with a read-only robot"
+status = "proposed"
+date = "2026-11-23"
+refs = [
+    "ADR-0031",
+    "ADR-0034",
+    "ADR-0036",
+    "ADR-0048",
+]
+
+[content]
+context = """
+This repository's workflows (`docker.yml`, `images.yml`, `openshell-gateway.yml`) push every image to ghcr.io. A deployment's loop image, the runtime image with its packs, is pushed to quay.io. A run pulls from both: the loop and gateway pods from one registry, the supervisor, sandbox runtime and sandbox images from the other.
+
+A deploy profile names one pull Secret, `[image] pull_secret`. The renders put that name on the loop pod, the turn pod, each run's gateway pod, the sandbox and supervisor pods (through the driver config), the crucible-kueue Deployment and the buildit cache Deployment. Those pods run in several namespaces. The Secret has to exist in each and hold a credential for every registry one of those images is on. Nothing creates it: an operator copies it into each namespace of each cluster by hand.
+
+What has gone wrong:
+
+- A gateway pod named a Secret that had not been copied into the sandbox namespace, and started only on nodes that had the image cached.
+- ghcr.io has no machine credential that fits. A pull takes a classic personal access token with `read:packages`, which belongs to a person and reads every package that person can. One was revoked, and the kubelet then got 403 from ghcr.io for public images too, because it presents a Secret's credential to the whole host.
+- Deployments got around the single name with a second Secret that holds a personal credential for both registries, named through an `[env]` override and a ServiceAccount's `imagePullSecrets`.
+- `docker.yml` and `openshell-gateway.yml` build linux/amd64 only, and `docker/Containerfile.kueue` has no workflow. A cluster with one arm64 node ran an amd64 image there. `[cluster] avoid_nodes` keeps pods off a node by hostname, with one list for every cluster a profile dispatches to, and it does not reach sandbox pods or the buildit cache.
+- A sandbox pod that cannot pull its image is reported as `sandbox not found`.
+
+Constraints:
+
+- A pull credential is read-only, scoped to one registry namespace, and not a person's.
+- A push credential exists in CI secrets, or in a cluster Secret that can write only the repositories cluster builds push to.
+- Stored pack versions pin sandbox images by digest on ghcr.io.
+- A shared cluster gives no cluster-admin, so nothing may depend on node-level or cluster-wide pull configuration.
+- A quay.io robot account belongs to an organisation and holds read or write per repository. Regenerating its token invalidates the old one at once.
+- quay.io creates a repository as private on its first push.
+- A quay.io plan caps an organisation's private repositories and does not count public ones.
+"""
+decision = """
+Every image a Crucible deployment pulls is in one quay.io organisation, `quay.io/crucible-ai`, and a cluster pulls with one read-only robot through one Secret name.
+
+Repositories keep their names: `crucible`, `crucible-controller`, `crucible-buildit`, `crucible-kueue`, `openshell-gateway`, `openshell-supervisor`, `openshell-sandbox`, `loop-base` and the `sandbox-*` feedstock. Every image this repository builds is public, the `sandbox-*` feedstock and `loop-base` included. A deployment's loop image and its domain images are private repositories in the same organisation. No profile, pack or Containerfile references an image in a personal namespace, and CI refuses one.
+
+Each repository's CI logs in to quay.io with its own push robot, held in that repository's Actions secrets and able to write only the repositories it builds, on trusted refs only (main, tags, dispatch). A pull-request build logs in to nothing and pushes nothing. `docker.yml` builds `crucible-kueue`. Buildx layer caches stay on ghcr.io under the workflow's own token, since no cluster reads them. Signatures and SBOMs are attached to the quay.io digests.
+
+The pull credential is one robot with read on every repository in the organisation, granted through a team that is the organisation's default permission for new repositories. It is delivered as one Secret, `crucible-pull`, of type `kubernetes.io/dockerconfigjson`, with a single entry keyed `quay.io/crucible-ai`, so it is never presented for another quay.io namespace. Every pod Crucible renders or creates names that Secret for Crucible's images and no other. The podman driver's authfile holds the same robot. A deployment sets no pull Secret on a ServiceAccount and overrides none through `[env]`. A registry a pack brings keeps its own run-scoped Secret.
+
+Cluster builds (forge, buildit) push with a second robot that can write the build-output repositories only, in the Secret `[secrets] push_authfile` names. It is not the CI robot.
+
+The robot's dockerconfig has one source per deployment, the store the hub already projects its secrets from ([[ADR-0031]]). The controller writes `crucible-pull` from its own copy into every namespace its profile names on every cluster it dispatches to (loop, sandbox, crucible-kueue, workload and buildit namespaces), and rewrites it when its copy changes. A cluster with no controller gets the Secret from `crucible deploy`, which takes the authfile as an input and applies it to the same namespaces. Nobody copies a Secret between namespaces.
+
+Rotation is by replacement: create a new robot in the read team, put it in the store, wait until the controller reports every cluster written, delete the old robot. A token is not regenerated in place, since pulls would fail until every cluster had the new one.
+
+Every pod Crucible renders carries a required node affinity on `kubernetes.io/arch` for the architectures the profile states in `[cluster] arches`. The default is amd64, which is all CI builds the loop, controller, crucible-kueue and OpenShell images for. Sandbox and supervisor pods get the same constraint through the gateway's driver config. `avoid_nodes` stays for bad nodes.
+
+Before a dispatch the controller refuses a cluster where `crucible-pull` is missing from a namespace the run's pods use, or has no entry that covers an image's registry. It compares registry names and never presents the credential. A sandbox or supervisor pod stuck on its image pull fails the turn with the kubelet's reason and the image name ([[ADR-0034]]).
+
+Migration, in an order that leaves a running cluster with a Secret covering what it pulls:
+
+1. Create the repositories with their visibility, the teams and the robots.
+2. Copy every digest a profile, pack or example pins from ghcr.io to quay.io, digests unchanged.
+3. CI pushes to both registries.
+4. `crucible-pull` on every cluster holds the quay.io robot and, until step 7, a ghcr.io entry.
+5. Profiles, packs, examples and the compiled defaults move to quay.io references. The `[env]` and ServiceAccount overrides go.
+6. The architecture affinity, the dispatch check and the pull-failure report land.
+7. CI stops pushing to ghcr.io. The ghcr.io entry and the personal Secrets are deleted and the personal tokens revoked.
+"""
+consequences = """
+A run pulls from one registry with one credential. A missing or wrong Secret is refused at dispatch by name, before a pod exists.
+
+Sandbox, supervisor and controller images pull with no credential on a cluster that has none; the robot is needed for the loop image and domain images. A leaked pull credential reads one organisation's images and is revoked without touching a person's account. A leaked CI credential writes one repository's images.
+
+The controller's identity on a cluster gains create and update on `secrets` in the namespaces the profile names, to keep `crucible-pull` there. [[ADR-0048]]'s grant already writes Secrets in the loop namespace ([[ADR-0036]]); this extends it to the sandbox, crucible-kueue and workload namespaces.
+
+A controller that reads the Secret as its authfile has to match the `quay.io/crucible-ai` key to an image, which a lookup by registry host does not. forge's lookup takes the most specific `registry/path` key; buildit's still goes by host, so `push_authfile` stays keyed by host until it does too.
+
+The kubelet presents the robot for public repositories in the organisation too. A deleted robot fails those pulls on a node with no cached copy, which is why rotation replaces the robot and deletes the old one last.
+
+A new image's repository has to be created public, or flipped, before anything without the credential can pull it. A first push alone leaves it private.
+
+A stored pack version that pins a ghcr.io digest needs ghcr.io until it is re-pinned. The same digest is on quay.io after step 2, so re-pinning changes the host and nothing else. After step 7 a version still naming a private ghcr.io image is refused by the dispatch check.
+
+The controller's image catalog expands a `ghcr.io/<owner>/<glob>` pattern through the GitHub packages API. It needs the same for a quay.io organisation.
+
+References to the public ghcr.io images outside this repository go stale. The packages stay as they are at step 7 and get no new tags.
+
+The OpenShell driver gives a supervisor pod no node selector, so that part needs a change in the fork before Crucible can set it.
+
+An arm64 node runs no Crucible pod until an image is built for it and a profile says so. A profile whose images are built for another architecture, the kind e2e on an arm64 host among them, sets `arches`. The feedstock already builds its light sandbox images for arm64; the loop, controller, crucible-kueue and OpenShell images do not.
+
+`docs/controller-deploy.md`, `docs/domain-images.md`, `docs/openshell-fork.md`, the Containerfile `produces:` headers and the personal-namespace lint in `ci.yml` name ghcr.io and change with step 5.
+"""
+
+[[content.alternatives]]
+text = "One quay.io organisation, one read-only robot, one Secret name the controller writes into every namespace"
+status = "accepted"
+pros = [
+    "One registry and one credential per run",
+    "The credential is read-only, scoped to the organisation and no person's",
+    "One write path for the Secret, so a rotation reaches every namespace",
+]
+cons = [
+    "The controller holds standing Secret writes in more namespaces",
+    "Every reference, pin and compiled default moves",
+]
+
+[[content.alternatives]]
+text = "Stay on ghcr.io and pull with a machine user's token"
+status = "rejected"
+pros = [
+    "No image or reference moves",
+]
+cons = [
+    "The token is a classic personal access token: a seat, not a robot, with no per-repository scope",
+    "Deployments' loop images are already on quay.io, so a run still needs two registries",
+]
+rejection_reason = "ghcr.io has no read-only credential scoped to one organisation's packages that is not a user's."
+
+[[content.alternatives]]
+text = "Keep both registries and put both credentials in the one Secret"
+status = "rejected"
+pros = [
+    "Only the Secret's contents change",
+]
+cons = [
+    "Two credentials to issue and rotate, one of them a personal token",
+    "A bad entry for either host fails that host's public pulls too",
+]
+rejection_reason = "It keeps the personal token, which is what failed."
+
+[[content.alternatives]]
+text = "A secrets operator on every cluster projects the Secret from the store"
+status = "considered"
+pros = [
+    "The mechanism the hub already uses",
+    "The controller needs no standing Secret writes",
+]
+cons = [
+    "Every dispatch cluster needs the operator installed and a route and login to the store",
+    "The hub is the only client of the store today",
+]
+
+[[content.alternatives]]
+text = "Deliver the pull Secret per run, owner-referenced to the pod"
+status = "rejected"
+pros = [
+    "No standing Secret to drift",
+    "The delivery [[ADR-0036]] already has",
+]
+cons = [
+    "crucible-kueue and the buildit cache are standing Deployments and still need a standing Secret",
+    "The gateway pod needs the Secret in the sandbox namespace before the run's own pod exists",
+]
+rejection_reason = "It leaves two delivery mechanisms for one credential."
+
+[[content.alternatives]]
+text = "Cluster-wide pull configuration: a global pull secret or a registry mirror set"
+status = "rejected"
+pros = [
+    "No Secret in any namespace",
+    "A mirror set keeps old ghcr.io digest pins working",
+]
+cons = [
+    "Needs cluster-admin, which a shared cluster does not give",
+    "Every tenant of the cluster can pull the private images",
+    "OpenShift only",
+]
+rejection_reason = "It cannot be the scheme on a cluster Crucible does not administer."
+
+[[content.alternatives]]
+text = "One `sandbox` repository with a tag per feedstock image, in place of a repository per image"
+status = "considered"
+pros = [
+    "One repository to create and grant, and a new feedstock image needs no registry setup",
+    "The image catalog reads one repository's tags and needs no listing of an organisation's repositories",
+]
+cons = [
+    "The catalog takes a repository as an image and its tags as channels, so it has to take the image from the tag",
+    "Build, per-architecture, signature and SBOM tags of every image share one tag list",
+    "A digest pin no longer names its image unless the tag is written beside it",
+    "The feedstock workflow's tag scheme and the pins move again",
+]
+
+[[content.alternatives]]
+text = "One read robot per cluster"
+status = "rejected"
+pros = [
+    "A leak on one cluster is revoked without rotating the others",
+    "The registry's logs say which cluster pulled",
+]
+cons = [
+    "One store entry and one rotation per cluster",
+]
+rejection_reason = "A read-only credential does not earn a store entry and a rotation per cluster."
+
+[[content.alternatives]]
+text = "Build the loop, controller, crucible-kueue and OpenShell images for arm64 too"
+status = "rejected"
+pros = [
+    "No node is excluded",
+]
+cons = [
+    "A second build leg and runner for each image, and an arm64 smoke test",
+    "A deployment's loop image and domain images would have to follow before a run could land on arm64",
+]
+rejection_reason = "The affinity is needed for single-arch images either way, and it alone keeps pods off a node they cannot run on."
