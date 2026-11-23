@@ -21,9 +21,9 @@ The code that runs those tasks lived in the engine binary beside the agent runti
 decision = """
 The run driver, the workspace runner and workspace setup move into the library. Two traits carry what differs between binaries. A dispatcher runs one task in the root prepared for it. An engine builds the runner for a manifest, admits or refuses the compiled plan, and says what the substrate can do. The library's command runner no longer calls the decision client: a model-decided route goes to a handler its caller supplies, and a runner given none fails the task.
 
-`crucible-runner` is a second binary over that library. Its dispatcher runs command, evaluate and report tasks and output-decided routes through the command runner, with no route handler. It refuses a plan that holds an agent turn, a model-decided route or the scored loop's propose turn before the workspace is set up, and it refuses a pack that names `[workflow].servers`. It opens no decision desk, so a human-decided route is a missing capability ([[RFC-0002:C-PLAYBOOK-CAPS]]). It takes the `plan run` flags a pod wrapper and the desktop app pass, so either can spawn it in place of the full engine.
+`crucible-runner` is a second binary over that library. Its dispatcher runs command, evaluate and report tasks and output-decided routes through the command runner, with no route handler. It refuses a plan that holds an agent turn, a model-decided route or the scored loop's propose turn before the workspace is set up, and it refuses a pack that names `[workflow].servers`. It opens no decision desk, so a human-decided route is a missing capability ([[RFC-0002:C-PLAYBOOK-CAPS]]), and a plan that requires one is refused with the rest. `crucible check --engine runner` reports the same refusals as findings. It takes the `plan run` flags a pod wrapper and the desktop app pass, so either can spawn it in place of the full engine.
 
-It reads one credential, the run's own token, and uses it only for the run's evidence ([[RFC-0004:C-RUN-EVIDENCE]]): the upload when the run ends, and a rerun's fetch of its parent. It starts the run's buildit when the controller granted one, so a command task can build on the cluster. It does not serve the git sidecar to tasks.
+It reads one credential, the run's own token, and uses it only for the run's evidence ([[RFC-0004:C-RUN-EVIDENCE]]): the upload when the run ends, and a rerun's fetch of its parent. A pod that names the controller and carries no token uploads nothing and marks its session undelivered, so the wrapper prints it for the controller to scrape. It starts the run's buildit when the controller granted one, so a command task can build on the cluster. It does not serve the git sidecar to tasks.
 
 The full engine implements the same two traits and behaves as it did."""
 consequences = """
@@ -33,7 +33,7 @@ consequences = """
 - The runner still compiles every dependency of the library, which holds the sandbox client and the deployment renderers. Moving those into crates of their own would shorten its build and is not done here.
 - What the controller delivers to a pod is unchanged. A dispatch to a cluster its operator does not control still carries what the controller renders for it, and whoever holds the pod holds that. Rendering no inference document, run servers or sidecar credential for such a target is a controller change this decision does not make.
 - A report task still posts to the webhook the environment names, so a run that reports holds that address.
-- The full engine's `check` does not know what the runner refuses. A pack the runner cannot run passes `check` and is refused when the run starts.
+- `check` reports the runner's refusals only when asked with `--engine runner`, and only for a graph it can compile without launch parameters. A graph that needs them is refused when the run starts.
 - No image ships the runner and no dispatch target selects it yet."""
 
 [[content.alternatives]]

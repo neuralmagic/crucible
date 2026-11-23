@@ -16,6 +16,7 @@ pub mod options;
 pub mod output;
 pub mod param;
 pub mod record;
+pub mod refusal;
 pub mod rerun;
 pub mod resume;
 pub mod route;

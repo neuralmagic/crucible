@@ -17,7 +17,8 @@ use crucible::openshell::buildit::{self, RunSocket};
 use crucible::paths::Paths;
 use crucible::plan::attempt::Attempt;
 use crucible::plan::exec::TaskRunner;
-use crucible::plan::ir::{Isolation, ModelAsk, Task, TaskKind, TaskName, ValidPlan};
+use crucible::plan::ir::{Isolation, Task, TaskKind, TaskName, ValidPlan};
+use crucible::plan::refusal::{Refusal, task_refusals, workflow_refusals};
 use crucible::plan::rerun::ParentRef;
 use crucible::plan::run::{Ceilings, Engine, Launch, NoValidVerdict, Rerun, Source};
 use crucible::plan::runner::ShellRunner;
@@ -105,38 +106,6 @@ struct RunArgs {
 )]
 struct AgentFlags;
 
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "task {task} asks {ask}, and crucible-runner calls no model: it runs command, evaluate and \
-     report tasks and routes decided by a task's output. Run this pack on the full engine"
-)]
-struct AsksModel {
-    task: TaskName,
-    ask: ModelAsk,
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "the pack names [workflow].servers ({servers}), which a task reaches with a token \
-     crucible-runner does not mint. Run this pack on the full engine"
-)]
-struct WorkflowServers {
-    servers: String,
-}
-
-fn asks_model<'a>(tasks: impl IntoIterator<Item = &'a Task>) -> Result<(), AsksModel> {
-    match tasks
-        .into_iter()
-        .find_map(|task| Some((task, task.task.model_ask()?)))
-    {
-        Some((task, ask)) => Err(AsksModel {
-            task: task.name.clone(),
-            ask,
-        }),
-        None => Ok(()),
-    }
-}
-
 /// Runs a task as a shell command in the root prepared for it.
 #[derive(Clone)]
 struct Commands {
@@ -149,7 +118,7 @@ impl Dispatch for Commands {
         if let Some(ask) = task.task.model_ask() {
             return Attempt::failed(
                 0.0,
-                AsksModel {
+                Refusal::AsksModel {
                     task: task.name.clone(),
                     ask,
                 }
@@ -195,19 +164,13 @@ impl Engine for Runner {
         start: Start,
     ) -> Result<(WorkspaceRunner<Commands>, Manifest)> {
         let loaded = crucible::plan::setup::load(manifest, variant, params)?;
-        if let Some(workflow) = &loaded.manifest.workflow {
-            asks_model(&workflow.tasks)?;
-            if !workflow.servers.is_empty() {
-                return Err(WorkflowServers {
-                    servers: workflow
-                        .servers
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                }
-                .into());
-            }
+        if let Some(refusal) = loaded
+            .manifest
+            .workflow
+            .as_ref()
+            .and_then(|workflow| workflow_refusals(workflow).into_iter().next())
+        {
+            return Err(refusal.into());
         }
         loaded.checkout(start)?;
         let dispatch = Commands {
@@ -218,7 +181,9 @@ impl Engine for Runner {
     }
 
     fn admit(&self, plan: &ValidPlan) -> Result<()> {
-        Ok(asks_model(plan.tasks_topo())?)
+        task_refusals(plan.tasks_topo())
+            .next()
+            .map_or(Ok(()), |refusal| Err(refusal.into()))
     }
 }
 

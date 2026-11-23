@@ -153,11 +153,12 @@ it call a model (ADR-0079).
 - `crucible-runner plan run` takes the `crucible plan run` flags a pod wrapper and the desktop
   app pass, so either can spawn it in place of the full engine. `--harness` and `--model` are
   refused.
-- A pack with an agent task, a model-decided route or `[workflow].servers` is refused when the
-  run starts, before its workspace is set up. A human-decided route has no decision desk, so the
-  plan truncates at it.
+- A pack with an agent task, a model-decided route, a required human-decided route or
+  `[workflow].servers` is refused when the run starts, before its workspace is set up.
+  `crucible check --engine runner` reports the same refusals.
 - It uploads the run's session, files and commits to the controller under the run's own token,
-  and a rerun fetches its parent the same way. It reads no other credential.
+  and a rerun fetches its parent the same way. It reads no other credential. Without the token
+  it uploads nothing and the pod prints the session for the controller to scrape.
 - It starts the run's buildit when the controller granted one, so a command task can build on
   the cluster. It does not serve the git sidecar to tasks.
 

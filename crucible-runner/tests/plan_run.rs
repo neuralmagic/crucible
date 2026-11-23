@@ -323,6 +323,32 @@ workflow(type = "playbook", tasks = [read, gate, page])
 }
 
 #[test]
+fn a_required_human_decision_is_refused_before_the_workspace_is_set_up() {
+    let (why, workspace, _dir) = refused(
+        r#"
+read = command(name = "read", run = "true")
+sign = route(
+    name = "sign",
+    depends_on = [read],
+    decider = human(),
+    questions = {"ship": noul(ask = "Ship it?")},
+)
+workflow(type = "playbook", tasks = [read, sign])
+"#,
+        "",
+        &[],
+    );
+    assert!(
+        why.contains("task sign is required and needs a person's decision"),
+        "{why}"
+    );
+    assert!(
+        !workspace.exists(),
+        "the workspace was set up for a refused pack"
+    );
+}
+
+#[test]
 fn a_pack_naming_workflow_servers_is_refused() {
     let (why, workspace, _dir) = refused(
         r#"
@@ -442,5 +468,46 @@ fn the_run_uploads_its_record_under_its_own_token() {
             .join(crucible_contract::RUN_SESSION_UNDELIVERED)
             .exists(),
         "a delivered session was marked undelivered"
+    );
+}
+
+/// A pod that names a controller and carries no run token uploads nothing and marks its session,
+/// so the wrapper prints it. A run with no controller leaves no mark: its wrapper prints anyway.
+#[test]
+fn a_run_with_a_controller_and_no_token_marks_its_session_undelivered() {
+    let marker = |dir: &Path| {
+        dir.join("state")
+            .join(crucible_contract::RUN_SESSION_UNDELIVERED)
+    };
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().expect("addr").port();
+    let dir = pack(PIPELINE, "");
+    let out = plan_run(dir.path(), &[])
+        .env(
+            crucible_contract::ENV_CONTROLLER_URL,
+            format!("http://127.0.0.1:{port}/"),
+        )
+        .env(crucible_contract::ENV_RUN_NAME, "run_1")
+        .output()
+        .expect("runs");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        marker(dir.path()).exists(),
+        "the session was neither uploaded nor marked: {}",
+        stderr(&out)
+    );
+    assert_eq!(
+        listener.accept().map(|_| ()).map_err(|e| e.kind()),
+        Err(std::io::ErrorKind::WouldBlock),
+        "the run called the controller without a token"
+    );
+
+    let alone = pack(PIPELINE, "");
+    let out = plan_run(alone.path(), &[]).output().expect("runs");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        !marker(alone.path()).exists(),
+        "a run with no controller marked its session"
     );
 }

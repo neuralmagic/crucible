@@ -43,6 +43,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
         manifest,
         parse_only,
         variant,
+        engine,
         profile,
         clusters,
     }) = &cli.command
@@ -50,7 +51,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
         let mut outcome = if *parse_only {
             check::run_parse_only(manifest, variant.as_ref())?
         } else {
-            check::run(manifest, variant.as_ref())?
+            check::run(*engine, manifest, variant.as_ref())?
         };
         if let Some(profile) = profile {
             // Static wiring always; the live sandbox-SA Secret probe only on a full check.

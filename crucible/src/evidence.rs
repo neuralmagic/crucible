@@ -101,22 +101,32 @@ fn non_empty_env(name: &str) -> Option<String> {
 
 /// Upload the finished run's evidence when the pod carries a controller and a run token: the
 /// captured files, the git memory, and the otel log when the run produced them, and the session
-/// log last, since the controller completes the run off it.
+/// log last, since the controller completes the run off it. A pod that carries the controller
+/// and not the rest uploads nothing and marks its session undelivered.
 pub fn deliver_run_evidence(p: &Paths) {
-    let Some(upload) = Upload::run_from_env() else {
-        return;
+    let delivered = match Upload::run_from_env() {
+        Some(upload) => {
+            deliver_dir(&upload, ArtifactKind::RunFiles, &p.state.join("files"));
+            deliver_dir(
+                &upload,
+                ArtifactKind::RunCommits,
+                &p.state.join(GIT_MEMORY_DIR),
+            );
+            let otel = p.state.join("otel.jsonl");
+            if otel.exists() {
+                deliver_file(&upload, ArtifactKind::OtelLog, &otel);
+            }
+            deliver_file(&upload, ArtifactKind::RunSession, &p.session_log)
+        }
+        None if non_empty_env(crucible_contract::ENV_CONTROLLER_URL).is_some() => {
+            eprintln!(
+                "[crucible] the pod names a controller and carries no run token or run name; \
+                 the run's evidence is not uploaded"
+            );
+            false
+        }
+        None => return,
     };
-    deliver_dir(&upload, ArtifactKind::RunFiles, &p.state.join("files"));
-    deliver_dir(
-        &upload,
-        ArtifactKind::RunCommits,
-        &p.state.join(GIT_MEMORY_DIR),
-    );
-    let otel = p.state.join("otel.jsonl");
-    if otel.exists() {
-        deliver_file(&upload, ArtifactKind::OtelLog, &otel);
-    }
-    let delivered = deliver_file(&upload, ArtifactKind::RunSession, &p.session_log);
     if let Err(e) = mark_session(&p.state, delivered) {
         eprintln!(
             "[crucible] marking the session in {} failed: {e}",
