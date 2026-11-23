@@ -1,4 +1,4 @@
-# produces: ghcr.io/neuralmagic/crucible-kueue
+# produces: quay.io/crucible-ai/crucible-kueue
 # The crucible-kueue MCP server: one per cluster, holding the Kubernetes credentials through
 # which sandboxed agents submit and watch Kueue workloads. Self-contained: compiles the one
 # crate in a builder stage, so a plain cluster build (buildit, forge) needs no CI pre-step.
