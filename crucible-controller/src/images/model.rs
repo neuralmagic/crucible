@@ -4,7 +4,7 @@ use crucible_capability::CapabilityDoc;
 /// currently point at it and the capability document read off its config.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CatalogImage {
-    /// The repository reference without tag or digest, e.g. `ghcr.io/neuralmagic/sandbox-go-cc`.
+    /// The repository reference without tag or digest, e.g. `quay.io/crucible-ai/sandbox-go-cc`.
     pub repository: String,
     /// The digest a tag resolves to: the index digest for a multi-arch image.
     pub digest: String,
