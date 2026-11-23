@@ -510,16 +510,6 @@ pub fn gateway_toml(
             }
         }
         ComputeDriver::Kubernetes => {
-            // The gateway auto-detects the JWT bundle `generate-certs` writes next to the TLS
-            // bundle and turns on its authenticator chain, and it hard-rejects mTLS *user* auth
-            // under the kubernetes compute driver (the implicit auth the podman path rides via
-            // its singleplayer-driver auto-default). Without this block, crucible's own
-            // bearer-less RPCs bounce UNAUTHENTICATED at the first authenticated method
-            // (CreateProvider). Trust model is unchanged: the socket still requires the
-            // generated client cert (require_client_auth), so possession of the local mTLS
-            // client cert = authorized, exactly what mtls_auth grants under podman. Sandbox
-            // supervisor calls keep using gateway-minted JWTs either way.
-            s.push_str("\n[openshell.gateway.auth]\nallow_unauthenticated_users = true\n");
             let dial_back = dial_back.ok_or(GatewayError::NoDialBack)?;
             let mut cfg = KubernetesDriverConfig::new(images);
             cfg.grpc_endpoint = dial_back.grpc_endpoint.clone();
@@ -1605,18 +1595,12 @@ mod tests {
         assert!(k8s.get("image_pull_secrets").is_none());
     }
 
-    /// Under kubernetes the gateway's authenticator chain is always on (certgen's JWT bundle)
-    /// and mTLS user auth is rejected, so the rendered config must opt in to unauthenticated
-    /// local users or every authenticated RPC from crucible itself dies UNAUTHENTICATED at
-    /// CreateProvider. Podman must stay untouched: it authenticates via the mTLS
-    /// singleplayer-driver auto-default, and the escape hatch would only widen it.
     #[test]
-    fn kubernetes_rendering_allows_unauthenticated_local_users_podman_does_not() {
-        let parsed = kubernetes_toml(&DriverImages::default());
-        assert_eq!(
-            parsed["openshell"]["gateway"]["auth"]["allow_unauthenticated_users"].as_bool(),
-            Some(true),
-            "{parsed}"
+    fn no_rendering_admits_callers_without_credentials() {
+        let kubernetes = kubernetes_toml(&DriverImages::default());
+        assert!(
+            kubernetes["openshell"]["gateway"].get("auth").is_none(),
+            "{kubernetes}"
         );
 
         let podman = gateway_toml(
@@ -1628,7 +1612,11 @@ mod tests {
             CLIENT_TLS_SECRET,
         )
         .unwrap();
-        assert!(!podman.contains("allow_unauthenticated_users"), "{podman}");
+        let podman: toml::Value = toml::from_str(&podman).unwrap();
+        assert!(
+            podman["openshell"]["gateway"].get("auth").is_none(),
+            "{podman}"
+        );
     }
 
     /// The driver defaults `grpc_endpoint` to "" and passes it verbatim into the supervisor's

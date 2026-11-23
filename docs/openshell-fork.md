@@ -118,14 +118,6 @@ Changes that would remove the fork:
   `CreateSshSession` relay of the gateway), because no RPC supports it. This is one of the two
   remaining CLI uses that `crucible/src/openshell/mod.rs` names. With a native upload and
   download RPC, Crucible could remove the CLI from the turn path.
-- **mTLS user auth with the kubernetes driver.** The gateway rejects mTLS user authentication
-  with the kubernetes compute driver, so Crucible renders `allow_unauthenticated_users = true`
-  for gateways with the k8s driver (`crucible/src/openshell/gateway.rs`). The trust model while
-  this setting exists: transport mTLS with a CA for each pod still checks every connection
-  (`require_client_auth`). The client certificate is only in the Crucible turn pod and the
-  supervisor pod, never in the agent container, so possession of the certificate is the
-  authorization. **Acceptance criterion for the upstream change: Crucible removes the
-  `allow_unauthenticated_users` setting.**
 
 ## Maintenance rule
 
