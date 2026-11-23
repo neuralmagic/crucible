@@ -141,12 +141,11 @@ impl App {
         let Some(launcher) = &mut self.remote.launcher else {
             return;
         };
-        let answers: Vec<String> = launcher.answers.iter().map(|a| a.text.clone()).collect();
         let (params, uploads) = match &launcher.rerun {
             Some(rerun) => (Ok(rerun.params.clone()), Ok(Vec::new())),
             None => (
-                form::params(&launcher.fields, &answers),
-                form::uploads(&launcher.fields, &answers),
+                form::params(&launcher.fields, &launcher.answers),
+                form::uploads(&launcher.fields, &launcher.answers),
             ),
         };
         let ceilings = form::ceilings(
@@ -220,7 +219,7 @@ impl App {
         };
         let refused = form::upload(&field.name, spec, path).err();
         if let Some(answer) = launcher.answers.get_mut(i) {
-            *answer = TextEdit::new(path.display().to_string());
+            *answer = form::Answer::typed(path.display().to_string());
         }
         launcher.problems.retain(|(at, _)| *at != i);
         if let Some(why) = refused {
@@ -319,14 +318,7 @@ impl App {
                     .fields
                     .iter()
                     .map(|field| {
-                        let before = previous
-                            .as_ref()
-                            .and_then(|params| params.get(&field.name))
-                            .map(|value| match value {
-                                serde_json::Value::String(text) => text.clone(),
-                                other => other.to_string(),
-                            });
-                        TextEdit::new(before.unwrap_or_else(|| field.default.clone()))
+                        field.answer(previous.as_ref().and_then(|params| params.get(&field.name)))
                     })
                     .collect();
                 let cost = stored

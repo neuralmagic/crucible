@@ -238,7 +238,7 @@ pub struct Launcher {
     pub target: Target,
     pub stage: Stage,
     pub fields: Vec<form::Field>,
-    pub answers: Vec<TextEdit>,
+    pub answers: Vec<form::Answer>,
     /// Fields that take a typed value in place of their offered choices.
     pub typing: std::collections::BTreeSet<usize>,
     pub cost: TextEdit,

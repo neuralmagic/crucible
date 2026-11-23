@@ -5,11 +5,12 @@
 //! side catches what it can say before a round trip: a missing required field, a number that
 //! is not one, a ceiling over the admin cap.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crucible_contract::calls::{MAX_FILE_PARAM_BYTES, MAX_JSON_PARAM_BYTES};
 use crucible_contract::emits::JsonSchema;
+use rune::TextEdit;
 use serde_json::{Map, Value};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -21,7 +22,7 @@ pub enum Kind {
     Bool,
     /// One of these values.
     Choice(Vec<String>),
-    /// Any of these values, sent as a list; the answer is its JSON array.
+    /// Any of these values, sent as a list.
     MultiChoice(Vec<String>),
     Json(Option<JsonSchema>),
     File(FileSpec),
@@ -43,14 +44,38 @@ pub struct Upload {
     pub media_type: Option<String>,
 }
 
+/// One field's answer, in the shape its kind takes.
+#[derive(Clone, PartialEq)]
+pub enum Answer {
+    Text(Box<TextEdit>),
+    Flag(bool),
+    /// The picked choices, by their place in the field's list.
+    MultiChoice(BTreeSet<usize>),
+}
+
+impl Answer {
+    /// A typed answer holding `text`.
+    pub fn typed(text: impl Into<String>) -> Answer {
+        Answer::Text(Box::new(TextEdit::new(text)))
+    }
+
+    /// The trimmed text of a typed answer; empty for a switch or picks.
+    pub fn text(&self) -> &str {
+        match self {
+            Answer::Text(edit) => edit.text.trim(),
+            Answer::Flag(_) | Answer::MultiChoice(_) => "",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Field {
     pub name: String,
     pub kind: Kind,
     pub required: bool,
     pub description: String,
-    /// The schema's default, as the text the field starts with.
-    pub default: String,
+    /// The schema's default, else what its kind starts with.
+    pub default: Value,
     pub offer: Offer,
 }
 
@@ -162,15 +187,12 @@ pub fn fields(schema: &Value) -> Vec<Field> {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
-                default: prop
-                    .get("default")
-                    .map(text_of)
-                    .unwrap_or_else(|| match kind {
-                        Kind::Bool => "false".to_string(),
-                        Kind::Choice(ref values) => values.first().cloned().unwrap_or_default(),
-                        Kind::MultiChoice(_) => "[]".to_string(),
-                        _ => String::new(),
-                    }),
+                default: prop.get("default").cloned().unwrap_or_else(|| match kind {
+                    Kind::Bool => Value::Bool(false),
+                    Kind::Choice(ref values) => Value::from(values.first().cloned()),
+                    Kind::MultiChoice(_) => Value::Array(Vec::new()),
+                    _ => Value::Null,
+                }),
                 kind,
                 offer: offer(prop, props),
             })
@@ -254,27 +276,26 @@ fn entries<T>(value: &Value, read: impl Fn(&Value) -> Option<T>) -> Option<BTree
         .collect()
 }
 
-/// The trimmed answer to the field named `name`.
-fn answer_to<'a>(fields: &[Field], answers: &'a [String], name: &str) -> &'a str {
+/// The answer to the field named `name`.
+fn answer_to<'a>(fields: &[Field], answers: &'a [Answer], name: &str) -> Option<&'a Answer> {
     fields
         .iter()
         .position(|f| f.name == name)
         .and_then(|i| answers.get(i))
-        .map_or("", |a| a.trim())
 }
 
 impl Field {
     /// Whether this field is sent: it has no gate, or its gate is on.
-    pub fn enabled(&self, fields: &[Field], answers: &[String]) -> bool {
+    pub fn enabled(&self, fields: &[Field], answers: &[Answer]) -> bool {
         self.offer
             .enabled_by
             .as_deref()
-            .is_none_or(|gate| answer_to(fields, answers, gate).eq_ignore_ascii_case("true"))
+            .is_none_or(|gate| matches!(answer_to(fields, answers, gate), Some(Answer::Flag(true))))
     }
 
     /// The values to pick from now: the declared choices, else the snapshot's, narrowed to the
     /// key field's answer. `None` when the field is typed.
-    pub fn offered(&self, fields: &[Field], answers: &[String]) -> Option<Vec<String>> {
+    pub fn offered(&self, fields: &[Field], answers: &[Answer]) -> Option<Vec<String>> {
         if let Kind::Choice(values) = &self.kind {
             return Some(values.clone());
         }
@@ -283,7 +304,7 @@ impl Field {
             Lists::Keyed(keyed) => Some(
                 keyed
                     .entries
-                    .get(answer_to(fields, answers, &keyed.by))
+                    .get(answer_to(fields, answers, &keyed.by).map_or("", Answer::text))
                     .cloned()
                     .unwrap_or_default(),
             ),
@@ -291,13 +312,117 @@ impl Field {
     }
 
     /// What the empty field shows: the pack's pick for the key field's answer, else the default.
-    pub fn placeholder(&self, fields: &[Field], answers: &[String]) -> String {
+    pub fn placeholder(&self, fields: &[Field], answers: &[Answer]) -> String {
         self.offer
             .placeholder
             .as_ref()
-            .and_then(|keyed| keyed.entries.get(answer_to(fields, answers, &keyed.by)))
-            .unwrap_or(&self.default)
-            .clone()
+            .and_then(|keyed| {
+                keyed
+                    .entries
+                    .get(answer_to(fields, answers, &keyed.by).map_or("", Answer::text))
+            })
+            .cloned()
+            .unwrap_or_else(|| self.default_text())
+    }
+
+    /// The default as the text a typed field holds.
+    pub fn default_text(&self) -> String {
+        text_of(&self.default)
+    }
+
+    /// The answer this field starts with: what `previous` sent for it, else its default.
+    pub fn answer(&self, previous: Option<&Value>) -> Answer {
+        let from = previous.unwrap_or(&self.default);
+        match &self.kind {
+            Kind::Bool => Answer::Flag(from.as_bool().unwrap_or(false)),
+            Kind::MultiChoice(choices) => Answer::MultiChoice(
+                from.as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|value| {
+                        choices
+                            .iter()
+                            .position(|c| value.as_str() == Some(c.as_str()))
+                    })
+                    .collect(),
+            ),
+            Kind::Text
+            | Kind::Multiline
+            | Kind::Integer
+            | Kind::Number
+            | Kind::Choice(_)
+            | Kind::Json(_)
+            | Kind::File(_) => Answer::typed(text_of(from)),
+        }
+    }
+
+    /// The param `answer` makes, `None` when an optional field is left empty; else what is
+    /// wrong with it.
+    fn param(
+        &self,
+        fields: &[Field],
+        answers: &[Answer],
+        answer: Option<&Answer>,
+    ) -> Result<Option<Value>, String> {
+        let empty = || {
+            if self.required {
+                Err("Required".to_string())
+            } else {
+                Ok(None)
+            }
+        };
+        match (&self.kind, answer) {
+            (Kind::Bool, Some(Answer::Flag(on))) => Ok(Some(Value::Bool(*on))),
+            (Kind::MultiChoice(_), Some(Answer::MultiChoice(held)))
+                if self.required && held.is_empty() =>
+            {
+                Err("Pick at least one".to_string())
+            }
+            (Kind::MultiChoice(choices), Some(Answer::MultiChoice(held))) => Ok(Some(Value::from(
+                held.iter()
+                    .filter_map(|at| choices.get(*at).cloned())
+                    .collect::<Vec<_>>(),
+            ))),
+            (Kind::File(_), _) => Ok(None),
+            (Kind::Json(schema), Some(Answer::Text(edit))) => match edit.text.trim() {
+                "" => empty(),
+                text => json_value(text, schema.as_ref()).map(Some),
+            },
+            (
+                Kind::Text | Kind::Multiline | Kind::Integer | Kind::Number | Kind::Choice(_),
+                Some(Answer::Text(edit)),
+            ) => {
+                let text = edit.text.trim();
+                if text.is_empty() {
+                    return empty();
+                }
+                if !self.offer.allow_other
+                    && let Some(values) = self.offered(fields, answers)
+                    && !values.iter().any(|v| v == text)
+                {
+                    return Err(match (values.is_empty(), self.keyed_by()) {
+                        (true, Some(key)) => format!("No options for this {key}"),
+                        (true, None) => "No options".to_string(),
+                        (false, _) => format!("One of {}", values.join(", ")),
+                    });
+                }
+                match &self.kind {
+                    Kind::Integer => text
+                        .parse::<i64>()
+                        .map(Value::from)
+                        .map_err(|_| "A whole number".to_string()),
+                    Kind::Number => text
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|n| n.is_finite())
+                        .map(Value::from)
+                        .ok_or_else(|| "A number".to_string()),
+                    _ => Ok(Value::String(text.to_string())),
+                }
+                .map(Some)
+            }
+            _ => empty(),
+        }
     }
 
     /// The key field whose answer picks this field's choices.
@@ -307,27 +432,6 @@ impl Field {
             Lists::One(_) => None,
         }
     }
-}
-
-/// The values a `MultiChoice` answer holds; empty when it is not a JSON list of strings.
-pub fn picked(answer: &str) -> Vec<String> {
-    serde_json::from_str::<Value>(answer)
-        .ok()
-        .as_ref()
-        .and_then(strings)
-        .unwrap_or_default()
-}
-
-/// A `MultiChoice` answer with `value` flipped, its entries kept in the order of `choices`.
-pub fn toggled(choices: &[String], answer: &str, value: &str) -> String {
-    let mut held = picked(answer);
-    if let Some(at) = held.iter().position(|v| v == value) {
-        held.remove(at);
-    } else {
-        held.push(value.to_string());
-    }
-    let ordered: Vec<&String> = choices.iter().filter(|c| held.contains(c)).collect();
-    Value::from(ordered.into_iter().cloned().collect::<Vec<_>>()).to_string()
 }
 
 fn text_of(value: &Value) -> String {
@@ -343,73 +447,20 @@ pub type Problems = Vec<(usize, String)>;
 
 /// The params object the answers make. An empty optional field is left out, so the schema's
 /// own default applies. A file field is left out too: [`uploads`] reads it.
-pub fn params(fields: &[Field], answers: &[String]) -> Result<Value, Problems> {
+pub fn params(fields: &[Field], answers: &[Answer]) -> Result<Value, Problems> {
     let mut out = Map::new();
     let mut problems = Vec::new();
     for (i, field) in fields.iter().enumerate() {
         if !field.enabled(fields, answers) || matches!(field.kind, Kind::File(_)) {
             continue;
         }
-        let answer = answers.get(i).map(|a| a.trim()).unwrap_or_default();
-        if answer.is_empty() {
-            if field.required {
-                problems.push((i, "Required".to_string()));
+        match field.param(fields, answers, answers.get(i)) {
+            Ok(Some(value)) => {
+                out.insert(field.name.clone(), value);
             }
-            continue;
+            Ok(None) => {}
+            Err(why) => problems.push((i, why)),
         }
-        if !field.offer.allow_other
-            && let Some(values) = field.offered(fields, answers)
-            && !values.iter().any(|v| v == answer)
-        {
-            problems.push((
-                i,
-                match (values.is_empty(), field.keyed_by()) {
-                    (true, Some(key)) => format!("No options for this {key}"),
-                    (true, None) => "No options".to_string(),
-                    (false, _) => format!("One of {}", values.join(", ")),
-                },
-            ));
-            continue;
-        }
-        let value = match &field.kind {
-            Kind::Text | Kind::Multiline | Kind::Choice(_) => Value::String(answer.to_string()),
-            Kind::MultiChoice(choices) => {
-                let held = picked(answer);
-                if field.required && held.is_empty() {
-                    problems.push((i, "Pick at least one".to_string()));
-                    continue;
-                }
-                if let Some(stray) = held.iter().find(|v| !choices.contains(v)) {
-                    problems.push((i, format!("{stray} is not one of {}", choices.join(", "))));
-                    continue;
-                }
-                Value::from(held)
-            }
-            Kind::Integer => match answer.parse::<i64>() {
-                Ok(n) => Value::from(n),
-                Err(_) => {
-                    problems.push((i, "A whole number".to_string()));
-                    continue;
-                }
-            },
-            Kind::Number => match answer.parse::<f64>().ok().filter(|n| n.is_finite()) {
-                Some(n) => Value::from(n),
-                None => {
-                    problems.push((i, "A number".to_string()));
-                    continue;
-                }
-            },
-            Kind::Bool => Value::Bool(answer == "true"),
-            Kind::Json(schema) => match json_value(answer, schema.as_ref()) {
-                Ok(value) => value,
-                Err(why) => {
-                    problems.push((i, why));
-                    continue;
-                }
-            },
-            Kind::File(_) => continue,
-        };
-        out.insert(field.name.clone(), value);
     }
     if problems.is_empty() {
         Ok(Value::Object(out))
@@ -432,7 +483,7 @@ fn json_value(answer: &str, schema: Option<&JsonSchema>) -> Result<Value, String
     }
 }
 
-pub fn uploads(fields: &[Field], answers: &[String]) -> Result<Vec<Upload>, Problems> {
+pub fn uploads(fields: &[Field], answers: &[Answer]) -> Result<Vec<Upload>, Problems> {
     let mut out = Vec::new();
     let mut problems = Vec::new();
     for (i, field) in fields.iter().enumerate() {
@@ -442,7 +493,7 @@ pub fn uploads(fields: &[Field], answers: &[String]) -> Result<Vec<Upload>, Prob
         if !field.enabled(fields, answers) {
             continue;
         }
-        let answer = answers.get(i).map(|a| a.trim()).unwrap_or_default();
+        let answer = answers.get(i).map_or("", Answer::text);
         if answer.is_empty() {
             if field.required {
                 problems.push((i, "Required".to_string()));
@@ -664,9 +715,13 @@ impl From<&str> for Refusal {
 mod tests {
     use serde_json::json;
 
+    use std::collections::BTreeSet;
+
+    use serde_json::Value;
+
     use crate::form::{
-        Field, FileSpec, Kind, Refusal, Scale, Upload, ceilings, duration, fields, minutes, params,
-        picked, toggled, upload, uploads,
+        Answer, Field, FileSpec, Kind, Refusal, Scale, Upload, ceilings, duration, fields, minutes,
+        params, upload, uploads,
     };
 
     #[test]
@@ -709,20 +764,16 @@ mod tests {
         assert_eq!(names, ["repo", "label", "limit", "deep", "mode", "tries"]);
         assert!(f[0].required && !f[1].required);
         assert_eq!(f[0].description, "owner/name");
-        assert_eq!(f[2].default, "6");
-        assert_eq!(
-            (f[3].kind.clone(), f[3].default.as_str()),
-            (Kind::Bool, "false")
-        );
+        assert_eq!(f[2].default, json!("6"));
+        assert_eq!((&f[3].kind, &f[3].default), (&Kind::Bool, &json!(false)));
         assert_eq!(
             f[4].kind,
             Kind::Choice(vec!["fast".into(), "thorough".into()])
         );
-        assert_eq!(f[4].default, "fast");
-        assert_eq!(
-            (f[5].kind.clone(), f[5].default.as_str()),
-            (Kind::Integer, "2")
-        );
+        assert_eq!(f[4].default, json!("fast"));
+        assert_eq!((&f[5].kind, &f[5].default), (&Kind::Integer, &json!(2)));
+        assert_eq!(f[5].default_text(), "2");
+        assert_eq!(f[0].default_text(), "", "no default reads as empty text");
         assert!(fields(&json!({})).is_empty());
     }
 
@@ -746,7 +797,11 @@ mod tests {
         assert_eq!(fields[2].kind, Kind::Bool);
         let request = "Compare revisions:\n\n  baseline: v0.17.0\n  candidate: main";
         assert_eq!(
-            params(&fields, &[request.into(), "full".into(), "true".into()]).unwrap(),
+            params(
+                &fields,
+                &each(&fields, &[json!(request), json!("full"), json!(true)])
+            )
+            .unwrap(),
             json!({"request": request, "mode": "full", "enabled": true})
         );
     }
@@ -754,9 +809,17 @@ mod tests {
     #[test]
     fn answers_become_typed_params_and_empty_optionals_are_left_out() {
         let f = fields(&triage());
-        let answers: Vec<String> = ["vllm-project/speculators", "", "2", "true", "thorough", "3"]
-            .map(String::from)
-            .to_vec();
+        let answers = each(
+            &f,
+            &[
+                json!("vllm-project/speculators"),
+                json!(""),
+                json!("2"),
+                json!(true),
+                json!("thorough"),
+                json!("3"),
+            ],
+        );
         assert_eq!(
             params(&f, &answers).unwrap(),
             json!({"repo": "vllm-project/speculators", "limit": "2", "deep": true, "mode": "thorough", "tries": 3})
@@ -766,9 +829,17 @@ mod tests {
     #[test]
     fn problems_name_each_field_that_cannot_be_sent() {
         let f = fields(&triage());
-        let answers: Vec<String> = ["  ", "", "", "false", "slow", "three"]
-            .map(String::from)
-            .to_vec();
+        let answers = each(
+            &f,
+            &[
+                json!("  "),
+                json!(""),
+                json!(""),
+                json!(false),
+                json!("slow"),
+                json!("three"),
+            ],
+        );
         let problems = params(&f, &answers).unwrap_err();
         assert_eq!(
             problems,
@@ -876,47 +947,123 @@ mod tests {
         })
     }
 
-    fn answer(f: &[Field], pairs: &[(&str, &str)]) -> Vec<String> {
+    /// Each field answered with the value named for it, and left empty otherwise.
+    fn answer(f: &[Field], pairs: &[(&str, Value)]) -> Vec<Answer> {
         f.iter()
             .map(|field| {
-                pairs
-                    .iter()
-                    .find(|(name, _)| *name == field.name)
-                    .map_or(String::new(), |(_, v)| (*v).to_string())
+                let named = pairs.iter().find(|(name, _)| *name == field.name);
+                field.answer(Some(named.map_or(&Value::Null, |(_, value)| value)))
             })
             .collect()
     }
 
-    #[test]
-    fn a_list_with_choices_is_picked_as_a_subset_and_sent_as_a_list() {
-        let schema = json!({
+    /// Each field answered with the value at its place.
+    fn each(f: &[Field], values: &[Value]) -> Vec<Answer> {
+        f.iter()
+            .zip(values)
+            .map(|(field, value)| field.answer(Some(value)))
+            .collect()
+    }
+
+    fn workloads() -> Vec<Field> {
+        fields(&json!({
             "properties": {
                 "workloads": {"type": "array", "uniqueItems": true, "default": ["chat", "agentic"],
-                              "items": {"type": "string", "enum": ["chat", "agentic"]}},
+                              "items": {"type": "string", "enum": ["chat", "agentic", "batch"]}},
                 "tags": {"type": "array", "items": {"type": "string"}}
             }
-        });
-        let f = fields(&schema);
-        let picks = vec!["chat".to_string(), "agentic".to_string()];
-        assert_eq!(f[1].kind, Kind::MultiChoice(picks.clone()));
-        assert_eq!(f[0].kind, Kind::Text, "a list without choices stays typed");
-        assert_eq!(picked(&f[1].default), picks);
+        }))
+    }
 
-        let unticked = toggled(&picks, &f[1].default, "chat");
-        assert_eq!(unticked, r#"["agentic"]"#);
+    #[test]
+    fn a_list_with_choices_is_picked_as_a_subset_and_sent_as_a_list() {
+        let f = workloads();
+        assert_eq!(f[0].kind, Kind::Text, "a list without choices stays typed");
         assert_eq!(
-            toggled(&picks, &unticked, "chat"),
-            r#"["chat","agentic"]"#,
+            f[1].kind,
+            Kind::MultiChoice(vec!["chat".into(), "agentic".into(), "batch".into()])
+        );
+        let held = |picks: &[usize]| {
+            vec![
+                f[0].answer(None),
+                Answer::MultiChoice(BTreeSet::from_iter(picks.iter().copied())),
+            ]
+        };
+        assert_eq!(
+            params(&f, &held(&[2, 0])).unwrap()["workloads"],
+            json!(["chat", "batch"]),
             "choice order, not tick order"
         );
-
-        let answers = |w: &str| vec![String::new(), w.to_string()];
+        assert_eq!(params(&f, &held(&[])).unwrap()["workloads"], json!([]));
         assert_eq!(
-            params(&f, &answers(&unticked)).unwrap()["workloads"],
-            json!(["agentic"])
+            params(&f, &held(&[1, 9])).unwrap()["workloads"],
+            json!(["agentic"]),
+            "a place past the list picks nothing"
         );
-        assert_eq!(params(&f, &answers("[]")).unwrap()["workloads"], json!([]));
-        assert_eq!(params(&f, &answers(r#"["batch"]"#)).unwrap_err()[0].0, 1);
+    }
+
+    #[test]
+    fn a_required_list_with_nothing_picked_is_a_problem() {
+        let f = fields(&json!({
+            "properties": {
+                "workloads": {"type": "array", "items": {"enum": ["chat", "agentic"]}}
+            },
+            "required": ["workloads"]
+        }));
+        assert_eq!(f[0].default, json!([]));
+        assert_eq!(
+            params(&f, &[f[0].answer(None)]).unwrap_err(),
+            vec![(0, "Pick at least one".to_string())]
+        );
+        assert_eq!(
+            params(&f, &[f[0].answer(Some(&json!(["agentic"])))]).unwrap(),
+            json!({"workloads": ["agentic"]})
+        );
+    }
+
+    #[test]
+    fn a_field_starts_from_what_was_sent_before_else_its_default() {
+        let f = workloads();
+        let picks = |from: Option<&Value>| match f[1].answer(from) {
+            Answer::MultiChoice(held) => held.into_iter().collect::<Vec<_>>(),
+            _ => panic!("a list with choices is answered by picks"),
+        };
+        assert_eq!(picks(None), [0, 1], "the default");
+        assert_eq!(picks(Some(&json!(["batch"]))), [2]);
+        assert_eq!(
+            picks(Some(&json!(["batch", "gone", 7, "chat"]))),
+            [0, 2],
+            "values that are no longer choices are dropped"
+        );
+        assert_eq!(picks(Some(&json!("chat"))), [0usize; 0], "not a list");
+
+        let f = fields(&triage());
+        assert!(f[3].answer(None) == Answer::Flag(false));
+        assert!(f[3].answer(Some(&json!(true))) == Answer::Flag(true));
+        assert!(
+            f[3].answer(Some(&json!("true"))) == Answer::Flag(false),
+            "only a bool turns a switch on"
+        );
+        assert_eq!(f[2].answer(None).text(), "6");
+        assert_eq!(f[2].answer(Some(&json!(" 9 "))).text(), "9");
+        assert_eq!(f[4].answer(None).text(), "fast", "the first choice");
+        assert_eq!(f[5].answer(None).text(), "2");
+        assert_eq!(f[5].answer(Some(&json!(7))).text(), "7");
+        assert_eq!(f[0].answer(None).text(), "");
+        assert_eq!(Answer::Flag(true).text(), "");
+    }
+
+    #[test]
+    fn an_answer_that_is_missing_or_the_wrong_shape_is_no_answer() {
+        let f = fields(&triage());
+        assert_eq!(
+            params(&f, &[]).unwrap_err(),
+            vec![(0, "Required".to_string())]
+        );
+        let mut answers = answer(&f, &[("repo", json!("a/b"))]);
+        answers[3] = f[0].answer(Some(&json!("true")));
+        answers[5] = Answer::Flag(true);
+        assert_eq!(params(&f, &answers).unwrap(), json!({"repo": "a/b"}));
     }
 
     #[test]
@@ -940,7 +1087,7 @@ mod tests {
     #[test]
     fn a_keyed_snapshot_offers_the_list_for_the_key_fields_answer() {
         let f = fields(&release());
-        let on = |release: &str| f[1].offered(&f, &answer(&f, &[("release", release)]));
+        let on = |release: &str| f[1].offered(&f, &answer(&f, &[("release", json!(release))]));
         assert_eq!(on("3.1"), Some(vec!["vllm".into(), "llm-d".into()]));
         assert_eq!(on(" 3.0 "), Some(vec!["vllm".into()]));
         assert_eq!(on("9.9"), Some(vec![]));
@@ -950,27 +1097,36 @@ mod tests {
     fn a_keyed_placeholder_follows_the_key_and_falls_back_to_the_default() {
         let f = fields(&release());
         assert_eq!(
-            f[3].placeholder(&f, &answer(&f, &[("release", "3.1")])),
+            f[3].placeholder(&f, &answer(&f, &[("release", json!("3.1"))])),
             "rhoai-3.1"
         );
-        assert_eq!(f[3].placeholder(&f, &answer(&f, &[("release", "3.0")])), "");
+        assert_eq!(
+            f[3].placeholder(&f, &answer(&f, &[("release", json!("3.0"))])),
+            ""
+        );
     }
 
     #[test]
     fn a_gated_field_is_sent_only_while_its_switch_is_on() {
         let f = fields(&release());
         let base = [
-            ("release", "3.1"),
-            ("component", "vllm"),
-            ("branch", "main"),
+            ("release", json!("3.1")),
+            ("component", json!("vllm")),
+            ("branch", json!("main")),
         ];
-        let off = answer(&f, &[base.as_slice(), &[("override", "false")]].concat());
+        let off = answer(
+            &f,
+            &[base.as_slice(), &[("override", json!(false))]].concat(),
+        );
         assert!(!f[3].enabled(&f, &off));
         let sent = params(&f, &off).unwrap();
         assert_eq!(sent.get("branch"), None);
         assert_eq!(sent["override"], json!(false));
 
-        let on = answer(&f, &[base.as_slice(), &[("override", "true")]].concat());
+        let on = answer(
+            &f,
+            &[base.as_slice(), &[("override", json!(true))]].concat(),
+        );
         assert!(f[3].enabled(&f, &on));
         assert_eq!(params(&f, &on).unwrap()["branch"], json!("main"));
         assert!(f[0].enabled(&f, &on), "an ungated field is always sent");
@@ -991,16 +1147,16 @@ mod tests {
     fn offered_choices_refuse_other_values_unless_other_is_allowed() {
         let f = fields(&release());
         let problems =
-            |pairs: &[(&str, &str)]| params(&f, &answer(&f, pairs)).err().unwrap_or_default();
+            |pairs: &[(&str, Value)]| params(&f, &answer(&f, pairs)).err().unwrap_or_default();
         assert_eq!(
-            problems(&[("release", "2.9"), ("stage", "qa")]),
+            problems(&[("release", json!("2.9")), ("stage", json!("qa"))]),
             vec![
                 (0, "One of 3.0, 3.1".to_string()),
                 (5, "One of dev, prod".to_string()),
             ]
         );
         assert_eq!(
-            problems(&[("release", "3.2"), ("component", "vllm")]),
+            problems(&[("release", json!("3.2")), ("component", json!("vllm"))]),
             vec![
                 (0, "One of 3.0, 3.1".to_string()),
                 (1, "No options for this release".to_string()),
@@ -1011,10 +1167,10 @@ mod tests {
             &answer(
                 &f,
                 &[
-                    ("release", "3.1"),
-                    ("component", "llm-d"),
-                    ("image", "alpine"),
-                    ("unread", "anything"),
+                    ("release", json!("3.1")),
+                    ("component", json!("llm-d")),
+                    ("image", json!("alpine")),
+                    ("unread", json!("anything")),
                 ],
             ),
         )
@@ -1093,7 +1249,12 @@ mod tests {
         let with = |config: &str, extra: &str| {
             params(
                 &f,
-                &[config.into(), extra.into(), String::new(), String::new()],
+                &[
+                    Answer::typed(config),
+                    Answer::typed(extra),
+                    Answer::typed(""),
+                    Answer::typed(""),
+                ],
             )
         };
         assert_eq!(
@@ -1125,10 +1286,10 @@ mod tests {
         let f = fields(&typed());
         let answers = |notes: &str, blob: &str| {
             vec![
-                r#"{"name": "a"}"#.to_string(),
-                String::new(),
-                notes.to_string(),
-                blob.to_string(),
+                Answer::typed(r#"{"name": "a"}"#),
+                Answer::typed(""),
+                Answer::typed(notes),
+                Answer::typed(blob),
             ]
         };
         let path = notes.display().to_string();
