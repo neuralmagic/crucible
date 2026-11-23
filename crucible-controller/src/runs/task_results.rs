@@ -8,6 +8,7 @@
 use crate::runs::model::{RunPlan, TaskResult};
 use anyhow::{Context, Result};
 use sqlx::PgExecutor;
+use std::borrow::Cow;
 
 /// Record one admitted plan version. `graph_json` is the `plan_admitted` event's `tasks` array.
 #[tracing::instrument(name = "db.upsert_run_plan", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", run_id = %run_id), err)]
@@ -32,7 +33,33 @@ pub(crate) async fn upsert_run_plan(
     Ok(())
 }
 
-/// Record one task attempt's terminal status, last write wins per `(run_id, iter, task)`.
+/// `text` with each U+0000, which Postgres stores in neither `text` nor `jsonb`, replaced by
+/// U+FFFD.
+fn text_without_nul(text: &str) -> Cow<'_, str> {
+    match text.contains('\0') {
+        true => Cow::Owned(text.replace('\0', "\u{fffd}")),
+        false => Cow::Borrowed(text),
+    }
+}
+
+/// `value` with [`text_without_nul`] applied to every string and object key in it.
+fn json_without_nul(value: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::String(text) => Value::String(text_without_nul(&text).into_owned()),
+        Value::Array(items) => Value::Array(items.into_iter().map(json_without_nul).collect()),
+        Value::Object(fields) => Value::Object(
+            fields
+                .into_iter()
+                .map(|(key, value)| (text_without_nul(&key).into_owned(), json_without_nul(value)))
+                .collect(),
+        ),
+        scalar => scalar,
+    }
+}
+
+/// Record one task attempt's terminal status, last write wins per `(run_id, iter, task)`. A U+0000
+/// in the note or in any stored JSON is written as U+FFFD.
 #[tracing::instrument(name = "db.upsert_task_result", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", run_id = %run_id), err)]
 pub(crate) async fn upsert_task_result(
     ex: impl PgExecutor<'_>,
@@ -44,15 +71,23 @@ pub(crate) async fn upsert_task_result(
         .as_ref()
         .map(serde_json::to_value)
         .transpose()
-        .context("encoding the blocked reason")?;
-    let links = serde_json::to_value(&result.links).context("encoding the reported links")?;
+        .context("encoding the blocked reason")?
+        .map(json_without_nul);
+    let links = json_without_nul(
+        serde_json::to_value(&result.links).context("encoding the reported links")?,
+    );
     let agent = result
         .agent
         .as_ref()
         .map(serde_json::to_value)
         .transpose()
-        .context("encoding the resolved agent")?;
-    let repairs = serde_json::to_value(&result.repairs).context("encoding the repair turns")?;
+        .context("encoding the resolved agent")?
+        .map(json_without_nul);
+    let repairs = json_without_nul(
+        serde_json::to_value(&result.repairs).context("encoding the repair turns")?,
+    );
+    let output = result.output.clone().map(json_without_nul);
+    let note = text_without_nul(&result.note);
     sqlx::query!(
         r#"
         INSERT INTO run_task_results (run_id, iter, task, status, note, cost_usd, secs, blocked, links, agent, repairs, output)
@@ -72,14 +107,14 @@ pub(crate) async fn upsert_task_result(
         result.iter,
         result.task,
         result.status,
-        result.note,
+        note.as_ref(),
         result.cost_usd,
         result.secs,
         blocked,
         links,
         agent,
         repairs,
-        result.output,
+        output,
     )
     .execute(ex)
     .await
@@ -172,7 +207,7 @@ pub(crate) async fn count_transport_losses(ex: impl PgExecutor<'_>, run_id: &str
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::runs::task_results::*;
     use sqlx::PgPool;
 
     fn result(iter: i64, task: &str, status: &str) -> TaskResult {
@@ -214,6 +249,55 @@ mod tests {
         assert_eq!(rows[0].status, "pass");
         assert_eq!(rows[1].task, "propose");
         Ok(())
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_nul_in_a_task_result_is_stored_as_the_replacement_character(
+        pool: PgPool,
+    ) -> Result<()> {
+        let repair = crucible_contract::session::TaskRepair {
+            label: "probe repair 1/1".to_string(),
+            round: 1,
+            of: 1,
+            cost_usd: 0.25,
+            notes: vec!["exit\0 1".to_string()],
+        };
+        upsert_task_result(
+            &pool,
+            "run-nul",
+            &TaskResult {
+                note: "read\0 4 bytes".to_string(),
+                repairs: vec![repair],
+                output: Some(serde_json::json!({
+                    "stdout": "a\0b",
+                    "by\0key": ["\0", {"nested": "x\0"}],
+                    "count": 3,
+                    "clean": "untouched",
+                })),
+                ..result(0, "probe", "pass")
+            },
+        )
+        .await?;
+        let rows = list_task_results(&pool, "run-nul").await?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].note, "read\u{fffd} 4 bytes");
+        assert_eq!(rows[0].repairs[0].notes, ["exit\u{fffd} 1"]);
+        assert_eq!(
+            rows[0].output,
+            Some(serde_json::json!({
+                "stdout": "a\u{fffd}b",
+                "by\u{fffd}key": ["\u{fffd}", {"nested": "x\u{fffd}"}],
+                "count": 3,
+                "clean": "untouched",
+            }))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn text_without_a_nul_is_not_copied() {
+        assert!(matches!(text_without_nul("plain"), Cow::Borrowed("plain")));
+        assert_eq!(text_without_nul("\0\0"), "\u{fffd}\u{fffd}");
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
