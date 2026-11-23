@@ -81,9 +81,8 @@ impl App {
         }
     }
 
-    /// Lay every window out at `zoom` and keep it for next time.
+    /// Keep `zoom`, which the view lays out at.
     pub fn set_zoom(&mut self, zoom: f32) {
-        rune::zoom::set(zoom);
         self.settings.set_zoom(zoom);
     }
 
