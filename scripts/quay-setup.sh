@@ -197,9 +197,11 @@ stage_repos() {
     done
     for repo in ${MAKE_PUBLIC[@]+"${MAKE_PUBLIC[@]}"}; do
         call "making $repo public" POST "/repository/$QUAY_ORG/$repo/changevisibility" '{"visibility":"public"}'
+        say "  $repo is public"
     done
     for repo in ${MAKE_PRIVATE[@]+"${MAKE_PRIVATE[@]}"}; do
         call "making $repo private" POST "/repository/$QUAY_ORG/$repo/changevisibility" '{"visibility":"private"}'
+        say "  $repo is private"
     done
     say "  done"
 }
@@ -209,6 +211,7 @@ create_repo() {
     body=$(jq -cn --arg ns "$QUAY_ORG" --arg repo "$1" --arg vis "$2" \
         '{namespace: $ns, repository: $repo, visibility: $vis, description: "", repo_kind: "image"}')
     call "creating $1" POST /repository "$body"
+    say "  created $1 ($2)"
 }
 
 stage_read_team() {
@@ -374,8 +377,10 @@ main() {
 
     read -r -s -p "Quay OAuth token (org:admin, repo:admin, repo:create): " QUAY_TOKEN
     say
+    QUAY_TOKEN=$(printf '%s' "$QUAY_TOKEN" | tr -d '[:space:]')
     case "$QUAY_TOKEN" in
-    "" | *[!A-Za-z0-9_-]*) die "that does not look like a Quay token" ;;
+    "") die "no token was entered" ;;
+    *[!A-Za-z0-9_-]*) die "the ${#QUAY_TOKEN} characters entered include some a Quay token never has" ;;
     esac
 
     load_state
