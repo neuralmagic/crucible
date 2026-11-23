@@ -253,7 +253,7 @@ stage_read_team() {
 stage_ci_robot() {
     say
     say "3. CI robot $QUAY_ORG+$QUAY_CI_ROBOT"
-    local repo writes= missing=
+    local repo writes="" missing=""
     # shellcheck disable=SC2086
     if contains "$QUAY_CI_ROBOT" $ROBOTS; then
         call "reading the robot's permissions" GET \
