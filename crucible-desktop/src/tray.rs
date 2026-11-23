@@ -260,6 +260,7 @@ impl App {
                     title: format!("{profile}: {now} awaiting approval"),
                     body: String::new(),
                     link: String::new(),
+                    answers: None,
                 });
             }
         }

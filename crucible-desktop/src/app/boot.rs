@@ -153,7 +153,7 @@ pub(crate) fn setup(app: &mut App, waker: Waker) {
     {
         instance::serve(clicked.clone(), waker.clone());
         if let Some(link) = instance::launch_link(rune::extra_args()) {
-            let _ = clicked.send(link);
+            let _ = clicked.send(notify::Clicked::Open(link));
         }
     }
     app.notifier = Some(notify::Notifier::start(clicked, waker.clone()));
@@ -202,14 +202,20 @@ pub(crate) fn poll(app: &mut App, clock: f64, tx: &mut Tx) -> bool {
         app.apply_admin(view);
         changed = true;
     }
-    while let Some(link) = app
+    while let Some(clicked) = app
         .clicks
         .as_ref()
         .and_then(|clicks| clicks.try_recv().ok())
-        .and_then(|url| Link::parse(&url))
     {
-        app.follow(&link);
-        notify::bring_to_front();
+        match clicked {
+            notify::Clicked::Open(url) => {
+                if let Some(link) = Link::parse(&url) {
+                    app.follow(&link);
+                    notify::bring_to_front();
+                }
+            }
+            notify::Clicked::Answer(answer) => app.answer_from_note(answer),
+        }
         changed = true;
     }
     while let Some(paths) = app
