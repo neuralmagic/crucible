@@ -23,6 +23,13 @@ commit. A nightly's app icon is green. Asset names carry the build date and shor
 last. They are signed exactly as the tagged builds are: the macOS app ad hoc, so the first-launch
 steps above apply, and the RPM not at all. The app's update check follows tagged releases only.
 
+```sh
+curl -fsSL https://raw.githubusercontent.com/neuralmagic/crucible/main/scripts/install-desktop.sh | sh -s nightly
+```
+
+installs the current nightly over the app already there; without `nightly` it puts the newest
+tagged release back.
+
 ## Fedora
 
 Each release also carries `crucible-playbooks-<version>-1.fc45.<arch>.rpm` for x86_64 and
