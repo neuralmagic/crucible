@@ -478,6 +478,8 @@ pub struct App {
     pub pane_focus: Option<PaneKind>,
     /// Posts notifications once the app's loop is up.
     notifier: Option<notify::Notifier>,
+    /// The launch a notification's Rerun button was pressed on, until its rerun form can open.
+    rerun_wanted: Option<String>,
     /// What clicked notifications and links handed over by a second launch ask for.
     clicks: Option<std::sync::mpsc::Receiver<notify::Clicked>>,
     /// Each command's key recorder in Settings, once touched.

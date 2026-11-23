@@ -363,6 +363,11 @@ scope packs and pack imports waiting across profiles, and a growing approval cou
 notification. Profiles other than the one in use are read once a minute; their tunnels are not
 started for it.
 
+A launch of yours, or the pinned one, is announced when it stops. One that did not pass has a
+Rerun button, which opens the form that reruns what did not pass, and a Log button; one a person
+cancelled has Rerun alone; one that finished has a Report button when views are on. Each opens
+the run first.
+
 A decision request on the profile in use is announced when it opens. When it asks one question
 that takes one of up to four labels, the notification has a button for each label, and pressing
 one answers the request without opening the app. If the answer is refused, a second notification
