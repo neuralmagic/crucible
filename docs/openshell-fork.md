@@ -1,19 +1,19 @@
 # The OpenShell fork
 
 Crucible pins `openshell-core` and `openshell-policy` to a fork,
-[`wseaton/OpenShell`](https://github.com/wseaton/OpenShell), branch `crucible/v0.1.5`, instead of
+[`wseaton/OpenShell`](https://github.com/wseaton/OpenShell), branch `crucible/v0.1.9`, instead of
 upstream [`nvidia/OpenShell`](https://github.com/nvidia/OpenShell). This page records the
 reasons for the fork, so that you do not have to find them in the Git history.
 
 ## Reason for the fork
 
-The branch must **rebase without conflicts**. `crucible/v0.1.5` is the upstream release tag
-`v0.1.5` with a small stack of commits that Crucible needs. The module docs in
+The branch must **rebase without conflicts**. `crucible/v0.1.9` is the upstream release tag
+`v0.1.9` with a small stack of commits that Crucible needs. The module docs in
 `crucible/src/openshell/mod.rs` give the result: the control-plane boundary is the native
 `openshell.v1` gRPC API of the gateway, and the shipped gateway, supervisor, and sandbox
 runtime binaries are built from the exact pinned rev.
 
-The pin follows a release tag, not upstream `main`. Upstream v0.1.5 has everything that
+The pin follows a release tag, not upstream `main`. Upstream v0.1.9 has everything that
 Crucible needs from upstream, so the only difference is the fork-only stack below.
 
 ## Pin mechanics
@@ -30,20 +30,29 @@ There is one rev, and five consumers use it. All of them get it from `Cargo.lock
 
 ## The divergence ledger
 
-Fork-only commits on `crucible/v0.1.5`, relative to upstream `v0.1.5` (`bdb956f2`), checked
-2026-11-17:
+Fork-only commits on `crucible/v0.1.9`, relative to upstream `v0.1.9` (`ce58cf8e`), checked
+2026-11-23:
 
 | sha | What | Why crucible needs it | Upstreamable? |
 | --- | --- | --- | --- |
-| `8350ed52` | `feat(kubernetes): answer driver-supplied static hosts in the supervisor`: the kubernetes driver accepts `pod.host_aliases` (hostname to IP) in a sandbox's `driver_config`, validates it, and the network supervisor answers those names before its resolver, with every policy and destination check still applied. Static hosts are driver-supplied, so they answer both name-authorized and IP-constrained lookups, unlike the sandbox's `/etc/hosts` (upstream #4602) | Deployments reach hosts with no public DNS record (`[cluster].host_aliases`); stock v0.1.5 rejects the key, and sandbox egress is resolved by the supervisor, not by pod `hostAliases` | Yes, no upstream PR yet |
-| `a895315d` | `fix(kubernetes): backfill gateway-id only on unlabelled sandboxes`: the shared-mode startup backfill patches `openshell.ai/gateway-id` only on a Sandbox that has no such label. Stock v0.1.5 also relabels a Sandbox that names another gateway | Crucible runs one gateway per run, and several share a sandbox namespace. A gateway that started while another run's sandbox was alive took that sandbox's label, the owning gateway's label-scoped list came back empty, and its reconcile removed the sandbox from the store after the provisioning grace period. File transfer then failed with `sandbox not found` and the agent exited without a verdict | Yes. The change is needed by any deployment with more than one gateway in a namespace |
-| `ae753f2e` | `feat(kubernetes): add an ephemeral sandbox workspace mode`: `workspace_persistence = "ephemeral"` backs a sandbox's `/sandbox` with an `emptyDir` instead of a PersistentVolumeClaim. The default, `pvc`, is unchanged. | The workspace claim takes one StorageClass for the whole gateway. Where the classes are node-local, a sandbox with a node selector, a GPU sandbox for example, cannot schedule on nodes the class does not serve. A Crucible sandbox lives for one turn, so it does not need the claim. Crucible always renders `ephemeral`. | Yes. It is additive and off by default. |
-| `a18f1bba` | `fix(providers): retry JWT-SVID fetch while registration is pending`: the supervisor retries the Workload API's "no identity issued" with backoff until 10 s after its first SVID request, then fails as before. | A new sandbox's first MCP requests can reach the supervisor before the node's SPIRE agent has synced the pod's registration entry. Stock v0.1.5 denies them, and an agent whose MCP client gives up runs the turn without its tools. | Yes. Upstream main has the same code path. |
+| `577b379c` | `feat(kubernetes): answer driver-supplied static hosts in the supervisor`: the kubernetes driver accepts `pod.host_aliases` (hostname to IP) in a sandbox's `driver_config`, validates it, and the network supervisor answers those names before its resolver, with every policy and destination check still applied. Static hosts are driver-supplied, so they answer both name-authorized and IP-constrained lookups, unlike the sandbox's `/etc/hosts` (upstream #4602) | Deployments reach hosts with no public DNS record (`[cluster].host_aliases`); stock v0.1.9 rejects the key, and sandbox egress is resolved by the supervisor, not by pod `hostAliases` | Yes, no upstream PR yet |
+| `724cfe4d` | `fix(kubernetes): backfill gateway-id only on unlabelled sandboxes`: the shared-mode startup backfill patches `openshell.ai/gateway-id` only on a Sandbox that has no such label. Stock v0.1.9 also relabels a Sandbox that names another gateway | Crucible runs one gateway per run, and several share a sandbox namespace. A gateway that started while another run's sandbox was alive took that sandbox's label, the owning gateway's label-scoped list came back empty, and its reconcile removed the sandbox from the store after the provisioning grace period. File transfer then failed with `sandbox not found` and the agent exited without a verdict | Yes. The change is needed by any deployment with more than one gateway in a namespace |
+| `d2c67a9e` | `feat(kubernetes): add an ephemeral sandbox workspace mode`: `workspace_persistence = "ephemeral"` backs a sandbox's `/sandbox` with an `emptyDir` instead of a PersistentVolumeClaim. The default, `pvc`, is unchanged. | The workspace claim takes one StorageClass for the whole gateway. Where the classes are node-local, a sandbox with a node selector, a GPU sandbox for example, cannot schedule on nodes the class does not serve. A Crucible sandbox lives for one turn, so it does not need the claim. Crucible always renders `ephemeral`. | Yes. It is additive and off by default. |
+| `29d68bda` | `fix(providers): retry JWT-SVID fetch while registration is pending`: the supervisor retries the Workload API's "no identity issued" with backoff until 10 s after a sandbox's first SVID request, then fails as before. The deadline is kept per sandbox instance. | A new sandbox's first MCP requests can reach the supervisor before the node's SPIRE agent has synced the pod's registration entry. Stock v0.1.9 denies them, and an agent whose MCP client gives up runs the turn without its tools. | Yes. Upstream main has the same code path. |
 
-Dropped at this pin, relative to `crucible/v0.1.2`:
+Re-applied by hand at this pin, relative to `crucible/v0.1.5`:
+
+- **Static hosts.** Upstream rewrote the kubernetes driver's provisioning into one install
+  path and split the forward proxy handler, so the commit conflicted in four files and needed
+  new call sites updated.
+- **Ephemeral workspace.** Two import and startup conflicts in the kubernetes driver.
+- **JWT-SVID retry.** Applied cleanly, but its process-wide deadline moved into upstream's
+  per-sandbox token grant state.
+
+Dropped at the `crucible/v0.1.5` pin, relative to `crucible/v0.1.2`:
 
 - **`46dcbe04`**, the cherry-pick of `f7273e48` (#3973). v0.1.5 contains it.
-- **`aeeecb7d`**, the metadata proxy test fixup. It is part of `8350ed52`.
+- **`aeeecb7d`**, the metadata proxy test fixup. It is part of the static hosts commit.
 - **`50978123`**, noyalib 0.0.58. v0.1.5 has noyalib 0.0.53, which RUSTSEC-2026-0333 lists as
   patched.
 
@@ -84,6 +93,18 @@ Dropped at the `crucible/v0.1.2` pin, relative to the previous `crucible/grpc-ba
   over the supervisor session instead of waiting for the supervisor's poll. A supervisor
   without push support keeps polling.
 
+## Changes in v0.1.6 to v0.1.9 that Crucible adapted to
+
+- `KubernetesComputeConfig` gained `supervisor_topology`, `shared_supervisor`,
+  `runtime_bootstrap_grace_seconds`, `sandbox_attach_request_timeout_seconds`, and
+  `supervisor_runtime_class_name`. `supervisor_otlp` replaces `supervisor_otlp_endpoint` and
+  `supervisor_ocsf_export`. Crucible renders none of them.
+- `openshell-core` no longer depends on `rustls-pemfile` (#5122), so the RUSTSEC-2025-0134
+  exception is gone from `deny.toml`.
+- New sandboxes open the control connection from the sandbox to its supervisor (#4656). The
+  gateway, supervisor, and sandbox runtime images all come from the pinned rev, so they move
+  together.
+
 `MIN_GATEWAY_VERSION` in `grpc.rs` is `0.1.5`. Older gateways reject the
 `config_delivery_mode` key in `gateway.toml`. The protos from v0.1.2 to v0.1.5 only add.
 
@@ -91,7 +112,7 @@ Dropped at the `crucible/v0.1.2` pin, relative to the previous `crucible/grpc-ba
 
 Changes that would remove the fork:
 
-- **Static hosts** (`8350ed52`) and the **ephemeral workspace** (`ae753f2e`). When upstream
+- **Static hosts** (`577b379c`) and the **ephemeral workspace** (`d2c67a9e`). When upstream
   merges both, the fork is only a release pin.
 - **Upload and download RPCs.** File transfer still uses the `openshell` CLI (SSH-tar over the
   `CreateSshSession` relay of the gateway), because no RPC supports it. This is one of the two

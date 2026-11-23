@@ -545,12 +545,14 @@ pub fn gateway_toml(
     Ok(s)
 }
 
-/// Every field v0.1.5's `KubernetesComputeConfig` (`crates/openshell-driver-kubernetes/src/
+/// Every field v0.1.9's `KubernetesComputeConfig` (`crates/openshell-driver-kubernetes/src/
 /// config.rs`) accepts. That struct is `deny_unknown_fields`, so a name outside this list kills
 /// the gateway on startup, and its log lands in `gateway.log`, not the pod log. Re-derive it
 /// from the struct whenever the pin moves.
 #[cfg(test)]
 pub(crate) const UPSTREAM_KUBERNETES_COMPUTE_CONFIG_FIELDS: &[&str] = &[
+    "supervisor_topology",
+    "shared_supervisor",
     "allow_driver_config",
     "resource_admission",
     "workspace_mode",
@@ -568,6 +570,8 @@ pub(crate) const UPSTREAM_KUBERNETES_COMPUTE_CONFIG_FIELDS: &[&str] = &[
     "supervisor_image",
     "supervisor_image_pull_policy",
     "sandbox_runtime",
+    "runtime_bootstrap_grace_seconds",
+    "sandbox_attach_request_timeout_seconds",
     "https_proxy",
     "no_proxy",
     "proxy_auth_secret_name",
@@ -576,8 +580,7 @@ pub(crate) const UPSTREAM_KUBERNETES_COMPUTE_CONFIG_FIELDS: &[&str] = &[
     "proxy_connect_by_hostname",
     "proxy_ca_bundle",
     "grpc_endpoint",
-    "supervisor_otlp_endpoint",
-    "supervisor_ocsf_export",
+    "supervisor_otlp",
     "supervisor_gateway_name",
     "ssh_socket_path",
     "client_tls_secret_name",
@@ -587,6 +590,7 @@ pub(crate) const UPSTREAM_KUBERNETES_COMPUTE_CONFIG_FIELDS: &[&str] = &[
     "workspace_storage_class",
     "workspace_persistence",
     "default_runtime_class_name",
+    "supervisor_runtime_class_name",
     "allowed_pod_annotations",
     "allowed_pod_labels",
     "sa_token_ttl_secs",

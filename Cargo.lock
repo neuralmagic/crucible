@@ -1690,7 +1690,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "117725a109d387c937a1533ce01b450cbde6b88abceea8473c4d7a85853cda3c"
 dependencies = [
  "lazy_static",
- "windows-sys 0.52.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -6927,7 +6927,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.21.7",
  "chrono",
  "getrandom 0.2.17",
  "http",
@@ -7121,12 +7121,13 @@ dependencies = [
 [[package]]
 name = "openshell-core"
 version = "0.0.0"
-source = "git+https://github.com/wseaton/OpenShell.git?rev=a18f1bba75e997f83321213311d8c55a5df81781#a18f1bba75e997f83321213311d8c55a5df81781"
+source = "git+https://github.com/wseaton/OpenShell.git?rev=29d68bdab90d19fd996d227876ac8dfcd112ec94#29d68bdab90d19fd996d227876ac8dfcd112ec94"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
  "glob",
  "ipnet",
+ "libc",
  "miette",
  "nix 0.29.0",
  "openshell-crypto",
@@ -7137,7 +7138,6 @@ dependencies = [
  "protoc-bin-vendored",
  "rustix",
  "rustls",
- "rustls-pemfile",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -7156,7 +7156,7 @@ dependencies = [
 [[package]]
 name = "openshell-crypto"
 version = "0.0.0"
-source = "git+https://github.com/wseaton/OpenShell.git?rev=a18f1bba75e997f83321213311d8c55a5df81781#a18f1bba75e997f83321213311d8c55a5df81781"
+source = "git+https://github.com/wseaton/OpenShell.git?rev=29d68bdab90d19fd996d227876ac8dfcd112ec94#29d68bdab90d19fd996d227876ac8dfcd112ec94"
 dependencies = [
  "aws-lc-rs",
  "jsonwebtoken 10.4.0",
@@ -7174,7 +7174,7 @@ dependencies = [
 [[package]]
 name = "openshell-extension-core"
 version = "0.0.0"
-source = "git+https://github.com/wseaton/OpenShell.git?rev=a18f1bba75e997f83321213311d8c55a5df81781#a18f1bba75e997f83321213311d8c55a5df81781"
+source = "git+https://github.com/wseaton/OpenShell.git?rev=29d68bdab90d19fd996d227876ac8dfcd112ec94#29d68bdab90d19fd996d227876ac8dfcd112ec94"
 dependencies = [
  "hyper-util",
  "serde",
@@ -7187,7 +7187,7 @@ dependencies = [
 [[package]]
 name = "openshell-policy"
 version = "0.0.0"
-source = "git+https://github.com/wseaton/OpenShell.git?rev=a18f1bba75e997f83321213311d8c55a5df81781#a18f1bba75e997f83321213311d8c55a5df81781"
+source = "git+https://github.com/wseaton/OpenShell.git?rev=29d68bdab90d19fd996d227876ac8dfcd112ec94#29d68bdab90d19fd996d227876ac8dfcd112ec94"
 dependencies = [
  "hickory-proto",
  "miette",
@@ -7201,7 +7201,7 @@ dependencies = [
 [[package]]
 name = "openshell-policy-schema"
 version = "0.0.0"
-source = "git+https://github.com/wseaton/OpenShell.git?rev=a18f1bba75e997f83321213311d8c55a5df81781#a18f1bba75e997f83321213311d8c55a5df81781"
+source = "git+https://github.com/wseaton/OpenShell.git?rev=29d68bdab90d19fd996d227876ac8dfcd112ec94#29d68bdab90d19fd996d227876ac8dfcd112ec94"
 dependencies = [
  "miette",
  "noyalib",
@@ -7323,7 +7323,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -7975,7 +7975,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "petgraph 0.8.3",
@@ -7996,7 +7996,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -8816,15 +8816,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustls-pemfile"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
-dependencies = [
- "rustls-pki-types",
-]
-
-[[package]]
 name = "rustls-pki-types"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9153,7 +9144,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d43fb82d550b07e6f929a58d7d0935182602f48ddead875f5ee313c41c8f07fe"
 dependencies = [
  "annotate-snippets 0.12.17",
- "base64 0.23.1",
+ "base64 0.21.7",
  "encoding_rs_io",
  "granit-parser",
  "nohash-hasher",
@@ -10268,7 +10259,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -11609,7 +11600,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
