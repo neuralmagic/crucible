@@ -57,7 +57,7 @@ COPY . .
 # The engine's feature set. The default is what docker.yml builds, so the packaged output
 # matches CI's; an external-cluster build passes
 # `--build-arg ENGINE_FEATURES="--no-default-features --features crucible/hard-tools-only"` for the
-# hard-tools-only engine, which refuses every task that asks a model (ADR-0078). The other crates
+# hard-tools-only engine, which refuses every task that asks a model (ADR-0079). The other crates
 # ship no features, so --no-default-features touches the engine alone.
 ARG ENGINE_FEATURES=--features crucible/autoresearch
 RUN cargo build --release --locked -p crucible -p crucible-broker -p forge -p buildit -p crucible-git --bins \

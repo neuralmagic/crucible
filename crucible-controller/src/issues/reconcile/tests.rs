@@ -7881,12 +7881,8 @@ async fn a_restart_adopts_the_local_runs_it_orphaned(pool: PgPool) -> Result<()>
             .execute(db.pool())
             .await?;
         if key == published {
-            let state = cfg
-                .scratch_root()
-                .join("local-runs")
-                .join(crucible_controller::model::sanitize_key(&run_id))
-                .join("pack")
-                .join("state");
+            let state =
+                crucible_controller::runs::task_evidence::state_dir(cfg.scratch_root(), &run_id);
             std::fs::create_dir_all(&state)?;
             std::fs::write(state.join("session.jsonl"), playbook_log("finished"))?;
         }

@@ -209,7 +209,7 @@ fn operator_history_limit() -> Option<String> {
 }
 
 /// What the hard-tools-only build refuses, as check findings, so `check` never passes a pack
-/// the run would refuse (ADR-0078):
+/// the run would refuse (ADR-0079):
 ///
 /// - A task that asks a model: an agent turn, a model-decided route, or the scored loop's
 ///   propose turn. Plan admission refuses these before any dispatch.

@@ -495,7 +495,7 @@ pub(crate) fn prep_plan_runner_with_params(
     m.resolve_workflow_with(&manifest_dir, params)?;
     warn_inherited_env(crate::exposure::inherits_engine_env(&m));
     // The hard-tools-only build mints no task tokens, so a pack naming `[workflow].servers`
-    // would run its tasks without the servers they reach; refuse it before any work (ADR-0078).
+    // would run its tasks without the servers they reach; refuse it before any work (ADR-0079).
     #[cfg(not(feature = "agents"))]
     if let Some(workflow) = m.workflow.as_ref()
         && !workflow.servers.is_empty()
@@ -577,7 +577,7 @@ pub(crate) fn prep_plan_runner_with_params(
     args.manifest = Some(manifest_path.to_path_buf());
     args.compute_driver = compute_driver;
     // The hard-tools-only build applies no `[agent]` configuration: no harness pinning, no skills
-    // toolbox, no agent env/secret relay, no MCP servers (ADR-0078). Its runs carry no agent
+    // toolbox, no agent env/secret relay, no MCP servers (ADR-0079). Its runs carry no agent
     // credentials to relay.
     #[cfg(feature = "agents")]
     {

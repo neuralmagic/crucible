@@ -825,7 +825,7 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
         budget_left,
         lane,
     } = job;
-    // Plan admission refuses model-asking tasks first (ADR-0078); the runner refuses again so
+    // Plan admission refuses model-asking tasks first (ADR-0079); the runner refuses again so
     // no other caller of this build can reach a model surface.
     #[cfg(not(feature = "agents"))]
     if let Some(ask) = task.task.model_ask() {

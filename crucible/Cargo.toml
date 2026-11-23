@@ -21,7 +21,7 @@ publish = ["dep:aws-config", "dep:aws-sdk-s3"]
 # The agent harnesses, agent turns, and model-decided routes. The external-cluster build omits
 # it: that engine refuses every task that asks a model, reads no inference document, relays no
 # agent credentials, and authenticates to nothing — the hard-tools-only build for clusters we
-# do not manage (ADR-0078).
+# do not manage (ADR-0079).
 agents = []
 # Names that build: `cargo build -p crucible --no-default-features --features hard-tools-only`.
 # Carries nothing itself; with defaults off it leaves the engine without the S3 surface and

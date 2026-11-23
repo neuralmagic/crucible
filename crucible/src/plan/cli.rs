@@ -847,7 +847,7 @@ pub fn run(
             (None, None) => unreachable!("clap requires --file without --manifest"),
         };
     // The hard-tools-only build refuses a plan that asks a model before any dispatch or spend;
-    // the runner refuses again as a backstop (ADR-0078).
+    // the runner refuses again as a backstop (ADR-0079).
     #[cfg(not(feature = "agents"))]
     if let Some((task, ask)) = crucible::plan::ir::model_asks(plan.tasks_topo()).first() {
         return Err(ModelTaskRefused {
@@ -858,7 +858,7 @@ pub fn run(
     }
     // Remote agent servers stay refused (their tokens are credentials this build holds nowhere),
     // but the local socket servers are hard tools: buildit and crucible-git serve the run itself
-    // over a unix socket with no token, so they run (ADR-0078).
+    // over a unix socket with no token, so they run (ADR-0079).
     #[cfg(not(feature = "agents"))]
     {
         let granted = crate::openshell::agent_servers::AgentServers::from_env()
@@ -1152,7 +1152,7 @@ pub fn run(
     }
     // Both builds deliver; the hard-tools-only one carries no token, so an open controller takes
     // its record bare and a guarded one's refusal marks the session for the pod-log scrape
-    // (ADR-0078).
+    // (ADR-0079).
     if let Some(p) = &evidence {
         crate::report::evidence_client::deliver_run_evidence(p);
     }
@@ -1906,7 +1906,7 @@ mod tests {
     }
 
     /// The hard-tools-only build reads no run token: an open controller takes its record bare
-    /// (ADR-0078). The fake controller here stands for one — it answers every PUT with 200 —
+    /// (ADR-0079). The fake controller here stands for one — it answers every PUT with 200 —
     /// and the test asserts the record arrived with no Authorization header at all.
     #[cfg(not(feature = "agents"))]
     #[test]
@@ -1957,7 +1957,7 @@ mod tests {
 
     /// A guarded controller refuses the tokenless upload; the run marks its session undelivered
     /// so the pod wrapper prints it to the pod log, where the controller's completion edge
-    /// collects it (ADR-0078).
+    /// collects it (ADR-0079).
     #[cfg(not(feature = "agents"))]
     #[test]
     fn a_refused_upload_marks_the_session_for_the_log_scrape() {

@@ -77,7 +77,7 @@ impl Upload {
                 .to_string(),
             target,
             // The hard-tools-only build reads no run token: a controller that runs open accepts
-            // its evidence with none (ADR-0078), and a guarded one's refusal marks the session
+            // its evidence with none (ADR-0079), and a guarded one's refusal marks the session
             // for the pod-log scrape instead.
             #[cfg(feature = "agents")]
             token: non_empty_env(crucible_contract::ENV_POD_TOKEN)?,
@@ -289,7 +289,7 @@ pub enum FetchError {
 /// out like that run's state directory: `session.jsonl`, `files/`, and `git-memory/`. Evidence
 /// the controller does not hold is left absent, for the rerun's own read of the parent to name.
 /// The bearer is the run token when this process holds one, else a person's controller token; the
-/// hard-tools-only build reads neither and asks an open controller bare (ADR-0078).
+/// hard-tools-only build reads neither and asks an open controller bare (ADR-0079).
 pub fn fetch_parent(parent: &url::Url, dest: &Path) -> Result<(), FetchError> {
     #[cfg(feature = "agents")]
     let token =

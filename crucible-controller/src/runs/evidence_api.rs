@@ -9,7 +9,7 @@
 //! a pod token and answers with its [`Grant`], and anything else goes through the human guard
 //! unchanged. Only a pod token uploads, and only its own evidence — except on a controller that
 //! runs open, which already answers every caller as its dev identity and admits their run-record
-//! writes the same way (ADR-0078).
+//! writes the same way (ADR-0079).
 
 use crate::client::Db;
 use crate::identity::auth::{HumanOrKeyGuard, require_auth_or_api_key};
@@ -94,7 +94,7 @@ fn fetchable(kind: ArtifactKind) -> bool {
 /// `PUT /api/evidence/runs/{run_id}/{kind}`: store the gzipped body as the run's `kind`, replacing
 /// any earlier upload. Run token only — except on a controller that runs open, where every caller
 /// is already the dev identity and a run-record write is no more authority than anything else it
-/// admits (ADR-0078).
+/// admits (ADR-0079).
 async fn upload(
     grant: Option<Extension<Grant>>,
     State(state): State<EvidenceState>,
@@ -469,7 +469,7 @@ mod tests {
 
     /// The evidence routes over an open guard: no token, no issuer, a dev identity that answers
     /// every caller. A run-record write is admitted the same as everything else the open
-    /// controller admits (ADR-0078).
+    /// controller admits (ADR-0079).
     fn open_app(pool: &PgPool, scratch: &Path) -> axum::Router {
         let guard = BearerGuard::new(None, None)
             .expect("open guard")

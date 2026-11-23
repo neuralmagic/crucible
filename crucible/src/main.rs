@@ -24,7 +24,7 @@
 //! feature (default) carries the agent turns and model-decided routes; the external-cluster build
 //! omits it (`--no-default-features --features hard-tools-only`) for the hard-tools-only engine, which
 //! refuses every task that asks a model, reads no agent credentials, and authenticates to
-//! nothing (ADR-0078).
+//! nothing (ADR-0079).
 //!
 //! Operator ergonomics:
 //!

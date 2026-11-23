@@ -65,7 +65,7 @@ formal-mutants:
     python3 formal/mutate.py
 
 # Build the external-cluster engine: the hard-tools-only build, which refuses every task that
-# asks a model, reads no agent credentials, and authenticates to nothing (ADR-0078).
+# asks a model, reads no agent credentials, and authenticates to nothing (ADR-0079).
 hard-tools-only:
     cargo build -p crucible --no-default-features --features hard-tools-only --bin crucible
 

@@ -146,7 +146,7 @@ If the controller runs loops in other clusters (spokes):
 
 ### External clusters: the hard-tools-only engine
 
-A cluster we do not manage gets the **hard-tools-only build** (ADR-0078). It runs command,
+A cluster we do not manage gets the **hard-tools-only build** (ADR-0079). It runs command,
 evaluate, and report tasks and routes decided by a dependency's output, and it refuses
 everything that asks a model or holds a credential.
 
