@@ -34,11 +34,12 @@ Constraints:
 - A shared cluster gives no cluster-admin, so nothing may depend on node-level or cluster-wide pull configuration.
 - A quay.io robot account belongs to an organisation and holds read or write per repository. Regenerating its token invalidates the old one at once.
 - quay.io creates a repository as private on its first push.
+- A quay.io plan caps an organisation's private repositories and does not count public ones.
 """
 decision = """
 Every image a Crucible deployment pulls is in one quay.io organisation, `quay.io/crucible-ai`, and a cluster pulls with one read-only robot through one Secret name.
 
-Repositories keep their names: `crucible`, `crucible-controller`, `crucible-buildit`, `crucible-kueue`, `openshell-gateway`, `openshell-supervisor`, `openshell-sandbox`, `loop-base` and the `sandbox-*` feedstock. `crucible`, `crucible-controller`, `crucible-buildit`, `crucible-kueue` and the three OpenShell images are public. The `sandbox-*` feedstock, `loop-base`, a deployment's loop image and its domain images are private repositories in the same organisation. No profile, pack or Containerfile references an image in a personal namespace, and CI refuses one.
+Repositories keep their names: `crucible`, `crucible-controller`, `crucible-buildit`, `crucible-kueue`, `openshell-gateway`, `openshell-supervisor`, `openshell-sandbox`, `loop-base` and the `sandbox-*` feedstock. Every image this repository builds is public, the `sandbox-*` feedstock and `loop-base` included. A deployment's loop image and its domain images are private repositories in the same organisation. No profile, pack or Containerfile references an image in a personal namespace, and CI refuses one.
 
 Each repository's CI logs in to quay.io with its own push robot, held in that repository's Actions secrets and able to write only the repositories it builds, on trusted refs only (main, tags, dispatch). A pull-request build logs in to nothing and pushes nothing. `docker.yml` builds `crucible-kueue`. Buildx layer caches stay on ghcr.io under the workflow's own token, since no cluster reads them. Signatures and SBOMs are attached to the quay.io digests.
 
@@ -67,7 +68,7 @@ Migration, in an order that leaves a running cluster with a Secret covering what
 consequences = """
 A run pulls from one registry with one credential. A missing or wrong Secret is refused at dispatch by name, before a pod exists.
 
-A leaked pull credential reads one organisation's images and is revoked without touching a person's account. A leaked CI credential writes one repository's images.
+Sandbox, supervisor and controller images pull with no credential on a cluster that has none; the robot is needed for the loop image and domain images. A leaked pull credential reads one organisation's images and is revoked without touching a person's account. A leaked CI credential writes one repository's images.
 
 The controller's identity on a cluster gains create and update on `secrets` in the namespaces the profile names, to keep `crucible-pull` there. [[ADR-0048]]'s grant already writes Secrets in the loop namespace ([[ADR-0036]]); this extends it to the sandbox, crucible-kueue and workload namespaces.
 
@@ -163,6 +164,20 @@ cons = [
     "OpenShift only",
 ]
 rejection_reason = "It cannot be the scheme on a cluster Crucible does not administer."
+
+[[content.alternatives]]
+text = "One `sandbox` repository with a tag per feedstock image, in place of a repository per image"
+status = "considered"
+pros = [
+    "One repository to create and grant, and a new feedstock image needs no registry setup",
+    "The image catalog reads one repository's tags and needs no listing of an organisation's repositories",
+]
+cons = [
+    "The catalog takes a repository as an image and its tags as channels, so it has to take the image from the tag",
+    "Build, per-architecture, signature and SBOM tags of every image share one tag list",
+    "A digest pin no longer names its image unless the tag is written beside it",
+    "The feedstock workflow's tag scheme and the pins move again",
+]
 
 [[content.alternatives]]
 text = "One read robot per cluster"

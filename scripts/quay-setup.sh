@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Set up the quay.io organisation Crucible's images live in (ADR-0080):
-#   1. the repositories this repo's CI pushes, each public or private;
+#   1. the repositories this repo's CI pushes, public unless listed as private;
 #   2. a read team that every repository grants read to, now and when created;
 #   3. the read robot's membership of that team, and a CI robot with write on those repositories;
 #   4. the CI robot's credentials as this repo's Actions secrets;
@@ -19,14 +19,14 @@
 #   QUAY_READ_TEAM      team that reads every repository          [pull]
 #   QUAY_PULL_ROBOT     short name of the existing read robot
 #   QUAY_CI_ROBOT       short name of this repo's CI push robot   [crucible_ci]
-#   QUAY_PUBLIC_REPOS   space-separated public repositories
-#   QUAY_PRIVATE_REPOS  space-separated private repositories      [cargo xtask images list]
+#   QUAY_PUBLIC_REPOS   space-separated public repositories       [core images, cargo xtask images list]
+#   QUAY_PRIVATE_REPOS  space-separated private repositories; a name here is taken off the public list
 #   GH_REPO             repository the Actions secrets go to      [gh repo view]
 #   KUBECTL             kubectl or oc                             [kubectl, else oc]
 set -euo pipefail
 
 API=https://quay.io/api/v1
-DEFAULT_PUBLIC="crucible crucible-controller crucible-buildit crucible-kueue openshell-gateway openshell-supervisor openshell-sandbox"
+CORE_REPOS="crucible crucible-controller crucible-buildit crucible-kueue openshell-gateway openshell-supervisor openshell-sandbox"
 PULL_SECRET=crucible-pull
 
 DRY_RUN=0
@@ -80,6 +80,7 @@ call() {
     api "$@"
     case "$API_STATUS" in
     2*) ;;
+    402) die "$what: the organisation's plan has no private repositories left (HTTP 402)" ;;
     *) die "$what: HTTP $API_STATUS $(api_message)" ;;
     esac
 }
@@ -354,12 +355,18 @@ main() {
     QUAY_ORG=${QUAY_ORG:-$(ask "Quay organisation" crucible-ai)}
     QUAY_READ_TEAM=${QUAY_READ_TEAM:-$(ask "Read team" pull)}
     QUAY_CI_ROBOT=${QUAY_CI_ROBOT:-$(ask "CI push robot (short name)" crucible_ci)}
-    QUAY_PUBLIC_REPOS=${QUAY_PUBLIC_REPOS:-$DEFAULT_PUBLIC}
-    if [ -z "${QUAY_PRIVATE_REPOS:-}" ]; then
+    QUAY_PRIVATE_REPOS=${QUAY_PRIVATE_REPOS:-}
+    if [ -z "${QUAY_PUBLIC_REPOS:-}" ]; then
         need cargo
         say "listing the sandbox feedstock (cargo xtask images list)"
-        QUAY_PRIVATE_REPOS=$(cd "$(dirname "$0")/.." && cargo xtask images list | tr '\n' ' ')
+        QUAY_PUBLIC_REPOS="$CORE_REPOS $(cd "$(dirname "$0")/.." && cargo xtask images list | tr '\n' ' ')"
     fi
+    local repo public=
+    for repo in $QUAY_PUBLIC_REPOS; do
+        # shellcheck disable=SC2086
+        contains "$repo" $QUAY_PRIVATE_REPOS || public="$public $repo"
+    done
+    QUAY_PUBLIC_REPOS=$public
     if [ -z "${GH_REPO:-}" ] && [ "$DRY_RUN" -eq 0 ]; then
         GH_REPO=$(ask "GitHub repository for the Actions secrets" \
             "$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)")
