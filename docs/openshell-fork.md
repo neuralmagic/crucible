@@ -118,13 +118,19 @@ Changes that would remove the fork:
   `CreateSshSession` relay of the gateway), because no RPC supports it. This is one of the two
   remaining CLI uses that `crucible/src/openshell/mod.rs` names. With a native upload and
   download RPC, Crucible could remove the CLI from the turn path.
-- **mTLS user auth with the kubernetes driver.** The gateway rejects mTLS user authentication
-  with the kubernetes compute driver, so Crucible renders `allow_unauthenticated_users = true`
-  for gateways with the k8s driver (`crucible/src/openshell/gateway.rs`). The trust model while
-  this setting exists: transport mTLS with a CA for each pod still checks every connection
-  (`require_client_auth`). The client certificate is only in the Crucible turn pod and the
-  supervisor pod, never in the agent container, so possession of the certificate is the
-  authorization. **Acceptance criterion for the upstream change: Crucible removes the
+- **mTLS user auth with the kubernetes driver.** Crucible renders
+  `allow_unauthenticated_users = true` for gateways with the k8s driver
+  (`crucible/src/openshell/gateway.rs`). Upstream stopped rejecting mTLS user authentication
+  under that driver in v0.1.3 (#3110), so the setting is no longer forced by the gateway. What
+  still holds it in place is authorization: the gateway takes a client certificate's roles
+  from its subject OUs, and a caller without the admin role needs a membership in the
+  workspace. `generate-certs` issues its client certificate with the user role only, and the
+  certificate the controller mints for a run has no OU. The unauthenticated user that the
+  setting grants has both roles. The trust model while this setting exists: transport mTLS
+  with a CA for each pod still checks every connection (`require_client_auth`). The client
+  certificate is only in the Crucible turn pod and the supervisor pod, never in the agent
+  container, so possession of the certificate is the authorization. **Acceptance criterion:
+  Crucible's client certificate carries the roles its RPCs need, and Crucible removes the
   `allow_unauthenticated_users` setting.**
 
 ## Maintenance rule
