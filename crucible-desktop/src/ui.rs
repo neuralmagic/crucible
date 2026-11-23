@@ -16,6 +16,7 @@ mod dock;
 mod files;
 mod finder;
 mod graph;
+mod graph_find;
 mod issues;
 mod keys;
 mod launch;

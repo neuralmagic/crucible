@@ -203,6 +203,8 @@ The Graph draws a fan-out that has run as a frame holding its instances; the che
 frame's corner folds them away. The wheel or a drag on empty space moves the graph, and a pinch
 or `Cmd` with the wheel zooms it. Its controls zoom, reset the view, fold every fan-out and switch
 between the compact and roomy drawing; `Compact graph` in Settings picks which one a run starts in.
+The magnifier opens a find field: what it holds is marked in every label, Enter moves the graph
+to the next match, and Escape puts the field away.
 
 ## The Pack pane
 

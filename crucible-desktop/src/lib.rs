@@ -414,6 +414,12 @@ pub struct RunView {
     pub camera: camera::Camera,
     /// Whether the graph is drawn compact; `None` takes the setting.
     pub compact_graph: Option<bool>,
+    /// Whether the Graph pane shows its find field.
+    pub graph_finding: bool,
+    /// What the Graph pane's find field holds.
+    pub graph_find: rune::TextEdit,
+    /// The match the graph last moved to; `None` until Enter after the query changes.
+    pub graph_found: Option<usize>,
     /// The launch picked to compare against; `None` takes the one before.
     pub compare_to: Option<String>,
     /// The saves the History pane compares, once picked by hand; `None` opens on the save the
