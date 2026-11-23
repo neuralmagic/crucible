@@ -1084,7 +1084,9 @@ The phases are these:
 - `reserve` creates the gateway Service and mints the TLS material for its ClusterIP
   (`crucible-controller/src/runs/workpod/gateway.rs:184`).
 - `start` creates the loop Service, the NetworkPolicy and the gateway pod (`gateway.rs:256`).
-  It then creates the two TLS Secrets with an owner reference to the gateway pod.
+  It then creates the two TLS Secrets with an owner reference to the gateway pod. Before it
+  creates the gateway pod, it checks that each image pull Secret the pod names is in the sandbox
+  namespace, and refuses the dispatch with `PullSecretsMissing` when one is not.
 - `teardown` deletes objects in this order (`gateway.rs:337`):
   1. the `Sandbox` resources and supervisor pods with the gateway id label;
   2. the loop Service in the loop namespace;
@@ -2265,7 +2267,9 @@ in place.
 2. On each cluster that hosts runs, install SPIRE with the OIDC discovery provider. Add a
    ClusterSPIFFEID for supervisor pods in the sandbox namespace, with `jwtTtl: 5m` and the
    template in section 6.1.
-3. In the deploy profile, set `sandbox_namespace` and `sandbox_readers`.
+3. In the deploy profile, set `sandbox_namespace` and `sandbox_readers`. Copy the loop image's
+   pull Secret (`[image] pull_secret`) into the sandbox namespace: each run's gateway pod pulls
+   the loop image there.
 4. Render the loop RBAC with `crucible deploy render --manifest <render.toml> --profile <profile>`.
    Apply the ServiceAccount, Roles and bindings on each cluster. They include
    `crucible-spire-reader`, which lets `sandbox_readers` discover the cluster's SPIRE (section 6.9).
@@ -2473,6 +2477,7 @@ COMMIT;
 | --- | --- | --- |
 | The gateway pod exits at once; its log names an unknown subcommand or an absent `openshell-gateway` | The loop image predates this feature and lacks `crucible openshell-gateway` | Build the loop image from the same commit as the controller |
 | `agent token refused` with `reason` about the assertion lifetime | SPIRE issues 1-hour JWT-SVIDs | Set `jwtTtl: 5m` on the supervisors' ClusterSPIFFEID |
+| Dispatch fails with `PullSecretsMissing` | The sandbox namespace has no Secret named `[image] pull_secret`, so the gateway pod could not pull the loop image | Copy the Secret from the loop namespace into the sandbox namespace, and again after each rotation |
 | Dispatch fails with `PushOnlyCluster` | The hub has a push token and no client for the cluster | Put a kubeconfig for the cluster in `CONTROLLER_CLUSTERS_DIR`, or use a profile that is not isolated for it |
 | The Job is admitted but its pods are in `ImagePullBackOff` | The declared pull secret does not exist in the workload namespace | Copy the Secret into the workload namespace with the name in `[kueue] pull_secrets` |
 | The agent turn fails at the first model call | The launch named no `--model`, and the endpoint does not serve the provider's `default_model` | Launch with `--provider <name> --model <model>`, or fix the provider's default model |

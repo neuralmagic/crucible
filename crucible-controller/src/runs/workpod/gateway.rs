@@ -49,6 +49,17 @@ pub enum DispatchError {
          hub reaches directly"
     )]
     PushOnlyCluster { cluster: String },
+    #[error(
+        "the run's gateway pod pulls the loop image in namespace {namespace} on cluster \
+         {cluster}, which has no image pull Secret named {}; create it there with the \
+         credential the loop namespace's Secret of that name holds",
+        secrets.iter().map(String::as_str).collect::<Vec<_>>().join(", ")
+    )]
+    PullSecretsMissing {
+        cluster: String,
+        namespace: String,
+        secrets: std::collections::BTreeSet<String>,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -253,6 +264,7 @@ impl<'a> RunGateway<'a> {
     /// Start the gateway for the rendered `loop_pod`, ahead of creating it so the gateway boots
     /// while the loop pod schedules: the loop Service sandboxes reach the loop pod through on
     /// `sandbox_ports`, the NetworkPolicy, the gateway pod, then the TLS Secrets owned by it.
+    /// Refused when the sandbox namespace lacks an image pull Secret the gateway pod names.
     pub async fn start(
         &self,
         dispatcher: &dyn PodDispatcher,
@@ -287,12 +299,27 @@ impl<'a> RunGateway<'a> {
             )
             .await
             .context("creating the gateway's NetworkPolicy")?;
+        let gateway_pod = render::gateway_pod(self.profile, &self.names, loop_pod, addresses);
+        let pull_secrets: std::collections::BTreeSet<String> = gateway_pod
+            .spec
+            .iter()
+            .flat_map(|spec| spec.image_pull_secrets.iter().flatten())
+            .map(|secret| secret.name.clone())
+            .collect();
+        let missing = dispatcher
+            .missing_secrets(cluster, &ns, &pull_secrets)
+            .await
+            .context("checking the gateway pod's image pull Secrets")?;
+        if !missing.is_empty() {
+            return Err(DispatchError::PullSecretsMissing {
+                cluster: cluster.to_string(),
+                namespace: ns,
+                secrets: missing,
+            }
+            .into());
+        }
         let gateway_pod = dispatcher
-            .create(
-                cluster,
-                &ns,
-                render::gateway_pod(self.profile, &self.names, loop_pod, addresses),
-            )
+            .create(cluster, &ns, gateway_pod)
             .await
             .context("creating the gateway pod")?;
         let owner = owner_reference_to_pod(&gateway_pod)
