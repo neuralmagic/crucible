@@ -299,5 +299,6 @@ pub(crate) fn scene_tab(app: &mut App) {
 pub(crate) fn open_link(app: &mut App, url: &str, _tx: &mut Tx) {
     if let Some(link) = Link::parse(url) {
         app.follow(&link);
+        notify::bring_to_front();
     }
 }

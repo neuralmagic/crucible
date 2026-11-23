@@ -1,6 +1,6 @@
 //! The Dock and the menu bar: a badge counting what waits on the person, the budget a pinned
-//! launch has used drawn on the Dock icon, and a menu bar item listing the launches running on the
-//! profile in use.
+//! launch has used drawn on the Dock icon, the launches running on the profile in use in the Dock
+//! icon's menu, and a menu bar item listing them with the other profiles'.
 //!
 //! What they show is worked out from the app's state on every poll and handed to AppKit only when
 //! it changes.
@@ -18,6 +18,16 @@ pub struct Shown {
     pub progress: Option<u16>,
     pub title: String,
     pub lines: Vec<Line>,
+    /// The Dock icon's menu: the launches running on the profile in use.
+    pub dock: Vec<Jump>,
+}
+
+/// An entry of the Dock icon's menu.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Jump {
+    pub title: String,
+    /// The `crucible-playbooks://` link picking it opens.
+    pub link: String,
 }
 
 /// A running launch, as the menu lists it.
@@ -161,11 +171,24 @@ pub fn shown(
             .iter()
             .map(crate::fleet::Status::waiting)
             .sum::<usize>();
+    let dock = running
+        .iter()
+        .map(|r| Jump {
+            title: r.line(),
+            link: crate::link::Link::Launch {
+                playbook: r.playbook.clone(),
+                key: r.key.clone(),
+                task: None,
+            }
+            .url(),
+        })
+        .collect();
     Shown {
         badge: (badge > 0).then(|| badge.to_string()),
         progress,
         title,
         lines,
+        dock,
     }
 }
 
@@ -233,6 +256,14 @@ impl App {
         }
         if last.map(|s| (&s.title, &s.lines)) != Some((&now.title, &now.lines)) {
             rune_mac::status::show(&now.title, &now.lines);
+        }
+        if last.map(|s| &s.dock) != Some(&now.dock) {
+            let items = now
+                .dock
+                .iter()
+                .map(|jump| rune::JumpItem::new(&jump.title, &jump.link))
+                .collect();
+            rune::set_jump_list(rune::JumpList::new().category("Running", items));
         }
         self.tray = Some(now);
     }
@@ -430,6 +461,49 @@ mod tests {
             Some(Pick::OpenOn("wdc".into(), "playbook:x:1".into()))
         );
         assert_eq!(pick("waiting@wdc"), Some(Pick::WaitingOn("wdc".into())));
+        assert_eq!(
+            s.dock.iter().map(|j| j.title.as_str()).collect::<Vec<_>>(),
+            [run("a", 0.0, 0.0, 0, None).line()],
+            "the Dock menu lists only the profile in use"
+        );
+    }
+
+    #[test]
+    fn the_dock_menu_opens_each_running_launch_by_its_link() {
+        let running = [
+            Running {
+                key: "playbook:fanout:01a1".into(),
+                playbook: "fanout".into(),
+                cost: 1.2,
+                cap: 5.0,
+                elapsed: 750,
+                max: Some(1800),
+            },
+            Running {
+                key: "playbook:cve triage:01b2".into(),
+                playbook: "cve triage".into(),
+                cost: 0.0,
+                cap: 0.0,
+                elapsed: 0,
+                max: None,
+            },
+        ];
+        let s = shown("mpp", &running, 0, None, &[]);
+        assert_eq!(
+            s.dock.iter().map(|j| j.title.clone()).collect::<Vec<_>>(),
+            running.iter().map(Running::line).collect::<Vec<_>>()
+        );
+        for (jump, launch) in s.dock.iter().zip(&running) {
+            assert_eq!(
+                crate::link::Link::parse(&jump.link),
+                Some(crate::link::Link::Launch {
+                    playbook: launch.playbook.clone(),
+                    key: launch.key.clone(),
+                    task: None,
+                })
+            );
+        }
+        assert!(shown("mpp", &[], 3, None, &[]).dock.is_empty());
     }
 
     #[test]

@@ -353,7 +353,8 @@ draft that has never run opens its launch form instead.
 ## The Dock and the menu bar
 
 The menu bar item lists the launches running on every profile, with spend, elapsed time and budget
-used; picking one opens it, switching profile if it runs on another. Pin a launch under "Budget on
+used; picking one opens it, switching profile if it runs on another. The Dock icon's menu lists
+the launches running on the profile in use. Pin a launch under "Budget on
 Dock" to draw its budget used (the larger of spend over its cost cap and time over its time cap)
 as a bar on the Dock icon; it is announced when it finishes. The Dock badge counts the decisions,
 scope packs and pack imports waiting across profiles, and a growing approval count raises a
