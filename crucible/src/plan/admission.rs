@@ -423,6 +423,15 @@ impl<'j> Admission<'j> {
             *next += 1;
             Some((item, slots.get(i)?, self.admit(item)))
         };
+        // The first width is admitted as one cohort before any lane runs: the ceiling counts
+        // in-flight spend against later admissions, never against the wave that is still
+        // starting, so a lane that reports spend the moment it launches cannot refuse its own
+        // wave-mates. The resume estimate already charges the width as a unit, so admission
+        // and estimation must agree on what a wave is.
+        let cohort: std::collections::VecDeque<_> = (0..self.width.get().min(batch.len()))
+            .filter_map(|_| take())
+            .collect();
+        let cohort = Mutex::new(cohort);
         std::thread::scope(|scope| {
             if self.journal_file.is_some() {
                 // The sender closes when the scope body ends, so the flusher exits with the
@@ -439,7 +448,9 @@ impl<'j> Admission<'j> {
             }
             for _ in 0..self.width.get().min(batch.len()) {
                 scope.spawn(|| {
-                    while let Some((item, slot, admitted)) = take() {
+                    let mut first =
+                        { cohort.lock().unwrap_or_else(PoisonError::into_inner) }.pop_front();
+                    while let Some((item, slot, admitted)) = first.take().or_else(take) {
                         let settled = admitted.map(|admitted| {
                             let attempt = guarded(item, &admitted);
                             self.settle(admitted, &attempt);
