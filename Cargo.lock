@@ -2249,6 +2249,7 @@ dependencies = [
  "kingfisher-rules",
  "kingfisher-scanner",
  "reqwest",
+ "serde",
  "serde_json",
  "tokio",
 ]

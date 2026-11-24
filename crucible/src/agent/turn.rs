@@ -169,22 +169,35 @@ impl StreamPump {
         json: bool,
         sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
     ) {
-        let parsed = crucible_harness::line::parse_line(line);
-        let events = self.decoder.push_parsed(&parsed);
+        let StreamPump {
+            decoder,
+            chain_decoder,
+            cost,
+            chain,
+        } = self;
+        // Compact mode runs two decoders over one line, so the Value parse is shared; solo,
+        // the decoder parses through its own entry, which is a typed fast path where the
+        // harness has one.
+        let (events, chain_events) = match chain_decoder {
+            Some(chain_decoder) => {
+                let parsed = crucible_harness::line::parse_line(line);
+                let events = decoder.push_parsed(&parsed);
+                let chain_events = chain_decoder.push_parsed(&parsed);
+                (events, Some(chain_events))
+            }
+            None => (decoder.push(line), None),
+        };
         for ev in &events {
-            self.cost.observe(ev);
+            cost.observe(ev);
             if json {
                 sink(line, RawStream::Stdout, Some(ev));
             } else if let Some(human) = human_line(ev) {
                 sink(&human, RawStream::Stdout, Some(ev));
             }
         }
-        let chain_events = match &mut self.chain_decoder {
-            Some(decoder) => decoder.push_parsed(&parsed),
-            None => events,
-        };
-        for ev in &chain_events {
-            if let Some(reason) = self.chain.observe(ev) {
+        let chain_events = chain_events.as_deref().unwrap_or(&events);
+        for ev in chain_events {
+            if let Some(reason) = chain.observe(ev) {
                 emit(&stop_event(reason), sink);
             }
         }

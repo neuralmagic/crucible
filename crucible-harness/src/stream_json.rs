@@ -7,7 +7,7 @@
 //! viewer never loses output to schema drift, and so a startup failure claude prints as bare
 //! text reaches the turn's log instead of being dropped.
 
-use crate::line::{LineFormat, raw};
+use crate::line::{LineFormat, parse_line, raw};
 use crate::otel::{CostHandle, LiveMeters, RateHandle};
 use crucible_contract::event::{AgentEvent, Tokens};
 use serde_json::Value;
@@ -92,7 +92,396 @@ impl StreamJsonParser {
     }
 }
 
+/// The borrowed wire model of claude's `stream-json`: one streaming deserialize per line, no
+/// `Value` tree. Protocol constants stay borrowed `&str` — an escaped one fails the line, which
+/// routes it to the `Value` walk, never a wrong decode. Free-form text (deltas, results, error
+/// bodies) is `Cow`, so escapes cost an allocation instead of the fallback.
+mod wire {
+    use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+    use serde::{Deserialize, Deserializer};
+    use std::borrow::Cow;
+    use std::collections::BTreeMap;
+    use std::fmt;
+
+    #[derive(Deserialize)]
+    pub(super) struct Line<'a> {
+        #[serde(rename = "type", default)]
+        pub kind: Option<&'a str>,
+        #[serde(default)]
+        pub subtype: Option<&'a str>,
+        #[serde(default)]
+        pub model: Option<&'a str>,
+        #[serde(default)]
+        pub tools: Vec<IgnoredAny>,
+        #[serde(default)]
+        pub agents: Vec<IgnoredAny>,
+        #[serde(default)]
+        pub attempt: Option<u64>,
+        #[serde(rename = "max_retries", default)]
+        pub max_retries: Option<u64>,
+        #[serde(default)]
+        pub error: RetryError<'a>,
+        #[serde(default)]
+        pub message: Message<'a>,
+        #[serde(default)]
+        pub status: Option<&'a str>,
+        #[serde(default)]
+        pub reason: Option<&'a str>,
+        #[serde(default)]
+        pub is_error: Option<bool>,
+        #[serde(default)]
+        pub result: Option<Cow<'a, str>>,
+        #[serde(rename = "num_turns", default)]
+        pub num_turns: Option<u64>,
+        #[serde(rename = "total_cost_usd", default)]
+        pub total_cost_usd: Option<f64>,
+        #[serde(rename = "modelUsage", default)]
+        pub model_usage: Option<BTreeMap<&'a str, ModelUsage>>,
+        #[serde(default)]
+        pub event: Option<Event<'a>>,
+    }
+
+    /// The `error` field, which `api_retry` writes as a string or an object and other lines
+    /// write as a plain string.
+    #[derive(Default)]
+    pub(super) enum RetryError<'a> {
+        Str(Cow<'a, str>),
+        Obj {
+            message: Option<Cow<'a, str>>,
+            kind: Option<Cow<'a, str>>,
+        },
+        #[default]
+        Absent,
+    }
+
+    impl RetryError<'_> {
+        /// What `retry_error`'s direct arm reads: the string, or the object's message else its
+        /// type; empty for anything else, as `str_field` reads the Value walk.
+        pub fn retry_direct(&self) -> &str {
+            match self {
+                RetryError::Str(s) => s,
+                RetryError::Obj { message, kind } => {
+                    let message = message.as_deref().unwrap_or("");
+                    if message.is_empty() {
+                        kind.as_deref().unwrap_or("")
+                    } else {
+                        message
+                    }
+                }
+                RetryError::Absent => "",
+            }
+        }
+
+        /// What `str_field(msg, "error")` reads: the string spelling only.
+        pub fn as_plain_str(&self) -> &str {
+            match self {
+                RetryError::Str(s) => s,
+                _ => "",
+            }
+        }
+    }
+
+    impl<'de: 'a, 'a> Deserialize<'de> for RetryError<'a> {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            struct V<'a>(std::marker::PhantomData<&'a ()>);
+            impl<'de: 'a, 'a> Visitor<'de> for V<'a> {
+                type Value = RetryError<'a>;
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    f.write_str("a string, an object, or nothing")
+                }
+                fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E> {
+                    Ok(RetryError::Str(Cow::Borrowed(v)))
+                }
+                fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+                    Ok(RetryError::Str(Cow::Owned(v.to_string())))
+                }
+                fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+                where
+                    A: MapAccess<'de>,
+                {
+                    let mut message = None;
+                    let mut kind = None;
+                    while let Some(key) = map.next_key::<&'de str>()? {
+                        match key {
+                            "message" => message = map.next_value()?,
+                            "type" => kind = map.next_value()?,
+                            _ => {
+                                map.next_value::<IgnoredAny>()?;
+                            }
+                        }
+                    }
+                    Ok(RetryError::Obj { message, kind })
+                }
+                fn visit_none<E>(self) -> Result<Self::Value, E> {
+                    Ok(RetryError::Absent)
+                }
+                fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                    Ok(RetryError::Absent)
+                }
+            }
+            deserializer.deserialize_any(V(std::marker::PhantomData))
+        }
+    }
+
+    /// The `message` field: a user line's message object (only its content array is read), or
+    /// an `api_retry` fallback string.
+    #[derive(Default)]
+    pub(super) enum Message<'a> {
+        User {
+            content: Vec<ToolResultBlock<'a>>,
+        },
+        Str(Cow<'a, str>),
+        #[default]
+        Absent,
+    }
+
+    impl Message<'_> {
+        /// What the `api_retry` fallback loop reads: the string spelling only.
+        pub fn as_str(&self) -> &str {
+            match self {
+                Message::Str(s) => s,
+                _ => "",
+            }
+        }
+
+        /// The user message's content blocks; `None` for every other shape, as the Value walk's
+        /// `as_array` gate reads it.
+        pub fn user_content(&self) -> Option<&[ToolResultBlock<'_>]> {
+            match self {
+                Message::User { content } => Some(content),
+                _ => None,
+            }
+        }
+    }
+
+    impl<'de: 'a, 'a> Deserialize<'de> for Message<'a> {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            struct V<'a>(std::marker::PhantomData<&'a ()>);
+            impl<'de: 'a, 'a> Visitor<'de> for V<'a> {
+                type Value = Message<'a>;
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    f.write_str("a message object, a string, or nothing")
+                }
+                fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E> {
+                    Ok(Message::Str(Cow::Borrowed(v)))
+                }
+                fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+                    Ok(Message::Str(Cow::Owned(v.to_string())))
+                }
+                fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+                where
+                    A: MapAccess<'de>,
+                {
+                    let mut content = Vec::new();
+                    while let Some(key) = map.next_key::<&'de str>()? {
+                        if key == "content" {
+                            content = map.next_value()?;
+                        } else {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                    Ok(Message::User { content })
+                }
+                fn visit_none<E>(self) -> Result<Self::Value, E> {
+                    Ok(Message::Absent)
+                }
+                fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                    Ok(Message::Absent)
+                }
+            }
+            deserializer.deserialize_any(V(std::marker::PhantomData))
+        }
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct Event<'a> {
+        #[serde(rename = "type", default)]
+        pub kind: Option<&'a str>,
+        #[serde(default)]
+        pub content_block: Option<ContentBlock<'a>>,
+        #[serde(default)]
+        pub delta: Option<Delta<'a>>,
+        #[serde(default)]
+        pub message: Option<StartMessage>,
+        #[serde(default)]
+        pub usage: Option<Usage>,
+        #[serde(default)]
+        pub error: Option<StreamError<'a>>,
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct ContentBlock<'a> {
+        #[serde(rename = "type", default)]
+        pub kind: Option<&'a str>,
+        #[serde(default)]
+        pub name: Option<&'a str>,
+        #[serde(default)]
+        pub id: Option<&'a str>,
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct Delta<'a> {
+        #[serde(rename = "type", default)]
+        pub kind: Option<&'a str>,
+        #[serde(default)]
+        pub text: Option<Cow<'a, str>>,
+        #[serde(default)]
+        pub thinking: Option<Cow<'a, str>>,
+        #[serde(default)]
+        pub partial_json: Option<Cow<'a, str>>,
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct StartMessage {
+        #[serde(default)]
+        pub usage: Option<Usage>,
+    }
+
+    #[derive(Deserialize, Default)]
+    pub(super) struct Usage {
+        #[serde(rename = "input_tokens", default)]
+        pub input_tokens: Option<u64>,
+        #[serde(rename = "cache_read_input_tokens", default)]
+        pub cache_read: Option<u64>,
+        #[serde(rename = "cache_creation_input_tokens", default)]
+        pub cache_write: Option<u64>,
+        #[serde(rename = "output_tokens", default)]
+        pub output_tokens: Option<u64>,
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct StreamError<'a> {
+        #[serde(rename = "type", default)]
+        pub kind: Option<Cow<'a, str>>,
+        #[serde(default)]
+        pub message: Option<Cow<'a, str>>,
+    }
+
+    /// A `modelUsage` entry, camelCased unlike the streamed usage samples.
+    #[derive(Deserialize)]
+    pub(super) struct ModelUsage {
+        #[serde(rename = "inputTokens", default)]
+        pub input: Option<u64>,
+        #[serde(rename = "outputTokens", default)]
+        pub output: Option<u64>,
+        #[serde(rename = "cacheReadInputTokens", default)]
+        pub cache_read: Option<u64>,
+        #[serde(rename = "cacheCreationInputTokens", default)]
+        pub cache_write: Option<u64>,
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct ToolResultBlock<'a> {
+        #[serde(rename = "type", default)]
+        pub kind: Option<&'a str>,
+        #[serde(rename = "tool_use_id", default)]
+        pub tool_use_id: Option<&'a str>,
+        #[serde(rename = "is_error", default)]
+        pub is_error: Option<bool>,
+        #[serde(default)]
+        pub content: ResultContent<'a>,
+    }
+
+    /// A tool result's `content`: a plain string, or an array of text blocks.
+    #[derive(Default)]
+    pub(super) enum ResultContent<'a> {
+        Str(Cow<'a, str>),
+        Blocks(Vec<TextBlock<'a>>),
+        #[default]
+        Absent,
+    }
+
+    impl ResultContent<'_> {
+        /// What `result_text` reads: the string, or the text blocks joined on newlines.
+        pub fn text_joined(&self) -> String {
+            match self {
+                ResultContent::Str(s) => s.to_string(),
+                ResultContent::Blocks(blocks) => blocks
+                    .iter()
+                    .filter(|b| b.kind == Some("text"))
+                    .map(|b| b.text.as_deref().unwrap_or(""))
+                    .collect::<Vec<_>>()
+                    .join(
+                        "
+",
+                    ),
+                ResultContent::Absent => String::new(),
+            }
+        }
+    }
+
+    impl<'de: 'a, 'a> Deserialize<'de> for ResultContent<'a> {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            struct V<'a>(std::marker::PhantomData<&'a ()>);
+            impl<'de: 'a, 'a> Visitor<'de> for V<'a> {
+                type Value = ResultContent<'a>;
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    f.write_str("a string, an array of blocks, or nothing")
+                }
+                fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E> {
+                    Ok(ResultContent::Str(Cow::Borrowed(v)))
+                }
+                fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+                    Ok(ResultContent::Str(Cow::Owned(v.to_string())))
+                }
+                fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+                where
+                    A: SeqAccess<'de>,
+                {
+                    let mut blocks = Vec::new();
+                    while let Some(block) = seq.next_element()? {
+                        blocks.push(block);
+                    }
+                    Ok(ResultContent::Blocks(blocks))
+                }
+                fn visit_none<E>(self) -> Result<Self::Value, E> {
+                    Ok(ResultContent::Absent)
+                }
+                fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                    Ok(ResultContent::Absent)
+                }
+            }
+            deserializer.deserialize_any(V(std::marker::PhantomData))
+        }
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct TextBlock<'a> {
+        #[serde(rename = "type", default)]
+        pub kind: Option<&'a str>,
+        #[serde(default)]
+        pub text: Option<Cow<'a, str>>,
+    }
+}
+
 impl LineFormat for StreamJsonParser {
+    /// The typed fast path: parse straight into the borrowed [`wire`] model, one pass with no
+    /// per-line `Value` tree. Any line the model cannot mirror event-for-event — schema drift,
+    /// wrong-typed fields, the retry fallback that re-renders the whole line — takes the
+    /// [`Value`] walk below, so behavior is the fallback's, never a divergence.
+    fn push(&mut self, line: &str) -> Vec<AgentEvent> {
+        let text = line.trim();
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        if let Ok(parsed) = serde_json::from_str::<wire::Line<'_>>(text)
+            && self.typed_line(parsed, text, &mut out)
+        {
+            return out;
+        }
+        self.push_parsed(&parse_line(line))
+    }
+
     fn line(&mut self, msg: &Value, text: &str, out: &mut Vec<AgentEvent>) {
         match msg.get("type").and_then(Value::as_str) {
             Some("system") => self.system(msg, out),
@@ -134,6 +523,234 @@ impl LineFormat for StreamJsonParser {
 }
 
 impl StreamJsonParser {
+    /// The typed mirror of [`LineFormat::line`]. `false` means "this line needs the Value
+    /// walk" — the one case being `api_retry`'s whole-line fallback, which re-renders the
+    /// parsed object as text and only the Value walk holds it.
+    fn typed_line(&mut self, line: wire::Line<'_>, text: &str, out: &mut Vec<AgentEvent>) -> bool {
+        match line.kind {
+            Some("system") => self.typed_system(line, out),
+            Some("result") => {
+                self.end_block(out);
+                let is_error = line.is_error.unwrap_or(false);
+                let error = is_error
+                    .then(|| {
+                        let declared = line.result.as_deref().unwrap_or("");
+                        if declared.is_empty() {
+                            line.error.as_plain_str()
+                        } else {
+                            declared
+                        }
+                    })
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                let cost_usd = line.total_cost_usd.unwrap_or(0.0);
+                self.stream_cost = self.stream_cost.max(cost_usd);
+                out.extend(self.typed_turn_tokens(&line.model_usage, cost_usd));
+                out.push(AgentEvent::Result {
+                    subtype: line.subtype.unwrap_or("").to_string(),
+                    is_error,
+                    turns: line.num_turns.unwrap_or(0) as u32,
+                    cost_usd,
+                    error,
+                });
+                true
+            }
+            Some("stream_event") => {
+                if let Some(event) = line.event {
+                    self.typed_stream_event(event, out);
+                }
+                true
+            }
+            Some("user") => {
+                self.typed_tool_results(line.message, out);
+                true
+            }
+            Some("assistant") | Some("rate_limit_event") => true,
+            _ => {
+                out.push(raw(text));
+                true
+            }
+        }
+    }
+
+    fn typed_system(&mut self, line: wire::Line<'_>, out: &mut Vec<AgentEvent>) -> bool {
+        match line.subtype {
+            Some("init") => out.push(AgentEvent::Init {
+                model: line.model.unwrap_or("").to_string(),
+                tools: line.tools.len() as u32,
+                agents: line.agents.len() as u32,
+            }),
+            Some("api_retry") => {
+                let direct = line.error.retry_direct();
+                let mut error = None;
+                if !direct.is_empty() && direct != "unknown" {
+                    error = Some(truncate_chars(direct, TOOL_ERROR_LIMIT));
+                } else {
+                    for candidate in [Some(line.message.as_str()), line.status, line.reason] {
+                        if let Some(found) = candidate.filter(|s| !s.is_empty()) {
+                            error = Some(truncate_chars(found, TOOL_ERROR_LIMIT));
+                            break;
+                        }
+                    }
+                }
+                let Some(error) = error else {
+                    return false;
+                };
+                out.push(AgentEvent::Retry {
+                    attempt: line.attempt.unwrap_or(0) as u32,
+                    max: line.max_retries.unwrap_or(0) as u32,
+                    error,
+                });
+            }
+            _ => {}
+        }
+        true
+    }
+
+    fn typed_stream_event(&mut self, event: wire::Event<'_>, out: &mut Vec<AgentEvent>) {
+        match event.kind {
+            Some("content_block_start") => match event.content_block {
+                Some(wire::ContentBlock {
+                    kind: Some("text"), ..
+                }) => self.block = Some(TextKind::Text),
+                Some(wire::ContentBlock {
+                    kind: Some("thinking"),
+                    ..
+                }) => self.block = Some(TextKind::Thinking),
+                Some(wire::ContentBlock {
+                    kind: Some("tool_use" | "server_tool_use"),
+                    name,
+                    id,
+                }) => {
+                    self.tool_name = Some(name.unwrap_or("").to_string());
+                    self.tool_json.clear();
+                    let id = id.unwrap_or("");
+                    self.tool_id = (!id.is_empty()).then(|| id.to_string());
+                }
+                _ => {}
+            },
+            Some("content_block_delta") => {
+                if let Some(delta) = event.delta {
+                    match delta.kind {
+                        Some("text_delta") => {
+                            self.buffer(TextKind::Text, delta.text.as_deref().unwrap_or(""), out)
+                        }
+                        Some("thinking_delta") => self.buffer(
+                            TextKind::Thinking,
+                            delta.thinking.as_deref().unwrap_or(""),
+                            out,
+                        ),
+                        Some("input_json_delta") => self
+                            .tool_json
+                            .push_str(delta.partial_json.as_deref().unwrap_or("")),
+                        _ => {}
+                    }
+                }
+            }
+            Some("content_block_stop") => self.end_block(out),
+            Some("message_start") => match event.message.and_then(|m| m.usage) {
+                Some(usage) => {
+                    self.input = usage.input_tokens.unwrap_or(0);
+                    self.cache_read = usage.cache_read.unwrap_or(0);
+                    self.cache_write = usage.cache_write.unwrap_or(0);
+                }
+                None => {
+                    self.input = 0;
+                    self.cache_read = 0;
+                    self.cache_write = 0;
+                }
+            },
+            Some("message_delta") => {
+                if let Some(usage) = event.usage {
+                    if let Some(input) = usage.input_tokens {
+                        self.input = input;
+                    }
+                    if let Some(read) = usage.cache_read {
+                        self.cache_read = read;
+                    }
+                    if let Some(write) = usage.cache_write {
+                        self.cache_write = write;
+                    }
+                    let out_tokens = usage.output_tokens.unwrap_or(0);
+                    if out_tokens > 0 {
+                        self.output = out_tokens;
+                        self.maybe_emit_tokens(out);
+                    }
+                }
+            }
+            Some("error") => {
+                let (error_type, message) = match event.error {
+                    Some(e) => (
+                        e.kind.as_deref().unwrap_or("").to_string(),
+                        e.message.as_deref().unwrap_or("").to_string(),
+                    ),
+                    None => (String::new(), String::new()),
+                };
+                out.push(AgentEvent::Error {
+                    error_type,
+                    message,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn typed_tool_results(&mut self, message: wire::Message<'_>, out: &mut Vec<AgentEvent>) {
+        let Some(blocks) = message.user_content() else {
+            return;
+        };
+        for block in blocks {
+            if block.kind != Some("tool_result") {
+                continue;
+            }
+            let id = block.tool_use_id.unwrap_or("");
+            let name = self
+                .tool_names
+                .remove(id)
+                .unwrap_or_else(|| "tool".to_string());
+            let failed = block.is_error.unwrap_or(false);
+            let text = block.content.text_joined();
+            if self.tool_io {
+                out.push(AgentEvent::Tool {
+                    name,
+                    summary: if failed { "failed" } else { "result" }.to_string(),
+                    subagent: false,
+                    input: None,
+                    result: Some(truncate_chars(&text, TOOL_IO_LIMIT)),
+                    failed,
+                });
+            } else if failed {
+                let reason = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                out.push(AgentEvent::Tool {
+                    name,
+                    summary: format!("failed: {}", truncate_chars(&reason, TOOL_ERROR_LIMIT)),
+                    subagent: false,
+                    input: None,
+                    result: None,
+                    failed: true,
+                });
+            }
+        }
+    }
+
+    fn typed_turn_tokens(
+        &self,
+        models: &Option<std::collections::BTreeMap<&str, wire::ModelUsage>>,
+        cost_usd: f64,
+    ) -> Option<AgentEvent> {
+        let models = models.as_ref()?;
+        let mut tokens = Tokens::default();
+        for usage in models.values() {
+            tokens.input += usage.input.unwrap_or(0);
+            tokens.output += usage.output.unwrap_or(0);
+            tokens.cache_read += usage.cache_read.unwrap_or(0);
+            tokens.cache_write += usage.cache_write.unwrap_or(0);
+        }
+        tokens.total = tokens.input + tokens.output + tokens.cache_read + tokens.cache_write;
+        tokens.cost_usd = (cost_usd > 0.0).then_some(cost_usd);
+        Some(AgentEvent::Tokens(tokens))
+    }
+
     /// `system/init` -> [`AgentEvent::Init`]; `system/api_retry` -> [`AgentEvent::Retry`].
     fn system(&mut self, msg: &Value, out: &mut Vec<AgentEvent>) {
         match msg.get("subtype").and_then(Value::as_str) {
@@ -575,6 +1192,54 @@ mod tests {
 
     /// The outage shape: claude prints a bare-text failure to stdout and exits non-zero. The
     /// line must reach the caller, not vanish for failing to parse as JSON.
+    /// The typed fast path must emit exactly what the Value walk emits, over the golden
+    /// captures plus shapes that force the fallback (wrong-typed fields, unknown types, junk)
+    /// and shapes that must not (escaped text, nulls, empty arrays).
+    #[test]
+    fn the_typed_path_emits_what_the_value_walk_emits() {
+        let mut lines: Vec<&str> = include_str!("testdata/claude_stream_hello.jsonl")
+            .lines()
+            .chain(include_str!("testdata/claude_stream_tools.jsonl").lines())
+            .collect();
+        lines.extend([
+            r#"{"type":"some_future_kind","detail":"x"}"#,
+            "Error: connection refused (os error 111)",
+            r#"{"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,"error":"overloaded_error"}"#,
+            r#"{"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,"error":"unknown","message":"upstream connect error"}"#,
+            r#"{"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,"error":"unknown"}"#,
+            r#"{"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,"error":{"type":"overloaded_error","message":"busy"}}"#,
+            r#"{"type":"result","subtype":"success","num_turns":"x","total_cost_usd":0.1}"#,
+            r#"{"type":"system","subtype":"init","model":"m","tools":"not-an-array"}"#,
+            r#"{"type":"stream_event","event":{"type":"error","error":null}}"#,
+            r#"{"type":"stream_event","event":{"type":"message_delta","usage":{"output_tokens":4}}}"#,
+            r#"{"type":"user","message":{"content":[]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"a"},{"type":"other"}]},{"junk":"element"}]}}"#,
+            r#"{"type":"user","message":"just a string"}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_1","name":"Bash"}}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"done"}]}}"#,
+            "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"quoted \\\"text\\\" here\\n\"}}}",
+        ]);
+        let mut typed = StreamJsonParser::default();
+        let mut value = StreamJsonParser::default();
+        let mut parsed_typed = 0usize;
+        for line in &lines {
+            if serde_json::from_str::<wire::Line<'_>>(line.trim()).is_ok() {
+                parsed_typed += 1;
+            }
+        }
+        let events_typed: Vec<_> = lines.iter().flat_map(|l| typed.push(l)).collect();
+        let events_value: Vec<_> = lines
+            .iter()
+            .flat_map(|l| value.push_parsed(&parse_line(l)))
+            .collect();
+        assert_eq!(events_typed, events_value, "the fast path diverged");
+        assert!(
+            parsed_typed * 10 >= lines.len() * 9,
+            "the fast path must carry the corpus: {parsed_typed}/{}",
+            lines.len()
+        );
+    }
+
     #[test]
     fn non_json_stdout_passes_through_as_raw() {
         let evs = run(&["Error: connection refused (os error 111)"]);

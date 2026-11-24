@@ -6,6 +6,7 @@ license.workspace = true
 edition.workspace = true
 
 [dependencies]
+serde.workspace = true
 serde_json.workspace = true
 jiff.workspace = true
 # axum 0.8 is the workspace's shared HTTP server, so no new heavy dep enters the tree.
