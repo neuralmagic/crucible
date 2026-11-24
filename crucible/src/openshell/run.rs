@@ -1422,7 +1422,9 @@ async fn exec_and_stream(
             }
         })
         .await?;
-    let crate::agent::turn::PumpEnd { cost, stopped } = pump.finish(sink);
+    // The openshell turn's wrapper is gone only on the fast-mode branch; here it still
+    // scrubs everything, so the pump's own redactor stays unset.
+    let crate::agent::turn::PumpEnd { cost, stopped } = pump.finish(None, sink);
     let (exit_code, transport_error) = (exec.exit_code, exec.transport_error);
     // Bank it here, not at the caller's `?`: the agent can bill real tokens and still exit
     // non-zero below, and a turn that spent money is never reported free.
