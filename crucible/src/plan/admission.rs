@@ -103,10 +103,10 @@ const JOURNAL_FLUSH_BYTES: usize = 8 * 1024;
 const JOURNAL_FLUSH_EVERY: Duration = Duration::from_millis(100);
 
 impl JournalBuf {
-    fn append(&mut self, file: &File, event: &SessionEvent, sync: bool) -> std::io::Result<()> {
-        let mut line = crucible_contract::session::encode(event);
-        line.push('\n');
-        self.buf.extend_from_slice(line.as_bytes());
+    /// Take one encoded, newline-terminated line. The caller encodes outside the journal lock
+    /// so concurrent lanes contend only over the buffer, not the serialization.
+    fn append_line(&mut self, file: &File, line: &[u8], sync: bool) -> std::io::Result<()> {
+        self.buf.extend_from_slice(line);
         let due = self.buf.len() >= JOURNAL_FLUSH_BYTES
             || self
                 .flushed
@@ -291,11 +291,13 @@ impl<'j> Admission<'j> {
         let Some(file) = self.journal_file else {
             return Ok(());
         };
+        let mut line = crucible_contract::session::encode(event);
+        line.push('\n');
         let mut journal = self
             .journal_buf
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        journal.append(file, event, sync)
+        journal.append_line(file, line.as_bytes(), sync)
     }
 
     fn tally(&self) -> MutexGuard<'_, Tally> {

@@ -266,20 +266,24 @@ impl TurnCost {
         }
     }
 
-    pub(crate) fn observe(&mut self, ev: &AgentEvent) {
-        if let Some(c) = cost_of(ev) {
-            self.report(c);
-        }
+    /// Fold `ev` into the totals; `true` when the settled figure can have moved (a cost or
+    /// token sample arrived), so a per-event reporter can skip the unchanged ones.
+    pub(crate) fn observe(&mut self, ev: &AgentEvent) -> bool {
+        let mut changed = cost_of(ev).is_some_and(|c| self.report(c));
         if let AgentEvent::Tokens(t) = ev
             && self.tokens.as_ref().is_none_or(|b| t.total >= b.total)
         {
             self.tokens = Some(t.clone());
+            changed = true;
         }
+        changed
     }
 
-    /// A cost the harness reported outside its event stream.
-    pub(crate) fn report(&mut self, usd: f64) {
+    /// A cost the harness reported outside its event stream. Returns whether the figure rose.
+    pub(crate) fn report(&mut self, usd: f64) -> bool {
+        let rose = usd > self.reported;
         self.reported = self.reported.max(usd);
+        rose
     }
 
     pub(crate) fn total(&self) -> f64 {
