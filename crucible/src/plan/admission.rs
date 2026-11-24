@@ -8,7 +8,7 @@ use std::io::Write;
 use std::num::NonZeroUsize;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crucible_contract::event::AgentEvent;
 use crucible_contract::session::SessionEvent;
@@ -27,17 +27,25 @@ pub struct TaskClock(Mutex<HashMap<String, Vec<Run>>>);
 /// One attempt's start, and its end once it settled.
 type Run = (Instant, Option<Instant>);
 
+/// A task name's node half: everything before the first `[` of its instance key.
+fn node_name(name: &str) -> &str {
+    name.split('[').next().unwrap_or(name)
+}
+
 impl TaskClock {
     fn started(&self, task: &TaskName) -> usize {
         let mut spans = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        let runs = spans.entry(task.0.clone()).or_default();
+        let runs = spans.entry(node_name(&task.0).to_owned()).or_default();
         runs.push((Instant::now(), None));
         runs.len() - 1
     }
 
     fn finished(&self, task: &TaskName, run: usize) {
         let mut spans = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some((_, end @ None)) = spans.get_mut(&task.0).and_then(|runs| runs.get_mut(run)) {
+        if let Some((_, end @ None)) = spans
+            .get_mut(node_name(&task.0))
+            .and_then(|runs| runs.get_mut(run))
+        {
             *end = Some(Instant::now());
         }
     }
@@ -49,16 +57,14 @@ impl TaskClock {
 
     /// Seconds `task`, or any of its instances, had an attempt running; `None` when none started.
     pub fn ran(&self, task: &TaskName) -> Option<f64> {
-        let instance = format!("{}[", task.0);
         let now = Instant::now();
-        let mut runs: Vec<(Instant, Instant)> = self
-            .0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        let spans = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut runs: Vec<(Instant, Instant)> = spans
+            .get(node_name(&task.0))?
             .iter()
-            .filter(|(name, _)| **name == task.0 || name.starts_with(&instance))
-            .flat_map(|(_, runs)| runs.iter().map(|(start, end)| (*start, end.unwrap_or(now))))
+            .map(|(start, end)| (*start, end.unwrap_or(now)))
             .collect();
+        drop(spans);
         runs.sort();
         let mut runs = runs.into_iter();
         let (mut from, mut to) = runs.next()?;
@@ -82,15 +88,44 @@ pub fn stamp() -> String {
 /// Lanes of one dispatch in flight at once, unless the executor is configured otherwise.
 pub const DEFAULT_WIDTH: NonZeroUsize = NonZeroUsize::MIN.saturating_add(7);
 
-/// Append one event to the session log as a single write, synced to disk when `sync` asks.
-fn journal(mut journal: &File, event: &SessionEvent, sync: bool) -> std::io::Result<()> {
-    let mut line = crucible_contract::session::encode(event);
-    line.push('\n');
-    journal.write_all(line.as_bytes())?;
-    if sync {
-        journal.sync_data()?;
+/// A dispatch's session-log buffer; the `File` it flushes to stays in [`Admission`], keeping
+/// the borrow covariant. A `sync` append flushes and `sync_data`s first: a resumed run charges
+/// a lane from its journaled start (RFC-0002:C-PLAYBOOK-RESUME).
+#[derive(Default)]
+struct JournalBuf {
+    buf: Vec<u8>,
+    flushed: Option<Instant>,
+}
+
+/// Buffered bytes that force a flush ahead of the cadence.
+const JOURNAL_FLUSH_BYTES: usize = 8 * 1024;
+/// Longest a journaled line waits in the buffer; the control bridge tailer polls no less often.
+const JOURNAL_FLUSH_EVERY: Duration = Duration::from_millis(100);
+
+impl JournalBuf {
+    /// Take one encoded, newline-terminated line. The caller encodes outside the journal lock
+    /// so concurrent lanes contend only over the buffer, not the serialization.
+    fn append_line(&mut self, file: &File, line: &[u8], sync: bool) -> std::io::Result<()> {
+        self.buf.extend_from_slice(line);
+        let due = self.buf.len() >= JOURNAL_FLUSH_BYTES
+            || self
+                .flushed
+                .is_none_or(|at| at.elapsed() >= JOURNAL_FLUSH_EVERY);
+        if sync || due {
+            self.flush(file)?;
+            if sync {
+                file.sync_data()?;
+            }
+        }
+        Ok(())
     }
-    Ok(())
+
+    fn flush(&mut self, mut file: &File) -> std::io::Result<()> {
+        file.write_all(&self.buf)?;
+        self.buf.clear();
+        self.flushed = Some(Instant::now());
+        Ok(())
+    }
 }
 
 fn panicked() -> Attempt {
@@ -136,9 +171,10 @@ pub struct Admission<'j> {
     run_ceiling: Option<RunCeiling>,
     width: NonZeroUsize,
     tally: Mutex<Tally>,
-    journal: Option<&'j File>,
-    /// Lanes on several threads append to the one journal; this keeps their lines whole.
-    journal_lock: Mutex<()>,
+    /// Lanes on several threads append to the one journal; the shared buffer keeps their lines
+    /// whole.
+    journal_file: Option<&'j File>,
+    journal_buf: Mutex<JournalBuf>,
     clock: Option<&'j TaskClock>,
 }
 
@@ -232,15 +268,18 @@ impl<'j> Admission<'j> {
                 settled: spent,
                 ..Tally::default()
             }),
-            journal: None,
-            journal_lock: Mutex::new(()),
+            journal_file: None,
+            journal_buf: Mutex::default(),
             clock: None,
         }
     }
 
     /// Record every admitted lane in `journal` before it runs.
     pub fn journaled(self, journal: Option<&'j File>) -> Self {
-        Admission { journal, ..self }
+        Admission {
+            journal_file: journal,
+            ..self
+        }
     }
 
     /// Note on `clock` when each task first starts.
@@ -249,14 +288,16 @@ impl<'j> Admission<'j> {
     }
 
     fn append(&self, event: &SessionEvent, sync: bool) -> std::io::Result<()> {
-        let Some(file) = self.journal else {
+        let Some(file) = self.journal_file else {
             return Ok(());
         };
-        let _whole = self
-            .journal_lock
+        let mut line = crucible_contract::session::encode(event);
+        line.push('\n');
+        let mut journal = self
+            .journal_buf
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        journal(file, event, sync)
+        journal.append_line(file, line.as_bytes(), sync)
     }
 
     fn tally(&self) -> MutexGuard<'_, Tally> {
@@ -302,11 +343,48 @@ impl<'j> Admission<'j> {
         })
     }
 
-    /// Count what an admitted lane cost and retire its running figure.
+    /// Count what an admitted lane cost and retire its running figure. The lane's transcript
+    /// flushes with it: a settled lane is what a resume replays.
     fn settle(&self, lane: Lane<'_>, attempt: &Attempt) {
         let mut tally = self.tally();
         tally.live.remove(&lane.id);
         tally.settled += attempt.cost_usd;
+        drop(tally);
+        self.flush_journal();
+    }
+
+    fn flush_journal(&self) {
+        if let Some(file) = self.journal_file {
+            let mut journal = self
+                .journal_buf
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let _ = journal.flush(file);
+        }
+    }
+
+    /// Run `lane` with a flusher ticking the journal every [`JOURNAL_FLUSH_EVERY`], so a quiet
+    /// stretch (an agent mid-tool-call) still reaches the file within the cadence instead of
+    /// waiting for the next event or the lane's settle. The channel closes when the lane ends;
+    /// the flusher exits without lag.
+    fn with_journal_flusher<T>(&self, lane: impl FnOnce() -> T) -> T {
+        if self.journal_file.is_none() {
+            return lane();
+        }
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let flusher = scope.spawn(move || {
+                while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                    stopped.recv_timeout(JOURNAL_FLUSH_EVERY)
+                {
+                    self.flush_journal();
+                }
+            });
+            let out = lane();
+            drop(stop);
+            let _ = flusher.join();
+            out
+        })
     }
 
     /// Run `item` if the ceilings admit it, and count what it cost.
@@ -316,7 +394,7 @@ impl<'j> Admission<'j> {
         lane: impl FnOnce(&Lane<'_>) -> Attempt,
     ) -> Result<Attempt, Refusal> {
         let admitted = self.admit(item)?;
-        let attempt = lane(&admitted);
+        let attempt = self.with_journal_flusher(|| lane(&admitted));
         self.settle(admitted, &attempt);
         Ok(attempt)
     }
@@ -346,6 +424,19 @@ impl<'j> Admission<'j> {
             Some((item, slots.get(i)?, self.admit(item)))
         };
         std::thread::scope(|scope| {
+            if self.journal_file.is_some() {
+                // The sender closes when the scope body ends, so the flusher exits with the
+                // dispatch; between closes it keeps a quiet journal within the cadence of the
+                // file instead of waiting for the next event or a settle.
+                let (_stop, stopped) = std::sync::mpsc::channel::<()>();
+                scope.spawn(move || {
+                    while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                        stopped.recv_timeout(JOURNAL_FLUSH_EVERY)
+                    {
+                        self.flush_journal();
+                    }
+                });
+            }
             for _ in 0..self.width.get().min(batch.len()) {
                 scope.spawn(|| {
                     while let Some((item, slot, admitted)) = take() {

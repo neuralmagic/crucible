@@ -820,6 +820,7 @@ pub fn run(
     // does not reach it.
     let _ = ctrlc::set_handler(|| {
         crucible::deadline::terminate_live_children();
+        crate::process::flush_all_before_exit();
         std::process::exit(130);
     });
     // Manifest runs append plan wire events to the run's session log so tailers (and the

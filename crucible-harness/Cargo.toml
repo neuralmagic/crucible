@@ -16,6 +16,8 @@ tokio = { version = "1", features = ["rt", "net", "time", "io-util", "sync", "ma
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 crucible-contract = { path = "../crucible-contract" }
 kingfisher-scanner = { version = "3.0.2", default-features = false }
+# RuleCacheConfig only; the same pin kingfisher-scanner uses, so no new tree entry.
+kingfisher-rules = "3.1"
 
 [[bench]]
 name = "stream_json"
