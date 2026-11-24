@@ -1123,10 +1123,12 @@ fn stream_turn(
 }
 
 /// Fold `ev` into the turn's running cost and report the lane's spend as the turn would settle
-/// it now, on top of what its earlier turns `banked`.
+/// it now, on top of what its earlier turns `banked`. Only a cost- or token-bearing event can
+/// move the figure, so the shared tally is touched only on those.
 fn report_spend(lane: &Lane<'_>, banked: f64, live: &mut TurnCost, ev: &AgentEvent) {
-    live.observe(ev);
-    lane.spent_so_far(banked + live.total());
+    if live.observe(ev) {
+        lane.spent_so_far(banked + live.total());
+    }
 }
 
 #[cfg(feature = "autoresearch")]
