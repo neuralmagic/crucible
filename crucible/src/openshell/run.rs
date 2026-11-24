@@ -1416,7 +1416,7 @@ async fn exec_and_stream(
     let stop = opts.cancel.child_token();
     let exec = gw
         .exec(name, command, &stop, |line| {
-            pump.push(line, opts.json, sink);
+            pump.push(line, opts.json, None, sink);
             if pump.stopped().is_some() {
                 stop.cancel();
             }

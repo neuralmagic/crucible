@@ -139,6 +139,8 @@ pub(crate) struct StreamPump {
     chain_decoder: Option<Box<dyn LineFormat + Send>>,
     cost: TurnCost,
     chain: ToolChain,
+    events: Vec<AgentEvent>,
+    chain_events: Vec<AgentEvent>,
 }
 
 impl StreamPump {
@@ -157,6 +159,8 @@ impl StreamPump {
             chain_decoder,
             cost: TurnCost::new(pricing),
             chain,
+            events: Vec::new(),
+            chain_events: Vec::new(),
         }
     }
 
@@ -167,6 +171,7 @@ impl StreamPump {
         &mut self,
         line: &str,
         json: bool,
+        redactor: Option<&crucible_harness::redact::Redactor>,
         sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
     ) {
         let StreamPump {
@@ -174,28 +179,50 @@ impl StreamPump {
             chain_decoder,
             cost,
             chain,
+            events,
+            chain_events,
         } = self;
         // Compact mode runs two decoders over one line, so the Value parse is shared; solo,
         // the decoder parses through its own entry, which is a typed fast path where the
-        // harness has one.
-        let (events, chain_events) = match chain_decoder {
+        // harness has one. Both decode into reused buffers.
+        match chain_decoder {
             Some(chain_decoder) => {
                 let parsed = crucible_harness::line::parse_line(line);
-                let events = decoder.push_parsed(&parsed);
-                let chain_events = chain_decoder.push_parsed(&parsed);
-                (events, Some(chain_events))
+                decoder.push_parsed_into(&parsed, events);
+                chain_decoder.push_parsed_into(&parsed, chain_events);
             }
-            None => (decoder.push(line), None),
-        };
-        for ev in &events {
+            None => decoder.push_into(line, events),
+        }
+        // With a redactor, the pump scrubs each event once and renders the console line from
+        // the scrubbed event, so the same content is never scanned twice; `json` mode passes
+        // the raw line, whose escaped spellings still need its own scan. Without one, the
+        // caller's wrapper does the scrubbing.
+        for ev in events.iter() {
             cost.observe(ev);
-            if json {
-                sink(line, RawStream::Stdout, Some(ev));
-            } else if let Some(human) = human_line(ev) {
-                sink(&human, RawStream::Stdout, Some(ev));
+            match redactor {
+                Some(redactor) => {
+                    let scrubbed = redactor.event(ev);
+                    let scrubbed = &*scrubbed;
+                    if json {
+                        let line = redactor.text(line);
+                        sink(&line, RawStream::Stdout, Some(scrubbed));
+                    } else if let Some(human) = human_line(scrubbed) {
+                        sink(&human, RawStream::Stdout, Some(scrubbed));
+                    }
+                }
+                None => {
+                    if json {
+                        sink(line, RawStream::Stdout, Some(ev));
+                    } else if let Some(human) = human_line(ev) {
+                        sink(&human, RawStream::Stdout, Some(ev));
+                    }
+                }
             }
         }
-        let chain_events = chain_events.as_deref().unwrap_or(&events);
+        let chain_events = match chain_decoder.as_deref() {
+            Some(_) => chain_events.as_slice(),
+            None => events.as_slice(),
+        };
         for ev in chain_events {
             if let Some(reason) = chain.observe(ev) {
                 emit(&stop_event(reason), sink);
@@ -304,11 +331,14 @@ impl TurnCost {
     }
 }
 
-/// Render observable activity and failed results for the headless console.
-pub(crate) fn human_line(ev: &AgentEvent) -> Option<String> {
+/// Render observable activity and failed results for the headless console. A plain text delta
+/// borrows; every other kind formats.
+pub(crate) fn human_line(ev: &AgentEvent) -> Option<std::borrow::Cow<'_, str>> {
     match ev {
-        AgentEvent::Text { delta } => Some(delta.clone()),
-        AgentEvent::Thinking { delta } => Some(format!("\u{1f9e0} {delta}")),
+        AgentEvent::Text { delta } => Some(std::borrow::Cow::Borrowed(delta.as_str())),
+        AgentEvent::Thinking { delta } => {
+            Some(std::borrow::Cow::Owned(format!("\u{1f9e0} {delta}")))
+        }
         AgentEvent::Tool {
             name,
             summary,
@@ -321,35 +351,43 @@ pub(crate) fn human_line(ev: &AgentEvent) -> Option<String> {
             } else {
                 summary.clone()
             };
-            Some(format!("{icon} {name} {summary}").trim_end().to_string())
+            Some(std::borrow::Cow::Owned(
+                format!("{icon} {name} {summary}").trim_end().to_string(),
+            ))
         }
-        AgentEvent::Tokens(t) => Some(format!(
+        AgentEvent::Tokens(t) => Some(std::borrow::Cow::Owned(format!(
             "\u{1f4ca} TOKENS in={} out={} cache_r={} cache_w={} total={}",
             t.input, t.output, t.cache_read, t.cache_write, t.total
-        )),
+        ))),
         AgentEvent::Retry {
             attempt,
             max,
             error,
-        } => Some(format!("\u{1f504} Retry {attempt}/{max} {error}")),
+        } => Some(std::borrow::Cow::Owned(format!(
+            "\u{1f504} Retry {attempt}/{max} {error}"
+        ))),
         AgentEvent::Error {
             error_type,
             message,
-        } => Some(format!("\u{274c} Error: {error_type}: {message}")),
+        } => Some(std::borrow::Cow::Owned(format!(
+            "\u{274c} Error: {error_type}: {message}"
+        ))),
         AgentEvent::Log {
             label,
             value: Some(value),
             ..
-        } if label.starts_with("tool_") => Some(format!("\u{1f9e9} {label}: {value}")),
+        } if label.starts_with("tool_") => Some(std::borrow::Cow::Owned(format!(
+            "\u{1f9e9} {label}: {value}"
+        ))),
         AgentEvent::Result {
             is_error: true,
             subtype,
             error,
             ..
-        } => Some(format!(
+        } => Some(std::borrow::Cow::Owned(format!(
             "\u{274c} Error: {subtype}: {}",
             error.as_deref().unwrap_or("agent reported a failed turn"),
-        )),
+        ))),
         _ => None,
     }
 }
@@ -397,6 +435,7 @@ mod tests {
             pump.push(
                 line,
                 true,
+                None,
                 &mut |_l: &str, _s: RawStream, ev: Option<&AgentEvent>| events.extend(ev.cloned()),
             );
             read += 1;
@@ -437,7 +476,7 @@ mod tests {
             let mut sink =
                 |_l: &str, _s: RawStream, ev: Option<&AgentEvent>| logged.extend(ev.cloned());
             for line in lines {
-                pump.push(line, true, &mut sink);
+                pump.push(line, true, None, &mut sink);
             }
             (pump.finish(&mut sink), logged)
         };
@@ -541,6 +580,7 @@ mod tests {
             pump.push(
                 line,
                 true,
+                None,
                 &mut |_l: &str, _s: RawStream, ev: Option<&AgentEvent>| {
                     errors += usize::from(matches!(ev, Some(AgentEvent::Error { .. })));
                 },

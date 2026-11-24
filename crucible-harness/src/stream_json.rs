@@ -469,17 +469,23 @@ impl LineFormat for StreamJsonParser {
     /// wrong-typed fields, the retry fallback that re-renders the whole line — takes the
     /// [`Value`] walk below, so behavior is the fallback's, never a divergence.
     fn push(&mut self, line: &str) -> Vec<AgentEvent> {
-        let text = line.trim();
-        if text.is_empty() {
-            return Vec::new();
-        }
         let mut out = Vec::new();
-        if let Ok(parsed) = serde_json::from_str::<wire::Line<'_>>(text)
-            && self.typed_line(parsed, text, &mut out)
-        {
-            return out;
+        self.push_into(line, &mut out);
+        out
+    }
+
+    fn push_into(&mut self, line: &str, out: &mut Vec<AgentEvent>) {
+        let text = line.trim();
+        out.clear();
+        if text.is_empty() {
+            return;
         }
-        self.push_parsed(&parse_line(line))
+        if let Ok(parsed) = serde_json::from_str::<wire::Line<'_>>(text)
+            && self.typed_line(parsed, text, out)
+        {
+            return;
+        }
+        self.push_parsed_into(&parse_line(line), out);
     }
 
     fn line(&mut self, msg: &Value, text: &str, out: &mut Vec<AgentEvent>) {

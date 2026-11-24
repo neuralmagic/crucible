@@ -76,7 +76,9 @@ impl TurnLog {
                 {
                     self.tokens_at = Some(now);
                     self.unprinted_tokens = None;
-                    lines.extend(crate::agent::turn::human_line(ev));
+                    lines.extend(
+                        crate::agent::turn::human_line(ev).map(std::borrow::Cow::into_owned),
+                    );
                 } else {
                     self.unprinted_tokens = Some(ev.clone());
                 }
@@ -89,11 +91,9 @@ impl TurnLog {
                 error,
             } => {
                 lines.extend(self.flush_all(now));
-                lines.extend(
-                    self.unprinted_tokens
-                        .take()
-                        .and_then(|t| crate::agent::turn::human_line(&t)),
-                );
+                lines.extend(self.unprinted_tokens.take().and_then(|t| {
+                    crate::agent::turn::human_line(&t).map(std::borrow::Cow::into_owned)
+                }));
                 let mut line = format!("result {subtype} turns={turns} cost=${cost_usd:.4}");
                 if *is_error {
                     line.push_str(&format!(
@@ -105,7 +105,7 @@ impl TurnLog {
             }
             AgentEvent::Error { .. } => {
                 lines.extend(self.flush_all(now));
-                lines.extend(crate::agent::turn::human_line(ev));
+                lines.extend(crate::agent::turn::human_line(ev).map(std::borrow::Cow::into_owned));
             }
             other => {
                 if let Some(line) = crate::agent::turn::human_line(other) {

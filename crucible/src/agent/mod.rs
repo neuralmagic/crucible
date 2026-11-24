@@ -276,11 +276,9 @@ fn run_turn_with(
     deadline: Option<Deadline>,
     mut sink: impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> TurnOutcome {
+    // The pump scrubs the stream and renders console lines from scrubbed events; every other
+    // site below scrubs what it hands the sink.
     let redactor = crucible_harness::redact::Redactor::with_rules(args.secret_rules.clone());
-    let mut sink = |line: &str, stream: RawStream, ev: Option<&AgentEvent>| {
-        let ev = ev.map(|ev| redactor.event(ev));
-        sink(&redactor.text(line), stream, ev.as_deref());
-    };
     // Start the in-process OTLP collector for a local claude turn when telemetry is opted in
     // . A bind failure degrades to telemetry-off: no collector, no otel_summary, the
     // pricing-table estimate stays the cost fallback. The `otel.jsonl` lands next to the session
@@ -298,10 +296,11 @@ fn run_turn_with(
         ) {
             Ok(c) => Some(c),
             Err(e) => {
-                let ev = AgentEvent::Raw {
+                let raw = AgentEvent::Raw {
                     text: format!("otel collector unavailable (cost falls back to estimate): {e}"),
                     stream: RawStream::Stderr,
                 };
+                let ev = redactor.event(&raw);
                 sink("", RawStream::Stderr, Some(&ev));
                 None
             }
@@ -319,10 +318,11 @@ fn run_turn_with(
         Ok(s) => s,
         Err(e) => {
             let message = format!("failed to launch agent source: {e}");
-            let ev = AgentEvent::Error {
+            let error = AgentEvent::Error {
                 error_type: "spawn".into(),
                 message: message.clone(),
             };
+            let ev = redactor.event(&error);
             sink("", RawStream::Stderr, Some(&ev));
             return TurnOutcome::failed(0.0, TurnFailure::Spawn(message));
         }
@@ -360,7 +360,7 @@ fn run_turn_with(
                 ToolChain::declared(args.tool_plugins.as_deref()),
                 args.pricing(),
             );
-            let end = pump_stream(out, json, pump, &mut sink);
+            let end = pump_stream(out, json, Some(&redactor), pump, &mut sink);
             cost = end.cost;
             stopped = end.stopped;
             if stopped.is_some() {
@@ -373,9 +373,13 @@ fn run_turn_with(
                 if let Some(e) = ev.as_ref() {
                     cost.observe(e);
                 }
-                sink(&line, RawStream::Stdout, ev.as_ref());
+                let scrubbed = ev.as_ref().map(|e| redactor.event(e));
+                let line = redactor.text(&line);
+                sink(&line, RawStream::Stdout, scrubbed.as_deref());
                 if let Some(reason) = ev.as_ref().and_then(|e| chain.observe(e)) {
-                    sink("", RawStream::Stderr, Some(&stop_event(reason)));
+                    let stop = stop_event(reason);
+                    let ev = redactor.event(&stop);
+                    sink("", RawStream::Stderr, Some(&ev));
                     child.kill();
                     break;
                 }
@@ -393,7 +397,9 @@ fn run_turn_with(
             if let Some(e) = ev.as_ref() {
                 cost.observe(e);
             }
-            sink(&line, RawStream::Stderr, ev.as_ref());
+            let ev = ev.as_ref().map(|e| redactor.event(e));
+            let line = redactor.text(&line);
+            sink(&line, RawStream::Stderr, ev.as_deref());
         }
     }
 
@@ -405,7 +411,8 @@ fn run_turn_with(
     {
         for ev in &artifacts.events {
             cost.observe(ev);
-            sink("", RawStream::Stdout, Some(ev));
+            let ev = redactor.event(ev);
+            sink("", RawStream::Stdout, Some(&ev));
         }
         if let Some(c) = artifacts.cost_usd {
             cost.report(c);
@@ -416,8 +423,9 @@ fn run_turn_with(
     // `otel_summary` event (authoritative cost, per-model usage, API latency, active time).
     if let Some(collector) = collector {
         if let Some(summary) = collector.summary() {
-            let ev = summary.to_event();
-            cost.observe(&ev);
+            let summary = summary.to_event();
+            cost.observe(&summary);
+            let ev = redactor.event(&summary);
             sink("", RawStream::Stdout, Some(&ev));
         }
         collector.stop();
@@ -452,11 +460,12 @@ fn line_event(line: &str, stream: RawStream) -> Option<AgentEvent> {
 pub(crate) fn pump_stream(
     reader: impl Read,
     json: bool,
+    redactor: Option<&crucible_harness::redact::Redactor>,
     mut pump: StreamPump,
     sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> PumpEnd {
     for line in BufReader::new(reader).lines().map_while(Result::ok) {
-        pump.push(&line, json, sink);
+        pump.push(&line, json, redactor, sink);
         if pump.stopped().is_some() {
             break;
         }
@@ -798,6 +807,79 @@ mod tests {
             other => panic!("expected a spawn failure, got {other:?}"),
         }
         assert_eq!(errors.len(), 1, "the sink still sees the error event");
+    }
+
+    /// The pump owns the scrubbing for a local turn: with a redactor, both the event and the
+    /// console line it renders must come out masked. Pins the line-rendering path against
+    /// ever passing the raw line through.
+    #[test]
+    fn the_pump_masks_the_events_and_the_lines_it_renders() {
+        use crucible_harness::redact::{Redactor, SecretRules};
+        use crucible_harness::stream_json::StreamJsonParser;
+        let rules = SecretRules::default();
+        assert!(rules.ready(), "builtin rules compiled");
+        let redactor = Redactor::with_rules(rules);
+        let secret = "ghp_R2d9sXbQk7LmP4vT8wYzA1cE6fH3jN0uKoIq";
+        let mut pump = crate::agent::turn::StreamPump::new(
+            Box::new(StreamJsonParser::default()),
+            None,
+            crate::agent::tool_chain::ToolChain::new(&[]),
+            crate::agent::event::Pricing::resolve("claude-opus-4-6", None),
+        );
+        let line = format!(
+            r#"{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"token {secret}\n"}}}}}}"#
+        );
+        let mut seen = Vec::new();
+        pump.push(&line, false, Some(&redactor), &mut |line, _stream, ev| {
+            seen.push((line.to_string(), ev.cloned()));
+        });
+        let rendered = format!("{seen:?}");
+        assert!(
+            !rendered.contains(secret),
+            "the secret leaked through the pump: {rendered}"
+        );
+        assert!(
+            rendered.contains(crucible_harness::redact::MASK),
+            "the mask appears: {rendered}"
+        );
+    }
+
+    /// A command-backend turn echoes a secret-bearing token on stdout and stderr; every line
+    /// and every event the sink sees must be masked. Pins the call sites the pump does not
+    /// cover (command loop, stderr drain) against passing raw lines.
+    #[test]
+    fn a_command_turns_lines_and_events_come_out_masked() {
+        let a = args(&["--agent-backend", "command"]);
+        let mut a = a;
+        a.agent_cmd = Some(
+            r#"echo "token ghp_R2d9sXbQk7LmP4vT8wYzA1cE6fH3jN0uKoIq"; echo "token ghp_R2d9sXbQk7LmP4vT8wYzA1cE6fH3jN0uKoIq" >&2"#
+                .to_string(),
+        );
+        a.secret_rules = crucible_harness::redact::SecretRules::default();
+        let p = workspace("redact-command");
+        let mut seen: Vec<String> = Vec::new();
+        let outcome = run_turn_with(
+            &a.agent_source(),
+            &a,
+            &p,
+            "prompt",
+            false,
+            None,
+            None,
+            |line, _stream, ev| {
+                seen.push(line.to_string());
+                if let Some(ev) = ev {
+                    seen.push(format!("{ev:?}"));
+                }
+            },
+        );
+        let _ = std::fs::remove_dir_all(&p.workspace);
+        assert_eq!(outcome.failure(), None);
+        let secret = "ghp_R2d9sXbQk7LmP4vT8wYzA1cE6fH3jN0uKoIq";
+        assert!(
+            !seen.iter().any(|s| s.contains(secret)),
+            "the secret leaked: {seen:?}"
+        );
     }
 
     #[test]
