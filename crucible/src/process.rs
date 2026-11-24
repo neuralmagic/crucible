@@ -14,7 +14,10 @@ static FLUSH: OnceLock<Mutex<Vec<FlushHook>>> = OnceLock::new();
 /// One registered exit-time flush.
 type FlushHook = Box<dyn Fn() + Send>;
 
-/// Register `f` to run before an exit-signal leaves the process.
+/// Register `f` to run before an exit-signal leaves the process. Only the stream reporter
+/// (autoresearch) registers, so the registrar is gated with it; the flush-all side stays
+/// ungated for the plan runner's ctrl-c handler.
+#[cfg(feature = "autoresearch")]
 pub(crate) fn flush_before_exit(f: FlushHook) {
     FLUSH
         .get_or_init(|| Mutex::new(Vec::new()))
