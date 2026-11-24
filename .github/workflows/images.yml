@@ -2,11 +2,10 @@
 # (image, arch) matrix via `cargo xtask images plan`; build runs per-arch on native runners
 # (amd64 on the beefy self-hosted pool, arm64 on GitHub's hosted arm runners) with docker
 # buildx and a per-image-per-arch registry cache on GHCR (type=gha 400s from the AWS
-# runners — see docker.yml). On main pushes/nightly, manifest stitches the arch images into
+# runners — see docker.yml). Images push to quay.io/crucible-ai; only the cache is on GHCR.
+# On main pushes/nightly, manifest stitches the arch images into
 # one multi-arch tag via imagetools, and every pushed digest gets a keyless cosign signature
-# plus an SPDX SBOM attached as an OCI referrer and signed the same way. manifest then copies
-# the stitched image to quay.io/crucible-ai under the same tags, digest unchanged, and signs it
-# there; the SBOMs stay on GHCR. The nightly builds
+# plus an SPDX SBOM attached as an OCI referrer and signed the same way. The nightly builds
 # with no layer cache so it proves the feedstock still builds from scratch. PRs build
 # affected non-heavy images only and push nothing; the build-heavy label opts a PR into the
 # heavy columns too. report keeps one tracking issue open while main/nightly is red.
@@ -92,7 +91,8 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.plan.outputs.matrix).build }}
     env:
-      REF: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+      REF: quay.io/crucible-ai/${{ matrix.image }}
+      CACHE: ghcr.io/${{ github.repository }}-images-cache:${{ matrix.image }}-${{ matrix.arch }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -106,6 +106,13 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Log in to Quay
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_CRUCIBLE_AI_PUSH_USER }}
+          password: ${{ secrets.QUAY_CRUCIBLE_AI_PUSH_TOKEN }}
       # registry.access.redhat.com answers the base image's manifest HEAD with a transient error
       # under a burst of parallel pulls, and buildkit does not retry source resolution, so one
       # retry after a short pause is what separates a flake from a real failure.
@@ -120,8 +127,8 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           no-cache: ${{ github.event_name == 'schedule' }}
           tags: ${{ env.REF }}:${{ github.sha }}-${{ matrix.arch }}
-          cache-from: type=registry,ref=${{ env.REF }}:buildcache-${{ matrix.arch }}
-          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}:buildcache-{1},mode=max', env.REF, matrix.arch) || '' }}
+          cache-from: type=registry,ref=${{ env.CACHE }}
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0},mode=max', env.CACHE) || '' }}
       - name: pause before the retry
         if: steps.build.outcome == 'failure'
         run: sleep 45
@@ -136,8 +143,8 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           no-cache: ${{ github.event_name == 'schedule' }}
           tags: ${{ env.REF }}:${{ github.sha }}-${{ matrix.arch }}
-          cache-from: type=registry,ref=${{ env.REF }}:buildcache-${{ matrix.arch }}
-          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}:buildcache-{1},mode=max', env.REF, matrix.arch) || '' }}
+          cache-from: type=registry,ref=${{ env.CACHE }}
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0},mode=max', env.CACHE) || '' }}
       # A pull-request build is not pushed and exports no digest, so the verdict is the
       # attempts' outcomes, not the digest.
       - name: the built digest
@@ -198,23 +205,15 @@ jobs:
     if: ${{ !cancelled() && github.event_name != 'pull_request' && fromJSON(needs.plan.outputs.matrix).count > 0 }}
     runs-on: ubuntu-24.04
     permissions:
-      packages: write
       id-token: write
     strategy:
       fail-fast: false
       matrix:
         include: ${{ fromJSON(needs.plan.outputs.matrix).manifest }}
     env:
-      REF: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
-      QUAY_REF: quay.io/crucible-ai/${{ matrix.image }}
+      REF: quay.io/crucible-ai/${{ matrix.image }}
     steps:
       - uses: sigstore/cosign-installer@v3
-      - name: Log in to GHCR
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Log in to Quay
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
@@ -247,26 +246,11 @@ jobs:
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "stitched=$sources" >> "$GITHUB_OUTPUT"
           retry cosign sign --yes "$REF@$digest"
-      - name: copy the manifest to Quay and sign it there
-        env:
-          DIGEST: ${{ steps.stitch.outputs.digest }}
-        run: |
-          retry() {
-            for i in 1 2 3 4; do "$@" && return 0; echo "attempt $i failed; retrying in $((i * 30))s"; sleep $((i * 30)); done
-            "$@"
-          }
-          retry docker buildx imagetools create -t "$QUAY_REF:${{ github.sha }}" -t "$QUAY_REF:latest" "$REF@$DIGEST"
-          copied=$(docker buildx imagetools inspect "$QUAY_REF:${{ github.sha }}" --format '{{.Manifest.Digest}}')
-          if [ "$copied" != "$DIGEST" ]; then
-            echo "::error::$QUAY_REF:${{ github.sha }} is $copied, $REF is $DIGEST"
-            exit 1
-          fi
-          retry cosign sign --yes --recursive "$QUAY_REF@$DIGEST"
       - name: Manifest summary
         run: |
           {
             echo "**${{ matrix.image }}** multi-arch \`${{ steps.stitch.outputs.digest }}\`"
-            echo "- tags: \`${{ github.sha }}\`, \`latest\`, on GHCR and Quay"
+            echo "- tags: \`${{ github.sha }}\`, \`latest\`"
             echo "- stitched from:${{ steps.stitch.outputs.stitched }}"
           } >> "$GITHUB_STEP_SUMMARY"
 
