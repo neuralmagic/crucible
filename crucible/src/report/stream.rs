@@ -25,13 +25,24 @@ pub struct SessionReporter {
     meta: RunMeta,
 }
 
+/// Buffered bytes that force the session log's file flush ahead of the cadence.
+const FILE_FLUSH_BYTES: usize = 8 * 1024;
+/// Longest a session event waits in the file buffer; the control bridge tailer polls no less
+/// often.
+const FILE_FLUSH_EVERY: Duration = Duration::from_millis(100);
+
 enum Sink {
     /// `--ui jsonl`: NDJSON on stdout only.
     Stdout(std::io::Stdout),
     /// `--ui stream`: the session-log file for external tailers AND stdout so the loop's decisions are visible
     /// in `kubectl logs` (mid-run). Without the stdout copy, the only thing on the pod's stdout/stderr is
     /// the broker's eprintln, so a healthy run looks dead from the outside (`0 decided rows`).
-    Tee { out: std::io::Stdout, file: File },
+    /// The file side is buffered; stdout stays line-buffered by contract (it is the CLI surface).
+    Tee {
+        out: std::io::Stdout,
+        file: std::io::BufWriter<File>,
+        flushed: std::time::Instant,
+    },
 }
 
 impl Sink {
@@ -40,14 +51,24 @@ impl Sink {
         match self {
             Sink::Stdout(out) => {
                 let _ = writeln!(out, "{line}");
-                let _ = out.flush();
             }
-            Sink::Tee { out, file } => {
+            Sink::Tee { out, file, flushed } => {
                 let _ = writeln!(file, "{line}");
-                let _ = file.flush();
+                if file.buffer().len() >= FILE_FLUSH_BYTES || flushed.elapsed() >= FILE_FLUSH_EVERY
+                {
+                    let _ = file.flush();
+                    *flushed = std::time::Instant::now();
+                }
                 let _ = writeln!(out, "{line}");
-                let _ = out.flush();
             }
+        }
+    }
+
+    /// Push the session log's buffered tail to disk; `run` can end in `std::process::exit`,
+    /// which skips the drop flush.
+    fn flush_file(&mut self) {
+        if let Sink::Tee { file, .. } = self {
+            let _ = file.flush();
         }
     }
 }
@@ -91,7 +112,8 @@ impl SessionReporter {
             // Tee: the session-log file, plus stdout so the run is observable in `kubectl logs`.
             sink: Sink::Tee {
                 out: std::io::stdout(),
-                file,
+                file: std::io::BufWriter::new(file),
+                flushed: std::time::Instant::now(),
             },
             control: Some(p.control.clone()),
             meta,
@@ -230,6 +252,7 @@ impl Reporter for SessionReporter {
             best_score: Some(best_score).filter(|s| s.is_finite()),
         });
         self.emit(&SessionEvent::Finished);
+        self.sink.flush_file();
     }
 
     fn shutdown(&mut self, outcome: &str, reason: &str) {
@@ -237,5 +260,6 @@ impl Reporter for SessionReporter {
             outcome: outcome.to_string(),
             reason: reason.to_string(),
         });
+        self.sink.flush_file();
     }
 }
