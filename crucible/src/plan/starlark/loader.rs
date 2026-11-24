@@ -1,4 +1,4 @@
-//! `load()` resolution, confined to the pack directory.
+//! `load()` resolution, confined to the pack directory and the dependencies its lock pins.
 //!
 //! A `FrozenModule` has to exist before the evaluator that loads it starts, so the whole `load()`
 //! tree is resolved, evaluated, and frozen up front, depth-first in source order. Every module in
@@ -14,18 +14,23 @@ use starlark_syntax::codemap::FileSpan;
 use starlark_syntax::syntax::AstModule;
 
 use crate::errors::FileError;
+use crate::plan::deps::Root;
 use crate::plan::starlark as dsl;
 
-/// The pre-resolved module map. Keys are the raw `load()` strings, so two spellings of one file
-/// hold two entries pointing at the same frozen module.
+/// The tree a `load()` was written in, and its raw string.
+type LoadKey = (Root, String);
+
+/// The pre-resolved module map for the files of one tree. Keys hold the raw `load()` strings, so
+/// two spellings of one file hold two entries pointing at the same frozen module.
 pub(crate) struct PackLoader<'a> {
     state: &'a dsl::CompileState,
-    modules: HashMap<String, FrozenModule>,
+    root: Root,
+    modules: HashMap<LoadKey, FrozenModule>,
 }
 
 impl FileLoader for PackLoader<'_> {
     fn load(&self, path: &str) -> starlark::Result<FrozenModule> {
-        match self.modules.get(path) {
+        match self.modules.get(&(self.root.clone(), path.to_owned())) {
             Some(module) => Ok(module.clone()),
             None => Err(self.state.throw(dsl::CompileError::LoadUnresolved {
                 raw: path.to_owned(),
@@ -52,9 +57,10 @@ pub(crate) fn resolve<'a>(
         admitted: 0,
         total_bytes: root_bytes,
     };
-    resolver.resolve_all(root)?;
+    resolver.resolve_all(root, &Root::Pack)?;
     Ok(PackLoader {
         state,
+        root: Root::Pack,
         modules: resolver.modules,
     })
 }
@@ -63,7 +69,7 @@ struct Resolver<'a, 'g> {
     state: &'a dsl::CompileState,
     lane: crate::plan::workflow::WorkflowType,
     globals: &'g Globals,
-    modules: HashMap<String, FrozenModule>,
+    modules: HashMap<LoadKey, FrozenModule>,
     /// Frozen modules by canonical path, so two spellings of one file are evaluated once.
     by_path: HashMap<PathBuf, FrozenModule>,
     /// Canonical paths of the modules currently being evaluated. Its length is the Rust
@@ -77,26 +83,29 @@ struct Resolver<'a, 'g> {
 }
 
 impl Resolver<'_, '_> {
-    fn resolve_all(&mut self, module: &AstModule) -> dsl::Result<()> {
+    fn resolve_all(&mut self, module: &AstModule, from: &Root) -> dsl::Result<()> {
         for load in module.loads() {
-            self.resolve_one(load.module_id, &load.span)?;
+            self.resolve_one(load.module_id, &load.span, from)?;
         }
         Ok(())
     }
 
-    fn resolve_one(&mut self, raw: &str, at: &FileSpan) -> dsl::Result<()> {
-        if self.modules.contains_key(raw) {
+    fn resolve_one(&mut self, raw: &str, at: &FileSpan, from: &Root) -> dsl::Result<()> {
+        let key = (from.clone(), raw.to_owned());
+        if self.modules.contains_key(&key) {
             return Ok(());
         }
         let located = |error: dsl::CompileError| dsl::CompileError::At {
             at: at.clone(),
             inner: Box::new(error),
         };
-        let (_, canonical) = self
+        let dsl::Resolved {
+            root, canonical, ..
+        } = self
             .state
             .context_mut()
-            .resolve_in_pack(raw, dsl::PathKind::Module)
-            .map_err(|rejection| located(rejection.at(dsl::PathKind::Module, raw)))?;
+            .resolve(from, raw, dsl::PathKind::Module)
+            .map_err(located)?;
         if self.active.contains(&canonical) {
             return Err(located(dsl::CompileError::LoadCycle {
                 raw: raw.to_owned(),
@@ -104,7 +113,7 @@ impl Resolver<'_, '_> {
         }
         if let Some(existing) = self.by_path.get(&canonical) {
             let existing = existing.clone();
-            self.modules.insert(raw.to_owned(), existing);
+            self.modules.insert(key, existing);
             return Ok(());
         }
         // Counted here, on the way down, so a chain is bounded exactly as a fan-out is. This
@@ -144,20 +153,21 @@ impl Resolver<'_, '_> {
         let ast = AstModule::parse(&canonical.display().to_string(), source, &dsl::dialect())
             .map_err(|error| located(dsl::parse_error(error)))?;
         self.active.push(canonical.clone());
-        let frozen = self.evaluate(ast);
+        let frozen = self.evaluate(ast, root);
         self.active.pop();
         let frozen = frozen?;
         self.by_path.insert(canonical, frozen.clone());
-        self.modules.insert(raw.to_owned(), frozen);
+        self.modules.insert(key, frozen);
         Ok(())
     }
 
     /// Resolve the module's own loads, evaluate it, and freeze it.
-    fn evaluate(&mut self, ast: AstModule) -> dsl::Result<FrozenModule> {
-        self.resolve_all(&ast)?;
+    fn evaluate(&mut self, ast: AstModule, root: Root) -> dsl::Result<FrozenModule> {
+        self.resolve_all(&ast, &root)?;
         let idents = dsl::idents::scan(&ast, self.lane);
         let loader = PackLoader {
             state: self.state,
+            root,
             modules: self.modules.clone(),
         };
         let state = self.state;

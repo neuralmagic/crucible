@@ -1,0 +1,20 @@
+[package]
+name = "crucible-task"
+description = "Write a crucible command or evaluate task as a typed Rust program: read its inputs, write its files, and print its result line."
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "crucible-task-demo"
+path = "src/bin/demo.rs"
+test = false
+doc = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
