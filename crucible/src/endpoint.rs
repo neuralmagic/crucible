@@ -259,7 +259,7 @@ impl fmt::Display for Endpoint {
 
 #[cfg(test)]
 mod tests {
-    use crate::openshell::endpoint::*;
+    use crate::endpoint::*;
 
     #[test]
     fn every_segment_round_trips_through_display() {

@@ -116,7 +116,7 @@ pub(crate) fn iteration_template(
 
 #[cfg(test)]
 mod tests {
-    use crate::plan::template::*;
+    use crate::plan_run::template::*;
 
     #[test]
     fn pack_tasks_splice_between_the_turn_and_the_gate() {

@@ -1,4 +1,4 @@
-//! The real-harness runner. `Agent` tasks execute through [`crate::agent::run_turn`], the
+//! The real-harness runner. `Agent` tasks execute through [`crate::turn::run_turn`], the
 //! same path the loop uses (local claude, openshell, or the free `command` backend),
 //! with the task's harness/model/effort overriding the manifest's `[agent]` defaults.
 //! `Command` tasks run in the workspace via the shell runner.
@@ -22,8 +22,8 @@ use crate::plan::exec::TaskRunner;
 use crate::plan::files::CapturedFiles;
 use crate::plan::ir::{Isolation, Task, TaskKind, TaskName};
 use crate::plan::runner::ShellRunner;
-use crate::plan::transcript::Transcript;
-use crate::plan::turn_log::{Heartbeat, TurnLog};
+use crate::plan_run::transcript::Transcript;
+use crate::plan_run::turn_log::{Heartbeat, TurnLog};
 use crucible_contract::TransportCause;
 use crucible_contract::emits::DeclaredFile;
 use crucible_contract::session::TaskRepair;
@@ -681,7 +681,7 @@ fn materialize_inputs(
 
 fn prepare_and_run(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
     for (src, dst) in &args.workflow_frozen_injects {
-        if let Err(e) = crate::manifest::apply_inject(src, &paths.workspace.join(dst)) {
+        if let Err(e) = crate::inject::apply(src, &paths.workspace.join(dst)) {
             return Attempt::transport(
                 TransportCause::Workspace,
                 format!(
@@ -805,9 +805,11 @@ pub(crate) fn resolved_agent(
 fn task_tokens(
     servers: &[crucible_contract::agent_servers::ServerName],
     task: &str,
-) -> Result<Option<crate::plan::task_tokens::TaskTokens>, crate::plan::task_tokens::TaskTokenError>
-{
-    use crate::plan::task_tokens::{TaskTokens, TokenEndpoint, wanted};
+) -> Result<
+    Option<crate::plan_run::task_tokens::TaskTokens>,
+    crate::plan_run::task_tokens::TaskTokenError,
+> {
+    use crate::plan_run::task_tokens::{TaskTokens, TokenEndpoint, wanted};
     if servers.is_empty() {
         return Ok(None);
     }
@@ -816,7 +818,7 @@ fn task_tokens(
 }
 
 /// One task against a specific workspace. `Command` tasks go to the shell runner; `Agent`
-/// tasks run through the real [`crate::agent::run_turn`] with the task's knob overrides.
+/// tasks run through the real [`crate::turn::run_turn`] with the task's knob overrides.
 fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
     let Job {
         attempt,
@@ -839,8 +841,9 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
         | TaskKind::Report { .. } => {
             let buildit_socket = match task.task {
                 TaskKind::Command { .. } | TaskKind::Evaluate { .. } => {
-                    match crate::openshell::agent_servers::run_buildit(args.buildit_socket.as_ref())
-                    {
+                    match crate::openshell_turn::agent_servers::run_buildit(
+                        args.buildit_socket.as_ref(),
+                    ) {
                         Ok(socket) => socket,
                         Err(e) => {
                             return Attempt::transport(TransportCause::Other, format!("{e:#}"));
@@ -851,7 +854,7 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
             };
             let github = match task.task {
                 TaskKind::Command { .. } | TaskKind::Evaluate { .. } => {
-                    match crate::openshell::agent_servers::run_git() {
+                    match crate::openshell_turn::agent_servers::run_git() {
                         Ok(github) => github,
                         Err(e) => {
                             return Attempt::transport(TransportCause::Other, format!("{e:#}"));
@@ -907,7 +910,7 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
     {
         return Attempt::failed(0.0, err.to_string());
     }
-    if let Err(e) = crate::cli::workspace::install_toolbox(
+    if let Err(e) = crate::workspace::install_toolbox(
         paths,
         &args.workflow_toolbox_exclude,
         args.harness().spec().skills_dir,
@@ -1067,7 +1070,7 @@ fn stream_turn(
         Heartbeat::spawn(Arc::clone(&log), move |line| eprintln!("[{name}] {line}"))
     };
     let mut live = TurnCost::new(cx.args.pricing());
-    let turn = crate::agent::run_turn_with_session(
+    let turn = crate::turn::run_turn_with_session(
         cx.args,
         paths,
         prompt,
@@ -1367,7 +1370,7 @@ fn task_worktree_name(name: &TaskName) -> String {
 #[cfg(test)]
 mod tests {
     use crate::plan::exec::{ExecCfg, PlanExit, Substrate};
-    use crate::plan::harness::*;
+    use crate::plan_run::harness::*;
     use crucible_contract::session::TaskStatus;
 
     fn relay(dest: &str) -> crate::manifest::RelayFile {
@@ -1917,7 +1920,7 @@ mod tests {
         }
         .validate()
         .unwrap();
-        let mut runner = crate::cli::setup::prep_plan_runner(&dir.join("crucible.toml"))
+        let mut runner = crate::plan_run::setup::prep_plan_runner(&dir.join("crucible.toml"))
             .unwrap()
             .0;
         runner.args.secret_rules = crate::testing::secret_rules();
@@ -1968,14 +1971,14 @@ mod tests {
         .unwrap();
         let manifest = dir.join("crucible.toml");
 
-        let (plain, _) = crate::cli::setup::prep_plan_runner(&manifest).unwrap();
+        let (plain, _) = crate::plan_run::setup::prep_plan_runner(&manifest).unwrap();
         assert_eq!(plain.args.harness(), crate::knobs::Harness::Claude);
         assert_eq!(
             plain.args.model(),
             crate::knobs::Harness::Claude.default_model()
         );
 
-        let (overridden, _) = crate::cli::setup::prep_plan_runner_with_params(
+        let (overridden, _) = crate::plan_run::setup::prep_plan_runner_with_params(
             &manifest,
             None,
             &BTreeMap::new(),
@@ -1985,7 +1988,7 @@ mod tests {
                 model: Some("gpt-5.6-luna".to_string()),
             },
             None,
-            crate::cli::setup::Start::Fresh,
+            crate::plan_run::setup::Start::Fresh,
         )
         .unwrap();
         assert_eq!(overridden.args.harness(), crate::knobs::Harness::Codex);
@@ -2051,14 +2054,14 @@ workflow(type = "playbook", tasks = [plan, review, ship])
                 .collect()
         };
         let turns = |pairs: &[(&str, &str)], flags: crate::args::AgentOverride| {
-            let (runner, m) = crate::cli::setup::prep_plan_runner_with_params(
+            let (runner, m) = crate::plan_run::setup::prep_plan_runner_with_params(
                 &manifest,
                 None,
                 &params(pairs),
                 crate::openshell::gateway::ComputeDriver::Podman,
                 flags,
                 None,
-                crate::cli::setup::Start::Fresh,
+                crate::plan_run::setup::Start::Fresh,
             )
             .unwrap();
             m.workflow
@@ -2108,7 +2111,7 @@ workflow(type = "playbook", tasks = [plan, review, ship])
         assert_eq!(flagged["review"].1, "launched-review");
         assert_eq!(flagged["ship"].1, "authored-ship");
 
-        let twice = crate::cli::setup::prep_plan_runner_with_params(
+        let twice = crate::plan_run::setup::prep_plan_runner_with_params(
             &manifest,
             None,
             &params(&[("*.model", "launched-all")]),
@@ -2118,7 +2121,7 @@ workflow(type = "playbook", tasks = [plan, review, ship])
                 model: Some("flag-model".into()),
             },
             None,
-            crate::cli::setup::Start::Fresh,
+            crate::plan_run::setup::Start::Fresh,
         )
         .map(|_| ())
         .expect_err("one setting, two run-wide sources");
@@ -2154,8 +2157,8 @@ workflow(type = "playbook", tasks = [plan, review, ship])
         .unwrap();
         let manifest = dir.join("crucible.toml");
         let workspace = dir.join("workspace");
-        let prep = |r: &str, start: crate::cli::setup::Start| {
-            crate::cli::setup::prep_plan_runner_with_params(
+        let prep = |r: &str, start: crate::plan_run::setup::Start| {
+            crate::plan_run::setup::prep_plan_runner_with_params(
                 &manifest,
                 None,
                 &BTreeMap::from([("repo.ref".to_string(), r.to_string())]),
@@ -2166,7 +2169,7 @@ workflow(type = "playbook", tasks = [plan, review, ship])
             )
             .map(|_| ())
         };
-        use crate::cli::setup::Start::{Continues, Fresh};
+        use crate::plan_run::setup::Start::{Continues, Fresh};
 
         pack("[\"feature/*\"]");
         prep("refs/heads/feature/x", Fresh).expect("a launched branch");
@@ -2686,7 +2689,7 @@ workflow(type = "playbook", tasks = [prod, cons, serial_stranger, isolated_stran
         .validate()
         .unwrap();
 
-        let mut runner = crate::cli::setup::prep_plan_runner(&dir.join("crucible.toml"))
+        let mut runner = crate::plan_run::setup::prep_plan_runner(&dir.join("crucible.toml"))
             .unwrap()
             .0;
         let out = execute(
@@ -2823,7 +2826,7 @@ workflow(type = "playbook", tasks = [draft, shape, polish, audit_a, audit_b, rou
         );
         assert!(manifest.is_task(), "a playbook carries no judge");
 
-        let plan = crate::plan::template::iteration_template(
+        let plan = crate::plan_run::template::iteration_template(
             Some(workflow),
             &crate::plan::workflow::WorkflowCaps::for_lane(workflow.workflow_type)
                 .with_persistent_sessions(),
@@ -2831,7 +2834,7 @@ workflow(type = "playbook", tasks = [draft, shape, polish, audit_a, audit_b, rou
         .unwrap();
 
         let mut settled: Vec<(String, &'static str)> = Vec::new();
-        let mut runner = crate::cli::setup::prep_plan_runner(&dir.join("crucible.toml"))
+        let mut runner = crate::plan_run::setup::prep_plan_runner(&dir.join("crucible.toml"))
             .unwrap()
             .0;
         let out = execute(
@@ -2965,7 +2968,7 @@ workflow(type = "playbook", tasks = [discover, audit, roundup])
         let mut manifest = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
         manifest.resolve_workflow(&dir).unwrap();
         let workflow = manifest.workflow.as_ref().expect("workflow");
-        let plan = crate::plan::template::iteration_template(
+        let plan = crate::plan_run::template::iteration_template(
             Some(workflow),
             &crate::plan::workflow::WorkflowCaps::for_lane(workflow.workflow_type),
         )
@@ -2974,7 +2977,7 @@ workflow(type = "playbook", tasks = [discover, audit, roundup])
         assert_eq!(plan.plan().tasks.len(), 3);
 
         let mut rows: Vec<(String, &'static str)> = Vec::new();
-        let mut runner = crate::cli::setup::prep_plan_runner(&dir.join("crucible.toml"))
+        let mut runner = crate::plan_run::setup::prep_plan_runner(&dir.join("crucible.toml"))
             .unwrap()
             .0;
         let out = execute(
@@ -3041,14 +3044,14 @@ workflow(type = "playbook", tasks = [discover, audit, roundup])
         .unwrap();
         let mut narrow = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
         narrow.resolve_workflow(&dir).unwrap();
-        let plan = crate::plan::template::iteration_template(
+        let plan = crate::plan_run::template::iteration_template(
             Some(narrow.workflow.as_ref().unwrap()),
             &crate::plan::workflow::WorkflowCaps::for_lane(
                 crate::plan::workflow::WorkflowType::Playbook,
             ),
         )
         .unwrap();
-        let mut runner = crate::cli::setup::prep_plan_runner(&dir.join("crucible.toml"))
+        let mut runner = crate::plan_run::setup::prep_plan_runner(&dir.join("crucible.toml"))
             .unwrap()
             .0;
         let out = execute(
@@ -3153,14 +3156,14 @@ workflow(type = "playbook", tasks = [discover, audit, tally])
         let mut manifest = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
         manifest.resolve_workflow(&dir).unwrap();
         let workflow = manifest.workflow.as_ref().expect("workflow");
-        let plan = crate::plan::template::iteration_template(
+        let plan = crate::plan_run::template::iteration_template(
             Some(workflow),
             &crate::plan::workflow::WorkflowCaps::for_lane(workflow.workflow_type),
         )
         .unwrap();
 
         let mut rows: Vec<(String, &'static str, String)> = Vec::new();
-        let mut runner = crate::cli::setup::prep_plan_runner(&dir.join("crucible.toml"))
+        let mut runner = crate::plan_run::setup::prep_plan_runner(&dir.join("crucible.toml"))
             .unwrap()
             .0;
         let out = execute(
@@ -3274,12 +3277,12 @@ workflow(type = "playbook", tasks = [good, bad, after])
         let mut manifest = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
         manifest.resolve_workflow(&dir).unwrap();
         let workflow = manifest.workflow.as_ref().unwrap();
-        let plan = crate::plan::template::iteration_template(
+        let plan = crate::plan_run::template::iteration_template(
             Some(workflow),
             &crate::plan::workflow::WorkflowCaps::for_lane(workflow.workflow_type),
         )
         .unwrap();
-        let mut runner = crate::cli::setup::prep_plan_runner(&dir.join("crucible.toml"))
+        let mut runner = crate::plan_run::setup::prep_plan_runner(&dir.join("crucible.toml"))
             .unwrap()
             .0;
         assert!(
@@ -3391,18 +3394,18 @@ workflow(type = "playbook", tasks = [good, bad, after])
         // already spent whatever it was meant to bound.
         for (ceilings, expected) in [
             (
-                crate::plan::cli::Ceilings::default(),
+                crate::plan_run::cli::Ceilings::default(),
                 "--max-cost and --max-time",
             ),
             (
-                crate::plan::cli::Ceilings {
+                crate::plan_run::cli::Ceilings {
                     usd: Some(1.0),
                     ..Default::default()
                 },
                 "--max-time",
             ),
             (
-                crate::plan::cli::Ceilings {
+                crate::plan_run::cli::Ceilings {
                     wall_clock: Some(std::time::Duration::from_secs(60)),
                     wall_clock_raw: Some("1m".into()),
                     ..Default::default()
@@ -3410,7 +3413,7 @@ workflow(type = "playbook", tasks = [good, bad, after])
                 "--max-cost",
             ),
             (
-                crate::plan::cli::Ceilings {
+                crate::plan_run::cli::Ceilings {
                     usd: Some(1.0),
                     wall_clock: None,
                     wall_clock_raw: Some("later".into()),
@@ -3418,13 +3421,13 @@ workflow(type = "playbook", tasks = [good, bad, after])
                 "is not a duration",
             ),
         ] {
-            let error = crate::plan::cli::run(
+            let error = crate::plan_run::cli::run(
                 None,
                 &BTreeMap::new(),
                 &caps,
                 None,
                 Some(&manifest),
-                crate::plan::cli::RunOpts {
+                crate::plan_run::cli::RunOpts {
                     ceilings,
                     ..Default::default()
                 },
@@ -3437,14 +3440,14 @@ workflow(type = "playbook", tasks = [good, bad, after])
             "a refused launch dispatched a task anyway"
         );
 
-        crate::plan::cli::run(
+        crate::plan_run::cli::run(
             None,
             &BTreeMap::new(),
             &caps,
             None,
             Some(&manifest),
-            crate::plan::cli::RunOpts {
-                ceilings: crate::plan::cli::Ceilings {
+            crate::plan_run::cli::RunOpts {
+                ceilings: crate::plan_run::cli::Ceilings {
                     usd: Some(1.0),
                     wall_clock: Some(std::time::Duration::from_secs(600)),
                     wall_clock_raw: Some("10m".into()),
@@ -3487,14 +3490,14 @@ workflow(type = "playbook", tasks = [good, bad, after])
         fake_agent_manifest(&dir);
         let launch = |source: &str, max_time: &str| {
             std::fs::write(dir.join("workflow.star"), source).unwrap();
-            crate::plan::cli::run(
+            crate::plan_run::cli::run(
                 None,
                 &BTreeMap::new(),
                 &std::collections::BTreeSet::new(),
                 None,
                 Some(&dir.join("crucible.toml")),
-                crate::plan::cli::RunOpts {
-                    ceilings: crate::plan::cli::Ceilings {
+                crate::plan_run::cli::RunOpts {
+                    ceilings: crate::plan_run::cli::Ceilings {
                         usd: Some(1.0),
                         wall_clock: crate::duration::parse_duration(max_time),
                         wall_clock_raw: Some(max_time.to_string()),
@@ -3707,7 +3710,7 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
         .validate()
         .unwrap();
 
-        let mut runner = crate::cli::setup::prep_plan_runner(&dir.join("crucible.toml"))
+        let mut runner = crate::plan_run::setup::prep_plan_runner(&dir.join("crucible.toml"))
             .unwrap()
             .0;
         let state = runner.paths.state.clone();
@@ -3772,8 +3775,8 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
     }
 
     fn run_review_plan(dir: &std::path::Path, plan_file: &str) -> crate::plan::exec::PlanOutcome {
-        let plan = crate::plan::cli::load(&dir.join(plan_file)).unwrap();
-        let mut runner = crate::cli::setup::prep_plan_runner(&dir.join("crucible.toml"))
+        let plan = crate::plan_run::cli::load(&dir.join(plan_file)).unwrap();
+        let mut runner = crate::plan_run::setup::prep_plan_runner(&dir.join("crucible.toml"))
             .unwrap()
             .0;
         execute(
@@ -3999,7 +4002,7 @@ workflow(type = "playbook", tasks = [discover, audit])
         .unwrap();
         write_fanout_manifest(&dir, &fake);
 
-        let mut runner = crate::cli::setup::prep_plan_runner(&dir.join("crucible.toml"))
+        let mut runner = crate::plan_run::setup::prep_plan_runner(&dir.join("crucible.toml"))
             .unwrap()
             .0;
         assert!(runner.commit_per_task, "a playbook commits per task");
@@ -4113,7 +4116,7 @@ workflow(type = "playbook", tasks = [discover, audit, roundup])
         .unwrap();
         write_fanout_manifest(&dir, &fake);
 
-        let mut runner = crate::cli::setup::prep_plan_runner(&dir.join("crucible.toml"))
+        let mut runner = crate::plan_run::setup::prep_plan_runner(&dir.join("crucible.toml"))
             .unwrap()
             .0;
         let out = execute(
@@ -4181,7 +4184,7 @@ workflow(type = "playbook", tasks = [discover, audit, roundup])
         let mut manifest = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
         manifest.resolve_workflow(dir).unwrap();
         let workflow = manifest.workflow.as_ref().expect("workflow");
-        crate::plan::template::iteration_template(
+        crate::plan_run::template::iteration_template(
             Some(workflow),
             &crate::plan::workflow::WorkflowCaps::for_lane(workflow.workflow_type),
         )
@@ -5187,19 +5190,19 @@ workflow(type = "playbook", tasks = [echo])
         let mut manifest = crate::manifest::Manifest::load(&manifest_path).unwrap();
         manifest.resolve_workflow_with(&dir, &supplied).unwrap();
         let workflow = manifest.workflow.as_ref().unwrap();
-        let plan = crate::plan::template::iteration_template(
+        let plan = crate::plan_run::template::iteration_template(
             Some(workflow),
             &crate::plan::workflow::WorkflowCaps::for_lane(workflow.workflow_type),
         )
         .unwrap();
-        let mut runner = crate::cli::setup::prep_plan_runner_with_params(
+        let mut runner = crate::plan_run::setup::prep_plan_runner_with_params(
             &manifest_path,
             None,
             &supplied,
             crate::openshell::gateway::ComputeDriver::Podman,
             crate::args::AgentOverride::default(),
             None,
-            crate::cli::setup::Start::Fresh,
+            crate::plan_run::setup::Start::Fresh,
         )
         .unwrap()
         .0;
@@ -5489,13 +5492,13 @@ workflow(type = "playbook", tasks = [author, repro])
         let mut manifest = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
         manifest.resolve_workflow(&dir).unwrap();
         let workflow = manifest.workflow.as_ref().unwrap();
-        let plan = crate::plan::template::iteration_template(
+        let plan = crate::plan_run::template::iteration_template(
             Some(workflow),
             &crate::plan::workflow::WorkflowCaps::for_lane(workflow.workflow_type)
                 .with_persistent_sessions(),
         )
         .unwrap();
-        let mut runner = crate::cli::setup::prep_plan_runner(&dir.join("crucible.toml"))
+        let mut runner = crate::plan_run::setup::prep_plan_runner(&dir.join("crucible.toml"))
             .unwrap()
             .0;
         let mut rows = Vec::new();

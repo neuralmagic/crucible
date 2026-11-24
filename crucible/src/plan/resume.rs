@@ -8,7 +8,7 @@ use std::time::Duration;
 use crucible_contract::session::SessionEvent;
 use serde::{Deserialize, Serialize};
 
-use crate::manifest::variant::VariantName;
+use crate::knobs::VariantName;
 use crate::plan::exec::{FanoutSummary, Prior, TaskResult, row_task};
 use crate::plan::ir::{TaskName, ValidPlan};
 use crate::plan::machine::BlockedReason;
@@ -312,7 +312,7 @@ pub fn fold_log(
 
 #[cfg(test)]
 mod tests {
-    use crate::manifest::variant::VariantName;
+    use crate::knobs::VariantName;
     use crate::plan::exec::Prior;
     use crate::plan::ir::{Plan, TaskName, ValidPlan};
     use crate::plan::machine::BlockedReason;

@@ -11,6 +11,30 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "autoresearch")]
 use std::time::Duration;
 
+/// One random identity for a run's sandboxes, minted when the run's broker starts. Kubernetes
+/// containers commonly reuse the same small PID, so a PID cannot distinguish a relaunched run
+/// from the sandbox it left behind.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunId(String);
+
+impl RunId {
+    pub fn mint() -> Self {
+        RunId(uuid::Uuid::now_v7().simple().to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Where the run's own command and evaluate tasks reach its buildit: a unix socket in the run's
+/// state dir, whose builds read their contexts from the run's workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunSocket {
+    pub path: PathBuf,
+    pub workdir: PathBuf,
+}
+
 /// Which front-end to drive the loop with.
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum Ui {
@@ -29,10 +53,10 @@ pub(crate) enum Ui {
 pub(crate) struct Args {
     /// The identity this run's sandboxes are named under, minted when its broker starts.
     #[arg(skip)]
-    pub sandbox_run_id: Option<openshell::sandbox::RunId>,
+    pub sandbox_run_id: Option<RunId>,
     /// The lock every turn of this process boots the gateway under.
     #[arg(skip)]
-    pub gateway_boot: crucible::openshell::gateway::BootLock,
+    pub gateway_boot: openshell::gateway::BootLock,
     /// The engine runtime's handle, set by the arm that built the runtime; the async call sites
     /// (the openshell turn, the S3 publish and fetch) run on it.
     #[arg(skip)]
@@ -233,7 +257,7 @@ pub(crate) struct Args {
     /// Where the run's buildit serves the run's own command and evaluate tasks, fixed from the
     /// run's top-level paths so every task and turn starts it the same way.
     #[arg(skip)]
-    pub buildit_socket: Option<crate::openshell::buildit::RunSocket>,
+    pub buildit_socket: Option<RunSocket>,
     /// Opt-in: when publish-on-keep opens draft PR(s), spawn a detached `crucible watch-pr` pointed
     /// at them, reseeding this run's `STEER.md` from review comments so the NEXT run picks up feedback
     /// without a human running `watch-pr` by hand. Best-effort: spawn failure only logs (the PR still
@@ -280,12 +304,6 @@ impl Args {
             .unwrap_or_else(|| self.harness().default_model())
     }
 
-    /// How this run's agent turns are priced: the agent binding's price, else the model's
-    /// vendor rates, else nothing.
-    pub(crate) fn pricing(&self) -> crate::agent::event::Pricing {
-        crate::agent::event::Pricing::resolve(self.model(), self.price.as_ref())
-    }
-
     /// The engine runtime, which every async call site runs on; an error, never a panic, when
     /// the arm that built this run never built one.
     #[cfg(feature = "autoresearch")]
@@ -318,7 +336,7 @@ impl Args {
     pub(crate) fn sandbox_turn(&self) -> SandboxTurn<'_> {
         SandboxTurn {
             agent: self.turn_agent(),
-            pricing: self.pricing(),
+            price: self.price.as_ref(),
             broker: &self.broker,
             broker_token: self.broker_token.as_deref(),
             openshell: &self.openshell,
@@ -365,7 +383,7 @@ pub(crate) struct TurnAgent<'a> {
 /// relay, and MCP settings that shape one sandboxed turn.
 pub(crate) struct SandboxTurn<'a> {
     pub agent: TurnAgent<'a>,
-    pub pricing: crate::agent::event::Pricing,
+    pub price: Option<&'a crucible_contract::inference::TokenPrice>,
     pub broker: &'a manifest::BrokerCfg,
     pub broker_token: Option<&'a str>,
     pub openshell: &'a manifest::OpenshellCfg,
@@ -379,14 +397,14 @@ pub(crate) struct SandboxTurn<'a> {
     pub compute_driver: openshell::gateway::ComputeDriver,
     pub disclosure: Option<&'a crate::exposure::Covered>,
     /// The run's sandbox identity; `None` names each turn's sandbox afresh.
-    pub run_id: Option<&'a openshell::sandbox::RunId>,
-    pub gateway_boot: &'a crucible::openshell::gateway::BootLock,
+    pub run_id: Option<&'a RunId>,
+    pub gateway_boot: &'a openshell::gateway::BootLock,
     /// The engine runtime the turn runs on; `None` fails the turn as an orchestration error.
     pub engine: Option<&'a tokio::runtime::Handle>,
     pub secret_rules: &'a crucible_harness::redact::SecretRules,
     /// The declared tool plugin chain; `None` runs the default chain.
     pub tool_plugins: Option<&'a [manifest::ToolPluginSpec]>,
-    pub buildit_socket: Option<&'a crate::openshell::buildit::RunSocket>,
+    pub buildit_socket: Option<&'a RunSocket>,
 }
 
 /// Runtime paths for a manifest run. Everything anchors off the manifest dir + an explicit
@@ -462,8 +480,8 @@ impl Paths {
     }
 
     /// The run's buildit socket: in its state dir, building from its workspace.
-    pub(crate) fn buildit_socket(&self) -> crate::openshell::buildit::RunSocket {
-        crate::openshell::buildit::RunSocket {
+    pub(crate) fn buildit_socket(&self) -> RunSocket {
+        RunSocket {
             path: self.state.join("buildit.sock"),
             workdir: self.workspace.clone(),
         }

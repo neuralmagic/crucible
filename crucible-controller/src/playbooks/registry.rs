@@ -17,8 +17,8 @@
 use crate::playbooks::pack_trees::PACK_COLS;
 use crate::playbooks::packs::{Deliverable, MaterializedPack};
 use anyhow::{Context, Result};
+use crucible::knobs::VariantName;
 use crucible::manifest::launch::{CHOICES_REFRESH, is_refresh};
-use crucible::manifest::variant::VariantName;
 use crucible::plan::starlark::declared_params;
 use crucible::plan::starlark::params::ParamType;
 use crucible_contract::content_digest;

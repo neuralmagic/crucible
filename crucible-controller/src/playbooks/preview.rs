@@ -116,7 +116,7 @@ pub fn preview_pack(
     pack_root: &Path,
     params: &BTreeMap<String, String>,
     unvalued: Unvalued,
-    variant: Option<&crucible::manifest::variant::VariantName>,
+    variant: Option<&crucible::knobs::VariantName>,
 ) -> Result<PackPreview, RegisterError> {
     preview_pack_for(
         pack_root,
@@ -133,7 +133,7 @@ pub(crate) fn preview_pack_for(
     kind: crate::playbooks::registry::PackWorkflowKind,
     params: &BTreeMap<String, String>,
     unvalued: Unvalued,
-    variant: Option<&crucible::manifest::variant::VariantName>,
+    variant: Option<&crucible::knobs::VariantName>,
 ) -> Result<PackPreview, RegisterError> {
     let source = crate::playbooks::registry::workflow_source_for(pack_root, kind, variant)?;
     let mut preview = PackPreview {

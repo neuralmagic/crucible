@@ -1,10 +1,10 @@
 //! The typed gRPC boundary to the local OpenShell gateway: Health / sandbox / provider / policy /
 //! exec / logs RPCs over a lazily-connected mTLS [`Channel`], all natively `async` and awaited
-//! from `openshell::run::turn`'s one `block_on` on the shared engine runtime.
+//! from `openshell_turn::run::turn`'s one `block_on` on the shared engine runtime.
 //! [`Gateway::exec`] consumes the tonic server stream directly, handing stdout lines to a caller
 //! callback and `select!`ing a [`CancellationToken`] so Ctrl-C drops the stream and cancels the
 //! RPC server-side (there is no local child to signal). Boot and file upload/download stay on the
-//! CLI, see [`crate::openshell::gateway`] and `openshell::run`.
+//! CLI, see [`crate::openshell::gateway`] and `openshell_turn::run`.
 
 use anyhow::{Context, Result};
 use crucible_broker::workspace::scoped;
@@ -1630,7 +1630,7 @@ impl GrpcError {
 
 /// A rejected endpoint spec. The offending spec is named once here rather than re-interpolated
 /// into every message.
-use crate::openshell::endpoint::{
+use crate::endpoint::{
     Access, Endpoint as EgressEndpoint, EndpointSpecError, Enforcement, Protocol,
 };
 
@@ -1736,7 +1736,7 @@ pub(crate) mod in_process;
 
 #[cfg(test)]
 mod tests {
-    use crate::openshell::endpoint::EndpointProblem;
+    use crate::endpoint::EndpointProblem;
     use crate::openshell::grpc::in_process::{FakeGateway, Writes};
     use crate::openshell::grpc::*;
     use openshell_core::proto::NetworkAccessPreset;

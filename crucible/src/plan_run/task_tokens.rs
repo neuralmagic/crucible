@@ -368,7 +368,7 @@ fn refresh(
 
 #[cfg(test)]
 mod tests {
-    use crate::plan::task_tokens::*;
+    use crate::plan_run::task_tokens::*;
     use std::io::{BufRead, BufReader, Read};
     use std::sync::atomic::{AtomicUsize, Ordering};
 

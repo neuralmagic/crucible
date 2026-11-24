@@ -40,7 +40,7 @@ pub struct PackRegistries {
 /// Read a pack tree's `[buildit]` and `[kueue]` tables. A tree with no manifest has neither.
 pub fn of_pack(
     pack_root: &Path,
-    variant: Option<&crucible::manifest::variant::VariantName>,
+    variant: Option<&crucible::knobs::VariantName>,
 ) -> Result<PackRegistries> {
     if !pack_root.join(crate::playbooks::packs::MANIFEST).is_file() {
         return Ok(PackRegistries::default());

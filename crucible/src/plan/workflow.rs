@@ -267,7 +267,7 @@ pub struct WorkflowCfg {
     /// The manifest's top-level edition, never read from or written to the `[workflow]` table. A
     /// compiled source carries the manifest's across.
     #[serde(skip)]
-    pub edition: crate::manifest::edition::Edition,
+    pub edition: crate::edition::Edition,
     /// Every declared parameter's value as compilation bound it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, ParamValue>,

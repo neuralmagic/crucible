@@ -192,7 +192,7 @@ pub struct PlaybookLaunch {
     pub max_cost: f64,
     pub params: BTreeMap<String, String>,
     /// The manifest variant the run reads; the base manifest when `None`.
-    pub variant: Option<crate::manifest::variant::VariantName>,
+    pub variant: Option<crate::knobs::VariantName>,
     /// The finished run this launch reruns, fetched from the controller.
     pub rerun: Option<RerunLaunch>,
 }
@@ -1012,7 +1012,7 @@ impl Renderer<'_> {
         }
 
         // Sandbox S3 reads: the gateway runs as this read-only role via the same projected token
-        // and its `aws-s3` provider signs sandbox egress at the proxy (see openshell::run).
+        // and its `aws-s3` provider signs sandbox egress at the proxy (see openshell_turn::run).
         if let Some(arn) = self.profile.cluster.aws_sandbox_role_arn.as_deref()
             && !arn.is_empty()
         {

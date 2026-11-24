@@ -217,7 +217,7 @@ impl Drop for Heartbeat {
 #[cfg(test)]
 mod tests {
     use crate::agent::event::{AgentEvent, Tokens};
-    use crate::plan::turn_log::*;
+    use crate::plan_run::turn_log::*;
     use crucible_harness::line::LineFormat as _;
 
     fn at(start: Instant, secs: u64) -> Instant {

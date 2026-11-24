@@ -747,9 +747,7 @@ mod tests {
             max_time: MaxTime::parse("30m").expect("duration"),
             agent: crate::playbooks::providers::AgentSelection::default(),
             rerun: None,
-            variant: Some(
-                crucible::manifest::variant::VariantName::parse("offline").expect("name"),
-            ),
+            variant: Some(crucible::knobs::VariantName::parse("offline").expect("name")),
         };
         let argv = run_argv(Path::new("/runs/r1/pack/crucible.toml"), &opts);
         assert_eq!(

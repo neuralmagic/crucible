@@ -147,7 +147,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::agent::event::{AgentEvent, RawStream, Tokens};
-    use crate::plan::transcript::{BLOCK_CHARS, Transcript};
+    use crate::plan_run::transcript::{BLOCK_CHARS, Transcript};
 
     fn text(s: &str) -> AgentEvent {
         AgentEvent::Text { delta: s.into() }

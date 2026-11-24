@@ -21,11 +21,11 @@ use crate::control;
 use crate::plan::admission::{Admission, Lane, Refusal};
 use crate::plan::attempt::{Attempt, AttemptOutcome, BatchItem};
 use crate::plan::exec::{ExecCfg, Substrate, TaskRunner, execute};
-use crate::plan::harness::CandidateEvent;
 use crate::plan::ir::{
     EngineOp, Isolation, Join, Plan, PlanBudget, Stage, Task, TaskKind, TaskName, ValidPlan,
 };
 use crate::plan::workflow::{WorkflowCaps, WorkflowCfg};
+use crate::plan_run::harness::CandidateEvent;
 use crate::process::STOP;
 use crate::report::reporter::Reporter;
 use crate::report::session::Row;
@@ -93,7 +93,7 @@ pub(crate) fn run_iteration(
     if agent::supports_persistent_sessions(&runner.args) {
         caps = caps.with_persistent_sessions();
     }
-    let plan = crate::plan::template::iteration_template(cx.workflow, &caps)?;
+    let plan = crate::plan_run::template::iteration_template(cx.workflow, &caps)?;
     let result_task = cx
         .workflow
         .filter(|workflow| !workflow.is_legacy_splice())
@@ -101,7 +101,7 @@ pub(crate) fn run_iteration(
         .unwrap_or_else(|| "decide".into());
     runner
         .r
-        .plan_event(&crate::plan::events::plan_admitted_event(&plan, None));
+        .plan_event(&crate::plan_run::events::plan_admitted_event(&plan, None));
     runner.arm(&cx);
     let task_states = Arc::clone(&runner.task_states);
     // The runner and the on_result hook both need the reporter; collect the wire lines
@@ -125,7 +125,7 @@ pub(crate) fn run_iteration(
         &mut *runner,
         |task, result| {
             states_of(&task_states).insert(task.name.clone(), (result.status, result.note.clone()));
-            task_events.push(crate::plan::events::task_result_event(
+            task_events.push(crate::plan_run::events::task_result_event(
                 plan.plan().version,
                 cx.it,
                 task,
@@ -265,7 +265,7 @@ pub(crate) fn run_epilogue(
         plan.plan().tasks.len(),
         kept.iter
     ));
-    r.plan_event(&crate::plan::events::plan_admitted_event(&plan, None));
+    r.plan_event(&crate::plan_run::events::plan_admitted_event(&plan, None));
 
     // The executor derives inputs from dependencies, and the epilogue's roots have none, so the
     // kept context rides in as a run input on every task.
@@ -291,7 +291,7 @@ pub(crate) fn run_epilogue(
         },
         &mut runner,
         |task, result| {
-            task_events.push(crate::plan::events::task_result_event(
+            task_events.push(crate::plan_run::events::task_result_event(
                 plan.plan().version,
                 kept.iter,
                 task,
@@ -377,11 +377,11 @@ pub(crate) struct LoopTaskRunner<'a> {
     /// Settled-task dispositions, fed by the executor's `on_result` callback; read by
     /// `grade` to record which declared evidence tasks actually ran.
     task_states: TaskStates,
-    workflow_runner: crate::plan::harness::HarnessRunner,
+    workflow_runner: crate::plan_run::harness::HarnessRunner,
 }
 
-fn harness_runner(args: &Args, p: &Paths) -> crate::plan::harness::HarnessRunner {
-    crate::plan::harness::HarnessRunner {
+fn harness_runner(args: &Args, p: &Paths) -> crate::plan_run::harness::HarnessRunner {
+    crate::plan_run::harness::HarnessRunner {
         args: args.clone(),
         paths: p.clone(),
         commit_per_task: false,
@@ -908,7 +908,7 @@ pub(crate) fn run_wide_tournament(
 
     let direction = judge.direction();
     let plan = wide_template(cfg, prep, direction)?;
-    r.plan_event(&crate::plan::events::plan_admitted_event(&plan, None));
+    r.plan_event(&crate::plan_run::events::plan_admitted_event(&plan, None));
     r.note("wide: starting parallel PROPOSE turns");
     let snap = world
         .snapshot("wide-pre-measure")
@@ -945,7 +945,7 @@ pub(crate) fn run_wide_tournament(
         },
         &mut runner,
         |task, result| {
-            task_events.push(crate::plan::events::task_result_event(
+            task_events.push(crate::plan_run::events::task_result_event(
                 plan.plan().version,
                 0,
                 task,
@@ -1397,7 +1397,7 @@ fn wide_propose(
     }
     let cand_paths = Paths::for_worktree(worktree.clone(), skills);
     let _ = std::fs::create_dir_all(&cand_paths.state);
-    let turn = agent::run_turn_with_session(
+    let turn = crate::turn::run_turn_with_session(
         args,
         &cand_paths,
         prompt,
@@ -1473,7 +1473,7 @@ mod tests {
         )
         .unwrap();
         w.validate().unwrap();
-        let plan = crate::plan::template::iteration_template(
+        let plan = crate::plan_run::template::iteration_template(
             Some(&w),
             &WorkflowCaps::autoresearch_engine(),
         )
@@ -1499,7 +1499,7 @@ mod tests {
              [[task]]\nname = \"racecheck\"\nkind = \"command\"\ncommand = \"true\"\nstage = \"epilogue\"\n",
         )
         .unwrap();
-        let plan = crate::plan::template::iteration_template(
+        let plan = crate::plan_run::template::iteration_template(
             Some(&authored),
             &WorkflowCaps::autoresearch_engine(),
         )
@@ -1903,7 +1903,7 @@ mod tests {
 
         let m = manifest::Manifest::load_frozen(&manifest_path).unwrap();
         let workspace = dir.join("workspace");
-        crate::cli::workspace::manifest_setup(&m, &dir, &workspace).unwrap();
+        crate::workspace::manifest_setup(&m, &dir, &workspace).unwrap();
         // The real run path does this right after setup. Without it the workspace has no
         // committer identity of its own, so every keep's snapshot fails on a machine with
         // no global git config and the run silently stops ratcheting.

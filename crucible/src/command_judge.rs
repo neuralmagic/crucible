@@ -54,7 +54,7 @@ impl CommandJudge {
         // Re-establish the frozen judge files before scoring, so any edit the candidate made to the
         // gate (the harness, the regression test) is overwritten and can't game the measurement.
         for (src, dst) in &self.frozen_injects {
-            crate::manifest::apply_inject(src, dst)
+            crate::inject::apply(src, dst)
                 .context("re-establishing frozen judge before measure")?;
         }
         let mut c = Command::new("sh");
@@ -214,7 +214,7 @@ mod tests {
         let judge = CommandJudge {
             workspace: std::env::temp_dir(),
             measure_cmd: r#"test -z "$CRUCIBLE_TEST_UNDECLARED" && test "$CRUCIBLE_TEST_DECLARED" = passed && echo "{\"valid\": true, \"score\": $CRUCIBLE_BEST_SCORE}""#.into(),
-            env: crate::host_env::HostEnv::resolve(crate::manifest::edition::Edition::Two, "[judge]", &declared).unwrap(),
+            env: crate::host_env::HostEnv::resolve(crate::edition::Edition::Two, "[judge]", &declared).unwrap(),
             ..judge(Direction::Higher)
         };
         let reading = judge.measure(&MeasureCtx {
@@ -241,7 +241,7 @@ mod tests {
             workspace: std::env::temp_dir(),
             measure_cmd: r#"test "$CRUCIBLE_TEST_INHERITED" = kept && echo "{\"valid\": true, \"score\": $CRUCIBLE_BEST_SCORE}""#.into(),
             env: crate::host_env::HostEnv::resolve(
-                crate::manifest::edition::Edition::One,
+                crate::edition::Edition::One,
                 "[judge]",
                 &crate::host_env::DeclaredEnv::default(),
             )
@@ -273,11 +273,8 @@ mod tests {
             "CRUCIBLE_TEST_OPTIONAL_UNSET?"
         ]))
         .unwrap();
-        let env = crate::host_env::HostEnv::resolve(
-            crate::manifest::edition::Edition::Two,
-            "[judge]",
-            &declared,
-        );
+        let env =
+            crate::host_env::HostEnv::resolve(crate::edition::Edition::Two, "[judge]", &declared);
         unsafe {
             std::env::remove_var("CRUCIBLE_TEST_OPTIONAL_SET");
         }

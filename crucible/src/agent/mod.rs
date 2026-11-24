@@ -1,7 +1,7 @@
 //! Running one agent turn, shared by every front-end.
 //!
 //! The loop consumes a stream of [`AgentEvent`]s and does not care where they came
-//! from. [`run_turn`] picks an [`AgentSource`] (resolved once from [`Args`]), hands
+//! from. [`crate::turn::run_turn`] picks an [`AgentSource`] (resolved once from [`Args`]), hands
 //! each line + decoded event to a `sink`, and returns a [`TurnOutcome`]: the turn's cost (the max
 //! authoritative cost the agent reported, so the loop can budget on it) plus the transport failure
 //! that stopped it, if any, so a turn that never ran is not mistaken for one that answered badly.
@@ -57,7 +57,7 @@ pub enum AgentSource {
     LocalClaude,
     /// Drive the OpenShell gateway over its gRPC API for a sandboxed turn (the `openshell`
     /// backend; the CLI is used only for file transfer). Has its own multi-step flow, so
-    /// [`run_turn`] delegates to [`crate::openshell::run::turn`] rather than the generic
+    /// [`crate::turn::run_turn`] delegates to [`crate::openshell_turn::run::turn`] rather than the generic
     /// spawn/stream path.
     OpenshellDriver,
     /// The `command` backend: run a fixed shell command in the workspace as the proposal
@@ -106,7 +106,7 @@ impl AgentSource {
             // intercepts it before `spawn`, so this is never reached.
             AgentSource::OpenshellDriver => {
                 return Err(std::io::Error::other(
-                    "OpenshellDriver is driven by openshell::run::turn, not spawn",
+                    "OpenshellDriver is driven by openshell_turn::run::turn, not spawn",
                 ));
             }
         };
@@ -220,53 +220,10 @@ fn local_command(
     Ok(cmd)
 }
 
-#[cfg(feature = "autoresearch")]
-/// Run one agent turn against the source resolved from `args`. `sink(raw_line, stream,
-/// event)` is called per output line; returns the turn's [`TurnOutcome`]: the highest cost the
-/// agent reported (0 if none) plus the transport failure that stopped it, if any.
-pub fn run_turn(
-    args: &Args,
-    p: &Paths,
-    prompt: &str,
-    json: bool,
-    sink: impl FnMut(&str, RawStream, Option<&AgentEvent>),
-) -> TurnOutcome {
-    run_turn_with_session(args, p, prompt, json, None, None, sink)
-}
-
-/// Run a turn using a prepared session; the caller commits successful transport afterward. A turn
-/// still running at `deadline` is killed and fails with [`TurnFailure::DeadlineExceeded`].
-pub(crate) fn run_turn_with_session(
-    args: &Args,
-    p: &Paths,
-    prompt: &str,
-    json: bool,
-    session: Option<&crate::agent::agent_session::SessionTurn>,
-    deadline: Option<Deadline>,
-    sink: impl FnMut(&str, RawStream, Option<&AgentEvent>),
-) -> TurnOutcome {
-    let source = args.agent_source();
-    // The openshell driver owns a multi-step turn (gateway/provider/sandbox/exec/download),
-    // not a single streamed child, delegate to its module rather than the generic path. It
-    // reaches the engine runtime handle itself (see `crate::agent::engine::handle`).
-    if source == AgentSource::OpenshellDriver {
-        return crate::openshell::run::turn(
-            &args.sandbox_turn(),
-            p,
-            prompt,
-            json,
-            session,
-            deadline,
-            sink,
-        );
-    }
-    run_turn_with(&source, args, p, prompt, json, session, deadline, sink)
-}
-
 /// Inner driver, generic over the source. Split out so the source is explicit and
-/// testable; [`run_turn`] is the convenience that resolves it from `args`.
+/// testable; [`crate::turn::run_turn`] is the convenience that resolves it from `args`.
 #[allow(clippy::too_many_arguments)]
-fn run_turn_with(
+pub(crate) fn run_turn_with(
     source: &AgentSource,
     args: &Args,
     p: &Paths,
@@ -465,6 +422,12 @@ pub(crate) fn pump_stream(
 }
 
 impl Args {
+    /// How this run's agent turns are priced: the agent binding's price, else the model's
+    /// vendor rates, else nothing.
+    pub(crate) fn pricing(&self) -> crate::agent::event::Pricing {
+        crate::agent::event::Pricing::resolve(self.model(), self.price.as_ref())
+    }
+
     /// Resolve where this run's agent events come from. `local` spawns `claude` directly
     /// (parsed as `stream-json`); `openshell` uses the in-Rust OpenShell driver.
     pub(crate) fn agent_source(&self) -> AgentSource {

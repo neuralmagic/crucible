@@ -5,7 +5,7 @@
 //! Ownership split: this module holds the *types* + the pure rendering (prompt text, the fenced
 //! JSON trail, the human summaries) and nothing that touches an agent or the filesystem, the
 //! loop driver itself lives in `scope.rs`, where the propose plumbing (scratch checkout, seed
-//! context, `agent::run_turn`) already sits. Keeping the records here means `scope.rs` stays about
+//! context, `crate::turn::run_turn`) already sits. Keeping the records here means `scope.rs` stays about
 //! orchestration and this stays trivially unit-testable. The records themselves are
 //! [`crucible_contract::refine`], which a controller depends on directly to read a frozen trail.
 

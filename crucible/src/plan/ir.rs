@@ -536,11 +536,11 @@ pub enum TaskKind {
     /// names an `[agent.sandbox.<name>]`.
     Agent {
         prompt: String,
-        #[serde(default, deserialize_with = "crate::manifest::launch::harness_knob")]
+        #[serde(default, deserialize_with = "crate::knobs::harness_knob")]
         harness: Option<Harness>,
         #[serde(default)]
         model: Option<String>,
-        #[serde(default, deserialize_with = "crate::manifest::launch::effort_knob")]
+        #[serde(default, deserialize_with = "crate::knobs::effort_knob")]
         effort: Option<ReasoningEffort>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sandbox: Option<String>,

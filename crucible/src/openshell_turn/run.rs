@@ -13,18 +13,20 @@
 //! crucible processes sharing one gateway never collide on a fixed name.
 
 use crate::agent::event::{AgentEvent, RawStream};
+use crate::agent::harness::codex::CodexAuth;
 use crate::agent::harness::{McpServer, SandboxAuth, SandboxLayout, TurnArtifacts, backend};
 use crate::agent::relay;
 use crate::agent::sandbox_env::{EnvSource, SandboxEnv};
 use crate::agent::tool_chain::StopReason;
 use crate::agent::turn::{TurnFailure, TurnOutcome};
 use crate::args::{Paths, SandboxTurn};
+use crate::endpoint::Endpoint;
 use crate::knobs::Harness;
 use crate::openshell::grpc::Gateway;
-use crate::openshell::{gateway, grpc, policy, provider, sandbox};
+use crate::openshell::{gateway, grpc, policy};
+use crate::openshell_turn::{provider, sandbox};
 use anyhow::{Context, Result};
 use crucible::harness::{ApiFamily, AuthProvider, TranscriptLocator};
-use crucible::openshell::endpoint::Endpoint;
 use crucible_contract::TransportCause;
 use crucible_harness::redact::Redactor;
 use std::time::Instant;
@@ -121,7 +123,7 @@ use tokio::fs;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
-/// Run one openshell turn. Mirrors `agent::run_turn`'s contract: drives `sink` per output
+/// Run one openshell turn. Mirrors `crate::turn::run_turn`'s contract: drives `sink` per output
 /// line/event and returns the turn's [`TurnOutcome`]. Any orchestration failure surfaces as an
 /// [`AgentEvent::Error`] through the sink and lands in the outcome's
 /// [`TurnFailure::Orchestration`], carrying whatever the turn had already spent. Every secret the
@@ -440,8 +442,8 @@ async fn try_turn(
         }
         AuthProvider::Codex => SandboxAuth::Codex(
             match selected_codex_api_key(turn.agent.codex, &inference)? {
-                Some(key) => provider::CodexAuth::ApiKey(key),
-                None => provider::CodexAuth::ChatGpt(
+                Some(key) => CodexAuth::ApiKey(key),
+                None => CodexAuth::ChatGpt(
                     provider::mint_codex_token()
                         .await
                         .context("minting the codex ChatGPT access token")?,
@@ -450,8 +452,8 @@ async fn try_turn(
         ),
     };
     match sandbox_auth.codex() {
-        Some(provider::CodexAuth::ApiKey(key)) => redactor.add(key),
-        Some(provider::CodexAuth::ChatGpt(token)) => {
+        Some(CodexAuth::ApiKey(key)) => redactor.add(key),
+        Some(CodexAuth::ChatGpt(token)) => {
             redactor.add(&token.access_token);
             redactor.add(&token.id_token);
         }
@@ -479,7 +481,7 @@ async fn try_turn(
     //     `openshell:resolve:env:` placeholder. The proxy resolves it at egress, solely for the
     //     policy endpoint bound to this provider (the step-4 `credential_binding`), so the real
     //     token never enters the sandbox and a leaked placeholder resolves nowhere else.
-    let agent_servers = crate::openshell::agent_servers::AgentServers::from_env()
+    let agent_servers = crate::openshell_turn::agent_servers::AgentServers::from_env()
         .context("reading the run's agent servers")?;
     agent_servers.check_names(
         turn.broker.enabled.then_some(turn.broker.name.as_str()),
@@ -862,7 +864,7 @@ async fn try_turn(
             token: None,
         }));
         let issued = match (&sandbox_auth, &model_key) {
-            (SandboxAuth::Codex(provider::CodexAuth::ApiKey(_)), Some(key)) => {
+            (SandboxAuth::Codex(CodexAuth::ApiKey(_)), Some(key)) => {
                 Some(issued_placeholder(&gw, &name, key.var.env(), &cancel).await?)
             }
             _ => None,
@@ -944,7 +946,7 @@ async fn try_turn(
             backend.decoder(&turn.agent, meters.as_ref(), full),
             (!full).then(|| backend.decoder(&turn.agent, None, true)),
             crate::agent::tool_chain::ToolChain::declared(turn.tool_plugins),
-            turn.pricing,
+            crate::agent::event::Pricing::resolve(turn.agent.model, turn.price),
         );
         let exec_result =
             exec_and_stream(&gw, &name, &wrapper, pump, &exec_opts, spent, sink).await;
@@ -1253,7 +1255,7 @@ impl<'a> InferenceKey<'a> {
                 None => return Ok(None),
             },
             AuthProvider::Codex => match sandbox_auth.codex() {
-                Some(provider::CodexAuth::ApiKey(key)) => (
+                Some(CodexAuth::ApiKey(key)) => (
                     OpenAi,
                     key,
                     inference
@@ -1261,7 +1263,7 @@ impl<'a> InferenceKey<'a> {
                         .clone()
                         .unwrap_or_else(|| OPENAI_API_URL.to_string()),
                 ),
-                Some(provider::CodexAuth::ChatGpt(_)) | None => return Ok(None),
+                Some(CodexAuth::ChatGpt(_)) | None => return Ok(None),
             },
             AuthProvider::ApiKey => {
                 match crate::agent::harness::api_endpoint(agent.model, inference, agent.env) {
@@ -2039,7 +2041,7 @@ async fn write_temp(tag: &str, content: &str) -> Result<tempfile::NamedTempFile>
 mod tests {
     #[test]
     fn a_sandbox_is_bound_only_where_the_controller_issues_agent_tokens() {
-        use crate::openshell::run::binds_sandboxes;
+        use crate::openshell_turn::run::binds_sandboxes;
         let target = || {
             crate::report::sandbox_bind::BindTarget::new(
                 "http://crucible-controller.ns.svc:8080",
@@ -2059,7 +2061,7 @@ mod tests {
 
     #[test]
     fn the_broker_placeholder_reads_the_sandbox_only_alongside_a_token_grant() {
-        use crate::openshell::run::{BrokerAuth, Placeholder};
+        use crate::openshell_turn::run::{BrokerAuth, Placeholder};
         assert_eq!(
             BrokerAuth::resolve(true, Some("t"), false),
             BrokerAuth::Provider(Placeholder::Canonical)
@@ -2075,11 +2077,11 @@ mod tests {
         );
         assert_eq!(
             BrokerAuth::resolve(true, Some("t"), false).provider(),
-            Some(&crate::openshell::provider::BROKER_PROVIDER_NAME)
+            Some(&crate::openshell_turn::provider::BROKER_PROVIDER_NAME)
         );
         assert_eq!(BrokerAuth::None.provider(), None);
         assert_eq!(
-            crate::openshell::provider::broker_token_placeholder(),
+            crate::openshell_turn::provider::broker_token_placeholder(),
             format!(
                 "{}BROKER_TOKEN",
                 openshell_core::secrets::PLACEHOLDER_PREFIX_PUBLIC
@@ -2087,7 +2089,7 @@ mod tests {
         );
     }
 
-    use crate::openshell::run::*;
+    use crate::openshell_turn::run::*;
 
     #[test]
     fn an_orchestration_error_is_classified_by_the_typed_error_in_its_chain() {
@@ -2386,7 +2388,7 @@ mod tests {
             (
                 Harness::Codex,
                 AuthProvider::Codex,
-                SandboxAuth::Codex(provider::CodexAuth::ApiKey(CODEX_KEY.into())),
+                SandboxAuth::Codex(CodexAuth::ApiKey(CODEX_KEY.into())),
             ),
             (Harness::OpenCode, AuthProvider::ApiKey, SandboxAuth::ApiKey),
             (Harness::Pi, AuthProvider::ApiKey, SandboxAuth::ApiKey),
@@ -2463,12 +2465,14 @@ mod tests {
     fn each_auth_resolves_the_key_its_harness_sends_and_where_it_sends_it() {
         use provider::InferenceKeyVar::{Anthropic, OpenAi};
         let codex = crate::manifest::CodexCfg::default();
-        let codex_key = SandboxAuth::Codex(provider::CodexAuth::ApiKey(CODEX_KEY.into()));
-        let chatgpt = SandboxAuth::Codex(provider::CodexAuth::ChatGpt(provider::CodexToken {
-            access_token: "at".into(),
-            account_id: "acct".into(),
-            id_token: "id".into(),
-        }));
+        let codex_key = SandboxAuth::Codex(CodexAuth::ApiKey(CODEX_KEY.into()));
+        let chatgpt = SandboxAuth::Codex(CodexAuth::ChatGpt(
+            crate::agent::harness::codex::CodexToken {
+                access_token: "at".into(),
+                account_id: "acct".into(),
+                id_token: "id".into(),
+            },
+        ));
         let enmaas = Some("https://api.enmaas.devshift.net/v1");
         let vllm = Some("http://vllm.internal:8000/v1");
         let cases: Vec<(_, _, _, _, _, Option<(_, &str, &str)>)> = vec![

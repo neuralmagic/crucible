@@ -52,7 +52,7 @@ pub(crate) fn task_result_event(
         trace_id,
         span_id,
         agent: args
-            .and_then(|args| crate::plan::harness::resolved_agent(args, task))
+            .and_then(|args| crate::plan_run::harness::resolved_agent(args, task))
             .map(Box::new),
         repairs: r.repairs.clone(),
         reused_from: None,
@@ -130,7 +130,7 @@ mod tests {
         .validate()
         .unwrap();
         let SessionEvent::PlanAdmitted { tasks, .. } =
-            crate::plan::events::plan_admitted_event(&plan, None)
+            crate::plan_run::events::plan_admitted_event(&plan, None)
         else {
             panic!("not a plan_admitted event");
         };
@@ -178,7 +178,7 @@ mod tests {
         .validate()
         .unwrap();
         let SessionEvent::PlanAdmitted { tasks, .. } =
-            crate::plan::events::plan_admitted_event(&plan, None)
+            crate::plan_run::events::plan_admitted_event(&plan, None)
         else {
             panic!("not a plan_admitted event");
         };
@@ -212,7 +212,7 @@ mod tests {
         );
         assert!(emits("bare").is_empty());
         let line =
-            crucible_contract::encode(&crate::plan::events::plan_admitted_event(&plan, None));
+            crucible_contract::encode(&crate::plan_run::events::plan_admitted_event(&plan, None));
         assert!(
             line.contains(r#""emits":[{"field":"score","type":"number"},{"field":"tier","type":["high","low"]}]"#),
             "{line}"
@@ -238,7 +238,7 @@ mod tests {
         .unwrap()
         .validate()
         .unwrap();
-        let event = crate::plan::events::plan_admitted_event(&plan, None);
+        let event = crate::plan_run::events::plan_admitted_event(&plan, None);
         let SessionEvent::PlanAdmitted { tasks, .. } = &event else {
             panic!("not a plan_admitted event");
         };
@@ -300,9 +300,14 @@ mod tests {
             transport: None,
             repairs: Vec::new(),
         };
-        let SessionEvent::TaskResult { links, .. } =
-            crate::plan::events::task_result_event(1, 0, &plan.plan().tasks[0], &result, None, 0.0)
-        else {
+        let SessionEvent::TaskResult { links, .. } = crate::plan_run::events::task_result_event(
+            1,
+            0,
+            &plan.plan().tasks[0],
+            &result,
+            None,
+            0.0,
+        ) else {
             panic!("not a task_result event");
         };
         assert_eq!(links.len(), 2, "the string field contributed nothing");
@@ -316,9 +321,14 @@ mod tests {
             output: None,
             ..result
         };
-        let SessionEvent::TaskResult { links, .. } =
-            crate::plan::events::task_result_event(1, 0, &plan.plan().tasks[0], &none, None, 0.0)
-        else {
+        let SessionEvent::TaskResult { links, .. } = crate::plan_run::events::task_result_event(
+            1,
+            0,
+            &plan.plan().tasks[0],
+            &none,
+            None,
+            0.0,
+        ) else {
             panic!("not a task_result event");
         };
         assert!(links.is_empty(), "no output, no links");
@@ -350,8 +360,14 @@ mod tests {
             transport: None,
             repairs: vec![repair.clone()],
         };
-        let event =
-            crate::plan::events::task_result_event(1, 0, &plan.plan().tasks[0], &result, None, 0.0);
+        let event = crate::plan_run::events::task_result_event(
+            1,
+            0,
+            &plan.plan().tasks[0],
+            &result,
+            None,
+            0.0,
+        );
         let SessionEvent::TaskResult { repairs, .. } = &event else {
             panic!("not a task_result event");
         };
@@ -383,7 +399,7 @@ mod tests {
         .validate()
         .unwrap();
         let SessionEvent::PlanAdmitted { tasks, .. } =
-            crate::plan::events::plan_admitted_event(&plan, None)
+            crate::plan_run::events::plan_admitted_event(&plan, None)
         else {
             panic!("not a plan_admitted event");
         };
@@ -470,7 +486,7 @@ mod tests {
         .validate()
         .unwrap();
         let mut log = crucible_contract::session::encode(
-            &crate::plan::events::plan_admitted_event(&plan, None),
+            &crate::plan_run::events::plan_admitted_event(&plan, None),
         );
         let mut written: Vec<(TaskName, TaskResult)> = Vec::new();
         execute(
@@ -481,7 +497,7 @@ mod tests {
             |task, result| {
                 log.push('\n');
                 log.push_str(&crucible_contract::session::encode(
-                    &crate::plan::events::task_result_event(1, 0, task, result, None, 0.0),
+                    &crate::plan_run::events::task_result_event(1, 0, task, result, None, 0.0),
                 ));
                 written.push((task.name.clone(), result.clone()));
             },

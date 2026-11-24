@@ -7,7 +7,6 @@ mod broker;
 mod capability;
 mod deploy;
 mod dispatch;
-pub mod edition;
 mod git_ref;
 mod judge;
 pub mod launch;
@@ -54,9 +53,10 @@ pub use tool_plugins::{DEFAULT_REPEAT_LIMIT, ToolPluginSpec, default_chain};
 pub use world::WorldCfg;
 
 use crate::crucible::Direction;
+use crate::edition::Edition;
+use crate::knobs::VariantName;
 use crate::knobs::{Harness, ReasoningEffort};
-use crate::manifest::edition::Edition;
-use crate::manifest::variant::{VariantName, Variants};
+use crate::manifest::variant::Variants;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -65,8 +65,6 @@ use std::path::{Component, Path, PathBuf};
 /// Manifest-level rejections that belong to no single sub-table.
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
-    #[error("inject destination {} is a directory", .path.display())]
-    InjectDestIsDir { path: PathBuf },
     #[error("[[workspace.inject]] sources not found under {}:\n{}", .manifest_dir.display(), .missing.join("\n"))]
     InjectSrcMissing {
         manifest_dir: PathBuf,
@@ -647,46 +645,6 @@ fn default_workspace_dir() -> String {
     "workspace".to_string()
 }
 
-/// Copy one inject `src` -> `dst`, creating parent dirs. Used at setup (all injects) and before each
-/// scored measure (frozen injects), so the frozen judge the gate runs is always the baked one.
-pub fn apply_inject(src: &Path, dst: &Path) -> Result<()> {
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating inject dir {}", parent.display()))?;
-    }
-    // Replace the entry: copying through an agent-created symlink could escape `dst`.
-    let dst_meta = std::fs::symlink_metadata(dst);
-    let same_file = matches!(
-        (std::fs::canonicalize(src), std::fs::canonicalize(dst)),
-        (Ok(src), Ok(dst)) if src == dst
-    );
-    if dst_meta
-        .as_ref()
-        .is_ok_and(|meta| !meta.file_type().is_symlink())
-        && same_file
-    {
-        return Ok(());
-    }
-    match dst_meta {
-        Ok(meta) if meta.file_type().is_dir() && !meta.file_type().is_symlink() => {
-            return Err(ManifestError::InjectDestIsDir {
-                path: dst.to_path_buf(),
-            }
-            .into());
-        }
-        Ok(_) => std::fs::remove_file(dst)
-            .with_context(|| format!("removing old inject destination {}", dst.display()))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(e)
-                .with_context(|| format!("inspecting inject destination {}", dst.display()));
-        }
-    }
-    std::fs::copy(src, dst)
-        .with_context(|| format!("inject {} -> {}", src.display(), dst.display()))?;
-    Ok(())
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentCfg {
@@ -1038,7 +996,7 @@ fn validate_carry_forward(entries: &[String]) -> Result<()> {
 }
 
 /// `[agent.codex].api_key` is a name the host resolves against the deployment's OpenAI keys
-/// ([`crate::openshell::run`]); the manifest never names the credential's carrier, so the check is
+/// ([`crate::openshell_turn::run`]); the manifest never names the credential's carrier, so the check is
 /// on the name's character set rather than on an environment variable.
 fn validate_codex_api_key(name: Option<&str>) -> Result<()> {
     let Some(name) = name else {
@@ -2625,46 +2583,6 @@ workflow(type = "playbook", tasks = [options, work])
                 true,
             )
         );
-    }
-
-    #[test]
-    fn apply_inject_copies_and_creates_parents() {
-        let tmp = std::env::temp_dir().join(format!("inject-test-{}", std::process::id()));
-        let src = tmp.join("src.txt");
-        let dst = tmp.join("nested/deeper/dst.txt");
-        std::fs::create_dir_all(&tmp).unwrap();
-        std::fs::write(&src, b"frozen-judge").unwrap();
-        apply_inject(&src, &dst).unwrap();
-        assert_eq!(std::fs::read(&dst).unwrap(), b"frozen-judge");
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn apply_inject_replaces_a_destination_symlink_without_following_it() {
-        use std::os::unix::fs::symlink;
-
-        let tmp = std::env::temp_dir().join(format!("inject-symlink-test-{}", std::process::id()));
-        let src = tmp.join("src.txt");
-        let outside = tmp.join("outside.txt");
-        let dst = tmp.join("dst.txt");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-        std::fs::write(&src, b"frozen-judge").unwrap();
-        std::fs::write(&outside, b"do-not-touch").unwrap();
-        symlink(&outside, &dst).unwrap();
-
-        apply_inject(&src, &dst).unwrap();
-
-        assert!(
-            !std::fs::symlink_metadata(&dst)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-        assert_eq!(std::fs::read(&dst).unwrap(), b"frozen-judge");
-        assert_eq!(std::fs::read(&outside).unwrap(), b"do-not-touch");
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// The synthetic fixture packs under `tests/fixtures/domains/`, the core suite's stand-ins

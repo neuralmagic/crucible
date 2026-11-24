@@ -609,7 +609,7 @@ mod tests {
         let declared: crate::host_env::DeclaredEnv =
             serde_json::from_value(serde_json::json!(["CRUCIBLE_TEST_DECLARED"])).unwrap();
         let env = crate::host_env::HostEnv::resolve(
-            crate::manifest::edition::Edition::Two,
+            crate::edition::Edition::Two,
             "[workflow]",
             &declared,
         )
@@ -697,7 +697,7 @@ mod tests {
         ]))
         .unwrap();
         let env = crate::host_env::HostEnv::resolve(
-            crate::manifest::edition::Edition::Two,
+            crate::edition::Edition::Two,
             "[workflow]",
             &declared,
         );

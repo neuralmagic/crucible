@@ -46,10 +46,10 @@ pub(crate) struct RegisterPlaybookBody {
 /// A request's manifest variant: blank is none, and `Err` names why the engine would refuse it.
 pub(crate) fn requested_variant(
     raw: Option<&str>,
-) -> Result<Option<crucible::manifest::variant::VariantName>, String> {
+) -> Result<Option<crucible::knobs::VariantName>, String> {
     match raw.map(str::trim).filter(|v| !v.is_empty()) {
         None => Ok(None),
-        Some(name) => crucible::manifest::variant::VariantName::parse(name)
+        Some(name) => crucible::knobs::VariantName::parse(name)
             .map(Some)
             .map_err(|e| e.to_string()),
     }

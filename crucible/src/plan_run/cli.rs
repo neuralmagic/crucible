@@ -526,7 +526,7 @@ pub struct RunOpts {
     /// Continue the playbook run the manifest's state dir holds instead of starting one.
     pub resume: bool,
     /// The manifest variant the run reads.
-    pub variant: Option<crate::manifest::variant::VariantName>,
+    pub variant: Option<crate::knobs::VariantName>,
     /// Rerun a finished playbook run from some of its tasks instead of starting afresh.
     pub rerun: Option<Rerun>,
     /// The engine runtime the run's sandboxed turns run on.
@@ -599,7 +599,7 @@ pub fn parse_params(pairs: &[String]) -> Result<BTreeMap<String, String>> {
 fn record_git_memory(paths: &crate::args::Paths) -> Result<()> {
     let start = RunStart::read(&paths.state)?;
     let commits = crucible_vcs::git_memory::task_commits(&paths.workspace, &start.base)?;
-    let fetched = crate::cli::workspace::fetched_blobs(&paths.workspace)?;
+    let fetched = crate::workspace::fetched_blobs(&paths.workspace)?;
     crate::plan::rerun::write_git_memory(&paths.state, &start, &commits, &fetched)?;
     Ok(())
 }
@@ -639,8 +639,13 @@ fn start_rerun(
     let seeded = crate::plan::rerun::plan(plan, &parent.parent, &rerun.from)?;
     let commits = seeded.evidence(plan, &parent)?;
     let fetched = crate::plan::rerun::read_fetched_blobs(&parent.dir)?;
-    let base =
-        crate::cli::setup::restore_for_rerun(manifest, loaded, &parent.start, &commits, &fetched)?;
+    let base = crate::plan_run::setup::restore_for_rerun(
+        manifest,
+        loaded,
+        &parent.start,
+        &commits,
+        &fetched,
+    )?;
     seeded
         .restore_captured(&parent, &paths.state)
         .context("restoring the parent's captured files")?;
@@ -689,14 +694,14 @@ pub fn run(
     let (plan, mut runner, events): (ValidPlan, Box<dyn TaskRunner>, Option<std::fs::File>) =
         match (path, manifest) {
             (_, Some(m)) => {
-                let state = crate::cli::setup::state_dir(m);
+                let state = crate::plan_run::setup::state_dir(m);
                 let resumed = resume.then(|| RunStart::read(&state)).transpose()?;
                 let start = if resume || rerun.is_some() {
-                    crate::cli::setup::Start::Continues
+                    crate::plan_run::setup::Start::Continues
                 } else {
-                    crate::cli::setup::Start::Fresh
+                    crate::plan_run::setup::Start::Fresh
                 };
-                let (mut prepared, loaded) = crate::cli::setup::prep_plan_runner_with_params(
+                let (mut prepared, loaded) = crate::plan_run::setup::prep_plan_runner_with_params(
                     m,
                     variant.as_ref(),
                     params,
@@ -752,7 +757,7 @@ pub fn run(
                                 workflow.workflow_type,
                             )
                             .with_persistent_sessions();
-                            crate::plan::template::iteration_template(Some(workflow), &caps)?
+                            crate::plan_run::template::iteration_template(Some(workflow), &caps)?
                         }
                     }
                 };
@@ -762,7 +767,7 @@ pub fn run(
                 match (resumed, &rerun) {
                     (Some(resumed), _) => {
                         resumed.continues(run, &plan, variant.as_ref())?;
-                        crate::cli::setup::restore_pristine(m, &loaded, &resumed.base)?;
+                        crate::plan_run::setup::restore_pristine(m, &loaded, &resumed.base)?;
                         prior = Some(crate::plan::resume::fold_log(
                             &session_log,
                             &plan,
@@ -833,7 +838,7 @@ pub fn run(
     // its last line.
     let events = events.filter(|_| !prior.as_ref().is_some_and(|p| p.shut_down));
     // A run with an ingest surface can open decision requests, which is the `human` capability.
-    let desk = crate::plan::desk::HttpDesk::from_env(events.as_ref());
+    let desk = crate::plan_run::desk::HttpDesk::from_env(events.as_ref());
     let mut caps = caps.clone();
     if desk.is_some() {
         caps.insert(crucible::plan::ir::NEEDS_HUMAN.to_owned());
@@ -861,7 +866,7 @@ pub fn run(
         if !prior.as_ref().is_some_and(|p| p.admitted) {
             append(
                 f,
-                &crate::plan::events::plan_admitted_event(
+                &crate::plan_run::events::plan_admitted_event(
                     &plan,
                     series_entry.as_ref().and_then(Option::as_ref),
                 ),
@@ -871,7 +876,7 @@ pub fn run(
                     if let Some(from) = prior.reused.get(&task.name) {
                         append(
                             f,
-                            &crate::plan::events::reused_result_event(
+                            &crate::plan_run::events::reused_result_event(
                                 plan.plan().version,
                                 &task,
                                 result,
@@ -1002,7 +1007,7 @@ pub fn run(
             if let Some(f) = &events {
                 append(
                     f,
-                    &crate::plan::events::task_result_event(
+                    &crate::plan_run::events::task_result_event(
                         plan.plan().version,
                         0,
                         task,
@@ -1111,7 +1116,7 @@ fn elapsed(secs: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::variant::VariantName;
+    use crate::knobs::VariantName;
 
     #[test]
     fn a_tasks_wall_time_reads_in_the_largest_unit_it_reaches() {
@@ -1679,7 +1684,7 @@ mod tests {
     #[test]
     fn wire_events_round_trip_through_the_contract_codec() {
         let plan = Plan::from_toml_str(SRC).unwrap().validate().unwrap();
-        let admitted = crate::plan::events::plan_admitted_event(&plan, None);
+        let admitted = crate::plan_run::events::plan_admitted_event(&plan, None);
         let back =
             crate::report::session::decode(&crate::report::session::encode(&admitted)).unwrap();
         match back {
@@ -1708,7 +1713,7 @@ mod tests {
             repairs: Vec::new(),
         };
         let back = crate::report::session::decode(&crate::report::session::encode(
-            &crate::plan::events::task_result_event(1, 0, t, &r, None, 0.0),
+            &crate::plan_run::events::task_result_event(1, 0, t, &r, None, 0.0),
         ))
         .unwrap();
         match back {
@@ -2069,7 +2074,7 @@ workflow(type = "playbook", tasks = [pick, gate, a, b, lint, optional, publish])
         )
         .expect_err("the run cannot start its server");
 
-        assert!(error.is::<crate::cli::setup::EndedAtSetup>(), "{error:#}");
+        assert!(error.is::<crate::setup::EndedAtSetup>(), "{error:#}");
         let log = std::fs::read_to_string(dir.join("state/session.jsonl")).unwrap();
         let last = log.lines().last().and_then(crate::report::session::decode);
         let Some(crate::report::session::SessionEvent::Shutdown { outcome, reason }) = last else {

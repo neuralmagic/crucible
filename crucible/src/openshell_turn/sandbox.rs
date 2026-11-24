@@ -1,23 +1,13 @@
 //! The per-workspace sandbox name plus the argv for the file-transfer subcommands that stay on the
 //! `openshell` CLI. Sandbox lifecycle, exec, policy and logs moved to the gateway's gRPC API
-//! ([`super::grpc`]); only upload/download remain here, because file transfer is SSH-tar inside
-//! the CLI with no equivalent RPC. The spawning lives in [`super::run`]; this module just builds
+//! ([`crate::openshell::grpc`]); only upload/download remain here, because file transfer is SSH-tar inside
+//! the CLI with no equivalent RPC. The spawning lives in [`crate::openshell_turn::run`]; this module just builds
 //! the argv after the `openshell` program name.
 //!
 //! The per-turn targeted upload (`upload <name> <local> <dest>`) places a rendered cluster cred
 //! straight at its sandbox path, never through the workspace/repo.
 
-/// One random identity for a run's sandboxes, minted when the run's broker starts. Kubernetes
-/// containers commonly reuse the same small PID, so a PID cannot distinguish a relaunched run
-/// from the sandbox it left behind.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RunId(String);
-
-impl RunId {
-    pub fn mint() -> Self {
-        RunId(uuid::Uuid::now_v7().simple().to_string())
-    }
-}
+use crate::args::RunId;
 
 /// The gateway's cap on a sandbox name: three routable names and two `--` delimiters have to fit
 /// one 63-character DNS label.
@@ -30,7 +20,7 @@ const _: () = assert!("ci-".len() + 16 == MAX_NAME_LEN);
 /// gateway. The broker gets this exact string at spawn (`BROKER_SANDBOX_NAME`) rather than
 /// re-deriving it; neither component is a durable ID.
 pub fn name_for(workspace: &std::path::Path, run: &RunId) -> String {
-    name_for_identity(workspace, &run.0)
+    name_for_identity(workspace, run.as_str())
 }
 
 /// An invocation-specific sandbox identity within the gateway's DNS limit.
@@ -86,7 +76,7 @@ pub fn download_args(name: &str, sandbox_path: &str, local: &str) -> Vec<String>
 
 #[cfg(test)]
 mod tests {
-    use crate::openshell::sandbox::*;
+    use crate::openshell_turn::sandbox::*;
 
     #[test]
     fn name_for_is_per_workspace_and_run() {

@@ -110,7 +110,7 @@ pub struct PackImport {
     pub resolved_by: Option<String>,
     pub resolved_at: Option<String>,
     /// The manifest variant the import previews and registers; `None` is the base manifest.
-    pub variant: Option<crucible::manifest::variant::VariantName>,
+    pub variant: Option<crucible::knobs::VariantName>,
 }
 
 const COLUMNS: &str = "id, repo, git_ref, path, rev, tree_digest, params_schema, schema_digest, \
@@ -192,7 +192,7 @@ pub async fn propose(
     source: PackSource<'_>,
     actor: Option<&str>,
     owner: &crate::authz::model::Principal,
-    variant: Option<crucible::manifest::variant::VariantName>,
+    variant: Option<crucible::knobs::VariantName>,
 ) -> Result<Proposed, ImportError> {
     validate_path(source.path).map_err(RegisterError::Invalid)?;
     let core_rev = crate::playbooks::registry::core_rev()?;
@@ -602,7 +602,7 @@ mod tests {
              [[variant.offline.secret]]\nname = \"fixture_token\"\n"
         );
         let repo = git_pack_repo(dir.path(), &manifest, WORKFLOW_NO_PARAMS);
-        let offline = crucible::manifest::variant::VariantName::parse("offline").expect("name");
+        let offline = crucible::knobs::VariantName::parse("offline").expect("name");
 
         let import = propose(
             &pool,
@@ -657,7 +657,7 @@ mod tests {
             source(&repo),
             Some("agent"),
             &crate::authz::model::Principal::platform(),
-            Some(crucible::manifest::variant::VariantName::parse("online").expect("name")),
+            Some(crucible::knobs::VariantName::parse("online").expect("name")),
         )
         .await;
         assert!(

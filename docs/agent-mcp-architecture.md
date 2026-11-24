@@ -416,9 +416,9 @@ The steps are these:
 4. The engine reads `CRUCIBLE_OPENSHELL_GATEWAY_URL` and talks to the remote gateway over mTLS
    (`crucible/src/openshell/gateway.rs:422-437`). It creates one token-grant provider, one egress
    entry and one `.mcp.json` entry for each server in `CRUCIBLE_AGENT_SERVERS` the same way, after
-   starting a server whose transport is the loop pod (`crucible/src/openshell/agent_servers.rs`). A provider holds no secret and gives the sandbox no
-   placeholder (`crucible/src/openshell/provider.rs:368`).
-5. After `CreateSandbox`, the engine binds the sandbox (`crucible/src/openshell/run.rs:469`). It
+   starting a server whose transport is the loop pod (`crucible/src/openshell_turn/agent_servers.rs`). A provider holds no secret and gives the sandbox no
+   placeholder (`crucible/src/openshell_turn/provider.rs:368`).
+5. After `CreateSandbox`, the engine binds the sandbox (`crucible/src/openshell_turn/run.rs:469`). It
    binds only when the loop pod carries `CRUCIBLE_AGENT_TOKEN_ENDPOINT`. A failed bind does not
    fail the turn. The sandbox then gets no token.
 6. The bind route trusts only the pod token of that run (`crucible-controller/src/agent_auth/bindings.rs:298`).
@@ -1641,7 +1641,7 @@ with a stock OIDC provider:
 an entry of `CRUCIBLE_AGENT_SERVERS` like any other, named `buildit`, whose transport is the loop
 pod (`local.buildit`, carrying its run issuer, builder namespace and push repository). The engine
 starts it before it creates the providers (`Granted::start_local`,
-`crucible/src/openshell/agent_servers.rs`), and gives it a provider, an egress entry and a
+`crucible/src/openshell_turn/agent_servers.rs`), and gives it a provider, an egress entry and a
 `.mcp.json` entry the way it does every server. It listens on the port of its URL,
 `[buildit] url`, by default `http://host.openshell.internal:8848/mcp`, which is the loop Service.
 The supervisor injects a token for that audience on egress to that host and port only.
@@ -1655,7 +1655,7 @@ image` names one. `docker.yml` publishes `ghcr.io/neuralmagic/crucible-buildit` 
 build (`docker/Containerfile.buildit`), and the controller reads the deploy profile at each
 dispatch, so moving the pin rolls buildit for the next runs with no new loop image.
 
-The engine starts it with these arguments (`Buildit::args`, `crucible/src/openshell/buildit.rs`):
+The engine starts it with these arguments (`Buildit::args`, `crucible/src/openshell_turn/buildit.rs`):
 
 | Argument | Value |
 | --- | --- |
@@ -1798,7 +1798,7 @@ push_secret = "registry"      # a [[secret]] of kind registry_authfile
 The controller then hands that run a `BuilditSite` with the pack's `push_repo` and
 `push_authfile`, the path the secret's binding projects it to in the loop pod
 (`ServerSpec::for_run`, `crucible/src/deploy/servers.rs`), and the engine starts `buildit` with
-those over the profile's (`crucible/src/openshell/buildit.rs`). The run's tools panel shows the
+those over the profile's (`crucible/src/openshell_turn/buildit.rs`). The run's tools panel shows the
 repository it got.
 
 Otherwise the authfile is the loop pod's `[secrets] push_authfile` Secret, mounted in the loop pod only
@@ -1825,7 +1825,7 @@ builder namespace, the queue and the push repository are the same as over HTTP.
 The engine exports the socket as `CRUCIBLE_BUILDIT_SOCKET` to `command` and `evaluate` tasks only
 (`ShellRunner`, `crucible/src/plan/runner.rs`). Agent turns and sandboxes never get it, and route and
 report tasks spawn nothing. Before such a task runs, the engine starts the run's buildit if the
-controller granted one (`run_buildit`, `crucible/src/openshell/agent_servers.rs`), and the task
+controller granted one (`run_buildit`, `crucible/src/openshell_turn/agent_servers.rs`), and the task
 fails as a transport error when buildit does not come up. With the variable set, `buildit build`,
 `status`, `run`, `push`, `logs` and `clean` call the socket. Each prints one JSON object on stdout
 and exits nonzero on failure:
@@ -2060,7 +2060,7 @@ The controller sets these. Do not set them by hand.
 
 The engine refuses a partial set: servers without the token endpoint or the SVID audience fail
 the turn, and so does a list that does not parse or a server URL without an http(s) host and port
-(`AgentServersError`, `crucible/src/openshell/agent_servers.rs`). No list, or an empty one, gives
+(`AgentServersError`, `crucible/src/openshell_turn/agent_servers.rs`). No list, or an empty one, gives
 the sandbox no provider, no egress entry and no `.mcp.json` entry. A granted server named like the
 turn's broker or one of its `[mcp]` servers fails the turn with an error naming it, rather than one
 silently replacing the other in `.mcp.json` (`AgentServers::check_names`).

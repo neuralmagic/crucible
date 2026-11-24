@@ -18,7 +18,6 @@ use crate::agent::activity::ActivityFeed;
 use crate::agent::event::{AgentEvent, RawStream};
 use crate::agent::sandbox_env::{EnvSource, SandboxEnv, process_env};
 use crate::agent::turn::{TurnFailure, TurnOutcome};
-use crate::agent::{self};
 use crate::args::Paths;
 use crate::manifest::AgentBackend;
 use anyhow::{Context, Result};
@@ -408,7 +407,7 @@ fn run_grounded_turn(
     // caps and byte budget, and always before the verdict marker `run` prints last.
     let pricing = args.pricing();
     let mut activity = ActivityFeed::new(crucible_contract::RANK_ACTIVITY_MARKER, a.marker);
-    let outcome = agent::run_turn(&args, &paths, prompt, false, |_line, _stream, ev| {
+    let outcome = crate::turn::run_turn(&args, &paths, prompt, false, |_line, _stream, ev| {
         if let Some(ev) = ev {
             activity.observe(&pricing, ev);
         }

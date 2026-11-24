@@ -14,7 +14,6 @@ use crate::agent::harness::{Backend, McpServer, SandboxAuth, SeedFile, TurnArtif
 use crate::agent::inference::InferenceEnv;
 use crate::args::TurnAgent;
 use crate::knobs::{Harness, ReasoningEffort};
-use crate::openshell::provider::CodexAuth;
 use crate::turn_trace::{self, GenAiRecord, ToolCall, ToolInvocation};
 use crucible::harness::HarnessSpec;
 use crucible_harness::codex_json::CodexJsonParser;
@@ -67,6 +66,29 @@ fn reasoning_effort(effort: ReasoningEffort) -> &'static str {
         ReasoningEffort::Medium => "medium",
         ReasoningEffort::High | ReasoningEffort::Xhigh | ReasoningEffort::Max => "high",
     }
+}
+
+/// The short-lived material a codex sandbox is handed, via its seeded `$CODEX_HOME/auth.json`:
+/// one access token, the account it belongs to, and the id token
+/// codex echoes back. No refresh token, by construction: the loop process is the single
+/// refresher, so a sandbox that outlives its access token fails loudly instead of racing the
+/// host for a rotation. No gateway provider is involved (provider env resolves to a placeholder
+/// at the L7 proxy and codex's transport is an L4 WebSocket, so codex needs the real bytes).
+///
+/// This is the ChatGPT-subscription auth path. API-key turns bypass it, while deployments that
+/// provide `CODEX_CREDENTIALS` retain refresh and rotation behavior.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexToken {
+    pub access_token: String,
+    pub account_id: String,
+    pub id_token: String,
+}
+
+/// The two authentication modes Crucible can seed into a Codex sandbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexAuth {
+    ApiKey(String),
+    ChatGpt(CodexToken),
 }
 
 /// `$CODEX_HOME/auth.json` in the shape Codex expects for the selected auth mode.
@@ -757,7 +779,7 @@ mod tests {
 
     #[test]
     fn the_seeded_auth_json_carries_chatgpt_token_fields() {
-        let auth = CodexAuth::ChatGpt(crate::openshell::provider::CodexToken {
+        let auth = CodexAuth::ChatGpt(CodexToken {
             access_token: "access-jwt".to_string(),
             account_id: "acct-1".to_string(),
             id_token: "id-jwt".to_string(),
