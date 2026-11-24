@@ -1,11 +1,15 @@
 name: Rerun lost runner
 
-# Rerun the failed jobs of a CI or Docker run when every unsuccessful job is a self-hosted runner
-# that lost contact with GitHub (a reclaimed spot instance), or the build-and-test gate that fails
-# with them. Any other failure leaves the run alone. At most two reruns per run.
+# Rerun the failed jobs of a CI, Docker, or Formal run when every unsuccessful job is a runner
+# that died under the run (a reclaimed spot instance: either the self-hosted lost-contact
+# signature, or a hosted runner whose service stopped, which fails the in-flight step with exit
+# 143 and cancels the run), or the build-and-test gate that fails with them. Any other failure
+# leaves the run alone, and so does a run that a newer run for the same workflow and branch has
+# already superseded (rerunning it would cancel that newer run through the workflow's
+# concurrency group). At most two reruns per run.
 on:
   workflow_run:
-    workflows: [CI, Docker]
+    workflows: [CI, Docker, Formal]
     types: [completed]
 
 permissions:
@@ -14,7 +18,13 @@ permissions:
 
 jobs:
   rerun:
-    if: github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.run_attempt < 3
+    # `cancelled` is admitted because a runner-service stop fails the in-flight step (exit 143)
+    # and then cancels the run; the annotation gate below still leaves ordinary cancellations (a
+    # push superseding the run) alone.
+    if: >-
+      (github.event.workflow_run.conclusion == 'failure' ||
+       github.event.workflow_run.conclusion == 'cancelled') &&
+      github.event.workflow_run.run_attempt < 3
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -23,15 +33,26 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
         run: |
           set -euo pipefail
           unsuccessful=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/attempts/$ATTEMPT/jobs?per_page=100" \
             --jq '.jobs[] | select(.conclusion != "success" and .conclusion != "skipped") | "\(.id) \(.name)"')
+          meta=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" \
+            --jq '[.head_branch, .created_at] | @tsv')
+          read -r branch created <<< "$meta"
+          export RUN_BRANCH="$branch" RUN_CREATED="$created"
+          newer=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?branch=$branch&per_page=50" \
+            --jq '[.workflow_runs[] | select(.name == $ENV.WORKFLOW_NAME and .created_at > $ENV.RUN_CREATED)] | length')
+          if [ "$newer" != 0 ]; then
+            echo "a newer $WORKFLOW_NAME run exists for $branch; leaving run $RUN_ID attempt $ATTEMPT alone"
+            exit 0
+          fi
           lost=0
           while read -r id name; do
             [ -n "$id" ] || continue
             if [ "$(gh api "repos/$GITHUB_REPOSITORY/check-runs/$id/annotations" \
-              --jq 'any(.[]; .message | startswith("The self-hosted runner lost communication with the server"))')" = true ]; then
+              --jq 'any(.[]; .message | startswith("The self-hosted runner lost communication with the server") or startswith("Process completed with exit code 143."))')" = true ]; then
               echo "$name: lost its runner"
               lost=$((lost + 1))
             elif [ "$name" != build-and-test ]; then
