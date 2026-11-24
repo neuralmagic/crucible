@@ -384,7 +384,7 @@ fn run_turn_with(
                     break;
                 }
             }
-            report_chain(&chain, &mut sink);
+            report_chain(Some(&redactor), &chain, &mut sink);
             stopped = chain.into_stopped();
         }
     }
@@ -470,7 +470,7 @@ pub(crate) fn pump_stream(
             break;
         }
     }
-    pump.finish(sink)
+    pump.finish(redactor, sink)
 }
 
 impl Args {

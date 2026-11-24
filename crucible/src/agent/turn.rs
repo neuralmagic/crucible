@@ -225,7 +225,7 @@ impl StreamPump {
         };
         for ev in chain_events {
             if let Some(reason) = chain.observe(ev) {
-                emit(&stop_event(reason), sink);
+                emit(redactor, &stop_event(reason), sink);
             }
         }
     }
@@ -239,9 +239,10 @@ impl StreamPump {
     /// reports reach `sink`.
     pub(crate) fn finish(
         self,
+        redactor: Option<&crucible_harness::redact::Redactor>,
         sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
     ) -> PumpEnd {
-        report_chain(&self.chain, sink);
+        report_chain(redactor, &self.chain, sink);
         PumpEnd {
             cost: self.cost,
             stopped: self.chain.into_stopped(),
@@ -251,12 +252,14 @@ impl StreamPump {
 
 /// Send each of `chain`'s end-of-turn reports to `sink` as a `Log` event.
 pub(crate) fn report_chain(
+    redactor: Option<&crucible_harness::redact::Redactor>,
     chain: &ToolChain,
     sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) {
     for (label, value) in chain.reports() {
         tracing::info!(label, report = %value, "tool chain report");
         emit(
+            redactor,
             &AgentEvent::Log {
                 level: "info".into(),
                 label: label.into(),
@@ -267,9 +270,19 @@ pub(crate) fn report_chain(
     }
 }
 
-fn emit(ev: &AgentEvent, sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>)) {
-    let human = human_line(ev).unwrap_or_default();
-    sink(&human, RawStream::Stderr, Some(ev));
+fn emit(
+    redactor: Option<&crucible_harness::redact::Redactor>,
+    ev: &AgentEvent,
+    sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
+) {
+    // Everything the pump hands the sink goes through one scrubbing point, the stop event and
+    // the chain reports included: a wedge report embeds the raw tool summaries it stopped on.
+    let scrubbed = match redactor {
+        Some(redactor) => redactor.event(ev),
+        None => std::borrow::Cow::Borrowed(ev),
+    };
+    let human = human_line(&scrubbed).unwrap_or_default();
+    sink(&human, RawStream::Stderr, Some(&scrubbed));
 }
 
 /// The run-log event for a tool chain stop.
@@ -443,7 +456,7 @@ mod tests {
                 break;
             }
         }
-        let end = pump.finish(&mut |_l: &str, _s: RawStream, ev: Option<&AgentEvent>| {
+        let end = pump.finish(None, &mut |_l: &str, _s: RawStream, ev: Option<&AgentEvent>| {
             events.extend(ev.cloned())
         });
         (end, read, events)
@@ -478,7 +491,7 @@ mod tests {
             for line in lines {
                 pump.push(line, true, None, &mut sink);
             }
-            (pump.finish(&mut sink), logged)
+            (pump.finish(None, &mut sink), logged)
         };
         let (end, logged) = run(&polls);
         assert!(
@@ -499,6 +512,54 @@ mod tests {
             .flat_map(|i| claude_call(i, "buildit status b-1", Some(("0% built", false))))
             .collect();
         assert!(matches!(run(&same).0.stopped, Some(StopReason::Wedged(_))));
+    }
+
+    /// The wedge stop event embeds the raw tool summaries it stopped on; through the pump's
+    /// redactor it must reach the sink masked, like every other event and line the pump emits.
+    #[test]
+    fn a_wedge_stop_reaches_the_sink_masked() {
+        use crucible_harness::redact::{Redactor, SecretRules};
+        let rules = SecretRules::default();
+        assert!(rules.ready(), "builtin rules compiled");
+        let redactor = Redactor::with_rules(rules);
+        let secret = "ghp_R2d9sXbQk7LmP4vT8wYzA1cE6fH3jN0uKoIq";
+        let lines: Vec<String> = (0..4)
+            .flat_map(|i| claude_call(i, &format!("echo token {secret}"), Some(("boom", true))))
+            .collect();
+        let mut pump = StreamPump::new(
+            Box::new(StreamJsonParser::default()),
+            None,
+            guard(3),
+            pricing(),
+        );
+        let mut seen = Vec::new();
+        for line in &lines {
+            pump.push(line, false, Some(&redactor), &mut |line: &str,
+                                                          _stream: RawStream,
+                                                          ev: Option<
+                &AgentEvent,
+            >| {
+                seen.push(format!("{line} {ev:?}"));
+            });
+            if pump.stopped().is_some() {
+                break;
+            }
+        }
+        let end = pump.finish(
+            Some(&redactor),
+            &mut |_l: &str, _s: RawStream, ev: Option<&AgentEvent>| {
+                if let Some(ev) = ev {
+                    seen.push(format!("{ev:?}"));
+                }
+            },
+        );
+        assert!(end.stopped.is_some(), "the guard trips");
+        let rendered = seen.join("\n");
+        assert!(!rendered.contains(secret), "leaked: {rendered}");
+        assert!(
+            rendered.contains(crucible_harness::redact::MASK),
+            "{rendered}"
+        );
     }
 
     #[test]

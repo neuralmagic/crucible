@@ -136,8 +136,8 @@ mod wire {
         #[serde(rename = "total_cost_usd", default)]
         pub total_cost_usd: Option<f64>,
         #[serde(rename = "modelUsage", default)]
-        pub model_usage: Option<BTreeMap<&'a str, ModelUsage>>,
-        #[serde(default)]
+        pub model_usage: Option<BTreeMap<&'a str, Map<ModelUsage>>>,
+        #[serde(default, deserialize_with = "map_only")]
         pub event: Option<Event<'a>>,
     }
 
@@ -231,7 +231,7 @@ mod wire {
     #[derive(Default)]
     pub(super) enum Message<'a> {
         User {
-            content: Vec<ToolResultBlock<'a>>,
+            content: Vec<Map<ToolResultBlock<'a>>>,
         },
         Str(Cow<'a, str>),
         #[default]
@@ -249,7 +249,7 @@ mod wire {
 
         /// The user message's content blocks; `None` for every other shape, as the Value walk's
         /// `as_array` gate reads it.
-        pub fn user_content(&self) -> Option<&[ToolResultBlock<'_>]> {
+        pub fn user_content(&self) -> Option<&[Map<ToolResultBlock<'_>>]> {
             match self {
                 Message::User { content } => Some(content),
                 _ => None,
@@ -281,7 +281,7 @@ mod wire {
                     let mut content = Vec::new();
                     while let Some(key) = map.next_key::<&'de str>()? {
                         if key == "content" {
-                            content = map.next_value()?;
+                            content = map.next_value::<Vec<Map<ToolResultBlock<'de>>>>()?;
                         } else {
                             map.next_value::<IgnoredAny>()?;
                         }
@@ -299,19 +299,65 @@ mod wire {
         }
     }
 
+    /// Deserialize `Option<T>` where `T` must come from a JSON object. Derived structs also
+    /// accept arrays positionally — every field defaulted lets a short array parse — which the
+    /// Value walk passes through as raw; this gate keeps the typed path to match-or-decline.
+    /// `null` and a missing field stay `None`, as the plain `Option` reads them.
+    fn map_only<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: Deserialize<'de>,
+    {
+        struct SomeMap<T>(std::marker::PhantomData<T>);
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for SomeMap<T> {
+            type Value = Option<T>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("an object or null")
+            }
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+            fn visit_some<D2>(self, deserializer: D2) -> Result<Self::Value, D2::Error>
+            where
+                D2: Deserializer<'de>,
+            {
+                struct FromMap<T>(std::marker::PhantomData<T>);
+                impl<'de, T: Deserialize<'de>> Visitor<'de> for FromMap<T> {
+                    type Value = T;
+                    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                        f.write_str("a JSON object")
+                    }
+                    fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+                    where
+                        A: MapAccess<'de>,
+                    {
+                        T::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    }
+                }
+                deserializer
+                    .deserialize_map(FromMap(std::marker::PhantomData))
+                    .map(Some)
+            }
+        }
+        deserializer.deserialize_option(SomeMap(std::marker::PhantomData))
+    }
+
     #[derive(Deserialize)]
     pub(super) struct Event<'a> {
         #[serde(rename = "type", default)]
         pub kind: Option<&'a str>,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "map_only")]
         pub content_block: Option<ContentBlock<'a>>,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "map_only")]
         pub delta: Option<Delta<'a>>,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "map_only")]
         pub message: Option<StartMessage>,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "map_only")]
         pub usage: Option<Usage>,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "map_only")]
         pub error: Option<StreamError<'a>>,
     }
 
@@ -376,6 +422,34 @@ mod wire {
         pub cache_write: Option<u64>,
     }
 
+    /// `T` deserialized only from a JSON object, for the positions a plain `T` would also
+    /// accept positionally: sequence elements and map values.
+    pub(super) struct Map<T>(pub T);
+
+    impl<'de, T: Deserialize<'de>> Deserialize<'de> for Map<T> {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            struct FromMap<T>(std::marker::PhantomData<T>);
+            impl<'de, T: Deserialize<'de>> Visitor<'de> for FromMap<T> {
+                type Value = T;
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    f.write_str("a JSON object")
+                }
+                fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+                where
+                    A: MapAccess<'de>,
+                {
+                    T::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                }
+            }
+            deserializer
+                .deserialize_map(FromMap(std::marker::PhantomData))
+                .map(Map)
+        }
+    }
+
     #[derive(Deserialize)]
     pub(super) struct ToolResultBlock<'a> {
         #[serde(rename = "type", default)]
@@ -392,7 +466,7 @@ mod wire {
     #[derive(Default)]
     pub(super) enum ResultContent<'a> {
         Str(Cow<'a, str>),
-        Blocks(Vec<TextBlock<'a>>),
+        Blocks(Vec<Map<TextBlock<'a>>>),
         #[default]
         Absent,
     }
@@ -404,8 +478,8 @@ mod wire {
                 ResultContent::Str(s) => s.to_string(),
                 ResultContent::Blocks(blocks) => blocks
                     .iter()
-                    .filter(|b| b.kind == Some("text"))
-                    .map(|b| b.text.as_deref().unwrap_or(""))
+                    .filter(|b| b.0.kind == Some("text"))
+                    .map(|b| b.0.text.as_deref().unwrap_or(""))
                     .collect::<Vec<_>>()
                     .join(
                         "
@@ -454,6 +528,7 @@ mod wire {
         }
     }
 
+    // The Blocks elements flow through `Map` at the visitor below.
     #[derive(Deserialize)]
     pub(super) struct TextBlock<'a> {
         #[serde(rename = "type", default)]
@@ -480,7 +555,10 @@ impl LineFormat for StreamJsonParser {
         if text.is_empty() {
             return;
         }
-        if let Ok(parsed) = serde_json::from_str::<wire::Line<'_>>(text)
+        // A line that is not a JSON object (an array or a bare scalar, which the derived
+        // structs would otherwise parse positionally) is the Value walk's Raw.
+        if text.starts_with('{')
+            && let Ok(parsed) = serde_json::from_str::<wire::Line<'_>>(text)
             && self.typed_line(parsed, text, out)
         {
             return;
@@ -705,7 +783,8 @@ impl StreamJsonParser {
         let Some(blocks) = message.user_content() else {
             return;
         };
-        for block in blocks {
+        for wrapper in blocks {
+            let block = &wrapper.0;
             if block.kind != Some("tool_result") {
                 continue;
             }
@@ -741,12 +820,13 @@ impl StreamJsonParser {
 
     fn typed_turn_tokens(
         &self,
-        models: &Option<std::collections::BTreeMap<&str, wire::ModelUsage>>,
+        models: &Option<std::collections::BTreeMap<&str, wire::Map<wire::ModelUsage>>>,
         cost_usd: f64,
     ) -> Option<AgentEvent> {
         let models = models.as_ref()?;
         let mut tokens = Tokens::default();
         for usage in models.values() {
+            let usage = &usage.0;
             tokens.input += usage.input.unwrap_or(0);
             tokens.output += usage.output.unwrap_or(0);
             tokens.cache_read += usage.cache_read.unwrap_or(0);
@@ -1224,15 +1304,29 @@ mod tests {
             r#"{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_1","name":"Bash"}}}"#,
             r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"done"}]}}"#,
             "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"quoted \\\"text\\\" here\\n\"}}}",
+            // Positional-array shapes: derived structs would parse these field-by-field,
+            // so the map-only gates must route every one to the Value walk's Raw.
+            r#"["result","success"]"#,
+            r#"["system","init","m"]"#,
+            r#"{"type":"stream_event","event":["error"]}"#,
+            r#"{"type":"stream_event","event":{"type":"message_delta","usage":["x"]}}"#,
+            r#"{"type":"user","message":{"content":[["tool_result","toolu_1",true,"boom"]]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t","content":[["text","hi"]]}]}}"#,
+            r#"{"type":"result","subtype":"success","modelUsage":{"m":[1,2,3,4]}}"#,
+            r#""just a string""#,
         ]);
         let mut typed = StreamJsonParser::default();
         let mut value = StreamJsonParser::default();
-        let mut parsed_typed = 0usize;
-        for line in &lines {
-            if serde_json::from_str::<wire::Line<'_>>(line.trim()).is_ok() {
-                parsed_typed += 1;
-            }
-        }
+        // The real corpus must ride the fast path; the array shapes must decline it (their
+        // typed parse, if any, is exactly the bug this test pins).
+        let fixtures: Vec<&str> = include_str!("testdata/claude_stream_hello.jsonl")
+            .lines()
+            .chain(include_str!("testdata/claude_stream_tools.jsonl").lines())
+            .collect();
+        let parsed_typed = fixtures
+            .iter()
+            .filter(|l| serde_json::from_str::<wire::Line<'_>>(l.trim()).is_ok())
+            .count();
         let events_typed: Vec<_> = lines.iter().flat_map(|l| typed.push(l)).collect();
         let events_value: Vec<_> = lines
             .iter()
@@ -1240,9 +1334,9 @@ mod tests {
             .collect();
         assert_eq!(events_typed, events_value, "the fast path diverged");
         assert!(
-            parsed_typed * 10 >= lines.len() * 9,
+            parsed_typed * 10 >= fixtures.len() * 9,
             "the fast path must carry the corpus: {parsed_typed}/{}",
-            lines.len()
+            fixtures.len()
         );
     }
 
