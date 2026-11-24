@@ -1633,6 +1633,7 @@ dependencies = [
  "axum",
  "crucible-contract",
  "jiff",
+ "kingfisher-rules",
  "kingfisher-scanner",
  "reqwest",
  "serde_json",
