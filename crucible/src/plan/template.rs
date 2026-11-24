@@ -9,7 +9,7 @@ use crate::plan::ir::{
 use crate::plan::workflow::{WorkflowCaps, WorkflowCfg, WorkflowType};
 
 /// Build and admit the default or authored iteration graph.
-pub(crate) fn iteration_template(
+pub fn iteration_template(
     workflow: Option<&WorkflowCfg>,
     caps: &WorkflowCaps,
 ) -> Result<ValidPlan> {

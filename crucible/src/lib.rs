@@ -10,6 +10,7 @@ pub mod deploy;
 pub mod diagram;
 pub mod duration;
 pub mod errors;
+pub mod evidence;
 pub mod exposure;
 pub mod flow;
 pub mod harness;
@@ -19,9 +20,14 @@ pub mod knobs;
 pub mod manifest;
 pub mod openshell;
 pub mod outputs;
+pub mod paths;
 pub mod plan;
 pub mod task_judge;
 pub mod turn_trace;
+pub mod workspace;
+
+#[cfg(test)]
+mod test_fixtures;
 
 /// Support for tests in this crate and the binary that mutate the process environment.
 #[doc(hidden)]

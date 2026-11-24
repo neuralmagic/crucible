@@ -144,6 +144,31 @@ If the controller runs loops in other clusters (spokes):
   `crucible-controller cluster-snapshot` runs on the spoke as a CronJob and posts to the push
   endpoint of the hub with a bearer token that the hub lists in `CONTROLLER_PUSH_TOKENS`.
 
+### Clusters you do not control: `crucible-runner`
+
+`crucible-runner` runs a playbook's command, evaluate and report tasks and its routes decided by
+a task's output. It has no agent harness and no model client, so nothing in its environment makes
+it call a model (ADR-0079).
+
+- `crucible-runner plan run` takes the `crucible plan run` flags a pod wrapper and the desktop
+  app pass, so either can spawn it in place of the full engine. `--harness` and `--model` are
+  refused.
+- A pack with an agent task, a model-decided route, a required human-decided route or
+  `[workflow].servers` is refused when the run starts, before its workspace is set up.
+  `crucible check --engine runner` reports the same refusals.
+- It uploads the run's session, files and commits to the controller under the run's own token,
+  and a rerun fetches its parent the same way. It reads no other credential. Without the token
+  it uploads nothing and the pod prints the session for the controller to scrape.
+- It starts the run's buildit when the controller granted one, so a command task can build on
+  the cluster. It does not serve the git sidecar to tasks.
+
+Build it with `just runner`. No image ships it yet. A controller that runs playbooks itself
+(`CONTROLLER_PLAYBOOK_EXECUTOR=local`) spawns the engine `CRUCIBLE_BIN` names.
+
+The controller still delivers the inference document and the run's servers to every pod it
+dispatches, whichever binary the pod runs. Running `crucible-runner` does not keep those off a
+cluster.
+
 ## Agent tokens
 
 The controller can act as the OAuth authorization server for sandboxed agents. An OpenShell

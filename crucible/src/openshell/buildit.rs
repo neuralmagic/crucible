@@ -1,8 +1,7 @@
 //! The run's buildit, started in the loop pod when the controller granted the run a server served
 //! there by `buildit mcp`: it runs builder pods in the profile's buildit namespace from the run's
 //! own sandboxes, through the run's gateway, and takes only run tokens the controller issued for
-//! this run. Its grant, egress and `.mcp.json` entry are any agent server's
-//! ([`crate::openshell::agent_servers`]).
+//! this run. Its grant, egress and `.mcp.json` entry are any agent server's.
 
 use anyhow::{Context, Result};
 use crucible_contract::agent_servers::{BuilditSite, CacheWriters, NodeArch};
@@ -157,7 +156,7 @@ impl Buildit<'_> {
     }
 
     fn listening(&self, probe: &str) -> bool {
-        crate::control::broker::port_open(probe) && self.socket.is_none_or(|s| accepts(&s.path))
+        crate::openshell::port_open(probe) && self.socket.is_none_or(|s| accepts(&s.path))
     }
 
     /// Start buildit for this run unless it is already listening, and wait until it accepts
@@ -206,6 +205,41 @@ impl Buildit<'_> {
         }
         .into())
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("buildit's URL {url:?} is not an http(s) URL with a host and port: {reason}")]
+struct BadUrl {
+    url: String,
+    reason: String,
+}
+
+/// Start the buildit the controller granted this run and serve the run's own tasks on `socket`.
+/// None when the controller granted the run no buildit in this pod.
+pub fn serve_tasks(socket: &RunSocket) -> Result<Option<PathBuf>> {
+    use crucible_contract::agent_servers::{ENV_AGENT_SERVERS, LocalServer, Transport, decode};
+    let granted = decode(&std::env::var(ENV_AGENT_SERVERS).unwrap_or_default())
+        .with_context(|| format!("{ENV_AGENT_SERVERS} is not a list of servers"))?;
+    let Some((server, site)) = granted.iter().find_map(|s| match &s.transport {
+        Transport::Local(LocalServer::Buildit(site)) => Some((s, site)),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+    let (host, port) = crate::openshell::http_host_port(&server.url).map_err(|reason| BadUrl {
+        url: server.url.clone(),
+        reason,
+    })?;
+    Buildit {
+        site,
+        url: &server.url,
+        host: &host,
+        port,
+        socket: Some(socket),
+    }
+    .ensure_running()
+    .with_context(|| format!("starting the run's {}", server.name))?;
+    Ok(Some(socket.path.clone()))
 }
 
 fn accepts(socket: &Path) -> bool {
@@ -406,7 +440,7 @@ mod tests {
     #[test]
     fn the_runs_own_socket_sits_in_its_state_dir_and_builds_from_its_workspace() {
         let dir = std::path::Path::new("/runs/r1/pack");
-        let paths = crate::args::Paths::for_manifest(dir.join("ws"), dir.join("state"), dir, None);
+        let paths = crate::paths::Paths::for_manifest(dir.join("ws"), dir.join("state"), dir, None);
         let socket = paths.buildit_socket();
         assert_eq!(socket.path, dir.join("state/buildit.sock"));
         assert_eq!(socket.workdir, dir.join("ws"));

@@ -13,7 +13,6 @@
 
 use crate::manifest::BrokerCfg;
 use anyhow::{Context, Result};
-use std::net::{SocketAddr, TcpStream};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -128,13 +127,7 @@ fn probe_addr(bind: &str) -> String {
     }
 }
 
-/// True if a TCP connection to `addr` succeeds within a short timeout.
-pub(crate) fn port_open(addr: &str) -> bool {
-    addr.parse::<SocketAddr>()
-        .ok()
-        .and_then(|sa| TcpStream::connect_timeout(&sa, Duration::from_millis(300)).ok())
-        .is_some()
-}
+pub(crate) use crucible::openshell::port_open;
 
 #[cfg(test)]
 mod tests {

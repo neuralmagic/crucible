@@ -382,8 +382,9 @@ pub(crate) struct LoopTaskRunner<'a> {
 
 fn harness_runner(args: &Args, p: &Paths) -> crate::plan::harness::HarnessRunner {
     crate::plan::harness::HarnessRunner {
-        args: args.clone(),
+        dispatch: args.clone(),
         paths: p.clone(),
+        frozen_injects: args.workflow_frozen_injects.clone(),
         commit_per_task: false,
         captured_bytes: std::sync::atomic::AtomicU64::new(0),
         staged: Default::default(),
@@ -478,47 +479,51 @@ impl<'a> LoopTaskRunner<'a> {
         let max_cost = crate::runloop::step::live_max_cost(args, control.as_deref());
         let pricing = args.pricing();
         let mut stopped = false;
-        let attempt =
-            workflow_runner.candidate_turn(task, prompt, resume_prompt, deadline, &mut |event| {
-                match event {
-                    CandidateEvent::Starting(session) => {
-                        r.agent_starting(*it, args.model(), session);
-                        if let Some(turn) = session {
-                            r.plan_event(&SessionEvent::AgentSession {
-                                session: turn.logical_name.clone(),
-                                action: turn.action(),
-                                turn: turn.completed_turns + 1,
-                            });
-                        }
-                        r.plan_event(&SessionEvent::AgentStart { iter: *it });
+        let attempt = crate::plan::harness::candidate_turn(
+            workflow_runner,
+            task,
+            prompt,
+            resume_prompt,
+            deadline,
+            &mut |event| match event {
+                CandidateEvent::Starting(session) => {
+                    r.agent_starting(*it, args.model(), session);
+                    if let Some(turn) = session {
+                        r.plan_event(&SessionEvent::AgentSession {
+                            session: turn.logical_name.clone(),
+                            action: turn.action(),
+                            turn: turn.completed_turns + 1,
+                        });
                     }
-                    CandidateEvent::Line(line, stream, ev) => {
-                        r.agent_line(line, stream);
-                        let Some(ev) = ev else {
-                            return;
-                        };
-                        if let crate::agent::event::AgentEvent::Tokens(t) = ev {
-                            let spent = *spent_before + pricing.provisional(t);
-                            if let Some(heartbeat) = heartbeat {
-                                heartbeat.record(*it, spent);
-                            }
-                            r.plan_event(&SessionEvent::Budget {
-                                spent,
-                                elapsed_secs: started.elapsed().as_secs(),
-                            });
-                            if max_cost > 0.0 && spent >= max_cost && !stopped {
-                                stopped = true;
-                                r.note(&format!(
+                    r.plan_event(&SessionEvent::AgentStart { iter: *it });
+                }
+                CandidateEvent::Line(line, stream, ev) => {
+                    r.agent_line(line, stream);
+                    let Some(ev) = ev else {
+                        return;
+                    };
+                    if let crate::agent::event::AgentEvent::Tokens(t) = ev {
+                        let spent = *spent_before + pricing.provisional(t);
+                        if let Some(heartbeat) = heartbeat {
+                            heartbeat.record(*it, spent);
+                        }
+                        r.plan_event(&SessionEvent::Budget {
+                            spent,
+                            elapsed_secs: started.elapsed().as_secs(),
+                        });
+                        if max_cost > 0.0 && spent >= max_cost && !stopped {
+                            stopped = true;
+                            r.note(&format!(
                                 "budget: provisional spend ${spent:.4} reached cap ${max_cost:.2} \
                                  mid-turn — stopping the agent"
                             ));
-                                crucible::deadline::terminate_live_children();
-                            }
+                            crucible::deadline::terminate_live_children();
                         }
-                        r.plan_event(&SessionEvent::Agent { event: ev.clone() });
                     }
+                    r.plan_event(&SessionEvent::Agent { event: ev.clone() });
                 }
-            });
+            },
+        );
         r.plan_event(&SessionEvent::AgentDone);
         attempt
     }

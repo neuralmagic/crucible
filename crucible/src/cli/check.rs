@@ -53,15 +53,45 @@ impl CheckOutcome {
     }
 }
 
-/// Check `manifest_path`: composite or single, picked the same way [`crate::cli::run::dispatch`] does.
-pub fn run(manifest_path: &Path, variant: Option<&VariantName>) -> Result<CheckOutcome> {
+/// The engine binary a check answers for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum Engine {
+    /// `crucible`.
+    #[default]
+    Full,
+    /// `crucible-runner`: what it refuses of the pack is a finding.
+    Runner,
+}
+
+impl Engine {
+    /// What this engine refuses of `m`'s workflow as resolved.
+    fn refusals(self, m: &Manifest) -> Vec<String> {
+        match (self, &m.workflow) {
+            (Engine::Runner, Some(workflow)) => {
+                crucible::plan::refusal::workflow_refusals(workflow)
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect()
+            }
+            (Engine::Runner, None) | (Engine::Full, _) => Vec::new(),
+        }
+    }
+}
+
+/// Check `manifest_path` for `engine`: composite or single, picked the same way
+/// [`crate::cli::run::dispatch`] does.
+pub fn run(
+    engine: Engine,
+    manifest_path: &Path,
+    variant: Option<&VariantName>,
+) -> Result<CheckOutcome> {
     if manifest::is_composite(manifest_path) {
         if let Some(variant) = variant {
             return Ok(CheckOutcome::fail(composite_variant(variant)));
         }
         check_composite(manifest_path)
     } else {
-        check_single(manifest_path, variant)
+        check_single(engine, manifest_path, variant)
     }
 }
 
@@ -211,6 +241,7 @@ fn operator_history_limit() -> Option<String> {
 /// The graph of every declared variant other than `selected`, and of the base when a variant
 /// is selected, compiled as the selected one is, so a broken variant fails the check of any.
 fn other_variant_findings(
+    engine: Engine,
     manifest_path: &Path,
     manifest_dir: &Path,
     selected: Option<&VariantName>,
@@ -225,21 +256,30 @@ fn other_variant_findings(
     std::iter::once(None)
         .chain(declared.iter().map(Some))
         .filter(|other| *other != selected)
-        .filter_map(|other| {
+        .flat_map(|other| {
             let label = other.map_or("the base manifest".to_owned(), |v| format!("[variant.{v}]"));
-            let finding = match Manifest::load_variant(manifest_path, other) {
-                Ok(mut m) => m
-                    .resolve_workflow(manifest_dir)
-                    .err()
-                    .and_then(|e| sandbox_finding(&e)),
-                Err(e) => Some(format!("manifest parse failed: {e:#}")),
+            let findings = match Manifest::load_variant(manifest_path, other) {
+                Ok(mut m) => {
+                    let unresolved = m
+                        .resolve_workflow(manifest_dir)
+                        .err()
+                        .and_then(|e| sandbox_finding(&e));
+                    unresolved.into_iter().chain(engine.refusals(&m)).collect()
+                }
+                Err(e) => vec![format!("manifest parse failed: {e:#}")],
             };
-            finding.map(|finding| format!("{label}: {finding}"))
+            findings
+                .into_iter()
+                .map(move |finding| format!("{label}: {finding}"))
         })
         .collect()
 }
 
-fn check_single(manifest_path: &Path, variant: Option<&VariantName>) -> Result<CheckOutcome> {
+fn check_single(
+    engine: Engine,
+    manifest_path: &Path,
+    variant: Option<&VariantName>,
+) -> Result<CheckOutcome> {
     let mut m = match Manifest::load_frozen_variant(manifest_path, variant) {
         Ok(m) => m,
         Err(e) => return Ok(CheckOutcome::fail(format!("manifest parse failed: {e:#}"))),
@@ -271,7 +311,9 @@ fn check_single(manifest_path: &Path, variant: Option<&VariantName>) -> Result<C
             .extend(uninjected_script_warnings(&m, &manifest_dir)),
         Err(e) => out.findings.extend(sandbox_finding(&e)),
     }
+    out.findings.extend(engine.refusals(&m));
     out.findings.extend(other_variant_findings(
+        engine,
         manifest_path,
         &manifest_dir,
         variant,
@@ -865,7 +907,7 @@ mod tests {
             "#;
         fs::write(dir.join(MANIFEST), manifest).expect("write manifest");
 
-        let out = run(&dir.join(MANIFEST), None).expect("check runs");
+        let out = run(Engine::Full, &dir.join(MANIFEST), None).expect("check runs");
         assert!(
             out.findings.is_empty(),
             "probe must apply frozen injects first: {:?}",
@@ -883,7 +925,7 @@ mod tests {
             &dir,
             "#!/bin/sh\necho '{\"valid\": true, \"score\": 1.0}'\n",
         );
-        let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
+        let outcome = run(Engine::Full, &dir.join(MANIFEST), None).expect("check runs");
         assert!(outcome.ok(), "findings: {:?}", outcome.findings);
         assert!(
             outcome
@@ -980,7 +1022,7 @@ mod tests {
             "[repo]\npath = \".\"\ntypo_field = 3\n[judge]\nmeasure_cmd = \"m\"\ndirection = \"higher\"\n[agent]\nbackend=\"command\"\nagent_cmd=\"x\"\ngoal=\"g\"\n",
         )
         .unwrap();
-        let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
+        let outcome = run(Engine::Full, &dir.join(MANIFEST), None).expect("check runs");
         assert!(!outcome.ok());
         assert!(outcome.findings[0].contains("parse failed"));
         let _ = fs::remove_dir_all(&dir);
@@ -994,7 +1036,7 @@ mod tests {
             "[repo]\npath = \".\"\n[workspace]\ndir = \"workspace\"\nsetup_cmd = \"mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=t@t -c user.name=t commit -q --allow-empty -m baseline\"\n[agent]\nbackend=\"command\"\nagent_cmd=\"true\"\ngoal=\"do the chore\"\n",
         )
         .unwrap();
-        let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
+        let outcome = run(Engine::Full, &dir.join(MANIFEST), None).expect("check runs");
         assert!(outcome.ok(), "findings: {:?}", outcome.findings);
         assert!(
             outcome.warnings.iter().any(|w| w.contains("task mode")),
@@ -1020,7 +1062,7 @@ mod tests {
             "[repo]\npath = \".\"\n[workspace]\ndir = \"workspace\"\nsetup_cmd = \"mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=t@t -c user.name=t commit -q --allow-empty -m baseline\"\n[agent]\nbackend=\"command\"\nagent_cmd=\"true\"\n",
         )
         .unwrap();
-        let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
+        let outcome = run(Engine::Full, &dir.join(MANIFEST), None).expect("check runs");
         assert!(!outcome.ok());
         assert!(
             outcome
@@ -1045,7 +1087,7 @@ mod tests {
         let outcome = {
             let _guard = crucible::test_support::env_lock();
             unsafe { std::env::set_var("CRUCIBLE_TEST_CHECK_INHERITED", "kept") };
-            let outcome = run(&dir.join(MANIFEST), None);
+            let outcome = run(Engine::Full, &dir.join(MANIFEST), None);
             unsafe { std::env::remove_var("CRUCIBLE_TEST_CHECK_INHERITED") };
             outcome.expect("check runs")
         };
@@ -1074,7 +1116,7 @@ mod tests {
             "#!/bin/sh\necho '{\"valid\": true, \"score\": 1.0}'\n",
             "[]",
         );
-        let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
+        let outcome = run(Engine::Full, &dir.join(MANIFEST), None).expect("check runs");
         assert!(outcome.ok(), "findings: {:?}", outcome.findings);
         assert_eq!(warned(&outcome), 0, "{:?}", outcome.warnings);
         assert!(
@@ -1092,7 +1134,7 @@ mod tests {
         let measure = "#!/bin/sh\ntest -z \"${CRUCIBLE_TEST_NEVER_SET+set}\" || exit 1\necho '{\"valid\": true, \"score\": 1.0}'\n";
         let dir = tempdir("optional-env");
         scaffold_domain_declaring(&dir, measure, "[\"CRUCIBLE_TEST_NEVER_SET?\"]");
-        let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
+        let outcome = run(Engine::Full, &dir.join(MANIFEST), None).expect("check runs");
         assert!(outcome.ok(), "findings: {:?}", outcome.findings);
         let disclosed = "  host-env    [judge] commands receive CRUCIBLE_TEST_NEVER_SET (optional) \
                          besides PATH, HOME, LANG, TMPDIR, CRUCIBLE_RUN_NAME, \
@@ -1110,7 +1152,7 @@ mod tests {
             measure,
             "[\"CRUCIBLE_TEST_NEVER_SET?\", \"CRUCIBLE_TEST_ALSO_NEVER_SET\"]",
         );
-        let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
+        let outcome = run(Engine::Full, &dir.join(MANIFEST), None).expect("check runs");
         let missing = "[judge].env declares CRUCIBLE_TEST_ALSO_NEVER_SET, which the engine's \
                        environment does not set";
         assert_eq!(outcome.findings, [missing]);
@@ -1121,7 +1163,7 @@ mod tests {
     fn check_fails_when_measure_cmd_misbehaves() {
         let dir = tempdir("bad-measure");
         scaffold_domain(&dir, "#!/bin/sh\necho 'not json'\nexit 1\n");
-        let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
+        let outcome = run(Engine::Full, &dir.join(MANIFEST), None).expect("check runs");
         assert!(!outcome.ok());
         assert!(
             outcome
@@ -1155,7 +1197,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
+        let outcome = run(Engine::Full, &dir.join(MANIFEST), None).expect("check runs");
         assert!(!outcome.ok());
         assert!(
             outcome
@@ -1192,7 +1234,7 @@ mod tests {
             direction = "higher"
             "#;
         fs::write(dir.join(MANIFEST), manifest).unwrap();
-        let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
+        let outcome = run(Engine::Full, &dir.join(MANIFEST), None).expect("check runs");
         assert!(outcome.ok(), "findings: {:?}", outcome.findings);
         assert!(
             !outcome
@@ -1242,7 +1284,7 @@ mod tests {
             &dir,
             "#!/bin/sh\necho '{\"valid\": true, \"score\": 1.0}'\n",
         );
-        let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
+        let outcome = run(Engine::Full, &dir.join(MANIFEST), None).expect("check runs");
         assert!(outcome.ok(), "no selftest is a warning, not a failure");
         assert!(
             outcome
@@ -1259,7 +1301,7 @@ mod tests {
     fn check_runs_declared_selftest_and_passes_when_discriminating() {
         let dir = tempdir("selftest-discriminates");
         scaffold_value_domain(&dir, "100", "10");
-        let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
+        let outcome = run(Engine::Full, &dir.join(MANIFEST), None).expect("check runs");
         assert!(outcome.ok(), "findings: {:?}", outcome.findings);
         assert!(
             outcome
@@ -1276,7 +1318,7 @@ mod tests {
     fn check_fails_when_declared_selftest_does_not_discriminate() {
         let dir = tempdir("selftest-fails");
         scaffold_value_domain(&dir, "10", "10");
-        let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
+        let outcome = run(Engine::Full, &dir.join(MANIFEST), None).expect("check runs");
         assert!(!outcome.ok(), "equal good/bad must fail check");
         assert!(
             outcome
@@ -1327,7 +1369,7 @@ mod tests {
     fn check_fails_when_a_live_rig_has_no_toolbox_exclusions() {
         let dir = tempdir("rig-unfenced");
         scaffold_rig_domain(&dir, "");
-        let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
+        let outcome = run(Engine::Full, &dir.join(MANIFEST), None).expect("check runs");
         assert!(
             !outcome.ok(),
             "an unfenced live-rig toolbox must fail check"
@@ -1347,7 +1389,7 @@ mod tests {
     fn check_passes_when_the_live_rig_toolbox_is_fenced() {
         let dir = tempdir("rig-fenced");
         scaffold_rig_domain(&dir, r#"toolbox_exclude = ["rig-config"]"#);
-        let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
+        let outcome = run(Engine::Full, &dir.join(MANIFEST), None).expect("check runs");
         assert!(
             !outcome
                 .findings
@@ -1476,7 +1518,7 @@ workflow(type = "playbook", tasks = [r, h])
             "#,
         )
         .unwrap();
-        let out = run(&dir.join(MANIFEST), None).expect("check runs");
+        let out = run(Engine::Full, &dir.join(MANIFEST), None).expect("check runs");
         assert!(out.ok(), "findings: {:?}", out.findings);
         let hits: Vec<&String> = out
             .warnings
@@ -1520,7 +1562,7 @@ workflow(type = "playbook", tasks = [a])
             "#,
         )
         .unwrap();
-        let out = run(&dir.join(MANIFEST), None).expect("check runs");
+        let out = run(Engine::Full, &dir.join(MANIFEST), None).expect("check runs");
         assert!(
             out.findings.iter().any(|f| f.contains(
                 r#"task "analyze" runs in sandbox "rust", which no [agent.sandbox.rust] declares"#
@@ -1564,7 +1606,7 @@ workflow(type = "playbook", tasks = [a])
         let undeclared =
             r#"task "analyze" runs in sandbox "rust", which no [agent.sandbox.rust] declares"#;
 
-        let base = run(&dir.join(MANIFEST), None).expect("check runs");
+        let base = run(Engine::Full, &dir.join(MANIFEST), None).expect("check runs");
         assert!(
             base.findings
                 .iter()
@@ -1574,7 +1616,7 @@ workflow(type = "playbook", tasks = [a])
         );
 
         let offline = VariantName::parse("offline").unwrap();
-        let selected = run(&dir.join(MANIFEST), Some(&offline)).expect("check runs");
+        let selected = run(Engine::Full, &dir.join(MANIFEST), Some(&offline)).expect("check runs");
         assert!(
             selected
                 .findings
@@ -1602,6 +1644,111 @@ workflow(type = "playbook", tasks = [a])
             "findings: {:?}",
             refused.findings
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A playbook pack `crucible-runner` sets up and checks out as the full engine does, with
+    /// `workflow` as its graph, `workflow_extra` appended to `[workflow]`, and one variant.
+    fn scaffold_playbook(dir: &Path, workflow: &str, workflow_extra: &str) {
+        fs::write(dir.join("workflow.star"), workflow).unwrap();
+        fs::write(
+            dir.join(MANIFEST),
+            format!(
+                r#"
+            [repo]
+            path = "."
+            [workspace]
+            dir = "workspace"
+            setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+            [agent]
+            backend = "command"
+            agent_cmd = "true"
+            goal = "goal"
+            [workflow]
+            type = "playbook"
+            file = "workflow.star"
+            {workflow_extra}
+            [variant.offline.agent]
+            backend = "command"
+            agent_cmd = "false"
+            goal = "goal"
+            "#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// `--engine runner` reports each thing `crucible-runner` refuses of the selected graph and
+    /// of every other declared variant's. The full engine's check of the same pack reports none.
+    #[test]
+    fn the_runner_engine_reports_what_crucible_runner_refuses() {
+        let dir = tempdir("runner-refusals");
+        scaffold_playbook(
+            &dir,
+            r#"
+read = command(name = "read", run = "true")
+think = agent(name = "think", prompt = "decide", depends_on = [read])
+sign = route(name = "sign", decider = human(), depends_on = [read], questions = {"ship": noul(ask = "Ship it?")})
+workflow(type = "playbook", tasks = [read, think, sign])
+"#,
+            r#"servers = ["tracker"]"#,
+        );
+        let refusals = [
+            "task think asks an agent turn, and crucible-runner calls no model",
+            "task sign is required and needs a person's decision",
+            "the pack names [workflow].servers (tracker)",
+        ];
+
+        let runner = run(Engine::Runner, &dir.join(MANIFEST), None).expect("check runs");
+        for refusal in refusals {
+            for found in [refusal.to_owned(), format!("[variant.offline]: {refusal}")] {
+                assert!(
+                    runner.findings.iter().any(|f| f.starts_with(&found)),
+                    "no {found:?} among {:?}",
+                    runner.findings
+                );
+            }
+        }
+        assert_eq!(runner.findings.len(), 2 * refusals.len());
+
+        let offline = VariantName::parse("offline").unwrap();
+        let selected =
+            run(Engine::Runner, &dir.join(MANIFEST), Some(&offline)).expect("check runs");
+        for refusal in refusals {
+            for found in [refusal.to_owned(), format!("the base manifest: {refusal}")] {
+                assert!(
+                    selected.findings.iter().any(|f| f.starts_with(&found)),
+                    "no {found:?} among {:?}",
+                    selected.findings
+                );
+            }
+        }
+
+        let full = run(Engine::Full, &dir.join(MANIFEST), None).expect("check runs");
+        assert!(full.ok(), "findings: {:?}", full.findings);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_runner_engine_passes_a_pack_crucible_runner_runs() {
+        let dir = tempdir("runner-passes");
+        scaffold_playbook(
+            &dir,
+            r#"
+check = command(name = "check", run = "echo '{\"verdict\": \"ship\"}'", emits = {"verdict": ["ship", "hold"]})
+gate = route(
+    name = "gate",
+    depends_on = [check],
+    decider = output(check),
+    questions = {"verdict": choice(ask = "Ship it?", options = {"ship": "release now", "hold": "wait"})},
+)
+ship = command(name = "ship", run = "true", when = gate.verdict.any_of("ship"))
+workflow(type = "playbook", tasks = [check, gate, ship])
+"#,
+            "",
+        );
+        let runner = run(Engine::Runner, &dir.join(MANIFEST), None).expect("check runs");
+        assert!(runner.ok(), "findings: {:?}", runner.findings);
         let _ = fs::remove_dir_all(&dir);
     }
 }

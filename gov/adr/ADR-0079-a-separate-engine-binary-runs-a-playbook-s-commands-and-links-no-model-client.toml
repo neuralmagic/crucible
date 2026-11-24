@@ -1,0 +1,76 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0079"
+title = "A separate engine binary runs a playbook's commands and links no model client"
+status = "proposed"
+date = "2026-11-21"
+refs = [
+    "RFC-0001:C-INFERENCE",
+    "RFC-0001:C-ROUTE",
+    "RFC-0002:C-PLAYBOOK-CAPS",
+    "RFC-0004:C-RUN-EVIDENCE",
+    "ADR-0065",
+]
+
+[content]
+context = """
+A run on a cluster its operator does not control should be unable to call a model, whatever its environment carries and whatever its pack asks for. A run with no agent binding calls its model with the credentials the environment holds ([[RFC-0001:C-INFERENCE]]), and the controller hands every pod the inference document with its provider keys ([[ADR-0065]]). The engine binary carries every path that uses them: the agent harnesses, the decision client behind a model-decided route ([[RFC-0001:C-ROUTE]]), the inference document reader and the sandbox gateway client. A playbook's builds, tests, measures and reports need none of these.
+
+The code that runs those tasks lived in the engine binary beside the agent runtime. The run driver, the per-task workspace runner and workspace setup did not depend on an agent, but they shared modules and types with the code that does. The library's command runner called the decision client itself when it met a model-decided route. Nothing smaller than the whole engine could run a playbook."""
+decision = """
+The run driver, the workspace runner and workspace setup move into the library. Two traits carry what differs between binaries. A dispatcher runs one task in the root prepared for it. An engine builds the runner for a manifest, admits or refuses the compiled plan, and says what the substrate can do. The library's command runner no longer calls the decision client: a model-decided route goes to a handler its caller supplies, and a runner given none fails the task.
+
+`crucible-runner` is a second binary over that library. Its dispatcher runs command, evaluate and report tasks and output-decided routes through the command runner, with no route handler. It refuses a plan that holds an agent turn, a model-decided route or the scored loop's propose turn before the workspace is set up, and it refuses a pack that names `[workflow].servers`. It opens no decision desk, so a human-decided route is a missing capability ([[RFC-0002:C-PLAYBOOK-CAPS]]), and a plan that requires one is refused with the rest. `crucible check --engine runner` reports the same refusals as findings. It takes the `plan run` flags a pod wrapper and the desktop app pass, so either can spawn it in place of the full engine.
+
+It reads one credential, the run's own token, and uses it only for the run's evidence ([[RFC-0004:C-RUN-EVIDENCE]]): the upload when the run ends, and a rerun's fetch of its parent. A pod that names the controller and carries no token uploads nothing and marks its session undelivered, so the wrapper prints it for the controller to scrape. It starts the run's buildit when the controller granted one, so a command task can build on the cluster. It does not serve the git sidecar to tasks.
+
+The full engine implements the same two traits and behaves as it did."""
+consequences = """
+- The runner contains no agent harness, decision client, inference document reader, sandbox gateway client or cloud SDK. They are not linked, so no environment and no pack reaches them. Its refusals exist to fail early with a clear error.
+- A stripped release build of the runner is about 22 MB, against about 57 MB for the full engine.
+- Both binaries share one run driver, so resume, rerun, declared files and per-task commits behave the same in both.
+- The runner still compiles every dependency of the library, which holds the sandbox client and the deployment renderers. Moving those into crates of their own would shorten its build and is not done here.
+- What the controller delivers to a pod is unchanged. A dispatch to a cluster its operator does not control still carries what the controller renders for it, and whoever holds the pod holds that. Rendering no inference document, run servers or sidecar credential for such a target is a controller change this decision does not make.
+- A report task still posts to the webhook the environment names, so a run that reports holds that address.
+- `check` reports the runner's refusals only when asked with `--engine runner`, and only for a graph it can compile without launch parameters. A graph that needs them is refused when the run starts.
+- No image ships the runner and no dispatch target selects it yet."""
+
+[[content.alternatives]]
+text = "Move the plan run path into the library behind two traits and build a second binary that leaves the agent runtime out"
+status = "accepted"
+pros = [
+    "The property holds by construction: the binary has no code that calls a model.",
+    "One run driver serves both binaries.",
+    "No conditional compilation in shared code or its tests.",
+]
+cons = [
+    "A large move of code from the engine binary into the library.",
+    "The library keeps the sandbox client and the deployment renderers, so the runner compiles them.",
+]
+
+[[content.alternatives]]
+text = "A cargo feature that turns the agent paths off in the engine binary, with refusals at plan admission, in check and in the task runner"
+status = "rejected"
+pros = ["A small change to the engine binary."]
+cons = [
+    "The agent modules and the decision client stay compiled and linked, so the property rests on every path to them being refused.",
+    "Conditional compilation spreads through shared code and gates most of the runner's tests off in one build.",
+    "The library's command runner still reads the inference document and calls the decision client.",
+]
+
+[[content.alternatives]]
+text = "Refuse at run time, keyed on an environment variable or a profile"
+status = "rejected"
+cons = [
+    "The deployed binary is still the full engine, and whoever controls the pod controls the switch.",
+]
+
+[[content.alternatives]]
+text = "Keep one engine binary and strip credentials at dispatch only"
+status = "rejected"
+pros = ["Withholding the credentials is needed whichever binary runs."]
+cons = [
+    "A credential a dispatch misses is used by an engine that can call a model.",
+    "Nothing in the binary catches the mistake.",
+]

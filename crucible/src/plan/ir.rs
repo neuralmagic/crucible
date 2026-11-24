@@ -524,6 +524,28 @@ impl Join {
     }
 }
 
+/// What a task asks a model for. Every task that draws on the run's cost ceiling asks one, and
+/// no other task does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelAsk {
+    /// An agent turn through a harness.
+    AgentTurn,
+    /// A route task's decision model.
+    DecisionRoute,
+    /// The scored loop's propose turn.
+    ProposeTurn,
+}
+
+impl std::fmt::Display for ModelAsk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ModelAsk::AgentTurn => "an agent turn",
+            ModelAsk::DecisionRoute => "a decision model",
+            ModelAsk::ProposeTurn => "the scored loop's propose turn",
+        })
+    }
+}
+
 /// What a task *is*. The executor owns advancement; agents only ever run inside `Agent` tasks.
 ///
 /// Internally tagged so TOML and JSON authoring read naturally:
@@ -646,6 +668,22 @@ impl TaskKind {
                     | EngineOp::MeasureDiff,
                 ..
             } => false,
+        }
+    }
+
+    /// What this task asks a model for, if it asks one. Agrees with [`TaskKind::spends`].
+    pub fn model_ask(&self) -> Option<ModelAsk> {
+        match self {
+            TaskKind::Agent { .. } => Some(ModelAsk::AgentTurn),
+            TaskKind::Route {
+                decider: Decider::Model { .. },
+                ..
+            } => Some(ModelAsk::DecisionRoute),
+            TaskKind::Engine {
+                op: EngineOp::Propose,
+                ..
+            } => Some(ModelAsk::ProposeTurn),
+            _ => None,
         }
     }
 }
@@ -3275,6 +3313,58 @@ mod tests {
     fn a_human_route_does_not_spend() {
         let gate = human_route("gate", &[], &[("pick", pick_question("a", "items", false))]);
         assert!(!gate.task.spends());
+    }
+
+    /// One task of every kind that differs on whether it asks a model.
+    fn every_kind() -> Vec<Task> {
+        let propose = Task {
+            task: TaskKind::Engine {
+                op: EngineOp::Propose,
+                source: None,
+                tiebreak: None,
+            },
+            ..agent("propose", &[])
+        };
+        vec![
+            agent("scan", &[]),
+            model_route("gate", &["scan"], &[]),
+            propose,
+            human_route(
+                "human",
+                &[],
+                &[("pick", pick_question("a", "items", false))],
+            ),
+            output_route("read", "scan", &[]),
+        ]
+    }
+
+    #[test]
+    fn model_ask_names_what_each_spending_task_asks() {
+        let tasks = every_kind();
+        let asks: Vec<(&str, ModelAsk)> = tasks
+            .iter()
+            .filter_map(|t| Some((t.name.0.as_str(), t.task.model_ask()?)))
+            .collect();
+        assert_eq!(
+            asks,
+            [
+                ("scan", ModelAsk::AgentTurn),
+                ("gate", ModelAsk::DecisionRoute),
+                ("propose", ModelAsk::ProposeTurn),
+            ]
+        );
+    }
+
+    #[test]
+    fn model_ask_agrees_with_spends_over_every_kind() {
+        for task in every_kind() {
+            assert_eq!(
+                task.task.spends(),
+                task.task.model_ask().is_some(),
+                "{}",
+                task.name.0
+            );
+        }
     }
 
     fn human_route(name: &str, deps: &[&str], questions: &[(&str, Question)]) -> Task {

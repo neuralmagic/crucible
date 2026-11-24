@@ -1,0 +1,23 @@
+[package]
+name = "crucible-runner"
+description = "Runs a playbook's command, evaluate and report tasks and its output-decided routes. It carries no agent harness, calls no model, and opens no decision desk."
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "crucible-runner"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+thiserror.workspace = true
+# The plan compiler, executor, workspace runner and run driver. No S3 publishing.
+crucible = { path = "../crucible", default-features = false }
+crucible-contract = { path = "../crucible-contract" }
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile = "3"

@@ -64,6 +64,11 @@ formal:
 formal-mutants:
     python3 formal/mutate.py
 
+# Build crucible-runner: the engine binary that runs a playbook's commands and calls no model
+# (ADR-0079).
+runner:
+    cargo build --release --locked -p crucible-runner
+
 # Lint + test the Rust workspace.
 lint:
     cargo fmt --check && cargo clippy --workspace --all-targets --all-features && cargo clippy -p crucible --all-targets && cargo test --workspace --all-features && cargo test -p crucible

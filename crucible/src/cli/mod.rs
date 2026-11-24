@@ -9,7 +9,7 @@ pub(crate) mod run;
 pub(crate) mod scored;
 pub(crate) mod selftest;
 pub(crate) mod setup;
-pub(crate) mod workspace;
+pub(crate) use crucible::workspace;
 
 use crate::args::Args;
 #[cfg(feature = "autoresearch")]
@@ -68,6 +68,10 @@ pub(crate) enum Cmd {
         /// Every declared variant is parsed and validated, and its graph compiled, either way.
         #[arg(long, value_name = "NAME")]
         variant: Option<crate::manifest::variant::VariantName>,
+        /// The engine binary the check answers for. `runner` also fails a pack `crucible-runner`
+        /// refuses: a task that asks a model, a required human decision, `[workflow].servers`.
+        #[arg(long, value_enum, default_value_t, conflicts_with = "parse_only")]
+        engine: check::Engine,
         /// Also validate a deploy profile's cluster wiring: the named [measure].cluster resolves
         /// against the fleet file, its secret name is non-empty, no bastion (not implemented yet),
         /// and, live, the sandbox SA cannot read the spoke kubeconfig Secret in the loop namespace.
@@ -746,6 +750,31 @@ mod tests {
                 "f.html",
             ])
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn check_answers_for_the_full_engine_unless_told_the_runner() {
+        let engine = |extra: &[&str]| {
+            let argv = ["crucible", "check", "--manifest", "crucible.toml"]
+                .iter()
+                .chain(extra);
+            match Cli::try_parse_from(argv).map(|cli| cli.command) {
+                Ok(Some(Cmd::Check { engine, .. })) => Ok(engine),
+                Ok(_) => panic!("check parses as its subcommand"),
+                Err(e) => Err(e.kind()),
+            }
+        };
+        assert_eq!(engine(&[]), Ok(check::Engine::Full));
+        assert_eq!(engine(&["--engine", "full"]), Ok(check::Engine::Full));
+        assert_eq!(engine(&["--engine", "runner"]), Ok(check::Engine::Runner));
+        assert_eq!(
+            engine(&["--engine", "runner", "--parse-only"]),
+            Err(clap::error::ErrorKind::ArgumentConflict)
+        );
+        assert_eq!(
+            engine(&["--engine", "agentless"]),
+            Err(clap::error::ErrorKind::InvalidValue)
         );
     }
 

@@ -13,8 +13,35 @@
 //! - `gateway`: boot/teardown the local gateway + rootless podman socket (still subprocess).
 //! - `run`: the per-turn flow: env script, prompt-over-stdin, exec, download.
 
+pub mod buildit;
 pub mod endpoint;
 pub mod gateway;
 pub mod grpc;
 pub mod placement;
 pub mod policy;
+
+use std::net::{SocketAddr, TcpStream};
+use std::time::Duration;
+
+/// True if a TCP connection to `addr` succeeds within a short timeout.
+pub fn port_open(addr: &str) -> bool {
+    addr.parse::<SocketAddr>()
+        .ok()
+        .and_then(|sa| TcpStream::connect_timeout(&sa, Duration::from_millis(300)).ok())
+        .is_some()
+}
+
+/// The host and port an http(s) server URL names, or why it names none.
+pub fn http_host_port(url: &str) -> Result<(String, u16), String> {
+    let parsed = url::Url::parse(url).map_err(|e| e.to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("the scheme must be http or https".to_string());
+    }
+    let host = parsed
+        .host_str()
+        .filter(|h| !h.is_empty())
+        .ok_or("it has no host")?
+        .to_string();
+    let port = parsed.port_or_known_default().ok_or("it has no port")?;
+    Ok((host, port))
+}
