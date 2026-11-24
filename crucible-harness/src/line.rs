@@ -15,6 +15,20 @@ pub trait LineFormat {
         self.push_parsed(&parse_line(line))
     }
 
+    /// [`LineFormat::push`] into a caller-owned buffer, so a consumer decoding many lines
+    /// reuses one allocation. Default: clear and fill from [`LineFormat::push`]; an override
+    /// must not call back into [`LineFormat::push`], or the pair recurses.
+    fn push_into(&mut self, line: &str, out: &mut Vec<AgentEvent>) {
+        out.clear();
+        out.append(&mut self.push(line));
+    }
+
+    /// [`LineFormat::push_parsed`] into a caller-owned buffer.
+    fn push_parsed_into(&mut self, parsed: &ParsedLine<'_>, out: &mut Vec<AgentEvent>) {
+        out.clear();
+        out.append(&mut self.push_parsed(parsed));
+    }
+
     /// Interpret one already-parsed line, so several decoders can share the parse.
     fn push_parsed(&mut self, parsed: &ParsedLine<'_>) -> Vec<AgentEvent> {
         let mut out = Vec::new();
