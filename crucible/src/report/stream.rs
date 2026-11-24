@@ -14,6 +14,7 @@ use crate::report::reporter::{Reporter, RunMeta, Stop};
 use crate::report::session::{self, Row, RowWire, SessionEvent};
 use anyhow::{Context, Result};
 use crucible_contract::LoopPhase;
+use crucible_contract::event::AgentEvent;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::sync::atomic::Ordering;
@@ -37,9 +38,10 @@ enum Sink {
     /// `--ui stream`: the session-log file for external tailers AND stdout so the loop's decisions are visible
     /// in `kubectl logs` (mid-run). Without the stdout copy, the only thing on the pod's stdout/stderr is
     /// the broker's eprintln, so a healthy run looks dead from the outside (`0 decided rows`).
-    /// The file side is buffered; stdout stays line-buffered by contract (it is the CLI surface).
+    /// Both sides buffer and flush together: a pod-log viewer polls at second granularity, so
+    /// the 100 ms cadence is invisible. `--ui jsonl` keeps its line-buffered stdout.
     Tee {
-        out: std::io::Stdout,
+        out: std::io::BufWriter<std::io::Stdout>,
         file: std::io::BufWriter<File>,
         flushed: std::time::Instant,
     },
@@ -47,19 +49,27 @@ enum Sink {
 
 impl Sink {
     fn write_event(&mut self, ev: &SessionEvent) {
-        let line = session::encode(ev);
+        self.write_line(&session::encode(ev));
+    }
+
+    fn write_agent(&mut self, ev: &AgentEvent) {
+        self.write_line(&session::encode_agent(ev));
+    }
+
+    fn write_line(&mut self, line: &str) {
         match self {
             Sink::Stdout(out) => {
                 let _ = writeln!(out, "{line}");
             }
             Sink::Tee { out, file, flushed } => {
                 let _ = writeln!(file, "{line}");
-                if file.buffer().len() >= FILE_FLUSH_BYTES || flushed.elapsed() >= FILE_FLUSH_EVERY
-                {
-                    let _ = file.flush();
-                    *flushed = std::time::Instant::now();
-                }
                 let _ = writeln!(out, "{line}");
+                if file.buffer().len() >= FILE_FLUSH_BYTES
+                    || out.buffer().len() >= FILE_FLUSH_BYTES
+                    || flushed.elapsed() >= FILE_FLUSH_EVERY
+                {
+                    self.flush_file();
+                }
             }
         }
     }
@@ -67,8 +77,10 @@ impl Sink {
     /// Push the session log's buffered tail to disk; `run` can end in `std::process::exit`,
     /// which skips the drop flush.
     fn flush_file(&mut self) {
-        if let Sink::Tee { file, .. } = self {
+        if let Sink::Tee { out, file, flushed } = self {
             let _ = file.flush();
+            let _ = out.flush();
+            *flushed = std::time::Instant::now();
         }
     }
 }
@@ -111,7 +123,7 @@ impl SessionReporter {
         Ok(Self {
             // Tee: the session-log file, plus stdout so the run is observable in `kubectl logs`.
             sink: Sink::Tee {
-                out: std::io::stdout(),
+                out: std::io::BufWriter::new(std::io::stdout()),
                 file: std::io::BufWriter::new(file),
                 flushed: std::time::Instant::now(),
             },
@@ -202,6 +214,10 @@ impl Reporter for SessionReporter {
 
     fn plan_event(&mut self, ev: &SessionEvent) {
         self.emit(ev);
+    }
+
+    fn agent_event(&mut self, ev: &AgentEvent) {
+        self.sink.write_agent(ev);
     }
 
     fn recovery(&mut self, class: crate::report::session::RecoveryClass, iter: u32, detail: &str) {

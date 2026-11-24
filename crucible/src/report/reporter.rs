@@ -129,6 +129,10 @@ pub trait Reporter {
     /// iteration. Default no-op: only the session reporter persists them; the console
     /// front-end has no plan rendering, and the legacy sequencing path never emits one.
     fn plan_event(&mut self, _ev: &crate::report::session::SessionEvent) {}
+    /// One agent event from the running turn. Default no-op like [`Reporter::plan_event`];
+    /// the by-reference spelling exists so the session reporter logs the stream without
+    /// cloning every event.
+    fn agent_event(&mut self, _ev: &crate::agent::event::AgentEvent) {}
     /// How this resume classified the previous shutdown; the session reporter emits a
     /// structured [`crate::report::session::SessionEvent::Recovery`].
     fn recovery(&mut self, class: crate::report::session::RecoveryClass, iter: u32, detail: &str) {
