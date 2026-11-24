@@ -411,6 +411,16 @@ dto! {
         pub when: String,
         /// `producer.field` references each instance receives narrowed to its own entry.
         pub keyed: Vec<String>,
+        /// The tasks of the loop this task decides, in dispatch order; empty otherwise.
+        pub r#loop: Vec<String>,
+        /// `task.field in a|b`: the loop runs another round while this task's field is one of
+        /// those values. Empty when the task decides no loop.
+        pub again: String,
+        /// The most rounds `loop` may run; 0 when the task decides no loop.
+        pub loop_rounds: u32,
+        /// How long after its first round begins `loop` may still begin a round; empty when the
+        /// loop declares none.
+        pub loop_duration: String,
     }
 }
 

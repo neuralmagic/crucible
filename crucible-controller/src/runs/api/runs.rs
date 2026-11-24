@@ -651,6 +651,10 @@ mod tests {
             max_fanout: 0,
             when: String::new(),
             keyed: Vec::new(),
+            r#loop: Vec::new(),
+            again: String::new(),
+            loop_rounds: 0,
+            loop_duration: String::new(),
         }
     }
 

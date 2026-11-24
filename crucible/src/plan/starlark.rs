@@ -28,9 +28,9 @@ use crate::errors::FileError;
 use crate::knobs::{Harness, ReasoningEffort};
 use crate::plan::diag;
 use crate::plan::ir::{
-    Decider, Emits, EngineOp, Isolation, Join, MAX_FANOUT_CEILING, MAX_REPAIR_CEILING,
-    MAX_ROUNDS_CEILING, OutputField, OutputRef, ReportDestination, Revise, SlackDestination, Stage,
-    Task, TaskKind, TaskName, When,
+    Again, Decider, Emits, EngineOp, Isolation, Join, Loop, MAX_FANOUT_CEILING, MAX_LOOP_ROUNDS,
+    MAX_REPAIR_CEILING, MAX_ROUNDS_CEILING, OutputField, OutputRef, ReportDestination, Revise,
+    SlackDestination, Stage, Task, TaskKind, TaskName, When,
 };
 use crate::plan::param::ParamValue;
 use crate::plan::starlark::error::{
@@ -80,6 +80,8 @@ struct CompileContext {
     /// Every task a DSL constructor built, keyed by name. A constructed-but-dropped task
     /// silently never runs, so it is a compile error.
     constructed_tasks: BTreeMap<String, FileSpan>,
+    /// Every `loop(...)` built, keyed by its deciding task.
+    constructed_loops: BTreeMap<String, FileSpan>,
     /// Tasks with `otherwise = True`, expanded in `workflow()`.
     otherwise: BTreeSet<String>,
     /// Routes `workflow()` adds for a `when` that reads a task's field, by route name.
@@ -379,6 +381,7 @@ impl CompileState {
                 schema_files: BTreeSet::new(),
                 total_embedded_bytes: 0,
                 constructed_tasks: BTreeMap::new(),
+                constructed_loops: BTreeMap::new(),
                 otherwise: BTreeSet::new(),
                 field_routes: BTreeMap::new(),
                 others: BTreeSet::new(),
@@ -472,6 +475,8 @@ enum Value {
     Each(Each),
     /// `send_back(tasks, rounds = N)`.
     SendBack(Revise),
+    /// `loop(body, again, rounds)`: the body's tasks, the deciding one carrying the loop.
+    Loop(Vec<Task>),
     /// `at_least(n)` or `at_most(n)`.
     Bound(Bound),
     /// `model(...)`, `human(...)`, or `output(task)`.
@@ -520,6 +525,7 @@ impl CompileError {
             }
             CompileError::Parse { at, .. } => at.iter().cloned().collect(),
             CompileError::DroppedTasks { sites }
+            | CompileError::DroppedLoops { sites }
             | CompileError::LateSessionDeclaration { sites }
             | CompileError::UnboundSessions { sites } => sites
                 .iter()
@@ -584,6 +590,7 @@ const COMMON_FUNCTIONS: &[&str] = &[
     "each",
     "skill",
     "evaluate",
+    "loop",
     "param",
     "prompt_file",
     "report",
@@ -736,6 +743,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
         "top_k" => &["name", "k", "direction", "depends_on", "required"],
         "each" => &["list", "max"],
         "send_back" => &["tasks", "rounds"],
+        "loop" => &["body", "again", "rounds", "duration"],
         "at_least" | "at_most" => &["bound"],
         "model" => &["min_confidence", "files"],
         "human" => &["review", "timeout"],
@@ -907,7 +915,7 @@ fn constructor(
             .map_err(|error| CompileError::InvalidQuestion { error })?;
         return Ok(Value::Question(question));
     }
-    if let Some(value) = value_constructor(function, &mut named, state)? {
+    if let Some(value) = value_constructor(function, &mut named, state, at)? {
         no_unknown_kwargs(function, &named)?;
         return Ok(value);
     }
@@ -1019,6 +1027,7 @@ fn constructor(
             keyed: Vec::new(),
             when: None,
             revise: None,
+            loop_while: None,
             timeout: None,
             history: None,
             repair: 0,
@@ -1061,6 +1070,7 @@ fn constructor(
                 max_fanout: None,
                 keyed: Vec::new(),
                 revise: None,
+                loop_while: None,
                 timeout: None,
                 when: None,
                 history: None,
@@ -1096,6 +1106,7 @@ fn constructor(
                 max_fanout,
                 keyed: take_keyed(&mut named)?,
                 revise: None,
+                loop_while: None,
                 timeout,
                 when: take_when(&mut named, state, &name)?,
                 name,
@@ -1193,8 +1204,106 @@ fn value_constructor(
     function: &str,
     named: &mut BTreeMap<String, Value>,
     state: &CompileState,
+    at: &FileSpan,
 ) -> Result<Option<Value>> {
     let value = match function {
+        "loop" => {
+            let mut body = match take_value(named, "body")? {
+                Value::List(entries) => entries
+                    .into_iter()
+                    .map(|entry| match entry {
+                        Value::Task(task) => Ok(*task),
+                        _ => Err(CompileError::LoopBodyNotTasks),
+                    })
+                    .collect::<Result<Vec<Task>>>()?,
+                _ => return Err(CompileError::LoopBodyNotTasks),
+            };
+            if body.is_empty() {
+                return Err(CompileError::LoopBodyEmpty);
+            }
+            let (output, is) = match take_value(named, "again")? {
+                Value::Output(output) => (output, Vec::new()),
+                Value::When(WhenSpec {
+                    subject:
+                        Subject::Field {
+                            reference,
+                            declared,
+                        },
+                    selection: Selection::Answers(labels),
+                }) => {
+                    let labels = labels
+                        .into_iter()
+                        .map(|label| identifier("any_of", Label::new(label)))
+                        .collect::<Result<Vec<_>>>()?;
+                    (resolve_output(&reference, &declared)?, labels)
+                }
+                _ => return Err(CompileError::LoopAgainNotField),
+            };
+            let answerable = matches!(
+                (&output.ty, is.is_empty()),
+                (Some(FieldType::Boolean), true) | (Some(FieldType::OneOf(_)), false)
+            );
+            if !answerable {
+                return Err(CompileError::LoopAgainNotAnswerable {
+                    reference: output.reference.to_string(),
+                    declared: output
+                        .ty
+                        .map_or_else(|| "untyped".to_owned(), |ty| ty.to_string()),
+                });
+            }
+            let rounds = match named.remove("rounds") {
+                None | Some(Value::None) => None,
+                Some(Value::Int(rounds)) => Some(
+                    u32::try_from(rounds)
+                        .ok()
+                        .filter(|rounds| (1..=MAX_LOOP_ROUNDS).contains(rounds))
+                        .ok_or(CompileError::LoopRoundsOutOfRange {
+                            got: i64::from(rounds),
+                        })?,
+                ),
+                Some(_) => return Err(wrong_type("rounds", "an integer")),
+            };
+            let duration = match named.remove("duration") {
+                None | Some(Value::None) => None,
+                Some(Value::String(raw)) => Some(
+                    raw.parse::<TaskTimeout>()
+                        .map_err(|_| CompileError::LoopDurationInvalid { raw })?,
+                ),
+                Some(_) => return Err(wrong_type("duration", "a duration string")),
+            };
+            if rounds.is_none() && duration.is_none() {
+                return Err(CompileError::LoopUnbounded);
+            }
+            let rounds = rounds.unwrap_or(MAX_LOOP_ROUNDS);
+            let names: Vec<TaskName> = body.iter().map(|task| task.name.clone()).collect();
+            let Some(decider) = body
+                .iter_mut()
+                .find(|task| task.name == output.reference.task)
+            else {
+                return Err(CompileError::LoopAgainOutsideBody {
+                    reference: output.reference.to_string(),
+                    body: names
+                        .iter()
+                        .map(TaskName::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                });
+            };
+            decider.loop_while = Some(Loop {
+                body: names,
+                again: Again {
+                    field: output.reference.field,
+                    is,
+                },
+                rounds,
+                duration,
+            });
+            state
+                .context_mut()
+                .constructed_loops
+                .insert(decider.name.0.clone(), at.clone());
+            Value::Loop(body)
+        }
         "each" => {
             let output = match take_value(named, "list")? {
                 Value::Output(output) => output,
@@ -1341,22 +1450,26 @@ fn take_session(
     }
 }
 
-fn task_list(function: &str, tasks: Vec<Value>) -> Result<Vec<Task>> {
-    if tasks.len() > MAX_TASKS {
-        return Err(CompileError::TooManyTasks {
-            function: function.to_owned(),
-            count: tasks.len(),
-        });
-    }
-    tasks
-        .into_iter()
-        .map(|task| match task {
-            Value::Task(task) => Ok(*task),
-            _ => Err(CompileError::TaskListEntryNotTask {
+fn task_list(function: &str, entries: Vec<Value>) -> Result<Vec<Task>> {
+    let mut tasks = Vec::new();
+    for entry in entries {
+        match entry {
+            Value::Task(task) => tasks.push(*task),
+            Value::Loop(body) => tasks.extend(body),
+            _ => {
+                return Err(CompileError::TaskListEntryNotTask {
+                    function: function.to_owned(),
+                });
+            }
+        }
+        if tasks.len() > MAX_TASKS {
+            return Err(CompileError::TooManyTasks {
                 function: function.to_owned(),
-            }),
-        })
-        .collect()
+                count: tasks.len(),
+            });
+        }
+    }
+    Ok(tasks)
 }
 
 fn default_autoresearch(mut extras: Vec<Task>) -> Result<WorkflowCfg> {
@@ -1461,6 +1574,7 @@ fn dsl_task(
         keyed: take_keyed(named)?,
         when,
         revise: take_revise(named)?,
+        loop_while: None,
         timeout: take_timeout(named)?,
         history: take_optional_history(named)?,
         repair,
@@ -2379,6 +2493,7 @@ fn engine(name: &str, op: EngineOp, source: Option<TaskName>, depends_on: Vec<Ta
         keyed: Vec::new(),
         when: None,
         revise: None,
+        loop_while: None,
         timeout: None,
         history: None,
         repair: 0,
@@ -3370,6 +3485,22 @@ fn compile_source_here(
         .collect();
     if !dropped.is_empty() {
         return Err(CompileError::DroppedTasks { sites: dropped });
+    }
+    let dropped_loops: Vec<Site> = context
+        .constructed_loops
+        .iter()
+        .filter(|(decider, _)| {
+            !workflow
+                .tasks
+                .iter()
+                .any(|t| &t.name.0 == *decider && t.loop_while.is_some())
+        })
+        .map(|(decider, at)| site(decider, at))
+        .collect();
+    if !dropped_loops.is_empty() {
+        return Err(CompileError::DroppedLoops {
+            sites: dropped_loops,
+        });
     }
     check_choice_producers(&declared_params, &workflow)?;
     let producers = choice_producers(&declared_params);
@@ -5859,6 +5990,10 @@ workflow(type = \"playbook\", tasks = [classify, gate, fix, rest, now, later])\n
             (
                 "send_back",
                 "u = command(name = \"u\", run = \"true\")\nc = command(name = \"c\", run = \"true\", depends_on = [u], revise = send_back(tasks = [u], rounds = 2{extra}))\nworkflow(type = \"playbook\", tasks = [u, c])\n",
+            ),
+            (
+                "loop",
+                "t = command(name = \"t\", run = \"true\", emits = {\"go\": \"boolean\"})\nworkflow(type = \"playbook\", tasks = [loop(body = [t], again = t.go, rounds = 2, duration = \"1h\"{extra})])\n",
             ),
             (
                 "at_least",
@@ -9537,6 +9672,243 @@ src = route(name = "src", decider = output(scan), depends_on = [scan], questions
             .unwrap_or_else(|| panic!("compiled: {source}"));
         let _ = std::fs::remove_dir_all(&pack);
         crate::errors::report(&error)
+    }
+
+    const LOOPED: &str = r#"
+turn = agent(name = "turn", prompt = "take one more step", session = "work", emits = ["summary"])
+score = command(name = "score", run = "./score.sh", depends_on = [turn],
+                emits = {"go": "boolean", "verdict": ["more", "retry", "done"], "points": "integer"})
+last = command(name = "last", run = "true", depends_on = [score])
+workflow(type = "playbook", tasks = [LOOP, last])
+"#;
+
+    fn looped(call: &str) -> String {
+        LOOPED.replace("LOOP", call)
+    }
+
+    #[test]
+    fn a_loop_compiles_to_its_body_once_with_the_loop_on_the_deciding_task() {
+        let workflow = compiled(
+            "loop-shape",
+            &looped("loop(body = [turn, score], again = score.go, rounds = 60)"),
+        )
+        .workflow;
+        let names: Vec<&str> = workflow.tasks.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["turn", "score", "last"],
+            "no task or route is added"
+        );
+        let score = &workflow.tasks[1];
+        assert_eq!(
+            score.loop_while,
+            Some(Loop {
+                body: vec!["turn".into(), "score".into()],
+                again: Again {
+                    field: OutputField("go".into()),
+                    is: Vec::new(),
+                },
+                rounds: 60,
+                duration: None,
+            })
+        );
+        assert!(workflow.tasks[0].loop_while.is_none());
+        assert!(score.when.is_none() && score.revise.is_none());
+    }
+
+    #[test]
+    fn a_loop_continues_on_listed_labels_of_a_label_field() {
+        let workflow = compiled(
+            "loop-labels",
+            &looped(
+                "loop(body = [turn, score], again = score.verdict.any_of(\"more\", \"retry\"), rounds = 3)",
+            ),
+        )
+        .workflow;
+        let again = &workflow.tasks[1].loop_while.as_ref().unwrap().again;
+        assert_eq!(again.field.0, "verdict");
+        let labels: Vec<&str> = again.is.iter().map(Label::as_str).collect();
+        assert_eq!(labels, ["more", "retry"]);
+        assert_eq!(again.wire(&"score".into()), "score.verdict in more|retry");
+    }
+
+    #[test]
+    fn a_loop_refuses_a_body_condition_or_bound_it_cannot_run() {
+        let cases = [
+            (
+                "loop(body = [], again = score.go, rounds = 3)",
+                "loop body = [] names no task",
+            ),
+            (
+                "loop(body = [turn, \"score\"], again = score.go, rounds = 3)",
+                "loop body must be a list of tasks",
+            ),
+            ("loop(body = [turn, score], rounds = 3)", "again"),
+            (
+                "loop(body = [turn, score], again = True, rounds = 3)",
+                "must be a field a body task emits",
+            ),
+            (
+                "loop(body = [turn, score], again = score.points, rounds = 3)",
+                "reads a field declared as integer",
+            ),
+            (
+                "loop(body = [turn, score], again = score.verdict, rounds = 3)",
+                "reads a field declared as",
+            ),
+            (
+                "loop(body = [turn, score], again = score.go.any_of(\"yes\"), rounds = 3)",
+                "reads a field declared as boolean",
+            ),
+            (
+                "loop(body = [turn, score], again = score.verdict.otherwise(), rounds = 3)",
+                "must be a field a body task emits",
+            ),
+            (
+                "loop(body = [turn, score], again = score.verdict.any_of(\"mroe\"), rounds = 3)",
+                "\"mroe\", which is not one of the labels the field declares",
+            ),
+            (
+                "loop(body = [turn, score], again = score.missing, rounds = 3)",
+                "missing",
+            ),
+            (
+                "loop(body = [turn], again = score.go, rounds = 3)",
+                "reads a task outside the body",
+            ),
+            ("loop(body = [turn, score], again = score.go)", "rounds"),
+            (
+                "loop(body = [turn, score], again = score.go, rounds = 0)",
+                "loop rounds = 0 is outside 1..=256",
+            ),
+            (
+                "loop(body = [turn, score], again = score.go, rounds = 257)",
+                "loop rounds = 257 is outside 1..=256",
+            ),
+            (
+                "loop(body = [turn, score], again = score.go, rounds = 3, until = score.go)",
+                "until",
+            ),
+            (
+                "loop(body = [turn, score], again = score.go, duration = 3600)",
+                "argument \"duration\" must be",
+            ),
+            (
+                "loop(body = [turn, score], again = score.go, duration = \"soon\")",
+                "loop duration = \"soon\" is not a positive duration",
+            ),
+            (
+                "loop(body = [turn, score], again = score.go, duration = \"0s\")",
+                "loop duration = \"0s\" is not a positive duration",
+            ),
+        ];
+        for (call, expected) in cases {
+            let error = refused("loop-refused", &looped(call));
+            assert!(error.contains(expected), "{call}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_loop_takes_a_duration_beside_or_in_place_of_rounds() {
+        let looped = |call: &str| {
+            compiled("loop-duration", &looped(call)).workflow.tasks[1]
+                .loop_while
+                .clone()
+                .unwrap()
+        };
+        let only = looped("loop(body = [turn, score], again = score.go, duration = \"8h\")");
+        assert_eq!(only.duration, Some("8h".parse().unwrap()));
+        assert_eq!(only.rounds, MAX_LOOP_ROUNDS, "the engine's bound stands in");
+        let both =
+            looped("loop(body = [turn, score], again = score.go, rounds = 12, duration = \"90m\")");
+        assert_eq!(
+            (both.rounds, both.duration),
+            (12, Some("90m".parse().unwrap()))
+        );
+    }
+
+    #[test]
+    fn a_loop_built_and_not_listed_is_refused() {
+        let source = LOOPED
+            .replace(
+                "workflow(",
+                "kept = loop(body = [turn, score], again = score.go, rounds = 3)\nworkflow(",
+            )
+            .replace("LOOP", "turn, score");
+        let error = refused("loop-dropped", &source);
+        assert!(
+            error.contains("loop(s) constructed but not included in the workflow"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_task_listed_through_its_loop_and_on_its_own_is_refused() {
+        let error = refused(
+            "loop-twice",
+            &looped("loop(body = [turn, score], again = score.go, rounds = 3), turn"),
+        );
+        assert!(error.contains("turn"), "{error}");
+    }
+
+    #[test]
+    fn a_loop_is_refused_outside_a_playbook() {
+        let source = looped("loop(body = [turn, score], again = score.go, rounds = 3)")
+            .replace("type = \"playbook\"", "type = \"custom\"")
+            .replace("tasks = [", "result = last, tasks = [");
+        let error = refused("loop-custom", &source);
+        assert!(error.contains("which only a playbook runs"), "{error}");
+    }
+
+    #[test]
+    fn a_loop_body_takes_no_route_fan_out_or_task_between_its_tasks() {
+        let cases = [
+            (
+                r#"
+a = command(name = "a", run = "true", emits = {"go": "boolean", "items": "list"})
+b = command(name = "b", run = "true", depends_on = [a], over = each(a.items, max = 2), emits = {"go": "boolean"})
+workflow(type = "playbook", tasks = [loop(body = [a, b], again = a.go, rounds = 2)])
+"#,
+                "which maps over a list",
+            ),
+            (
+                r#"
+a = command(name = "a", run = "true", emits = {"go": "boolean"})
+mid = command(name = "mid", run = "true", depends_on = [a])
+b = command(name = "b", run = "true", depends_on = [mid], emits = {"go": "boolean"})
+workflow(type = "playbook", tasks = [loop(body = [a, b], again = b.go, rounds = 2), mid])
+"#,
+                "\"mid\" lies between two of them",
+            ),
+            (
+                r#"
+a = command(name = "a", run = "true", emits = {"go": "boolean"})
+b = command(name = "b", run = "true", depends_on = [a], when = a.go, emits = {"go": "boolean"})
+workflow(type = "playbook", tasks = [loop(body = [a, b], again = b.go, rounds = 2)])
+"#,
+                "lies between two of them",
+            ),
+            (
+                r#"
+a = command(name = "a", run = "true", emits = {"go": "boolean"})
+b = command(name = "b", run = "true", depends_on = [a], emits = {"go": "boolean"}, revise = send_back(a, rounds = 2))
+workflow(type = "playbook", tasks = [loop(body = [a, b], again = b.go, rounds = 2)])
+"#,
+                "a task is in at most one loop or revise loop",
+            ),
+            (
+                r#"
+a = command(name = "a", run = "true", emits = {"go": "boolean"})
+b = command(name = "b", run = "true", stage = "epilogue", emits = {"go": "boolean"})
+workflow(type = "playbook", tasks = [loop(body = [a, b], again = b.go, rounds = 2)])
+"#,
+                "a body runs in one stage",
+            ),
+        ];
+        for (source, expected) in cases {
+            let error = refused("loop-body", source);
+            assert!(error.contains(expected), "{source}: {error}");
+        }
     }
 
     fn named<'a>(compiled: &'a CompiledWorkflow, name: &str) -> &'a Task {

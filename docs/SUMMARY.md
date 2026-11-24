@@ -50,6 +50,7 @@
 - [RFC-0004: Linked controller/engine boundary](./rfc/RFC-0004.md)
 - [RFC-0005: Run supervisor services](./rfc/RFC-0005.md)
 - [RFC-0006: Blueprints](./rfc/RFC-0006.md)
+- [RFC-0007: Bounded loop in playbooks](./rfc/RFC-0007.md)
 
 # Architecture decisions
 

@@ -32,6 +32,10 @@ const task = (name: string, depends_on: string[] = [], session = ''): PlanTask =
   max_fanout: 0,
   when: '',
   keyed: [],
+  loop: [],
+  again: '',
+  loop_rounds: 0,
+  loop_duration: '',
 });
 
 /// A task mapped over a producer's field, as the wire writes it.

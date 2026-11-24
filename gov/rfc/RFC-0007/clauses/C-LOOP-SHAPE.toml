@@ -1,0 +1,15 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-LOOP-SHAPE"
+title = "What a loop compiles to"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+The compiled graph MUST contain each body task exactly once, under the name the source gave it, whatever rounds declares. A loop MUST NOT add a task, a route, or an edge to the compiled graph. The condition is read from the deciding task's output and MUST NOT compile to a route.
+
+Each body task MUST count once against the plan's task limit. The loop, its condition, and its rounds MUST NOT count against it.
+
+The admitted-plan event MUST carry, on the deciding task, the names of the body's tasks in dispatch order under "loop", the condition under "again", the round bound under "loop_rounds", and the duration under "loop_duration". The round bound of a loop given only duration is the engine's upper bound. The duration is written in the form the event carries a task's timeout and is empty where the loop declares none. The condition MUST be written in the form the event carries a task's when, with the deciding task and field in place of the route and question, so the example in [[RFC-0007:C-LOOP-SURFACE]] carries "score.go in yes". The event MUST carry an empty list, empty strings, and zero under those keys for every other task, so a reader that predates loops reads every plan without one. A deciding task MUST carry an empty value under "revise" and zero under "max_rounds", as [[RFC-0002:C-REVISE-LOOP]] requires of a task that is not a reviewer."""

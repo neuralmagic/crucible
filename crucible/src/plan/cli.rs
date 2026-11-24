@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use crate::plan::exec::Prior;
 use crate::plan::exec::{Substrate, required_tasks_held, runnable_set};
 use crate::plan::history::SeriesHistory;
-use crate::plan::ir::{Plan, Stage, TaskKind, TaskName, ValidPlan};
+use crate::plan::ir::{Again, Continue, Plan, RoundLoop, Stage, TaskKind, TaskName, ValidPlan};
 use crate::plan::record::declared_output;
 use crate::plan::rerun::ParentRef;
 use crate::plan::resume::RunStart;
@@ -143,6 +143,18 @@ pub fn render(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
         if let Some(timeout) = &t.timeout {
             detail.push_str(&format!(" timeout={timeout}"));
         }
+        if let Some(looped) = &t.loop_while {
+            let body: Vec<&str> = looped.body.iter().map(TaskName::as_str).collect();
+            detail.push_str(&format!(
+                " loop[{}; {}; max {}{}]",
+                body.join(", "),
+                looped.again.wire(&t.name),
+                looped.rounds,
+                looped
+                    .duration
+                    .map_or(String::new(), |duration| format!(", {duration}"))
+            ));
+        }
         out.push_str(&format!(
             "  {:<20} {:<28} needs={:<8} {} deps: {}{}\n",
             t.name.0,
@@ -226,8 +238,17 @@ fn render_mermaid_styled(
         .tasks_topo()
         .map(|t| (t.name.clone(), t.over.as_ref()))
         .collect();
+    let loops: Vec<(RoundLoop<'_>, &Again)> = plan
+        .round_loops()
+        .into_iter()
+        .filter_map(|rounds| match rounds.on {
+            Continue::While(again) => Some((rounds, again)),
+            Continue::Failing => None,
+        })
+        .collect();
     let mut regular_nodes = Vec::new();
     let mut measurement_nodes = Vec::new();
+    let mut loop_nodes = vec![Vec::new(); loops.len()];
     let mut edges = Vec::new();
     for t in plan.tasks_topo() {
         let ok = runnable.contains(&t.name);
@@ -298,7 +319,12 @@ fn render_mermaid_styled(
         if styling == Styling::PerNode {
             styles.push_str(&format!("    style {id} {props}\n"));
         }
-        if matches!(
+        if let Some(at) = loops
+            .iter()
+            .position(|(rounds, _)| rounds.contains(&t.name))
+        {
+            loop_nodes[at].push(node);
+        } else if matches!(
             t.task,
             TaskKind::Evaluate { .. }
                 | TaskKind::Engine {
@@ -349,8 +375,43 @@ fn render_mermaid_styled(
         }
         out.push_str("    end\n");
     }
+    for (at, nodes) in loop_nodes.into_iter().enumerate() {
+        out.push_str(&format!(
+            "    subgraph loop{at}[\"loop\"]\n        direction TD\n"
+        ));
+        for node in nodes {
+            out.push_str("    ");
+            out.push_str(&node);
+        }
+        out.push_str("    end\n");
+    }
     for edge in edges {
         out.push_str(&edge);
+    }
+    for (rounds, again) in &loops {
+        let Some(first) = rounds.body.first() else {
+            continue;
+        };
+        let values = match again.is.as_slice() {
+            [] => crucible_contract::decision::NOUL_YES.to_owned(),
+            labels => labels
+                .iter()
+                .map(|label| label.as_str())
+                .collect::<Vec<_>>()
+                .join(" / "),
+        };
+        out.push_str(&format!(
+            "    {} -.->|\"{}: {} \u{2264}{}{}\"| {}\n",
+            ids[&rounds.decider.name],
+            mermaid_label(&again.field.0),
+            mermaid_label(&values),
+            rounds.max_rounds,
+            rounds.duration.map_or(String::new(), |duration| format!(
+                " {}",
+                crucible::duration::Shown(duration)
+            )),
+            ids[&first.name],
+        ));
     }
     match styling {
         Styling::ClassDef => {
@@ -1378,6 +1439,63 @@ mod tests {
         );
         let with_caps = render_mermaid(&plan, &["gpu".to_string()].into());
         assert!(!with_caps.contains('⛔'));
+    }
+
+    #[test]
+    fn mermaid_frames_a_loop_and_draws_one_dotted_edge_back_with_its_condition_and_bound() {
+        let plan = Plan::from_toml_str(
+            r#"
+            version = 1
+            [budget]
+            usd = 1.0
+            [[task]]
+            name = "turn"
+            kind = "command"
+            command = "true"
+            [[task]]
+            name = "score"
+            kind = "evaluate"
+            command = "true"
+            depends_on = ["turn"]
+            emits = { verdict = ["more", "retry", "done"] }
+            loop = { body = ["turn", "score"], again = { field = "verdict", is = ["more", "retry"] }, rounds = 60, duration = "8h" }
+            [[task]]
+            name = "last"
+            kind = "command"
+            command = "true"
+            depends_on = ["score"]
+            "#,
+        )
+        .unwrap()
+        .validate()
+        .unwrap();
+        let out = render_mermaid(&plan, &BTreeSet::new());
+        let frame = out
+            .split_once("    subgraph loop0[\"loop\"]\n")
+            .and_then(|(_, rest)| rest.split_once("    end\n"))
+            .map(|(frame, _)| frame)
+            .unwrap_or_else(|| panic!("no loop frame: {out}"));
+        assert!(frame.contains("t0[\"turn\"]"), "{frame}");
+        assert!(frame.contains("t1([\"score\"])"), "{frame}");
+        assert!(!frame.contains("last"), "{frame}");
+        assert!(
+            !out.contains("subgraph measurement"),
+            "a body task is framed once, by its loop: {out}"
+        );
+        assert!(
+            out.contains("    t1 -.->|\"verdict: more / retry \u{2264}60 8h\"| t0\n"),
+            "{out}"
+        );
+        assert_eq!(out.matches("-.->").count(), 1, "{out}");
+        assert!(
+            out.contains("    t0 --> t1\n") && out.contains("    t1 --> t2\n"),
+            "{out}"
+        );
+        let table = render(&plan, &BTreeSet::new());
+        assert!(
+            table.contains("loop[turn, score; score.verdict in more|retry; max 60, 8h]"),
+            "{table}"
+        );
     }
 
     const PER_ELEMENT: &str = r#"

@@ -164,6 +164,21 @@ pub struct PlanTaskWire {
     /// The most rounds `revise` may run, the first included; 0 when the task revises nothing.
     #[serde(default)]
     pub max_rounds: u32,
+    /// The tasks of the loop this task decides, in dispatch order, itself among them; empty
+    /// otherwise. Each round reports as `task[round-N]`.
+    #[serde(default)]
+    pub r#loop: Vec<String>,
+    /// `task.field in a|b`: the loop runs another round while this task's field is one of those
+    /// values. Empty when the task decides no loop.
+    #[serde(default)]
+    pub again: String,
+    /// The most rounds `loop` may run, the first included; 0 when the task decides no loop.
+    #[serde(default)]
+    pub loop_rounds: u32,
+    /// How long after its first round begins `loop` may still begin a round (`90s`, `30m`,
+    /// `8h`); empty when the loop declares none.
+    #[serde(default)]
+    pub loop_duration: String,
     /// The fields the task's output promises, each with its type when the declaration gave one.
     /// Empty when the task declares none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1119,6 +1134,10 @@ mod tests {
                 keyed: Vec::new(),
                 revise: vec!["draft".into(), "check".into()],
                 max_rounds: 3,
+                r#loop: Vec::new(),
+                again: String::new(),
+                loop_rounds: 0,
+                loop_duration: String::new(),
                 emits: vec![
                     crate::emits::EmitWire {
                         field: "targets".into(),
@@ -1220,6 +1239,10 @@ mod tests {
             keyed: Vec::new(),
             revise,
             max_rounds: 0,
+            r#loop: Vec::new(),
+            again: String::new(),
+            loop_rounds: 0,
+            loop_duration: String::new(),
             emits: Vec::new(),
             emits_files: Vec::new(),
             timeout: String::new(),

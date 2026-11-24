@@ -1,0 +1,13 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-LOOP-BUDGET"
+title = "Ceilings"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+A loop can spend, in the sense of [[RFC-0002:C-PLAYBOOK-BUDGET]], when any task of its body can. The engine MUST check the cost and wall-clock ceilings before every round after the first, and before every dispatch within a round that the task's join and when would allow. An exhausted ceiling MUST end the loop and halt the run as it would halt any dispatch. Within a round, a body task not dispatched because of a ceiling MUST settle blocked for that round, naming the ceiling. A loop ended by a ceiling between rounds MUST leave each body task settled as its last round did. Every round's spend MUST count against the cost ceiling as [[RFC-0002:C-PLAYBOOK-BUDGET]] counts any task's.
+
+A loop has no ceiling of its own, and neither rounds nor duration is a budget. A duration longer than the run's wall-clock ceiling is allowed, and the ceiling ends the run first. The engine MUST NOT refuse to begin a round on the ground that the rounds still allowed could exceed a ceiling. A task's own per-attempt limit under [[RFC-0002:C-PLAYBOOK-BUDGET]] applies to each attempt of each round separately."""

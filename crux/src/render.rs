@@ -400,7 +400,7 @@ pub fn graph(run_id: &str, g: &dto::RunGraph) -> String {
         let Some(t) = g.tasks.iter().find(|t| &t.name == name) else {
             continue;
         };
-        let latest = g.results.iter().rfind(|r| &r.task == name);
+        let latest = latest_row(g, name);
         let deps = if t.depends_on.is_empty() {
             "-".to_string()
         } else {
@@ -423,8 +423,9 @@ pub fn graph(run_id: &str, g: &dto::RunGraph) -> String {
                 "opt".into()
             },
             deps,
-            latest.map_or("-".into(), |r| {
-                let mut s = format!("i{}", r.iter);
+            latest.map_or(round_counter(g, name).unwrap_or("-".into()), |r| {
+                let mut s = round_counter(g, name).map_or(String::new(), |c| format!("{c} "));
+                s.push_str(&format!("i{}", r.iter));
                 if let Some(c) = r.cost_usd {
                     s.push_str(&format!(" {}", usd(Some(c))));
                 }
@@ -449,6 +450,7 @@ pub fn graph(run_id: &str, g: &dto::RunGraph) -> String {
             &rows
         )
     );
+    out.push_str(&loops_block(g));
     out.push_str(&outputs_block(g));
     out.push_str(&emitted(&order, g));
     out.push_str(&full_notes(&order, g));
@@ -502,22 +504,138 @@ fn full_notes(order: &[String], g: &dto::RunGraph) -> String {
     out
 }
 
-/// The same graph as a mermaid flowchart, for pasting into the docs or a PR.
+/// The task that decides the loop `name` runs in, when it runs in one.
+fn loop_of<'a>(g: &'a dto::RunGraph, name: &str) -> Option<&'a dto::PlanTask> {
+    g.tasks
+        .iter()
+        .find(|t| t.r#loop.iter().any(|member| member == name))
+}
+
+/// The newest `name[round-N]` row and its N.
+fn last_round<'a>(g: &'a dto::RunGraph, name: &str) -> Option<(u32, &'a dto::TaskResult)> {
+    g.results
+        .iter()
+        .filter_map(|r| {
+            let round = r
+                .task
+                .strip_prefix(name)?
+                .strip_prefix("[round-")?
+                .strip_suffix(']')?;
+            Some((round.parse().ok()?, r))
+        })
+        .max_by_key(|(round, _)| *round)
+}
+
+/// A task's own row, or the last round's while its loop has not folded one.
+fn latest_row<'a>(g: &'a dto::RunGraph, name: &str) -> Option<&'a dto::TaskResult> {
+    g.results
+        .iter()
+        .rfind(|r| r.task == name)
+        .or_else(|| last_round(g, name).map(|(_, r)| r))
+}
+
+/// `r12/60` for a loop's body task, `≤60` before its first round; `None` outside a loop.
+fn round_counter(g: &dto::RunGraph, name: &str) -> Option<String> {
+    let bound = loop_of(g, name)?.loop_rounds;
+    Some(match last_round(g, name) {
+        Some((round, _)) => format!("r{round}/{bound}"),
+        None => format!("\u{2264}{bound}"),
+    })
+}
+
+/// `score.go in yes|more` as an edge label, `go: yes / more`.
+fn again_label(decider: &dto::PlanTask) -> String {
+    let (reference, values) = decider
+        .again
+        .split_once(" in ")
+        .unwrap_or((&decider.again, ""));
+    let field = reference
+        .strip_prefix(&format!("{}.", decider.name))
+        .unwrap_or(reference);
+    format!("{field}: {}", values.replace('|', " / "))
+}
+
+/// The rounds a loop has begun over its bound, `12/60`, or `≤60` before the first, then its
+/// duration where it declares one.
+fn rounds_begun(g: &dto::RunGraph, decider: &dto::PlanTask) -> String {
+    let begun = decider
+        .r#loop
+        .iter()
+        .filter_map(|member| last_round(g, member))
+        .map(|(round, _)| round)
+        .max();
+    let rounds = match begun {
+        Some(round) => format!("{round}/{}", decider.loop_rounds),
+        None => format!("\u{2264}{}", decider.loop_rounds),
+    };
+    match decider.loop_duration.as_str() {
+        "" => rounds,
+        duration => format!("{rounds} {duration}"),
+    }
+}
+
+/// Each loop's body, condition and round count, one line each.
+fn loops_block(g: &dto::RunGraph) -> String {
+    let lines: Vec<String> = g
+        .tasks
+        .iter()
+        .filter(|t| !t.r#loop.is_empty())
+        .map(|decider| {
+            format!(
+                "  {}  while {}  rounds {}\n",
+                decider.r#loop.join(", "),
+                decider.again,
+                rounds_begun(g, decider)
+            )
+        })
+        .collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!("\nloops:\n{}", lines.concat())
+}
+
+/// The same graph as a mermaid flowchart, for pasting into the docs or a PR. A loop's body sits
+/// in one subgraph, with one dotted edge from its deciding task back to its first task.
 pub fn graph_mermaid(g: &dto::RunGraph) -> String {
     let mut out = String::from("flowchart TD\n");
-    for t in &g.tasks {
-        let latest = g.results.iter().rfind(|r| r.task == t.name);
-        let status = latest.map_or("pending", |r| r.status.as_str());
-        out.push_str(&format!(
-            "  {}[\"{}<br/>{} · {status}\"]\n",
+    let node = |t: &dto::PlanTask| {
+        let status = latest_row(g, &t.name).map_or("pending", |r| r.status.as_str());
+        let counter = round_counter(g, &t.name).map_or(String::new(), |c| format!(" · {c}"));
+        format!(
+            "{}[\"{}<br/>{} · {status}{counter}\"]\n",
             node_id(&t.name),
             t.name,
             t.kind
-        ));
+        )
+    };
+    for t in g.tasks.iter().filter(|t| loop_of(g, &t.name).is_none()) {
+        out.push_str(&format!("  {}", node(t)));
+    }
+    let deciders: Vec<&dto::PlanTask> = g.tasks.iter().filter(|t| !t.r#loop.is_empty()).collect();
+    for (at, decider) in deciders.iter().enumerate() {
+        out.push_str(&format!("  subgraph loop{at}[\"loop\"]\n"));
+        for member in &decider.r#loop {
+            if let Some(t) = g.tasks.iter().find(|t| &t.name == member) {
+                out.push_str(&format!("    {}", node(t)));
+            }
+        }
+        out.push_str("  end\n");
     }
     for t in &g.tasks {
         for dep in &t.depends_on {
             out.push_str(&format!("  {} --> {}\n", node_id(dep), node_id(&t.name)));
+        }
+    }
+    for decider in &deciders {
+        if let Some(first) = decider.r#loop.first() {
+            out.push_str(&format!(
+                "  {} -.->|\"{} {}\"| {}\n",
+                node_id(&decider.name),
+                again_label(decider),
+                rounds_begun(g, decider),
+                node_id(first)
+            ));
         }
     }
     out.push_str(&outputs_mermaid(g));
@@ -2543,6 +2661,90 @@ mod tests {
     }
 
     /// A run whose plan never got admitted still deserves a sentence rather than an empty table.
+    /// turn -> score (loop, at most 5 rounds) -> last, with `results` as the run's rows.
+    fn looped_graph(results: &str) -> dto::RunGraph {
+        serde_json::from_str(&format!(
+            r#"{{"plan_version":1,
+              "tasks":[
+                {{"name":"turn","kind":"agent","depends_on":[],"needs":"all","required":true}},
+                {{"name":"score","kind":"command","depends_on":["turn"],"needs":"all","required":true,
+                 "loop":["turn","score"],"again":"score.go in yes","loop_rounds":5}},
+                {{"name":"last","kind":"command","depends_on":["score"],"needs":"all","required":true}}],
+              "results":[{results}]}}"#
+        ))
+        .expect("the looped graph fixture parses")
+    }
+
+    const TWO_ROUNDS: &str = r#"
+        {"iter":0,"task":"turn[round-1]","status":"pass","note":"","cost_usd":0.2,"secs":30.0},
+        {"iter":0,"task":"score[round-1]","status":"pass","note":"","cost_usd":0.0,"secs":2.0},
+        {"iter":0,"task":"turn[round-2]","status":"pass","note":"","cost_usd":0.2,"secs":31.0}"#;
+
+    #[test]
+    fn the_mermaid_graph_frames_a_loop_and_draws_one_edge_back() {
+        let before = graph_mermaid(&looped_graph(""));
+        for part in [
+            "  subgraph loop0[\"loop\"]\n    t_turn[\"turn<br/>agent · pending · \u{2264}5\"]\n    t_score[\"score<br/>command · pending · \u{2264}5\"]\n  end\n",
+            "  t_last[\"last<br/>command · pending\"]\n",
+            "  t_turn --> t_score\n",
+            "  t_score --> t_last\n",
+            "  t_score -.->|\"go: yes \u{2264}5\"| t_turn\n",
+        ] {
+            assert!(before.contains(part), "{part} in\n{before}");
+        }
+        assert_eq!(before.matches("-.->").count(), 1, "{before}");
+        assert_eq!(
+            before.matches("t_turn[").count(),
+            1,
+            "one node per body task"
+        );
+
+        let running = graph_mermaid(&looped_graph(TWO_ROUNDS));
+        for part in [
+            "t_turn[\"turn<br/>agent · pass · r2/5\"]",
+            "t_score[\"score<br/>command · pass · r1/5\"]",
+            "  t_score -.->|\"go: yes 2/5\"| t_turn\n",
+        ] {
+            assert!(running.contains(part), "{part} in\n{running}");
+        }
+    }
+
+    #[test]
+    fn the_graph_table_counts_a_loops_rounds_and_states_its_condition() {
+        let out = graph("0192run", &looped_graph(TWO_ROUNDS));
+        let row = |name: &str| {
+            out.lines()
+                .find(|l| l.split_whitespace().nth(1) == Some(name))
+                .unwrap_or_else(|| panic!("{name} row in {out}"))
+        };
+        assert!(row("turn").starts_with("pass"), "{out}");
+        assert!(row("turn").contains("r2/5 i0 $0.20 31s"), "{out}");
+        assert!(row("score").contains("r1/5 i0"), "{out}");
+        assert!(!row("last").contains("/5"), "{out}");
+        assert!(
+            out.contains("\nloops:\n  turn, score  while score.go in yes  rounds 2/5\n"),
+            "{out}"
+        );
+
+        let before = graph("0192run", &looped_graph(""));
+        assert!(before.contains("rounds \u{2264}5"), "{before}");
+        assert!(
+            !graph("0192run", &run_graph()).contains("loops:"),
+            "a graph with no loop prints no loop block"
+        );
+
+        let mut timed = looped_graph(TWO_ROUNDS);
+        timed.tasks[1].loop_duration = "8h".into();
+        assert!(
+            graph("0192run", &timed).contains("rounds 2/5 8h\n"),
+            "a duration follows the round bound"
+        );
+        assert!(
+            graph_mermaid(&timed).contains("|\"go: yes 2/5 8h\"|"),
+            "and on the edge back"
+        );
+    }
+
     #[test]
     fn an_empty_graph_says_so() {
         let empty: dto::RunGraph =

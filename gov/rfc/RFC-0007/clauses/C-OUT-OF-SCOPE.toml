@@ -1,0 +1,13 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-OUT-OF-SCOPE"
+title = "Out of scope"
+kind = "informative"
+status = "active"
+
+[content]
+text = """
+This RFC does not cover the following. Each can be added later without changing a clause above.
+
+A loop inside a loop, a revise loop inside a loop, and a mapped task inside a body. A route inside a body, which includes a condition a decision model or a person answers. A body whose tasks run concurrently, and rounds that run concurrently. A rerun that starts from a chosen round. A launch setting that lowers rounds for one launch. A cost or time ceiling scoped to one loop, and a loop that ends itself cleanly as a run ceiling approaches. An input that carries more than the previous round, the time left among it. A duration that ends a round in flight. Any change to [[RFC-0002:C-REVISE-LOOP]], its ceiling of five rounds, or the scored loop."""

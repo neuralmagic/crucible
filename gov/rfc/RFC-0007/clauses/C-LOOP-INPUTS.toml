@@ -1,0 +1,22 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-LOOP-INPUTS"
+title = "What a round reads"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+In every round the engine MUST give each body task the reserved input "loop". It MUST carry under "round" the number of the round about to run, counted from 1, under "max_rounds" the declared bound, and under "previous" an object. In the first round "previous" MUST be empty. In every later round "previous" MUST hold one entry for each body task that settled passing in the round before, under that task's name, holding that round's JSON output. It MUST NOT hold an entry for a body task that settled not taken in the round before, and MUST NOT hold output from any earlier round.
+
+```json
+{"round": 3, "max_rounds": 60,
+ "previous": {"turn": {"summary": "tightened the parser"}, "score": {"go": true, "points": 41}}}
+```
+
+The engine MUST NOT give "loop" to a task outside the body. The name is reserved for body tasks only: the engine MUST reject a body task that declares a dependency named "loop", and MUST NOT reject that name on any other task.
+
+Within a round, a body task reads another body task's output and captured files from the same round through its dependency on that task, under the rules that apply outside a loop. The engine MUST NOT give a body task an earlier round's result through a dependency.
+
+A file a passing round wrote is in the workspace for later rounds because [[RFC-0002:C-PLAYBOOK-LANE]] commits it. It is not staged as an input."""

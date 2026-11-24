@@ -1539,6 +1539,7 @@ mod tests {
             keyed: Vec::new(),
             when: None,
             revise: None,
+            loop_while: None,
             timeout: None,
             history: None,
             repair: 0,
@@ -1709,6 +1710,7 @@ mod tests {
             keyed: Vec::new(),
             when: None,
             revise: None,
+            loop_while: None,
             timeout: None,
             history: None,
             repair: 0,
@@ -5552,6 +5554,158 @@ workflow(type = "playbook", tasks = [author, repro])
             1,
             "{log}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The turn is an agent resuming one session each round; the score is a command that counts
+    /// rounds in the workspace and asks for another until the third.
+    #[test]
+    fn a_loop_resumes_its_session_commits_each_round_and_hands_on_the_round_before() {
+        let dir = playbook_pack(
+            "loop-session",
+            r#"
+turn = agent(
+    name = "turn",
+    prompt = "take one more step",
+    session = "work",
+    emits_files = ["STEP.md"],
+)
+score = command(
+    name = "score",
+    run = "n=$(($(cat COUNT 2>/dev/null || echo 0) + 1)); echo $n > COUNT; if [ $n -lt 3 ]; then go=true; else go=false; fi; printf '{\"go\": %s, \"points\": %s}\n' $go $n",
+    depends_on = [turn],
+    emits = {"go": "boolean", "points": "integer"},
+)
+last = command(
+    name = "last",
+    run = "printf '{\"rounds\": %s}\n' $(cat COUNT)",
+    depends_on = [score],
+)
+workflow(type = "playbook", tasks = [
+    loop(body = [turn, score], again = score.go, rounds = 5),
+    last,
+])
+"#,
+        );
+        std::fs::write(
+            dir.join("agents.json"),
+            r#"{"turn": {
+                "writes": {"STEP.md": "{ENV:CRUCIBLE_PROMPT}"},
+                "appends": {"SESSION.log": "{ENV:CRUCIBLE_AGENT_SESSION_ACTION}\n"},
+                "result": {"stepped": true}
+            }}"#,
+        )
+        .unwrap();
+        let mut manifest = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
+        manifest.resolve_workflow(&dir).unwrap();
+        let workflow = manifest.workflow.as_ref().unwrap();
+        let plan = crate::plan::template::iteration_template(
+            Some(workflow),
+            &crate::plan::workflow::WorkflowCaps::for_lane(workflow.workflow_type)
+                .with_persistent_sessions(),
+        )
+        .unwrap();
+        let mut runner = crate::cli::setup::prep_plan_runner(&dir.join("crucible.toml"))
+            .unwrap()
+            .0;
+        let mut rows = Vec::new();
+        let out = execute(
+            &plan,
+            &Substrate::default(),
+            ExecCfg::default(),
+            &mut runner,
+            |task, result| rows.push((task.name.0.clone(), result.status.as_str())),
+        );
+
+        assert!(out.valid, "{:?}", out.results);
+        assert_eq!(
+            rows,
+            [
+                ("turn[round-1]".to_string(), "pass"),
+                ("score[round-1]".to_string(), "pass"),
+                ("turn[round-2]".to_string(), "pass"),
+                ("score[round-2]".to_string(), "pass"),
+                ("turn[round-3]".to_string(), "pass"),
+                ("score[round-3]".to_string(), "pass"),
+                ("turn".to_string(), "pass"),
+                ("score".to_string(), "pass"),
+                ("last".to_string(), "pass"),
+            ]
+        );
+        assert_eq!(
+            out.results[&"last".into()].output,
+            Some(serde_json::json!({"rounds": 3}))
+        );
+        assert_eq!(
+            out.results[&"score".into()].output,
+            Some(serde_json::json!({"go": false, "points": 3})),
+            "the task settles as its last round did"
+        );
+        let workspace = dir.join("workspace");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("SESSION.log")).unwrap(),
+            "start\nresume\nresume\n",
+            "each later round resumes the first round's conversation"
+        );
+        let prompt = std::fs::read_to_string(dir.join("state/files/turn/STEP.md")).unwrap();
+        let inputs: serde_json::Value = prompt
+            .split_once("Upstream task results, as JSON:\n\n")
+            .and_then(|(_, rest)| rest.split_once("\n\n## Result contract"))
+            .and_then(|(json, _)| serde_json::from_str(json).ok())
+            .unwrap_or_else(|| panic!("no inputs block in the turn's prompt: {prompt}"));
+        assert_eq!(
+            inputs["loop"],
+            serde_json::json!({
+                "round": 3,
+                "max_rounds": 5,
+                "previous": {
+                    "turn": {"stepped": true},
+                    "score": {"go": true, "points": 2},
+                },
+            })
+        );
+        let log = git_output(&workspace, &["log", "--format=%s"]);
+        for task in ["task turn", "task score"] {
+            assert_eq!(
+                log.lines().filter(|l| *l == task).count(),
+                3,
+                "each passing round commits: {log}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One round outlasts the duration, so no second round begins although `go` is still true.
+    #[test]
+    fn a_loop_past_its_duration_ends_after_the_round_in_flight() {
+        let dir = playbook_pack(
+            "loop-duration",
+            r#"
+tick = command(
+    name = "tick",
+    run = "sleep 1.1 && printf '{\"go\": true}\n'",
+    emits = {"go": "boolean"},
+)
+last = command(name = "last", run = "printf '{\"done\": true}\n'", depends_on = [tick])
+workflow(type = "playbook", tasks = [
+    loop(body = [tick], again = tick.go, duration = "1s"),
+    last,
+])
+"#,
+        );
+        let out = run_playbook(&dir);
+
+        assert!(out.valid, "{:?}", out.results);
+        assert_eq!(
+            out.results[&"tick[round-1]".into()].status,
+            TaskStatus::Pass
+        );
+        assert!(
+            !out.results.contains_key(&"tick[round-2]".into()),
+            "a round began after the duration passed"
+        );
+        assert_eq!(out.results[&"tick".into()].status, TaskStatus::Pass);
+        assert_eq!(out.results[&"last".into()].status, TaskStatus::Pass);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

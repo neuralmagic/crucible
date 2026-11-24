@@ -1,0 +1,15 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-SCOPE"
+title = "Scope"
+kind = "informative"
+status = "active"
+
+[content]
+text = """
+A playbook's graph is dispatched once. The one repetition it states is the revise loop of [[RFC-0002:C-REVISE-LOOP]], which runs again only on a failing verdict and for at most five rounds. An author who wants a set of tasks to run again while their own output says to has no construct for it, and unrolls the rounds at compile time: one copy of each task per round, each copy gated on a field the copy before it emitted. A two-task body unrolled 62 times is 124 declared tasks, the most a 128-task limit leaves room for, and compiles to 188 nodes and 249 edges once the route behind each gate is added. The round count comes from the task limit and not from the work, and every reader of the graph gets N copies of one body.
+
+This RFC adds a loop. On its own the word means this construct here, and the revise loop and the scored loop are always named in full. A loop is a set of tasks, the body, that runs in rounds while a field one of them emits holds, up to a bound of rounds, of time, or of both that the source declares. The body's tasks are declared once and compile to one node each. A round is the unit the engine checks ceilings before, records, resumes from, and renders.
+
+A loop keeps what [[RFC-0002:C-PLAYBOOK-SHAPE]] promises. The node set, the edges, and the bound of every repetition are fixed at compile time, and only the number of rounds run varies. A loop uses the round model of [[RFC-0002:C-REVISE-LOOP]] (a row per round, one folded row per task, replay on resume) and leaves that clause as it is. Finalizing this RFC needs one edit to [[RFC-0002:C-PLAYBOOK-SHAPE]], which says a revise loop is the only repetition the graph states."""
