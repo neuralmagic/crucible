@@ -169,7 +169,8 @@ impl StreamPump {
         json: bool,
         sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
     ) {
-        let events = self.decoder.push(line);
+        let parsed = crucible_harness::line::parse_line(line);
+        let events = self.decoder.push_parsed(&parsed);
         for ev in &events {
             self.cost.observe(ev);
             if json {
@@ -179,7 +180,7 @@ impl StreamPump {
             }
         }
         let chain_events = match &mut self.chain_decoder {
-            Some(decoder) => decoder.push(line),
+            Some(decoder) => decoder.push_parsed(&parsed),
             None => events,
         };
         for ev in &chain_events {
