@@ -296,11 +296,16 @@ impl Redactor {
                     name: name.into_owned(),
                     summary: summary.into_owned(),
                     subagent: *subagent,
-                    input: dirty_input.map(|v| {
-                        let mut scrubbed = v.clone();
-                        self.json(&mut scrubbed);
-                        scrubbed
-                    }),
+                    // A clean input survives a dirty sibling field: only the input that
+                    // matched is re-rendered, the rest keeps the original.
+                    input: match dirty_input {
+                        Some(v) => {
+                            let mut scrubbed = v.clone();
+                            self.json(&mut scrubbed);
+                            Some(scrubbed)
+                        }
+                        None => input.clone(),
+                    },
                     result: result.map(|r| r.into_owned()),
                     failed: *failed,
                 })
@@ -518,6 +523,24 @@ mod tests {
         assert_eq!(v["n"], 1);
         let mut clean = json!({ "a": ["b", 1] });
         assert!(!r.json(&mut clean));
+    }
+
+    #[test]
+    fn a_clean_input_survives_a_dirty_summary() {
+        let r = redactor(&[KEY]);
+        let ev = AgentEvent::Tool {
+            name: "Bash".into(),
+            summary: format!("token {KEY}"),
+            subagent: false,
+            input: Some(json!({ "command": "ls" })),
+            result: None,
+            failed: false,
+        };
+        let scrubbed = r.event(&ev);
+        let AgentEvent::Tool { input, .. } = scrubbed.as_ref() else {
+            panic!("{scrubbed:?}")
+        };
+        assert_eq!(input, &Some(json!({ "command": "ls" })));
     }
 
     #[test]

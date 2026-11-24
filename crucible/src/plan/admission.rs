@@ -350,6 +350,10 @@ impl<'j> Admission<'j> {
         tally.live.remove(&lane.id);
         tally.settled += attempt.cost_usd;
         drop(tally);
+        self.flush_journal();
+    }
+
+    fn flush_journal(&self) {
         if let Some(file) = self.journal_file {
             let mut journal = self
                 .journal_buf
@@ -359,6 +363,30 @@ impl<'j> Admission<'j> {
         }
     }
 
+    /// Run `lane` with a flusher ticking the journal every [`JOURNAL_FLUSH_EVERY`], so a quiet
+    /// stretch (an agent mid-tool-call) still reaches the file within the cadence instead of
+    /// waiting for the next event or the lane's settle. The channel closes when the lane ends;
+    /// the flusher exits without lag.
+    fn with_journal_flusher<T>(&self, lane: impl FnOnce() -> T) -> T {
+        if self.journal_file.is_none() {
+            return lane();
+        }
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let flusher = scope.spawn(move || {
+                while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                    stopped.recv_timeout(JOURNAL_FLUSH_EVERY)
+                {
+                    self.flush_journal();
+                }
+            });
+            let out = lane();
+            drop(stop);
+            let _ = flusher.join();
+            out
+        })
+    }
+
     /// Run `item` if the ceilings admit it, and count what it cost.
     pub fn run(
         &self,
@@ -366,7 +394,7 @@ impl<'j> Admission<'j> {
         lane: impl FnOnce(&Lane<'_>) -> Attempt,
     ) -> Result<Attempt, Refusal> {
         let admitted = self.admit(item)?;
-        let attempt = lane(&admitted);
+        let attempt = self.with_journal_flusher(|| lane(&admitted));
         self.settle(admitted, &attempt);
         Ok(attempt)
     }
@@ -396,6 +424,19 @@ impl<'j> Admission<'j> {
             Some((item, slots.get(i)?, self.admit(item)))
         };
         std::thread::scope(|scope| {
+            if self.journal_file.is_some() {
+                // The sender closes when the scope body ends, so the flusher exits with the
+                // dispatch; between closes it keeps a quiet journal within the cadence of the
+                // file instead of waiting for the next event or a settle.
+                let (_stop, stopped) = std::sync::mpsc::channel::<()>();
+                scope.spawn(move || {
+                    while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                        stopped.recv_timeout(JOURNAL_FLUSH_EVERY)
+                    {
+                        self.flush_journal();
+                    }
+                });
+            }
             for _ in 0..self.width.get().min(batch.len()) {
                 scope.spawn(|| {
                     while let Some((item, slot, admitted)) = take() {

@@ -18,6 +18,7 @@ use crucible_contract::event::AgentEvent;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub struct SessionReporter {
@@ -35,16 +36,32 @@ const FILE_FLUSH_EVERY: Duration = Duration::from_millis(100);
 enum Sink {
     /// `--ui jsonl`: NDJSON on stdout only.
     Stdout(std::io::Stdout),
-    /// `--ui stream`: the session-log file for external tailers AND stdout so the loop's decisions are visible
-    /// in `kubectl logs` (mid-run). Without the stdout copy, the only thing on the pod's stdout/stderr is
-    /// the broker's eprintln, so a healthy run looks dead from the outside (`0 decided rows`).
-    /// Both sides buffer and flush together: a pod-log viewer polls at second granularity, so
-    /// the 100 ms cadence is invisible. `--ui jsonl` keeps its line-buffered stdout.
+    /// `--ui stream`: the session-log file for external tailers AND stdout so the loop's
+    /// decisions are visible in `kubectl logs` (mid-run). Without the stdout copy, the only
+    /// thing on the pod's stdout/stderr is the broker's eprintln, so a healthy run looks dead
+    /// from the outside (`0 decided rows`). Both sides buffer and flush together: a pod-log
+    /// viewer polls at second granularity, so the 100 ms cadence is invisible. The buffers sit
+    /// behind a mutex a flusher thread shares, so a quiet stretch still reaches the file and
+    /// stdout within the cadence. `--ui jsonl` keeps its line-buffered stdout.
     Tee {
-        out: std::io::BufWriter<std::io::Stdout>,
-        file: std::io::BufWriter<File>,
-        flushed: std::time::Instant,
+        buffers: Arc<Mutex<TeeBuffers>>,
+        /// Kept alive for the run; dropping it stops the flusher after one last flush.
+        _flusher: std::sync::mpsc::Sender<()>,
     },
+}
+
+/// The Tee's two buffered writers plus the cadence stamp, shared between the loop (writes) and
+/// the flusher thread (time-based flushes).
+struct TeeBuffers {
+    out: std::io::BufWriter<std::io::Stdout>,
+    file: std::io::BufWriter<File>,
+    flushed: std::time::Instant,
+}
+
+fn flush_tee(buffers: &mut TeeBuffers) {
+    let _ = buffers.file.flush();
+    let _ = buffers.out.flush();
+    buffers.flushed = std::time::Instant::now();
 }
 
 impl Sink {
@@ -61,26 +78,25 @@ impl Sink {
             Sink::Stdout(out) => {
                 let _ = writeln!(out, "{line}");
             }
-            Sink::Tee { out, file, flushed } => {
-                let _ = writeln!(file, "{line}");
-                let _ = writeln!(out, "{line}");
-                if file.buffer().len() >= FILE_FLUSH_BYTES
-                    || out.buffer().len() >= FILE_FLUSH_BYTES
-                    || flushed.elapsed() >= FILE_FLUSH_EVERY
+            Sink::Tee { buffers, .. } => {
+                let mut buffers = buffers.lock().unwrap_or_else(|p| p.into_inner());
+                let _ = writeln!(buffers.file, "{line}");
+                let _ = writeln!(buffers.out, "{line}");
+                if buffers.file.buffer().len() >= FILE_FLUSH_BYTES
+                    || buffers.out.buffer().len() >= FILE_FLUSH_BYTES
+                    || buffers.flushed.elapsed() >= FILE_FLUSH_EVERY
                 {
-                    self.flush_file();
+                    flush_tee(&mut buffers);
                 }
             }
         }
     }
 
-    /// Push the session log's buffered tail to disk; `run` can end in `std::process::exit`,
-    /// which skips the drop flush.
+    /// Push the session log's buffered tail to disk and stdout; `run` can end in
+    /// `std::process::exit`, which skips the drop flush.
     fn flush_file(&mut self) {
-        if let Sink::Tee { out, file, flushed } = self {
-            let _ = file.flush();
-            let _ = out.flush();
-            *flushed = std::time::Instant::now();
+        if let Sink::Tee { buffers, .. } = self {
+            flush_tee(&mut buffers.lock().unwrap_or_else(|p| p.into_inner()));
         }
     }
 }
@@ -122,10 +138,38 @@ impl SessionReporter {
         let _ = std::fs::remove_file(&p.control);
         Ok(Self {
             // Tee: the session-log file, plus stdout so the run is observable in `kubectl logs`.
-            sink: Sink::Tee {
-                out: std::io::BufWriter::new(std::io::stdout()),
-                file: std::io::BufWriter::new(file),
-                flushed: std::time::Instant::now(),
+            sink: {
+                let buffers = Arc::new(Mutex::new(TeeBuffers {
+                    out: std::io::BufWriter::new(std::io::stdout()),
+                    file: std::io::BufWriter::new(file),
+                    flushed: std::time::Instant::now(),
+                }));
+                let (stop, stopped) = std::sync::mpsc::channel::<()>();
+                let ticking = Arc::clone(&buffers);
+                std::thread::spawn(move || {
+                    loop {
+                        match stopped.recv_timeout(FILE_FLUSH_EVERY) {
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                flush_tee(&mut ticking.lock().unwrap_or_else(|p| p.into_inner()));
+                            }
+                            _ => {
+                                // The reporter is gone: one last flush, then stop.
+                                flush_tee(&mut ticking.lock().unwrap_or_else(|p| p.into_inner()));
+                                break;
+                            }
+                        }
+                    }
+                });
+                // The signal handlers cannot reach run context, so this hook is how the
+                // buffered tail survives an exit-signal's `process::exit`.
+                crate::process::flush_before_exit(Box::new({
+                    let buffers = Arc::clone(&buffers);
+                    move || flush_tee(&mut buffers.lock().unwrap_or_else(|p| p.into_inner()))
+                }));
+                Sink::Tee {
+                    buffers,
+                    _flusher: stop,
+                }
             },
             control: Some(p.control.clone()),
             meta,
