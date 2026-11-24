@@ -126,20 +126,75 @@ struct GithubPackage {
     name: String,
 }
 
-#[async_trait::async_trait]
-impl RegistryReader for LiveRegistryReader {
-    /// GHCR has no `_catalog`; the owner's container packages come from the GitHub API, read
-    /// with the authfile's ghcr.io credential (a token with `read:packages`).
-    async fn discover(&self, pattern: &str) -> Result<Vec<String>, RegistryError> {
-        let (registry, owner, glob) = split_pattern(pattern)?;
-        if registry != "ghcr.io" {
+#[derive(serde::Deserialize)]
+struct QuayRepositories {
+    repositories: Vec<QuayRepository>,
+    next_page: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct QuayRepository {
+    name: String,
+    kind: String,
+}
+
+fn http_client() -> Result<reqwest::Client, RegistryError> {
+    reqwest::Client::builder()
+        .timeout(READ_TIMEOUT)
+        .user_agent("crucible-controller")
+        .build()
+        .map_err(|e| RegistryError(format!("building the registry API client: {e}")))
+}
+
+/// The names of `owner`'s public image repositories on quay.io.
+async fn quay_public_repositories(owner: &str) -> Result<Vec<String>, RegistryError> {
+    let http = http_client()?;
+    let mut names = Vec::new();
+    let mut next_page: Option<String> = None;
+    loop {
+        let mut params = vec![("namespace", owner), ("public", "true")];
+        if let Some(token) = next_page.as_deref() {
+            params.push(("next_page", token));
+        }
+        let url = reqwest::Url::parse_with_params("https://quay.io/api/v1/repository", &params)
+            .map_err(|e| RegistryError(format!("building the quay.io listing URL: {e}")))?;
+        let res = http
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| RegistryError(format!("listing {owner}'s repositories: {e}")))?;
+        if !res.status().is_success() {
             return Err(RegistryError(format!(
-                "{pattern}: pattern discovery is only supported on ghcr.io"
+                "listing {owner}'s repositories: quay.io answered {}",
+                res.status()
             )));
         }
-        let reference = parse(&format!("{registry}/{owner}/{glob}"))
-            .or_else(|_| parse(&format!("{registry}/{owner}/x")))?;
-        let token = match self.auth(&reference)? {
+        let page: QuayRepositories = res
+            .json()
+            .await
+            .map_err(|e| RegistryError(format!("decoding {owner}'s repositories: {e}")))?;
+        names.extend(
+            page.repositories
+                .into_iter()
+                .filter(|r| r.kind == "image")
+                .map(|r| r.name),
+        );
+        match page.next_page {
+            Some(token) => next_page = Some(token),
+            None => return Ok(names),
+        }
+    }
+}
+
+impl LiveRegistryReader {
+    /// GHCR has no `_catalog`; the owner's container packages come from the GitHub API, read
+    /// with the authfile's ghcr.io credential (a token with `read:packages`).
+    async fn ghcr_packages(
+        &self,
+        pattern: &str,
+        owner: &str,
+    ) -> Result<Vec<String>, RegistryError> {
+        let token = match self.auth(&parse(&format!("ghcr.io/{owner}/x"))?)? {
             oci_client::secrets::RegistryAuth::Basic(_, password) => password,
             _ => {
                 return Err(RegistryError(format!(
@@ -147,11 +202,7 @@ impl RegistryReader for LiveRegistryReader {
                 )));
             }
         };
-        let http = reqwest::Client::builder()
-            .timeout(READ_TIMEOUT)
-            .user_agent("crucible-controller")
-            .build()
-            .map_err(|e| RegistryError(format!("building the GitHub client: {e}")))?;
+        let http = http_client()?;
         let mut names = Vec::new();
         for kind in ["orgs", "users"] {
             names.clear();
@@ -193,6 +244,23 @@ impl RegistryReader for LiveRegistryReader {
                 break;
             }
         }
+        Ok(names)
+    }
+}
+
+#[async_trait::async_trait]
+impl RegistryReader for LiveRegistryReader {
+    async fn discover(&self, pattern: &str) -> Result<Vec<String>, RegistryError> {
+        let (registry, owner, glob) = split_pattern(pattern)?;
+        let names = match registry {
+            "ghcr.io" => self.ghcr_packages(pattern, owner).await?,
+            "quay.io" => quay_public_repositories(owner).await?,
+            _ => {
+                return Err(RegistryError(format!(
+                    "{pattern}: pattern discovery is supported on ghcr.io and quay.io"
+                )));
+            }
+        };
         let mut repos: Vec<String> = names
             .into_iter()
             .filter(|n| glob_matches(glob, n))
@@ -431,7 +499,9 @@ impl RegistryReader for TableRegistry {
 
 #[cfg(test)]
 mod tests {
-    use crate::images::registry::{glob_matches, is_channel_tag, is_pattern, split_pattern};
+    use crate::images::registry::{
+        LiveRegistryReader, RegistryReader, glob_matches, is_channel_tag, is_pattern, split_pattern,
+    };
 
     #[test]
     fn globs_match_on_the_repository_name() {
@@ -455,6 +525,18 @@ mod tests {
         assert!(split_pattern("ghcr.io/acme/deep/sandbox-*").is_err());
     }
 
+    #[tokio::test]
+    async fn discovery_refuses_a_pattern_on_a_registry_it_cannot_list() {
+        let error = LiveRegistryReader::new(None)
+            .discover("docker.io/library/sandbox-*")
+            .await
+            .expect_err("docker.io has no listing");
+        assert_eq!(
+            error.0,
+            "docker.io/library/sandbox-*: pattern discovery is supported on ghcr.io and quay.io"
+        );
+    }
+
     #[test]
     fn channel_tags_exclude_feedstock_plumbing() {
         assert!(is_channel_tag("latest"));
@@ -476,15 +558,26 @@ mod tests {
 mod live_tests {
     use crate::images::registry::{LiveRegistryReader, RegistryReader, is_channel_tag};
 
-    /// Reads a real feedstock image off GHCR with the process's own registry login.
+    #[tokio::test]
+    #[ignore = "needs network"]
+    async fn live_reader_discovers_public_quay_repositories_by_glob() {
+        let reader = LiveRegistryReader::new(None);
+        let discovered = reader
+            .discover("quay.io/crucible-ai/crucible-k*")
+            .await
+            .expect("discover");
+        assert_eq!(discovered, ["quay.io/crucible-ai/crucible-kueue"]);
+    }
+
+    /// Reads a real feedstock image off quay.io, anonymously.
     /// `cargo test -p crucible-controller --lib -- --ignored images::registry::live_tests`.
     #[tokio::test]
-    #[ignore = "needs network and a ghcr.io login"]
+    #[ignore = "needs network"]
     async fn live_reader_lists_resolves_and_describes_a_feedstock_image() {
         let reader = LiveRegistryReader::new(None);
-        let repo = "ghcr.io/neuralmagic/sandbox-go-cc";
+        let repo = "quay.io/crucible-ai/sandbox-go-cc";
         let discovered = reader
-            .discover("ghcr.io/neuralmagic/sandbox-go-*")
+            .discover("quay.io/crucible-ai/sandbox-go-*")
             .await
             .expect("discover");
         assert!(

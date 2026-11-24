@@ -522,8 +522,9 @@ pub struct ControllerCfg {
     #[arg(long = "registry-authfile", env = "CONTROLLER_REGISTRY_AUTHFILE")]
     pub registry_authfile: Option<PathBuf>,
     /// Repositories the image catalog watches (`GET /api/images`): repeatable, or comma-separated
-    /// via the env var, each a registry/repository reference without tag. Read with
-    /// `--registry-authfile`. Empty leaves the catalog off.
+    /// via the env var, each a registry/repository reference without tag, or a
+    /// `registry/owner/<glob>` pattern on ghcr.io or quay.io (public repositories only on quay.io).
+    /// Read with `--registry-authfile`. Empty leaves the catalog off.
     #[arg(
         long = "image-catalog-repo",
         env = "CONTROLLER_IMAGE_CATALOG_REPOS",
