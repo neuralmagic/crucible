@@ -3,7 +3,7 @@
 
 use rune::{El, TextEdit, Tx, col, el, icon, row, text};
 use rune_kit::{
-    Button, ButtonVariant, Dialog, SegmentedControl, Spinner, Switch, TextArea, TextInput,
+    Button, ButtonVariant, Checkbox, Dialog, SegmentedControl, Spinner, Switch, TextArea, TextInput,
 };
 use rune_theme_opencode::icons as oc;
 
@@ -384,6 +384,33 @@ fn form(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
                     *edit(app, Slot::Answer(i)) = TextEdit::new(if on { "false" } else { "true" });
                 })
                 .build(p.k),
+            (Kind::MultiChoice(values), _) => {
+                let held = crate::form::picked(answer);
+                let mut boxes = row()
+                    .key(format!("launch-picks-{}", field.name))
+                    .w_full()
+                    .gap(16.0)
+                    .flex_wrap();
+                for value in values {
+                    let choices = values.clone();
+                    let flip = value.clone();
+                    boxes = boxes.child(
+                        Checkbox::new(held.contains(value))
+                            .label(value.clone())
+                            .disabled(off)
+                            .on_toggle(move |app: &mut App| {
+                                let next = crate::form::toggled(
+                                    &choices,
+                                    &edit(app, Slot::Answer(i)).text,
+                                    &flip,
+                                );
+                                *edit(app, Slot::Answer(i)) = TextEdit::new(&next);
+                            })
+                            .build(p.k),
+                    );
+                }
+                boxes
+            }
             (Kind::Choice(values), _) if values.len() <= 4 && !field.offer.allow_other && !off => {
                 let picks = values.clone();
                 SegmentedControl::new(values, values.iter().position(|v| v == answer))

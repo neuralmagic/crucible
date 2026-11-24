@@ -18,6 +18,8 @@ pub enum Kind {
     Bool,
     /// One of these values.
     Choice(Vec<String>),
+    /// Any of these values, sent as a list; the answer is its JSON array.
+    MultiChoice(Vec<String>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -95,8 +97,15 @@ pub fn fields(schema: &Value) -> Vec<Field> {
                 .get("enum")
                 .or_else(|| prop.get("x-choices"))
                 .and_then(Value::as_array);
+            let picks = prop
+                .get("items")
+                .and_then(|items| items.get("enum"))
+                .and_then(strings);
             let kind = match (listed, prop.get("type").and_then(Value::as_str)) {
                 (_, Some("boolean")) => Kind::Bool,
+                (_, Some("array")) if picks.is_some() => {
+                    Kind::MultiChoice(picks.unwrap_or_default())
+                }
                 (Some(values), _) => Kind::Choice(values.iter().map(text_of).collect()),
                 (None, Some("integer")) => Kind::Integer,
                 (None, Some("number")) => Kind::Number,
@@ -121,6 +130,7 @@ pub fn fields(schema: &Value) -> Vec<Field> {
                     .unwrap_or_else(|| match kind {
                         Kind::Bool => "false".to_string(),
                         Kind::Choice(ref values) => values.first().cloned().unwrap_or_default(),
+                        Kind::MultiChoice(_) => "[]".to_string(),
                         _ => String::new(),
                     }),
                 kind,
@@ -257,6 +267,27 @@ impl Field {
     }
 }
 
+/// The values a `MultiChoice` answer holds; empty when it is not a JSON list of strings.
+pub fn picked(answer: &str) -> Vec<String> {
+    serde_json::from_str::<Value>(answer)
+        .ok()
+        .as_ref()
+        .and_then(strings)
+        .unwrap_or_default()
+}
+
+/// A `MultiChoice` answer with `value` flipped, its entries kept in the order of `choices`.
+pub fn toggled(choices: &[String], answer: &str, value: &str) -> String {
+    let mut held = picked(answer);
+    if let Some(at) = held.iter().position(|v| v == value) {
+        held.remove(at);
+    } else {
+        held.push(value.to_string());
+    }
+    let ordered: Vec<&String> = choices.iter().filter(|c| held.contains(c)).collect();
+    Value::from(ordered.into_iter().cloned().collect::<Vec<_>>()).to_string()
+}
+
 fn text_of(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
@@ -300,6 +331,18 @@ pub fn params(fields: &[Field], answers: &[String]) -> Result<Value, Problems> {
         }
         let value = match &field.kind {
             Kind::Text | Kind::Multiline | Kind::Choice(_) => Value::String(answer.to_string()),
+            Kind::MultiChoice(choices) => {
+                let held = picked(answer);
+                if field.required && held.is_empty() {
+                    problems.push((i, "Pick at least one".to_string()));
+                    continue;
+                }
+                if let Some(stray) = held.iter().find(|v| !choices.contains(v)) {
+                    problems.push((i, format!("{stray} is not one of {}", choices.join(", "))));
+                    continue;
+                }
+                Value::from(held)
+            }
             Kind::Integer => match answer.parse::<i64>() {
                 Ok(n) => Value::from(n),
                 Err(_) => {
@@ -468,7 +511,9 @@ impl From<&str> for Refusal {
 mod tests {
     use serde_json::json;
 
-    use crate::form::{Field, Kind, Refusal, Scale, ceilings, duration, fields, minutes, params};
+    use crate::form::{
+        Field, Kind, Refusal, Scale, ceilings, duration, fields, minutes, params, picked, toggled,
+    };
 
     #[test]
     fn a_refusal_says_what_the_controller_said_about_each_field() {
@@ -686,6 +731,38 @@ mod tests {
                     .map_or(String::new(), |(_, v)| (*v).to_string())
             })
             .collect()
+    }
+
+    #[test]
+    fn a_list_with_choices_is_picked_as_a_subset_and_sent_as_a_list() {
+        let schema = json!({
+            "properties": {
+                "workloads": {"type": "array", "uniqueItems": true, "default": ["chat", "agentic"],
+                              "items": {"type": "string", "enum": ["chat", "agentic"]}},
+                "tags": {"type": "array", "items": {"type": "string"}}
+            }
+        });
+        let f = fields(&schema);
+        let picks = vec!["chat".to_string(), "agentic".to_string()];
+        assert_eq!(f[1].kind, Kind::MultiChoice(picks.clone()));
+        assert_eq!(f[0].kind, Kind::Text, "a list without choices stays typed");
+        assert_eq!(picked(&f[1].default), picks);
+
+        let unticked = toggled(&picks, &f[1].default, "chat");
+        assert_eq!(unticked, r#"["agentic"]"#);
+        assert_eq!(
+            toggled(&picks, &unticked, "chat"),
+            r#"["chat","agentic"]"#,
+            "choice order, not tick order"
+        );
+
+        let answers = |w: &str| vec![String::new(), w.to_string()];
+        assert_eq!(
+            params(&f, &answers(&unticked)).unwrap()["workloads"],
+            json!(["agentic"])
+        );
+        assert_eq!(params(&f, &answers("[]")).unwrap()["workloads"], json!([]));
+        assert_eq!(params(&f, &answers(r#"["batch"]"#)).unwrap_err()[0].0, 1);
     }
 
     #[test]
