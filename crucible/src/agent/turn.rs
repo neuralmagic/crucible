@@ -456,9 +456,10 @@ mod tests {
                 break;
             }
         }
-        let end = pump.finish(None, &mut |_l: &str, _s: RawStream, ev: Option<&AgentEvent>| {
-            events.extend(ev.cloned())
-        });
+        let end = pump.finish(
+            None,
+            &mut |_l: &str, _s: RawStream, ev: Option<&AgentEvent>| events.extend(ev.cloned()),
+        );
         (end, read, events)
     }
 
