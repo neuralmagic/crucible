@@ -66,7 +66,7 @@ Dropped at the `crucible/v0.1.2` pin, relative to the previous `crucible/grpc-ba
   without it.
 - Provider profiles are import-only. The gateway has no compiled profiles. Crucible ships the
   `google-cloud`, `aws-s3`, and `crucible-broker` profiles from
-  `crucible/src/openshell/provider.rs` and imports them before it creates providers.
+  `crucible/src/openshell_turn/provider.rs` and imports them before it creates providers.
 - `gateway.toml` uses schema version 2 (singular `compute_driver`). The kubernetes driver runs
   the supervisor as a separate pod, so `grpc_endpoint` is the IP of the loop pod (with a
   matching IP SAN in the server certificate). `sandbox_runtime_image` is a new image.

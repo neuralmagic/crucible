@@ -5,10 +5,10 @@
 //! token on egress to that server alone, so no token reaches the loop pod or the sandbox. No
 //! servers, nothing: no provider, no egress entry, no `.mcp.json` entry.
 
+use crate::endpoint::{Access, Endpoint, Protocol};
 use crate::openshell::grpc::ProviderName;
-use crate::openshell::{buildit, git, provider};
+use crate::openshell_turn::{buildit, git, provider};
 use anyhow::{Context, Result};
-use crucible::openshell::endpoint::{Access, Endpoint, Protocol};
 use crucible_contract::agent_servers::{AgentServer, ENV_AGENT_SERVERS, LocalServer, Transport};
 use crucible_contract::sandbox::{ENV_AGENT_SVID_AUDIENCE, ENV_AGENT_TOKEN_ENDPOINT};
 
@@ -92,7 +92,7 @@ impl Granted {
 
     /// Start the server in the loop pod when it runs there, and wait until it listens. A buildit
     /// also serves the run's own tasks on `socket`.
-    pub fn start_local(&self, socket: Option<&buildit::RunSocket>) -> Result<()> {
+    pub fn start_local(&self, socket: Option<&crate::args::RunSocket>) -> Result<()> {
         match &self.server.transport {
             Transport::Remote => Ok(()),
             Transport::Local(LocalServer::Buildit(site)) => buildit::Buildit {
@@ -126,7 +126,7 @@ pub fn run_git() -> Result<bool> {
 
 /// The socket a command or evaluate task reaches the run's buildit on, once it is running: none
 /// when the controller granted no buildit in this pod or the run has no socket.
-pub fn run_buildit(socket: Option<&buildit::RunSocket>) -> Result<Option<std::path::PathBuf>> {
+pub fn run_buildit(socket: Option<&crate::args::RunSocket>) -> Result<Option<std::path::PathBuf>> {
     let Some(socket) = socket else {
         return Ok(None);
     };
@@ -267,7 +267,7 @@ impl AgentServers {
 
 #[cfg(test)]
 mod tests {
-    use crate::openshell::agent_servers::*;
+    use crate::openshell_turn::agent_servers::*;
     use crucible_contract::agent_servers::{BuilditSite, ServerName};
 
     const ENDPOINT: &str = "http://crucible-controller.crucible-system.svc:8080/oauth/token";

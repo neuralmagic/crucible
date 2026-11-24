@@ -173,7 +173,7 @@ struct SandboxTable {
 /// does not parse; a manifest with no `[agent]` table is the engine's default backend and no image.
 pub fn pack_agent(
     pack_root: &Path,
-    variant: Option<&crucible::manifest::variant::VariantName>,
+    variant: Option<&crucible::knobs::VariantName>,
 ) -> Result<PackAgent> {
     let text = crate::playbooks::packs::manifest_text(pack_root, variant)?;
     let parsed: ManifestAgent = toml::from_str(&text).context("parsing the pack's [agent]")?;

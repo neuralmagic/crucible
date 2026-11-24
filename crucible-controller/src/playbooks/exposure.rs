@@ -351,7 +351,7 @@ pub enum ExtractError {
 pub fn extract(
     pack_root: &Path,
     pr_repo: Option<&str>,
-    variant: Option<&crucible::manifest::variant::VariantName>,
+    variant: Option<&crucible::knobs::VariantName>,
 ) -> Result<Exposure, ExtractError> {
     let manifest = pack_root.join(MANIFEST);
     if !manifest.is_file() {

@@ -151,7 +151,7 @@ pub(crate) async fn get_playbook_launch(
         }),
         variant: row
             .variant
-            .map(|v| crucible::manifest::variant::VariantName::parse(&v))
+            .map(|v| crucible::knobs::VariantName::parse(&v))
             .transpose()
             .with_context(|| format!("stored manifest variant for {key}"))?,
     }))
@@ -162,7 +162,7 @@ pub(crate) async fn get_playbook_launch(
 pub(crate) async fn launch_variant(
     pool: &PgPool,
     key: &str,
-) -> Result<Option<crucible::manifest::variant::VariantName>> {
+) -> Result<Option<crucible::knobs::VariantName>> {
     let stored: Option<Option<String>> =
         sqlx::query_scalar("SELECT variant FROM playbook_launches WHERE key = $1")
             .bind(key)
@@ -171,7 +171,7 @@ pub(crate) async fn launch_variant(
             .context("reading a launch's manifest variant")?;
     stored
         .flatten()
-        .map(|v| crucible::manifest::variant::VariantName::parse(&v))
+        .map(|v| crucible::knobs::VariantName::parse(&v))
         .transpose()
         .with_context(|| format!("stored manifest variant for {key}"))
 }

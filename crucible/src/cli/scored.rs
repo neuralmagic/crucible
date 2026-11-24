@@ -37,7 +37,7 @@ pub(crate) enum ScoredError {
     #[error(transparent)]
     File(#[from] FileError),
     #[error(transparent)]
-    Workspace(#[from] crate::cli::workspace::WorkspaceError),
+    Workspace(#[from] crate::workspace::WorkspaceError),
 }
 
 /// `crucible watch-pr`: poll draft PRs' review comments and steer a live run or reseed the next.
@@ -89,7 +89,7 @@ pub(crate) fn run_from_manifest(mut args: Args) -> Result<()> {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     m.resolve_workflow(&manifest_dir)?;
-    crate::cli::setup::warn_inherited_env(crate::exposure::inherits_engine_env(&m));
+    crate::setup::warn_inherited_env(crate::exposure::inherits_engine_env(&m));
     let workspace = manifest_dir.join(&m.workspace.dir);
     let state = args
         .state_dir
@@ -98,7 +98,7 @@ pub(crate) fn run_from_manifest(mut args: Args) -> Result<()> {
     let skills = m.agent.toolbox_dir.as_ref().map(|d| manifest_dir.join(d));
     let p = Paths::for_manifest(workspace.clone(), state, &manifest_dir, skills);
     // Before the workspace clone: crucible-git reads the draft-pr bound to authorize it.
-    let frozen = crate::cli::setup::frozen_projection(
+    let frozen = crate::setup::frozen_projection(
         &m,
         m.publish
             .as_ref()
@@ -109,28 +109,23 @@ pub(crate) fn run_from_manifest(mut args: Args) -> Result<()> {
     )?;
 
     if !workspace.exists() {
-        crate::cli::workspace::manifest_setup(&m, &manifest_dir, &workspace)?;
+        crate::workspace::manifest_setup(&m, &manifest_dir, &workspace)?;
         // Inject baked judge/fixture files into the fresh clone (frozen judges + one-time fixtures).
         // Frozen ones are also re-copied before each measure; the initial copy gives the agent a
         // present, compilable harness from turn one.
         for (src, dst, _frozen) in m.resolved_injects(&manifest_dir, &workspace)? {
-            manifest::apply_inject(&src, &dst)
-                .context("applying [workspace].inject after setup")?;
+            crate::inject::apply(&src, &dst).context("applying [workspace].inject after setup")?;
         }
     }
     vcs::ensure_repo(&workspace).context("ensuring workspace is a git repo")?;
     std::fs::create_dir_all(&p.state)
         .with_context(|| format!("creating state dir {}", p.state.display()))?;
     // The toolbox lands where the resolved harness discovers skills.
-    let harness = crate::cli::setup::pin_agent(&mut args, &m.agent)?;
-    crate::cli::workspace::install_toolbox(
-        &p,
-        &m.agent.toolbox_exclude,
-        harness.spec().skills_dir,
-    )?;
+    let harness = crate::setup::pin_agent(&mut args, &m.agent)?;
+    crate::workspace::install_toolbox(&p, &m.agent.toolbox_exclude, harness.spec().skills_dir)?;
 
     // Fold the manifest's [agent] config onto Args (+ spawn the broker for openshell).
-    crate::cli::setup::apply_agent_cfg(&mut args, &m.agent, &m.secrets, &p.workspace, &frozen)?;
+    crate::setup::apply_agent_cfg(&mut args, &m.agent, &m.secrets, &p.workspace, &frozen)?;
     // Single-repo publish target: a `[publish] pr_repo` in the manifest wins over any `--pr-repo` the
     // caller passed (the controller passes its per-repo default via the flag; a pack that names its
     // own fork overrides it). Absent → keep the flag value (empty by default, so no PR opens).
@@ -220,7 +215,7 @@ fn read_seed_diff(manifest_dir: &Path, seed_diff: Option<&str>) -> Result<Option
 /// co-locate under the base so the agent has one cwd / one sandbox upload tree spanning both repos.
 fn run_composite(mut args: Args, manifest_path: PathBuf) -> Result<()> {
     let m = manifest::CompositeManifest::load_frozen(&manifest_path)?;
-    crate::cli::setup::warn_inherited_env(m.edition == manifest::edition::Edition::One);
+    crate::setup::warn_inherited_env(m.edition == crate::edition::Edition::One);
     let manifest_dir = manifest_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -249,13 +244,8 @@ fn run_composite(mut args: Args, manifest_path: PathBuf) -> Result<()> {
                 .clone()
                 .or_else(|| repo.path.clone())
                 .with_context(|| format!("component `{}` [repo] needs url or path", c.name))?;
-            crate::cli::workspace::clone_repo(
-                &src,
-                repo.git_ref.as_ref(),
-                repo.filter,
-                &c.workspace,
-            )
-            .with_context(|| format!("cloning component `{}`", c.name))?;
+            crate::workspace::clone_repo(&src, repo.git_ref.as_ref(), repo.filter, &c.workspace)
+                .with_context(|| format!("cloning component `{}`", c.name))?;
         }
         vcs::ensure_repo(&c.workspace)
             .with_context(|| format!("ensuring component `{}` is a git repo", c.name))?;
@@ -275,28 +265,24 @@ fn run_composite(mut args: Args, manifest_path: PathBuf) -> Result<()> {
     let p = Paths::for_manifest(base, state, &manifest_dir, skills);
     std::fs::create_dir_all(&p.state)
         .with_context(|| format!("creating state dir {}", p.state.display()))?;
-    let harness = crate::cli::setup::pin_agent(&mut args, &m.agent)?;
-    crate::cli::workspace::install_toolbox(
-        &p,
-        &m.agent.toolbox_exclude,
-        harness.spec().skills_dir,
-    )?;
+    let harness = crate::setup::pin_agent(&mut args, &m.agent)?;
+    crate::workspace::install_toolbox(&p, &m.agent.toolbox_exclude, harness.spec().skills_dir)?;
 
     // A composite has no single-repo [publish]; its forks are per component.
-    let bounds = crate::cli::setup::run_bounds(
+    let bounds = crate::setup::run_bounds(
         &m.outputs,
         &m.build,
         Some(args.pr_repo.as_str()),
         &std::collections::BTreeMap::new(),
     );
-    let frozen = crate::cli::setup::FrozenProjection {
-        broker_env: crate::cli::setup::broker_bounds_env(&bounds, &p.session_log)?,
+    let frozen = crate::setup::FrozenProjection {
+        broker_env: crate::setup::broker_bounds_env(&bounds, &p.session_log)?,
         disclosure: Some(crate::exposure::covered_from(
             crate::exposure::composite_capabilities(&m.agent, &m.capabilities, &m.mcp),
         )),
         bounds: Some(bounds),
     };
-    crate::cli::setup::apply_agent_cfg(&mut args, &m.agent, &m.secrets, &p.workspace, &frozen)?;
+    crate::setup::apply_agent_cfg(&mut args, &m.agent, &m.secrets, &p.workspace, &frozen)?;
     // The per-component fork map for publish-on-keep, manifest-owned via [[component]].pr_repo.
     args.component_pr_repos = m.component_pr_repos();
     let (goal, template) = resolve_goal_template(&args, &m.agent, &manifest_dir)?;
@@ -539,7 +525,7 @@ fn start_mcp<R: report::reporter::Reporter>(
     r: &mut R,
     header: Option<(&str, &str)>,
 ) -> Result<()> {
-    let Err(error) = crate::cli::setup::start_mcp(args, mcp) else {
+    let Err(error) = crate::setup::start_mcp(args, mcp) else {
         return Ok(());
     };
     if !error.is::<crate::control::mcp::StartError>() {
@@ -549,7 +535,7 @@ fn start_mcp<R: report::reporter::Reporter>(
         r.start(goal, gate);
     }
     r.shutdown("error", &format!("{error:#}"));
-    Err(crate::cli::setup::ended_at_setup(p, error))
+    Err(crate::setup::ended_at_setup(p, error))
 }
 
 /// Ctrl+C stops cleanly at the next checkpoint.
@@ -625,7 +611,7 @@ mod tests {
         let error = crate::cli::scored::run_from_manifest(args)
             .expect_err("the run cannot start its server");
 
-        assert!(error.is::<crate::cli::setup::EndedAtSetup>(), "{error:#}");
+        assert!(error.is::<crate::setup::EndedAtSetup>(), "{error:#}");
         let log = std::fs::read_to_string(state.join("session.jsonl")).unwrap();
         let events: Vec<SessionEvent> = log.lines().filter_map(decode).collect();
         let [

@@ -534,7 +534,7 @@ env = ["GH_TOKEN", "GPUS?"]
         let env = |env: &crucible::host_env::DeclaredEnv| -> Vec<String> {
             env.iter().map(ToString::to_string).collect()
         };
-        assert_eq!(m.edition, crate::manifest::edition::Edition::Two);
+        assert_eq!(m.edition, crate::edition::Edition::Two);
         let judge = m.judge.as_ref().unwrap();
         assert!(judge.selftest.is_none());
         assert_eq!(env(&judge.env), ["KUBECONFIG", "EPP_ENDPOINT?"]);

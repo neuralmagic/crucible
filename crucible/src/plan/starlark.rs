@@ -7506,7 +7506,7 @@ env = ["GH_TOKEN", "GPUS?"]
 
             let mut m = crate::manifest::Manifest::load(&manifest_path)
                 .unwrap_or_else(|e| panic!("{tag}: {e:#}\n{text}"));
-            assert_eq!(m.edition, crate::manifest::edition::Edition::Two, "{tag}");
+            assert_eq!(m.edition, crate::edition::Edition::Two, "{tag}");
             let judge = m.judge.as_ref().unwrap();
             assert_eq!(
                 declared_env(&judge.env),
@@ -7525,11 +7525,7 @@ env = ["GH_TOKEN", "GPUS?"]
                 ["GH_TOKEN", "GPUS?"],
                 "{tag}\n{text}"
             );
-            assert_eq!(
-                workflow.edition,
-                crate::manifest::edition::Edition::Two,
-                "{tag}"
-            );
+            assert_eq!(workflow.edition, crate::edition::Edition::Two, "{tag}");
             assert_eq!(workflow.tasks.len(), 1, "{tag}");
 
             materialize_manifest(

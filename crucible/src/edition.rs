@@ -71,7 +71,7 @@ pub const INHERITED_ENV_WARNING: &str = "this pack is edition 1, so measure_cmd,
 
 #[cfg(test)]
 mod tests {
-    use crate::manifest::edition::{Edition, UnknownEdition};
+    use crate::edition::{Edition, UnknownEdition};
 
     #[derive(serde::Deserialize)]
     struct Doc {

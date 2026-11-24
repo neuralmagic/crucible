@@ -5,8 +5,8 @@
 //! content executes, so `crucible check` and `crucible plan exposure` can print a pack's reach
 //! before anything of the pack has run.
 
+use crate::edition::Edition;
 use crate::host_env::DeclaredEnv;
-use crate::manifest::edition::Edition;
 use crate::manifest::{CapabilitiesCfg, CredentialContext, Manifest};
 use crate::openshell::gateway::ComputeDriver;
 use crucible_contract::outputs::{BoundSource, ResolvedOutputs, ResolvedTarget};
@@ -245,7 +245,7 @@ fn egress(m: &Manifest) -> Vec<Capability> {
 /// The broker's own allowlist entry, when the pack enables one. The sandbox reaches the loop pod
 /// through the compute driver's alias; both drivers name the same pod, so the disclosure states
 /// the in-cluster one.
-fn broker_endpoint(m: &Manifest) -> Option<crate::openshell::endpoint::Endpoint> {
+fn broker_endpoint(m: &Manifest) -> Option<crate::endpoint::Endpoint> {
     if !m.agent.broker.enabled {
         return None;
     }
@@ -258,10 +258,10 @@ fn broker_endpoint(m: &Manifest) -> Option<crate::openshell::endpoint::Endpoint>
 
 /// An allowlist entry's host, port, and access, `full` when the entry names none.
 fn parse_endpoint(entry: &str) -> Option<(String, u16, String)> {
-    let ep: crate::openshell::endpoint::Endpoint = entry.parse().ok()?;
+    let ep: crate::endpoint::Endpoint = entry.parse().ok()?;
     let access = ep
         .access
-        .unwrap_or(crate::openshell::endpoint::Access::Full)
+        .unwrap_or(crate::endpoint::Access::Full)
         .as_str()
         .to_string();
     Some((ep.host, ep.port, access))

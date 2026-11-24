@@ -4,7 +4,7 @@
 //! asks this server-side broker, which holds the privilege and the admission logic. crucible spawns
 //! it once per run and the sandboxed claude reaches it over streamable-http at
 //! `host.containers.internal:8849` (egress-allowlisted, seeded as `.mcp.json` by
-//! [`crate::openshell::run`]).
+//! [`crate::openshell_turn::run`]).
 //!
 //! Like the openshell gateway (see [`crate::openshell::gateway`]), the broker is a run-lifetime
 //! daemon, not handle-held: crucible is the pod entrypoint, so when it exits the container exits and

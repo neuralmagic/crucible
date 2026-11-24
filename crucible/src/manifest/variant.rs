@@ -2,73 +2,16 @@
 //! selecting the variant replaces each base entry of the same name whole, with no deeper merge.
 
 use std::collections::BTreeMap;
-use std::fmt;
-use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
+use crate::knobs::{BadVariantName, VariantName};
 
 /// The top-level table that declares variants.
 pub const VARIANT_TABLE: &str = "variant";
 
-const MAX_NAME_LEN: usize = 64;
-
-/// A variant's name: 1-64 ASCII letters, digits, `-` or `_`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct VariantName(String);
-
-impl VariantName {
-    pub fn parse(name: &str) -> Result<Self, VariantError> {
-        let valid = !name.is_empty()
-            && name.len() <= MAX_NAME_LEN
-            && name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
-        if !valid {
-            return Err(VariantError::BadName {
-                name: name.to_owned(),
-            });
-        }
-        Ok(VariantName(name.to_owned()))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for VariantName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl FromStr for VariantName {
-    type Err = VariantError;
-
-    fn from_str(name: &str) -> Result<Self, Self::Err> {
-        VariantName::parse(name)
-    }
-}
-
-impl TryFrom<String> for VariantName {
-    type Error = VariantError;
-
-    fn try_from(name: String) -> Result<Self, Self::Error> {
-        VariantName::parse(&name)
-    }
-}
-
-impl From<VariantName> for String {
-    fn from(name: VariantName) -> Self {
-        name.0
-    }
-}
-
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum VariantError {
-    #[error("variant name {name:?} must be 1-64 ASCII letters, digits, '-' or '_'")]
-    BadName { name: String },
+    #[error(transparent)]
+    BadName(#[from] BadVariantName),
     #[error("[variant] must be a table holding one table per variant")]
     NotATable,
     #[error("[variant.{name}] must be a table of manifest tables")]
@@ -277,23 +220,10 @@ dir = "e2e"
         );
         assert_eq!(
             split("[variant.\"off line\".agent]\nbackend = \"command\"\n"),
-            VariantError::BadName {
+            VariantError::BadName(BadVariantName {
                 name: "off line".into()
-            }
+            })
         );
-    }
-
-    #[test]
-    fn a_variant_name_is_a_short_identifier() {
-        for good in ["offline", "e2e", "live_eu-1", "A"] {
-            assert_eq!(name(good).as_str(), good);
-        }
-        for bad in ["", "off line", "a/b", "ü", &"x".repeat(65)] {
-            assert!(VariantName::parse(bad).is_err(), "{bad:?}");
-        }
-        let round: VariantName = serde_json::from_str("\"offline\"").unwrap();
-        assert_eq!(serde_json::to_string(&round).unwrap(), "\"offline\"");
-        assert!(serde_json::from_str::<VariantName>("\"a b\"").is_err());
     }
 
     #[test]
@@ -341,7 +271,7 @@ goal = "g"
             let text = effective_text(manifest, variant.as_ref()).unwrap();
             let m = crate::manifest::Manifest::parse_variant(&text, None, "effective text")
                 .unwrap_or_else(|e| panic!("{variant:?}: {e:#}\n{text}"));
-            assert_eq!(m.edition, crate::manifest::edition::Edition::Two);
+            assert_eq!(m.edition, crate::edition::Edition::Two);
             assert_eq!(
                 env(&m.judge.as_ref().unwrap().env),
                 ["KUBECONFIG", "EPP_ENDPOINT?"]

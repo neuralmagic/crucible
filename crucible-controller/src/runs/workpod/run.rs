@@ -145,7 +145,7 @@ pub enum RunRenderOpts {
         /// The finished run this launch reruns.
         rerun: Option<crate::launches::model::RerunOf>,
         /// The manifest variant the run reads.
-        variant: Option<crucible::manifest::variant::VariantName>,
+        variant: Option<crucible::knobs::VariantName>,
     },
 }
 

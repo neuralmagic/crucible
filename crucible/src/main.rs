@@ -12,7 +12,8 @@
 //!
 //! Layout: this file is the entrypoint. [`args`] is the shared vocabulary ([`args::Args`],
 //! [`args::Paths`], [`args::Prepared`]); [`cli`] parses the command line and dispatches it;
-//! [`runloop`] holds the single orchestration loop; [`agent`] runs one turn; [`control`] steers a
+//! [`runloop`] holds the single orchestration loop; [`turn`] runs one turn on the run's backend,
+//! out of the parts in [`agent`]; [`setup`] resolves a run from its manifest; [`control`] steers a
 //! running loop from outside; [`report`] is how the loop talks to a human or a log; [`scope`]
 //! is the scoping pipeline. The loop talks only to a [`report::reporter::Reporter`], so one loop drives
 //! multiple front-ends: [`report::console::ConsoleReporter`] for headless runs and the NDJSON
@@ -40,18 +41,21 @@ mod report;
 mod runloop;
 #[cfg(feature = "autoresearch")]
 mod scope;
+mod setup;
 #[cfg(test)]
 mod testing;
+mod turn;
+mod workspace;
 pub(crate) use crucible_harness::stream_json;
 
-use crucible::{deploy, duration, errors, exposure, flow, knobs, manifest, outputs, turn_trace};
+use crucible::{
+    deploy, duration, edition, endpoint, errors, exposure, flow, inject, knobs, manifest,
+    openshell, outputs, plan, turn_trace,
+};
 
-/// The OpenShell turn runtime. The gateway client and the egress policy are library code (the
-/// deploy renderer needs their constants); the per-turn flow, provider, and sandbox helpers run
-/// only here.
-mod openshell {
-    pub use crucible::openshell::{gateway, grpc, policy};
-
+/// The OpenShell turn runtime over the library's gateway client and egress policy: the per-turn
+/// flow, provider, and sandbox helpers.
+mod openshell_turn {
     pub mod agent_servers;
     pub mod buildit;
     pub mod git;
@@ -62,16 +66,12 @@ mod openshell {
 
 /// The plan runtime: the CLI and the agent-harness task runner over the library's plan IR,
 /// compiler, and executor.
-mod plan {
-    pub use crucible::plan::{
-        STAGED_INPUTS, TASK_NAME_ENV, admission, attempt, exec, files, history, ir, machine,
-        record, rerun, resume, runner, starlark, term_img, workflow, worktree,
-    };
-
+mod plan_run {
     pub mod cli;
     pub mod desk;
     pub mod events;
     pub mod harness;
+    pub mod setup;
     pub mod task_tokens;
     pub mod template;
     pub mod transcript;
@@ -86,7 +86,8 @@ fn main() -> std::process::ExitCode {
         Err(error) => {
             eprintln!("Error: {error:?}");
             std::process::ExitCode::from(
-                if error.is::<plan::cli::NoValidVerdict>() || error.is::<cli::setup::EndedAtSetup>()
+                if error.is::<plan_run::cli::NoValidVerdict>()
+                    || error.is::<crate::setup::EndedAtSetup>()
                 {
                     crucible::plan::INVALID_VERDICT_EXIT
                 } else {

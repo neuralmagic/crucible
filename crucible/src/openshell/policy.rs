@@ -17,9 +17,9 @@
 //! See [`resolve_endpoints`] for the full rule. `deny_binaries` stays exact-string, a binary path
 //! has no domain structure.
 
+use crate::endpoint::Endpoint;
 use crate::knobs::Harness;
 use crate::manifest::OpenshellCfg;
-use crate::openshell::endpoint::Endpoint;
 
 /// Built-in egress endpoints in openshell's `host:port:access[:proto[:enforcement]]` form.
 /// No protocol is given, so these are L4-only (CONNECT tunneling): `protocol=rest` would
@@ -56,24 +56,6 @@ pub const DEFAULT_ENDPOINTS: &[&str] = &[
     "oauth2.googleapis.com:443:read-write",
     "api.anthropic.com:443:read-write",
 ];
-
-/// Egress hosts a codex turn needs on top of the shared defaults. `full` (raw L4 tunnel, like
-/// github's default) rather than `read-write`: the proxy applies protocol handling to read-write
-/// endpoints, and codex's streaming connection to the ChatGPT backend dies mid-stream through it.
-pub const CODEX_ENDPOINTS: &[&str] = &[
-    "chatgpt.com:443:full",
-    "auth.openai.com:443:full",
-    "api.openai.com:443:full",
-    "ab.chatgpt.com:443:full",
-];
-
-/// Claude Code's own log intake: `claude` posts its client logs here whatever backend serves the
-/// model.
-pub const CLAUDE_ENDPOINTS: &[&str] = &["http-intake.logs.us5.datadoghq.com:443:read-write"];
-
-/// The one OpenAI host a key-authenticated harness (opencode, pi) reaches when no custom base URL
-/// redirects it; a custom endpoint's host is added per turn from `OPENAI_BASE_URL` instead.
-pub const OPENAI_API_ENDPOINTS: &[&str] = &["api.openai.com:443:full"];
 
 /// The egress allowlist built-ins for `harness`: the shared defaults, plus the model backend's
 /// own hosts for a harness that does not talk to Vertex. Per-harness so a claude turn's allowlist

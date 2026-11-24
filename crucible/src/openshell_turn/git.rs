@@ -2,7 +2,7 @@
 //! the run the `git` server. The loop never holds the run's GitHub credential: it waits for the
 //! sidecar to listen, and hands it the run's output bounds through the directory they share.
 //! Its grant, egress and `.mcp.json` entry are any agent server's
-//! ([`crate::openshell::agent_servers`]).
+//! ([`crate::openshell_turn::agent_servers`]).
 
 use anyhow::{Context, Result};
 use crucible_contract::git::{BOUNDS_FILE, Bounds, SHARED_DIR, TLS_BIND};

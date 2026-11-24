@@ -13,7 +13,7 @@
 use crate::playbooks::pack_trees::EncodedPack;
 use crate::runs::blob_store::StoredPack;
 use anyhow::{Context, Result};
-use crucible::manifest::variant::VariantName;
+use crucible::knobs::VariantName;
 use crucible_contract::pack_tree::{
     OverBudget, PackTree, ReadPack, TreeDigest, TreeError, check_delivery_budget, walk_dir,
 };

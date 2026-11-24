@@ -4,7 +4,7 @@
 //! read the engine's own credentials. An edition-1 pack's commands inherit the engine's
 //! environment.
 
-use crate::manifest::edition::Edition;
+use crate::edition::Edition;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
@@ -270,10 +270,10 @@ impl HostEnv {
 
 #[cfg(test)]
 mod tests {
+    use crate::edition::Edition;
     use crate::host_env::{
         BASE, DeclaredEnv, EnvDecl, EnvDeclError, EnvName, HostEnv, MissingEnv, RequiredAndOptional,
     };
-    use crate::manifest::edition::Edition;
     use std::ffi::OsString;
 
     fn declared(entries: &[&str]) -> DeclaredEnv {

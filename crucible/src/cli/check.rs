@@ -5,8 +5,9 @@
 //! judge wall, applied here as a lint rather than a block).
 
 use crate::cli::selftest::{self, SelftestReport};
-use crate::manifest::edition::{Edition, INHERITED_ENV_WARNING};
-use crate::manifest::variant::{self, VariantName};
+use crate::edition::{Edition, INHERITED_ENV_WARNING};
+use crate::knobs::VariantName;
+use crate::manifest::variant;
 use crate::manifest::{self, AgentCfg, CompositeManifest, Manifest, WorldCfg};
 use crate::openshell;
 use crate::plan::history::HistoryLimit;
@@ -278,12 +279,12 @@ fn check_single(manifest_path: &Path, variant: Option<&VariantName>) -> Result<C
     ));
 
     if !workspace.exists() {
-        if let Err(e) = crate::cli::workspace::manifest_setup(&m, &manifest_dir, &workspace) {
+        if let Err(e) = crate::workspace::manifest_setup(&m, &manifest_dir, &workspace) {
             out.findings.push(format!("workspace setup failed: {e:#}"));
             return Ok(out);
         }
         for (src, dst, _frozen) in m.resolved_injects(&manifest_dir, &workspace)? {
-            if let Err(e) = manifest::apply_inject(&src, &dst) {
+            if let Err(e) = crate::inject::apply(&src, &dst) {
                 out.findings
                     .push(format!("applying [workspace].inject failed: {e:#}"));
                 return Ok(out);
@@ -300,7 +301,7 @@ fn check_single(manifest_path: &Path, variant: Option<&VariantName>) -> Result<C
     // probe must apply them too, a pre-existing workspace may predate an inject added since.
     let frozen = frozen_injects(&m, &manifest_dir, &workspace)?;
     for (src, dst) in &frozen {
-        if let Err(e) = manifest::apply_inject(src, dst) {
+        if let Err(e) = crate::inject::apply(src, dst) {
             out.findings
                 .push(format!("applying frozen [workspace].inject failed: {e:#}"));
             return Ok(out);
@@ -480,12 +481,9 @@ fn check_composite(manifest_path: &Path) -> Result<CheckOutcome> {
                     .push(format!("component `{}` [repo] needs url or path", c.name));
                 continue;
             };
-            if let Err(e) = crate::cli::workspace::clone_repo(
-                &src,
-                repo.git_ref.as_ref(),
-                repo.filter,
-                &c.workspace,
-            ) {
+            if let Err(e) =
+                crate::workspace::clone_repo(&src, repo.git_ref.as_ref(), repo.filter, &c.workspace)
+            {
                 out.findings
                     .push(format!("cloning component `{}` failed: {e:#}", c.name));
                 continue;

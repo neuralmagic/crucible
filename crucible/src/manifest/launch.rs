@@ -14,7 +14,9 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::knobs::{Harness, ReasoningEffort};
+use crate::knobs::{
+    EFFORT_NAMES, HARNESS_NAMES, Harness, ReasoningEffort, parse_effort, parse_harness,
+};
 use crate::manifest::{AgentOverridesCfg, GitRef, GitRefError, RepoOverridesCfg};
 use crate::plan::diag;
 use crate::plan::ir::{Task, TaskKind, TaskName};
@@ -194,45 +196,6 @@ pub fn split(
         .iter()
         .map(|(name, value)| (name.clone(), value.clone()))
         .partition(|(name, _)| !crate::plan::param::is_address(name))
-}
-
-/// A harness name, read the way a turn reads it.
-pub fn parse_harness(raw: &str) -> Option<Harness> {
-    <Harness as clap::ValueEnum>::from_str(raw, true).ok()
-}
-
-/// A reasoning effort, read the way a turn reads it.
-pub fn parse_effort(raw: &str) -> Option<ReasoningEffort> {
-    <ReasoningEffort as clap::ValueEnum>::from_str(raw, true).ok()
-}
-
-const HARNESS_NAMES: &str = "claude, codex, opencode or pi";
-const EFFORT_NAMES: &str = "low, medium, high, xhigh or max";
-
-/// An agent task's `harness`, read the way a turn reads it.
-pub fn harness_knob<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Harness>, D::Error> {
-    use serde::Deserialize;
-    use serde::de::Error;
-    Option::<String>::deserialize(d)?
-        .map(|raw| {
-            parse_harness(&raw)
-                .ok_or_else(|| D::Error::custom(format!("harness {raw:?} is not {HARNESS_NAMES}")))
-        })
-        .transpose()
-}
-
-/// An agent task's `effort`, read the way a turn reads it.
-pub fn effort_knob<'de, D: serde::Deserializer<'de>>(
-    d: D,
-) -> Result<Option<ReasoningEffort>, D::Error> {
-    use serde::Deserialize;
-    use serde::de::Error;
-    Option::<String>::deserialize(d)?
-        .map(|raw| {
-            parse_effort(&raw)
-                .ok_or_else(|| D::Error::custom(format!("effort {raw:?} is not {EFFORT_NAMES}")))
-        })
-        .transpose()
 }
 
 const MODEL_SHAPE: &str = "a model name: letters, digits and . _ - : / @ [ ], not starting with -";

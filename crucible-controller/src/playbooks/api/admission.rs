@@ -90,7 +90,7 @@ impl<'a> LaunchTarget<'a> {
 
     /// The manifest variant a launch of this target runs under: the registration's, never a
     /// draft's.
-    pub(crate) fn variant(self) -> Option<&'a crucible::manifest::variant::VariantName> {
+    pub(crate) fn variant(self) -> Option<&'a crucible::knobs::VariantName> {
         match self {
             Self::Registered(pack) => pack.variant.as_ref(),
             Self::Draft(_) => None,
@@ -347,7 +347,7 @@ async fn check_plan(
     tree: crucible_contract::pack_tree::PackTree,
     params: &serde_json::Value,
     max_time: &crate::model::MaxTime,
-    variant: Option<&crucible::manifest::variant::VariantName>,
+    variant: Option<&crucible::knobs::VariantName>,
 ) -> Result<(), Response> {
     let params = crate::launches::store::stored_params(params);
     match crate::playbooks::registry::check_tree_runnable(

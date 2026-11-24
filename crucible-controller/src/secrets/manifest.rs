@@ -57,7 +57,7 @@ struct SecretEntry {
 /// credential the registry cannot resolve must not launch quietly without it.
 pub fn declared_secrets(
     pack_root: &Path,
-    variant: Option<&crucible::manifest::variant::VariantName>,
+    variant: Option<&crucible::knobs::VariantName>,
 ) -> Result<Vec<DeclaredSecret>> {
     let manifest = pack_root.join(crate::playbooks::packs::MANIFEST);
     if !manifest.is_file() {
@@ -241,14 +241,14 @@ name = "bare"
             format!("{MANIFEST}\n[[variant.offline.secret]]\nname = \"fixture-token\"\n"),
         )
         .expect("write");
-        let offline = crucible::manifest::variant::VariantName::parse("offline").expect("name");
+        let offline = crucible::knobs::VariantName::parse("offline").expect("name");
         let declared = declared_secrets(dir.path(), Some(&offline)).expect("parses");
         assert_eq!(
             declared.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
             ["fixture-token"]
         );
         assert_eq!(declared_secrets(dir.path(), None).expect("parses").len(), 3);
-        let unknown = crucible::manifest::variant::VariantName::parse("online").expect("name");
+        let unknown = crucible::knobs::VariantName::parse("online").expect("name");
         assert!(declared_secrets(dir.path(), Some(&unknown)).is_err());
     }
 

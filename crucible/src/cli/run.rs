@@ -156,17 +156,19 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                 file,
                 manifest,
                 params,
-            } => crate::plan::cli::compile_workflow(
+            } => crate::plan_run::cli::compile_workflow(
                 file,
                 manifest.as_deref(),
-                &crate::plan::cli::parse_params(params)?,
+                &crate::plan_run::cli::parse_params(params)?,
             ),
             crate::cli::PlanAction::Show {
                 file,
                 caps,
                 mermaid,
                 render,
-            } => crate::plan::cli::show(file, &caps.iter().cloned().collect(), *mermaid, *render),
+            } => {
+                crate::plan_run::cli::show(file, &caps.iter().cloned().collect(), *mermaid, *render)
+            }
             crate::cli::PlanAction::States { format, graph } => {
                 let digraph = match graph {
                     crate::cli::StatesGraph::Task => crate::plan::machine::task_digraph,
@@ -228,14 +230,14 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                 from,
             } => {
                 let engine = crate::agent::engine::EngineCtx::new()?;
-                crate::plan::cli::run(
+                crate::plan_run::cli::run(
                     file.as_deref(),
-                    &crate::plan::cli::parse_params(params)?,
+                    &crate::plan_run::cli::parse_params(params)?,
                     &caps.iter().cloned().collect(),
                     agent_cmd.clone(),
                     manifest.as_deref(),
-                    crate::plan::cli::RunOpts {
-                        ceilings: crate::plan::cli::Ceilings {
+                    crate::plan_run::cli::RunOpts {
+                        ceilings: crate::plan_run::cli::Ceilings {
                             usd: *max_cost,
                             wall_clock: max_time
                                 .as_deref()
@@ -250,7 +252,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                         resume: *resume,
                         variant: variant.clone(),
                         engine: Some(engine.handle()),
-                        rerun: rerun_of.as_ref().map(|parent| crate::plan::cli::Rerun {
+                        rerun: rerun_of.as_ref().map(|parent| crate::plan_run::cli::Rerun {
                             parent: parent.clone(),
                             from: from
                                 .iter()
@@ -466,7 +468,7 @@ fn playbook_launch(args: &crate::cli::DeployArgs) -> Result<Option<deploy::Playb
     Ok(Some(deploy::PlaybookLaunch {
         max_time,
         max_cost: args.max_cost,
-        params: crate::plan::cli::parse_params(&args.params)?,
+        params: crate::plan_run::cli::parse_params(&args.params)?,
         variant: args.variant.clone(),
         rerun: args.rerun_of.clone().map(|parent| deploy::RerunLaunch {
             parent,

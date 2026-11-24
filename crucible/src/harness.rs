@@ -3,9 +3,26 @@
 //! decoder, and transcript parser that genuinely differ per CLI live in the binary's backends.
 
 use crate::knobs::Harness;
-use crate::openshell::policy::{CLAUDE_ENDPOINTS, CODEX_ENDPOINTS, OPENAI_API_ENDPOINTS};
 use crucible_contract::inference::InferenceProtocol;
 use std::time::Duration;
+
+/// Egress hosts a codex turn needs on top of the shared defaults. `full` (raw L4 tunnel, like
+/// github's default) rather than `read-write`: the proxy applies protocol handling to read-write
+/// endpoints, and codex's streaming connection to the ChatGPT backend dies mid-stream through it.
+pub const CODEX_ENDPOINTS: &[&str] = &[
+    "chatgpt.com:443:full",
+    "auth.openai.com:443:full",
+    "api.openai.com:443:full",
+    "ab.chatgpt.com:443:full",
+];
+
+/// Claude Code's own log intake: `claude` posts its client logs here whatever backend serves the
+/// model.
+pub const CLAUDE_ENDPOINTS: &[&str] = &["http-intake.logs.us5.datadoghq.com:443:read-write"];
+
+/// The one OpenAI host a key-authenticated harness (opencode, pi) reaches when no custom base URL
+/// redirects it; a custom endpoint's host is added per turn from `OPENAI_BASE_URL` instead.
+pub const OPENAI_API_ENDPOINTS: &[&str] = &["api.openai.com:443:full"];
 
 /// How a sandbox turn gets its model credential. Vertex mints a `cloud-platform` access token from
 /// ADC and serves it through the gateway's metadata emulator; Codex seeds either an API key or a

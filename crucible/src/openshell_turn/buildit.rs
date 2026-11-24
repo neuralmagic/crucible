@@ -2,11 +2,12 @@
 //! there by `buildit mcp`: it runs builder pods in the profile's buildit namespace from the run's
 //! own sandboxes, through the run's gateway, and takes only run tokens the controller issued for
 //! this run. Its grant, egress and `.mcp.json` entry are any agent server's
-//! ([`crate::openshell::agent_servers`]).
+//! ([`crate::openshell_turn::agent_servers`]).
 
+use crate::args::RunSocket;
 use anyhow::{Context, Result};
 use crucible_contract::agent_servers::{BuilditSite, CacheWriters, NodeArch};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -22,14 +23,6 @@ const ENV_PUSH_AUTHFILE: &str = "FORGE_AUTHFILE";
 struct BootTimeout {
     probe: String,
     seconds: u64,
-}
-
-/// Where the run's own command and evaluate tasks reach its buildit: a unix socket in the run's
-/// state dir, whose builds read their contexts from the run's workspace.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RunSocket {
-    pub path: PathBuf,
-    pub workdir: PathBuf,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -214,7 +207,7 @@ fn accepts(socket: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::openshell::buildit::*;
+    use crate::openshell_turn::buildit::*;
     use crucible_contract::agent_servers::{
         Builder, BuilderPods, LayerCache, LayerCompression, SharedCache, StorageDriver,
     };

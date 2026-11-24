@@ -1,4 +1,4 @@
-use crate::openshell::endpoint::{Access, Endpoint};
+use crate::endpoint::{Access, Endpoint};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 

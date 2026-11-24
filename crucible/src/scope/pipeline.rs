@@ -252,7 +252,7 @@ impl Stage for Propose {
             .context("propose needs a resolved goal (ingest must have run first)")?;
 
         let scratch = scratch_dir("scope-propose-repo");
-        crate::cli::workspace::clone_repo(&self.opts.repo, None, None, &scratch)
+        crate::workspace::clone_repo(&self.opts.repo, None, None, &scratch)
             .context("checking out --repo for the propose turn")?;
         write_seed_context(&scratch, &goal)?;
         std::fs::create_dir_all(scratch.join(PACK_WORK_DIR))
@@ -736,7 +736,7 @@ fn run_adversary_turn(
     };
     let _ = std::fs::create_dir_all(&paths.state);
     let mut transcript = String::new();
-    let outcome = agent::run_turn(&args, &paths, prompt, false, |_line, stream, ev| {
+    let outcome = crate::turn::run_turn(&args, &paths, prompt, false, |_line, stream, ev| {
         forward_error(ev);
         if let Some(ev) = ev {
             transcript_event(session, ev);
@@ -955,7 +955,7 @@ fn note_turn_failure(session: &mut String, round: u32, turn: &TurnOutcome) {
 }
 
 /// Run the propose turn in `scratch` (cwd = the `--repo` checkout) and return its outcome. The
-/// backend comes from `opts` via [`turn_args`]; the real turn is the same `agent::run_turn` every
+/// backend comes from `opts` via [`turn_args`]; the real turn is the same `crate::turn::run_turn` every
 /// domain loop iteration uses. Every decoded event is preserved into `session`, the scratch dir
 /// (and any session file in it) is deleted when the turn ends, so this recording is the only
 /// transcript that survives.
@@ -970,7 +970,7 @@ fn run_propose_turn(
     let pricing = args.pricing();
     let paths = propose_paths(scratch);
     let _ = std::fs::create_dir_all(&paths.state);
-    agent::run_turn(&args, &paths, prompt, false, |_line, _stream, ev| {
+    crate::turn::run_turn(&args, &paths, prompt, false, |_line, _stream, ev| {
         forward_error(ev);
         if let Some(ev) = ev {
             transcript_event(session, ev);
@@ -1069,7 +1069,7 @@ fn render_workflow_preview(manifest_path: &Path, pack: &Path) -> Result<(u32, u3
             }
             .validate()?
         }
-        workflow => crate::plan::template::iteration_template(workflow, &workflow_caps)?,
+        workflow => crate::plan_run::template::iteration_template(workflow, &workflow_caps)?,
     };
     // Preview authored capabilities; execution still admits against the real substrate.
     let caps = plan
@@ -1077,7 +1077,7 @@ fn render_workflow_preview(manifest_path: &Path, pack: &Path) -> Result<(u32, u3
         .filter(|task| task.needs != "any")
         .map(|task| task.needs.clone())
         .collect();
-    crate::plan::cli::render_png_to(&plan, &caps, &pack.join("WORKFLOW.png"))
+    crate::plan_run::cli::render_png_to(&plan, &caps, &pack.join("WORKFLOW.png"))
 }
 
 /// Stage 3: compute the pack's `RunIdentity` and write `SCOPE.md`. Refuses to overwrite an

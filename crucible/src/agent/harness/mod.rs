@@ -14,11 +14,11 @@ pub(crate) mod opencode;
 pub(crate) mod pi;
 
 use crate::agent::event::AgentEvent;
+use crate::agent::harness::codex::CodexAuth;
 use crate::agent::inference::{InferenceEnv, WireApi};
 use crate::agent::sandbox_env::sh_quote;
 use crate::args::TurnAgent;
 use crate::knobs::Harness;
-use crate::openshell::provider::CodexAuth;
 use crate::turn_trace::{GenAiRecord, ToolInvocation};
 use crucible::harness::{AuthProvider, HarnessSpec};
 use crucible_harness::line::LineFormat;
@@ -526,7 +526,7 @@ mod tests {
         );
         assert_eq!(
             &claude[crate::openshell::policy::DEFAULT_ENDPOINTS.len()..],
-            crate::openshell::policy::CLAUDE_ENDPOINTS
+            crucible::harness::CLAUDE_ENDPOINTS
         );
         let codex = endpoints(Harness::Codex);
         assert_eq!(
@@ -560,7 +560,7 @@ mod tests {
             );
             assert_eq!(
                 &got[crate::openshell::policy::DEFAULT_ENDPOINTS.len()..],
-                crate::openshell::policy::OPENAI_API_ENDPOINTS,
+                crucible::harness::OPENAI_API_ENDPOINTS,
                 "{harness:?}"
             );
             assert!(!got.iter().any(|e| e.contains("chatgpt.com")));

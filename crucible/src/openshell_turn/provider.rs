@@ -7,6 +7,7 @@
 //! the Vertex cred is never a readable sandbox env var; it rides the Create/UpdateProvider gRPC
 //! request body ([`crate::openshell::grpc`]), never an argv, so there is no process-listing leak.
 
+use crate::agent::harness::codex::CodexToken;
 use crate::openshell::grpc::ProviderName;
 use anyhow::{Context, Result};
 
@@ -100,29 +101,6 @@ fn ensure_adc() -> Result<()> {
         unsafe { std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", &path) };
     }
     Ok(())
-}
-
-/// The short-lived material a codex sandbox is handed, via its seeded `$CODEX_HOME/auth.json`
-/// ([`crate::agent::harness::codex`]): one access token, the account it belongs to, and the id token
-/// codex echoes back. No refresh token, by construction: the loop process is the single
-/// refresher, so a sandbox that outlives its access token fails loudly instead of racing the
-/// host for a rotation. No gateway provider is involved (provider env resolves to a placeholder
-/// at the L7 proxy and codex's transport is an L4 WebSocket, so codex needs the real bytes).
-///
-/// This is the ChatGPT-subscription auth path. API-key turns bypass it, while deployments that
-/// provide `CODEX_CREDENTIALS` retain refresh and rotation behavior.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CodexToken {
-    pub access_token: String,
-    pub account_id: String,
-    pub id_token: String,
-}
-
-/// The two authentication modes Crucible can seed into a Codex sandbox.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CodexAuth {
-    ApiKey(String),
-    ChatGpt(CodexToken),
 }
 
 /// The `~/.codex/auth.json` shape, as far as crucible cares: the OAuth material under `tokens`.
@@ -617,7 +595,7 @@ pub fn aws_s3_profile() -> openshell_core::proto::ProviderProfile {
 
 #[cfg(test)]
 mod tests {
-    use crate::openshell::provider::*;
+    use crate::openshell_turn::provider::*;
 
     #[test]
     fn a_token_grant_profile_names_the_grant_type_the_gateway_stores() {
