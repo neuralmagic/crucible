@@ -50,7 +50,7 @@ pub enum Unvalued {
 /// The value each declared param compiles with: the caller's, else the pack's own declared
 /// default, else — under [`Unvalued::Placeholder`] — a stand-in derived from its declaration. A
 /// pack whose optional params carry defaults compiles with no values supplied at all.
-fn effective(
+pub(crate) fn effective(
     schema: Option<&serde_json::Value>,
     params: &BTreeMap<String, String>,
     unvalued: Unvalued,

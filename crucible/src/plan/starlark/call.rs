@@ -1,0 +1,957 @@
+//! `call(...)`, `budget(...)` and `item()`: a task that dispatches a `[calls]` target as its own
+//! run, compiled against the pack's `calls.lock` alone (RFC-0008 C-CALL).
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::{self, Display};
+
+use allocative::Allocative;
+use starlark::starlark_simple_value;
+use starlark::values::{Heap, NoSerialize, ProvidesStaticType, StarlarkValue, starlark_value};
+
+use crate::plan::call::Binding;
+use crate::plan::diag;
+use crate::plan::ir::{Emits, OutputField, Task, TaskKind, TaskName};
+use crate::plan::starlark::error::CompileError;
+use crate::plan::starlark::params::{ParamType, embedded, embedded_schema};
+use crate::plan::starlark::values::CONVERTED;
+use crate::plan::starlark::{
+    CompileState, Result, Value, check_fanout, imply_dependencies, note_explicit_required,
+    parse_join, parse_stage, take_bool_default, take_declared_name, take_dependencies, take_fanout,
+    take_string, take_string_default, take_when, wrong_type,
+};
+use crucible_contract::calls::{CallAlias, CallBudget, CallKind, MAX_CALL_FANOUT, TargetInterface};
+use crucible_contract::emits::{FieldType, JsonSchema};
+
+/// `param(name)` of a json or file parameter. Its value reaches a task only under `params`, or a
+/// call's target as a binding, never as text in the source.
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+pub(crate) struct ParamRefValue {
+    pub(crate) name: String,
+    #[allocative(skip)]
+    pub(crate) ty: ParamType,
+}
+
+starlark_simple_value!(ParamRefValue);
+
+impl Display for ParamRefValue {
+    /// Text a constructor refuses, as converted external text is.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{CONVERTED}param({:?}){CONVERTED}", self.name)
+    }
+}
+
+#[starlark_value(type = "param")]
+impl<'v> StarlarkValue<'v> for ParamRefValue {}
+
+/// `producer.files`: the files a task declares in `emits_files`, indexed by path.
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+pub(crate) struct FilesValue {
+    #[allocative(skip)]
+    pub(crate) task: TaskName,
+    pub(crate) declared: Vec<String>,
+}
+
+starlark_simple_value!(FilesValue);
+
+impl Display for FilesValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.files", self.task)
+    }
+}
+
+#[starlark_value(type = "files")]
+impl<'v> StarlarkValue<'v> for FilesValue {
+    /// Any string indexes; whether the producer declares the path is decided where the file is
+    /// bound, which can name the call and the parameter.
+    fn at(
+        &self,
+        index: starlark::values::Value<'v>,
+        heap: Heap<'v>,
+    ) -> starlark::Result<starlark::values::Value<'v>> {
+        let path = index.unpack_str().unwrap_or_default().to_owned();
+        Ok(heap.alloc(CallFileValue(CallFile {
+            producer: self.task.clone(),
+            declared: self.declared.contains(&path),
+            path,
+        })))
+    }
+}
+
+/// `producer.files["path"]`.
+#[derive(Clone, Debug)]
+pub(crate) struct CallFile {
+    pub(crate) producer: TaskName,
+    pub(crate) path: String,
+    /// The producer declares `path` in `emits_files`.
+    pub(crate) declared: bool,
+}
+
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+pub(crate) struct CallFileValue(#[allocative(skip)] pub(crate) CallFile);
+
+starlark_simple_value!(CallFileValue);
+
+impl Display for CallFileValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.files[{:?}]", self.0.producer, self.0.path)
+    }
+}
+
+#[starlark_value(type = "file")]
+impl<'v> StarlarkValue<'v> for CallFileValue {}
+
+/// `item()`: a mapped call's own item.
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+pub(crate) struct ItemValue;
+
+starlark_simple_value!(ItemValue);
+
+impl Display for ItemValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{CONVERTED}item(){CONVERTED}")
+    }
+}
+
+#[starlark_value(type = "item")]
+impl<'v> StarlarkValue<'v> for ItemValue {}
+
+/// `budget(cost = ..., wall_clock = ...)`.
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+pub(crate) struct BudgetValue(#[allocative(skip)] pub(crate) CallBudget);
+
+starlark_simple_value!(BudgetValue);
+
+impl Display for BudgetValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("budget(...)")
+    }
+}
+
+#[starlark_value(type = "budget")]
+impl<'v> StarlarkValue<'v> for BudgetValue {}
+
+/// `budget(cost = usd, wall_clock = "30m")`.
+pub(crate) fn budget(named: &mut BTreeMap<String, Value>) -> Result<Value> {
+    let invalid = |detail: &str| CompileError::BudgetInvalid {
+        detail: detail.to_owned(),
+    };
+    let cost_usd = match named.remove("cost") {
+        None | Some(Value::None) => None,
+        Some(Value::Int(n)) if n > 0 => Some(f64::from(n)),
+        Some(Value::Float(n)) if n.is_finite() && n > 0.0 => Some(n),
+        Some(_) => return Err(invalid("cost must be a positive number of dollars")),
+    };
+    let wall_clock_secs = match named.remove("wall_clock") {
+        None | Some(Value::None) => None,
+        Some(Value::String(raw)) => match crate::duration::parse_duration(&raw) {
+            Some(d) if !d.is_zero() => Some(d.as_secs().max(1)),
+            _ => return Err(invalid("wall_clock must be a duration such as \"30m\"")),
+        },
+        Some(_) => return Err(invalid("wall_clock must be a duration such as \"30m\"")),
+    };
+    if cost_usd.is_none() && wall_clock_secs.is_none() {
+        return Err(invalid("set cost, wall_clock, or both"));
+    }
+    Ok(Value::Budget(CallBudget {
+        cost_usd,
+        wall_clock_secs,
+    }))
+}
+
+/// One target parameter as the lock's interface declares it.
+struct TargetParam {
+    ty: ParamType,
+    required: bool,
+    /// A json parameter's own schema, as the target's params block embeds it.
+    schema: Option<serde_json::Value>,
+}
+
+fn target_params(interface: &TargetInterface) -> BTreeMap<String, TargetParam> {
+    let required: BTreeSet<&str> = interface
+        .params
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .map(|names| names.iter().filter_map(serde_json::Value::as_str).collect())
+        .unwrap_or_default();
+    interface
+        .params
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .map(|properties| {
+            properties
+                .iter()
+                .map(|(name, property)| {
+                    (
+                        name.clone(),
+                        TargetParam {
+                            ty: ParamType::from_schema(property),
+                            required: required.contains(name.as_str()),
+                            schema: embedded_schema(property).cloned(),
+                        },
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The emits a call promises: the target's result fields, typed when the target types them all.
+fn result_emits(interface: &TargetInterface) -> Emits {
+    let typed: Option<BTreeMap<OutputField, FieldType>> = interface
+        .result
+        .iter()
+        .map(|wire| Some((OutputField(wire.field.clone()), wire.ty.clone()?)))
+        .collect();
+    match typed {
+        Some(fields) if !fields.is_empty() => Emits::Typed(fields),
+        _ => Emits::Fields(
+            interface
+                .result
+                .iter()
+                .map(|wire| OutputField(wire.field.clone()))
+                .collect(),
+        ),
+    }
+}
+
+/// `call(name = ..., target = ..., params = {...}, ...)`.
+pub(crate) fn call_task(named: &mut BTreeMap<String, Value>, state: &CompileState) -> Result<Task> {
+    let name = take_declared_name(named, "name")?;
+    let target = take_string(named, "target")?;
+    let refused = |detail: String| CompileError::CallTarget {
+        task: name.0.clone(),
+        target: target.clone(),
+        detail,
+    };
+    let alias = CallAlias::parse(&target).map_err(|e| refused(e.to_string()))?;
+    let locked = state.context_mut().locked_call(&alias).map_err(refused)?;
+    let interface = &locked.interface;
+    let declared = target_params(interface);
+    if locked.kind == CallKind::GithubWorkflow
+        && let Some((param, _)) = declared.iter().find(|(_, p)| p.ty == ParamType::File)
+    {
+        return Err(refused(format!(
+            "the lock declares {param:?} a file parameter, which a GitHub workflow input cannot \
+             take"
+        )));
+    }
+    let budget = match named.remove("budget") {
+        None | Some(Value::None) => None,
+        Some(Value::Budget(budget)) => Some(budget),
+        Some(_) => return Err(wrong_type("budget", "budget(cost = ..., wall_clock = ...)")),
+    };
+    let bound = match named.remove("params") {
+        None | Some(Value::None) => BTreeMap::new(),
+        Some(Value::Map(bound)) => bound,
+        Some(_) => return Err(wrong_type("params", "a dict from parameter name to value")),
+    };
+    let when = take_when(named, state, &name)?;
+    let (mut depends_on, optional) = take_dependencies(named, state, &name)?;
+    let (over, max_fanout) = take_fanout(named)?;
+    if let Some(width) = max_fanout.filter(|width| *width > MAX_CALL_FANOUT) {
+        return Err(CompileError::CallFanout {
+            task: name.0.clone(),
+            got: width,
+            max: MAX_CALL_FANOUT,
+        });
+    }
+    note_explicit_required(named, state, &name);
+    let required = take_bool_default(named, "required", true)?;
+    let join = parse_join(&take_string_default(named, "join", "all")?)?;
+    let stage = parse_stage(&take_string_default(named, "stage", "iteration")?)?;
+
+    let mut bindings = BTreeMap::new();
+    let mut file_params = BTreeSet::new();
+    for (param, value) in bound {
+        let Some(wanted) = declared.get(&param) else {
+            return Err(CompileError::CallBinding {
+                task: name.0.clone(),
+                param: param.clone(),
+                detail: format!(
+                    "{target} declares no such parameter{}",
+                    diag::suggest(&param, declared.keys().map(String::as_str))
+                        .map(|s| format!("; did you mean {s:?}?"))
+                        .unwrap_or_default()
+                ),
+            });
+        };
+        let binding = bind(wanted, value, over.is_some(), locked.kind).map_err(|detail| {
+            CompileError::CallBinding {
+                task: name.0.clone(),
+                param: param.clone(),
+                detail,
+            }
+        })?;
+        if wanted.ty == ParamType::File {
+            file_params.insert(param.clone());
+        }
+        if let Some(producer) = binding.producer()
+            && !depends_on.contains(producer)
+        {
+            depends_on.push(producer.clone());
+        }
+        bindings.insert(param, binding);
+    }
+    if let Some((param, _)) = declared
+        .iter()
+        .find(|(param, p)| p.required && !bindings.contains_key(*param))
+    {
+        return Err(CompileError::CallBinding {
+            task: name.0.clone(),
+            param: param.clone(),
+            detail: format!("{target} requires it and params does not bind it"),
+        });
+    }
+    let mut task = Task {
+        task: TaskKind::Call {
+            alias,
+            target: locked.kind,
+            bindings,
+            budget,
+            interface_digest: locked.interface_digest.clone(),
+            file_params,
+        },
+        depends_on,
+        optional,
+        session: None,
+        needs: "any".to_owned(),
+        required,
+        isolation: None,
+        join,
+        stage,
+        emits: result_emits(interface),
+        emits_files: interface.result_files.clone(),
+        over,
+        max_fanout,
+        keyed: Vec::new(),
+        when,
+        revise: None,
+        timeout: None,
+        history: None,
+        repair: 0,
+        name,
+    };
+    imply_dependencies(&mut task);
+    check_fanout(&task)?;
+    Ok(task)
+}
+
+/// The binding one value makes for a parameter of type `wanted`, or why it cannot.
+fn bind(
+    wanted: &TargetParam,
+    value: Value,
+    mapped: bool,
+    kind: CallKind,
+) -> std::result::Result<Binding, String> {
+    let expected = wanted.ty.as_str();
+    match value {
+        Value::Output(output) => {
+            let Some(ty) = output.ty else {
+                return Err(format!(
+                    "{} declares no type for the field; type it in emits",
+                    output.reference
+                ));
+            };
+            field_admits(wanted, &ty, kind)?;
+            Ok(Binding::Field {
+                producer: output.reference.task,
+                field: output.reference.field,
+            })
+        }
+        Value::CallFile(file) => {
+            if wanted.ty != ParamType::File {
+                return Err(format!(
+                    "a file is bound to a {expected} parameter; only a file parameter takes one"
+                ));
+            }
+            if !file.declared {
+                return Err(format!(
+                    "{} does not declare {:?} in emits_files",
+                    file.producer, file.path
+                ));
+            }
+            Ok(Binding::File {
+                producer: file.producer,
+                path: file.path,
+            })
+        }
+        Value::ParamRef { name, ty } if ty == wanted.ty => Ok(Binding::Param { name }),
+        Value::ParamRef {
+            name,
+            ty: ParamType::Json,
+        } if kind == CallKind::GithubWorkflow && wanted.ty == ParamType::String => {
+            Ok(Binding::Param { name })
+        }
+        Value::ParamRef { name, ty } => Err(format!(
+            "param({name:?}) is a {} parameter, not a {expected} one",
+            ty.as_str()
+        )),
+        Value::Item if !mapped => Err("item() binds only in a call mapped with over".to_owned()),
+        Value::Item if wanted.ty == ParamType::String => Ok(Binding::Item { field: None }),
+        Value::Item => Err(format!(
+            "item() is a string and the parameter is a {expected}"
+        )),
+        literal => {
+            if wanted.ty == ParamType::File {
+                return Err("a file parameter takes producer.files[path] or param(...)".into());
+            }
+            let value = literal_json(&literal)
+                .ok_or_else(|| "the value is not a literal a call can send".to_owned())?;
+            literal_admits(wanted, &value)?;
+            Ok(Binding::Literal { value })
+        }
+    }
+}
+
+/// Whether a field of type `ty` can feed a parameter, which is where the RFC's "a field's
+/// declared type matches the parameter's type" is decided. A GitHub workflow's string input
+/// also takes JSON, sent serialized.
+fn field_admits(
+    wanted: &TargetParam,
+    ty: &FieldType,
+    kind: CallKind,
+) -> std::result::Result<(), String> {
+    let fits = match (wanted.ty, ty) {
+        (ParamType::String, FieldType::Object | FieldType::List | FieldType::Schema(_))
+            if kind == CallKind::GithubWorkflow =>
+        {
+            true
+        }
+        (ParamType::Json, FieldType::Schema(schema)) => {
+            return match &wanted.schema {
+                Some(param) if *param != embedded(schema) => Err(
+                    "the field's schema differs from the parameter's; they must be equal".into(),
+                ),
+                _ => Ok(()),
+            };
+        }
+        (_, FieldType::Schema(_)) => false,
+        (ParamType::Json, FieldType::Object | FieldType::List) => wanted.schema.is_none(),
+        (ParamType::String, FieldType::String | FieldType::Link | FieldType::OneOf(_)) => true,
+        (ParamType::Int, FieldType::Integer) => true,
+        (ParamType::Number, FieldType::Integer | FieldType::Number) => true,
+        (ParamType::Bool, FieldType::Boolean) => true,
+        (ParamType::StringList, FieldType::Links | FieldType::List) => true,
+        _ => false,
+    };
+    if fits {
+        return Ok(());
+    }
+    Err(format!(
+        "a {} field cannot feed a {} parameter",
+        field_type_name(ty),
+        wanted.ty.as_str()
+    ))
+}
+
+fn field_type_name(ty: &FieldType) -> &'static str {
+    match ty {
+        FieldType::String => "string",
+        FieldType::Integer => "integer",
+        FieldType::Number => "number",
+        FieldType::Boolean => "boolean",
+        FieldType::List => "list",
+        FieldType::Object => "object",
+        FieldType::Link => "link",
+        FieldType::Links => "links",
+        FieldType::OneOf(_) => "labelled string",
+        FieldType::Schema(_) => "schema-typed",
+    }
+}
+
+/// Whether a literal is of the parameter's type, and admitted by its schema when it has one.
+fn literal_admits(
+    wanted: &TargetParam,
+    value: &serde_json::Value,
+) -> std::result::Result<(), String> {
+    use serde_json::Value as Json;
+    let fits = match (wanted.ty, value) {
+        (ParamType::String, Json::String(_)) | (ParamType::Bool, Json::Bool(_)) => true,
+        (ParamType::Int, Json::Number(n)) => n.is_i64(),
+        (ParamType::Number, Json::Number(_)) => true,
+        (ParamType::StringList, Json::Array(items)) => items.iter().all(Json::is_string),
+        (ParamType::Json, Json::Object(_) | Json::Array(_)) => {
+            if let Some(schema) = &wanted.schema
+                && let Ok(schema) = JsonSchema::new(schema.clone())
+                && let Some(why) = schema.refusal(value)
+            {
+                return Err(format!(
+                    "the literal does not match the parameter's schema: {why}"
+                ));
+            }
+            true
+        }
+        _ => false,
+    };
+    if fits {
+        Ok(())
+    } else {
+        Err(format!("{value} is not a {}", wanted.ty.as_str()))
+    }
+}
+
+/// A literal the source wrote, as the JSON a dispatch sends.
+fn literal_json(value: &Value) -> Option<serde_json::Value> {
+    Some(match value {
+        Value::Bool(b) => serde_json::Value::Bool(*b),
+        Value::Int(n) => serde_json::json!(n),
+        Value::Float(n) => serde_json::json!(n),
+        Value::String(s) => serde_json::Value::String(s.clone()),
+        Value::External(segments) => serde_json::Value::String(
+            segments
+                .iter()
+                .map(|segment| segment.text.as_str())
+                .collect(),
+        ),
+        Value::List(items) => {
+            serde_json::Value::Array(items.iter().map(literal_json).collect::<Option<_>>()?)
+        }
+        Value::Map(entries) => serde_json::Value::Object(
+            entries
+                .iter()
+                .map(|(k, v)| Some((k.clone(), literal_json(v)?)))
+                .collect::<Option<_>>()?,
+        ),
+        _ => return None,
+    })
+}
+
+/// Refuse a json or file parameter's `param(...)` anywhere but a call's params.
+pub(crate) fn refuse_param_refs(named: &BTreeMap<String, Value>) -> Result<()> {
+    fn find(value: &Value) -> Option<&str> {
+        match value {
+            Value::ParamRef { name, .. } => Some(name),
+            Value::List(items) => items.iter().find_map(find),
+            Value::Map(entries) => entries.values().find_map(find),
+            Value::Ordered(entries) => entries.iter().find_map(|(_, v)| find(v)),
+            _ => None,
+        }
+    }
+    match named.values().find_map(find) {
+        Some(name) => Err(CompileError::ParamNotAValue {
+            name: name.to_owned(),
+        }),
+        None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::plan::call::Binding;
+    use crate::plan::ir::{Emits, OutputField, TaskKind, TaskName};
+    use crate::plan::starlark::params::PARAM_TYPE_KEY as TYPE_KEY;
+    use crate::plan::starlark::{compile_source, compile_source_with};
+    use crucible_contract::calls::{
+        CallAlias, CallsLock, GitRefName, GithubRepo, LOCK_FILE, LOCK_VERSION, LockedCall, Pin,
+        ProgressGraph, TargetInterface, WorkflowPath,
+    };
+    use crucible_contract::decision::Label;
+    use crucible_contract::emits::{DeclaredFile, EmitWire, FieldType};
+    use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    fn interface() -> TargetInterface {
+        TargetInterface {
+            params: json!({
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string"},
+                    "count": {"type": "integer"},
+                    "matrix": {"type": ["object", "array"], TYPE_KEY: "json"},
+                    "notes": {"type": "object", TYPE_KEY: "file", "x-max-bytes": 1024},
+                    "dry_run": {"type": "boolean"},
+                },
+                "required": ["repo"],
+            }),
+            result: vec![
+                EmitWire {
+                    field: "verdict".into(),
+                    ty: Some(FieldType::OneOf(vec![
+                        Label::new("ok".to_owned()).unwrap(),
+                        Label::new("bad".to_owned()).unwrap(),
+                    ])),
+                },
+                EmitWire {
+                    field: "score".into(),
+                    ty: Some(FieldType::Number),
+                },
+            ],
+            result_files: vec![DeclaredFile::from("report.md")],
+            graph: ProgressGraph::default(),
+        }
+    }
+
+    fn github_interface(file: bool) -> TargetInterface {
+        let mut properties = json!({"version": {"type": "string"}});
+        if file {
+            properties["blob"] = json!({"type": "object", TYPE_KEY: "file"});
+        }
+        TargetInterface {
+            params: json!({"type": "object", "properties": properties, "required": []}),
+            result: vec![EmitWire {
+                field: "version".into(),
+                ty: Some(FieldType::String),
+            }],
+            result_files: vec![],
+            graph: ProgressGraph::default(),
+        }
+    }
+
+    fn pack(github_file: bool) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = CallsLock {
+            version: LOCK_VERSION,
+            calls: BTreeMap::from([
+                (
+                    CallAlias::parse("triage").unwrap(),
+                    LockedCall::new(
+                        Pin::Revision {
+                            playbook: "triage".into(),
+                            digest: "sha256:aa".into(),
+                        },
+                        interface(),
+                    )
+                    .unwrap(),
+                ),
+                (
+                    CallAlias::parse("release").unwrap(),
+                    LockedCall::new(
+                        Pin::GithubRef {
+                            repo: GithubRepo::parse("acme/app").unwrap(),
+                            workflow: WorkflowPath::parse(".github/workflows/release.yml").unwrap(),
+                            git_ref: GitRefName::parse("main").unwrap(),
+                            commit: "abc".into(),
+                        },
+                        github_interface(github_file),
+                    )
+                    .unwrap(),
+                ),
+            ]),
+        };
+        std::fs::write(dir.path().join(LOCK_FILE), lock.render().unwrap()).unwrap();
+        dir
+    }
+
+    const CALLS: &str = r#"calls = {
+    "triage": {"kind": "playbook", "playbook": "triage"},
+    "release": {
+        "kind": "github_workflow",
+        "repo": "acme/app",
+        "workflow": ".github/workflows/release.yml",
+        "ref": "main",
+        "outputs": {"artifact": "result"},
+    },
+}
+"#;
+
+    const PLAN: &str = r#"
+plan = command(
+    name = "plan",
+    run = "true",
+    emits = {"repo": "string", "n": "integer", "items": "list", "conf": "object", "ok": "boolean"},
+    emits_files = ["notes.md"],
+)
+"#;
+
+    fn compile(pack: &Path, body: &str) -> Result<crate::plan::workflow::WorkflowCfg, String> {
+        let source = format!("{CALLS}{PLAN}\n{body}");
+        compile_source(&source, Path::new("workflow.star"), pack)
+            .map(|c| c.workflow)
+            .map_err(|e| e.message())
+    }
+
+    fn the_call(workflow: &crate::plan::workflow::WorkflowCfg) -> &crate::plan::ir::Task {
+        workflow
+            .tasks
+            .iter()
+            .find(|t| matches!(t.task, TaskKind::Call { .. }))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_call_compiles_its_bindings_and_takes_the_target_result_as_its_output() {
+        let pack = pack(false);
+        let workflow = compile(
+            pack.path(),
+            r#"
+t = call(
+    name = "triage",
+    target = "triage",
+    params = {
+        "repo": plan.repo,
+        "count": plan.n,
+        "matrix": {"os": ["linux"]},
+        "notes": plan.files["notes.md"],
+        "dry_run": True,
+    },
+    budget = budget(cost = 2, wall_clock = "30m"),
+)
+after = command(name = "after", run = "true", depends_on = [t], when = t.verdict.any_of("ok"))
+workflow(type = "playbook", tasks = [plan, t, after])
+"#,
+        )
+        .unwrap();
+        let call = the_call(&workflow);
+        let TaskKind::Call {
+            alias,
+            bindings,
+            budget,
+            interface_digest,
+            file_params,
+            ..
+        } = &call.task
+        else {
+            panic!()
+        };
+        assert_eq!(alias.as_str(), "triage");
+        assert_eq!(interface_digest, &interface().digest().unwrap());
+        assert_eq!(
+            bindings["repo"],
+            Binding::Field {
+                producer: TaskName("plan".into()),
+                field: OutputField("repo".into())
+            }
+        );
+        assert_eq!(
+            bindings["notes"],
+            Binding::File {
+                producer: TaskName("plan".into()),
+                path: "notes.md".into()
+            }
+        );
+        assert_eq!(
+            bindings["matrix"],
+            Binding::Literal {
+                value: json!({"os": ["linux"]})
+            }
+        );
+        assert_eq!(file_params.iter().collect::<Vec<_>>(), ["notes"]);
+        assert_eq!(budget.and_then(|b| b.wall_clock_secs), Some(1800));
+        assert_eq!(budget.and_then(|b| b.cost_usd), Some(2.0));
+        assert_eq!(call.depends_on, [TaskName("plan".into())]);
+        assert!(matches!(&call.emits, Emits::Typed(fields) if fields.len() == 2));
+        assert_eq!(call.emits_files, [DeclaredFile::from("report.md")]);
+    }
+
+    #[test]
+    fn a_call_refuses_what_the_lock_does_not_admit() {
+        let pack = pack(false);
+        let refused = |params: &str| {
+            compile(
+                pack.path(),
+                &format!(
+                    "t = call(name = \"t\", target = \"triage\", params = {params})\n\
+                     workflow(type = \"playbook\", tasks = [plan, t])"
+                ),
+            )
+            .unwrap_err()
+        };
+        for (params, says) in [
+            ("{}", "requires it"),
+            (r#"{"repo": "a", "rpo": "b"}"#, "did you mean \"repo\""),
+            (r#"{"repo": plan.n}"#, "integer field cannot feed a string"),
+            (r#"{"repo": 3}"#, "3 is not a string"),
+            (r#"{"repo": "a", "count": plan.repo}"#, "string field"),
+            (r#"{"repo": "a", "notes": plan.repo}"#, "string field"),
+            (
+                r#"{"repo": plan.files["notes.md"]}"#,
+                "only a file parameter",
+            ),
+            (
+                r#"{"repo": "a", "notes": plan.files["x.md"]}"#,
+                "does not declare",
+            ),
+            (r#"{"repo": "a", "notes": "x.md"}"#, "file parameter takes"),
+            (r#"{"repo": "a", "matrix": plan.repo}"#, "string field"),
+            (r#"{"repo": item()}"#, "mapped with over"),
+        ] {
+            let error = refused(params);
+            assert!(error.contains(says), "{params}: {error}");
+        }
+        let unknown = compile(
+            pack.path(),
+            "t = call(name = \"t\", target = \"nope\", params = {})\n\
+             workflow(type = \"playbook\", tasks = [plan, t])",
+        )
+        .unwrap_err();
+        assert!(unknown.contains("nope"), "{unknown}");
+        assert!(unknown.contains("release, triage"), "{unknown}");
+    }
+
+    #[test]
+    fn a_call_without_a_lock_is_refused() {
+        let pack = tempfile::tempdir().unwrap();
+        let error = compile(
+            pack.path(),
+            "t = call(name = \"t\", target = \"triage\", params = {})\n\
+             workflow(type = \"playbook\", tasks = [plan, t])",
+        )
+        .unwrap_err();
+        assert!(error.contains("calls.lock"), "{error}");
+    }
+
+    #[test]
+    fn a_github_target_never_takes_a_file() {
+        let error = compile(
+            pack(true).path(),
+            "t = call(name = \"t\", target = \"release\", params = {})\n\
+             workflow(type = \"playbook\", tasks = [plan, t])",
+        )
+        .unwrap_err();
+        assert!(error.contains("GitHub workflow input"), "{error}");
+        let ok = compile(
+            pack(false).path(),
+            "t = call(name = \"t\", target = \"release\", params = {\"version\": plan.repo})\n\
+             workflow(type = \"playbook\", tasks = [plan, t])",
+        )
+        .unwrap();
+        assert_eq!(
+            the_call(&ok).task.label(),
+            "call",
+            "a GitHub target compiles like any other"
+        );
+    }
+
+    #[test]
+    fn a_mapped_call_binds_its_item_and_is_bounded() {
+        let pack = pack(false);
+        let workflow = compile(
+            pack.path(),
+            r#"
+t = call(name = "t", target = "triage", params = {"repo": item()}, over = each(plan.items, max = 8))
+workflow(type = "playbook", tasks = [plan, t])
+"#,
+        )
+        .unwrap();
+        let call = the_call(&workflow);
+        assert_eq!(call.max_fanout, Some(8));
+        let TaskKind::Call { bindings, .. } = &call.task else {
+            panic!()
+        };
+        assert_eq!(bindings["repo"], Binding::Item { field: None });
+        let wide = compile(
+            pack.path(),
+            r#"
+t = call(name = "t", target = "triage", params = {"repo": item()}, over = each(plan.items, max = 65))
+workflow(type = "playbook", tasks = [plan, t])
+"#,
+        )
+        .unwrap_err();
+        assert!(wide.contains("64"), "{wide}");
+    }
+
+    #[test]
+    fn json_and_file_params_bind_only_by_param_inside_a_call() {
+        let pack = pack(false);
+        let source = &format!(
+            "{}{CALLS}{}",
+            r#"
+params = {
+    "matrix": {"type": "json", "required": True},
+    "notes": {"type": "file", "required": True, "max_bytes": 1024},
+}
+"#,
+            r#"plan = command(name = "plan", run = "true", emits = {"repo": "string"})
+t = call(
+    name = "t",
+    target = "triage",
+    params = {"repo": plan.repo, "matrix": param("matrix"), "notes": param("notes")},
+)
+workflow(type = "playbook", tasks = [plan, t])
+"#
+        );
+        let notes = pack.path().join("notes.md");
+        std::fs::write(&notes, "hello").unwrap();
+        let supplied = BTreeMap::from([
+            ("matrix".to_owned(), r#"{"os": ["linux"]}"#.to_owned()),
+            ("notes".to_owned(), notes.display().to_string()),
+        ]);
+        let compiled =
+            compile_source_with(source, Path::new("workflow.star"), pack.path(), &supplied)
+                .unwrap();
+        let TaskKind::Call {
+            bindings,
+            file_params,
+            ..
+        } = &the_call(&compiled.workflow).task
+        else {
+            panic!()
+        };
+        assert_eq!(
+            bindings["matrix"],
+            Binding::Param {
+                name: "matrix".into()
+            }
+        );
+        assert!(file_params.contains("notes"));
+        assert_eq!(
+            compiled.workflow.params["notes"].json()["digest"],
+            json!(crucible_contract::artifact::content_digest(b"hello"))
+        );
+
+        let swapped = source.replace(
+            r#""matrix": param("matrix"), "notes": param("notes")"#,
+            r#""matrix": param("notes"), "notes": param("matrix")"#,
+        );
+        let error =
+            compile_source_with(&swapped, Path::new("workflow.star"), pack.path(), &supplied)
+                .unwrap_err()
+                .message();
+        assert!(error.contains("not a json one"), "{error}");
+
+        let outside = source.replace(
+            "plan = command(name = \"plan\", run = \"true\",",
+            "plan = command(name = \"plan\", run = param(\"matrix\"),",
+        );
+        let error =
+            compile_source_with(&outside, Path::new("workflow.star"), pack.path(), &supplied)
+                .unwrap_err()
+                .message();
+        assert!(error.contains("json or file parameter"), "{error}");
+    }
+
+    #[test]
+    fn budget_needs_a_ceiling() {
+        let pack = pack(false);
+        for (budget, says) in [
+            ("budget()", "set cost"),
+            ("budget(cost = -1)", "positive"),
+            ("budget(wall_clock = \"soon\")", "duration"),
+        ] {
+            let error = compile(
+                pack.path(),
+                &format!(
+                    "t = call(name = \"t\", target = \"triage\", params = {{\"repo\": \"a\"}}, \
+                     budget = {budget})\nworkflow(type = \"playbook\", tasks = [plan, t])"
+                ),
+            )
+            .unwrap_err();
+            assert!(error.contains(says), "{budget}: {error}");
+        }
+    }
+
+    #[test]
+    fn autoresearch_and_revise_loops_refuse_a_call() {
+        let pack = pack(false);
+        let revised = compile(
+            pack.path(),
+            r#"
+t = call(name = "t", target = "triage", params = {"repo": "a"})
+review = command(name = "review", run = "true", depends_on = [t], revise = send_back([t], rounds = 2))
+workflow(type = "playbook", tasks = [plan, t, review])
+"#,
+        )
+        .unwrap_err();
+        assert!(revised.contains("revise"), "{revised}");
+        let scored = compile(
+            pack.path(),
+            r#"
+t = call(name = "t", target = "triage", params = {"repo": "a"})
+workflow(type = "autoresearch", tasks = [plan, t])
+"#,
+        )
+        .unwrap_err();
+        assert!(scored.contains("call"), "{scored}");
+    }
+}

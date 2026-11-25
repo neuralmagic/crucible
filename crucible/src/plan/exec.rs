@@ -145,6 +145,8 @@ pub struct ExecCfg<'a> {
     /// What every task reads besides its dependencies' outputs. The loop's epilogue passes the
     /// kept candidate under [`crate::plan::ir::KEPT_INPUT`].
     pub run_inputs: Option<&'a BTreeMap<TaskName, Value>>,
+    /// The controller call tasks are dispatched through. `None` settles every call failing.
+    pub calls: Option<&'a crate::plan::call_run::Controller>,
 }
 
 impl Default for ExecCfg<'_> {
@@ -161,6 +163,7 @@ impl Default for ExecCfg<'_> {
             clock: None,
             files: None,
             run_inputs: None,
+            calls: None,
         }
     }
 }
@@ -185,6 +188,9 @@ pub struct Prior {
     /// What the attempts that started and never settled are charged, since their process died
     /// before it could say what they spent.
     pub reserved_usd: f64,
+    /// The calls the run dispatched, which a resumed run attaches to rather than dispatching
+    /// again.
+    pub calls: BTreeMap<crate::plan::call_run::CallKey, crucible_contract::calls::CallId>,
 }
 
 impl Prior {
@@ -488,6 +494,15 @@ pub fn execute(
     runner: &mut dyn TaskRunner,
     mut on_result: impl FnMut(&Task, &TaskResult),
 ) -> Result<PlanOutcome, IllegalTransition> {
+    let mut with_calls = crate::plan::call_run::WithCalls::new(
+        runner,
+        crate::plan::call_run::CallCtx {
+            controller: cfg.calls,
+            files: cfg.files,
+            dispatched: cfg.prior.map(|prior| &prior.calls),
+        },
+    );
+    let runner: &mut dyn TaskRunner = &mut with_calls;
     runner.prepare();
     let runnable = runnable_set(plan, substrate);
     let clock = Clock {
@@ -1112,6 +1127,7 @@ pub fn execute(
                 | TaskKind::Command { .. }
                 | TaskKind::Evaluate { .. }
                 | TaskKind::Report { .. }
+                | TaskKind::Call { .. }
                 | TaskKind::Engine { .. } => {
                     let dispatched = run_one(t, inputs, cfg, runner, &mut ledger);
                     if dispatched.0.attempts > 0 {
@@ -1391,7 +1407,10 @@ fn inputs_for(
     staged: &[Task],
 ) -> BTreeMap<TaskName, Value> {
     let mut inputs = dependency_inputs(plan, t, results, staged);
-    if matches!(t.task, TaskKind::Command { .. } | TaskKind::Evaluate { .. }) {
+    if matches!(
+        t.task,
+        TaskKind::Command { .. } | TaskKind::Evaluate { .. } | TaskKind::Call { .. }
+    ) {
         let params = plan
             .plan()
             .params

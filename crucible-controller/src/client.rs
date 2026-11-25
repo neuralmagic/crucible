@@ -576,6 +576,10 @@ mod tests {
                 "0091_provider_model_prices.sql",
                 "5ce4bc74c9d964ce9367ec20ef48e02a2d63c1e5500c6ecac2dc92a55ac2d669",
             ),
+            (
+                "0092_call_target_runs.sql",
+                "aa7d52e615176826af7623c1325d7b95cc20a7f449adbf8ff7450873c4c0f72f",
+            ),
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
         for (name, want) in pinned {

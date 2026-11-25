@@ -780,7 +780,8 @@ impl TaskRunner for LoopTaskRunner<'_> {
                 op: EngineOp::MeasureDiff,
                 ..
             }
-            | TaskKind::TopK { .. } => Attempt::failed(
+            | TaskKind::TopK { .. }
+            | TaskKind::Call { .. } => Attempt::failed(
                 0.0,
                 format!(
                     "unexpected task kind in the loop template: {}",

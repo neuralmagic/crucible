@@ -210,6 +210,14 @@ pub static BINDINGS: &[Binding] = &[
     bind("GET", "/api/runs/{run_id}/graph", R::Run, V::Read, Route),
     bind(
         "GET",
+        crucible_contract::calls::CALL_PROGRESS_PATH,
+        R::Run,
+        V::Read,
+        Route,
+    ),
+    bind("POST", "/api/calls/lock", R::Playbook, V::Read, Route),
+    bind(
+        "GET",
         "/api/runs/{run_id}/tasks/{task}/evidence",
         R::Run,
         V::Read,

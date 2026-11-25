@@ -410,6 +410,8 @@ pub struct RunView {
     pub inspect: inspect::Inspect,
     /// Fan-outs the graph draws without their instances.
     pub folded: HashSet<String>,
+    /// Call frames and target groups folded or unfolded by hand, by task or `task/group`.
+    pub call_folds: HashSet<String>,
     /// How far the graph is zoomed and moved.
     pub camera: camera::Camera,
     /// Whether the graph is drawn compact; `None` takes the setting.

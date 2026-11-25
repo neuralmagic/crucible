@@ -48,7 +48,11 @@ pub(crate) fn run_routes(db: crate::Db) -> Router {
         .with_state(db)
 }
 
-async fn require_run_token(State(db): State<crate::Db>, mut req: Request, next: Next) -> Response {
+pub(crate) async fn require_run_token(
+    State(db): State<crate::Db>,
+    mut req: Request,
+    next: Next,
+) -> Response {
     let Some(presented) = req
         .headers()
         .get(header::AUTHORIZATION)

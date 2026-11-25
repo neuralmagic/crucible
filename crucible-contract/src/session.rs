@@ -186,6 +186,19 @@ pub struct PlanTaskWire {
     /// What a `command` or `evaluate` task runs, as the pack wrote it; empty for other kinds.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub command: String,
+    /// The target a `call` task dispatches; absent for other kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call: Option<PlanCallWire>,
+}
+
+/// A call task's target as the plan names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanCallWire {
+    pub alias: crate::calls::CallAlias,
+    pub target: crate::calls::CallKind,
+    /// Each parameter a dependency's output binds, by name, and the task that produces it.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub params: std::collections::BTreeMap<String, String>,
 }
 
 fn write_revise_targets<S: serde::Serializer>(targets: &[String], s: S) -> Result<S::Ok, S::Error> {
@@ -602,6 +615,22 @@ pub enum SessionEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reused_from: Option<String>,
     },
+    /// A call task's target run was dispatched, or found already dispatched for the same task,
+    /// instance and attempt. Written before the call waits, so a resume attaches to `handle`
+    /// rather than dispatching again.
+    CallDispatched {
+        task: String,
+        /// The mapped instance's item key; absent for an unmapped call.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance: Option<String>,
+        attempt: u32,
+        alias: crate::calls::CallAlias,
+        call: crate::calls::CallId,
+        /// The target run on its own system; its `kind` is the target kind.
+        handle: crate::calls::TargetHandle,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        link: Option<crate::calls::NodeLink>,
+    },
     /// What this run records for its launch series, emitted once before `Shutdown` by a playbook
     /// run. The orchestrator copies it into the record later runs of the series receive.
     HistoryEntry {
@@ -953,6 +982,20 @@ mod tests {
                 evidence_digest: "sha256:ab12".into(),
                 expires_at: "2026-10-06T18:00:00Z".into(),
             },
+            SessionEvent::CallDispatched {
+                task: "ship".into(),
+                instance: Some("pr-7".into()),
+                attempt: 1,
+                alias: crate::calls::CallAlias::parse("release").expect("alias"),
+                call: crate::calls::CallId("c-1".into()),
+                handle: crate::calls::TargetHandle::Playbook {
+                    run: "run-2".into(),
+                },
+                link: Some(crate::calls::NodeLink::Run {
+                    run: "run-2".into(),
+                    task: None,
+                }),
+            },
             SessionEvent::Recovery {
                 class: RecoveryClass::DiedMidTurn,
                 iter: 4,
@@ -1153,6 +1196,11 @@ mod tests {
                 history_depth: 5,
                 definition: String::new(),
                 optional: Vec::new(),
+                call: Some(PlanCallWire {
+                    alias: crate::calls::CallAlias::parse("release").expect("alias"),
+                    target: crate::calls::CallKind::GithubWorkflow,
+                    params: [("version".to_string(), "build".to_string())].into(),
+                }),
             }],
             history_record: "propose-a".into(),
         });
@@ -1227,6 +1275,7 @@ mod tests {
             definition: String::new(),
             command: String::new(),
             optional: Vec::new(),
+            call: None,
         };
         let written = |revise: Vec<String>| {
             serde_json::to_value(task(revise)).expect("encodes")["revise"].clone()

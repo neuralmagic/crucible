@@ -106,7 +106,7 @@ impl<'a> LaunchTarget<'a> {
     }
 
     /// The resource a launch decision on this target is about.
-    fn resource(self) -> crate::authz::decision::Resource {
+    pub(crate) fn resource(self) -> crate::authz::decision::Resource {
         match self {
             Self::Registered(pack) => pack.resource(),
             Self::Draft(head) => crate::authz::decision::Resource::new(
@@ -256,14 +256,34 @@ pub(crate) async fn admit<P: Admissible>(
     pack: P,
     request: LaunchRequest<'_>,
 ) -> Result<AuthorizedLaunch<P>, Response> {
+    admit_staged(state, pack, request, &std::collections::BTreeMap::new()).await
+}
+
+/// [`admit`] with file parameters the controller staged itself: `{name: staged file reference}`.
+/// A launcher's own values never name a file; only a call's dispatch stages one.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn admit_staged<P: Admissible>(
+    state: &ApiState,
+    pack: P,
+    request: LaunchRequest<'_>,
+    staged: &std::collections::BTreeMap<String, String>,
+) -> Result<AuthorizedLaunch<P>, Response> {
     let target = pack.target();
     let (schema, max_time) = admit_pack(state, target, request).await?;
     let (schema, choice_snapshots) =
         crate::playbooks::choices::attach(state.db.pool(), target.id(), &schema)
             .await
             .map_err(|e| ApiError::from(e).into_response())?;
-    let params = crate::playbooks::registry::validate_params(&schema, request.params)
-        .map_err(invalid_fields)?;
+    let mut params = crate::playbooks::registry::validate_params(
+        &without_required(&schema, staged.keys()),
+        request.params,
+    )
+    .map_err(invalid_fields)?;
+    if let Some(values) = params.as_object_mut() {
+        for (name, reference) in staged {
+            values.insert(name.clone(), serde_json::Value::String(reference.clone()));
+        }
+    }
     check_plan(
         target.tree(state.db.pool()).await?,
         &params,
@@ -278,6 +298,22 @@ pub(crate) async fn admit<P: Admissible>(
         max_time,
         choice_snapshots,
     })
+}
+
+/// `schema` with `names` no longer required, for values supplied apart from the launcher's.
+fn without_required<'a>(
+    schema: &serde_json::Value,
+    names: impl Iterator<Item = &'a String>,
+) -> serde_json::Value {
+    let names: Vec<&String> = names.collect();
+    let mut schema = schema.clone();
+    if let Some(required) = schema
+        .get_mut("required")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        required.retain(|r| !names.iter().any(|n| r.as_str() == Some(n.as_str())));
+    }
+    schema
 }
 
 /// [`admit`] up to the values, for a standing launch whose values are only complete at each
@@ -393,4 +429,24 @@ pub(crate) async fn decide_launch(
     .await
     .map(|_| ())
     .map_err(IntoResponse::into_response)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::playbooks::api::admission::without_required;
+    use serde_json::json;
+
+    #[test]
+    fn staged_parameters_leave_the_required_list_and_nothing_else_changes() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"label": {"type": "string"}, "notes": {"type": "object"}},
+            "required": ["label", "notes"],
+        });
+        let staged = ["notes".to_string()];
+        let relaxed = without_required(&schema, staged.iter());
+        assert_eq!(relaxed["required"], json!(["label"]));
+        assert_eq!(relaxed["properties"], schema["properties"]);
+        assert_eq!(without_required(&schema, [].iter()), schema);
+    }
 }

@@ -194,6 +194,11 @@ impl Lane<'_> {
         self.deadline
     }
 
+    /// Append `event` to the session log and sync it, for a fact a resumed run must find.
+    pub fn journal(&self, event: &SessionEvent) -> std::io::Result<()> {
+        self.admission.append(event, true)
+    }
+
     /// What this lane's attempt has spent so far. A figure lower than one already reported is
     /// ignored: a lane's spend never goes down.
     pub fn spent_so_far(&self, usd: f64) {

@@ -914,10 +914,23 @@ pub(crate) async fn save_playbook_draft(
         Ok(c) => c,
         Err(refusal) => return refusal,
     };
+    let mut files = body.files;
+    if let Err(refusal) = crate::calls::lock::into_files(
+        &crate::calls::Backends::new(&state),
+        &crate::calls::CallCtx {
+            db: state.db.clone(),
+            scratch_dir: state.scratch_dir.clone(),
+        },
+        &mut files,
+    )
+    .await
+    {
+        return unprocessable(format!("calls.lock: {refusal}"));
+    }
     match crate::playbooks::drafts::save_version(
         state.db.pool(),
         &id,
-        body.files,
+        files,
         identity.as_deref(),
         body.base_version,
     )

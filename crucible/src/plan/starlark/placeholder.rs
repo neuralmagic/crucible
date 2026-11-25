@@ -27,6 +27,23 @@ pub fn placeholder(name: &str, property: &serde_json::Value) -> Option<String> {
             other => other.to_string(),
         });
     }
+    match property
+        .get(crate::plan::starlark::params::PARAM_TYPE_KEY)
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("json") => return Some("{}".to_string()),
+        Some("file") => {
+            return Some(
+                serde_json::json!({
+                    "path": format!("<{name}>"),
+                    "size": 0,
+                    "digest": crate::plan::starlark::params::PROBE_DIGEST,
+                })
+                .to_string(),
+            );
+        }
+        _ => {}
+    }
     let min = property.get("minimum").and_then(serde_json::Value::as_f64);
     let max = property.get("maximum").and_then(serde_json::Value::as_f64);
     match property.get("type").and_then(|t| t.as_str())? {
@@ -237,5 +254,40 @@ mod tests {
         );
         assert_eq!(placeholder("p", &json!({"type": "object"})), None);
         assert_eq!(placeholder("p", &json!({})), None);
+    }
+
+    #[test]
+    fn json_and_file_parameters_bind_a_probe_without_a_staged_file() {
+        let source = r#"params = {
+    "conf": {"type": "json", "required": True},
+    "notes": {"type": "file", "required": True, "max_bytes": 64},
+}
+"#;
+        let declared = crate::plan::starlark::read_params(source, std::path::Path::new("w.star"))
+            .expect("declared");
+        let schema = declared.json_schema();
+        let supplied: std::collections::BTreeMap<String, String> = ["conf", "notes"]
+            .into_iter()
+            .map(|name| {
+                let value = placeholder(name, &schema["properties"][name]).expect("a placeholder");
+                (name.to_string(), value)
+            })
+            .collect();
+        assert_eq!(supplied["conf"], "{}");
+        let bound = declared.bind(&supplied).expect("the placeholders bind");
+        assert_eq!(bound.len(), 2);
+    }
+
+    #[test]
+    fn a_relative_file_reference_with_another_digest_is_still_refused() {
+        let source = r#"params = {"notes": {"type": "file", "required": True, "max_bytes": 64}}
+"#;
+        let declared = crate::plan::starlark::read_params(source, std::path::Path::new("w.star"))
+            .expect("declared");
+        let supplied = std::collections::BTreeMap::from([(
+            "notes".to_string(),
+            json!({"path": "notes.md", "digest": "sha256:00"}).to_string(),
+        )]);
+        assert!(declared.bind(&supplied).is_err());
     }
 }

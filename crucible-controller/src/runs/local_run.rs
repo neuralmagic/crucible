@@ -112,6 +112,30 @@ fn session_log(dir: &Path) -> PathBuf {
     dir.join("pack").join("state").join("session.jsonl")
 }
 
+/// Where a running local run's process group id is kept, for a cancel to interrupt it.
+fn pgid_file(dir: &Path) -> PathBuf {
+    dir.join("engine.pgid")
+}
+
+/// SIGINT the process group of local run `run_id` while it runs. False when no engine of it is
+/// running here.
+pub(crate) fn interrupt(scratch_root: &Path, run_id: &str) -> bool {
+    if !crate::runs::task_evidence::safe_segment(run_id) {
+        return false;
+    }
+    let Ok(raw) = std::fs::read_to_string(pgid_file(&run_dir(scratch_root, run_id))) else {
+        return false;
+    };
+    let Ok(pgid) = raw.trim().parse::<i32>() else {
+        return false;
+    };
+    if pgid <= 1 {
+        return false;
+    }
+    let group = nix::unistd::Pid::from_raw(pgid);
+    nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGINT).is_ok()
+}
+
 /// The engine's forge storage root inside a local run's directory.
 fn forge_root(dir: &Path) -> PathBuf {
     dir.join("forge")
@@ -306,6 +330,9 @@ pub(crate) async fn start(
         .spawn()
         .with_context(|| format!("spawning `{} plan run` for {run_id}", bin.display()))?;
     let group = ProcessGroup::led_by(&child)?;
+    if let Err(e) = std::fs::write(pgid_file(&dir), group.0.as_raw().to_string()) {
+        tracing::warn!(%run_id, error = %e, "recording a local run's process group failed; it cannot be cancelled");
+    }
     tracing::info!(%issue_key, %run_id, dir = %dir.display(), "playbook launch running locally");
     Ok(LocalRun {
         child,
@@ -366,6 +393,7 @@ pub async fn supervise(db: Db, key: String, run: LocalRun) {
             )
         }
     };
+    let _ = std::fs::remove_file(pgid_file(&dir));
     let drained = tokio::time::timeout(PIPE_DRAIN_GRACE, async {
         while streams.join_next().await.is_some() {}
     })

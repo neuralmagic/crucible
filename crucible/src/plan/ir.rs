@@ -577,6 +577,21 @@ pub enum TaskKind {
         questions: BTreeMap<QuestionId, CompiledQuestion>,
         decider: Decider,
     },
+    /// Engine-owned dispatch of a `[calls]` target as its own run, waiting for its result.
+    Call {
+        alias: crucible_contract::calls::CallAlias,
+        target: crucible_contract::calls::CallKind,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        bindings: BTreeMap<String, crate::plan::call::Binding>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        budget: Option<crucible_contract::calls::CallBudget>,
+        /// The locked interface digest the call was compiled against.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        interface_digest: String,
+        /// The bound parameters that carry a file rather than a value.
+        #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+        file_params: BTreeSet<String>,
+    },
     /// A capability-owned engine operation.
     Engine {
         op: EngineOp,
@@ -600,6 +615,7 @@ impl TaskKind {
             TaskKind::Report { .. } => "report",
             TaskKind::TopK { .. } => "top_k",
             TaskKind::Route { .. } => "route",
+            TaskKind::Call { .. } => "call",
             TaskKind::Engine { op, .. } => match op {
                 EngineOp::Propose => "engine_propose",
                 EngineOp::Apply => "engine_apply",
@@ -633,6 +649,7 @@ impl TaskKind {
             | TaskKind::Evaluate { .. }
             | TaskKind::Report { .. }
             | TaskKind::TopK { .. }
+            | TaskKind::Call { .. }
             | TaskKind::Route {
                 decider: Decider::Output { .. } | Decider::Human { .. },
                 ..
@@ -6626,5 +6643,48 @@ emits = ["lines"]
             .unwrap();
         assert!(listed.admits("scheduler"));
         assert!(!listed.admits("frontend"));
+    }
+
+    #[test]
+    fn a_call_task_kind_round_trips() {
+        let kind: TaskKind = serde_json::from_value(serde_json::json!({
+            "kind": "call",
+            "alias": "release",
+            "target": "github_workflow",
+            "bindings": {
+                "version": {"from": "field", "producer": "plan", "field": "version"},
+                "notes": {"from": "file", "producer": "plan", "path": "notes.md"},
+            },
+            "budget": {"wall_clock_secs": 600},
+        }))
+        .unwrap();
+        let TaskKind::Call {
+            alias,
+            target,
+            bindings,
+            budget,
+            ..
+        } = &kind
+        else {
+            panic!("decoded {kind:?}");
+        };
+        assert_eq!(alias.as_str(), "release");
+        assert_eq!(*target, crucible_contract::calls::CallKind::GithubWorkflow);
+        assert_eq!(bindings.len(), 2);
+        assert_eq!(budget.and_then(|b| b.wall_clock_secs), Some(600));
+        assert_eq!(kind.label(), "call");
+        assert!(!kind.spends());
+        assert!(!kind.may_complete_early());
+        let again: TaskKind = serde_json::from_value(serde_json::to_value(&kind).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&again).unwrap(),
+            serde_json::to_value(&kind).unwrap()
+        );
+        assert!(
+            serde_json::from_value::<TaskKind>(
+                serde_json::json!({"kind": "call", "alias": "Bad", "target": "playbook"})
+            )
+            .is_err()
+        );
     }
 }

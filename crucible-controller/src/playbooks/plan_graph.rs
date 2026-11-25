@@ -17,8 +17,16 @@ pub enum TaskKind {
     Command,
     Engine,
     Route,
+    Call,
     #[serde(other)]
     Other,
+}
+
+/// The target a call task dispatches, by its `[calls]` alias and kind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CallDto {
+    pub alias: String,
+    pub target: crucible_contract::calls::CallKind,
 }
 
 /// Which of a task's dependencies have to be admitted before it runs.
@@ -98,6 +106,9 @@ pub struct GraphNodeDto {
     pub prompt: Option<String>,
     /// What a command task runs.
     pub command: Option<String>,
+    /// Set on a call task.
+    #[serde(default)]
+    pub call: Option<CallDto>,
 }
 
 /// One dependency, from producer to consumer. The join and required flags are the consumer's:
@@ -184,6 +195,10 @@ struct CompiledTask {
     prompt: Option<String>,
     #[serde(default)]
     command: Option<String>,
+    #[serde(default)]
+    alias: Option<String>,
+    #[serde(default)]
+    target: Option<crucible_contract::calls::CallKind>,
 }
 
 fn any() -> Needs {
@@ -285,6 +300,10 @@ pub fn graph_from_compiled(compiled: &[u8]) -> Result<WorkflowGraphDto, String> 
             effort: task.effort,
             prompt: task.prompt,
             command: task.command,
+            call: match (task.kind, task.alias, task.target) {
+                (TaskKind::Call, Some(alias), Some(target)) => Some(CallDto { alias, target }),
+                _ => None,
+            },
         })
         .collect();
 
@@ -349,6 +368,28 @@ mod tests {
     }
 
     /// What a task actually runs: the agent knobs and prompt, or the command line.
+    #[test]
+    fn a_call_task_carries_its_alias_and_target_kind() {
+        let graph = graph_from_compiled(
+            br#"{"type":"playbook","task":[
+              {"name":"ship","kind":"call","alias":"release","target":"github_workflow",
+               "bindings":{"version":{"from":"literal","value":"1.0"}},"depends_on":[]},
+              {"name":"seed","kind":"command","command":"true","depends_on":[]}
+            ]}"#,
+        )
+        .expect("reduces");
+        let ship = node(&graph, "ship");
+        assert_eq!(ship.kind, TaskKind::Call);
+        assert_eq!(
+            ship.call,
+            Some(CallDto {
+                alias: "release".into(),
+                target: crucible_contract::calls::CallKind::GithubWorkflow,
+            })
+        );
+        assert_eq!(node(&graph, "seed").call, None);
+    }
+
     #[test]
     fn a_task_carries_the_source_it_runs() {
         let graph = graph_from_compiled(PLAN).expect("reduces");

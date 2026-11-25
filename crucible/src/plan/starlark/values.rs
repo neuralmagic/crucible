@@ -94,6 +94,12 @@ impl<'v> StarlarkValue<'v> for TaskValue {
                 }),
             });
         }
+        if attribute == FILES_ATTRIBUTE && !self.0.emits.names().iter().any(|f| f == attribute) {
+            return Some(heap.alloc(crate::plan::starlark::call::FilesValue {
+                task: self.0.name.clone(),
+                declared: self.0.emits_files.iter().map(|f| f.path.clone()).collect(),
+            }));
+        }
         Some(heap.alloc(OutputRefValue {
             reference: OutputRef {
                 task: self.0.name.clone(),
@@ -103,6 +109,9 @@ impl<'v> StarlarkValue<'v> for TaskValue {
         }))
     }
 }
+
+/// `producer.files`, unless the producer emits a field of that name.
+const FILES_ATTRIBUTE: &str = "files";
 
 /// `producer.field` once checked against what the producer declares, with the type it declares
 /// for the field when it gave one.

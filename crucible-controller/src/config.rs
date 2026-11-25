@@ -711,6 +711,14 @@ pub struct ControllerCfg {
         default_value = ""
     )]
     pub local_secret_allowlist: Vec<String>,
+    /// Where a call's `github_workflow` target takes its token: `gh` runs `gh auth token` at each
+    /// dispatch (a local controller), `app` the GitHub App installation. Unset dispatches none.
+    #[arg(
+        long = "calls-github-token",
+        env = "CONTROLLER_CALLS_GITHUB_TOKEN",
+        value_enum
+    )]
+    pub calls_github_token: Option<crate::calls::GithubToken>,
     #[command(flatten)]
     pub profile: Profile,
 }

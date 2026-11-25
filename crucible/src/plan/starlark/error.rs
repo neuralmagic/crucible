@@ -153,8 +153,14 @@ pub enum CompileError {
         raw: String,
         why: String,
     },
-    #[error("params must be the source's first statement")]
+    #[error("params must come before every statement but calls")]
     ParamsNotFirst,
+    #[error("calls must come before every statement but params")]
+    CallsNotLeading,
+    #[error("calls must be readable without evaluating the source: {detail}")]
+    CallsNotLiteral { detail: String },
+    #[error("{detail}")]
+    CallsUnpinned { detail: String },
     #[error("params must be readable without evaluating the source: {detail}")]
     ParamsNotLiteral { detail: String },
     #[error("parameter {param:?} declares no type")]
@@ -280,6 +286,31 @@ pub enum CompileError {
     },
     #[error("param({name:?}) names no declared parameter")]
     ParamNotDeclared { name: String },
+    #[error("call {task:?} cannot target {target:?}: {detail}")]
+    CallTarget {
+        task: String,
+        target: String,
+        detail: String,
+    },
+    #[error("call {task:?} cannot bind parameter {param:?}: {detail}")]
+    CallBinding {
+        task: String,
+        param: String,
+        detail: String,
+    },
+    #[error("call {task:?} maps over at most {max} items, not {got}")]
+    CallFanout { task: String, got: u32, max: u32 },
+    #[error("budget(...): {detail}")]
+    BudgetInvalid { detail: String },
+    #[error("file parameter {param:?} must declare max_bytes")]
+    ParamFileNeedsMaxBytes { param: String },
+    #[error("file parameter {param:?} declares max_bytes above the {max} byte limit")]
+    ParamMaxBytesTooLarge { param: String, max: u64 },
+    #[error(
+        "param({name:?}) is a json or file parameter; tasks receive it under params, not as a \
+         value in the source"
+    )]
+    ParamNotAValue { name: String },
     #[error("workflow evaluation failed: {0}")]
     Eval(String),
     #[error("workflow evaluation called fail(): {0}")]

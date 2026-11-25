@@ -1,0 +1,19 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-GITHUB-WORKFLOW"
+title = "GitHub workflow targets"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+A "github_workflow" target's interface MUST be read from the workflow file at the pinned commit: its parameters from on.workflow_dispatch.inputs, where string, choice, and environment inputs are string parameters, a boolean input is a boolean parameter, and a number input is a number parameter; and its static graph from its jobs and their needs. Its result MUST be the outputs the manifest entry declares: the name of an artifact the workflow uploads, the fields of a JSON object at result.json in that artifact, and the paths of further files in it. The controller MUST refuse a workflow file that has no workflow_dispatch trigger or more inputs than GitHub accepts.
+
+A json parameter of a call MUST be bound to a string input and sent as its serialized JSON. A file parameter MUST NOT be bound to a GitHub workflow input, and the engine MUST refuse a lock or source that does.
+
+The controller MUST dispatch with the token of the GitHub App installation on the target repository, and MUST refuse a target whose repository the App is not installed on or whose installation lacks actions write permission. It MUST dispatch on the pinned ref, MUST request the created run's details, and MUST use the run identifier GitHub returns as the handle. It MUST NOT find the run by searching recent runs. It MUST record the head commit the run ran on.
+
+The controller SHOULD learn progress from verified workflow_run and workflow_job deliveries under [[RFC-0003:C-WEBHOOK-DELIVERY]] and MUST also poll the run and its jobs, so that a lost delivery delays the outcome but cannot lose it.
+
+A completed run's conclusion MUST map as follows: success to passing; failure, timed_out, startup_failure, action_required, and stale to failing; cancelled to failing unless the caller cancelled it; skipped and neutral to passing with an empty result. A passing run whose declared artifact or result.json is missing, unreadable, or does not match the declared fields MUST settle the call failing with a note naming what is missing."""

@@ -215,7 +215,7 @@ Declare a durable agent conversation. Tasks that share one run serially under on
 
 ### `param()`
 
-Read a launch parameter. The `params` block must be the source's first statement, and a source that declares one compiles per run. A supplied value may reach a prompt, with `+` and inside a region marked as external input, or a skill argument; `str()`, `%`, `.format()`, and string methods on it are refused, as is a value carrying the marker text. A command or evaluate task reads it from `params` in the inputs JSON at `CRUCIBLE_INPUTS_FILE` instead of its command line.
+Read a launch parameter. The `params` block must come before every statement but `calls`, and a source that declares one compiles per run. A supplied value may reach a prompt, with `+` and inside a region marked as external input, or a skill argument; `str()`, `%`, `.format()`, and string methods on it are refused, as is a value carrying the marker text. A command or evaluate task reads it from `params` in the inputs JSON at `CRUCIBLE_INPUTS_FILE` instead of its command line.
 
 Takes one positional argument, `name`.
 
@@ -346,6 +346,39 @@ Engine-owned decision: answers typed questions about its dependencies' outputs a
 | `when` | `question.any_of(...) \| question.otherwise() \| question` | Run only on some answers to one question. A question is one a `route()` asks, named `gate.<id>`, or a field a task emits typed `"boolean"` or as a list of labels, named `task.<field>`; a field needs no route, and answers no `when` reads lead nowhere. `.any_of("a", "b")` lists the answers: labels the question declares, or `"uncertain"`. `.otherwise()` is every answer no other task lists and the question does not `drop`, `"uncertain"` included; it is expanded at compile time, an unreachable one is an error, and on a choice whose options come from a field it also stands for every option the choice resolves to and is the only way to route them. A bare yes/no question means `"yes"`. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it unless it lists the task as `optional(...)`. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
 | `answers` | `str \| list[str]` | Deprecated. Write `when = question.any_of(...)`. |
 | `otherwise` | `bool` | Deprecated. Write `when = question.otherwise()`. |
+
+### `call()`
+
+Engine-owned dispatch of a target the `calls` block declares, as a run of its own, compiled against the pack's `calls.lock`. The block is a dictionary literal from target name to `{"kind": "playbook", "playbook": ...}` or `{"kind": "github_workflow", "repo", "workflow", "ref", "outputs"}`, assigned before every statement but `params`, and read without evaluating the source. The call waits for the target run and settles as it ended; its output is the target's result and its files are the target's result files.
+
+| Argument | Type | Purpose |
+| --- | --- | --- |
+| `name` | `str` | Task identity, unique within the workflow. |
+| `target` | `str` | The name of a target in the source's `calls` block. |
+| `params` | `dict[str, value]` | The target's parameters, each bound to a literal, `param(name)`, `producer.field`, `producer.files["path"]`, or in a mapped call `item()`. A producer is made a dependency. Every binding is checked against the lock's interface: an unknown name, an unbound required parameter, a field of another type, or a file to a non-file parameter is refused. |
+| `over` | `each(producer.field, max = N)` | Dispatch one target run per item, at most 64. |
+| `max_fanout` | `int` | Deprecated. Write `over = each(producer.field, max = N)`. |
+| `budget` | `budget(cost = usd, wall_clock = duration)` | The target run's own ceilings, in place of the controller's launch defaults. The caller's ceilings keep running while it waits. |
+| `depends_on` | `list[task]` | Dependencies besides the producers its params read. |
+| `required` | `bool` | False makes the call advisory. |
+| `join` | `"all" \| "passed" \| "settled"` | As on any task. |
+| `stage` | `"iteration" \| "epilogue"` | As on any task. |
+| `when` | `question.any_of(...) \| question.otherwise() \| question` | Run only on some answers to one question. A question is one a `route()` asks, named `gate.<id>`, or a field a task emits typed `"boolean"` or as a list of labels, named `task.<field>`; a field needs no route, and answers no `when` reads lead nowhere. `.any_of("a", "b")` lists the answers: labels the question declares, or `"uncertain"`. `.otherwise()` is every answer no other task lists and the question does not `drop`, `"uncertain"` included; it is expanded at compile time, an unreachable one is an error, and on a choice whose options come from a field it also stands for every option the choice resolves to and is the only way to route them. A bare yes/no question means `"yes"`. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it unless it lists the task as `optional(...)`. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
+| `answers` | `str \| list[str]` | Deprecated. Write `when = question.any_of(...)`. |
+| `otherwise` | `bool` | Deprecated. Write `when = question.otherwise()`. |
+
+### `budget()`
+
+A call's ceilings for its target run.
+
+| Argument | Type | Purpose |
+| --- | --- | --- |
+| `cost` | `number` | The target run's cost ceiling in dollars. |
+| `wall_clock` | `duration` | The target run's wall-clock ceiling, such as `"30m"`. |
+
+### `item()`
+
+A mapped call's own item, as a value in `params`.
 
 ### `model()`
 

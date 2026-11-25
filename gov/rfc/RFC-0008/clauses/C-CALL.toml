@@ -1,0 +1,30 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-CALL"
+title = "The call task"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+A playbook or custom workflow MAY declare a call task with call(). A call takes a name, a target, params, and optionally over, budget, depends_on, required, join, stage, and when, with the meanings [[RFC-0002:C-PLAYBOOK-SHAPE]] and the DSL reference give them on any task. An autoresearch workflow MUST NOT declare one.
+
+target MUST name a target the source's calls block declares ([[RFC-0008:C-TARGETS]]). The engine MUST refuse a target that the block does not declare.
+
+params MUST be a dict from the target's declared parameter names to values. A value MUST be one of:
+
+- a literal of the parameter's type;
+- param(name), a parameter of the calling workflow;
+- producer.field, a field a dependency of the call declares in emits; or
+- producer.files[path], a path a dependency of the call declares in emits_files.
+
+A producer MUST be a direct dependency of the call. The engine MUST check every binding against the target's interface in the call lock ([[RFC-0008:C-LOCK]]) at compile time and MUST refuse a source in which a required target parameter is unbound, a name is not a target parameter, a field's declared type does not match the parameter's type, or a file is bound to a parameter that is not a file parameter. A field typed by a schema MUST match only a json parameter, and the parameter's schema, when it has one, MUST be equal to the field's.
+
+over = each(producer.field, max = N) MUST make the call a mapped task: one target run per item, with item available as a value in params. The engine MUST refuse N above 64.
+
+The engine MUST bind every value when the call becomes ready, not at compile time. A value the target refuses, such as one outside a choice set or a pattern, MUST settle the call failing with the refusal as its note before any target run is created and without spend.
+
+A call task's output MUST be the target's result as [[RFC-0008:C-TARGETS]] defines it, typed by the target's interface, so that dependents, when, and route decisions read it as they read any task's output. The target's result files MUST be staged as the call's declared files under [[RFC-0002:C-TASK-FILES]].
+
+A call MUST settle passing when the target run ends passing, failing when it ends failing, timed out, or cancelled by anything other than its caller, with the target's own note, and cancelled when its caller is cancelled. A call task MUST NOT set complete. A call MUST NOT be a member of a revise loop body or a session."""

@@ -212,6 +212,12 @@ impl ShellRunner {
                     cmd.env("CRUCIBLE_EFFORT", e.as_flag());
                 }
             }
+            TaskKind::Call { alias, .. } => {
+                return Attempt::failed(
+                    0.0,
+                    format!("call {alias} refused: this runner does not dispatch call targets"),
+                );
+            }
             TaskKind::Report {
                 template,
                 result,

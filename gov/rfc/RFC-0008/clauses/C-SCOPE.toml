@@ -1,0 +1,15 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-SCOPE"
+title = "Scope"
+kind = "informative"
+status = "active"
+
+[content]
+text = """
+A playbook can start a run of another pipeline and use what that run returns. The task that does this is a call. Its target is another Crucible playbook or a pipeline on an external system, first a GitHub Actions workflow started by workflow_dispatch. The target runs as its own run, not as part of the caller's graph. The caller binds the target's inputs from its own task outputs, agent or command alike, including JSON values and files, and receives the target's result as the call's output.
+
+This RFC covers the call task in the workflow DSL, how a pack names and pins its targets, the JSON and file parameter types a target can declare, how the controller dispatches, follows and cancels a target run, and how a client draws one. It does not cover a target that runs inside the caller's run, a call that does not wait for its target, or GitHub credentials other than an App installation.
+
+The parameter types in [[RFC-0008:C-PARAM-TYPES]] extend [[RFC-0002:C-PLAYBOOK-PARAMS]], and a call task is an engine-owned task under [[RFC-0002:C-PLAYBOOK-SHAPE]]. Finalizing this RFC requires amending both."""

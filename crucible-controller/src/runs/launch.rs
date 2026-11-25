@@ -153,7 +153,10 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
         return Ok(());
     }
 
-    let run_id = new_run_id(&issue.key);
+    let run_id = match crate::calls::store::reserved_run(db.pool(), &issue.key).await? {
+        Some(reserved) => reserved,
+        None => new_run_id(&issue.key),
+    };
     // Both a draft test-fire and a registered launch resolve the playbook scope's bindings, against
     // the principals the launch row recorded. What differs is the revision: a registered launch is
     // checked against the one it is pinned to, while a draft has no reviewed revision, so only an

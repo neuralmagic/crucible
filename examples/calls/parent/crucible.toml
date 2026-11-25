@@ -1,0 +1,33 @@
+# calls/parent: a playbook that calls another playbook and a GitHub Actions workflow, binds
+# their parameters from its own first task, and folds both results. Commands only, no model.
+#
+#   just calls-example
+#
+# workflow.star's `calls` block pins the child to its draft head, so this pack is a draft pack:
+# the recipe creates the `calls-child` draft from ../child, then pushes this pack as the
+# `calls-parent` draft. The controller writes calls.lock when it saves the parent.
+
+edition = 2
+
+[workspace]
+inject = ["prep.py", "summary.py"]
+
+[agent]
+backend   = "command"
+agent_cmd = "true"
+goal      = "Prepare a config and notes, hand them to a child playbook and a CI workflow, then summarize."
+
+[workflow]
+type = "playbook"
+file = "workflow.star"
+
+# `--variant agent`: the same graph with an agent turn writing the config and notes. Runs a
+# real model under your own login.
+[variant.agent.workflow]
+type = "playbook"
+file = "workflow-agent.star"
+
+[variant.agent.agent]
+backend = "local"
+harness = "claude"
+goal    = "Prepare a config and notes, hand them to a child playbook and a CI workflow, then summarize."

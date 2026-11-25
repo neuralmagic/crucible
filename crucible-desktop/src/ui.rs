@@ -16,6 +16,7 @@ mod dock;
 mod files;
 mod finder;
 mod graph;
+mod graph_call;
 mod graph_find;
 mod issues;
 mod keys;
@@ -310,6 +311,8 @@ struct Pane<'a> {
     previewing: bool,
     /// The run's tasks while the preview's are shown, for marking what the edit changed.
     run_tasks: &'a [TaskView],
+    /// The calls the run dispatched, with their targets' progress.
+    calls: &'a [crate::live::calls::LiveCall],
 }
 
 impl<'a> Pane<'a> {

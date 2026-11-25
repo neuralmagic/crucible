@@ -3,7 +3,7 @@
 
 use rune::{Color, El, ScrollSpec, col, el, icon, row, text};
 
-use crate::live::LivePlaybook;
+use crate::live::{LivePlaybook, LiveView};
 use crate::model::Verdict;
 use crate::runs::{
     DAY, Day, Summary, axis, calendar, date, day_label, lanes, month_labels, ticks, wall,
@@ -31,10 +31,14 @@ pub(crate) fn runs_page(
     shares: Option<El>,
     playbook: &str,
     launches: &[&LivePlaybook],
-    now: i64,
+    live: &LiveView,
     view: Option<(RunsTab, Option<El>)>,
     p: &Paint,
 ) -> El {
+    let now = match live {
+        LiveView::Ready { now, .. } => *now,
+        _ => 0,
+    };
     let summary = Summary::of(
         &launches
             .iter()
@@ -114,7 +118,7 @@ pub(crate) fn runs_page(
                             .children(shares.map(|shares| card("Shares", shares, p))),
                     )
                     .child(
-                        card("All runs", list(launches, now, p), p)
+                        card("All runs", list(launches, live, now, p), p)
                             .grow(1.0)
                             .min_w(0.0)
                             .min_h(0.0),
@@ -429,7 +433,7 @@ fn cell(d: &Day, busiest: usize, today: i64, landed: &[(i64, &LivePlaybook)], p:
 }
 
 /// Every launch, newest first, under its column heads.
-fn list(launches: &[&LivePlaybook], now: i64, p: &Paint) -> El {
+fn list(launches: &[&LivePlaybook], live: &LiveView, now: i64, p: &Paint) -> El {
     let columns =
         rune::memo::layout_with("runs-list", |rect| Columns::fit(rect[2])).unwrap_or(Columns::All);
     let mut sorted: Vec<&&LivePlaybook> = launches.iter().collect();
@@ -447,7 +451,18 @@ fn list(launches: &[&LivePlaybook], now: i64, p: &Paint) -> El {
         if i > 0 {
             rows = rows.child(el().h(p.hair).w_full().fill(p.c.border_muted));
         }
-        rows = rows.child(list_row(i, launch, now, columns, p));
+        rows = rows.child(list_row(format!("run-{i}"), launch, None, now, columns, p));
+        for (j, called) in live.called_from(&launch.key).into_iter().enumerate() {
+            let label = format!("\u{21b3} {}", called.id);
+            rows = rows.child(list_row(
+                format!("run-{i}-{j}"),
+                called,
+                Some(label),
+                now,
+                columns,
+                p,
+            ));
+        }
     }
     col()
         .w_full()
@@ -516,8 +531,16 @@ fn result(launch: &LivePlaybook) -> String {
         .unwrap_or_else(|| launch.status.to_string())
 }
 
-/// Row `i` of the list, newest first; keyed by position so a script can pick "run-0".
-fn list_row(i: usize, launch: &LivePlaybook, now: i64, columns: Columns, p: &Paint) -> El {
+/// One row of the list, keyed by position so a script can pick "run-0"; a launch a call
+/// dispatched sits under its caller's row as `run-<i>-<j>`, named `called` in place of its time.
+fn list_row(
+    key: String,
+    launch: &LivePlaybook,
+    called: Option<String>,
+    now: i64,
+    columns: Columns,
+    p: &Paint,
+) -> El {
     let verdict = launch.verdict();
     let glyph = match verdict_icon(verdict) {
         _ if verdict == Verdict::Running => Spinner::new().size(14.0).color(p.live).build(p.k),
@@ -533,13 +556,16 @@ fn list_row(i: usize, launch: &LivePlaybook, now: i64, columns: Columns, p: &Pai
         glyph
     };
     let result = result(launch);
+    let nested = called.is_some();
+    let landed = called.unwrap_or_else(|| launch.landed_at.clone());
     row()
-        .key(format!("run-{i}"))
+        .key(key)
         .role("button")
         .label(format!("{} \u{2014} {}", launch.landed_at, launch.status))
         .w_full()
         .h(36.0)
         .px(6.0)
+        .pl(if nested { 22.0 } else { 6.0 })
         .gap(10.0)
         .center_y()
         .radius(p.k.radius.md)
@@ -550,10 +576,11 @@ fn list_row(i: usize, launch: &LivePlaybook, now: i64, columns: Columns, p: &Pai
         .on_press(open(launch, Flight::Row))
         .child(row().size(16.0, 16.0).center().child(glyph))
         .child(
-            text(launch.landed_at.clone())
+            text(landed)
                 .font(p.k.ty.ui_medium)
                 .color(p.c.text_base)
-                .w(LANDED),
+                .w(LANDED)
+                .truncate(),
         )
         .child(
             text(if columns >= Columns::NoOrigin {

@@ -160,6 +160,8 @@ pub struct ApiState {
     pub(crate) cluster_links: Option<Arc<crate::identity::cluster_link::ClusterLinks>>,
     /// The issuer whose people grant the consent page decides; `None` when it serves no people.
     pub(crate) people_issuer: Option<Arc<crate::agent_auth::AgentAuth>>,
+    /// Where a call's GitHub workflow target takes its token; `None` dispatches none.
+    pub(crate) calls_github: Option<crate::calls::GithubToken>,
 }
 
 impl ApiState {
@@ -258,6 +260,7 @@ impl ApiState {
             contracts,
             images_refresh: Arc::new(tokio::sync::Notify::new()),
             policy,
+            calls_github: cfg.calls_github_token,
         }
     }
 
@@ -390,6 +393,7 @@ impl ApiState {
             cluster_policy: Arc::new(Default::default()),
             policy: crate::authz::policy::ActivePolicy::default_set()
                 .expect("the shipped default policy set loads"),
+            calls_github: None,
         }
     }
 }

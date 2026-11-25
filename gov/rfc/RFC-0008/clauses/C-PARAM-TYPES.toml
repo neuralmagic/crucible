@@ -1,0 +1,19 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-PARAM-TYPES"
+title = "JSON and file parameters"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+A declared parameter MAY have type json or file, in addition to the types [[RFC-0002:C-PLAYBOOK-PARAMS]] lists.
+
+A json parameter's value MUST be a JSON object or array of at most 64 KiB serialized. Its declaration MAY name schema, a path below the pack directory to a JSON Schema (draft 2020-12) read under the rules schema_file() follows. A launch MUST be refused when the value does not validate against the schema. A json parameter MUST NOT take choices, choices_from, pattern, or multiline.
+
+A file parameter's value MUST be one file of at most max_bytes, which the declaration MUST set and which MUST NOT exceed 16 MiB. Its declaration MAY name media_type, a list of media types the file must have. The controller MUST store a supplied file as a blob owned by the launch, record its digest and size with the launch, and deliver it beside the pack's tree, never inside it. A file parameter MUST NOT take a default or any value constraint other than max_bytes and media_type.
+
+A command or evaluate task MUST receive a json parameter's value under params as JSON, and a file parameter as an object giving the staged file's path, size, digest, and media type. An agent task MUST receive a json value only inside a region marked as external input, as [[RFC-0002:C-PLAYBOOK-PARAMS]] requires, and a file only as a read-only staged input under the same marking; a json value MUST NOT be convertible to plain text, as a string parameter is not.
+
+A launch form MUST take a json parameter as text validated against its schema before submission, and a file parameter as an upload refused above max_bytes. The JSON Schema the engine emits for the params block MUST describe both, with the schema embedded for json."""

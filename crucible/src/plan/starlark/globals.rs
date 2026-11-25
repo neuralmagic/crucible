@@ -18,6 +18,7 @@ use starlark_syntax::codemap::FileSpan;
 
 use crate::plan::ir::TaskName;
 use crate::plan::starlark as dsl;
+use crate::plan::starlark::call::{BudgetValue, CallFileValue, ItemValue, ParamRefValue};
 use crate::plan::starlark::values::{
     AnswerRefValue, BoundValue, CONVERTED, DeciderValue, EachValue, ExternalText, OptionalValue,
     OthersValue, OutputRefValue, QuestionValue, SchemaValue, SendBackValue, SessionValue,
@@ -233,6 +234,30 @@ pub(crate) fn routed(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
         dispatch("pick", args, kwargs, eval)
+    }
+
+    fn budget<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("budget", args, kwargs, eval)
+    }
+
+    fn call<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("call", args, kwargs, eval)
+    }
+
+    fn item<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("item", args, kwargs, eval)
     }
 
     fn route<'v>(
@@ -576,6 +601,21 @@ fn convert_at(value: Value<'_>, depth: usize) -> dsl::Result<dsl::Value> {
     if let Some(defaults) = TaskDefaultsValue::from_value(value) {
         return Ok(dsl::Value::Defaults(defaults.0));
     }
+    if let Some(param) = ParamRefValue::from_value(value) {
+        return Ok(dsl::Value::ParamRef {
+            name: param.name.clone(),
+            ty: param.ty,
+        });
+    }
+    if let Some(file) = CallFileValue::from_value(value) {
+        return Ok(dsl::Value::CallFile(file.0.clone()));
+    }
+    if ItemValue::from_value(value).is_some() {
+        return Ok(dsl::Value::Item);
+    }
+    if let Some(budget) = BudgetValue::from_value(value) {
+        return Ok(dsl::Value::Budget(budget.0));
+    }
     Ok(dsl::Value::Opaque)
 }
 
@@ -639,5 +679,9 @@ fn alloc_at<'v>(heap: Heap<'v>, value: dsl::Value, depth: usize) -> Value<'v> {
         dsl::Value::Decider(decider) => heap.alloc(DeciderValue(decider)),
         dsl::Value::Others => heap.alloc(OthersValue),
         dsl::Value::Defaults(defaults) => heap.alloc(TaskDefaultsValue(defaults)),
+        dsl::Value::ParamRef { name, ty } => heap.alloc(ParamRefValue { name, ty }),
+        dsl::Value::CallFile(file) => heap.alloc(CallFileValue(file)),
+        dsl::Value::Item => heap.alloc(ItemValue),
+        dsl::Value::Budget(budget) => heap.alloc(BudgetValue(budget)),
     }
 }

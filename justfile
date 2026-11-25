@@ -137,11 +137,41 @@ controller-local port="8870" user=env_var("USER"):
         CONTROLLER_ADMINS={{user}} \
         CONTROLLER_SESSION_SECURE=false \
         CONTROLLER_PLAYBOOK_EXECUTOR=local \
+        CONTROLLER_CALLS_GITHUB_TOKEN=gh \
         CONTROLLER_SCOPE_EXECUTOR=disabled \
         CONTROLLER_STATE_DIR="$state" \
         CRUCIBLE_BIN="$bin/crucible" \
         RUST_LOG="${RUST_LOG:-info}" \
         "$bin/crucible-controller" autopilot
+
+# The ci call dispatches wseaton/snapshotd with the controller's `gh auth token`.
+# Save examples/calls/{child,parent} as drafts on `just controller-local`, launch the parent.
+calls-example port="8870" max_cost="1" max_time="30m":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    SQLX_OFFLINE=true cargo build -q -p crux --bin crux
+    crux="${CARGO_TARGET_DIR:-$PWD/target}/debug/crux"
+    unset CONTROLLER_API_TOKEN
+    export CONTROLLER_URL=http://127.0.0.1:{{port}} CONTROLLER_CONFIG=/dev/null
+    gh auth status >/dev/null 2>&1 || { echo "gh is not logged in: the ci call needs it" >&2; exit 1; }
+    save() {
+        local id=$1 dir=$2 description=$3 base saved
+        if ! "$crux" draft-log "$id" --json >/dev/null 2>&1; then
+            "$crux" draft-create "$id" --description "$description" --json >/dev/null
+        fi
+        base=$("$crux" draft-log "$id" --json | jq '[.[].version] | max')
+        saved=$("$crux" draft-push "$id" "$dir" --base-version "$base" --json)
+        if [ "$(jq -r '.error // empty' <<<"$saved")" ]; then
+            echo "$id: $(jq -r .error <<<"$saved")" >&2
+            exit 1
+        fi
+        jq -r --arg id "$id" '"\($id) v\(.version)" + ([.diagnostics[]? | "\n  \(.file // ""):\(.line // ""): \(.message)"] | join(""))' <<<"$saved"
+    }
+    save calls-child examples/calls/child "Digest notes under a label and a JSON config"
+    save calls-parent examples/calls/parent "Call calls-child and a GitHub workflow"
+    "$crux" draft-files calls-parent --json | jq -e '.files | has("calls.lock")' >/dev/null \
+        || { echo "calls-parent: the controller saved no calls.lock" >&2; exit 1; }
+    "$crux" draft-launch calls-parent --max-cost {{max_cost}} --max-time {{max_time}} --json | jq -r .key
 
 # Regenerate the controller UI's OpenAPI spec + typed client (build artifacts, not committed):
 # `cargo run -p crucible-controller --bin openapi-spec` -> openapi.json -> openapi-typescript.

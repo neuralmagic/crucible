@@ -943,6 +943,7 @@ mod tests {
                     definition: String::new(),
                     command: String::new(),
                     optional: Vec::new(),
+                    call: None,
                 },
                 PlanTaskWire {
                     name: "measure".into(),
@@ -966,6 +967,7 @@ mod tests {
                     definition: String::new(),
                     command: String::new(),
                     optional: Vec::new(),
+                    call: None,
                 },
             ],
             history_record: String::new(),

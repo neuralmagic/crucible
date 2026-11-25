@@ -55,6 +55,8 @@ pub(crate) mod tests;
         crate::runs::api::cluster_view::list_clusters,
         crate::runs::api::cluster_view::list_dispatch_targets,
         crate::runs::api::runs::get_run,
+        crate::calls::api::call_progress,
+        crate::calls::api::write_lock,
         crate::runs::api::runs::get_run_iterations,
         crate::runs::api::runs::get_run_graph,
         crate::runs::api::evidence::get_task_evidence,
@@ -229,6 +231,8 @@ pub(crate) mod tests;
         dto::IssueDto,
         dto::ScopeDto,
         dto::RunDto,
+        dto::RunParentDto,
+        dto::RunChildDto,
         crate::runs::api::runs::RunRowDto,
         crate::images::api::CatalogDto,
         crate::images::api::CatalogImageDto,
@@ -316,6 +320,8 @@ pub(crate) mod tests;
         crate::playbooks::plan_graph::GraphEdgeDto,
         crate::playbooks::plan_graph::FanOutDto,
         crate::playbooks::plan_graph::WhenDto,
+        crate::playbooks::plan_graph::CallDto,
+        crucible_contract::calls::CallKind,
         crate::playbooks::plan_graph::TaskKind,
         crate::playbooks::plan_graph::Needs,
         crate::playbooks::plan_graph::Join,
@@ -779,6 +785,14 @@ pub fn router(state: ApiState) -> Router {
                 .layer(axum::extract::DefaultBodyLimit::max(
                     crate::identity::api::prefs::MAX_PREFS_BYTES,
                 )),
+        )
+        .route(
+            crucible_contract::calls::CALL_PROGRESS_PATH,
+            get(crate::calls::api::call_progress),
+        )
+        .route(
+            crate::calls::api::LOCK_ROUTE,
+            axum::routing::post(crate::calls::api::write_lock),
         )
         .route("/api/openapi.json", get(move || async { Json(api) }))
         .layer(axum::middleware::from_fn_with_state(

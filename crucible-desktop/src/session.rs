@@ -9,6 +9,9 @@ use crucible_contract::session::{
 use serde_json::Value;
 
 use crate::logline::LogLine;
+use crate::session::call::{CallTask, Dispatched};
+
+pub mod call;
 
 const NOTES: usize = 20;
 
@@ -71,6 +74,8 @@ pub struct TaskView {
     pub rounds: Vec<Round>,
     /// When its first attempt started, from logs that record it.
     pub started_at: Option<jiff::Timestamp>,
+    /// The target a call task dispatches, and the runs it dispatched.
+    pub call: Option<CallTask>,
 }
 
 /// A revise loop as one of its tasks sees it.
@@ -193,6 +198,7 @@ impl TaskView {
             max_rounds: task.max_rounds,
             revised: None,
             rounds: Vec::new(),
+            call: task.call.map(CallTask::from_wire),
         }
     }
 
@@ -408,6 +414,9 @@ impl RunFold {
                             task.result = old.result;
                             task.instances = old.instances;
                             task.rounds = old.rounds;
+                            if let (Some(call), Some(old)) = (&mut task.call, old.call) {
+                                call.dispatched = old.dispatched;
+                            }
                         }
                         task
                     })
@@ -535,6 +544,33 @@ impl RunFold {
             }
             SessionEvent::Shutdown { outcome, reason } => {
                 self.shutdown = Some(Shutdown { outcome, reason });
+                true
+            }
+            SessionEvent::CallDispatched {
+                task,
+                instance,
+                attempt,
+                alias,
+                call,
+                handle,
+                link,
+            } => {
+                let Some(task) = self.tasks.iter_mut().find(|t| t.name == task) else {
+                    return false;
+                };
+                let held = task.call.get_or_insert_with(|| CallTask {
+                    alias,
+                    kind: handle.kind(),
+                    params: Default::default(),
+                    dispatched: Vec::new(),
+                });
+                held.record(Dispatched {
+                    instance,
+                    attempt,
+                    call,
+                    handle,
+                    link,
+                });
                 true
             }
             _ => false,
@@ -1021,5 +1057,83 @@ not json at all
             r#"{"v":1,"kind":"task_result","task":"ghost","status":"pass","attempts":1}"#
         ));
         assert_eq!(fold, before);
+    }
+
+    const CALLS: &str = r##"{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":1.0,"tasks":[{"name":"build","kind":"command","required":true,"emits":[{"field":"version"}]},{"name":"ship","kind":"call","depends_on":["build"],"required":true,"call":{"alias":"release","target":"github_workflow","params":{"version":"build"}}},{"name":"triage","kind":"call","depends_on":["build"],"required":true,"over":"build.items","call":{"alias":"triage","target":"playbook"}}]}
+{"v":1,"kind":"call_dispatched","task":"ship","attempt":1,"alias":"release","call":"c-1","handle":{"kind":"github_workflow","repo":"acme/app","run_id":42},"link":{"kind":"external","url":"https://github.com/acme/app/actions/runs/42"}}
+{"v":1,"kind":"call_dispatched","task":"triage","instance":"a","attempt":1,"alias":"triage","call":"c-2","handle":{"kind":"playbook","run":"run-a1"},"link":{"kind":"run","run":"run-a1"}}
+{"v":1,"kind":"call_dispatched","task":"triage","instance":"a","attempt":2,"alias":"triage","call":"c-3","handle":{"kind":"playbook","run":"run-a2"}}
+{"v":1,"kind":"call_dispatched","task":"triage","instance":"a","attempt":1,"alias":"triage","call":"c-2","handle":{"kind":"playbook","run":"run-a1"}}
+"##;
+
+    #[test]
+    fn a_call_task_carries_its_alias_kind_bindings_and_target_link() {
+        use crucible_contract::calls::{CallId, CallKind, NodeLink, TargetHandle};
+
+        let fold = fold(CALLS);
+        let ship = &fold.tasks[1];
+        assert_eq!(ship.kind, "call");
+        let call = ship.call.as_ref().expect("a call");
+        assert_eq!(
+            (call.alias.as_str(), call.kind),
+            ("release", CallKind::GithubWorkflow)
+        );
+        assert_eq!(call.bound_by("build").collect::<Vec<_>>(), ["version"]);
+        assert_eq!(call.bound_by("ship").count(), 0);
+        assert!(matches!(
+            call.link(),
+            Some(NodeLink::External { url }) if url.as_str() == "https://github.com/acme/app/actions/runs/42"
+        ));
+        assert_eq!(
+            call.dispatch(None).map(|d| (&d.call, &d.handle)),
+            Some((
+                &CallId("c-1".into()),
+                &TargetHandle::GithubWorkflow {
+                    repo: crucible_contract::calls::GithubRepo::parse("acme/app").unwrap(),
+                    run_id: 42
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn a_mapped_call_keeps_each_instances_newest_dispatch() {
+        let fold = fold(CALLS);
+        let call = fold.tasks[2].call.as_ref().expect("a call");
+        assert_eq!(call.dispatched.len(), 1);
+        let a = call.dispatch(Some("a")).expect("instance a");
+        assert_eq!((a.attempt, a.call.0.as_str()), (2, "c-3"));
+        assert!(call.dispatch(None).is_none());
+        assert!(call.link().is_none());
+    }
+
+    #[test]
+    fn a_dispatch_for_an_unnamed_task_changes_nothing_and_a_replan_keeps_dispatches() {
+        let mut fold = fold(CALLS);
+        let before = fold.clone();
+        assert!(!fold.apply_line(
+            r#"{"v":1,"kind":"call_dispatched","task":"ghost","attempt":1,"alias":"x","call":"c","handle":{"kind":"playbook","run":"r"}}"#
+        ));
+        assert_eq!(fold, before);
+        let plan = CALLS.lines().next().expect("a plan");
+        assert!(fold.apply_line(&plan.replace("\"plan_version\":1", "\"plan_version\":2")));
+        assert_eq!(fold.tasks[1].call, before.tasks[1].call);
+    }
+
+    #[test]
+    fn a_dispatch_before_any_plan_wire_call_still_names_its_target() {
+        let mut fold = fold(
+            r#"{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":1.0,"tasks":[{"name":"ship","kind":"call","required":true}]}"#,
+        );
+        assert!(fold.tasks[0].call.is_none());
+        assert!(fold.apply_line(
+            r#"{"v":1,"kind":"call_dispatched","task":"ship","attempt":1,"alias":"release","call":"c-1","handle":{"kind":"playbook","run":"run-9"}}"#
+        ));
+        let call = fold.tasks[0].call.as_ref().expect("a call");
+        assert_eq!(
+            (call.alias.as_str(), call.kind),
+            ("release", crucible_contract::calls::CallKind::Playbook)
+        );
+        assert!(call.params.is_empty());
     }
 }

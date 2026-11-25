@@ -1,6 +1,7 @@
 //! Cancelling a launch's runs: each `running` run on a pod has its engine log kept, its pod and
-//! its gateway deleted on the cluster it ran on, and is marked `cancelled`. A run with no pod
-//! (local dispatch) is left alone; nothing here can stop it.
+//! its gateway deleted on the cluster it ran on, and is marked `cancelled`. A local run's engine
+//! is interrupted, and its supervisor folds whatever session it wrote. Every open call the
+//! launch's runs dispatched is cancelled with them.
 
 use anyhow::Result;
 
@@ -24,11 +25,25 @@ pub async fn cancel_runs(
     .fetch_all(db.pool())
     .await?;
     let note = format!("cancelled by {}", actor.unwrap_or("an operator"));
+    match crate::calls::api::cancel_for_launch(db, cfg, key).await {
+        Ok(0) => {}
+        Ok(calls) => {
+            tracing::info!(issue_key = %key, calls, "cancel: cancelled the launch's open calls")
+        }
+        Err(e) => {
+            tracing::warn!(issue_key = %key, error = %format!("{e:#}"), "cancel: cancelling the launch's calls failed")
+        }
+    }
     let profile = crate::runs::completion::collection_profile(cfg).await;
     let mut cancelled = 0;
     for (run_id, pod) in runs {
         let Some(pod) = pod else {
-            tracing::warn!(issue_key = %key, run_id = %run_id, "cancel: a run with no pod is not stopped here");
+            if crate::runs::local_run::interrupt(cfg.scratch_root(), &run_id) {
+                tracing::info!(issue_key = %key, run_id = %run_id, "cancel: interrupted the local run");
+                cancelled += 1;
+            } else {
+                tracing::warn!(issue_key = %key, run_id = %run_id, "cancel: a run with no pod and no local engine is not stopped here");
+            }
             continue;
         };
         let row = crate::runs::work_pods::get_work_pod(db.pool(), &pod).await?;

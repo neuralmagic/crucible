@@ -17,6 +17,7 @@ use rune_theme_opencode::icons as oc;
 use crate::camera;
 use crate::session::{Instance, TaskState, TaskView};
 use crate::ui::detail::empty_run;
+use crate::ui::graph_call::{self, Pressed, Targets};
 use crate::ui::graph_find::{self, Found};
 use crate::ui::{Paint, Pane};
 use crate::{App, GraphSource};
@@ -37,10 +38,13 @@ pub(crate) fn graph_view(pane: &Pane, app: &App, p: &Paint) -> El {
     } else {
         HashMap::new()
     };
+    let targets = Targets::new(pane.calls, pane.pack.as_ref().ok().copied());
     let shown = Shown {
         open: app.run.expanded.as_deref(),
         folded: &app.run.folded,
         marks: &marks,
+        targets: &targets,
+        call_folds: &app.run.call_folds,
     };
     let source = mermaid_source(pane.tasks, &shown, &Ink::of(p));
     let mut style = rune_mermaid::DiagramStyle::neutral(p.dark);
@@ -69,7 +73,7 @@ pub(crate) fn graph_view(pane: &Pane, app: &App, p: &Paint) -> El {
                     pointer(spot, name.clone())
                         .on_press(move |app: &mut App| app.pick_task(&name, None))
                 }
-                None => spot,
+                None => target_spot(spot, pane.tasks, &targets, &app.run.call_folds, id),
             },
             rune_mermaid::Target::Edge { from, to } => {
                 let (Some((from, _)), Some((task, key))) =
@@ -95,6 +99,9 @@ pub(crate) fn graph_view(pane: &Pane, app: &App, p: &Paint) -> El {
                 }
             }
             rune_mermaid::Target::Frame(id) => match graph_frame(pane.tasks, id) {
+                Some(task) if task.instances.is_empty() && task.call.is_some() => {
+                    spot.child(call_handles(task, &targets, &app.run.call_folds, p))
+                }
                 Some(task) => spot.child(fold_handle(task, app.run.folded.contains(&task.name), p)),
                 None => spot,
             },
@@ -378,6 +385,79 @@ fn fold_handle(task: &TaskView, folded: bool, p: &Paint) -> El {
         .child(icon(glyph, 10.0).color(p.c.icon_faint))
 }
 
+/// The corner of a call's frame: a press folds its target's graph away or shows it, and the
+/// arrow beside it opens the target run.
+fn call_handles(task: &TaskView, targets: &Targets, call_folds: &HashSet<String>, p: &Paint) -> El {
+    let name = task.name.clone();
+    let unfolded = targets
+        .graph(task)
+        .is_some_and(|graph| graph_call::unfolded(task, &graph, call_folds));
+    let (glyph, help) = if unfolded {
+        (&oc::CHEVRON_DOWN, format!("Fold {name}"))
+    } else {
+        (&oc::CHEVRON_RIGHT, format!("Show {name}"))
+    };
+    let fold = el()
+        .key(format!("graph-call-fold-{name}"))
+        .size(HANDLE, HANDLE)
+        .center()
+        .cursor(rune::Cursor::Pointer)
+        .help(help)
+        .on_press(move |app: &mut App| app.toggle_call(&name))
+        .child(icon(glyph, 10.0).color(p.c.icon_faint));
+    let open = targets.call(task).and_then(|call| call.open()).map(|jump| {
+        el().key(format!("graph-call-open-{}", task.name))
+            .size(HANDLE, HANDLE)
+            .center()
+            .cursor(rune::Cursor::Pointer)
+            .help("Open run")
+            .on_press_tx(move |app: &mut App, tx: &mut Tx| app.jump(&jump, tx))
+            .child(icon(&oc::ARROW_UP_RIGHT, 12.0).color(p.c.icon_faint))
+    });
+    row().absolute(0.0, 0.0).child(fold).children(open)
+}
+
+/// A spot on node `id` of a call's target graph: a folded group shows its members, and any other
+/// node opens its link.
+fn target_spot(
+    spot: El,
+    tasks: &[TaskView],
+    targets: &Targets,
+    call_folds: &HashSet<String>,
+    id: &str,
+) -> El {
+    let Some((i, n)) = graph_call::node_id(id) else {
+        return spot;
+    };
+    let Some(task) = tasks.get(i) else {
+        return spot;
+    };
+    let Some(graph) = targets.graph(task) else {
+        return spot;
+    };
+    let pointer = |spot: El, help: String| spot.cursor(rune::Cursor::Pointer).help(help);
+    match graph_call::pressed(&task.name, &graph, call_folds, n) {
+        Some(Pressed::Group(key)) => pointer(spot, "Show the group".to_string())
+            .on_press(move |app: &mut App| app.toggle_call(&key)),
+        Some(Pressed::Node(n)) => {
+            let Some(node) = graph.nodes.get(n) else {
+                return spot;
+            };
+            let jump = node
+                .link
+                .as_ref()
+                .zip(targets.call(task))
+                .and_then(|(link, call)| call.jump(link));
+            match jump {
+                Some(jump) => pointer(spot, node.label.clone())
+                    .on_press_tx(move |app: &mut App, tx: &mut Tx| app.jump(&jump, tx)),
+                None => spot.help(node.label.clone()),
+            }
+        }
+        None => spot,
+    }
+}
+
 /// The fan-out a [`mermaid_source`] subgraph id, `g<i>`, frames.
 fn graph_frame<'a>(tasks: &'a [TaskView], id: &str) -> Option<&'a TaskView> {
     tasks.get(id.strip_prefix('g')?.parse::<usize>().ok()?)
@@ -581,7 +661,9 @@ impl Ink {
 
 /// What runs a task, as the web graph marks it.
 fn glyph(task: &TaskView) -> &'static str {
-    if task.kind == "route" {
+    if task.call.is_some() {
+        "\u{2197}"
+    } else if task.kind == "route" {
         "\u{25c7}"
     } else if task.is_fanout() {
         "\u{2261}"
@@ -672,13 +754,13 @@ const ROW: usize = 6;
 
 /// How many instances each unfolded fan-out can draw with the source still inside [`ITEMS`]:
 /// an instance is a node, the edge that places it, and at most an edge from each dependency.
-fn instances_each(tasks: &[TaskView], unfolded: impl Fn(&TaskView) -> bool) -> usize {
+fn instances_each(tasks: &[TaskView], unfolded: impl Fn(&TaskView) -> bool, calls: usize) -> usize {
     let edges: usize = tasks
         .iter()
         .map(|task| 2 * task.depends_on.len() + task.revise.len())
         .sum();
     let framed = tasks.iter().filter(|task| !task.instances.is_empty());
-    let taken = tasks.len() + edges + 3 * framed.count();
+    let taken = tasks.len() + edges + 3 * framed.count() + calls;
     let per: usize = tasks
         .iter()
         .filter(|task| unfolded(task))
@@ -715,6 +797,10 @@ struct Shown<'a> {
     folded: &'a HashSet<String>,
     /// Tasks the compiled pack adds or redefines, outlined.
     marks: &'a HashMap<String, Edit>,
+    /// Each call's target graph.
+    targets: &'a Targets<'a>,
+    /// Call frames and target groups folded or unfolded by hand.
+    call_folds: &'a HashSet<String>,
 }
 
 /// The run's tasks as a mermaid flowchart, task `i` as node `t<i>`; a fan-out that ran is
@@ -723,6 +809,8 @@ struct Shown<'a> {
 ///
 /// ```text
 ///   route  {{◇ name}}   fan-out  [[≡ name ×n]]   agent  (✦ name)   command  [› name]
+///   call   [[↗ name · alias · kind]], framed as `g<i>` with its target's graph inside
+///   a -->|version| c    c's parameter `version` is bound from a's output
 ///   a --> b             b reads a, and no other dependency of b already leads back to a
 ///   a ==>|each .f| b    b runs once per element of a.f
 ///   a -->|.k| b         b gets its own entry of a.k
@@ -760,9 +848,25 @@ fn mermaid_source<'a>(tasks: &'a [TaskView], shown: &Shown, ink: &Ink) -> String
             format!("x{cleaned}")
         }
     };
+    let frames: Vec<Option<graph_call::Frame>> = tasks
+        .iter()
+        .enumerate()
+        .map(|(i, task)| {
+            if !task.instances.is_empty() {
+                return None;
+            }
+            let graph = shown.targets.graph(task)?;
+            Some(if graph_call::unfolded(task, &graph, shown.call_folds) {
+                graph_call::frame(i, &task.name, &graph, shown.call_folds)
+            } else {
+                graph_call::Frame::default()
+            })
+        })
+        .collect();
+    let framed_calls = frames.iter().flatten().map(|frame| frame.items + 3).sum();
     let unfolded =
         |task: &TaskView| !task.instances.is_empty() && !shown.folded.contains(&task.name);
-    let each = instances_each(tasks, unfolded);
+    let each = instances_each(tasks, unfolded, framed_calls);
     let drawn = |task: &'a TaskView| -> &'a [Instance] {
         let shown = if unfolded(task) { each } else { 0 };
         task.instances
@@ -780,7 +884,8 @@ fn mermaid_source<'a>(tasks: &'a [TaskView], shown: &Shown, ink: &Ink) -> String
     let mut classes: Vec<(String, &'static str)> = Vec::new();
     let mut edge = 0;
     for (i, task) in tasks.iter().enumerate() {
-        let mut label = format!("{} {}", glyph(task), clean(&task.name));
+        let named = graph_call::label(task).unwrap_or_else(|| task.name.clone());
+        let mut label = format!("{} {}", glyph(task), clean(&named));
         if !task.instances.is_empty() {
             label.push_str(&format!(
                 " \u{d7}{} ({} ok)",
@@ -793,7 +898,7 @@ fn mermaid_source<'a>(tasks: &'a [TaskView], shown: &Shown, ink: &Ink) -> String
         }
         let (open, close) = if task.kind == "route" {
             ("{{", "}}")
-        } else if task.is_fanout() {
+        } else if task.is_fanout() || task.call.is_some() {
             ("[[", "]]")
         } else if task.kind == "agent" {
             ("(", ")")
@@ -802,7 +907,21 @@ fn mermaid_source<'a>(tasks: &'a [TaskView], shown: &Shown, ink: &Ink) -> String
         };
         let node = format!("t{i}{open}\"{label}\"{close}");
         if task.instances.is_empty() {
-            source.push_str(&format!("  {node}\n"));
+            match frames.get(i).and_then(Option::as_ref) {
+                Some(frame) => {
+                    source.push_str(&format!(
+                        "  subgraph g{i} [\" \"]\n    {node}\n{}  end\n",
+                        frame.body
+                    ));
+                    edge += frame.links;
+                    for (id, status) in &frame.states {
+                        if let Some(class) = state_class(graph_call::state(*status)) {
+                            classes.push((id.clone(), class));
+                        }
+                    }
+                }
+                None => source.push_str(&format!("  {node}\n")),
+            }
             continue;
         }
         let instances = drawn(task);
@@ -858,6 +977,9 @@ fn mermaid_source<'a>(tasks: &'a [TaskView], shown: &Shown, ink: &Ink) -> String
                     .filter_map(|k| field(k))
                     .map(|f| format!(".{f}")),
             );
+            if let Some(call) = &task.call {
+                labels.extend(call.bound_by(dependency).map(clean));
+            }
             if let Some((_, answers)) = task
                 .when
                 .split_once(" in ")
@@ -1022,11 +1144,14 @@ mod tests {
 
     use rune::Color;
 
+    use crate::live::calls::LiveCall;
+    use crate::pack::PackFiles;
     use crate::session::{RunFold, TaskView};
     use crate::ui::graph::{
         Edit, ITEMS, Ink, ROW, Shown, Swatch, UNFOLDED, critical_path, edits, graph_frame,
         graph_node, mermaid_source,
     };
+    use crate::ui::graph_call::Targets;
 
     const RUN: &str = concat!(
         r#"{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":1.0,"tasks":["#,
@@ -1091,13 +1216,26 @@ mod tests {
     }
 
     fn source(tasks: &[TaskView], open: Option<&str>, folded: &[&str]) -> String {
+        called(tasks, open, folded, &Targets::new(&[], None), &[])
+    }
+
+    fn called(
+        tasks: &[TaskView],
+        open: Option<&str>,
+        folded: &[&str],
+        targets: &Targets,
+        call_folds: &[&str],
+    ) -> String {
         let folded: HashSet<String> = folded.iter().map(ToString::to_string).collect();
+        let call_folds: HashSet<String> = call_folds.iter().map(ToString::to_string).collect();
         let source = mermaid_source(
             tasks,
             &Shown {
                 open,
                 folded: &folded,
                 marks: &std::collections::HashMap::new(),
+                targets,
+                call_folds: &call_folds,
             },
             &ink(),
         );
@@ -1402,6 +1540,8 @@ mod tests {
                 open: None,
                 folded: &folded,
                 marks: &marks,
+                targets: &Targets::new(&[], None),
+                call_folds: &folded,
             },
             &ink(),
         );
@@ -1523,5 +1663,163 @@ mod tests {
         for nothing in ["g9", "g", "t2", "g2i0"] {
             assert_eq!(framed(nothing), None, "{nothing}");
         }
+    }
+
+    /// `build` binds `ship`'s `version`; `note` reads `ship` and was not taken.
+    const CALLED: &str = concat!(
+        r#"{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":1.0,"tasks":["#,
+        r#"{"name":"build","kind":"command","required":true},"#,
+        r#"{"name":"ship","kind":"call","depends_on":["build"],"required":true,"call":{"alias":"release","target":"github_workflow","params":{"version":"build"}}},"#,
+        r#"{"name":"note","kind":"command","depends_on":["ship"],"required":false}"#,
+        r#"]}"#,
+        "\n",
+        r#"{"v":1,"kind":"call_dispatched","task":"ship","attempt":1,"alias":"release","call":"c-1","handle":{"kind":"github_workflow","repo":"acme/app","run_id":42}}"#,
+        "\n",
+        r#"{"v":1,"kind":"task_result","task":"note","status":"not_taken","attempts":0,"cost_usd":0.0,"secs":0.0,"note":""}"#,
+        "\n",
+    );
+
+    /// A workflow whose `test` job ran as a matrix of two legs after `lint`.
+    fn workflow(lint: &str, legs: [&str; 2]) -> serde_json::Value {
+        serde_json::json!({
+            "nodes": [
+                {"id": "lint", "label": "lint", "status": lint,
+                 "link": {"kind": "external", "url": "https://github.com/acme/app/actions/runs/42/job/1"}},
+                {"id": "t1", "label": "test (linux)", "status": legs[0], "group": "test"},
+                {"id": "t2", "label": "test (mac)", "status": legs[1], "group": "test"}
+            ],
+            "edges": [{"from": "lint", "to": "t1"}, {"from": "lint", "to": "t2"}]
+        })
+    }
+
+    fn shipping() -> Vec<LiveCall> {
+        let view = serde_json::from_value(serde_json::json!({
+            "task": "ship",
+            "attempt": 1,
+            "alias": "release",
+            "kind": "github_workflow",
+            "state": {
+                "call": "c-1",
+                "status": "running",
+                "handle": {"kind": "github_workflow", "repo": "acme/app", "run_id": 42},
+                "progress": workflow("pass", ["pass", "running"])
+            }
+        }))
+        .unwrap();
+        vec![LiveCall { view, launch: None }]
+    }
+
+    #[test]
+    fn a_call_draws_its_target_in_its_frame_until_it_is_folded() {
+        let tasks = fold(CALLED);
+        let calls = shipping();
+        let targets = Targets::new(&calls, None);
+        let open = called(&tasks, None, &[], &targets, &[]);
+        contains_all(
+            &open,
+            &[
+                concat!(
+                    "  subgraph g1 [\" \"]\n",
+                    "    t1[[\"\u{2197} ship \u{b7} release \u{b7} github\"]]\n",
+                    "    t1c0[\"lint\"]\n",
+                    "    t1c1[[\"\u{2261} test \u{d7}2 (1 ok)\"]]\n",
+                    "    t1 ~~~ t1c0\n",
+                    "    t1c0 --> t1c1\n",
+                    "  end\n",
+                ),
+                "t0 -->|version| t1\n",
+                "t1 -.-> t2\n",
+                "linkStyle 3 stroke:",
+                "class t1c0 pass",
+                "class t1c1 running",
+            ],
+        );
+        let style = rune_mermaid::DiagramStyle::neutral(true);
+        assert!(
+            rune_mermaid::render_with_hover(&open, &style, rune_mermaid::Hover::Off, Color::WHITE)
+                .is_some(),
+            "{open}"
+        );
+
+        let legs = called(&tasks, None, &[], &targets, &["ship/test"]);
+        contains_all(
+            &legs,
+            &[
+                "t1c1[\"test (linux)\"]",
+                "t1c2[\"test (mac)\"]",
+                "t1c0 --> t1c2",
+                "linkStyle 4 stroke:",
+            ],
+        );
+
+        let folded = called(&tasks, None, &[], &targets, &["ship"]);
+        contains_all(
+            &folded,
+            &[
+                "  subgraph g1 [\" \"]\n    t1[[\"\u{2197} ship \u{b7} release \u{b7} github\"]]\n  end\n",
+                "t0 -->|version| t1\n",
+                "linkStyle 1 stroke:",
+            ],
+        );
+        assert!(!folded.contains("t1c"), "{folded}");
+        assert_eq!(
+            graph_frame(&tasks, "g1").map(|t| t.name.as_str()),
+            Some("ship")
+        );
+    }
+
+    #[test]
+    fn a_call_with_no_target_graph_is_a_plain_node_and_a_lock_draws_one_pending() {
+        use crucible_contract::calls::{
+            CallAlias, CallsLock, GitRefName, GithubRepo, LOCK_FILE, LOCK_VERSION, LockedCall, Pin,
+            TargetInterface, WorkflowPath,
+        };
+
+        let plan = CALLED.lines().next().unwrap();
+        let tasks = fold(plan);
+        let bare = source(&tasks, None, &[]);
+        contains_all(
+            &bare,
+            &["  t1[[\"\u{2197} ship \u{b7} release \u{b7} github\"]]\n"],
+        );
+        assert!(!bare.contains("subgraph"), "{bare}");
+
+        let pin = Pin::GithubRef {
+            repo: GithubRepo::parse("acme/app").unwrap(),
+            workflow: WorkflowPath::parse(".github/workflows/release.yml").unwrap(),
+            git_ref: GitRefName::parse("main").unwrap(),
+            commit: "abc123".into(),
+        };
+        let interface = TargetInterface {
+            params: serde_json::json!({"type": "object"}),
+            result: Vec::new(),
+            result_files: Vec::new(),
+            graph: serde_json::from_value(workflow("pass", ["fail", "pass"])).unwrap(),
+        };
+        let lock = CallsLock {
+            version: LOCK_VERSION,
+            calls: [(
+                CallAlias::parse("release").unwrap(),
+                LockedCall::new(pin, interface).unwrap(),
+            )]
+            .into(),
+        };
+        let pack = PackFiles::new(
+            "test".into(),
+            [(LOCK_FILE.to_string(), Some(lock.render().unwrap()))],
+        );
+        let locked = called(&tasks, None, &[], &Targets::new(&[], Some(&pack)), &[]);
+        contains_all(
+            &locked,
+            &[
+                "subgraph g1",
+                "t1c0[\"lint\"]",
+                "t1c1[[\"\u{2261} test \u{d7}2 (0 ok)\"]]",
+            ],
+        );
+        assert!(
+            !locked.contains("class t1c"),
+            "every target node is pending\n{locked}"
+        );
     }
 }

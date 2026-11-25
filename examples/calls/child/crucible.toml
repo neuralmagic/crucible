@@ -1,0 +1,16 @@
+# calls/child: the target of examples/calls/parent. Takes a string, a json and a file
+# parameter, and returns typed fields plus DIGEST.md. Commands only, no model.
+
+edition = 2
+
+[workspace]
+inject = ["read.py", "digest.py"]
+
+[agent]
+backend   = "command"
+agent_cmd = "true"
+goal      = "Digest a notes file under a label and a JSON config."
+
+[workflow]
+type = "playbook"
+file = "workflow.star"

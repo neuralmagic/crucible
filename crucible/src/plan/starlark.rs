@@ -3,6 +3,7 @@
 //! all are confined to the pack directory; process, environment, network, clock, and randomness APIs are
 //! unavailable.
 
+mod call;
 pub mod error;
 mod globals;
 pub mod idents;
@@ -10,6 +11,7 @@ mod loader;
 pub mod params;
 pub mod placeholder;
 pub mod reference;
+mod targets;
 mod values;
 
 use std::cell::{RefCell, RefMut};
@@ -98,6 +100,14 @@ struct CompileContext {
     /// The first [`CompileError`] a constructor raised, parked while the marker error unwinds
     /// the evaluator.
     thrown: Option<CompileError>,
+    /// Each declared parameter's type, so `param()` of a json or file parameter yields a
+    /// reference rather than a value.
+    param_types: BTreeMap<String, params::ParamType>,
+    /// The source's `calls` block.
+    declared_calls:
+        BTreeMap<crucible_contract::calls::CallAlias, crucible_contract::calls::CallTarget>,
+    /// The pack's `calls.lock`, read once and checked against `declared_calls`.
+    calls_lock: Option<crucible_contract::calls::CallsLock>,
 }
 
 /// The route that answers a `when` reading `producer.field`.
@@ -114,6 +124,7 @@ enum PathKind {
     Prompt,
     Schema,
     Module,
+    Lock,
 }
 
 impl PathKind {
@@ -122,6 +133,7 @@ impl PathKind {
             PathKind::Prompt => "reading prompt metadata",
             PathKind::Schema => "reading schema metadata",
             PathKind::Module => "reading module metadata",
+            PathKind::Lock => "reading call lock metadata",
         }
     }
 
@@ -131,6 +143,7 @@ impl PathKind {
             PathKind::Prompt => "prompt_file",
             PathKind::Schema => "schema_file",
             PathKind::Module => "load",
+            PathKind::Lock => "call",
         }
     }
 
@@ -139,6 +152,7 @@ impl PathKind {
             PathKind::Prompt => "resolving prompt file",
             PathKind::Schema => "resolving schema file",
             PathKind::Module => "resolving module file",
+            PathKind::Lock => "resolving call lock",
         }
     }
 
@@ -147,6 +161,7 @@ impl PathKind {
             PathKind::Prompt => "reading prompt file",
             PathKind::Schema => "reading schema file",
             PathKind::Module => "reading module file",
+            PathKind::Lock => "reading call lock",
         }
     }
 }
@@ -281,6 +296,19 @@ impl CompileContext {
                 ParamValue::StringList(items) => {
                     Value::List(items.iter().cloned().map(Value::String).collect())
                 }
+                ParamValue::Json(_) => match self.param_types.get(name) {
+                    Some(ty @ (params::ParamType::Json | params::ParamType::File)) => {
+                        Value::ParamRef {
+                            name: name.to_owned(),
+                            ty: *ty,
+                        }
+                    }
+                    _ => {
+                        return Err(CompileError::ParamNotAValue {
+                            name: name.to_owned(),
+                        });
+                    }
+                },
             }),
             None => Err(CompileError::ParamNotDeclared {
                 name: name.to_owned(),
@@ -323,6 +351,49 @@ impl CompileContext {
         let (relative, bytes) = self.embed(raw, PathKind::Prompt, MAX_PROMPT_BYTES)?;
         self.prompt_files.insert(relative);
         Ok(String::from_utf8(bytes)?)
+    }
+
+    /// The pack's `calls.lock`, read once and checked to pin every target the `calls` block
+    /// declares.
+    fn calls_lock(&mut self) -> std::result::Result<&crucible_contract::calls::CallsLock, String> {
+        use crucible_contract::calls::{CallsLock, LOCK_FILE};
+        if self.calls_lock.is_none() {
+            let (_, canonical) = self
+                .resolve_in_pack(LOCK_FILE, PathKind::Lock)
+                .map_err(|why| format!("the pack's {LOCK_FILE} cannot be read: {why}"))?;
+            let text = std::fs::read_to_string(&canonical)
+                .map_err(|e| format!("reading {LOCK_FILE}: {e}"))?;
+            let lock = CallsLock::parse(&text).map_err(|e| e.to_string())?;
+            lock.covers(&self.declared_calls)
+                .map_err(|e| format!("{LOCK_FILE}: {e}"))?;
+            self.calls_lock = Some(lock);
+        }
+        self.calls_lock
+            .as_ref()
+            .ok_or_else(|| format!("the pack has no {LOCK_FILE}"))
+    }
+
+    /// The lock's entry for `alias`, or why there is none.
+    fn locked_call(
+        &mut self,
+        alias: &crucible_contract::calls::CallAlias,
+    ) -> std::result::Result<crucible_contract::calls::LockedCall, String> {
+        if !self.declared_calls.contains_key(alias) {
+            let known: Vec<&str> = self.declared_calls.keys().map(|a| a.as_str()).collect();
+            return Err(format!(
+                "the calls block declares no target named {alias}; it declares {}",
+                if known.is_empty() {
+                    "none".to_string()
+                } else {
+                    known.join(", ")
+                }
+            ));
+        }
+        self.calls_lock()?
+            .calls
+            .get(alias)
+            .cloned()
+            .ok_or_else(|| format!("calls.lock pins no target named {alias}"))
     }
 
     fn schema_file(&mut self, raw: &str) -> Result<SchemaFile> {
@@ -387,6 +458,9 @@ impl CompileState {
                 bound_sessions: BTreeSet::new(),
                 string_session_refs: BTreeMap::new(),
                 thrown: None,
+                param_types: BTreeMap::new(),
+                declared_calls: BTreeMap::new(),
+                calls_lock: None,
             }),
         }
     }
@@ -480,6 +554,17 @@ enum Value {
     Others,
     /// `task_defaults(...)`.
     Defaults(TaskDefaults),
+    /// `param(name)` of a json or file parameter.
+    ParamRef {
+        name: String,
+        ty: params::ParamType,
+    },
+    /// `producer.files["path"]`.
+    CallFile(call::CallFile),
+    /// `item()`.
+    Item,
+    /// `budget(...)`.
+    Budget(crucible_contract::calls::CallBudget),
     /// A starlark value outside the DSL's own space: a dict, a function, a struct. The `take_*`
     /// helpers report it with the same wrong-type sentence a wrong scalar gets.
     Opaque,
@@ -608,7 +693,8 @@ const SCORED_FUNCTIONS: &[&str] = &[
 
 /// Typed decisions, present in the playbook and custom lanes and absent from autoresearch.
 const ROUTED_FUNCTIONS: &[&str] = &[
-    "choice", "human", "model", "noul", "optional", "output", "pick", "route", "score",
+    "budget", "call", "choice", "human", "item", "model", "noul", "optional", "output", "pick",
+    "route", "score",
 ];
 
 /// The callable surface of one lane, for unknown-function suggestions. A playbook author is
@@ -761,6 +847,23 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "answers",
             "otherwise",
         ],
+        "call" => &[
+            "name",
+            "target",
+            "params",
+            "over",
+            "max_fanout",
+            "budget",
+            "depends_on",
+            "required",
+            "join",
+            "stage",
+            "when",
+            "answers",
+            "otherwise",
+        ],
+        "budget" => &["cost", "wall_clock"],
+        "item" => &[],
         "noul" => &["ask", "drop"],
         "choice" => &["ask", "options", "multiple", "drop"],
         "pick" => &["ask", "source", "multiple"],
@@ -793,6 +896,9 @@ fn constructor(
     state: &CompileState,
     at: &FileSpan,
 ) -> Result<Value> {
+    if function != "call" {
+        call::refuse_param_refs(&named)?;
+    }
     if function == "workflow" {
         let workflow_type = match take_string_default(&mut named, "type", "autoresearch")?.as_str()
         {
@@ -982,6 +1088,7 @@ fn constructor(
             };
             dsl_task(&mut named, state, name, kind, None)?
         }
+        "call" => call::call_task(&mut named, state)?,
         "evaluate" => {
             let name = take_declared_name(&mut named, "name")?;
             let command = take_string(&mut named, "run")?;
@@ -1224,6 +1331,8 @@ fn value_constructor(
             Value::SendBack(Revise { tasks, max_rounds })
         }
         "others" => Value::Others,
+        "item" => Value::Item,
+        "budget" => call::budget(named)?,
         "task_defaults" => Value::Defaults(TaskDefaults {
             required: match named.remove("required") {
                 None | Some(Value::None) => None,
@@ -3104,6 +3213,30 @@ pub fn declared_params(source: &str, filename: &Path) -> Result<serde_json::Valu
     Ok(read_params(source, filename)?.json_schema())
 }
 
+/// The targets a source's `calls` block declares, read without evaluating it, so a controller can
+/// pin them before the source compiles.
+#[tracing::instrument(skip_all, fields(source = %filename.display()), err)]
+pub fn declared_calls(
+    source: &str,
+    filename: &Path,
+) -> Result<BTreeMap<crucible_contract::calls::CallAlias, crucible_contract::calls::CallTarget>> {
+    on_compile_stack(|| {
+        if source.len() > MAX_SOURCE_BYTES {
+            return Err(CompileError::SourceTooLarge {
+                bytes: source.len(),
+            });
+        }
+        reject_deep_nesting(source, filename)?;
+        let ast = AstModule::parse(
+            &filename.display().to_string(),
+            source.to_owned(),
+            &dialect(),
+        )
+        .map_err(parse_error)?;
+        targets::read(&ast)
+    })
+}
+
 /// The declarations themselves, typed, for a launcher that has values to bind rather than a form
 /// to draw: [`params::Params::bind`] parses and constrains supplied text through the same code the
 /// compiler runs, so a launcher cannot disagree with the compiler about what a pack accepts.
@@ -3319,10 +3452,22 @@ fn compile_source_here(
     let idents = idents::scan(&ast, lane);
     let globals = lane_globals(lane);
     let state = CompileState::new(pack_dir, filename);
-    let declared_params = params::Params::read(&ast)?;
+    let mut declared_params = params::Params::read(&ast)?;
     let declares_params = !declared_params.is_empty();
     {
         let mut context = state.context_mut();
+        context.declared_calls = targets::read(&ast)?;
+        if !context.declared_calls.is_empty() {
+            context
+                .calls_lock()
+                .map_err(|detail| CompileError::CallsUnpinned { detail })?;
+        }
+        declared_params.read_schemas(|path| context.schema_file(path).map(|file| file.schema))?;
+        context.param_types = declared_params
+            .specs()
+            .iter()
+            .map(|spec| (spec.name.clone(), spec.ty))
+            .collect();
         match binding {
             Binding::Supplied(supplied) | Binding::Launch(supplied) => {
                 context.params = declared_params.bind(supplied)?;
@@ -7393,7 +7538,7 @@ workflow(type = "playbook", tasks = [a])
         let late = "x = 1\nparams = {\"a\": {\"type\": \"string\", \"default\": \"d\"}}\nworkflow(type = \"playbook\", tasks = [])\n";
         let error =
             crate::errors::report(&declared_params(late, &pack.join("workflow.star")).unwrap_err());
-        assert!(error.contains("first statement"), "{error}");
+        assert!(error.contains("before every statement"), "{error}");
 
         let _ = std::fs::remove_dir_all(&pack);
     }

@@ -4,6 +4,7 @@
 //! The controller and its key come from the profile in use; see [`crate::profile`].
 
 mod action;
+pub mod calls;
 pub mod client;
 mod fetcher;
 mod reports;
@@ -132,6 +133,17 @@ impl LiveView {
         rows
     }
 
+    /// The launches a call of launch `key` dispatched, oldest first.
+    pub fn called_from(&self, key: &str) -> Vec<&LivePlaybook> {
+        let mut called: Vec<&LivePlaybook> = self
+            .launches()
+            .iter()
+            .filter(|launch| launch.called_by.as_ref().is_some_and(|by| by.launch == key))
+            .collect();
+        called.sort_by_key(|launch| launch.landed);
+        called
+    }
+
     pub fn playbook_count(&self) -> usize {
         self.launches()
             .iter()
@@ -198,6 +210,8 @@ pub struct LivePlaybook {
     pub description: Option<String>,
     pub landed: i64,
     pub landed_at: String,
+    /// The call that dispatched it, when one did.
+    pub called_by: Option<crux::dto::CalledBy>,
 }
 
 impl LivePlaybook {
@@ -304,6 +318,8 @@ pub struct LiveDetail {
     pub run_id: Option<String>,
     /// The files its tasks captured, or why they could not be listed; `None` until read.
     pub files: Option<Result<Vec<Captured>, String>>,
+    /// Every call the run dispatched, with its target's progress.
+    pub calls: Vec<calls::LiveCall>,
 }
 
 /// The launch a run is compared against: its tasks as its stored session left them.
@@ -634,6 +650,7 @@ mod tests {
             description: None,
             landed: 1_760_000_000,
             landed_at: "Nov 6 10:00".into(),
+            called_by: None,
         }
     }
 
@@ -2413,5 +2430,34 @@ mod tests {
                 "a refusal names why: {error}"
             ),
         }
+    }
+
+    #[test]
+    fn a_launch_lists_the_launches_its_calls_dispatched_oldest_first() {
+        let by = |task: &str| crux::dto::CalledBy {
+            run: "run-1".into(),
+            launch: "playbook:caller:1".into(),
+            task: task.into(),
+            instance: None,
+        };
+        let view = ready(vec![
+            firing("caller", 1, "manual", "running"),
+            LivePlaybook {
+                called_by: Some(by("ship")),
+                ..firing("release", 3, "call", "running")
+            },
+            LivePlaybook {
+                called_by: Some(by("triage")),
+                ..firing("triage", 2, "call", "done")
+            },
+            firing("release", 4, "manual", "done"),
+        ]);
+        let called: Vec<&str> = view
+            .called_from("playbook:caller:1")
+            .iter()
+            .map(|launch| launch.key.as_str())
+            .collect();
+        assert_eq!(called, ["playbook:triage:2", "playbook:release:3"]);
+        assert!(view.called_from("playbook:release:4").is_empty());
     }
 }

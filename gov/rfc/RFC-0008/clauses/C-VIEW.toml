@@ -1,0 +1,17 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-VIEW"
+title = "Drawing calls"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+A client that draws a run's graph MUST draw a call task as a node distinct from other task kinds, labelled with its alias and target kind, and MUST let a reader expand it into the target's graph from [[RFC-0008:C-PROGRESS]], drawn inside a frame attached to the call's place in the caller's graph. A mapped call MUST draw one frame per instance and fold them as other mapped tasks fold. An edge into a call SHOULD be labelled with the parameter it binds.
+
+From an expanded call, a reader MUST be able to open a node's link: a node of a playbook target opens that task in the target run, and a node of an external target opens its page outside the client. The call node MUST also open the target run as a whole. A client showing a playbook run that a call dispatched MUST show the calling run and call task and open them, so that a reader can move from caller to target and back.
+
+A client that lists runs SHOULD list a run a call dispatched under the run that called it rather than beside it.
+
+A client that previews a pack's graph before launch MUST draw each call's static graph from the lock."""

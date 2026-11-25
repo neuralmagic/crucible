@@ -50,6 +50,7 @@
 - [RFC-0004: Linked controller/engine boundary](./rfc/RFC-0004.md)
 - [RFC-0005: Run supervisor services](./rfc/RFC-0005.md)
 - [RFC-0006: Blueprints](./rfc/RFC-0006.md)
+- [RFC-0008: Playbook calls](./rfc/RFC-0008.md)
 
 # Architecture decisions
 
@@ -130,3 +131,4 @@
   - [ADR-0077: A provider names each model's limits, and the binding carries them to the harness](./adr/ADR-0077.md)
   - [ADR-0078: A Kueue workload's result files leave the pod on an injected sidecar's log](./adr/ADR-0078.md)
   - [ADR-0080: Images live in one quay.io organisation and clusters pull them with a read-only robot](./adr/ADR-0080.md)
+  - [ADR-0081: A call dispatches its target as a separate run through controller-owned target backends](./adr/ADR-0081.md)

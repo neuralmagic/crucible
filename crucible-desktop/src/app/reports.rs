@@ -87,7 +87,7 @@ impl App {
     }
 
     /// Opens the launch `key` names, with `task` open when one is named.
-    fn open_launch(&mut self, key: &str, task: Option<&str>) {
+    pub(crate) fn open_launch(&mut self, key: &str, task: Option<&str>) {
         let Some(launch) = self.listed_launch(key) else {
             return;
         };

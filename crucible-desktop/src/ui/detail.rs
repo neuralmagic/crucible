@@ -16,7 +16,9 @@ use crate::ui::{
 use crate::{App, Backend, MAX_TIME, Selection};
 use crucible_contract::session::TaskStatus;
 use rune::{Color, El, TextStyle, Tx, col, el, icon, row, text};
-use rune_kit::{Button, ButtonVariant, IconButton, IconButtonVariant, RollingText, Spinner};
+use rune_kit::{
+    Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, RollingText, Spinner,
+};
 use rune_theme_opencode::icons as oc;
 
 const VALUE: TextStyle = TextStyle::new(15.0, 600.0).lh(20.0).features("'tnum' 1");
@@ -55,6 +57,7 @@ fn local_pane(pack: &PackView, log_font: LogFont) -> Pane<'_> {
         preview: Some(&pack.preview),
         previewing: false,
         run_tasks: &[],
+        calls: &[],
         pack: Ok(&pack.pack),
         launch: None,
         run_id: None,
@@ -120,6 +123,7 @@ fn live_pane<'a>(
         preview: None,
         previewing: false,
         run_tasks: &[],
+        calls: detail.map_or(&[], |detail| &detail.calls),
         empty: live_empty(launch, detail),
         pack: detail.map_or_else(
             || Err("Reading the pack\u{2026}".to_string()),
@@ -168,6 +172,7 @@ fn draft_pane<'a>(
         preview: None,
         previewing: false,
         run_tasks: &[],
+        calls: &[],
         empty: ("No launches listed.", String::new()),
         pack: match pack {
             Some(pack) => pack.as_ref().map_err(Clone::clone),
@@ -238,7 +243,7 @@ pub(crate) fn detail(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
         crate::Page::Keys => return keys::page(app, p),
         crate::Page::Runs => {}
     }
-    if let (Some((playbook, launches)), LiveView::Ready { now, .. }) =
+    if let (Some((playbook, launches)), LiveView::Ready { .. }) =
         (app.runs_page(), &*app.remote.live)
     {
         let view = app.runs_view().map(|built| {
@@ -251,7 +256,7 @@ pub(crate) fn detail(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
             shares::section(app, p),
             playbook,
             &launches,
-            *now,
+            &app.remote.live,
             view,
             p,
         );
@@ -472,6 +477,7 @@ fn header(pane: &Pane, app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
                         .and_then(|playbook| launcher::launch_button(app, playbook, p)),
                 ),
         )
+        .children(called_by(app, p))
         .child(
             text(pane.subtitle.clone())
                 .font(p.k.ty.ui)
@@ -481,6 +487,45 @@ fn header(pane: &Pane, app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
                 .selection_color(p.k.selection())
                 .wrap(),
         )
+}
+
+/// `called by <run> › <task>`, for a launch a call dispatched; each part opens the caller.
+fn called_by(app: &App, p: &Paint) -> Option<El> {
+    let by = app.selected_live()?.called_by.clone()?;
+    let caller = app.remote.live.launch(&by.launch).map_or_else(
+        || by.launch.clone(),
+        |launch| format!("{} {}", launch.id, launch.landed_at),
+    );
+    let task = match &by.instance {
+        Some(key) => format!("{}[{key}]", by.task),
+        None => by.task.clone(),
+    };
+    let (whole, at) = (by.launch.clone(), by.launch.clone());
+    let open_task = by.task.clone();
+    Some(
+        row()
+            .key("called-by")
+            .gap(4.0)
+            .center_y()
+            .child(text("called by").font(p.k.ty.small).color(p.c.text_faint))
+            .child(
+                Button::new(caller)
+                    .variant(ButtonVariant::GhostMuted)
+                    .control_size(ControlSize::Small)
+                    .on_press(move |app: &mut App| app.open_launch(&whole, None))
+                    .build(p.k)
+                    .key("called-by-run"),
+            )
+            .child(icon(&oc::CHEVRON_RIGHT, 12.0).color(p.c.icon_faint))
+            .child(
+                Button::new(task)
+                    .variant(ButtonVariant::GhostMuted)
+                    .control_size(ControlSize::Small)
+                    .on_press(move |app: &mut App| app.open_launch(&at, Some(&open_task)))
+                    .build(p.k)
+                    .key("called-by-task"),
+            ),
+    )
 }
 
 /// Back to the runs page, ahead of a launch picked there.

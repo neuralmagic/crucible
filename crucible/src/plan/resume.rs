@@ -226,6 +226,22 @@ pub fn fold(log: &str, plan: &ValidPlan, elapsed: Duration) -> Result<Prior, Res
                     prior.order.push(row.name);
                 }
             }
+            SessionEvent::CallDispatched {
+                task,
+                instance,
+                attempt,
+                call,
+                ..
+            } => {
+                prior.calls.insert(
+                    crate::plan::call_run::CallKey {
+                        task,
+                        instance,
+                        attempt,
+                    },
+                    call,
+                );
+            }
             SessionEvent::HistoryEntry { .. } => prior.recorded_history = true,
             SessionEvent::Shutdown { .. } => prior.shut_down = true,
             _ => {}

@@ -894,6 +894,12 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
         TaskKind::Engine { .. } => {
             return Attempt::failed(0.0, "engine task reached a non-loop runner".to_string());
         }
+        TaskKind::Call { alias, .. } => {
+            return Attempt::failed(
+                0.0,
+                format!("call {alias} refused: this engine does not dispatch call targets yet"),
+            );
+        }
     };
 
     // Per-task knob overrides on a cloned Args: the heterogeneity axis.

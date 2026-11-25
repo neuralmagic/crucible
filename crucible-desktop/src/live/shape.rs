@@ -216,6 +216,7 @@ pub(in crate::live) fn build_detail(
         pack: Ok(PackFiles::default()),
         run_id: None,
         files: None,
+        calls: Vec::new(),
     }
 }
 

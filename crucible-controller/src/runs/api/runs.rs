@@ -137,8 +137,34 @@ pub(crate) async fn get_run(
             .unwrap_or_default(),
         None => AgentPinDto::default(),
     };
+    let (parent, children) = tokio::try_join!(
+        crate::calls::store::called_from(state.db.pool(), &run_id),
+        crate::calls::store::children(state.db.pool(), &run_id),
+    )?;
+    let mut run = RunDto::from_parts(run, issue_key, repo, agent, transport_losses);
+    run.parent = parent.map(|p| RunParentDto {
+        run: p.run,
+        task: p.task,
+        instance: p.instance,
+    });
+    run.children = children
+        .into_iter()
+        .map(|c| RunChildDto {
+            run: match &c.handle {
+                crucible_contract::calls::TargetHandle::Playbook { run } => Some(run.clone()),
+                crucible_contract::calls::TargetHandle::GithubWorkflow { .. } => None,
+            },
+            kind: c.handle.kind(),
+            call: c.call.0,
+            task: c.task,
+            instance: c.instance,
+            attempt: c.attempt,
+            alias: c.alias.to_string(),
+            status: crate::calls::store::status_str(c.status).to_string(),
+        })
+        .collect();
     let detail = RunDetail {
-        run: RunDto::from_parts(run, issue_key, repo, agent, transport_losses),
+        run,
         candidates: candidates.into_iter().map(CandidateDto::from).collect(),
         agent_tools,
     };
