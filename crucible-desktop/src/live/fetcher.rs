@@ -3,7 +3,7 @@
 
 use crate::captured::Captured;
 use crate::live::action::Msg;
-use crate::live::calls::{self, LiveCall};
+use crate::live::calls;
 use crate::live::shape::{
     agent_label, build_detail, captured, captured_files, clock, console, epoch, graph_fold,
     identity, landed_label, owned, pin_label, typed_log, unix_now, unlaunched,
@@ -27,6 +27,8 @@ use tokio::sync::oneshot;
 
 /// Console lines kept per run.
 const LOG_LINES: usize = 4000;
+mod dispatched;
+
 /// Finished launches kept for the window to notify about.
 pub(in crate::live) const FINISHED: usize = 32;
 /// How long a live session follow that failed waits before it is tried again.
@@ -63,6 +65,12 @@ pub(in crate::live) struct Fetcher {
     run_launches: HashMap<String, String>,
     /// The call each target launch was dispatched by, as the calling runs' calls named it.
     callers: HashMap<String, crux::dto::CalledBy>,
+    /// The target node whose log the window shows.
+    pub(in crate::live) node_ask: Option<calls::NodeAsk>,
+    /// Each target node's log as last read, and whether the node had ended then.
+    node_logs: HashMap<calls::NodeAsk, (Result<String, String>, bool)>,
+    /// What each run's detail says called it, by run id; `None` when nothing did.
+    parents: HashMap<String, Option<calls::Parent>>,
 }
 
 /// One launch's detail, as of the run count and status the launch list showed when it was read:
@@ -295,6 +303,9 @@ impl Fetcher {
             catalog_at: None,
             run_launches: HashMap::new(),
             callers: HashMap::new(),
+            node_ask: None,
+            node_logs: HashMap::new(),
+            parents: HashMap::new(),
         }
     }
 
@@ -764,63 +775,15 @@ impl Fetcher {
         next.streaming = streaming;
         next.run_id = run_id;
         next.files = files;
+        next.log.extend(calls::lifecycle(&next.fold.tasks, &calls));
         next.calls = calls;
-        let changed = self.detail.as_deref() != Some(&next);
+        next.node_log = self.node_log(connection, &next, poll).await;
+        let learned = self
+            .learn_caller(connection, &launch, next.run_id.as_deref())
+            .await;
+        let changed = learned || self.detail.as_deref() != Some(&next);
         self.detail = Some(Arc::new(next));
         changed
-    }
-}
-
-impl Fetcher {
-    /// The calls run `run` of `launch` dispatched, re-read on a poll while its plan has a call
-    /// task. Each target launch learns the call that dispatched it.
-    async fn calls(
-        &mut self,
-        connection: &Connection,
-        launch: &LivePlaybook,
-        run: Option<&str>,
-        fold: &RunFold,
-        poll: bool,
-    ) -> Vec<LiveCall> {
-        let held = self
-            .detail
-            .as_ref()
-            .filter(|detail| detail.key == launch.key && detail.run_id.as_deref() == run)
-            .map(|detail| detail.calls.clone())
-            .unwrap_or_default();
-        let Some(run) = run else {
-            return Vec::new();
-        };
-        let calling = fold.tasks.iter().any(|task| task.call.is_some());
-        if !poll || !calling {
-            return held;
-        }
-        let Ok(views) = calls::progress(connection, run).await else {
-            return held;
-        };
-        let mut read = Vec::with_capacity(views.len());
-        for view in views {
-            let target = match &view.state.handle {
-                crucible_contract::calls::TargetHandle::Playbook { run } => {
-                    calls::launch_of(connection, &mut self.run_launches, run).await
-                }
-                crucible_contract::calls::TargetHandle::GithubWorkflow { .. } => None,
-            };
-            read.push(LiveCall {
-                view,
-                launch: target,
-            });
-        }
-        for (target, by) in calls::callers(&read, run, &launch.key) {
-            if let LiveView::Ready { launches, .. } = &mut self.view
-                && let Some(listed) = launches.iter_mut().find(|l| l.key == target)
-                && listed.called_by.is_none()
-            {
-                listed.called_by = Some(by.clone());
-            }
-            self.callers.insert(target, by);
-        }
-        read
     }
 }
 

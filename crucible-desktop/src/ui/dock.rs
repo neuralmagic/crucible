@@ -189,6 +189,7 @@ fn content(kind: PaneKind, pane: &Pane, app: &App, p: &Paint, layer: &mut Vec<El
         PaneKind::Tasks => tasks::task_list(
             app,
             pane.tasks,
+            pane.calls,
             pane.agent_lines(),
             pane.verdict == crate::model::Verdict::Running,
             empty_run(pane, p),
@@ -231,9 +232,7 @@ fn content(kind: PaneKind, pane: &Pane, app: &App, p: &Paint, layer: &mut Vec<El
                     .color(p.c.text_muted),
             ),
         PaneKind::Launch => launch::launch_view(pane.launch, p),
-        PaneKind::Log => {
-            log::log_pane(pane.transcript, pane.log, pane.tasks, pane.log_font, app, p)
-        }
+        PaneKind::Log => log::log_pane(pane, app, p),
         PaneKind::Agent => agent::panel(pane.log_font, app, p),
         PaneKind::History => revisions::history_view(app, p),
         PaneKind::Report => report::report_view(app, p, layer),

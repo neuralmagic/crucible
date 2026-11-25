@@ -28,6 +28,8 @@ pub(in crate::live) enum Msg {
     Compare(Option<String>),
     /// Which draft save to read the pack of; `None` stops.
     Draft(Option<(String, i64)>),
+    /// Which call target node to read the log of; `None` stops.
+    NodeLog(Option<crate::live::calls::NodeAsk>),
 }
 
 /// What the window asks for that runs as a task of its own.

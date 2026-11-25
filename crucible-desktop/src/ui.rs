@@ -18,6 +18,7 @@ mod finder;
 mod graph;
 mod graph_call;
 mod graph_find;
+mod graph_fx;
 mod issues;
 mod keys;
 mod launch;
@@ -313,6 +314,8 @@ struct Pane<'a> {
     run_tasks: &'a [TaskView],
     /// The calls the run dispatched, with their targets' progress.
     calls: &'a [crate::live::calls::LiveCall],
+    /// The log of the call target node the window asked for.
+    node_log: Option<&'a crate::live::calls::NodeLog>,
 }
 
 impl<'a> Pane<'a> {

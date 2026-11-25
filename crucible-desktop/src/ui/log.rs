@@ -6,8 +6,9 @@ use rune_theme_opencode::icons as oc;
 
 use crate::logline::{self, Body, Level, LogLine, LogView};
 use crate::session::{TaskState, TaskView, split_name};
-use crate::settings::LogFont;
-use crate::ui::Paint;
+use crate::ui::{Paint, Pane};
+
+mod node;
 use crate::ui::tasks::{count, state_mark, status_color};
 use crate::unfurl::{self, Block, LogMode};
 use crate::{App, LogSource};
@@ -21,14 +22,12 @@ const BLOCK_SHOWN: usize = 300;
 const TAIL: usize = 3;
 const INDENT: f32 = 16.0;
 
-pub(crate) fn log_pane(
-    transcript: &[LogLine],
-    console: &[LogLine],
-    tasks: &[TaskView],
-    font: LogFont,
-    app: &App,
-    p: &Paint,
-) -> El {
+pub(crate) fn log_pane(pane: &Pane, app: &App, p: &Paint) -> El {
+    let (transcript, console, tasks, font) = (pane.transcript, pane.log, pane.tasks, pane.log_font);
+    if let Some(node) = &app.run.call_node {
+        let log = pane.node_log.filter(|log| log.ask == node.ask);
+        return node::node_log(node, log, font, p);
+    }
     let Shown {
         reading,
         log,

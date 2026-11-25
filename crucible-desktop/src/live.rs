@@ -320,6 +320,8 @@ pub struct LiveDetail {
     pub files: Option<Result<Vec<Captured>, String>>,
     /// Every call the run dispatched, with its target's progress.
     pub calls: Vec<calls::LiveCall>,
+    /// The log of the target node the window asked for.
+    pub node_log: Option<calls::NodeLog>,
 }
 
 /// The launch a run is compared against: its tasks as its stored session left them.

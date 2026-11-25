@@ -175,7 +175,8 @@ impl Connector {
             Arc::new(wire)
         };
         let connection = Connection {
-            client: crux::Client::new(transport),
+            client: crux::Client::new(Arc::clone(&transport)),
+            wire: transport,
             runtime,
         };
         *open = Some(connection.clone());
@@ -206,10 +207,27 @@ impl Connector {
 #[derive(Clone)]
 pub struct Connection {
     pub client: crux::Client,
+    /// The transport under `client`, for a body that is not JSON.
+    wire: Arc<dyn crux::client::Transport>,
     runtime: Handle,
 }
 
 impl Connection {
+    /// The text body of `path`, or why there is none.
+    pub async fn text(&self, path: &str) -> Result<String, String> {
+        let (status, bytes) = self
+            .wire
+            .get_bytes(path)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        if status.is_success() {
+            Ok(text)
+        } else {
+            Err(format!("HTTP {status}: {}", text.trim()))
+        }
+    }
+
     /// Run one call to its end or [`TIMEOUT`], whichever comes first. Blocks, so not for a
     /// runtime thread.
     #[cfg(test)]

@@ -1,5 +1,6 @@
 //! A call task in the Graph pane: its target's graph drawn inside the call's frame, from the
-//! target run's progress once dispatched and from the pack's lock before.
+//! target run's progress once dispatched and from the pack's lock before. A mapped call draws a
+//! frame per instance, `g<i>k<k>` around instance `t<i>i<k>`, inside the fan-out's frame.
 //!
 //! ```text
 //!   subgraph g3 [" "]
@@ -17,11 +18,16 @@ use std::collections::{HashMap, HashSet};
 
 use crucible_contract::calls::{CallsLock, LOCK_FILE, NodeStatus, ProgressGraph};
 use crucible_contract::session::TaskStatus;
+use rune::{El, Tx, el, icon, row};
+use rune_theme_opencode::icons as oc;
 
-use crate::live::calls::{LiveCall, newest};
+use crate::App;
+use crate::live::calls::{CallNode, LiveCall, NodeAsk, frame_name, newest, open_label};
 use crate::pack::PackFiles;
 use crate::session::call::badge;
 use crate::session::{TaskState, TaskView};
+use crate::ui::graph::HANDLE;
+use crate::ui::{Paint, Pane, graph_fx};
 
 /// A call frame with at most this many nodes opens unfolded.
 pub(crate) const HANDFUL: usize = 6;
@@ -45,16 +51,20 @@ impl<'a> Targets<'a> {
         Targets { calls, lock }
     }
 
-    /// The target run of unmapped call `task`, once dispatched.
-    pub(crate) fn call(&self, task: &TaskView) -> Option<&'a LiveCall> {
+    /// The target run of call `task`, or of its instance `instance`, once dispatched.
+    pub(crate) fn call(&self, task: &TaskView, instance: Option<&str>) -> Option<&'a LiveCall> {
         task.call.as_ref()?;
-        newest(self.calls, &task.name, None)
+        newest(self.calls, &task.name, instance)
     }
 
-    /// What `task`'s frame draws: its target run's progress, else the lock's graph, pending.
-    pub(crate) fn graph(&self, task: &TaskView) -> Option<Cow<'_, ProgressGraph>> {
+    /// What a frame of `task` draws: its target run's progress, else the lock's graph, pending.
+    pub(crate) fn graph(
+        &self,
+        task: &TaskView,
+        instance: Option<&str>,
+    ) -> Option<Cow<'_, ProgressGraph>> {
         let call = task.call.as_ref()?;
-        if let Some(live) = self.call(task) {
+        if let Some(live) = self.call(task, instance) {
             return Some(Cow::Borrowed(&live.view.state.progress));
         }
         let locked = self.lock.as_ref()?.calls.get(&call.alias)?;
@@ -85,9 +95,40 @@ fn groups(graph: &ProgressGraph) -> HashMap<&str, Vec<usize>> {
     groups
 }
 
-/// `task/group`, the key a group's fold is kept under.
-pub(crate) fn group_key(task: &str, group: &str) -> String {
-    format!("{task}/{group}")
+/// One call frame: task `i`, or instance `k` of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct At<'a> {
+    pub(crate) i: usize,
+    pub(crate) task: &'a str,
+    pub(crate) instance: Option<(usize, &'a str)>,
+}
+
+impl At<'_> {
+    /// The id of the node the frame holds: `t<i>` or `t<i>i<k>`.
+    pub(crate) fn anchor(&self) -> String {
+        match self.instance {
+            Some((k, _)) => format!("t{}i{k}", self.i),
+            None => format!("t{}", self.i),
+        }
+    }
+
+    /// The frame's subgraph id: `g<i>` or `g<i>k<k>`.
+    pub(crate) fn subgraph(&self) -> String {
+        match self.instance {
+            Some((k, _)) => format!("g{}k{k}", self.i),
+            None => format!("g{}", self.i),
+        }
+    }
+
+    /// The key the frame's fold is kept under: `task` or `task[key]`.
+    pub(crate) fn key(&self) -> String {
+        frame_name(self.task, self.instance.map(|(_, key)| key))
+    }
+}
+
+/// `frame/group`, the key a group's fold is kept under.
+pub(crate) fn group_key(frame: &str, group: &str) -> String {
+    format!("{frame}/{group}")
 }
 
 /// For each node, the node drawn for it: itself, or its folded group's first member.
@@ -108,11 +149,11 @@ fn drawn_as(task: &str, graph: &ProgressGraph, open: &HashSet<String>) -> Vec<us
         .collect()
 }
 
-/// Whether `task`'s frame draws its target's nodes: small graphs unless folded by hand, large
+/// Whether frame `frame` draws its target's nodes: small graphs unless folded by hand, large
 /// ones only once unfolded by hand.
-pub(crate) fn unfolded(task: &TaskView, graph: &ProgressGraph, open: &HashSet<String>) -> bool {
-    let shown: HashSet<usize> = drawn_as(&task.name, graph, open).into_iter().collect();
-    (shown.len() <= HANDFUL) != open.contains(&task.name)
+pub(crate) fn unfolded(frame: &str, graph: &ProgressGraph, open: &HashSet<String>) -> bool {
+    let shown: HashSet<usize> = drawn_as(frame, graph, open).into_iter().collect();
+    (shown.len() <= HANDFUL) != open.contains(frame)
 }
 
 /// What a frame's target node `n` is when pressed.
@@ -124,7 +165,7 @@ pub(crate) enum Pressed {
     Node(usize),
 }
 
-/// What pressing node `n` of `task`'s target graph does.
+/// What pressing node `n` of frame `task`'s target graph does.
 pub(crate) fn pressed(
     task: &str,
     graph: &ProgressGraph,
@@ -143,10 +184,26 @@ pub(crate) fn pressed(
     })
 }
 
-/// `t3c5` is node 5 of task 3's target graph.
-pub(crate) fn node_id(id: &str) -> Option<(usize, usize)> {
-    let (task, node) = id.strip_prefix('t')?.split_once('c')?;
-    Some((task.parse().ok()?, node.parse().ok()?))
+/// A target node's place: its task, the instance whose frame holds it, and its index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NodeId {
+    pub(crate) task: usize,
+    pub(crate) instance: Option<usize>,
+    pub(crate) node: usize,
+}
+
+/// `t3c5` is node 5 of task 3's target graph, and `t3i2c5` node 5 of its instance 2's.
+pub(crate) fn node_id(id: &str) -> Option<NodeId> {
+    let (frame, node) = id.strip_prefix('t')?.split_once('c')?;
+    let (task, instance) = match frame.split_once('i') {
+        Some((task, k)) => (task, Some(k.parse().ok()?)),
+        None => (frame, None),
+    };
+    Some(NodeId {
+        task: task.parse().ok()?,
+        instance,
+        node: node.parse().ok()?,
+    })
 }
 
 /// Where a whole group stands: running while any member runs or some are left, failing when one
@@ -189,6 +246,8 @@ pub(crate) struct Frame {
     pub(crate) items: usize,
     /// The edge lines in `body`, which `linkStyle` counts.
     pub(crate) links: usize,
+    /// The drawn id of the node the Log pane shows.
+    pub(crate) picked: Option<String>,
 }
 
 /// Text safe inside a quoted node label.
@@ -196,9 +255,15 @@ fn clean(text: &str) -> String {
     text.replace(['"', '|'], "'")
 }
 
-/// Task `i`'s target graph as the lines of its frame.
-pub(crate) fn frame(i: usize, task: &str, graph: &ProgressGraph, open: &HashSet<String>) -> Frame {
-    let drawn = drawn_as(task, graph, open);
+/// Frame `at`'s target graph as the lines inside its subgraph.
+pub(crate) fn frame(
+    at: At,
+    graph: &ProgressGraph,
+    open: &HashSet<String>,
+    picked: Option<&str>,
+) -> Frame {
+    let (anchor, key) = (at.anchor(), at.key());
+    let drawn = drawn_as(&key, graph, open);
     let mut body = String::new();
     let mut states = Vec::new();
     let mut shown: Vec<usize> = Vec::new();
@@ -223,7 +288,7 @@ pub(crate) fn frame(i: usize, task: &str, graph: &ProgressGraph, open: &HashSet<
             .filter_map(|(m, _)| graph.nodes.get(m).map(|node| node.status))
             .collect();
         let folded = members.len() > 1;
-        let id = format!("t{i}c{n}");
+        let id = format!("{anchor}c{n}");
         if folded {
             let group = node.group.as_deref().unwrap_or(node.label.as_str());
             let ok = members
@@ -265,27 +330,161 @@ pub(crate) fn frame(i: usize, task: &str, graph: &ProgressGraph, open: &HashSet<
     let mut nodes = shown.len();
     let mut links = 0;
     for &n in shown.iter().filter(|n| !fed.contains(n)) {
-        body.push_str(&format!("    t{i} ~~~ t{i}c{n}\n"));
+        body.push_str(&format!("    {anchor} ~~~ {anchor}c{n}\n"));
         links += 1;
     }
     for (from, to) in &edges {
-        body.push_str(&format!("    t{i}c{from} --> t{i}c{to}\n"));
+        body.push_str(&format!("    {anchor}c{from} --> {anchor}c{to}\n"));
         links += 1;
     }
     let more = (drawn.len() - drawn.iter().filter(|rep| kept.contains(rep)).count())
         + graph.omitted as usize;
     if more > 0 {
         body.push_str(&format!(
-            "    t{i}cmore[\"+{more} more\"]\n    t{i} ~~~ t{i}cmore\n"
+            "    {anchor}cmore[\"+{more} more\"]\n    {anchor} ~~~ {anchor}cmore\n"
         ));
         nodes += 1;
         links += 1;
     }
+    let picked = picked
+        .and_then(|id| graph.nodes.iter().position(|node| node.id == id))
+        .and_then(|n| drawn.get(n))
+        .filter(|rep| kept.contains(rep))
+        .map(|rep| format!("{anchor}c{rep}"));
     Frame {
         body,
         states,
         items: nodes + links,
         links,
+        picked,
+    }
+}
+
+/// A call's frame `at`: its target's look, and in its corner a press that folds its target's
+/// graph away or shows it, and one that opens the target run.
+pub(crate) fn frame_spot(
+    spot: El,
+    at: At,
+    task: &TaskView,
+    targets: &Targets,
+    app: &App,
+    p: &Paint,
+) -> El {
+    let instance = at.instance.map(|(_, key)| key);
+    let call = targets.call(task, instance);
+    let id = at.subgraph();
+    let hovered = app.run.frame_hover.as_deref() == Some(id.as_str());
+    let look = graph_fx::look(call, &app.afterglows);
+    let key = at.key();
+    let unfolded = targets
+        .graph(task, instance)
+        .is_some_and(|graph| unfolded(&key, &graph, &app.run.call_folds));
+    let (glyph, help) = if unfolded {
+        (&oc::CHEVRON_DOWN, format!("Fold {key}"))
+    } else {
+        (&oc::CHEVRON_RIGHT, format!("Show {key}"))
+    };
+    let fold = el()
+        .key(format!("graph-call-fold-{key}"))
+        .size(HANDLE, HANDLE)
+        .center()
+        .cursor(rune::Cursor::Pointer)
+        .help(help)
+        .on_press(move |app: &mut App| app.toggle_call(&key))
+        .child(icon(glyph, 10.0).color(p.c.icon_faint));
+    let open = call.and_then(|call| {
+        let says = open_label(call.view.kind);
+        call.open().map(|jump| {
+            el().key(format!("graph-call-open-{}", at.key()))
+                .role("button")
+                .label(says)
+                .size(HANDLE, HANDLE)
+                .center()
+                .cursor(rune::Cursor::Pointer)
+                .help(says)
+                .on_press_tx(move |app: &mut App, tx: &mut Tx| app.jump(&jump, tx))
+                .child(icon(&oc::ARROW_UP_RIGHT, 12.0).color(p.c.icon_faint))
+        })
+    });
+    spot.children(graph_fx::effect(look, hovered, p))
+        .child(row().absolute(0.0, 0.0).child(fold).children(open))
+        .on_hover_change(move |app: &mut App, inside: bool, _: &mut Tx| {
+            if inside {
+                app.run.frame_hover = Some(id.clone());
+            } else if app.run.frame_hover.as_deref() == Some(id.as_str()) {
+                app.run.frame_hover = None;
+            }
+        })
+}
+
+/// A spot on node `id` of a call's target graph: a folded group shows its members, and any other
+/// node shows its log, or opens its link before its call is dispatched.
+pub(crate) fn target_spot(spot: El, pane: &Pane, targets: &Targets, app: &App, id: &str) -> El {
+    let Some(NodeId {
+        task: i,
+        instance: k,
+        node: n,
+    }) = node_id(id)
+    else {
+        return spot;
+    };
+    let Some(task) = pane.tasks.get(i) else {
+        return spot;
+    };
+    let instance = match k {
+        Some(k) => match task.instances.get(k) {
+            Some(instance) => Some((k, instance.key.as_str())),
+            None => return spot,
+        },
+        None => None,
+    };
+    let at = At {
+        i,
+        task: &task.name,
+        instance,
+    };
+    let key = instance.map(|(_, key)| key);
+    let Some(graph) = targets.graph(task, key) else {
+        return spot;
+    };
+    let pointer = |spot: El, help: String| spot.cursor(rune::Cursor::Pointer).help(help);
+    let node = match pressed(&at.key(), &graph, &app.run.call_folds, n) {
+        Some(Pressed::Group(fold)) => {
+            return pointer(spot, "Show the group".to_string())
+                .on_press(move |app: &mut App| app.toggle_call(&fold));
+        }
+        Some(Pressed::Node(n)) => graph.nodes.get(n),
+        None => None,
+    };
+    let Some(node) = node else {
+        return spot;
+    };
+    let live = targets.call(task, key);
+    let jump = node
+        .link
+        .as_ref()
+        .zip(live)
+        .and_then(|(link, call)| call.jump(link));
+    match (live, pane.run_id.clone()) {
+        (Some(live), Some(run)) => {
+            let picked = CallNode {
+                ask: NodeAsk {
+                    run,
+                    call: live.view.state.call.clone(),
+                    node: node.id.clone(),
+                },
+                frame: at.key(),
+                label: node.label.clone(),
+                jump,
+            };
+            pointer(spot, node.label.clone())
+                .on_press(move |app: &mut App| app.pick_call_node(picked.clone()))
+        }
+        _ => match jump {
+            Some(jump) => pointer(spot, node.label.clone())
+                .on_press_tx(move |app: &mut App, tx: &mut Tx| app.jump(&jump, tx)),
+            None => spot.help(node.label.clone()),
+        },
     }
 }
 
@@ -307,8 +506,16 @@ mod tests {
     use serde_json::json;
 
     use crate::ui::graph_call::{
-        HANDFUL, Pressed, frame, group_key, group_status, node_id, pressed, unfolded,
+        At, HANDFUL, NodeId, Pressed, frame, group_key, group_status, node_id, pressed, unfolded,
     };
+
+    fn at(i: usize, task: &str) -> At<'_> {
+        At {
+            i,
+            task,
+            instance: None,
+        }
+    }
 
     fn graph(value: serde_json::Value) -> ProgressGraph {
         serde_json::from_value(value).unwrap()
@@ -335,7 +542,7 @@ mod tests {
     #[test]
     fn a_matrix_group_folds_to_one_node_until_it_is_opened() {
         let none = HashSet::new();
-        let folded = frame(2, "ship", &matrix(), &none);
+        let folded = frame(at(2, "ship"), &matrix(), &none, None);
         assert_eq!(
             folded.body,
             concat!(
@@ -350,7 +557,7 @@ mod tests {
         assert_eq!(folded.states[1], ("t2c1".to_string(), NodeStatus::Running));
         assert_eq!(folded.items, 6);
         let open = HashSet::from([group_key("ship", "test")]);
-        let shown = frame(2, "ship", &matrix(), &open);
+        let shown = frame(at(2, "ship"), &matrix(), &open, None);
         for part in ["t2c2[\"test (mac)\"]", "t2c0 --> t2c3", "t2c3 --> t2c4"] {
             assert!(shown.body.contains(part), "{part} in\n{}", shown.body);
         }
@@ -365,11 +572,6 @@ mod tests {
 
     #[test]
     fn a_large_graph_opens_folded_and_a_small_one_unfolded_until_toggled() {
-        let task = {
-            let mut fold = crate::session::RunFold::default();
-            fold.apply_line(r#"{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":1.0,"tasks":[{"name":"ship","kind":"call","required":true,"call":{"alias":"release","target":"playbook"}}]}"#);
-            fold.tasks.remove(0)
-        };
         let small = matrix();
         let nodes: Vec<serde_json::Value> = (0..=HANDFUL)
             .map(|n| json!({"id": format!("n{n}"), "label": format!("n{n}"), "status": "pending"}))
@@ -377,10 +579,10 @@ mod tests {
         let large = graph(json!({"nodes": nodes}));
         let none = HashSet::new();
         let toggled = HashSet::from(["ship".to_string()]);
-        assert!(unfolded(&task, &small, &none));
-        assert!(!unfolded(&task, &small, &toggled));
-        assert!(!unfolded(&task, &large, &none));
-        assert!(unfolded(&task, &large, &toggled));
+        assert!(unfolded("ship", &small, &none));
+        assert!(!unfolded("ship", &small, &toggled));
+        assert!(!unfolded("ship", &large, &none));
+        assert!(unfolded("ship", &large, &toggled));
     }
 
     #[test]
@@ -389,7 +591,7 @@ mod tests {
             .map(|n| json!({"id": format!("n{n}"), "label": format!("n{n}"), "status": "pass"}))
             .collect();
         let big = graph(json!({"nodes": nodes, "omitted": 3}));
-        let drawn = frame(0, "t", &big, &HashSet::new());
+        let drawn = frame(at(0, "t"), &big, &HashSet::new(), None);
         assert!(drawn.body.contains("t0c39[\"n39\"]"), "{}", drawn.body);
         assert!(!drawn.body.contains("t0c40["), "{}", drawn.body);
         assert!(
@@ -420,10 +622,72 @@ mod tests {
     }
 
     #[test]
-    fn target_node_ids_name_their_task_and_node() {
-        assert_eq!(node_id("t3c5"), Some((3, 5)));
-        for nothing in ["t3", "t3cmore", "g3", "t3i0", "tc1", "t3c"] {
+    fn target_node_ids_name_their_task_instance_and_node() {
+        assert_eq!(
+            node_id("t3c5"),
+            Some(NodeId {
+                task: 3,
+                instance: None,
+                node: 5
+            })
+        );
+        assert_eq!(
+            node_id("t3i2c5"),
+            Some(NodeId {
+                task: 3,
+                instance: Some(2),
+                node: 5
+            })
+        );
+        for nothing in [
+            "t3",
+            "t3cmore",
+            "g3",
+            "t3i0",
+            "tc1",
+            "t3c",
+            "t3ic1",
+            "t3i2cmore",
+        ] {
             assert_eq!(node_id(nothing), None, "{nothing}");
         }
+    }
+
+    #[test]
+    fn an_instance_frame_names_its_nodes_and_folds_under_its_instance() {
+        let instance = At {
+            i: 4,
+            task: "triage",
+            instance: Some((1, "b")),
+        };
+        assert_eq!(
+            (instance.anchor(), instance.subgraph(), instance.key()),
+            (
+                "t4i1".to_string(),
+                "g4k1".to_string(),
+                "triage[b]".to_string()
+            )
+        );
+        let drawn = frame(instance, &matrix(), &HashSet::new(), None);
+        for part in [
+            "    t4i1c0[\"build\"]\n",
+            "    t4i1 ~~~ t4i1c0\n",
+            "    t4i1c1 --> t4i1c4\n",
+        ] {
+            assert!(drawn.body.contains(part), "{part} in\n{}", drawn.body);
+        }
+        let open = HashSet::from([group_key("triage[b]", "test")]);
+        let legs = frame(instance, &matrix(), &open, None);
+        assert!(
+            legs.body.contains("t4i1c3[\"test (win)\"]"),
+            "{}",
+            legs.body
+        );
+        assert!(unfolded("triage[b]", &matrix(), &HashSet::new()));
+        assert!(!unfolded(
+            "triage[b]",
+            &matrix(),
+            &HashSet::from(["triage[b]".to_string()])
+        ));
     }
 }

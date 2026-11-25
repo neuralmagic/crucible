@@ -257,6 +257,11 @@ impl Client {
         let _ = self.tx.send(Msg::Draft(shown));
     }
 
+    /// Which call target node's log to keep current; `None` stops.
+    pub fn node_log(&self, ask: Option<crate::live::calls::NodeAsk>) {
+        let _ = self.tx.send(Msg::NodeLog(ask));
+    }
+
     /// Fetch the file `run` captured under `key`. Its copy on disk is used only when the run
     /// has `settled` and the copy is the `size` the listing gives.
     pub fn file(&self, run: &str, key: &str, size: u64, settled: bool) {
@@ -341,6 +346,10 @@ async fn run_client(
             Ok(Some(Msg::Compare(base))) => {
                 compare = base;
                 force = fetcher.refresh_base(compare.as_deref()).await;
+            }
+            Ok(Some(Msg::NodeLog(ask))) => {
+                fetcher.node_ask = ask;
+                force = fetcher.refresh_detail(selected.as_deref(), false).await;
             }
             Ok(Some(Msg::Draft(shown))) => {
                 draft = shown;

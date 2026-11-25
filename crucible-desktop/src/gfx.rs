@@ -36,6 +36,8 @@ pub const SHIMMER: u32 = 3;
 pub const GLOW: u32 = 4;
 /// Fine static film grain over the window. `data[3]` is the amount.
 pub const GRAIN: u32 = 5;
+/// A soft steady bloom around something settled. `data[3]` is the intensity.
+pub const HALO: u32 = 8;
 
 /// The crucible mark as particle lava. `data`: clicks so far, 1 while a run is live, then the
 /// slot's screen position in points.
@@ -84,6 +86,16 @@ fn layer(kind: u32, d: [f32; 4], shape: Shape, t: f32) -> Option<(FxLayer, bool)
                 ..Default::default()
             }),
             true,
+        ),
+        HALO => (
+            Fx::glow(GlowParams {
+                style: GlowStyle::Soft,
+                color,
+                intensity: d[3].max(0.1),
+                radius: 12.0,
+                ..Default::default()
+            }),
+            false,
         ),
         GRAIN => (
             Fx::grain(GrainParams {

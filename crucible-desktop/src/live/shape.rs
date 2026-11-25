@@ -217,6 +217,7 @@ pub(in crate::live) fn build_detail(
         run_id: None,
         files: None,
         calls: Vec::new(),
+        node_log: None,
     }
 }
 

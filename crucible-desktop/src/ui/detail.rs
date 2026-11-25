@@ -58,6 +58,7 @@ fn local_pane(pack: &PackView, log_font: LogFont) -> Pane<'_> {
         previewing: false,
         run_tasks: &[],
         calls: &[],
+        node_log: None,
         pack: Ok(&pack.pack),
         launch: None,
         run_id: None,
@@ -124,6 +125,7 @@ fn live_pane<'a>(
         previewing: false,
         run_tasks: &[],
         calls: detail.map_or(&[], |detail| &detail.calls),
+        node_log: detail.and_then(|detail| detail.node_log.as_ref()),
         empty: live_empty(launch, detail),
         pack: detail.map_or_else(
             || Err("Reading the pack\u{2026}".to_string()),
@@ -173,6 +175,7 @@ fn draft_pane<'a>(
         previewing: false,
         run_tasks: &[],
         calls: &[],
+        node_log: None,
         empty: ("No launches listed.", String::new()),
         pack: match pack {
             Some(pack) => pack.as_ref().map_err(Clone::clone),
@@ -256,7 +259,7 @@ pub(crate) fn detail(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
             shares::section(app, p),
             playbook,
             &launches,
-            &app.remote.live,
+            app,
             view,
             p,
         );

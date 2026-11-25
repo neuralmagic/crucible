@@ -17,7 +17,7 @@ use rune_theme_opencode::icons as oc;
 use crate::camera;
 use crate::session::{Instance, TaskState, TaskView};
 use crate::ui::detail::empty_run;
-use crate::ui::graph_call::{self, Pressed, Targets};
+use crate::ui::graph_call::{self, At, Targets};
 use crate::ui::graph_find::{self, Found};
 use crate::ui::{Paint, Pane};
 use crate::{App, GraphSource};
@@ -45,6 +45,11 @@ pub(crate) fn graph_view(pane: &Pane, app: &App, p: &Paint) -> El {
         marks: &marks,
         targets: &targets,
         call_folds: &app.run.call_folds,
+        picked: app
+            .run
+            .call_node
+            .as_ref()
+            .map(|node| (node.frame.as_str(), node.ask.node.as_str())),
     };
     let source = mermaid_source(pane.tasks, &shown, &Ink::of(p));
     let mut style = rune_mermaid::DiagramStyle::neutral(p.dark);
@@ -73,7 +78,7 @@ pub(crate) fn graph_view(pane: &Pane, app: &App, p: &Paint) -> El {
                     pointer(spot, name.clone())
                         .on_press(move |app: &mut App| app.pick_task(&name, None))
                 }
-                None => target_spot(spot, pane.tasks, &targets, &app.run.call_folds, id),
+                None => graph_call::target_spot(spot, pane, &targets, app, id),
             },
             rune_mermaid::Target::Edge { from, to } => {
                 let (Some((from, _)), Some((task, key))) =
@@ -99,10 +104,12 @@ pub(crate) fn graph_view(pane: &Pane, app: &App, p: &Paint) -> El {
                 }
             }
             rune_mermaid::Target::Frame(id) => match graph_frame(pane.tasks, id) {
-                Some(task) if task.instances.is_empty() && task.call.is_some() => {
-                    spot.child(call_handles(task, &targets, &app.run.call_folds, p))
+                Some((at, task)) if at.instance.is_some() || task.instances.is_empty() => {
+                    graph_call::frame_spot(spot, at, task, &targets, app, p)
                 }
-                Some(task) => spot.child(fold_handle(task, app.run.folded.contains(&task.name), p)),
+                Some((_, task)) => {
+                    spot.child(fold_handle(task, app.run.folded.contains(&task.name), p))
+                }
                 None => spot,
             },
         }
@@ -162,11 +169,22 @@ fn compact(app: &App) -> bool {
 
 const CANVAS: &str = "graph-canvas";
 
-/// The least a diagram wider than the pane is first drawn at.
-const FIT: f32 = 0.6;
+/// The least and most a diagram is first drawn at to fit its pane.
+const FIT: (f32, f32) = (0.2, 1.5);
 
-/// The diagram under the run's camera, top and centre in the pane and shrunk towards its width,
-/// with the camera's controls over it.
+/// Points kept clear around a fitted diagram.
+const MARGIN: f32 = 16.0;
+
+/// The scale that fits a `size` diagram whole in a `pane`, and how far down the pane its top
+/// edge sits so it shows in the middle.
+fn fit([across, down]: [f32; 2], [w, h]: [f32; 2]) -> (f32, f32) {
+    let room = |pane: f32, length: f32| (pane - 2.0 * MARGIN).max(1.0) / length.max(1.0);
+    let scale = room(across, w).min(room(down, h)).clamp(FIT.0, FIT.1);
+    (scale, ((down - h * scale) / 2.0).max(MARGIN))
+}
+
+/// The diagram under the run's camera, fitted whole to the pane and in its middle, with the
+/// camera's controls over it.
 fn canvas(
     drawing: rune_mermaid::Drawing,
     found: &[Found],
@@ -176,9 +194,9 @@ fn canvas(
 ) -> El {
     let [w, h] = drawing.size;
     let pane = rune::memo::layout_size(CANVAS);
-    let fit = pane.map_or(1.0, |[across, _]| (across / w.max(1.0)).clamp(FIT, 1.0));
+    let (fit, top) = pane.map_or((1.0, MARGIN), |pane| fit(pane, [w, h]));
     let half = pane.map_or(0.0, |[across, _]| across / 2.0);
-    let middle = [0.0, pane.map_or(0.0, |[_, down]| down / 2.0)];
+    let middle = [0.0, pane.map_or(0.0, |[_, down]| down / 2.0 - top)];
     let matches = found
         .iter()
         .map(|label| [(label.middle[0] - w / 2.0) * fit, label.middle[1] * fit])
@@ -208,7 +226,7 @@ fn canvas(
         .on_wheel(move |app: &mut App, e: WheelEvent, tx: &mut Tx| {
             let camera = &mut app.run.camera;
             if e.mods.cmd || e.mods.ctrl {
-                camera.zoom_by((e.dy / 100.0).exp(), [e.x - half, e.y]);
+                camera.zoom_by((e.dy / 100.0).exp(), [e.x - half, e.y - top]);
             } else {
                 camera.pan_by([e.dx, e.dy]);
             }
@@ -216,7 +234,9 @@ fn canvas(
             true
         })
         .on_magnify(move |app: &mut App, e: MagnifyEvent, tx: &mut Tx| {
-            app.run.camera.zoom_by(1.0 + e.delta, [e.x - half, e.y]);
+            app.run
+                .camera
+                .zoom_by(1.0 + e.delta, [e.x - half, e.y - top]);
             tx.live_only();
             true
         })
@@ -224,6 +244,7 @@ fn canvas(
             app.run.camera.drag(drag);
             tx.live_only();
         })
+        .child(el().key("graph-top").h(top).w(1.0))
         .child(world)
         .child(controls(tasks, app, middle, matches, p))
 }
@@ -364,8 +385,8 @@ fn controls(
         )
 }
 
-/// The side of the square at the corner of a fan-out's frame that folds and unfolds it.
-const HANDLE: f32 = 16.0;
+/// The side of the square at the corner of a frame that folds and unfolds it.
+pub(crate) const HANDLE: f32 = 16.0;
 
 /// The corner of a fan-out's frame: a press folds its instances away or shows them.
 fn fold_handle(task: &TaskView, folded: bool, p: &Paint) -> El {
@@ -385,82 +406,26 @@ fn fold_handle(task: &TaskView, folded: bool, p: &Paint) -> El {
         .child(icon(glyph, 10.0).color(p.c.icon_faint))
 }
 
-/// The corner of a call's frame: a press folds its target's graph away or shows it, and the
-/// arrow beside it opens the target run.
-fn call_handles(task: &TaskView, targets: &Targets, call_folds: &HashSet<String>, p: &Paint) -> El {
-    let name = task.name.clone();
-    let unfolded = targets
-        .graph(task)
-        .is_some_and(|graph| graph_call::unfolded(task, &graph, call_folds));
-    let (glyph, help) = if unfolded {
-        (&oc::CHEVRON_DOWN, format!("Fold {name}"))
-    } else {
-        (&oc::CHEVRON_RIGHT, format!("Show {name}"))
+/// What a [`mermaid_source`] subgraph id frames: a fan-out or call `g<i>`, or the call of
+/// instance `k` of a mapped call, `g<i>k<k>`.
+fn graph_frame<'a>(tasks: &'a [TaskView], id: &str) -> Option<(At<'a>, &'a TaskView)> {
+    let rest = id.strip_prefix('g')?;
+    let (i, k) = match rest.split_once('k') {
+        Some((i, k)) => (i, Some(k.parse::<usize>().ok()?)),
+        None => (rest, None),
     };
-    let fold = el()
-        .key(format!("graph-call-fold-{name}"))
-        .size(HANDLE, HANDLE)
-        .center()
-        .cursor(rune::Cursor::Pointer)
-        .help(help)
-        .on_press(move |app: &mut App| app.toggle_call(&name))
-        .child(icon(glyph, 10.0).color(p.c.icon_faint));
-    let open = targets.call(task).and_then(|call| call.open()).map(|jump| {
-        el().key(format!("graph-call-open-{}", task.name))
-            .size(HANDLE, HANDLE)
-            .center()
-            .cursor(rune::Cursor::Pointer)
-            .help("Open run")
-            .on_press_tx(move |app: &mut App, tx: &mut Tx| app.jump(&jump, tx))
-            .child(icon(&oc::ARROW_UP_RIGHT, 12.0).color(p.c.icon_faint))
-    });
-    row().absolute(0.0, 0.0).child(fold).children(open)
-}
-
-/// A spot on node `id` of a call's target graph: a folded group shows its members, and any other
-/// node opens its link.
-fn target_spot(
-    spot: El,
-    tasks: &[TaskView],
-    targets: &Targets,
-    call_folds: &HashSet<String>,
-    id: &str,
-) -> El {
-    let Some((i, n)) = graph_call::node_id(id) else {
-        return spot;
+    let i = i.parse::<usize>().ok()?;
+    let task = tasks.get(i)?;
+    let instance = match k {
+        Some(k) => Some((k, task.instances.get(k)?.key.as_str())),
+        None => None,
     };
-    let Some(task) = tasks.get(i) else {
-        return spot;
+    let at = At {
+        i,
+        task: &task.name,
+        instance,
     };
-    let Some(graph) = targets.graph(task) else {
-        return spot;
-    };
-    let pointer = |spot: El, help: String| spot.cursor(rune::Cursor::Pointer).help(help);
-    match graph_call::pressed(&task.name, &graph, call_folds, n) {
-        Some(Pressed::Group(key)) => pointer(spot, "Show the group".to_string())
-            .on_press(move |app: &mut App| app.toggle_call(&key)),
-        Some(Pressed::Node(n)) => {
-            let Some(node) = graph.nodes.get(n) else {
-                return spot;
-            };
-            let jump = node
-                .link
-                .as_ref()
-                .zip(targets.call(task))
-                .and_then(|(link, call)| call.jump(link));
-            match jump {
-                Some(jump) => pointer(spot, node.label.clone())
-                    .on_press_tx(move |app: &mut App, tx: &mut Tx| app.jump(&jump, tx)),
-                None => spot.help(node.label.clone()),
-            }
-        }
-        None => spot,
-    }
-}
-
-/// The fan-out a [`mermaid_source`] subgraph id, `g<i>`, frames.
-fn graph_frame<'a>(tasks: &'a [TaskView], id: &str) -> Option<&'a TaskView> {
-    tasks.get(id.strip_prefix('g')?.parse::<usize>().ok()?)
+    Some((at, task))
 }
 
 /// A spot that opens instance `key` of `task`.
@@ -755,18 +720,24 @@ const ROW: usize = 6;
 /// How many instances each unfolded fan-out can draw with the source still inside [`ITEMS`]:
 /// an instance is a node, the edge that places it, and at most an edge from each dependency.
 fn instances_each(tasks: &[TaskView], unfolded: impl Fn(&TaskView) -> bool, calls: usize) -> usize {
-    let edges: usize = tasks
-        .iter()
-        .map(|task| 2 * task.depends_on.len() + task.revise.len())
-        .sum();
-    let framed = tasks.iter().filter(|task| !task.instances.is_empty());
-    let taken = tasks.len() + edges + 3 * framed.count() + calls;
+    let taken = taken(tasks, calls);
     let per: usize = tasks
         .iter()
         .filter(|task| unfolded(task))
         .map(|task| 2 + task.depends_on.len())
         .sum();
     (ITEMS.saturating_sub(taken) / per.max(1)).min(UNFOLDED)
+}
+
+/// The items the source takes before any instance: tasks, their edges, fan-out frames and the
+/// `calls` frames.
+fn taken(tasks: &[TaskView], calls: usize) -> usize {
+    let edges: usize = tasks
+        .iter()
+        .map(|task| 2 * task.depends_on.len() + task.revise.len())
+        .sum();
+    let framed = tasks.iter().filter(|task| !task.instances.is_empty());
+    tasks.len() + edges + 3 * framed.count() + calls
 }
 
 /// The labels a route's output records for `question`.
@@ -801,6 +772,23 @@ struct Shown<'a> {
     targets: &'a Targets<'a>,
     /// Call frames and target groups folded or unfolded by hand.
     call_folds: &'a HashSet<String>,
+    /// The target node the Log pane shows, by its frame's key and its id.
+    picked: Option<(&'a str, &'a str)>,
+}
+
+impl Shown<'_> {
+    /// Frame `at`'s target graph as the lines inside it, or none while it is folded.
+    fn frame(&self, at: At, graph: &crucible_contract::calls::ProgressGraph) -> graph_call::Frame {
+        let key = at.key();
+        if !graph_call::unfolded(&key, graph, self.call_folds) {
+            return graph_call::Frame::default();
+        }
+        let picked = self
+            .picked
+            .filter(|(frame, _)| *frame == key)
+            .map(|(_, node)| node);
+        graph_call::frame(at, graph, self.call_folds, picked)
+    }
 }
 
 /// The run's tasks as a mermaid flowchart, task `i` as node `t<i>`; a fan-out that ran is
@@ -855,12 +843,13 @@ fn mermaid_source<'a>(tasks: &'a [TaskView], shown: &Shown, ink: &Ink) -> String
             if !task.instances.is_empty() {
                 return None;
             }
-            let graph = shown.targets.graph(task)?;
-            Some(if graph_call::unfolded(task, &graph, shown.call_folds) {
-                graph_call::frame(i, &task.name, &graph, shown.call_folds)
-            } else {
-                graph_call::Frame::default()
-            })
+            let graph = shown.targets.graph(task, None)?;
+            let at = At {
+                i,
+                task: &task.name,
+                instance: None,
+            };
+            Some(shown.frame(at, &graph))
         })
         .collect();
     let framed_calls = frames.iter().flatten().map(|frame| frame.items + 3).sum();
@@ -881,7 +870,13 @@ fn mermaid_source<'a>(tasks: &'a [TaskView], shown: &Shown, ink: &Ink) -> String
             &[]
         }
     };
+    let drawn_items: usize = tasks
+        .iter()
+        .map(|task| drawn(task).len() * (3 + task.depends_on.len()))
+        .sum();
+    let mut left = ITEMS.saturating_sub(taken(tasks, framed_calls) + drawn_items);
     let mut classes: Vec<(String, &'static str)> = Vec::new();
+    let mut picked: Vec<String> = Vec::new();
     let mut edge = 0;
     for (i, task) in tasks.iter().enumerate() {
         let named = graph_call::label(task).unwrap_or_else(|| task.name.clone());
@@ -919,6 +914,7 @@ fn mermaid_source<'a>(tasks: &'a [TaskView], shown: &Shown, ink: &Ink) -> String
                             classes.push((id.clone(), class));
                         }
                     }
+                    picked.extend(frame.picked.clone());
                 }
                 None => source.push_str(&format!("  {node}\n")),
             }
@@ -935,10 +931,37 @@ fn mermaid_source<'a>(tasks: &'a [TaskView], shown: &Shown, ink: &Ink) -> String
             if let Some(answer) = first_answer(instance).filter(|_| task.kind == "route") {
                 label.push_str(&format!(" \u{b7} {}", clean(&answer)));
             }
-            source.push_str(&format!(
-                "    t{i}i{k}[\"{label}\"]\n    {} ~~~ t{i}i{k}\n",
-                anchor(k)
-            ));
+            let node = format!("t{i}i{k}[\"{label}\"]");
+            let at = At {
+                i,
+                task: &task.name,
+                instance: Some((k, &instance.key)),
+            };
+            let frame = shown
+                .targets
+                .graph(task, Some(&instance.key))
+                .map(|graph| shown.frame(at, &graph))
+                .filter(|frame| frame.items < left)
+                .or_else(|| task.call.is_some().then(graph_call::Frame::default));
+            match frame {
+                Some(frame) => {
+                    left = left.saturating_sub(frame.items + 1);
+                    source.push_str(&format!(
+                        "    subgraph {} [\" \"]\n      {node}\n{}    end\n",
+                        at.subgraph(),
+                        frame.body
+                    ));
+                    edge += frame.links;
+                    for (id, status) in &frame.states {
+                        if let Some(class) = state_class(graph_call::state(*status)) {
+                            classes.push((id.clone(), class));
+                        }
+                    }
+                    picked.extend(frame.picked);
+                }
+                None => source.push_str(&format!("    {node}\n")),
+            }
+            source.push_str(&format!("    {} ~~~ t{i}i{k}\n", anchor(k)));
             edge += 1;
             if let Some(class) = state_class(instance.state()) {
                 classes.push((format!("t{i}i{k}"), class));
@@ -1107,6 +1130,12 @@ fn mermaid_source<'a>(tasks: &'a [TaskView], shown: &Shown, ink: &Ink) -> String
     for (node, class) in classes {
         source.push_str(&format!("  class {node} {class}\n"));
     }
+    for node in picked {
+        source.push_str(&format!(
+            "  style {node} stroke:{},stroke-width:2\n",
+            ink.accent.hex()
+        ));
+    }
     for (i, task) in tasks.iter().enumerate() {
         let ink = match shown.marks.get(&task.name) {
             Some(Edit::Added) => ink.added,
@@ -1148,8 +1177,8 @@ mod tests {
     use crate::pack::PackFiles;
     use crate::session::{RunFold, TaskView};
     use crate::ui::graph::{
-        Edit, ITEMS, Ink, ROW, Shown, Swatch, UNFOLDED, critical_path, edits, graph_frame,
-        graph_node, mermaid_source,
+        Edit, FIT, ITEMS, Ink, MARGIN, ROW, Shown, Swatch, UNFOLDED, critical_path, edits, fit,
+        graph_frame, graph_node, mermaid_source,
     };
     use crate::ui::graph_call::Targets;
 
@@ -1226,6 +1255,17 @@ mod tests {
         targets: &Targets,
         call_folds: &[&str],
     ) -> String {
+        picking(tasks, open, folded, targets, call_folds, None)
+    }
+
+    fn picking(
+        tasks: &[TaskView],
+        open: Option<&str>,
+        folded: &[&str],
+        targets: &Targets,
+        call_folds: &[&str],
+        picked: Option<(&str, &str)>,
+    ) -> String {
         let folded: HashSet<String> = folded.iter().map(ToString::to_string).collect();
         let call_folds: HashSet<String> = call_folds.iter().map(ToString::to_string).collect();
         let source = mermaid_source(
@@ -1236,6 +1276,7 @@ mod tests {
                 marks: &std::collections::HashMap::new(),
                 targets,
                 call_folds: &call_folds,
+                picked,
             },
             &ink(),
         );
@@ -1542,6 +1583,7 @@ mod tests {
                 marks: &marks,
                 targets: &Targets::new(&[], None),
                 call_folds: &folded,
+                picked: None,
             },
             &ink(),
         );
@@ -1658,9 +1700,13 @@ mod tests {
         for nothing in ["t9", "t2i7", "t9more", "g2", "xscan", "t", "tmore"] {
             assert_eq!(named(nothing), None, "{nothing}");
         }
-        let framed = |id: &str| graph_frame(&tasks, id).map(|task| task.name.as_str());
+        let framed = |id: &str| graph_frame(&tasks, id).map(|(_, task)| task.name.as_str());
         assert_eq!(framed("g2"), Some("c"));
-        for nothing in ["g9", "g", "t2", "g2i0"] {
+        assert_eq!(
+            graph_frame(&tasks, "g2k1").map(|(at, _)| (at.i, at.instance)),
+            Some((2, Some((1, "y \"q\""))))
+        );
+        for nothing in ["g9", "g", "t2", "g2i0", "g2k7", "g2k", "gk1"] {
             assert_eq!(framed(nothing), None, "{nothing}");
         }
     }
@@ -1763,9 +1809,100 @@ mod tests {
         );
         assert!(!folded.contains("t1c"), "{folded}");
         assert_eq!(
-            graph_frame(&tasks, "g1").map(|t| t.name.as_str()),
+            graph_frame(&tasks, "g1").map(|(_, t)| t.name.as_str()),
             Some("ship")
         );
+
+        let picked = picking(&tasks, None, &[], &targets, &[], Some(("ship", "t2")));
+        contains_all(&picked, &["  style t1c1 stroke:#ffffffff,stroke-width:2\n"]);
+        let elsewhere = picking(&tasks, None, &[], &targets, &[], Some(("other", "t2")));
+        assert!(!elsewhere.contains("stroke-width:2\n"), "{elsewhere}");
+    }
+
+    /// `triage` calls a playbook once per item of `build`; instance `a` has dispatched.
+    const MAPPED: &str = concat!(
+        r#"{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":1.0,"tasks":["#,
+        r#"{"name":"build","kind":"command","required":true},"#,
+        r#"{"name":"triage","kind":"call","depends_on":["build"],"required":true,"over":"build.items","call":{"alias":"triage","target":"playbook"}}"#,
+        r#"]}"#,
+        "\n",
+        r#"{"v":1,"kind":"call_dispatched","task":"triage","instance":"a","attempt":1,"alias":"triage","call":"c-a","handle":{"kind":"playbook","run":"run-a"}}"#,
+        "\n",
+        r#"{"v":1,"kind":"task_result","task":"triage[a]","status":"pass","attempts":1,"cost_usd":0.0,"secs":1.0,"note":""}"#,
+        "\n",
+        r#"{"v":1,"kind":"task_result","task":"triage[b]","status":"fail","attempts":1,"cost_usd":0.0,"secs":1.0,"note":""}"#,
+        "\n",
+    );
+
+    #[test]
+    fn a_mapped_call_draws_a_frame_per_instance_and_folds_with_the_fanout() {
+        let tasks = fold(MAPPED);
+        let view = serde_json::from_value(serde_json::json!({
+            "task": "triage",
+            "instance": "a",
+            "attempt": 1,
+            "alias": "triage",
+            "kind": "playbook",
+            "state": {
+                "call": "c-a",
+                "status": "passed",
+                "handle": {"kind": "playbook", "run": "run-a"},
+                "progress": {
+                    "nodes": [
+                        {"id": "scan", "label": "scan", "status": "pass"},
+                        {"id": "fix", "label": "fix", "status": "pass"}
+                    ],
+                    "edges": [{"from": "scan", "to": "fix"}]
+                }
+            }
+        }))
+        .unwrap();
+        let calls = vec![LiveCall { view, launch: None }];
+        let targets = Targets::new(&calls, None);
+        let open = called(&tasks, None, &[], &targets, &[]);
+        contains_all(
+            &open,
+            &[
+                concat!(
+                    "    subgraph g1k0 [\" \"]\n",
+                    "      t1i0[\"a\"]\n",
+                    "    t1i0c0[\"scan\"]\n",
+                    "    t1i0c1[\"fix\"]\n",
+                    "    t1i0 ~~~ t1i0c0\n",
+                    "    t1i0c0 --> t1i0c1\n",
+                    "    end\n",
+                    "    t1 ~~~ t1i0\n",
+                ),
+                "    subgraph g1k1 [\" \"]\n      t1i1[\"b\"]\n    end\n    t1 ~~~ t1i1\n",
+                "class t1i0c1 pass",
+                "class t1i1 fail",
+            ],
+        );
+        let style = rune_mermaid::DiagramStyle::neutral(true);
+        assert!(
+            rune_mermaid::render_with_hover(&open, &style, rune_mermaid::Hover::Off, Color::WHITE)
+                .is_some(),
+            "{open}"
+        );
+
+        let one = called(&tasks, None, &[], &targets, &["triage[a]"]);
+        assert!(one.contains("subgraph g1k0"), "{one}");
+        assert!(!one.contains("t1i0c"), "{one}");
+
+        let folded = called(&tasks, None, &["triage"], &targets, &[]);
+        assert!(!folded.contains("g1k"), "{folded}");
+        assert!(!folded.contains("t1i"), "{folded}");
+    }
+
+    #[test]
+    fn the_graph_fits_whole_in_its_pane_and_sits_in_the_middle() {
+        assert_eq!(fit([1000.0, 800.0], [500.0, 200.0]), (FIT.1, 250.0));
+        let (scale, top) = fit([1000.0, 500.0], [800.0, 1000.0]);
+        assert!((scale - 0.468).abs() < 1e-4, "{scale}");
+        assert!((top - MARGIN).abs() < 1e-3, "{top}");
+        let (scale, top) = fit([400.0, 300.0], [2000.0, 100.0]);
+        assert_eq!(scale, FIT.0);
+        assert!((top - 140.0).abs() < 1e-3, "{top}");
     }
 
     #[test]
