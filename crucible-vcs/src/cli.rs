@@ -1,5 +1,5 @@
 //! The `git` binary, for what libgit2 does not do: clones and fetches over the system's TLS and
-//! credential setup, partial clones, worktrees and patches.
+//! credential setup, partial clones, and a local clone that must copy objects across devices.
 //!
 //! ```text
 //!   git(dir, args) ─┬─ read()      stdout as text; a failure carries git's stderr

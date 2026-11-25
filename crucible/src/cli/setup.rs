@@ -155,6 +155,14 @@ pub(crate) fn apply_agent_cfg(
     workspace: &Path,
     frozen: &FrozenProjection,
 ) -> Result<()> {
+    // The rules compile is ~250ms of CPU nothing needs until the first turn's first line;
+    // warming it on a thread here hides it behind workspace prep (and, in a pod, sandbox
+    // boot). The OnceLock makes the first consumer block until it lands, fail-closed as
+    // before.
+    let rules = args.secret_rules.clone();
+    std::thread::spawn(move || {
+        rules.ready();
+    });
     // Model and harness: the CLI flag wins, else the manifest's `[agent]` value.
     if args.model.is_none() {
         args.model = Some(agent.model.clone());

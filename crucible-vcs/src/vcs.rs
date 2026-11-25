@@ -55,7 +55,7 @@ pub fn ensure_repo(ws: &Path) -> Result<()> {
 }
 
 /// `git add -A`: stage new, modified, and deleted paths (honoring .gitignore, like porcelain).
-pub(crate) fn stage_all(ws: &Path) -> Result<()> {
+pub fn stage_all(ws: &Path) -> Result<()> {
     let repo = Repository::open(ws).context("open workspace repo")?;
     let mut index = repo.index().context("open index")?;
     index
@@ -88,6 +88,56 @@ pub(crate) fn staged_diff(ws: &Path) -> Result<String> {
     })
     .context("render patch")?;
     Ok(buf)
+}
+
+/// The staged change as a binary-safe, apply-able patch (`git diff --cached --binary`): text
+/// hunks verbatim, binary deltas in libgit2's literal encoding, which [`apply_patch`] reads
+/// back. Unlike [`staged_diff`] this is a carrier format, never a display one.
+pub fn staged_patch(ws: &Path) -> Result<Vec<u8>> {
+    let repo = Repository::open(ws).context("open workspace repo")?;
+    let index = repo.index().context("open index")?;
+    let head_tree = match repo.head() {
+        Ok(h) => Some(h.peel_to_tree().context("peel HEAD to tree")?),
+        Err(_) => None, // unborn HEAD: diff against the empty tree
+    };
+    let mut opts = git2::DiffOptions::new();
+    opts.show_binary(true);
+    let diff = repo
+        .diff_tree_to_index(head_tree.as_ref(), Some(&index), Some(&mut opts))
+        .context("diff tree to index")?;
+    let mut patch = Vec::new();
+    diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
+        if matches!(line.origin(), '+' | '-' | ' ') {
+            patch.push(line.origin() as u8);
+        }
+        patch.extend_from_slice(line.content());
+        true
+    })
+    .context("render patch")?;
+    Ok(patch)
+}
+
+/// `git apply` to the working tree: apply `patch` (from [`staged_patch`] or
+/// [`commits_since`]) without touching the index or committing.
+pub fn apply_patch(ws: &Path, patch: &[u8]) -> Result<()> {
+    let repo = Repository::open(ws).context("open workspace repo")?;
+    let diff = git2::Diff::from_buffer(patch).context("parse patch")?;
+    repo.apply(&diff, git2::ApplyLocation::WorkDir, None)
+        .context("apply patch")?;
+    Ok(())
+}
+
+/// `git clone --local`: a clone whose object store is hard-linked to the source's (libgit2
+/// applies the same optimization as the CLI), with the workdir checked out at HEAD. A
+/// hard-link failure (source and destination on different devices) is an error, not a
+/// fallback: the caller decides whether to re-clone through the `git` binary with
+/// `--no-hardlinks`.
+pub fn clone_local(src: &Path, dst: &Path) -> Result<()> {
+    let url = src
+        .to_str()
+        .with_context(|| format!("clone source {} is not UTF-8", src.display()))?;
+    Repository::clone(url, dst).context("local clone for a task worktree")?;
+    Ok(())
 }
 
 /// Does the index differ from HEAD? Counts deltas instead of checking shortstat text: some libgit2 builds
@@ -426,6 +476,119 @@ mod tests {
             has_staged_changes(ws).expect("dirty check"),
             "an edit is a staged change"
         );
+    }
+
+    #[test]
+    fn a_staged_patch_round_trips_through_apply_with_text_and_binary_files() {
+        let tmp = tempdir();
+        let ws = tmp.as_path();
+        let repo = init_repo(ws);
+        commit_initial(&repo, ws);
+        fs::write(
+            ws.join("gone.txt"),
+            "bye
+",
+        )
+        .expect("seed");
+        stage_all(ws).expect("stage");
+        commit_all(ws, "seed gone").expect("commit");
+
+        fs::write(
+            ws.join("tracked.txt"),
+            "v2
+",
+        )
+        .expect("edit");
+        fs::remove_file(ws.join("gone.txt")).expect("delete");
+        fs::write(
+            ws.join("new.txt"),
+            "added
+",
+        )
+        .expect("add");
+        fs::write(ws.join("blob.bin"), [0u8, 159, 146, 150, 255, 0, 7, 42]).expect("binary");
+        stage_all(ws).expect("stage");
+        let patch = staged_patch(ws).expect("patch");
+        assert!(
+            patch.windows(4).any(|w| w == b"diff"),
+            "the patch carries a diff header: {:?}",
+            String::from_utf8_lossy(&patch[..patch.len().min(200)])
+        );
+
+        // A fresh clone at HEAD is the patch's base, the state a fan-out worktree starts from.
+        let fresh = tmp.as_path().parent().map(|p| {
+            p.join(format!(
+                "{}-fresh",
+                tmp.as_path().file_name().unwrap().to_string_lossy()
+            ))
+        });
+        let fresh = fresh.expect("parent");
+        let _ = std::fs::remove_dir_all(&fresh);
+        Repository::clone(ws.to_str().expect("utf-8 path"), &fresh).expect("clone at HEAD");
+
+        apply_patch(&fresh, &patch).expect("apply");
+        assert_eq!(
+            fs::read_to_string(fresh.join("tracked.txt")).expect("text"),
+            "v2\n"
+        );
+        assert!(!fresh.join("gone.txt").exists(), "deletion applied");
+        assert_eq!(
+            fs::read_to_string(fresh.join("new.txt")).expect("new"),
+            "added\n"
+        );
+        assert_eq!(
+            fs::read(fresh.join("blob.bin")).expect("binary"),
+            [0u8, 159, 146, 150, 255, 0, 7, 42],
+            "the binary file's bytes survive the round trip"
+        );
+        let _ = std::fs::remove_dir_all(&fresh);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_local_clone_hard_links_objects_and_checks_out_the_workdir() {
+        let tmp = tempdir();
+        let ws = tmp.as_path();
+        let repo = init_repo(ws);
+        commit_initial(&repo, ws);
+        let object = ws.join(".git/objects");
+        let source = walk_one(&object).expect("an object file");
+
+        let dst = tmp.as_path().parent().map(|p| {
+            p.join(format!(
+                "{}-dst",
+                tmp.as_path().file_name().unwrap().to_string_lossy()
+            ))
+        });
+        let dst = dst.expect("parent");
+        let _ = std::fs::remove_dir_all(&dst);
+        clone_local(ws, &dst).expect("clone");
+        assert!(dst.join("tracked.txt").exists(), "workdir checked out");
+        let cloned = walk_one(&dst.join(".git/objects")).expect("a cloned object");
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            source.metadata().expect("stat").ino(),
+            cloned.metadata().expect("stat").ino(),
+            "the clone's objects are the source's, by hard link"
+        );
+        let _ = std::fs::remove_dir_all(&dst);
+    }
+
+    /// The first regular file under `dir`, any depth.
+    fn walk_one(dir: &Path) -> Option<std::path::PathBuf> {
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(dir).ok()?;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_none() {
+                    return Some(path);
+                }
+            }
+        }
+        None
     }
 
     #[test]

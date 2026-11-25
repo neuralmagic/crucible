@@ -515,7 +515,7 @@ impl<'a> LoopTaskRunner<'a> {
                                 crucible::deadline::terminate_live_children();
                             }
                         }
-                        r.plan_event(&SessionEvent::Agent { event: ev.clone() });
+                        r.agent_event(ev);
                     }
                 }
             });
