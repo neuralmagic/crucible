@@ -2,7 +2,8 @@
 //! records, or exports before it leaves the loop pod; with [`SecretRules`], also the secrets the
 //! agent found itself, scrubbed by Kingfisher's built-in rules.
 
-use crucible_contract::event::{AgentEvent, RawStream};
+use crucible_contract::event::{AgentEvent, ModelUsage};
+use kingfisher_rules::RuleCacheConfig;
 use kingfisher_scanner::{RulesDatabase, Scanner, get_builtin_rules};
 use serde_json::Value;
 use std::borrow::Cow;
@@ -28,8 +29,13 @@ impl std::fmt::Debug for SecretRules {
     }
 }
 
+/// The builtin-rule vectorscan build costs seconds once per process; the keyed on-disk cache
+/// (`KF_RULE_CACHE_DIR` or the per-user OS cache dir) makes every process after the first a
+/// load. A cold or unusable directory compiles as before.
 fn compile() -> Option<Scanner> {
-    let db = RulesDatabase::from_rule_collection(get_builtin_rules(None).ok()?).ok()?;
+    let rules = get_builtin_rules(None).ok()?;
+    let cache = RuleCacheConfig::from_dir_or_env(None);
+    let db = RulesDatabase::from_rule_collection_with_cache(rules, &cache).ok()?;
     Some(Scanner::new(Arc::new(db)))
 }
 
@@ -187,32 +193,264 @@ impl Redactor {
         }
     }
 
-    /// `ev` with every string field masked. An event that cannot round-trip through its own
-    /// serde shape is withheld rather than passed on unscrubbed.
+    /// `ev` with every string field masked, `Borrowed` when nothing in it matched.
     pub fn event<'e>(&self, ev: &'e AgentEvent) -> Cow<'e, AgentEvent> {
         if self.is_empty() {
             return Cow::Borrowed(ev);
         }
-        let Ok(mut value) = serde_json::to_value(ev) else {
-            return Cow::Owned(withheld());
-        };
-        if !self.json(&mut value) {
-            return Cow::Borrowed(ev);
+        match self.scrub_event(ev) {
+            Some(owned) => Cow::Owned(owned),
+            None => Cow::Borrowed(ev),
         }
-        Cow::Owned(serde_json::from_value(value).unwrap_or_else(|_| withheld()))
     }
-}
 
-fn withheld() -> AgentEvent {
-    AgentEvent::Raw {
-        text: "event withheld: it carried a secret and did not re-encode".to_string(),
-        stream: RawStream::Stderr,
+    /// The scrubbed copy of `ev`, or `None` when every field came back clean.
+    fn scrub_event(&self, ev: &AgentEvent) -> Option<AgentEvent> {
+        let clean = |c: &Cow<'_, str>| matches!(c, Cow::Borrowed(_));
+        let any = |c: Option<&Cow<'_, str>>| c.is_none_or(clean);
+        match ev {
+            AgentEvent::Meta { model } => match self.text(model) {
+                scrubbed if clean(&scrubbed) => None,
+                model => Some(AgentEvent::Meta {
+                    model: model.into_owned(),
+                }),
+            },
+            AgentEvent::Thinking { delta } => match self.text(delta) {
+                scrubbed if clean(&scrubbed) => None,
+                delta => Some(AgentEvent::Thinking {
+                    delta: delta.into_owned(),
+                }),
+            },
+            AgentEvent::Text { delta } => match self.text(delta) {
+                scrubbed if clean(&scrubbed) => None,
+                delta => Some(AgentEvent::Text {
+                    delta: delta.into_owned(),
+                }),
+            },
+            AgentEvent::Log {
+                level,
+                label,
+                value,
+            } => {
+                let level = self.text(level);
+                let label = self.text(label);
+                let value = value.as_deref().map(|v| self.text(v));
+                if clean(&level) && clean(&label) && any(value.as_ref()) {
+                    return None;
+                }
+                Some(AgentEvent::Log {
+                    level: level.into_owned(),
+                    label: label.into_owned(),
+                    value: value.map(|v| v.into_owned()),
+                })
+            }
+            AgentEvent::Gate {
+                phase,
+                name,
+                status,
+                error,
+            } => {
+                let phase = self.text(phase);
+                let name = self.text(name);
+                let status = self.text(status);
+                let error = error.as_deref().map(|e| self.text(e));
+                if clean(&phase) && clean(&name) && clean(&status) && any(error.as_ref()) {
+                    return None;
+                }
+                Some(AgentEvent::Gate {
+                    phase: phase.into_owned(),
+                    name: name.into_owned(),
+                    status: status.into_owned(),
+                    error: error.map(|e| e.into_owned()),
+                })
+            }
+            AgentEvent::Init {
+                model,
+                tools,
+                agents,
+            } => match self.text(model) {
+                scrubbed if clean(&scrubbed) => None,
+                model => Some(AgentEvent::Init {
+                    model: model.into_owned(),
+                    tools: *tools,
+                    agents: *agents,
+                }),
+            },
+            AgentEvent::Tool {
+                name,
+                summary,
+                subagent,
+                input,
+                result,
+                failed,
+            } => {
+                let name = self.text(name);
+                let summary = self.text(summary);
+                let result = result.as_deref().map(|r| self.text(r));
+                let dirty_input = input.as_ref().filter(|v| self.json_dirty(v));
+                if clean(&name) && clean(&summary) && any(result.as_ref()) && dirty_input.is_none()
+                {
+                    return None;
+                }
+                Some(AgentEvent::Tool {
+                    name: name.into_owned(),
+                    summary: summary.into_owned(),
+                    subagent: *subagent,
+                    // A clean input survives a dirty sibling field: only the input that
+                    // matched is re-rendered, the rest keeps the original.
+                    input: match dirty_input {
+                        Some(v) => {
+                            let mut scrubbed = v.clone();
+                            self.json(&mut scrubbed);
+                            Some(scrubbed)
+                        }
+                        None => input.clone(),
+                    },
+                    result: result.map(|r| r.into_owned()),
+                    failed: *failed,
+                })
+            }
+            AgentEvent::Retry {
+                attempt,
+                max,
+                error,
+            } => match self.text(error) {
+                scrubbed if clean(&scrubbed) => None,
+                error => Some(AgentEvent::Retry {
+                    attempt: *attempt,
+                    max: *max,
+                    error: error.into_owned(),
+                }),
+            },
+            AgentEvent::Error {
+                error_type,
+                message,
+            } => {
+                let error_type = self.text(error_type);
+                let message = self.text(message);
+                if clean(&error_type) && clean(&message) {
+                    return None;
+                }
+                Some(AgentEvent::Error {
+                    error_type: error_type.into_owned(),
+                    message: message.into_owned(),
+                })
+            }
+            AgentEvent::Result {
+                subtype,
+                is_error,
+                turns,
+                cost_usd,
+                error,
+            } => {
+                let subtype = self.text(subtype);
+                let error = error.as_deref().map(|e| self.text(e));
+                if clean(&subtype) && any(error.as_ref()) {
+                    return None;
+                }
+                Some(AgentEvent::Result {
+                    subtype: subtype.into_owned(),
+                    is_error: *is_error,
+                    turns: *turns,
+                    cost_usd: *cost_usd,
+                    error: error.map(|e| e.into_owned()),
+                })
+            }
+            AgentEvent::OtelSummary {
+                cost_usd,
+                total,
+                models,
+                api_requests,
+                api_ms,
+                active_seconds,
+            } => {
+                let scrubbed = models
+                    .iter()
+                    .map(|m| (self.text(&m.model), m))
+                    .collect::<Vec<_>>();
+                if scrubbed.iter().all(|(model, _)| clean(model)) {
+                    return None;
+                }
+                Some(AgentEvent::OtelSummary {
+                    cost_usd: *cost_usd,
+                    total: *total,
+                    models: scrubbed
+                        .into_iter()
+                        .map(|(model, usage)| ModelUsage {
+                            model: model.into_owned(),
+                            ..usage.clone()
+                        })
+                        .collect(),
+                    api_requests: *api_requests,
+                    api_ms: *api_ms,
+                    active_seconds: *active_seconds,
+                })
+            }
+            AgentEvent::SandboxLog {
+                ts_ms,
+                level,
+                target,
+                message,
+                denial,
+                fields,
+            } => {
+                let level = self.text(level);
+                let target = self.text(target);
+                let message = self.text(message);
+                let fields = fields
+                    .iter()
+                    .map(|(k, v)| (self.text(k), self.text(v)))
+                    .collect::<Vec<_>>();
+                let field_clean = |(k, v): &(Cow<'_, str>, Cow<'_, str>)| clean(k) && clean(v);
+                if clean(&level)
+                    && clean(&target)
+                    && clean(&message)
+                    && fields.iter().all(field_clean)
+                {
+                    return None;
+                }
+                Some(AgentEvent::SandboxLog {
+                    ts_ms: *ts_ms,
+                    level: level.into_owned(),
+                    target: target.into_owned(),
+                    message: message.into_owned(),
+                    denial: *denial,
+                    fields: fields
+                        .into_iter()
+                        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                        .collect(),
+                })
+            }
+            AgentEvent::Raw { text, stream } => match self.text(text) {
+                scrubbed if clean(&scrubbed) => None,
+                text => Some(AgentEvent::Raw {
+                    text: text.into_owned(),
+                    stream: *stream,
+                }),
+            },
+            AgentEvent::Tokens(_) | AgentEvent::Exit { .. } => None,
+        }
+    }
+
+    /// Whether any string in `value` (object keys included) would be masked by [`Redactor::text`].
+    fn json_dirty(&self, value: &Value) -> bool {
+        match value {
+            Value::String(s) => !matches!(self.text(s), Cow::Borrowed(_)),
+            Value::Array(items) => items.iter().any(|item| self.json_dirty(item)),
+            Value::Object(map) => {
+                map.keys()
+                    .any(|key| !matches!(self.text(key), Cow::Borrowed(_)))
+                    || map.values().any(|item| self.json_dirty(item))
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) => false,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::redact::*;
+    use crucible_contract::event::RawStream;
     use serde_json::json;
     use std::collections::BTreeMap;
 
@@ -285,6 +523,24 @@ mod tests {
         assert_eq!(v["n"], 1);
         let mut clean = json!({ "a": ["b", 1] });
         assert!(!r.json(&mut clean));
+    }
+
+    #[test]
+    fn a_clean_input_survives_a_dirty_summary() {
+        let r = redactor(&[KEY]);
+        let ev = AgentEvent::Tool {
+            name: "Bash".into(),
+            summary: format!("token {KEY}"),
+            subagent: false,
+            input: Some(json!({ "command": "ls" })),
+            result: None,
+            failed: false,
+        };
+        let scrubbed = r.event(&ev);
+        let AgentEvent::Tool { input, .. } = scrubbed.as_ref() else {
+            panic!("{scrubbed:?}")
+        };
+        assert_eq!(input, &Some(json!({ "command": "ls" })));
     }
 
     #[test]

@@ -17,6 +17,10 @@ ignore = [
     # pin-utils reaches the graph only as wasmtimer's dependency, which reqwest-retry pulls for
     # wasm32 targets alone; nothing we build for a server or the CLI links it.
     { id = "RUSTSEC-2026-0441", reason = "pin-utils via reqwest-retry -> wasmtimer, wasm32-only; not linked into any shipped binary" },
+    # kube-client's openssl-tls connector trusts OpenSSL's default CA store alongside a
+    # configured cluster CA. Every kube consumer in this workspace (forge, crucible-kueue,
+    # crucible-controller, buildit) enables rustls-tls; openssl-tls is never compiled in.
+    { id = "RUSTSEC-2026-0600", reason = "kube-client openssl-tls connector; the workspace compiles rustls-tls only" },
     # Font parsing reached only through the vendored mermaid renderer (third_party/,
     # xai-grok-mermaid -> resvg -> usvg). Unmaintained, no fix available upstream. It parses
     # fonts we ship to rasterize our own generated SVG, never untrusted input.

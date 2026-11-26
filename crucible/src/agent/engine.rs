@@ -205,6 +205,7 @@ pub(crate) fn abort_on_signal(run_span: Option<tracing::Span>, engine: Option<&H
         // `flush` parks this worker for up to 3s. Acceptable: the process is exiting, and the
         // alternative is exporting nothing.
         flush();
+        crate::process::flush_all_before_exit();
         std::process::exit(cause.exit_code());
     });
 }

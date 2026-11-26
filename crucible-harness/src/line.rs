@@ -12,16 +12,56 @@ pub trait LineFormat {
 
     /// Decode one stdout line, returning every [`AgentEvent`] it completed.
     fn push(&mut self, line: &str) -> Vec<AgentEvent> {
+        self.push_parsed(&parse_line(line))
+    }
+
+    /// [`LineFormat::push`] into a caller-owned buffer, so a consumer decoding many lines
+    /// reuses one allocation. Default: clear and fill from [`LineFormat::push`]; an override
+    /// must not call back into [`LineFormat::push`], or the pair recurses.
+    fn push_into(&mut self, line: &str, out: &mut Vec<AgentEvent>) {
+        out.clear();
+        out.append(&mut self.push(line));
+    }
+
+    /// [`LineFormat::push_parsed`] into a caller-owned buffer.
+    fn push_parsed_into(&mut self, parsed: &ParsedLine<'_>, out: &mut Vec<AgentEvent>) {
+        out.clear();
+        out.append(&mut self.push_parsed(parsed));
+    }
+
+    /// Interpret one already-parsed line, so several decoders can share the parse.
+    fn push_parsed(&mut self, parsed: &ParsedLine<'_>) -> Vec<AgentEvent> {
         let mut out = Vec::new();
-        let line = line.trim();
-        if line.is_empty() {
-            return out;
-        }
-        match serde_json::from_str::<Value>(line) {
-            Ok(msg) => self.line(&msg, line, &mut out),
-            Err(_) => out.push(raw(line)),
+        match parsed {
+            ParsedLine::Blank => {}
+            ParsedLine::Json { msg, text } => self.line(msg, text, &mut out),
+            ParsedLine::Text(text) => out.push(raw(text)),
         }
         out
+    }
+}
+
+/// One stdout line, parsed for [`LineFormat::push_parsed`].
+pub enum ParsedLine<'a> {
+    /// Blank or whitespace-only.
+    Blank,
+    /// A decoded JSON object; `text` is the line as it arrived.
+    Json {
+        msg: Value,
+        text: &'a str,
+    },
+    Text(&'a str),
+}
+
+/// Parse one stdout line for [`LineFormat::push_parsed`].
+pub fn parse_line(line: &str) -> ParsedLine<'_> {
+    let text = line.trim();
+    if text.is_empty() {
+        return ParsedLine::Blank;
+    }
+    match serde_json::from_str::<Value>(text) {
+        Ok(msg) => ParsedLine::Json { msg, text },
+        Err(_) => ParsedLine::Text(text),
     }
 }
 
