@@ -498,6 +498,25 @@ fn info_card(call: &LiveCall, key: &str, p: &Paint) -> El {
                     .grow(1.0),
             )
     });
+    let links = call.view.state.links.iter().enumerate().map(|(i, link)| {
+        let jump = Jump::Web(link.url.as_str().to_string());
+        row()
+            .key(format!("graph-call-info-link-{key}-{i}"))
+            .role("link")
+            .label(link.label.clone())
+            .gap(6.0)
+            .center_y()
+            .cursor(rune::Cursor::Pointer)
+            .help(link.url.as_str().to_string())
+            .on_press_tx(move |app: &mut App, tx: &mut Tx| app.jump(&jump, tx))
+            .child(icon(&oc::ARROW_UP_RIGHT, 11.0).color(p.c.icon_base))
+            .child(
+                text(link.label.clone())
+                    .font(p.k.ty.ui)
+                    .color(p.c.text_base)
+                    .truncate(),
+            )
+    });
     rune::col()
         .key(format!("graph-call-info-card-{key}"))
         .pin(None, Some(4.0), Some(4.0), None)
@@ -508,6 +527,11 @@ fn info_card(call: &LiveCall, key: &str, p: &Paint) -> El {
         .fill(p.c.layer_02)
         .border(0.5, p.c.border_base)
         .children(rows)
+        .children(
+            (!call.view.state.links.is_empty())
+                .then(|| el().h(0.5).w_full().fill(p.c.border_base).my(4.0)),
+        )
+        .children(links)
 }
 
 fn external_run(call: &LiveCall, key: &str, p: &Paint) -> Option<El> {

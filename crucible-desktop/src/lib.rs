@@ -684,6 +684,7 @@ pub fn run() {
             // `CRUCIBLE_LINK=<crucible-playbooks:// link>` follows a link as the system would.
             // `CRUCIBLE_RANGE=<from>..<to>` picks the saves the History pane compares, and
             // `CRUCIBLE_DIFF=split` draws them side by side.
+            // `CRUCIBLE_FRAME_INFO=<frame>` opens that call frame's info card.
             // `CRUCIBLE_RUNS_TAB=report` shows the runs page's Report tab, and
             // `CRUCIBLE_VIEW_PLUGIN=<file>`, in any scene, draws live runs and runs pages with
             // that plugin file in place of the pack's.
@@ -703,6 +704,7 @@ pub fn run() {
                 {
                     app.follow(&link);
                 }
+                app.run.frame_info = std::env::var("CRUCIBLE_FRAME_INFO").ok();
                 app.run.history_range = std::env::var("CRUCIBLE_RANGE")
                     .ok()
                     .and_then(|range| revisions::Range::parse(&range));
