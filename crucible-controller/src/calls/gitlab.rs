@@ -20,7 +20,7 @@ use crucible_ci::commit::CommitId;
 use crucible_ci::gitlab::access::{Runner, refused_by};
 use crucible_ci::gitlab::graph::{PipelineState, pipeline_graph, pipeline_state};
 use crucible_ci::gitlab::model::{Job, Pipeline};
-use crucible_ci::gitlab::{Gitlab, GitlabError, ProjectPath};
+use crucible_ci::gitlab::{Gitlab, GitlabError, ProjectPath, Since};
 use crucible_ci::token::BearerToken;
 use crucible_contract::calls::{
     CallBudget, CallStatus, CallTarget, FileRef, GITLAB_RESULT_FILE, GitRefName, GitlabOutputs,
@@ -103,7 +103,26 @@ pub struct PipelinePoll {
     pub progress: ProgressGraph,
     pub number: Option<u64>,
     pub outcome: Option<GitlabOutcome>,
-    pub links: Vec<NamedLink>,
+    pub links: Option<Vec<NamedLink>>,
+    pub etags: Etags,
+}
+
+/// The ETags a look at a pipeline came back with, sent on the next look.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Etags {
+    pub pipeline: Option<String>,
+    pub jobs: Option<String>,
+    pub bridges: Option<String>,
+}
+
+/// What the last look at a pipeline saw, so the next asks GitLab only for what changed.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Seen<'a> {
+    pub pipeline: Option<&'a str>,
+    pub jobs: Option<&'a str>,
+    pub bridges: Option<&'a str>,
+    pub number: Option<u64>,
+    pub progress: Option<&'a ProgressGraph>,
 }
 
 /// A target's parts, checked.
@@ -393,18 +412,62 @@ impl GitlabPipelineBackend {
         pipeline_id: u64,
         graph: &ProgressGraph,
         caller_cancelled: bool,
+        seen: Seen<'_>,
     ) -> Result<PipelinePoll, TargetError> {
         let place = self.place(target)?;
         let api = self.api(&place.host)?;
         let token = self.token(&place.host).await?;
-        let Some(pipeline) = api.pipeline(&token, &place.project, pipeline_id).await? else {
-            return Err(TargetError::Refused(format!(
+        let gone = || {
+            TargetError::Refused(format!(
                 "pipeline {pipeline_id} of {} is gone",
                 place.project.as_str()
-            )));
+            ))
         };
-        let jobs = api.jobs(&token, &place.project, pipeline_id).await?;
-        let bridges = api.bridges(&token, &place.project, pipeline_id).await?;
+        let project = &place.project;
+        let pipeline = api
+            .pipeline_since(&token, project, pipeline_id, seen.pipeline)
+            .await?
+            .ok_or_else(gone)?;
+        let jobs = api
+            .jobs_since(&token, project, pipeline_id, seen.jobs)
+            .await?;
+        let bridges = api
+            .bridges_since(&token, project, pipeline_id, seen.bridges)
+            .await?;
+        if let (Since::Unchanged, Since::Unchanged, Since::Unchanged, Some(progress)) =
+            (&pipeline, &jobs, &bridges, seen.progress)
+        {
+            return Ok(PipelinePoll {
+                progress: progress.clone(),
+                number: seen.number,
+                outcome: None,
+                links: None,
+                etags: Etags {
+                    pipeline: seen.pipeline.map(str::to_owned),
+                    jobs: seen.jobs.map(str::to_owned),
+                    bridges: seen.bridges.map(str::to_owned),
+                },
+            });
+        }
+        let (pipeline, pipeline_etag) = match pipeline {
+            Since::Changed { value, etag } => (value, etag),
+            Since::Unchanged => match api
+                .pipeline_since(&token, project, pipeline_id, None)
+                .await?
+                .ok_or_else(gone)?
+            {
+                Since::Changed { value, etag } => (value, etag),
+                Since::Unchanged => return Err(gone()),
+            },
+        };
+        let (jobs, jobs_etag) = match jobs {
+            Since::Changed { value, etag } => (value, etag),
+            Since::Unchanged => (api.jobs(&token, project, pipeline_id).await?, None),
+        };
+        let (bridges, bridges_etag) = match bridges {
+            Since::Changed { value, etag } => (value, etag),
+            Since::Unchanged => (api.bridges(&token, project, pipeline_id).await?, None),
+        };
         let progress = pipeline_graph(&jobs, &bridges, &shape_of(graph)).graph;
         let outcome = match pipeline_state(&pipeline, &jobs) {
             PipelineState::Running | PipelineState::Blocked(_) => None,
@@ -417,7 +480,12 @@ impl GitlabPipelineBackend {
             progress,
             number: pipeline.iid,
             outcome,
-            links: pipeline_links(&place.host, &place.project, &pipeline),
+            links: Some(pipeline_links(&place.host, &place.project, &pipeline)),
+            etags: Etags {
+                pipeline: pipeline_etag,
+                jobs: jobs_etag,
+                bridges: bridges_etag,
+            },
         })
     }
 

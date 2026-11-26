@@ -196,6 +196,23 @@ pub(crate) struct CallRecord {
     pub created_at: String,
 }
 
+impl CallRecord {
+    pub(crate) fn age(&self, now: jiff::Timestamp) -> Option<std::time::Duration> {
+        let started = self.created_at.parse::<jiff::Timestamp>().ok()?;
+        let secs = now.duration_since(started).as_secs();
+        u64::try_from(secs).ok().map(std::time::Duration::from_secs)
+    }
+
+    pub(crate) fn aging_cadence(&self, now: jiff::Timestamp) -> std::time::Duration {
+        let secs = match self.age(now).map(|a| a.as_secs()) {
+            Some(0..120) => 10,
+            Some(120..1800) | None => 30,
+            Some(_) => 60,
+        };
+        std::time::Duration::from_secs(secs)
+    }
+}
+
 /// The operations every target kind implements (progress and outcome read in one
 /// poll), plus reading one result file.
 /// The engine performs none of them.

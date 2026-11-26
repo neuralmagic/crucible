@@ -27,7 +27,7 @@ impl From<TargetError> for CallError {
 const FRESH_RUN: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 fn following(e: TargetError, call: &CallRecord, now: jiff::Timestamp) -> CallError {
-    let fresh = age(call, now).is_some_and(|age| age < FRESH_RUN);
+    let fresh = call.age(now).is_some_and(|age| age < FRESH_RUN);
     if let TargetError::Github(api) = &e
         && let Some(after) = api.retry_after()
     {
@@ -64,21 +64,6 @@ fn seen(call: &CallRecord) -> Seen<'_> {
         run,
         jobs: text(JOBS_ETAG).map(|etag| (etag, &call.progress)),
     }
-}
-
-fn cadence_at(call: &CallRecord, now: jiff::Timestamp) -> std::time::Duration {
-    let secs = match age(call, now).map(|a| a.as_secs()) {
-        Some(0..120) => 10,
-        Some(120..1800) | None => 30,
-        Some(_) => 60,
-    };
-    std::time::Duration::from_secs(secs)
-}
-
-fn age(call: &CallRecord, now: jiff::Timestamp) -> Option<std::time::Duration> {
-    let started = call.created_at.parse::<jiff::Timestamp>().ok()?;
-    let secs = now.duration_since(started).as_secs();
-    u64::try_from(secs).ok().map(std::time::Duration::from_secs)
 }
 
 fn run_of(call: &CallRecord) -> Result<(&GithubRepo, u64), CallError> {
@@ -190,7 +175,7 @@ impl TargetBackend for GithubWorkflowBackend {
     }
 
     fn cadence(&self, call: &CallRecord, now: jiff::Timestamp) -> std::time::Duration {
-        cadence_at(call, now)
+        call.aging_cadence(now)
     }
 
     async fn poll(&self, ctx: &CallCtx, call: &CallRecord) -> Result<Polled, CallError> {
@@ -242,7 +227,7 @@ impl TargetBackend for GithubWorkflowBackend {
             Some(outcome) => Some(self.kept(ctx, call, outcome).await?),
             None => {
                 let bound = self.wall_clock(call.budget);
-                match age(call, now).is_some_and(|age| age > bound) {
+                match call.age(now).is_some_and(|age| age > bound) {
                     true => {
                         GithubWorkflowBackend::cancel(self, repo, run_id)
                             .await
@@ -306,9 +291,7 @@ mod tests {
     use forge::github::GithubError;
 
     use crate::calls::github::TargetError;
-    use crate::calls::github::backend::{
-        age, cadence_at, following, run_links, seen, unchecked_commit,
-    };
+    use crate::calls::github::backend::{following, run_links, seen, unchecked_commit};
     use crate::calls::{CallError, CallRecord};
     use crucible_contract::calls::{
         CallAlias, CallId, CallKind, CallStatus, CallTarget, FileRef, PlaybookRef, TargetInterface,
@@ -411,7 +394,7 @@ mod tests {
     #[test]
     fn a_run_is_looked_at_less_often_as_it_ages() {
         let now: jiff::Timestamp = "2026-11-25T12:00:00Z".parse().unwrap();
-        let every = |created: &str| cadence_at(&record(created), now).as_secs();
+        let every = |created: &str| record(created).aging_cadence(now).as_secs();
         assert_eq!(every("2026-11-25T11:59:30Z"), 10);
         assert_eq!(every("2026-11-25T11:50:00Z"), 30);
         assert_eq!(every("2026-11-25T11:00:00Z"), 60);
@@ -522,10 +505,10 @@ mod tests {
     fn a_calls_age_runs_from_its_dispatch() {
         let now: jiff::Timestamp = "2026-11-25T12:05:00Z".parse().unwrap();
         assert_eq!(
-            age(&record("2026-11-25T12:00:00Z"), now),
+            record("2026-11-25T12:00:00Z").age(now),
             Some(std::time::Duration::from_secs(300))
         );
-        assert_eq!(age(&record("not a time"), now), None);
+        assert_eq!(record("not a time").age(now), None);
     }
 
     #[test]

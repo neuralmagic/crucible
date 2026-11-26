@@ -6,7 +6,7 @@ use crucible_contract::calls::{CallTarget, LockedCall, TargetHandle};
 use serde_json::json;
 
 use crate::authz::model::Principal;
-use crate::calls::gitlab::{GitlabOutcome, GitlabPipelineBackend, TargetError};
+use crate::calls::gitlab::{GitlabOutcome, GitlabPipelineBackend, Seen, TargetError};
 use crate::calls::{
     CallCtx, CallError, CallRecord, DispatchSpec, Dispatched, Outcome, Polled, Resolved,
     TargetBackend,
@@ -25,7 +25,7 @@ impl From<TargetError> for CallError {
 }
 
 fn following(e: TargetError, call: &CallRecord, now: jiff::Timestamp) -> CallError {
-    let fresh = age(call, now).is_some_and(|age| age < FRESH_PIPELINE);
+    let fresh = call.age(now).is_some_and(|age| age < FRESH_PIPELINE);
     match &e {
         TargetError::Gitlab(GitlabError::Status {
             status: 403 | 429, ..
@@ -37,10 +37,22 @@ fn following(e: TargetError, call: &CallRecord, now: jiff::Timestamp) -> CallErr
     }
 }
 
-fn age(call: &CallRecord, now: jiff::Timestamp) -> Option<std::time::Duration> {
-    let started = call.created_at.parse::<jiff::Timestamp>().ok()?;
-    let secs = now.duration_since(started).as_secs();
-    u64::try_from(secs).ok().map(std::time::Duration::from_secs)
+const PIPELINE_ETAG: &str = "pipeline_etag";
+const JOBS_ETAG: &str = "jobs_etag";
+const BRIDGES_ETAG: &str = "bridges_etag";
+
+fn seen(call: &CallRecord) -> Seen<'_> {
+    let text = |key: &str| call.detail.get(key).and_then(serde_json::Value::as_str);
+    Seen {
+        pipeline: text(PIPELINE_ETAG),
+        jobs: text(JOBS_ETAG),
+        bridges: text(BRIDGES_ETAG),
+        number: call
+            .detail
+            .get("run_number")
+            .and_then(serde_json::Value::as_u64),
+        progress: Some(&call.progress),
+    }
 }
 
 fn pipeline_of(call: &CallRecord) -> Result<u64, CallError> {
@@ -131,6 +143,10 @@ impl TargetBackend for GitlabPipelineBackend {
         })
     }
 
+    fn cadence(&self, call: &CallRecord, now: jiff::Timestamp) -> std::time::Duration {
+        call.aging_cadence(now)
+    }
+
     async fn poll(&self, ctx: &CallCtx, call: &CallRecord) -> Result<Polled, CallError> {
         let pipeline_id = pipeline_of(call)?;
         let now = jiff::Timestamp::now();
@@ -140,6 +156,7 @@ impl TargetBackend for GitlabPipelineBackend {
             pipeline_id,
             &call.interface.graph,
             false,
+            seen(call),
         )
         .await
         .map_err(|e| following(e, call, now))?;
@@ -147,12 +164,23 @@ impl TargetBackend for GitlabPipelineBackend {
         if let Some(number) = polled.number {
             recorded.insert("run_number".to_owned(), number.into());
         }
-        crate::calls::record_links(&mut recorded, &polled.links);
+        if let Some(links) = &polled.links {
+            crate::calls::record_links(&mut recorded, links);
+        }
+        for (key, etag) in [
+            (PIPELINE_ETAG, &polled.etags.pipeline),
+            (JOBS_ETAG, &polled.etags.jobs),
+            (BRIDGES_ETAG, &polled.etags.bridges),
+        ] {
+            if let Some(etag) = etag {
+                recorded.insert(key.to_owned(), etag.clone().into());
+            }
+        }
         let outcome = match polled.outcome {
             Some(outcome) => Some(self.kept(ctx, call, outcome).await?),
             None => {
                 let bound = self.wall_clock(call.budget);
-                match age(call, now).is_some_and(|age| age > bound) {
+                match call.age(now).is_some_and(|age| age > bound) {
                     true => {
                         GitlabPipelineBackend::cancel(self, &call.target, pipeline_id)
                             .await
@@ -219,7 +247,7 @@ mod tests {
     use serde_json::json;
 
     use crate::calls::gitlab::TargetError;
-    use crate::calls::gitlab::backend::{following, pipeline_of};
+    use crate::calls::gitlab::backend::{following, pipeline_of, seen};
     use crate::calls::{CallError, CallRecord};
 
     fn record(created_at: &str, handle: Option<TargetHandle>) -> CallRecord {
@@ -290,6 +318,28 @@ mod tests {
             following(status(400), &fresh, now),
             CallError::Refused(_)
         ));
+    }
+
+    #[test]
+    fn a_look_sends_the_etags_the_last_look_kept() {
+        let mut call = record("2026-11-26T11:58:00Z", None);
+        let first = seen(&call);
+        assert_eq!(
+            (first.pipeline, first.jobs, first.bridges, first.number),
+            (None, None, None, None)
+        );
+        call.detail = json!({
+            "pipeline_etag": "W/\"p\"",
+            "jobs_etag": "W/\"j\"",
+            "bridges_etag": "W/\"b\"",
+            "run_number": 4,
+        });
+        let kept = seen(&call);
+        assert_eq!(
+            (kept.pipeline, kept.jobs, kept.bridges, kept.number),
+            (Some("W/\"p\""), Some("W/\"j\""), Some("W/\"b\""), Some(4))
+        );
+        assert_eq!(kept.progress, Some(&call.progress));
     }
 
     #[test]

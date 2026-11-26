@@ -5,7 +5,7 @@
 //! ```text
 //!   dispatch POST /projects/{id}/pipeline {ref, inputs}
 //!   find     GET  /projects/{id}/pipelines?sha=…&source=…
-//!   follow   GET  /projects/{id}/pipelines/{p}  + …/jobs  + …/bridges
+//!   follow   GET  /projects/{id}/pipelines/{p}  + …/jobs  + …/bridges   (If-None-Match)
 //!   access   GET  /projects/{id}/members/all/{u}  + …/protected_branches  + …/protected_tags
 //!   shape    GET  /projects/{id}/ci/lint?dry_run=true&include_jobs=true&content_ref=…
 //!   logs     GET  /projects/{id}/jobs/{j}/trace
@@ -99,6 +99,13 @@ impl GitlabError {
             _ => false,
         }
     }
+}
+
+/// A conditional read: unchanged since the ETag sent, or the new value and its ETag.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Since<T> {
+    Unchanged,
+    Changed { value: T, etag: Option<String> },
 }
 
 /// One GitLab host's API, reached with the caller's client.
@@ -267,6 +274,62 @@ impl Gitlab {
         }
     }
 
+    pub async fn pipeline_since(
+        &self,
+        token: &BearerToken,
+        project: &ProjectPath,
+        id: u64,
+        etag: Option<&str>,
+    ) -> Result<Option<Since<Pipeline>>, GitlabError> {
+        let doing = format!("reading pipeline {id} of {}", project.as_str());
+        let url = self.url(project, &["pipelines", &id.to_string()], &[]);
+        let r = match self
+            .response(token, &doing, if_none_match(self.http.get(url), etag))
+            .await
+        {
+            Ok(r) => r,
+            Err(GitlabError::Status { status: 404, .. }) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if r.status() == reqwest::StatusCode::NOT_MODIFIED {
+            return Ok(Some(Since::Unchanged));
+        }
+        let etag = etag_of(&r);
+        let value = r
+            .json()
+            .await
+            .map_err(|source| GitlabError::Http { doing, source })?;
+        Ok(Some(Since::Changed { value, etag }))
+    }
+
+    pub async fn jobs_since(
+        &self,
+        token: &BearerToken,
+        project: &ProjectPath,
+        pipeline: u64,
+        etag: Option<&str>,
+    ) -> Result<Since<Vec<Job>>, GitlabError> {
+        let doing = format!("listing the jobs of pipeline {pipeline}");
+        let url = self.url(project, &["pipelines", &pipeline.to_string(), "jobs"], &[]);
+        self.pages_since(token, &doing, url, etag).await
+    }
+
+    pub async fn bridges_since(
+        &self,
+        token: &BearerToken,
+        project: &ProjectPath,
+        pipeline: u64,
+        etag: Option<&str>,
+    ) -> Result<Since<Vec<Bridge>>, GitlabError> {
+        let doing = format!("listing the trigger jobs of pipeline {pipeline}");
+        let url = self.url(
+            project,
+            &["pipelines", &pipeline.to_string(), "bridges"],
+            &[],
+        );
+        self.pages_since(token, &doing, url, etag).await
+    }
+
     pub async fn jobs(
         &self,
         token: &BearerToken,
@@ -432,6 +495,41 @@ impl Gitlab {
             })
     }
 
+    async fn pages_since<T: DeserializeOwned>(
+        &self,
+        token: &BearerToken,
+        doing: &str,
+        url: Url,
+        etag: Option<&str>,
+    ) -> Result<Since<Vec<T>>, GitlabError> {
+        let mut first = url.clone();
+        first
+            .query_pairs_mut()
+            .append_pair("per_page", &PER_PAGE.to_string())
+            .append_pair("page", "1");
+        let r = self
+            .response(token, doing, if_none_match(self.http.get(first), etag))
+            .await?;
+        if r.status() == reqwest::StatusCode::NOT_MODIFIED {
+            return Ok(Since::Unchanged);
+        }
+        let more = r
+            .headers()
+            .get("x-next-page")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| !v.is_empty());
+        if more {
+            let value = self.pages(token, doing, url).await?;
+            return Ok(Since::Changed { value, etag: None });
+        }
+        let etag = etag_of(&r);
+        let value = r.json().await.map_err(|source| GitlabError::Http {
+            doing: doing.to_owned(),
+            source,
+        })?;
+        Ok(Since::Changed { value, etag })
+    }
+
     async fn pages<T: DeserializeOwned>(
         &self,
         token: &BearerToken,
@@ -478,7 +576,7 @@ impl Gitlab {
                 source,
             })?;
         let status = r.status();
-        if status.is_success() {
+        if status.is_success() || status == reqwest::StatusCode::NOT_MODIFIED {
             return Ok(r);
         }
         let body = r.text().await.unwrap_or_default();
@@ -490,7 +588,21 @@ impl Gitlab {
     }
 }
 
-async fn capped(mut r: reqwest::Response, cap: u64, doing: &str) -> Result<Vec<u8>, GitlabError> {
+fn if_none_match(request: reqwest::RequestBuilder, etag: Option<&str>) -> reqwest::RequestBuilder {
+    match etag {
+        Some(etag) => request.header(reqwest::header::IF_NONE_MATCH, etag),
+        None => request,
+    }
+}
+
+fn etag_of(r: &reqwest::Response) -> Option<String> {
+    r.headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+}
+
+async fn capped(r: reqwest::Response, cap: u64, doing: &str) -> Result<Vec<u8>, GitlabError> {
     let over = || GitlabError::TooLarge {
         doing: doing.to_owned(),
         cap,
@@ -499,28 +611,54 @@ async fn capped(mut r: reqwest::Response, cap: u64, doing: &str) -> Result<Vec<u
         return Err(over());
     }
     let mut buf = Vec::new();
-    while let Some(chunk) = r.chunk().await.map_err(|source| GitlabError::Http {
-        doing: doing.to_owned(),
-        source,
-    })? {
+    chunks(r, doing, |chunk| {
         if buf.len() as u64 + chunk.len() as u64 > cap {
             return Err(over());
         }
-        buf.extend_from_slice(&chunk);
-    }
+        buf.extend_from_slice(chunk);
+        Ok(())
+    })
+    .await?;
     Ok(buf)
 }
 
-async fn tail(mut r: reqwest::Response, keep: usize, doing: &str) -> Result<Vec<u8>, GitlabError> {
+async fn tail(r: reqwest::Response, keep: usize, doing: &str) -> Result<Vec<u8>, GitlabError> {
     let mut buf = Vec::new();
+    chunks(r, doing, |chunk| {
+        buf.extend_from_slice(chunk);
+        keep_last(&mut buf, keep);
+        Ok(())
+    })
+    .await?;
+    Ok(buf)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn chunks(
+    mut r: reqwest::Response,
+    doing: &str,
+    mut each: impl FnMut(&[u8]) -> Result<(), GitlabError>,
+) -> Result<(), GitlabError> {
     while let Some(chunk) = r.chunk().await.map_err(|source| GitlabError::Http {
         doing: doing.to_owned(),
         source,
     })? {
-        buf.extend_from_slice(&chunk);
-        keep_last(&mut buf, keep);
+        each(&chunk)?;
     }
-    Ok(buf)
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn chunks(
+    r: reqwest::Response,
+    doing: &str,
+    mut each: impl FnMut(&[u8]) -> Result<(), GitlabError>,
+) -> Result<(), GitlabError> {
+    let body = r.bytes().await.map_err(|source| GitlabError::Http {
+        doing: doing.to_owned(),
+        source,
+    })?;
+    each(&body)
 }
 
 fn char_start(bytes: &[u8]) -> &[u8] {

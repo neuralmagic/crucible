@@ -11,7 +11,7 @@
 
 use crucible_ci::commit::CommitId;
 use crucible_ci::gitlab::graph::{Shape, pipeline_graph, pipeline_state};
-use crucible_ci::gitlab::{Gitlab, ProjectPath};
+use crucible_ci::gitlab::{Gitlab, ProjectPath, Since};
 use crucible_ci::token::BearerToken;
 
 fn env(name: &str) -> String {
@@ -90,6 +90,60 @@ async fn watch_finds_and_follows_the_pipelines_of_a_live_commit() {
         .await
         .expect("finding pushes");
     assert!(pushes.iter().all(|p| p.source.as_deref() == Some("push")));
+
+    let settled = pipelines
+        .iter()
+        .find(|p| matches!(p.status.as_str(), "success" | "failed" | "canceled"))
+        .expect("the commit has a finished pipeline")
+        .id;
+    let Some(Since::Changed {
+        etag: Some(pipeline_etag),
+        ..
+    }) = gl
+        .pipeline_since(&token, &project, settled, None)
+        .await
+        .expect("reading the pipeline")
+    else {
+        panic!("a first read carries the pipeline and its ETag");
+    };
+    assert_eq!(
+        gl.pipeline_since(&token, &project, settled, Some(&pipeline_etag))
+            .await
+            .expect("reading again"),
+        Some(Since::Unchanged)
+    );
+    let Since::Changed {
+        etag: Some(jobs_etag),
+        ..
+    } = gl
+        .jobs_since(&token, &project, settled, None)
+        .await
+        .expect("listing jobs")
+    else {
+        panic!("a first listing carries the jobs and their ETag");
+    };
+    assert_eq!(
+        gl.jobs_since(&token, &project, settled, Some(&jobs_etag))
+            .await
+            .expect("listing again"),
+        Since::Unchanged
+    );
+    let Since::Changed {
+        etag: Some(bridges_etag),
+        ..
+    } = gl
+        .bridges_since(&token, &project, settled, None)
+        .await
+        .expect("listing trigger jobs")
+    else {
+        panic!("a first listing carries the trigger jobs and their ETag");
+    };
+    assert_eq!(
+        gl.bridges_since(&token, &project, settled, Some(&bridges_etag))
+            .await
+            .expect("listing again"),
+        Since::Unchanged
+    );
 
     for p in &pipelines {
         let fresh = gl
