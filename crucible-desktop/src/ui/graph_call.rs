@@ -21,7 +21,7 @@ use crucible_contract::calls::{
     ProgressGraph, TargetHandle,
 };
 use crucible_contract::session::TaskStatus;
-use rune::{El, Tx, el, icon, row, text};
+use rune::{El, Tx, col, el, icon, row, text};
 use rune_theme_opencode::icons as oc;
 
 use crate::App;
@@ -583,6 +583,8 @@ fn mark_icon(mark: BackendIcon) -> &'static rune::Icon {
     }
 }
 
+const CONTROLS_W: f32 = 40.0;
+
 pub(crate) fn frame_spot(
     spot: El,
     at: At,
@@ -640,10 +642,11 @@ pub(crate) fn frame_spot(
     };
     spot.children(graph_fx::effect(look, hovered, p))
         .child(
-            row()
-                .pin(None, Some(-22.0), Some(0.0), None)
+            col()
+                .w(CONTROLS_W)
+                .pin(None, Some(2.0), Some(-(CONTROLS_W + 4.0)), None)
                 .gap(2.0)
-                .center_y()
+                .items_start()
                 .children(open)
                 .children(call.map(|_| info_button(&key_for_info, p)))
                 .child(fold),
