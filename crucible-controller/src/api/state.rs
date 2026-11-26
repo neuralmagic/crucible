@@ -166,6 +166,13 @@ pub struct ApiState {
     pub(crate) github_logins: crate::identity::github_logins::GithubLogins,
     pub(crate) forge_signed_in: crate::identity::forge::held::SignedIn,
     pub(crate) gitlab_hosts: Arc<Vec<crate::identity::forge::ForgeHost>>,
+    pub(crate) calls_gitlab: Option<crate::calls::GitlabToken>,
+    pub(crate) gitlab_token_files: Arc<
+        Result<
+            std::collections::BTreeMap<crate::identity::forge::ForgeHost, std::path::PathBuf>,
+            String,
+        >,
+    >,
 }
 
 impl ApiState {
@@ -269,6 +276,8 @@ impl ApiState {
             github_logins: cfg.github_logins(),
             forge_signed_in: cfg.forge_signed_in.clone(),
             gitlab_hosts: Arc::new(cfg.gitlab_hosts()),
+            calls_gitlab: cfg.calls_gitlab_token,
+            gitlab_token_files: Arc::new(cfg.gitlab_token_files()),
         }
     }
 
@@ -406,6 +415,8 @@ impl ApiState {
             github_logins: Default::default(),
             forge_signed_in: Default::default(),
             gitlab_hosts: Arc::new(Vec::new()),
+            calls_gitlab: None,
+            gitlab_token_files: Arc::new(Ok(Default::default())),
         }
     }
 }

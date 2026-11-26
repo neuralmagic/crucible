@@ -12,6 +12,7 @@ pub(crate) mod access;
 pub(crate) mod api;
 pub(crate) mod compile;
 mod github;
+mod gitlab;
 pub(crate) mod lock;
 mod playbook;
 mod progress;
@@ -38,6 +39,15 @@ pub enum GithubToken {
     Person,
     #[value(name = "app")]
     AppInstallation,
+}
+
+/// Where the GitLab backend takes the token it creates pipelines with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum GitlabToken {
+    #[value(name = "person")]
+    Person,
+    #[value(name = "bot")]
+    Bot,
 }
 
 /// Why a backend operation did not do what it was asked.
@@ -210,10 +220,28 @@ pub(crate) trait TargetBackend: Send + Sync {
     ) -> Result<String, CallError>;
 }
 
+pub(crate) fn interface_moved(locked: &TargetInterface, now: &TargetInterface) -> Option<String> {
+    let mut parts = Vec::new();
+    if locked.params != now.params {
+        parts.push("params");
+    }
+    if locked.result != now.result || locked.result_files != now.result_files {
+        parts.push("result");
+    }
+    if locked.graph != now.graph {
+        parts.push("graph");
+    }
+    match parts.as_slice() {
+        [] => None,
+        parts => Some(format!("has a different {}", parts.join(" and "))),
+    }
+}
+
 /// The backends of every target kind this controller implements.
 pub(crate) struct Backends {
     playbook: playbook::PlaybookBackend,
     github: Result<github::GithubWorkflowBackend, String>,
+    gitlab: Result<gitlab::GitlabPipelineBackend, String>,
     tekton: Result<tekton::TektonBackend, String>,
 }
 
@@ -225,6 +253,13 @@ impl Backends {
                 state.calls_github,
                 state.pack_pr_app.as_ref(),
                 &state.github_logins,
+                &state.forge_signed_in,
+                &state.playbook_caps.max_time,
+            ),
+            gitlab: gitlab_backend(
+                state.calls_gitlab,
+                &state.gitlab_token_files,
+                state.gitlab_hosts.as_ref().clone(),
                 &state.forge_signed_in,
                 &state.playbook_caps.max_time,
             ),
@@ -245,6 +280,13 @@ impl Backends {
                 &cfg.forge_signed_in,
                 &cfg.playbook_max_time_cap,
             ),
+            gitlab: gitlab_backend(
+                cfg.calls_gitlab_token,
+                &cfg.gitlab_token_files(),
+                cfg.gitlab_hosts(),
+                &cfg.forge_signed_in,
+                &cfg.playbook_max_time_cap,
+            ),
             tekton: cfg
                 .calls_tekton_clusters()
                 .and_then(tekton::TektonBackend::new),
@@ -261,6 +303,13 @@ impl Backends {
                     reason: reason.clone(),
                 }),
             },
+            CallKind::GitlabPipeline => match &self.gitlab {
+                Ok(gitlab) => Ok(gitlab),
+                Err(reason) => Err(CallError::NotBuilt {
+                    kind,
+                    reason: reason.clone(),
+                }),
+            },
             CallKind::Tekton => match &self.tekton {
                 Ok(tekton) => Ok(tekton),
                 Err(reason) => Err(CallError::NotBuilt {
@@ -270,6 +319,29 @@ impl Backends {
             },
         }
     }
+}
+
+fn gitlab_backend(
+    token: Option<GitlabToken>,
+    files: &Result<BTreeMap<crate::identity::forge::ForgeHost, std::path::PathBuf>, String>,
+    hosts: Vec<crate::identity::forge::ForgeHost>,
+    signed_in: &crate::identity::forge::held::SignedIn,
+    max_time: &crate::model::MaxTime,
+) -> Result<gitlab::GitlabPipelineBackend, String> {
+    let tokens = match token {
+        None => {
+            return Err(
+                "no GitLab token source is configured (CONTROLLER_CALLS_GITLAB_TOKEN)".to_owned(),
+            );
+        }
+        Some(GitlabToken::Person) => gitlab::TokenSource::Person(signed_in.clone()),
+        Some(GitlabToken::Bot) => gitlab::TokenSource::Bot(files.clone()?),
+    };
+    if hosts.is_empty() {
+        return Err("no GitLab host is configured (CONTROLLER_GITLAB_HOSTS)".to_owned());
+    }
+    let max_wall_clock = std::time::Duration::from_secs(max_time.secs());
+    gitlab::GitlabPipelineBackend::new(tokens, hosts, max_wall_clock).map_err(|e| e.to_string())
 }
 
 fn github_backend(

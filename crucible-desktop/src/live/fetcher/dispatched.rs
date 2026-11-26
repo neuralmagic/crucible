@@ -46,6 +46,7 @@ impl Fetcher {
                     calls::launch_of(connection, &mut self.run_launches, run).await
                 }
                 crucible_contract::calls::TargetHandle::GithubWorkflow { .. }
+                | crucible_contract::calls::TargetHandle::GitlabPipeline { .. }
                 | crucible_contract::calls::TargetHandle::TektonWatch { .. } => None,
             };
             read.push(LiveCall {

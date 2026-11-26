@@ -81,7 +81,7 @@ pub fn read_result(
     Ok((Value::Object(result), files))
 }
 
-fn field_refusal(ty: &FieldType, value: &Value) -> Option<String> {
+pub(crate) fn field_refusal(ty: &FieldType, value: &Value) -> Option<String> {
     if let Some(why) = ty.link_refusal(value) {
         return Some(why);
     }

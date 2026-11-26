@@ -84,6 +84,13 @@ pub(crate) fn label(task: &TaskView, live: Option<&LiveCall>) -> Option<String> 
                 .unwrap_or(repo.as_str())
                 .to_string(),
         ),
+        TargetHandle::GitlabPipeline { project, .. } => Some(
+            project
+                .rsplit('/')
+                .next()
+                .unwrap_or(project.as_str())
+                .to_string(),
+        ),
         TargetHandle::TektonWatch { commit, .. } => {
             Some(commit.get(..12).unwrap_or(commit).to_string())
         }
@@ -91,7 +98,7 @@ pub(crate) fn label(task: &TaskView, live: Option<&LiveCall>) -> Option<String> 
     });
     match (repo, call.kind) {
         (Some(repo), _) => parts.push(repo),
-        (None, CallKind::GithubWorkflow | CallKind::Tekton) => {
+        (None, CallKind::GithubWorkflow | CallKind::GitlabPipeline | CallKind::Tekton) => {
             parts.push(badge(call.kind).to_string())
         }
         (None, CallKind::Playbook) => {}
@@ -443,6 +450,21 @@ fn info_rows(call: &LiveCall) -> Vec<(&'static str, String)> {
                 },
             ));
         }
+        TargetHandle::GitlabPipeline {
+            host,
+            project,
+            pipeline_id,
+        } => {
+            rows.push(("Host", host.clone()));
+            rows.push(("Project", project.clone()));
+            rows.push((
+                "Pipeline",
+                match state.run_number {
+                    Some(number) => format!("#{number} ({pipeline_id})"),
+                    None => pipeline_id.to_string(),
+                },
+            ));
+        }
         TargetHandle::TektonWatch {
             cluster,
             namespace,
@@ -554,6 +576,9 @@ fn step_note(detail: Option<&NodeDetail>, status: NodeStatus) -> Option<String> 
 fn mark_icon(mark: BackendIcon) -> &'static rune::Icon {
     match mark {
         BackendIcon::Github => &oc::GITHUB,
+        BackendIcon::Gitlab => {
+            rune_theme_opencode::provider_icons::named("gitlab").unwrap_or(&oc::BRANCH_OUT)
+        }
         BackendIcon::Tekton => &oc::BRANCH_OUT,
     }
 }
@@ -986,5 +1011,14 @@ mod tests {
             crate::ui::graph_call::step_note(None, NodeStatus::Running),
             None
         );
+    }
+
+    #[test]
+    fn every_backend_mark_has_its_own_icon() {
+        use crate::ui::graph_call::mark_icon;
+        use crucible_contract::calls::BackendIcon;
+        let gitlab = mark_icon(BackendIcon::Gitlab);
+        assert_eq!(gitlab.name, "gitlab");
+        assert!(!std::ptr::eq(gitlab, mark_icon(BackendIcon::Github)));
     }
 }

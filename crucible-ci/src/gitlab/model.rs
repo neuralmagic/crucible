@@ -11,8 +11,20 @@ pub struct User {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Commit {
+    pub id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Member {
+    pub access_level: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Pipeline {
     pub id: u64,
+    #[serde(default)]
+    pub iid: Option<u64>,
     pub sha: String,
     #[serde(rename = "ref")]
     pub git_ref: String,

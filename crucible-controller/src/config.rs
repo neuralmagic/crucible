@@ -720,6 +720,19 @@ pub struct ControllerCfg {
     #[arg(skip)]
     pub forge_signed_in: crate::identity::forge::held::SignedIn,
     #[arg(
+        long = "calls-gitlab-token",
+        env = "CONTROLLER_CALLS_GITLAB_TOKEN",
+        value_enum
+    )]
+    pub calls_gitlab_token: Option<crate::calls::GitlabToken>,
+    #[arg(
+        long = "gitlab-token-file",
+        env = "CONTROLLER_GITLAB_TOKEN_FILES",
+        value_delimiter = ',',
+        default_value = ""
+    )]
+    pub gitlab_token_files: Vec<String>,
+    #[arg(
         long = "gitlab-hosts",
         env = "CONTROLLER_GITLAB_HOSTS",
         value_delimiter = ',',
@@ -1058,6 +1071,67 @@ impl ControllerCfg {
             "CONTROLLER_DISPATCH_CLUSTER_BY_CONTRACT",
             "contract=cluster",
         )
+    }
+
+    pub(crate) fn gitlab_token_files(
+        &self,
+    ) -> std::result::Result<
+        std::collections::BTreeMap<crate::identity::forge::ForgeHost, PathBuf>,
+        String,
+    > {
+        let mut files = std::collections::BTreeMap::new();
+        for entry in self
+            .gitlab_token_files
+            .iter()
+            .filter(|e| !e.trim().is_empty())
+        {
+            let (host, path) = entry.split_once('=').ok_or_else(|| {
+                format!("CONTROLLER_GITLAB_TOKEN_FILES entry {entry:?} is not <host>=<token file>")
+            })?;
+            let host = crate::identity::forge::ForgeHost::parse(host).ok_or_else(|| {
+                format!("CONTROLLER_GITLAB_TOKEN_FILES entry {entry:?} names no host")
+            })?;
+            if path.trim().is_empty() {
+                return Err(format!(
+                    "CONTROLLER_GITLAB_TOKEN_FILES entry {entry:?} names no token file"
+                ));
+            }
+            files.insert(host, PathBuf::from(path.trim()));
+        }
+        Ok(files)
+    }
+
+    pub fn validate_calls_gitlab(&self, dev_identity: Option<&str>) -> Result<()> {
+        match self.calls_gitlab_token {
+            None => Ok(()),
+            Some(crate::calls::GitlabToken::Person) => {
+                let local = self.playbook_executor == PlaybookExecutor::Local;
+                let dev = dev_identity.is_some_and(|login| !login.trim().is_empty());
+                if !(local && dev) {
+                    bail!(
+                        "CONTROLLER_CALLS_GITLAB_TOKEN=person is for a local controller only: it \
+                         needs CONTROLLER_PLAYBOOK_EXECUTOR=local and CONTROLLER_DEV_IDENTITY; a \
+                         deployment creates pipelines with bot tokens \
+                         (CONTROLLER_CALLS_GITLAB_TOKEN=bot)"
+                    );
+                }
+                Ok(())
+            }
+            Some(crate::calls::GitlabToken::Bot) => {
+                let files = self.gitlab_token_files().map_err(anyhow::Error::msg)?;
+                for host in self.gitlab_hosts() {
+                    if !files.contains_key(&host) {
+                        bail!(
+                            "CONTROLLER_CALLS_GITLAB_TOKEN=bot needs a token file for every \
+                             CONTROLLER_GITLAB_HOSTS host; {} has none \
+                             (CONTROLLER_GITLAB_TOKEN_FILES)",
+                            host.as_str()
+                        );
+                    }
+                }
+                Ok(())
+            }
+        }
     }
 
     pub(crate) fn gitlab_hosts(&self) -> Vec<crate::identity::forge::ForgeHost> {
@@ -1466,6 +1540,44 @@ mod tests {
             cfg!(feature = "autoresearch"),
             "switching the lane on needs a build that carries it"
         );
+    }
+
+    #[test]
+    fn gitlab_person_tokens_are_local_only_and_bot_tokens_cover_every_host() {
+        let local = crate::testing::cfg_from_args([
+            "ctl",
+            "--calls-gitlab-token",
+            "person",
+            "--playbook-executor",
+            "local",
+        ]);
+        local.validate_calls_gitlab(Some("wren")).unwrap();
+        let err = local.validate_calls_gitlab(None).unwrap_err().to_string();
+        assert!(err.contains("CONTROLLER_DEV_IDENTITY"), "{err}");
+
+        let bot = crate::testing::cfg_from_args([
+            "ctl",
+            "--calls-gitlab-token",
+            "bot",
+            "--gitlab-hosts",
+            "gitlab.com,GL.example.com",
+            "--gitlab-token-file",
+            "gitlab.com=/run/secrets/gl",
+        ]);
+        let err = bot.validate_calls_gitlab(None).unwrap_err().to_string();
+        assert!(err.contains("gl.example.com has none"), "{err}");
+        let files = bot.gitlab_token_files().unwrap();
+        assert_eq!(
+            files.get(&crate::identity::forge::ForgeHost::parse("gitlab.com").unwrap()),
+            Some(&PathBuf::from("/run/secrets/gl"))
+        );
+        for bad in ["gitlab.com", "a b=/x", "gitlab.com= "] {
+            let cfg = crate::testing::cfg_from_args(["ctl", "--gitlab-token-file", bad]);
+            assert!(cfg.gitlab_token_files().is_err(), "{bad:?}");
+        }
+        let hosts =
+            crate::testing::cfg_from_args(["ctl", "--gitlab-hosts", "gitlab.com,not a host"]);
+        assert_eq!(hosts.gitlab_hosts().len(), 1);
     }
 
     #[test]

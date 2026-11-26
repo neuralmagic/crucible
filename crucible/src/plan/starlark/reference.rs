@@ -695,8 +695,9 @@ pub fn functions() -> Vec<Function> {
             lane: Lane::Routed,
             purpose: "Engine-owned dispatch of a target the `calls` block declares, as a run of \
                       its own, compiled against the pack's `calls.lock`. The block is a dictionary \
-                      literal from target name to `{\"kind\": \"playbook\", \"playbook\": ...}` or \
-                      `{\"kind\": \"github_workflow\", \"repo\", \"workflow\", \"ref\", \"outputs\"}`, \
+                      literal from target name to `{\"kind\": \"playbook\", \"playbook\": ...}`, \
+                      `{\"kind\": \"github_workflow\", \"repo\", \"workflow\", \"ref\", \"outputs\"}` \
+                      or `{\"kind\": \"gitlab_pipeline\", \"host\", \"project\", \"ref\", \"outputs\"}`, \
                       assigned before every statement but `params`, and read without evaluating \
                       the source. The call waits for the target run and \
                       settles as it ended; its output is the target's result and its files are \

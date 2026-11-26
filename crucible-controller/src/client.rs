@@ -584,6 +584,10 @@ mod tests {
                 "0093_forge_links.sql",
                 "5df4dd13b9061b783658d7e3f29ef3ab06390582f2c3a404cd1e2ce191c4cab5",
             ),
+            (
+                "0094_gitlab_call_kind.sql",
+                "51c01c7644ab6d9569b0eca454678d6092e5c6764c75f31e519e2d35680b19c0",
+            ),
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
         for (name, want) in pinned {

@@ -31,6 +31,8 @@ pub const MAX_GITHUB_INPUTS: usize = 25;
 
 pub const GITHUB_RESULT_FILE: &str = "result.json";
 
+pub const GITLAB_RESULT_FILE: &str = "result.json";
+
 pub const CALLS_PATH: &str = "/api/runs/{run}/calls";
 
 pub const CALL_PATH: &str = "/api/runs/{run}/calls/{call}";
@@ -54,13 +56,15 @@ pub const PARAM_FILE_PATH: &str = "/api/runs/{run}/param-files/{digest}";
 pub enum CallKind {
     Playbook,
     GithubWorkflow,
+    GitlabPipeline,
     Tekton,
 }
 
 impl CallKind {
-    pub const ALL: [CallKind; 3] = [
+    pub const ALL: [CallKind; 4] = [
         CallKind::Playbook,
         CallKind::GithubWorkflow,
+        CallKind::GitlabPipeline,
         CallKind::Tekton,
     ];
 
@@ -68,6 +72,7 @@ impl CallKind {
         match self {
             CallKind::Playbook => "playbook",
             CallKind::GithubWorkflow => "github_workflow",
+            CallKind::GitlabPipeline => "gitlab_pipeline",
             CallKind::Tekton => "tekton",
         }
     }
@@ -88,6 +93,14 @@ impl CallKind {
                 open: "Open on GitHub",
                 accent: Some(Rgb(0x82, 0x50, 0xdf)),
                 icon: Some(BackendIcon::Github),
+                nodes: NodeLook::Jobs,
+            },
+            CallKind::GitlabPipeline => Presentation {
+                name: "GitLab CI",
+                badge: "gitlab",
+                open: "Open on GitLab",
+                accent: Some(Rgb(0xfc, 0x6d, 0x26)),
+                icon: Some(BackendIcon::Gitlab),
                 nodes: NodeLook::Jobs,
             },
             CallKind::Tekton => Presentation {
@@ -121,6 +134,7 @@ pub struct Rgb(pub u8, pub u8, pub u8);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendIcon {
     Github,
+    Gitlab,
     Tekton,
 }
 
@@ -374,6 +388,19 @@ pub struct GithubOutputs {
     pub files: Vec<String>,
 }
 
+/// What a GitLab pipeline returns: the job whose artifacts hold the typed fields of the JSON
+/// object at [`GITLAB_RESULT_FILE`], and further file paths among them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitlabOutputs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<String>,
+    #[serde(default)]
+    pub fields: BTreeMap<String, FieldType>,
+    #[serde(default)]
+    pub files: Vec<String>,
+}
+
 /// One `[calls.<alias>]` entry of a manifest.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -387,6 +414,14 @@ pub enum CallTarget {
         #[serde(rename = "ref")]
         git_ref: GitRefName,
         outputs: GithubOutputs,
+    },
+    GitlabPipeline {
+        host: String,
+        project: String,
+        #[serde(rename = "ref")]
+        git_ref: GitRefName,
+        #[serde(default)]
+        outputs: GitlabOutputs,
     },
     Tekton {
         cluster: String,
@@ -431,6 +466,7 @@ impl CallTarget {
         match self {
             CallTarget::Playbook { .. } => CallKind::Playbook,
             CallTarget::GithubWorkflow { .. } => CallKind::GithubWorkflow,
+            CallTarget::GitlabPipeline { .. } => CallKind::GitlabPipeline,
             CallTarget::Tekton { .. } => CallKind::Tekton,
         }
     }
@@ -458,6 +494,13 @@ pub enum Pin {
         git_ref: GitRefName,
         commit: String,
     },
+    GitlabRef {
+        host: String,
+        project: String,
+        #[serde(rename = "ref")]
+        git_ref: GitRefName,
+        commit: String,
+    },
     TektonWatch,
 }
 
@@ -466,12 +509,16 @@ impl Pin {
         match self {
             Pin::Revision { .. } | Pin::DraftHead { .. } => CallKind::Playbook,
             Pin::GithubRef { .. } => CallKind::GithubWorkflow,
+            Pin::GitlabRef { .. } => CallKind::GitlabPipeline,
             Pin::TektonWatch => CallKind::Tekton,
         }
     }
 
     pub fn moves(&self) -> bool {
-        matches!(self, Pin::DraftHead { .. } | Pin::GithubRef { .. })
+        matches!(
+            self,
+            Pin::DraftHead { .. } | Pin::GithubRef { .. } | Pin::GitlabRef { .. }
+        )
     }
 
     pub fn pins(&self, target: &CallTarget) -> bool {
@@ -502,6 +549,20 @@ impl Pin {
                     ..
                 },
             ) => repo == r && workflow == w && git_ref == g,
+            (
+                Pin::GitlabRef {
+                    host,
+                    project,
+                    git_ref,
+                    ..
+                },
+                CallTarget::GitlabPipeline {
+                    host: h,
+                    project: p,
+                    git_ref: g,
+                    ..
+                },
+            ) => host == h && project == p && git_ref == g,
             (Pin::TektonWatch, CallTarget::Tekton { .. }) => true,
             _ => false,
         }
@@ -862,6 +923,11 @@ pub enum TargetHandle {
         repo: GithubRepo,
         run_id: u64,
     },
+    GitlabPipeline {
+        host: String,
+        project: String,
+        pipeline_id: u64,
+    },
     TektonWatch {
         cluster: String,
         namespace: String,
@@ -874,6 +940,7 @@ impl TargetHandle {
         match self {
             TargetHandle::Playbook { .. } => CallKind::Playbook,
             TargetHandle::GithubWorkflow { .. } => CallKind::GithubWorkflow,
+            TargetHandle::GitlabPipeline { .. } => CallKind::GitlabPipeline,
             TargetHandle::TektonWatch { .. } => CallKind::Tekton,
         }
     }
@@ -1428,6 +1495,64 @@ mod tests {
         assert_eq!(
             CallKind::GithubWorkflow.presentation().accent,
             Some(Rgb(0x82, 0x50, 0xdf))
+        );
+        assert_eq!(
+            CallKind::GitlabPipeline.presentation().accent,
+            Some(Rgb(0xfc, 0x6d, 0x26))
+        );
+        assert_eq!(
+            CallKind::GitlabPipeline.presentation().icon,
+            Some(BackendIcon::Gitlab)
+        );
+    }
+
+    #[test]
+    fn a_gitlab_pipeline_target_pins_and_names_its_runs() {
+        let target: CallTarget = serde_json::from_value(serde_json::json!({
+            "kind": "gitlab_pipeline",
+            "host": "gitlab.example.com",
+            "project": "group/app",
+            "ref": "main",
+            "outputs": {"job": "report", "fields": {"version": "string"}},
+        }))
+        .unwrap();
+        assert_eq!(target.kind(), CallKind::GitlabPipeline);
+        assert!(!target.watches());
+        let pin = Pin::GitlabRef {
+            host: "gitlab.example.com".into(),
+            project: "group/app".into(),
+            git_ref: GitRefName::parse("main").unwrap(),
+            commit: "a".repeat(40),
+        };
+        assert!(pin.pins(&target));
+        assert!(pin.moves());
+        assert_eq!(pin.kind(), CallKind::GitlabPipeline);
+        let elsewhere = Pin::GitlabRef {
+            host: "gitlab.example.com".into(),
+            project: "group/other".into(),
+            git_ref: GitRefName::parse("main").unwrap(),
+            commit: "a".repeat(40),
+        };
+        assert!(!elsewhere.pins(&target));
+        let bare: CallTarget = serde_json::from_value(serde_json::json!({
+            "kind": "gitlab_pipeline",
+            "host": "gitlab.com",
+            "project": "g/p",
+            "ref": "main",
+        }))
+        .unwrap();
+        assert!(
+            matches!(bare, CallTarget::GitlabPipeline { outputs, .. } if outputs == GitlabOutputs::default())
+        );
+        let handle = TargetHandle::GitlabPipeline {
+            host: "gitlab.com".into(),
+            project: "g/p".into(),
+            pipeline_id: 9,
+        };
+        assert_eq!(handle.kind(), CallKind::GitlabPipeline);
+        assert_eq!(
+            serde_json::to_value(&handle).unwrap()["kind"],
+            "gitlab_pipeline"
         );
     }
 }

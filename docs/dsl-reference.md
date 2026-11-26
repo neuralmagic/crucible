@@ -349,7 +349,7 @@ Engine-owned decision: answers typed questions about its dependencies' outputs a
 
 ### `call()`
 
-Engine-owned dispatch of a target the `calls` block declares, as a run of its own, compiled against the pack's `calls.lock`. The block is a dictionary literal from target name to `{"kind": "playbook", "playbook": ...}` or `{"kind": "github_workflow", "repo", "workflow", "ref", "outputs"}`, assigned before every statement but `params`, and read without evaluating the source. The call waits for the target run and settles as it ended; its output is the target's result and its files are the target's result files.
+Engine-owned dispatch of a target the `calls` block declares, as a run of its own, compiled against the pack's `calls.lock`. The block is a dictionary literal from target name to `{"kind": "playbook", "playbook": ...}`, `{"kind": "github_workflow", "repo", "workflow", "ref", "outputs"}` or `{"kind": "gitlab_pipeline", "host", "project", "ref", "outputs"}`, assigned before every statement but `params`, and read without evaluating the source. The call waits for the target run and settles as it ended; its output is the target's result and its files are the target's result files.
 
 | Argument | Type | Purpose |
 | --- | --- | --- |
@@ -361,6 +361,25 @@ Engine-owned dispatch of a target the `calls` block declares, as a run of its ow
 | `budget` | `budget(cost = usd, wall_clock = duration)` | The target run's own ceilings, in place of the controller's launch defaults. The caller's ceilings keep running while it waits. |
 | `depends_on` | `list[task]` | Dependencies besides the producers its params read. |
 | `required` | `bool` | False makes the call advisory. |
+| `join` | `"all" \| "passed" \| "settled"` | As on any task. |
+| `stage` | `"iteration" \| "epilogue"` | As on any task. |
+| `when` | `question.any_of(...) \| question.otherwise() \| question` | Run only on some answers to one question. A question is one a `route()` asks, named `gate.<id>`, or a field a task emits typed `"boolean"` or as a list of labels, named `task.<field>`; a field needs no route, and answers no `when` reads lead nowhere. `.any_of("a", "b")` lists the answers: labels the question declares, or `"uncertain"`. `.otherwise()` is every answer no other task lists and the question does not `drop`, `"uncertain"` included; it is expanded at compile time, an unreachable one is an error, and on a choice whose options come from a field it also stands for every option the choice resolves to and is the only way to route them. A bare yes/no question means `"yes"`. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it unless it lists the task as `optional(...)`. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
+| `answers` | `str \| list[str]` | Deprecated. Write `when = question.any_of(...)`. |
+| `otherwise` | `bool` | Deprecated. Write `when = question.otherwise()`. |
+
+### `watch()`
+
+Engine-owned wait for the runs a commit started on a target's system, such as the Pipelines-as-Code PipelineRuns a push or pull request triggered. The target is a `{"kind": "tekton", "cluster", "namespace", "repository", "event", "expected"}` entry of the `calls` block. The watch adds every run that appears within `appear`, passes once every matched run passed, fails as soon as one fails, and never cancels a run. Its output has `runs` and, per expected run, the results it declares.
+
+| Argument | Type | Purpose |
+| --- | --- | --- |
+| `name` | `str` | Task identity, unique within the workflow. |
+| `target` | `str` | The name of a `tekton` target in the source's `calls` block. |
+| `commit` | `str` | The full commit id, as a literal, `param(name)`, or `producer.field`. |
+| `timeout` | `duration` | How long the watch waits in all before it fails. |
+| `appear` | `duration` | How long runs may take to appear; 10m when unset. |
+| `depends_on` | `list[task]` | Dependencies besides the producer its commit reads. |
+| `required` | `bool` | False makes the watch advisory. |
 | `join` | `"all" \| "passed" \| "settled"` | As on any task. |
 | `stage` | `"iteration" \| "epilogue"` | As on any task. |
 | `when` | `question.any_of(...) \| question.otherwise() \| question` | Run only on some answers to one question. A question is one a `route()` asks, named `gate.<id>`, or a field a task emits typed `"boolean"` or as a list of labels, named `task.<field>`; a field needs no route, and answers no `when` reads lead nowhere. `.any_of("a", "b")` lists the answers: labels the question declares, or `"uncertain"`. `.otherwise()` is every answer no other task lists and the question does not `drop`, `"uncertain"` included; it is expanded at compile time, an unreachable one is an error, and on a choice whose options come from a field it also stands for every option the choice resolves to and is the only way to route them. A bare yes/no question means `"yes"`. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it unless it lists the task as `optional(...)`. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |

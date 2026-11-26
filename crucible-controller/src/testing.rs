@@ -81,6 +81,8 @@ pub(crate) fn cfg_with(state_dir: &std::path::Path) -> crate::config::Controller
         calls_github_token: None,
         forge_signed_in: Default::default(),
         gitlab_hosts: Vec::new(),
+        calls_gitlab_token: None,
+        gitlab_token_files: Vec::new(),
         github_logins: Vec::new(),
         calls_tekton_kubeconfigs: Vec::new(),
         calls_tekton_results: Vec::new(),

@@ -138,6 +138,7 @@ controller-local port="8870" user=env_var("USER"):
         CONTROLLER_SESSION_SECURE=false \
         CONTROLLER_PLAYBOOK_EXECUTOR=local \
         CONTROLLER_CALLS_GITHUB_TOKEN=person \
+        CONTROLLER_CALLS_GITLAB_TOKEN=person \
         CONTROLLER_GITLAB_HOSTS="${CONTROLLER_GITLAB_HOSTS:-gitlab.com}" \
         CONTROLLER_SCOPE_EXECUTOR=disabled \
         CONTROLLER_STATE_DIR="$state" \
@@ -189,6 +190,44 @@ calls-example port="8870" max_cost="1" max_time="30m":
     "$crux" draft-files calls-parent --json | jq -e '.files | has("calls.lock")' >/dev/null \
         || { echo "calls-parent: the controller saved no calls.lock" >&2; exit 1; }
     "$crux" draft-launch calls-parent --max-cost {{max_cost}} --max-time {{max_time}} --json | jq -r .key
+
+# Save examples/calls/gitlab as the `calls-gitlab` draft on `just controller-local` and launch it.
+# CALLS_GITLAB_PROJECT is <host>/<group>/<project>, a project holding examples/calls/gitlab/ci/.gitlab-ci.yml
+# on main; the call uses your desktop GitLab sign-in, else `glab`. The host must be in
+# CONTROLLER_GITLAB_HOSTS.
+calls-gitlab-example port="8870" max_cost="1" max_time="30m":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target="${CALLS_GITLAB_PROJECT:-}"
+    [[ "$target" =~ ^([a-z0-9.-]+(:[0-9]+)?)/([A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)+)$ ]] || {
+        echo "set CALLS_GITLAB_PROJECT to <host>/<group>/<project> (examples/calls/README.md)" >&2
+        exit 1
+    }
+    host="${BASH_REMATCH[1]}" project="${BASH_REMATCH[3]}"
+    pack=$(mktemp -d)
+    trap 'rm -rf "${pack:?}"' EXIT
+    cp -R examples/calls/gitlab/. "$pack"
+    rm -rf "${pack:?}/ci"
+    sed -i.orig "s#GITLAB_HOST#$host#; s#GITLAB_PROJECT#$project#" "$pack/workflow.star"
+    rm "${pack:?}/workflow.star.orig"
+    SQLX_OFFLINE=true cargo build -q -p crux --bin crux
+    crux="${CARGO_TARGET_DIR:-$PWD/target}/debug/crux"
+    unset CONTROLLER_API_TOKEN
+    export CONTROLLER_URL=http://127.0.0.1:{{port}} CONTROLLER_CONFIG=/dev/null
+    id=calls-gitlab
+    if ! "$crux" draft-log "$id" --json >/dev/null 2>&1; then
+        "$crux" draft-create "$id" --description "Run a GitLab pipeline on $host/$project" --json >/dev/null
+    fi
+    base=$("$crux" draft-log "$id" --json | jq '[.[].version] | max')
+    saved=$("$crux" draft-push "$id" "$pack" --base-version "$base" --json)
+    if [ "$(jq -r '.error // empty' <<<"$saved")" ]; then
+        echo "$id: $(jq -r .error <<<"$saved")" >&2
+        exit 1
+    fi
+    jq -r --arg id "$id" '"\($id) v\(.version)" + ([.diagnostics[]? | "\n  \(.file // ""):\(.line // ""): \(.message)"] | join(""))' <<<"$saved"
+    "$crux" draft-files "$id" --json | jq -e '.files | has("calls.lock")' >/dev/null \
+        || { echo "$id: the controller saved no calls.lock" >&2; exit 1; }
+    "$crux" draft-launch "$id" --max-cost {{max_cost}} --max-time {{max_time}} --json | jq -r .key
 
 # Launch a Konflux demo pack: `konflux-watch` watches the pull request builds of a ModelExpress
 # commit (params '{"commit":"<sha>"}'); `konflux-pr` pushes to a reused pull request first, with

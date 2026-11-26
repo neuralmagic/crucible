@@ -342,12 +342,14 @@ fn task(named: &mut BTreeMap<String, Value>, state: &CompileState, door: Door) -
     }
     let interface = &locked.interface;
     let declared = target_params(interface);
-    if locked.kind == CallKind::GithubWorkflow
-        && let Some((param, _)) = declared.iter().find(|(_, p)| p.ty == ParamType::File)
+    if matches!(
+        locked.kind,
+        CallKind::GithubWorkflow | CallKind::GitlabPipeline
+    ) && let Some((param, _)) = declared.iter().find(|(_, p)| p.ty == ParamType::File)
     {
         return Err(refused(format!(
-            "the lock declares {param:?} a file parameter, which a GitHub workflow input cannot \
-             take"
+            "the lock declares {param:?} a file parameter, which a {} input cannot take",
+            locked.kind.presentation().name
         )));
     }
     let budget = match named.remove("budget") {
@@ -912,7 +914,7 @@ workflow(type = "playbook", tasks = [plan, t, after])
              workflow(type = \"playbook\", tasks = [plan, t])",
         )
         .unwrap_err();
-        assert!(error.contains("GitHub workflow input"), "{error}");
+        assert!(error.contains("GitHub Actions input"), "{error}");
         let ok = compile(
             pack(false).path(),
             "t = call(name = \"t\", target = \"release\", params = {\"version\": plan.repo})\n\
@@ -1322,6 +1324,109 @@ push = command(name = "push", run = "true", emits = {"commit": "string"})
         compile_source(&source, Path::new("workflow.star"), pack.path())
             .map(|c| c.workflow)
             .map_err(|e| e.message())
+    }
+
+    fn gitlab_pack(file_param: bool) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let mut properties = json!({
+            "target": {"type": "string", "enum": ["staging", "production"]},
+            "tags": {"type": "array", "items": {"type": "string"}},
+        });
+        if file_param {
+            properties["bundle"] = json!({TYPE_KEY: "file"});
+        }
+        let interface = TargetInterface {
+            params: json!({
+                "type": "object",
+                "properties": properties,
+                "required": ["target"],
+            }),
+            result: vec![EmitWire {
+                field: "version".into(),
+                ty: Some(FieldType::String),
+            }],
+            result_files: vec![],
+            graph: ProgressGraph::default(),
+        };
+        let lock = CallsLock {
+            version: LOCK_VERSION,
+            calls: BTreeMap::from([(
+                CallAlias::parse("deploy").unwrap(),
+                LockedCall::new(
+                    Pin::GitlabRef {
+                        host: "gitlab.example.com".into(),
+                        project: "group/app".into(),
+                        git_ref: GitRefName::parse("main").unwrap(),
+                        commit: "abc".into(),
+                    },
+                    interface,
+                )
+                .unwrap(),
+            )]),
+        };
+        std::fs::write(dir.path().join(LOCK_FILE), lock.render().unwrap()).unwrap();
+        dir
+    }
+
+    const GITLAB_CALLS: &str = r#"calls = {
+    "deploy": {
+        "kind": "gitlab_pipeline",
+        "host": "gitlab.example.com",
+        "project": "group/app",
+        "ref": "main",
+        "outputs": {"job": "report", "fields": {"version": "string"}},
+    },
+}
+"#;
+
+    fn compile_gitlab(
+        file_param: bool,
+        body: &str,
+    ) -> Result<crate::plan::workflow::WorkflowCfg, String> {
+        let pack = gitlab_pack(file_param);
+        let source = format!("{GITLAB_CALLS}\n{body}");
+        compile_source(&source, Path::new("workflow.star"), pack.path())
+            .map(|c| c.workflow)
+            .map_err(|e| e.message())
+    }
+
+    #[test]
+    fn a_gitlab_call_binds_typed_inputs_and_returns_its_fields() {
+        let workflow = compile_gitlab(
+            false,
+            r#"
+d = call(name = "ship", target = "deploy", params = {"target": "staging", "tags": ["a", "b"]})
+workflow(type = "playbook", tasks = [d], result = d)
+"#,
+        )
+        .expect("compiles");
+        let task = the_call(&workflow);
+        let TaskKind::Call { bindings, .. } = &task.task else {
+            panic!("a call");
+        };
+        assert_eq!(
+            bindings.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["tags", "target"]
+        );
+        assert!(
+            matches!(&task.emits, Emits::Typed(fields) if fields.contains_key(&OutputField("version".into())))
+        );
+    }
+
+    #[test]
+    fn a_gitlab_call_refuses_a_file_parameter() {
+        let refused = compile_gitlab(
+            true,
+            r#"
+d = call(name = "ship", target = "deploy", params = {"target": "staging"})
+workflow(type = "playbook", tasks = [d], result = d)
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            refused.contains("which a GitLab CI input cannot take"),
+            "{refused}"
+        );
     }
 
     #[test]

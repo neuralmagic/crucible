@@ -54,8 +54,11 @@ fn person(caller: &Caller) -> Result<&str, &'static str> {
     }
 }
 
-fn keeps_tokens(state: &ApiState) -> bool {
-    state.calls_github == Some(crate::calls::GithubToken::Person)
+fn keeps_tokens(state: &ApiState, forge: Forge) -> bool {
+    match forge {
+        Forge::Github => state.calls_github == Some(crate::calls::GithubToken::Person),
+        Forge::Gitlab => state.calls_gitlab == Some(crate::calls::GitlabToken::Person),
+    }
 }
 
 enum Unserved {
@@ -222,7 +225,7 @@ pub(crate) async fn put_forge_account(
         Err(e @ LinkError::Taken { .. }) => return Ok(conflict(e.to_string())),
         Err(LinkError::Store(e)) => return Err(e.into()),
     }
-    if keeps_tokens(&state) {
+    if keeps_tokens(&state, link.forge) {
         state
             .forge_signed_in
             .set(link.forge, &link.host, Some(secret.to_owned()));
@@ -255,7 +258,7 @@ pub(crate) async fn delete_forge_account(
         Ok(account) => account,
         Err(unserved) => return Ok(unserved.response()),
     };
-    if keeps_tokens(&state) {
+    if keeps_tokens(&state, forge) {
         state.forge_signed_in.set(forge, &host, None);
     }
     Ok(
@@ -299,6 +302,7 @@ mod tests {
     fn person_state(pool: PgPool) -> ApiState {
         ApiState {
             calls_github: Some(crate::calls::GithubToken::Person),
+            calls_gitlab: Some(crate::calls::GitlabToken::Person),
             gitlab_hosts: std::sync::Arc::new(vec![
                 ForgeHost::parse("gitlab.example.com").unwrap(),
             ]),
@@ -398,10 +402,15 @@ mod tests {
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_controller_acting_with_the_app_never_keeps_a_token(pool: PgPool) {
         let mut state = person_state(pool);
-        assert!(keeps_tokens(&state));
+        assert!(keeps_tokens(&state, Forge::Github));
+        assert!(keeps_tokens(&state, Forge::Gitlab));
         state.calls_github = Some(crate::calls::GithubToken::AppInstallation);
-        assert!(!keeps_tokens(&state));
+        state.calls_gitlab = Some(crate::calls::GitlabToken::Bot);
+        assert!(!keeps_tokens(&state, Forge::Github));
+        assert!(!keeps_tokens(&state, Forge::Gitlab));
         state.calls_github = None;
-        assert!(!keeps_tokens(&state));
+        state.calls_gitlab = None;
+        assert!(!keeps_tokens(&state, Forge::Github));
+        assert!(!keeps_tokens(&state, Forge::Gitlab));
     }
 }

@@ -92,6 +92,9 @@ mod tests {
     fn call(kind: &str, status: &str) -> LiveCall {
         let handle = match kind {
             "playbook" => json!({"kind": "playbook", "run": "r"}),
+            "gitlab_pipeline" => {
+                json!({"kind": "gitlab_pipeline", "host": "gitlab.com", "project": "g/p", "pipeline_id": 1})
+            }
             _ => json!({"kind": "github_workflow", "repo": "acme/app", "run_id": 1}),
         };
         let view: CallView = serde_json::from_value(json!({
@@ -116,6 +119,10 @@ mod tests {
         assert_eq!(
             look(Some(&call("github_workflow", "running")), &glows),
             Look::Running(CallKind::GithubWorkflow)
+        );
+        assert_eq!(
+            look(Some(&call("gitlab_pipeline", "running")), &glows),
+            Look::Running(CallKind::GitlabPipeline)
         );
         assert_eq!(
             look(Some(&call("playbook", "pending")), &glows),

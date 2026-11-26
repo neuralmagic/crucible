@@ -153,6 +153,7 @@ pub(crate) async fn get_run(
             run: match &c.handle {
                 crucible_contract::calls::TargetHandle::Playbook { run } => Some(run.clone()),
                 crucible_contract::calls::TargetHandle::GithubWorkflow { .. }
+                | crucible_contract::calls::TargetHandle::GitlabPipeline { .. }
                 | crucible_contract::calls::TargetHandle::TektonWatch { .. } => None,
             },
             kind: c.handle.kind(),

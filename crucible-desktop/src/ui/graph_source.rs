@@ -1394,6 +1394,61 @@ mod tests {
         );
     }
 
+    const GITLAB_CALLED: &str = concat!(
+        r#"{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":1.0,"tasks":["#,
+        r#"{"name":"build","kind":"command","required":true},"#,
+        r#"{"name":"deploy","kind":"call","depends_on":["build"],"required":true,"call":{"alias":"ship","target":"gitlab_pipeline","params":{"target":"build"}}}"#,
+        r#"]}"#,
+        "\n",
+        r#"{"v":1,"kind":"call_dispatched","task":"deploy","attempt":1,"alias":"ship","call":"c-1","handle":{"kind":"gitlab_pipeline","host":"gitlab.example.com","project":"group/sub/app","pipeline_id":4242}}"#,
+        "\n",
+    );
+
+    #[test]
+    fn a_gitlab_call_frames_its_jobs_in_gitlab_orange_under_the_project_and_pipeline_number() {
+        let tasks = fold(GITLAB_CALLED);
+        let view = serde_json::from_value(serde_json::json!({
+            "task": "deploy",
+            "attempt": 1,
+            "alias": "ship",
+            "kind": "gitlab_pipeline",
+            "state": {
+                "call": "c-1",
+                "status": "running",
+                "run_number": 17,
+                "handle": {"kind": "gitlab_pipeline", "host": "gitlab.example.com", "project": "group/sub/app", "pipeline_id": 4242},
+                "progress": workflow("pass", ["pass", "running"])
+            }
+        }))
+        .unwrap();
+        let calls = vec![LiveCall { view, launch: None }];
+        let targets = Targets::new(&calls, None);
+        let open = called(&tasks, None, &[], &targets, &[]);
+        contains_all(
+            &open,
+            &[
+                "  subgraph g1 [\"deploy \u{b7} ship \u{b7} app #17\"]\n",
+                "class t1c0 job_gitlab_pipeline_pass",
+                "class t1c1 job_gitlab_pipeline_running",
+                "classDef job_gitlab_pipeline fill:",
+            ],
+        );
+        let stroke = |class: &str| {
+            open.lines()
+                .find(|l| l.contains(&format!("classDef {class} fill:")))
+                .and_then(|l| l.split("stroke:").nth(1))
+                .map(|rest| rest.split(',').next().unwrap_or_default().to_owned())
+        };
+        assert!(stroke("job_gitlab_pipeline").is_some(), "{open}");
+        assert_ne!(stroke("job_gitlab_pipeline"), stroke("job_github_workflow"));
+        let style = rune_mermaid::DiagramStyle::neutral(true);
+        assert!(
+            rune_mermaid::render_with_hover(&open, &style, rune_mermaid::Hover::Off, Color::WHITE)
+                .is_some(),
+            "{open}"
+        );
+    }
+
     const MAPPED: &str = concat!(
         r#"{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":1.0,"tasks":["#,
         r#"{"name":"build","kind":"command","required":true},"#,

@@ -474,6 +474,8 @@ fn dispatch_autopilot(mut cfg: crucible_controller::ControllerCfg, once: bool) -
         .context("configuring the GitHub App pack-PR credential")?;
     cfg.validate_calls_github(std::env::var("CONTROLLER_DEV_IDENTITY").ok().as_deref())
         .context("validating the calls GitHub token source")?;
+    cfg.validate_calls_gitlab(std::env::var("CONTROLLER_DEV_IDENTITY").ok().as_deref())
+        .context("validating the calls GitLab token source")?;
     // `--once` runs the reconcile core to quiescence (the dev/test/break-glass mode);
     // the no-flag path is the resident daemon.
     if once {

@@ -27,7 +27,9 @@ impl LiveCall {
     pub fn target_run(&self) -> Option<&str> {
         match &self.view.state.handle {
             TargetHandle::Playbook { run } => Some(run),
-            TargetHandle::GithubWorkflow { .. } | TargetHandle::TektonWatch { .. } => None,
+            TargetHandle::GithubWorkflow { .. }
+            | TargetHandle::GitlabPipeline { .. }
+            | TargetHandle::TektonWatch { .. } => None,
         }
     }
 
@@ -170,6 +172,14 @@ pub fn lifecycle(tasks: &[TaskView], calls: &[LiveCall]) -> Vec<LogLine> {
                 (None, TargetHandle::GithubWorkflow { repo, run_id }) => {
                     format!("{} run {run_id}", repo.as_str())
                 }
+                (
+                    None,
+                    TargetHandle::GitlabPipeline {
+                        project,
+                        pipeline_id,
+                        ..
+                    },
+                ) => format!("{project} pipeline {pipeline_id}"),
                 (
                     None,
                     TargetHandle::TektonWatch {

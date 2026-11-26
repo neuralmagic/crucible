@@ -23,7 +23,7 @@ use serde_json::Value;
 use url::Url;
 
 use crate::commit::CommitId;
-use crate::gitlab::model::{Bridge, Job, Lint, Pipeline, User};
+use crate::gitlab::model::{Bridge, Commit, Job, Lint, Member, Pipeline, User};
 use crate::token::BearerToken;
 
 const PER_PAGE: u32 = 100;
@@ -138,6 +138,40 @@ impl Gitlab {
         }
         self.get_json(token, "reading the token's account", url)
             .await
+    }
+
+    pub async fn commit(
+        &self,
+        token: &BearerToken,
+        project: &ProjectPath,
+        git_ref: &str,
+    ) -> Result<CommitId, GitlabError> {
+        let doing = format!("resolving {git_ref} of {}", project.as_str());
+        let url = self.url(project, &["repository", "commits", git_ref], &[]);
+        let commit: Commit = self.get_json(token, &doing, url).await?;
+        CommitId::parse(&commit.id).map_err(|e| GitlabError::Status {
+            doing,
+            status: 200,
+            body: e.to_string(),
+        })
+    }
+
+    pub async fn member_access(
+        &self,
+        token: &BearerToken,
+        project: &ProjectPath,
+        user_id: u64,
+    ) -> Result<Option<u32>, GitlabError> {
+        let doing = format!(
+            "reading the access of user {user_id} to {}",
+            project.as_str()
+        );
+        let url = self.url(project, &["members", "all", &user_id.to_string()], &[]);
+        match self.get_json::<Member>(token, &doing, url).await {
+            Ok(member) => Ok(Some(member.access_level)),
+            Err(GitlabError::Status { status: 404, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn pipelines_for(

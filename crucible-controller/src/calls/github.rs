@@ -166,7 +166,7 @@ impl GithubWorkflowBackend {
         let current = self
             .interface_at(&token, &api_repo, workflow, &commit, outputs)
             .await?;
-        if let Some(moved) = difference(&locked.interface, &current) {
+        if let Some(moved) = crate::calls::interface_moved(&locked.interface, &current) {
             return Err(TargetError::Refused(format!(
                 "{repo} {} at {} (commit {}) {moved} than calls.lock records",
                 workflow.as_str(),
@@ -216,14 +216,16 @@ impl GithubWorkflowBackend {
         let at_head = self
             .interface_at(&token, &api_repo, workflow, &head_sha, outputs)
             .await?;
-        Ok(difference(locked, &at_head).map(|moved| {
-            format!(
-                "{} moved to commit {} during dispatch, whose workflow {moved} than calls.lock \
+        Ok(
+            crate::calls::interface_moved(locked, &at_head).map(|moved| {
+                format!(
+                    "{} moved to commit {} during dispatch, whose workflow {moved} than calls.lock \
                  records",
-                git_ref.as_str(),
-                head_sha.short()
-            )
-        }))
+                    git_ref.as_str(),
+                    head_sha.short()
+                )
+            }),
+        )
     }
 
     pub async fn authorize(
@@ -443,23 +445,6 @@ fn github_target(
             outputs,
         } => Ok((repo, workflow, git_ref, outputs)),
         other => Err(TargetError::WrongKind(other.kind().to_string())),
-    }
-}
-
-fn difference(locked: &TargetInterface, now: &TargetInterface) -> Option<String> {
-    let mut parts = Vec::new();
-    if locked.params != now.params {
-        parts.push("params");
-    }
-    if locked.result != now.result || locked.result_files != now.result_files {
-        parts.push("result");
-    }
-    if locked.graph != now.graph {
-        parts.push("graph");
-    }
-    match parts.as_slice() {
-        [] => None,
-        parts => Some(format!("has a different {}", parts.join(" and "))),
     }
 }
 
