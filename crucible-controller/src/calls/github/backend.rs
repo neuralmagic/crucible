@@ -7,7 +7,9 @@ use serde_json::{Value, json};
 use forge::github::GithubError;
 
 use crate::authz::model::Principal;
-use crate::calls::github::{GithubOutcome, GithubWorkflowBackend, TargetError, github_target};
+use crate::calls::github::{
+    GithubOutcome, GithubWorkflowBackend, Seen, SeenRun, TargetError, github_target,
+};
 use crate::calls::{
     CallCtx, CallError, CallRecord, DispatchSpec, Dispatched, Outcome, Polled, Resolved,
     TargetBackend,
@@ -42,6 +44,25 @@ fn following(e: TargetError, call: &CallRecord, now: jiff::Timestamp) -> CallErr
             CallError::Internal(anyhow::Error::new(e))
         }
         _ => e.into(),
+    }
+}
+
+const RUN_ETAG: &str = "run_etag";
+const JOBS_ETAG: &str = "jobs_etag";
+
+fn seen(call: &CallRecord) -> Seen<'_> {
+    let text = |key: &str| call.detail.get(key).and_then(Value::as_str);
+    let run = match (text(RUN_ETAG), text("head_sha")) {
+        (Some(etag), Some(head_sha)) => Some(SeenRun {
+            etag,
+            head_sha,
+            run_number: call.detail.get("run_number").and_then(Value::as_u64),
+        }),
+        _ => None,
+    };
+    Seen {
+        run,
+        jobs: text(JOBS_ETAG).map(|etag| (etag, &call.progress)),
     }
 }
 
@@ -176,13 +197,25 @@ impl TargetBackend for GithubWorkflowBackend {
         let (repo, run_id) = run_of(call)?;
         let (_, _, _, outputs) = github_target(&call.target)?;
         let now = jiff::Timestamp::now();
-        let polled =
-            GithubWorkflowBackend::poll(self, repo, run_id, &call.interface.graph, outputs, false)
-                .await
-                .map_err(|e| following(e, call, now))?;
+        let polled = GithubWorkflowBackend::poll(
+            self,
+            repo,
+            run_id,
+            &call.interface.graph,
+            outputs,
+            false,
+            seen(call),
+        )
+        .await
+        .map_err(|e| following(e, call, now))?;
         let mut recorded = serde_json::Map::new();
         if let Some(number) = polled.run_number {
             recorded.insert("run_number".to_owned(), number.into());
+        }
+        for (key, etag) in [(RUN_ETAG, &polled.run_etag), (JOBS_ETAG, &polled.jobs_etag)] {
+            if let Some(etag) = etag {
+                recorded.insert(key.to_owned(), etag.clone().into());
+            }
         }
         if let Some(commit) = unchecked_commit(&call.detail) {
             let moved = self
@@ -273,7 +306,9 @@ mod tests {
     use forge::github::GithubError;
 
     use crate::calls::github::TargetError;
-    use crate::calls::github::backend::{age, cadence_at, following, run_links, unchecked_commit};
+    use crate::calls::github::backend::{
+        age, cadence_at, following, run_links, seen, unchecked_commit,
+    };
     use crate::calls::{CallError, CallRecord};
     use crucible_contract::calls::{
         CallAlias, CallId, CallKind, CallStatus, CallTarget, FileRef, PlaybookRef, TargetInterface,
@@ -347,6 +382,30 @@ mod tests {
             following(limited, &old, now),
             CallError::Throttled { after, .. } if after.as_secs() == 90
         ));
+    }
+
+    #[test]
+    fn a_look_sends_the_etags_the_last_look_kept() {
+        let mut call = record("2026-11-25T12:00:00Z");
+        let first = seen(&call);
+        assert!(first.run.is_none() && first.jobs.is_none());
+        call.detail = json!({"run_etag": "W/\"r\"", "jobs_etag": "W/\"j\""});
+        let partial = seen(&call);
+        assert!(
+            partial.run.is_none(),
+            "a run ETag without the head it saw is not used"
+        );
+        assert_eq!(partial.jobs.map(|(etag, _)| etag), Some("W/\"j\""));
+        call.detail = json!({
+            "run_etag": "W/\"r\"",
+            "head_sha": "abc",
+            "run_number": 14,
+        });
+        let full = seen(&call).run.expect("run seen");
+        assert_eq!(
+            (full.etag, full.head_sha, full.run_number),
+            ("W/\"r\"", "abc", Some(14))
+        );
     }
 
     #[test]

@@ -16,7 +16,7 @@ use crucible_contract::calls::{
 };
 use crucible_contract::link::ExternalUrl;
 use forge::github::workflow::Workflow;
-use forge::github::{Client, CommitSha, GithubError, Repo, RunStatus, Token, WorkflowRun};
+use forge::github::{Client, CommitSha, GithubError, Repo, RunStatus, Since, Token, WorkflowRun};
 use serde_json::{Value, json};
 
 use crate::authz::model::Principal;
@@ -95,6 +95,23 @@ pub struct RunPoll {
     pub head_sha: String,
     pub run_number: Option<u64>,
     pub outcome: Option<GithubOutcome>,
+    pub run_etag: Option<String>,
+    pub jobs_etag: Option<String>,
+}
+
+/// What the last look at a run saw, so the next asks GitHub only for what changed.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Seen<'a> {
+    pub run: Option<SeenRun<'a>>,
+    pub jobs: Option<(&'a str, &'a ProgressGraph)>,
+}
+
+/// The run as the last look saw it, with the ETag it came with.
+#[derive(Clone, Copy, Debug)]
+pub struct SeenRun<'a> {
+    pub etag: &'a str,
+    pub head_sha: &'a str,
+    pub run_number: Option<u64>,
 }
 
 /// The `github_workflow` target backend.
@@ -297,12 +314,40 @@ impl GithubWorkflowBackend {
         graph: &ProgressGraph,
         outputs: &GithubOutputs,
         caller_cancelled: bool,
+        seen: Seen<'_>,
     ) -> Result<RunPoll, TargetError> {
         let api_repo = api_repo(repo)?;
         let token = self.token(&api_repo).await?;
-        let run = self.client.run(&token, &api_repo, run_id).await?;
-        let jobs = self.client.jobs(&token, &api_repo, run_id).await?;
-        let progress = run_graph(graph, &jobs);
+        let run = self
+            .client
+            .run_since(&token, &api_repo, run_id, seen.run.map(|r| r.etag))
+            .await?;
+        let jobs = self
+            .client
+            .jobs_since(&token, &api_repo, run_id, seen.jobs.map(|(etag, _)| etag))
+            .await?;
+        let (progress, jobs_etag) = match (jobs, seen.jobs) {
+            (Since::Changed { value, etag }, _) => (run_graph(graph, &value), etag),
+            (Since::Unchanged, Some((etag, progress))) => (progress.clone(), Some(etag.to_owned())),
+            (Since::Unchanged, None) => {
+                let jobs = self.client.jobs(&token, &api_repo, run_id).await?;
+                (run_graph(graph, &jobs), None)
+            }
+        };
+        let (run, run_etag) = match (run, seen.run) {
+            (Since::Changed { value, etag }, _) => (value, etag),
+            (Since::Unchanged, Some(last)) => {
+                return Ok(RunPoll {
+                    progress,
+                    head_sha: last.head_sha.to_owned(),
+                    run_number: last.run_number,
+                    outcome: None,
+                    run_etag: Some(last.etag.to_owned()),
+                    jobs_etag,
+                });
+            }
+            (Since::Unchanged, None) => (self.client.run(&token, &api_repo, run_id).await?, None),
+        };
         let outcome = match run.status {
             Some(RunStatus::Completed) => Some(
                 self.outcome(&token, &api_repo, &run, outputs, caller_cancelled)
@@ -315,6 +360,8 @@ impl GithubWorkflowBackend {
             run_number: run.run_number,
             head_sha: run.head_sha,
             outcome,
+            run_etag,
+            jobs_etag,
         })
     }
 
@@ -816,7 +863,14 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(900);
         let outcome = loop {
             let poll = backend
-                .poll(repo, *run_id, &locked.interface.graph, outputs, false)
+                .poll(
+                    repo,
+                    *run_id,
+                    &locked.interface.graph,
+                    outputs,
+                    false,
+                    crate::calls::github::Seen::default(),
+                )
                 .await
                 .unwrap();
             seen_legs |= poll
@@ -866,7 +920,14 @@ mod tests {
 
         let unused = ProgressGraph::default();
         let again = backend
-            .poll(repo, *run_id, &unused, outputs, false)
+            .poll(
+                repo,
+                *run_id,
+                &unused,
+                outputs,
+                false,
+                crate::calls::github::Seen::default(),
+            )
             .await
             .unwrap();
         assert!(again.outcome.is_some());

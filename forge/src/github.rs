@@ -274,6 +274,13 @@ pub struct WorkflowRun {
     pub run_number: Option<u64>,
 }
 
+/// A conditional read: unchanged since the ETag sent, or the new value and its ETag.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Since<T> {
+    Unchanged,
+    Changed { value: T, etag: Option<String> },
+}
+
 /// One job as `GET .../actions/runs/{id}/jobs` answers.
 #[derive(Clone, Debug, Deserialize)]
 pub struct Job {
@@ -454,6 +461,65 @@ impl Client {
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    pub async fn run_since(
+        &self,
+        token: &Token,
+        repo: &Repo,
+        run_id: u64,
+        etag: Option<&str>,
+    ) -> Result<Since<WorkflowRun>, GithubError> {
+        let url = format!("{API}/repos/{repo}/actions/runs/{run_id}");
+        let doing = "reading the run";
+        let resp = self
+            .send(
+                if_none_match(self.http.get(url), etag),
+                token,
+                JSON_ACCEPT,
+                doing,
+            )
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+            return Ok(Since::Unchanged);
+        }
+        let etag = etag_of(&resp);
+        let value = resp.json().await.map_err(GithubError::http(doing))?;
+        Ok(Since::Changed { value, etag })
+    }
+
+    pub async fn jobs_since(
+        &self,
+        token: &Token,
+        repo: &Repo,
+        run_id: u64,
+        etag: Option<&str>,
+    ) -> Result<Since<Vec<Job>>, GithubError> {
+        let doing = "listing the run's jobs";
+        let url = format!(
+            "{API}/repos/{repo}/actions/runs/{run_id}/jobs?per_page={JOBS_PER_PAGE}&page=1"
+        );
+        let resp = self
+            .send(
+                if_none_match(self.http.get(url), etag),
+                token,
+                JSON_ACCEPT,
+                doing,
+            )
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+            return Ok(Since::Unchanged);
+        }
+        let etag = etag_of(&resp);
+        let first: Jobs = resp.json().await.map_err(GithubError::http(doing))?;
+        if (first.jobs.len() as u64) >= first.total_count {
+            return Ok(Since::Changed {
+                value: first.jobs,
+                etag,
+            });
+        }
+        let value = self.jobs(token, repo, run_id).await?;
+        Ok(Since::Changed { value, etag: None })
     }
 
     pub async fn jobs(
@@ -680,6 +746,20 @@ fn install_crypto_provider() {
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     }
+}
+
+fn if_none_match(request: reqwest::RequestBuilder, etag: Option<&str>) -> reqwest::RequestBuilder {
+    match etag {
+        Some(etag) => request.header(reqwest::header::IF_NONE_MATCH, etag),
+        None => request,
+    }
+}
+
+fn etag_of(resp: &reqwest::Response) -> Option<String> {
+    resp.headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
 }
 
 struct RateHeaders {
