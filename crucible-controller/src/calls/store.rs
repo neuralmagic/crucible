@@ -170,8 +170,8 @@ pub(crate) async fn live_earlier(
 
 pub(crate) async fn dispatched(pool: &PgPool, id: &CallId, started: &Dispatched) -> Result<bool> {
     let stop: Option<bool> = sqlx::query_scalar(
-        "UPDATE call_target_runs c SET handle = $2, link = $3, detail = $4, updated_at = $5 \
-         WHERE id = $1 RETURNING c.ended_at IS NOT NULL OR EXISTS ( \
+        "UPDATE call_target_runs c SET handle = $2, link = $3, detail = $4, updated_at = $5, \
+         next_poll_at = $6 WHERE id = $1 RETURNING c.ended_at IS NOT NULL OR EXISTS ( \
            SELECT 1 FROM runs r WHERE r.run_id = c.parent_run AND r.status = 'cancelled')",
     )
     .bind(&id.0)
@@ -185,6 +185,9 @@ pub(crate) async fn dispatched(pool: &PgPool, id: &CallId, started: &Dispatched)
     )
     .bind(&started.detail)
     .bind(crate::clock::now_rfc3339())
+    .bind(crate::clock::stamp(jiff::Timestamp::now().checked_add(
+        jiff::SignedDuration::try_from(crate::calls::refresh::REFRESH_EVERY)?,
+    )?))
     .fetch_optional(pool)
     .await
     .context("recording a call's dispatch")?;
@@ -288,23 +291,20 @@ const DUE: &str = "handle IS NOT NULL AND (ended_at IS NULL OR cancel_owed)";
 
 pub(crate) async fn earliest_due(pool: &PgPool) -> Result<Option<String>> {
     sqlx::query_scalar(const_format::formatcp!(
-        "SELECT MIN(updated_at) FROM call_target_runs WHERE {DUE}"
+        "SELECT MIN(COALESCE(next_poll_at, updated_at)) FROM call_target_runs WHERE {DUE}"
     ))
     .fetch_one(pool)
     .await
     .context("reading when the next call is due")
 }
 
-pub(crate) async fn due(
-    pool: &PgPool,
-    before: &str,
-    limit: i64,
-) -> Result<Vec<(CallRecord, bool)>> {
+pub(crate) async fn due(pool: &PgPool, now: &str, limit: i64) -> Result<Vec<(CallRecord, bool)>> {
     let rows = sqlx::query(const_format::formatcp!(
         "SELECT {COLUMNS}, cancel_owed FROM call_target_runs \
-         WHERE {DUE} AND updated_at <= $1 ORDER BY updated_at, id LIMIT $2"
+         WHERE {DUE} AND COALESCE(next_poll_at, updated_at) <= $1 \
+         ORDER BY COALESCE(next_poll_at, updated_at), id LIMIT $2"
     ))
-    .bind(before)
+    .bind(now)
     .bind(limit)
     .fetch_all(pool)
     .await
@@ -312,6 +312,16 @@ pub(crate) async fn due(
     rows.iter()
         .map(|row| Ok((decode(row)?, row.try_get("cancel_owed")?)))
         .collect()
+}
+
+pub(crate) async fn poll_at(pool: &PgPool, id: &CallId, at: &str) -> Result<()> {
+    sqlx::query("UPDATE call_target_runs SET next_poll_at = $2 WHERE id = $1")
+        .bind(&id.0)
+        .bind(at)
+        .execute(pool)
+        .await
+        .context("scheduling a call's next look")?;
+    Ok(())
 }
 
 pub(crate) async fn put_result_file(

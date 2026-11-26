@@ -1,5 +1,5 @@
 //! The call refresh loop: a source of the launch loop that brings each dispatched, unended call
-//! up to date with its target run every [`REFRESH_EVERY`], and asks again to stop a target run
+//! up to date with its target run at its backend's cadence, and asks again to stop a target run
 //! whose call ended while stopping it failed. Readers and the engine read the store; only this
 //! loop polls target systems, settles, or cuts a call off.
 
@@ -33,10 +33,7 @@ impl DueSource for CallRefresh {
             let Some(earliest) = crate::calls::store::earliest_due(db.pool()).await? else {
                 return Ok(None);
             };
-            let looked: jiff::Timestamp = earliest.parse()?;
-            Ok(Some(looked.checked_add(jiff::SignedDuration::try_from(
-                REFRESH_EVERY,
-            )?)?))
+            Ok(Some(earliest.parse()?))
         })
     }
 
@@ -63,12 +60,16 @@ pub(crate) async fn refresh_due(
     ctx: &CallCtx,
     now: jiff::Timestamp,
 ) -> anyhow::Result<usize> {
-    let before = now.checked_sub(jiff::SignedDuration::try_from(REFRESH_EVERY)?)?;
     let due =
-        crate::calls::store::due(ctx.db.pool(), &crate::clock::stamp(before), PASS_LIMIT).await?;
+        crate::calls::store::due(ctx.db.pool(), &crate::clock::stamp(now), PASS_LIMIT).await?;
     let count = due.len();
     for (record, cancel_owed) in due {
         let id = record.id.clone();
+        let every = backends
+            .get(record.kind)
+            .map_or(REFRESH_EVERY, |b| b.cadence(&record, now));
+        let next = now.checked_add(jiff::SignedDuration::try_from(every)?)?;
+        crate::calls::store::poll_at(ctx.db.pool(), &id, &crate::clock::stamp(next)).await?;
         let looked = match record.status.ended() {
             true if cancel_owed => stop_again(backends, ctx, &record).await,
             true => Ok(()),
@@ -165,6 +166,12 @@ pub(crate) async fn refresh(
         Err(CallError::Internal(e)) => {
             tracing::warn!(call = %record.id, error = %format!("{e:#}"), "following a call's target run failed; its last state stands");
             crate::calls::store::touched(pool, &record.id).await?;
+        }
+        Err(CallError::Throttled { after, why }) => {
+            tracing::warn!(call = %record.id, wait_secs = after.as_secs(), error = %why, "the target system is rate limiting; waiting");
+            let next =
+                jiff::Timestamp::now().checked_add(jiff::SignedDuration::try_from(after)?)?;
+            crate::calls::store::poll_at(pool, &record.id, &crate::clock::stamp(next)).await?;
         }
         Err(refused) => {
             crate::calls::api::stop_target(backends, ctx, &record).await?;
@@ -362,6 +369,49 @@ mod tests {
                 .expect("due")
                 .is_none()
         );
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn each_call_waits_its_backends_cadence_between_looks(pool: PgPool) {
+        let dir = tempfile::tempdir().expect("dir");
+        let (backends, ctx) = ctx(&pool, dir.path());
+        run(&pool, "caller", "playbook:caller:1", "running").await;
+        run(&pool, "t-1", "playbook:triage:1", "running").await;
+        let id = claim(&pool, "caller", 1, &playbook()).await;
+        crate::calls::store::dispatched(&pool, &id, &started("playbook:triage:1", "t-1"))
+            .await
+            .expect("dispatched");
+
+        let first = later(60);
+        assert_eq!(refresh_due(&backends, &ctx, first).await.expect("pass"), 1);
+        assert_eq!(
+            status(&pool, &id).await.0,
+            "pending",
+            "the target still runs"
+        );
+        let next = crate::calls::store::earliest_due(&pool)
+            .await
+            .expect("due")
+            .expect("still followed");
+        assert_eq!(
+            next,
+            crate::clock::stamp(
+                first
+                    .checked_add(jiff::SignedDuration::try_from(REFRESH_EVERY).unwrap())
+                    .unwrap()
+            )
+        );
+        let at = |secs: i64| {
+            first
+                .checked_add(jiff::SignedDuration::from_secs(secs))
+                .unwrap()
+        };
+        assert_eq!(
+            refresh_due(&backends, &ctx, at(3)).await.expect("pass"),
+            0,
+            "not before its next look"
+        );
+        assert_eq!(refresh_due(&backends, &ctx, at(6)).await.expect("pass"), 1);
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]

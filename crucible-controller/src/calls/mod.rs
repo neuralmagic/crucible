@@ -61,6 +61,11 @@ pub(crate) enum CallError {
     Unrecorded { call: CallId, what: &'static str },
     #[error("this {0} backend follows target runs and launches none")]
     FollowOnly(CallKind),
+    #[error("{why}; asking again in {}s", after.as_secs())]
+    Throttled {
+        after: std::time::Duration,
+        why: String,
+    },
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -212,6 +217,10 @@ pub(crate) trait TargetBackend: Send + Sync {
     ) -> Result<Dispatched, CallError>;
 
     async fn poll(&self, ctx: &CallCtx, call: &CallRecord) -> Result<Polled, CallError>;
+
+    fn cadence(&self, _call: &CallRecord, _now: jiff::Timestamp) -> std::time::Duration {
+        crate::calls::refresh::REFRESH_EVERY
+    }
 
     async fn result_file(
         &self,

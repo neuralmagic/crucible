@@ -1728,6 +1728,7 @@ base-image = "{{ builds.vllm-sandbox.digest_ref }}"
                 doing: "dispatching the workflow".into(),
                 status,
                 body: String::new(),
+                retry_after: None,
             }
             .into()
         };

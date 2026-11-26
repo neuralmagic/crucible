@@ -26,6 +26,14 @@ const FRESH_RUN: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 fn following(e: TargetError, call: &CallRecord, now: jiff::Timestamp) -> CallError {
     let fresh = age(call, now).is_some_and(|age| age < FRESH_RUN);
+    if let TargetError::Github(api) = &e
+        && let Some(after) = api.retry_after()
+    {
+        return CallError::Throttled {
+            after,
+            why: e.to_string(),
+        };
+    }
     match &e {
         TargetError::Github(GithubError::Api {
             status: 403 | 429, ..
@@ -35,6 +43,15 @@ fn following(e: TargetError, call: &CallRecord, now: jiff::Timestamp) -> CallErr
         }
         _ => e.into(),
     }
+}
+
+fn cadence_at(call: &CallRecord, now: jiff::Timestamp) -> std::time::Duration {
+    let secs = match age(call, now).map(|a| a.as_secs()) {
+        Some(0..120) => 10,
+        Some(120..1800) | None => 30,
+        Some(_) => 60,
+    };
+    std::time::Duration::from_secs(secs)
 }
 
 fn age(call: &CallRecord, now: jiff::Timestamp) -> Option<std::time::Duration> {
@@ -151,6 +168,10 @@ impl TargetBackend for GithubWorkflowBackend {
         })
     }
 
+    fn cadence(&self, call: &CallRecord, now: jiff::Timestamp) -> std::time::Duration {
+        cadence_at(call, now)
+    }
+
     async fn poll(&self, ctx: &CallCtx, call: &CallRecord) -> Result<Polled, CallError> {
         let (repo, run_id) = run_of(call)?;
         let (_, _, _, outputs) = github_target(&call.target)?;
@@ -252,7 +273,7 @@ mod tests {
     use forge::github::GithubError;
 
     use crate::calls::github::TargetError;
-    use crate::calls::github::backend::{age, following, run_links, unchecked_commit};
+    use crate::calls::github::backend::{age, cadence_at, following, run_links, unchecked_commit};
     use crate::calls::{CallError, CallRecord};
     use crucible_contract::calls::{
         CallAlias, CallId, CallKind, CallStatus, CallTarget, FileRef, PlaybookRef, TargetInterface,
@@ -295,6 +316,7 @@ mod tests {
             doing: "listing the run's jobs".into(),
             status,
             body: String::new(),
+            retry_after: None,
         })
     }
 
@@ -315,6 +337,26 @@ mod tests {
         }
         assert!(!retried(api(410), &fresh));
         assert!(!retried(api(422), &old));
+        let limited = TargetError::Github(GithubError::Api {
+            doing: "reading the run".into(),
+            status: 403,
+            body: String::new(),
+            retry_after: Some(90),
+        });
+        assert!(matches!(
+            following(limited, &old, now),
+            CallError::Throttled { after, .. } if after.as_secs() == 90
+        ));
+    }
+
+    #[test]
+    fn a_run_is_looked_at_less_often_as_it_ages() {
+        let now: jiff::Timestamp = "2026-11-25T12:00:00Z".parse().unwrap();
+        let every = |created: &str| cadence_at(&record(created), now).as_secs();
+        assert_eq!(every("2026-11-25T11:59:30Z"), 10);
+        assert_eq!(every("2026-11-25T11:50:00Z"), 30);
+        assert_eq!(every("2026-11-25T11:00:00Z"), 60);
+        assert_eq!(every("not a time"), 30);
     }
 
     #[test]

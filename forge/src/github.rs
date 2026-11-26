@@ -75,6 +75,7 @@ pub enum GithubError {
         doing: String,
         status: u16,
         body: String,
+        retry_after: Option<u64>,
     },
     #[error("GitHub {doing}: {cause}")]
     Http {
@@ -86,6 +87,16 @@ pub enum GithubError {
 }
 
 impl GithubError {
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            GithubError::Api {
+                retry_after: Some(secs),
+                ..
+            } => Some(std::time::Duration::from_secs(*secs)),
+            _ => None,
+        }
+    }
+
     pub fn is_transient(&self) -> bool {
         match self {
             GithubError::Http { .. } => true,
@@ -600,10 +611,25 @@ impl Client {
         if status.is_success() || status.is_redirection() {
             return Ok(resp);
         }
+        let header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        let limits = RateHeaders {
+            retry_after: header("retry-after"),
+            remaining: header("x-ratelimit-remaining"),
+            reset: header("x-ratelimit-reset"),
+        };
         let body = resp.text().await.unwrap_or_default();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
         Err(GithubError::Api {
             doing: doing.to_owned(),
             status: status.as_u16(),
+            retry_after: rate_wait(status.as_u16(), &limits, &body, now),
             body: body.chars().take(ERR_BODY_CHARS).collect(),
         })
     }
@@ -654,6 +680,38 @@ fn install_crypto_provider() {
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     }
+}
+
+struct RateHeaders {
+    retry_after: Option<String>,
+    remaining: Option<String>,
+    reset: Option<String>,
+}
+
+const SECONDARY_LIMIT_WAIT: u64 = 60;
+
+fn rate_wait(status: u16, headers: &RateHeaders, body: &str, now: u64) -> Option<u64> {
+    if !matches!(status, 403 | 429) {
+        return None;
+    }
+    if let Some(secs) = headers
+        .retry_after
+        .as_deref()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        return Some(secs.max(1));
+    }
+    let spent = headers.remaining.as_deref().map(str::trim) == Some("0");
+    if spent
+        && let Some(reset) = headers
+            .reset
+            .as_deref()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        return Some(reset.saturating_sub(now).max(1));
+    }
+    let limited = status == 429 || body.to_ascii_lowercase().contains("rate limit");
+    limited.then_some(SECONDARY_LIMIT_WAIT)
 }
 
 async fn capped(
@@ -732,6 +790,7 @@ mod tests {
             doing: "x".into(),
             status,
             body: String::new(),
+            retry_after: None,
         };
         for status in [429, 500, 502] {
             assert!(api(status).is_transient(), "{status}");
@@ -838,5 +897,57 @@ mod tests {
             .unwrap();
         let workflow = crate::github::workflow::Workflow::parse(&text).unwrap();
         assert!(!workflow.jobs.is_empty());
+    }
+
+    #[test]
+    fn a_rate_limited_answer_says_how_long_to_wait() {
+        let headers =
+            |retry: Option<&str>, remaining: Option<&str>, reset: Option<&str>| RateHeaders {
+                retry_after: retry.map(str::to_owned),
+                remaining: remaining.map(str::to_owned),
+                reset: reset.map(str::to_owned),
+            };
+        let none = headers(None, None, None);
+        assert_eq!(
+            rate_wait(403, &headers(Some("30"), None, None), "", 0),
+            Some(30)
+        );
+        assert_eq!(
+            rate_wait(429, &headers(Some("0"), None, None), "", 0),
+            Some(1)
+        );
+        assert_eq!(
+            rate_wait(403, &headers(None, Some("0"), Some("1000")), "", 940),
+            Some(60)
+        );
+        assert_eq!(
+            rate_wait(403, &headers(None, Some("0"), Some("900")), "", 940),
+            Some(1)
+        );
+        assert_eq!(
+            rate_wait(403, &headers(None, Some("12"), Some("1000")), "", 940),
+            None,
+            "a 403 with budget left is a permission answer"
+        );
+        assert_eq!(
+            rate_wait(403, &none, "You have exceeded a secondary rate limit", 0),
+            Some(SECONDARY_LIMIT_WAIT)
+        );
+        assert_eq!(rate_wait(429, &none, "", 0), Some(SECONDARY_LIMIT_WAIT));
+        assert_eq!(rate_wait(403, &none, "Resource not accessible", 0), None);
+        assert_eq!(
+            rate_wait(500, &headers(Some("30"), None, None), "", 0),
+            None
+        );
+        let limited = GithubError::Api {
+            doing: "x".into(),
+            status: 403,
+            body: String::new(),
+            retry_after: Some(42),
+        };
+        assert_eq!(
+            limited.retry_after(),
+            Some(std::time::Duration::from_secs(42))
+        );
     }
 }

@@ -71,6 +71,7 @@ impl From<CallError> for NotDispatched {
     fn from(e: CallError) -> Self {
         match e {
             CallError::Internal(e) => NotDispatched::Internal(e),
+            e @ CallError::Throttled { .. } => NotDispatched::Internal(anyhow::Error::new(e)),
             other => NotDispatched::Refused(other.note()),
         }
     }
