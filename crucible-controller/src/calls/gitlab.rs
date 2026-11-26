@@ -22,7 +22,8 @@ use crucible_ci::gitlab::{Gitlab, GitlabError, ProjectPath};
 use crucible_ci::token::BearerToken;
 use crucible_contract::calls::{
     CallBudget, CallStatus, CallTarget, FileRef, GITLAB_RESULT_FILE, GitRefName, GitlabOutputs,
-    LockedCall, MAX_FILE_PARAM_BYTES, NodeLink, Pin, ProgressGraph, TargetHandle, TargetInterface,
+    LockedCall, MAX_FILE_PARAM_BYTES, NamedLink, NodeLink, Pin, ProgressGraph, TargetHandle,
+    TargetInterface,
 };
 use crucible_contract::emits::value_type;
 use crucible_contract::link::ExternalUrl;
@@ -99,6 +100,7 @@ pub struct PipelinePoll {
     pub progress: ProgressGraph,
     pub number: Option<u64>,
     pub outcome: Option<GitlabOutcome>,
+    pub links: Vec<NamedLink>,
 }
 
 /// A target's parts, checked.
@@ -393,6 +395,7 @@ impl GitlabPipelineBackend {
             progress,
             number: pipeline.iid,
             outcome,
+            links: pipeline_links(&place.host, &place.project, &pipeline),
         })
     }
 
@@ -573,6 +576,29 @@ async fn glab_token(host: &ForgeHost) -> Result<BearerToken, TargetError> {
         true => Ok(BearerToken::new(token)),
         false => Err(failed("glab holds no token for the host".into())),
     }
+}
+
+fn pipeline_links(host: &ForgeHost, project: &ProjectPath, pipeline: &Pipeline) -> Vec<NamedLink> {
+    let base = format!("https://{}/{}", host.as_str(), project.as_str());
+    let merge_request = pipeline
+        .git_ref
+        .strip_prefix("refs/merge-requests/")
+        .and_then(|rest| rest.split('/').next())
+        .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    [
+        Some(("Project", base.clone())),
+        Some(("Commit", format!("{base}/-/commit/{}", pipeline.sha))),
+        merge_request.map(|n| ("Merge request", format!("{base}/-/merge_requests/{n}"))),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|(label, url)| {
+        ExternalUrl::new(url).ok().map(|url| NamedLink {
+            label: label.to_owned(),
+            url,
+        })
+    })
+    .collect()
 }
 
 fn latest_job<'a>(jobs: &'a [Job], name: &str) -> Option<&'a Job> {
@@ -776,6 +802,46 @@ mod tests {
                 .contains("not an object")
         );
         assert!(fields(b"nope", &outputs).unwrap_err().contains("not JSON"));
+    }
+
+    #[test]
+    fn a_pipeline_names_its_project_commit_and_merge_request() {
+        let host = ForgeHost::parse("gitlab.example.com").unwrap();
+        let project = ProjectPath::parse("g/app").unwrap();
+        let mut pipeline: Pipeline = serde_json::from_value(json!({
+            "id": 9, "sha": "abc123", "ref": "main", "status": "running",
+        }))
+        .unwrap();
+        let shown = |links: Vec<NamedLink>| -> Vec<(String, String)> {
+            links
+                .into_iter()
+                .map(|l| (l.label, l.url.as_str().to_owned()))
+                .collect()
+        };
+        assert_eq!(
+            shown(pipeline_links(&host, &project, &pipeline)),
+            [
+                (
+                    "Project".to_owned(),
+                    "https://gitlab.example.com/g/app".to_owned()
+                ),
+                (
+                    "Commit".to_owned(),
+                    "https://gitlab.example.com/g/app/-/commit/abc123".to_owned()
+                ),
+            ]
+        );
+        pipeline.git_ref = "refs/merge-requests/42/head".into();
+        let links = shown(pipeline_links(&host, &project, &pipeline));
+        assert_eq!(
+            links.last(),
+            Some(&(
+                "Merge request".to_owned(),
+                "https://gitlab.example.com/g/app/-/merge_requests/42".to_owned()
+            ))
+        );
+        pipeline.git_ref = "refs/merge-requests/x/head".into();
+        assert_eq!(pipeline_links(&host, &project, &pipeline).len(), 2);
     }
 
     #[test]

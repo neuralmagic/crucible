@@ -53,6 +53,25 @@ fn run_of(call: &CallRecord) -> Result<(&GithubRepo, u64), CallError> {
     }
 }
 
+fn run_links(repo: &GithubRepo, head_sha: &str) -> Vec<crucible_contract::calls::NamedLink> {
+    let base = format!("https://github.com/{}", repo.as_str());
+    [
+        ("Repo", base.clone()),
+        ("Commit", format!("{base}/commit/{head_sha}")),
+    ]
+    .into_iter()
+    .filter(|(label, _)| *label != "Commit" || !head_sha.is_empty())
+    .filter_map(|(label, url)| {
+        crucible_contract::link::ExternalUrl::new(url)
+            .ok()
+            .map(|url| crucible_contract::calls::NamedLink {
+                label: label.to_owned(),
+                url,
+            })
+    })
+    .collect()
+}
+
 fn unchecked_commit(detail: &Value) -> Option<&str> {
     match detail.get("head_sha") {
         Some(_) => None,
@@ -163,6 +182,7 @@ impl TargetBackend for GithubWorkflowBackend {
                 });
             }
         }
+        crate::calls::record_links(&mut recorded, &run_links(repo, &polled.head_sha));
         recorded.insert("head_sha".to_owned(), polled.head_sha.into());
         let outcome = match polled.outcome {
             Some(outcome) => Some(self.kept(ctx, call, outcome).await?),
@@ -232,7 +252,7 @@ mod tests {
     use forge::github::GithubError;
 
     use crate::calls::github::TargetError;
-    use crate::calls::github::backend::{age, following, unchecked_commit};
+    use crate::calls::github::backend::{age, following, run_links, unchecked_commit};
     use crate::calls::{CallError, CallRecord};
     use crucible_contract::calls::{
         CallAlias, CallId, CallKind, CallStatus, CallTarget, FileRef, PlaybookRef, TargetInterface,
@@ -405,5 +425,25 @@ mod tests {
             Some(std::time::Duration::from_secs(300))
         );
         assert_eq!(age(&record("not a time"), now), None);
+    }
+
+    #[test]
+    fn a_run_names_its_repo_and_commit() {
+        let repo = crucible_contract::calls::GithubRepo::parse("acme/app").unwrap();
+        let links: Vec<(String, String)> = run_links(&repo, "abc")
+            .into_iter()
+            .map(|l| (l.label, l.url.as_str().to_owned()))
+            .collect();
+        assert_eq!(
+            links,
+            [
+                ("Repo".to_owned(), "https://github.com/acme/app".to_owned()),
+                (
+                    "Commit".to_owned(),
+                    "https://github.com/acme/app/commit/abc".to_owned()
+                ),
+            ]
+        );
+        assert_eq!(run_links(&repo, "").len(), 1);
     }
 }

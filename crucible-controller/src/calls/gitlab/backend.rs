@@ -147,6 +147,7 @@ impl TargetBackend for GitlabPipelineBackend {
         if let Some(number) = polled.number {
             recorded.insert("run_number".to_owned(), number.into());
         }
+        crate::calls::record_links(&mut recorded, &polled.links);
         let outcome = match polled.outcome {
             Some(outcome) => Some(self.kept(ctx, call, outcome).await?),
             None => {

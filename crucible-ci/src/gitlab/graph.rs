@@ -79,15 +79,21 @@ pub fn pipeline_graph(jobs: &[Job], bridges: &[Bridge], shape: &Shape) -> RunGra
             url: j.web_url.as_deref(),
             downstream: None,
         })
-        .chain(bridges.iter().map(|b| Row {
-            id: b.id,
-            name: &b.name,
-            stage: &b.stage,
-            status: job_status(&b.status, b.allow_failure),
-            started: b.started_at.clone(),
-            ended: b.finished_at.clone(),
-            url: b.web_url.as_deref(),
-            downstream: b.downstream_pipeline.as_ref().map(|d| d.id),
+        .chain(bridges.iter().map(|b| {
+            Row {
+                id: b.id,
+                name: &b.name,
+                stage: &b.stage,
+                status: job_status(&b.status, b.allow_failure),
+                started: b.started_at.clone(),
+                ended: b.finished_at.clone(),
+                url: b
+                    .downstream_pipeline
+                    .as_ref()
+                    .and_then(|d| d.web_url.as_deref())
+                    .or(b.web_url.as_deref()),
+                downstream: b.downstream_pipeline.as_ref().map(|d| d.id),
+            }
         }))
         .collect();
     rows.sort_by_key(|r| r.id);
@@ -202,7 +208,7 @@ pub fn pipeline_state(pipeline: &Pipeline, jobs: &[Job]) -> PipelineState {
 
 #[cfg(test)]
 mod tests {
-    use crucible_contract::calls::NodeStatus;
+    use crucible_contract::calls::{NodeLink, NodeStatus};
     use crucible_contract::session::TaskStatus;
     use serde_json::json;
 
@@ -309,7 +315,8 @@ mod tests {
         ];
         let bridge: Bridge = serde_json::from_value(json!({
             "id": 4, "name": "deploy", "stage": "deploy", "status": "running",
-            "downstream_pipeline": {"id": 99}
+            "web_url": "https://gitlab.example.com/g/p/-/jobs/4",
+            "downstream_pipeline": {"id": 99, "web_url": "https://gitlab.example.com/g/ops/-/pipelines/99"}
         }))
         .expect("bridge parses");
         let lint: Lint = serde_json::from_value(json!({
@@ -331,6 +338,12 @@ mod tests {
             .collect();
         assert_eq!(edges, [("build", "test"), ("test", "deploy")]);
         assert_eq!(g.jobs.get("deploy").and_then(|d| d.downstream), Some(99));
+        let deploy = g.graph.nodes.iter().find(|n| n.id == "deploy").unwrap();
+        assert!(
+            matches!(&deploy.link, Some(NodeLink::External { url }) if url.as_str() == "https://gitlab.example.com/g/ops/-/pipelines/99"),
+            "{:?}",
+            deploy.link
+        );
     }
 
     #[test]
