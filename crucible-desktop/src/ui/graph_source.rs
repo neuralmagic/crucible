@@ -38,6 +38,16 @@ pub(crate) enum Edit {
     Changed,
 }
 
+const TITLE_PAD: char = '\u{2800}';
+
+fn title_pad(kind: crucible_contract::calls::CallKind) -> String {
+    let width = match kind.presentation().icon {
+        Some(_) => 14,
+        None => 8,
+    };
+    std::iter::repeat_n(TITLE_PAD, width).collect()
+}
+
 fn definition(task: &TaskView) -> impl PartialEq + '_ {
     (
         (
@@ -427,8 +437,9 @@ pub(crate) fn mermaid_source<'a>(tasks: &'a [TaskView], shown: &Shown, ink: &Ink
             match frames.get(i).and_then(Option::as_ref) {
                 Some(frame) if !frame.body.is_empty() => {
                     source.push_str(&format!(
-                        "  subgraph g{i} [\"{}\"]\n{}  end\n",
+                        "  subgraph g{i} [\"{}{}\"]\n{}  end\n",
                         clean(&named),
+                        title_pad(frame.kind),
                         frame.body
                     ));
                     edge += frame.links;
@@ -1319,7 +1330,7 @@ mod tests {
             &open,
             &[
                 concat!(
-                    "  subgraph g1 [\"ship \u{b7} release \u{b7} app\"]\n",
+                    "  subgraph g1 [\"ship \u{b7} release \u{b7} app\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\"]\n",
                     "    t1c0(\"\u{2713} lint\")\n",
                     "    t1c1([\"\u{25cf} test \u{d7}2 (1 ok)\"])\n",
                     "    t1c0 --> t1c1\n",
@@ -1380,7 +1391,7 @@ mod tests {
         let open = called(&tasks, None, &[], &targets, &[]);
         contains_all(
             &open,
-            &["  subgraph g1 [\"ship \u{b7} release \u{b7} app #10\"]\n"],
+            &["  subgraph g1 [\"ship \u{b7} release \u{b7} app #10\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\"]\n"],
         );
         let folded = called(&tasks, None, &[], &targets, &["ship"]);
         contains_all(
@@ -1390,7 +1401,7 @@ mod tests {
         let unnumbered = called(&tasks, None, &[], &Targets::new(&shipping(), None), &[]);
         contains_all(
             &unnumbered,
-            &["  subgraph g1 [\"ship \u{b7} release \u{b7} app\"]\n"],
+            &["  subgraph g1 [\"ship \u{b7} release \u{b7} app\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\"]\n"],
         );
     }
 
@@ -1427,7 +1438,7 @@ mod tests {
         contains_all(
             &open,
             &[
-                "  subgraph g1 [\"deploy \u{b7} ship \u{b7} app #17\"]\n",
+                "  subgraph g1 [\"deploy \u{b7} ship \u{b7} app #17\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\"]\n",
                 "class t1c0 job_gitlab_pipeline_pass",
                 "class t1c1 job_gitlab_pipeline_running",
                 "classDef job_gitlab_pipeline fill:",
