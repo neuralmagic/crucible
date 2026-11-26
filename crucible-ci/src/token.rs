@@ -7,7 +7,7 @@ impl BearerToken {
         BearerToken(token.into())
     }
 
-    pub(crate) fn expose(&self) -> &str {
+    pub fn expose(&self) -> &str {
         &self.0
     }
 }

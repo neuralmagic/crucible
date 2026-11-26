@@ -206,7 +206,7 @@ impl GitlabPipelineBackend {
         )?)
     }
 
-    async fn token(&self, host: &ForgeHost) -> Result<BearerToken, TargetError> {
+    pub(crate) async fn token(&self, host: &ForgeHost) -> Result<BearerToken, TargetError> {
         match &self.tokens {
             TokenSource::Person(held) => {
                 match held.token(crate::identity::forge::Forge::Gitlab, host) {

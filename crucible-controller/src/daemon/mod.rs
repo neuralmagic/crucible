@@ -167,6 +167,10 @@ pub async fn assemble(
             db.clone(),
             cfg.clone(),
         )),
+        Arc::new(crate::playbooks::promotion::follow::PromotionFollow::new(
+            db.clone(),
+            cfg.clone(),
+        )),
     ]));
     let mut sources: Vec<Arc<dyn DiscoverySource>> = vec![
         Arc::new(trigger_sweep(vec![Arc::new(

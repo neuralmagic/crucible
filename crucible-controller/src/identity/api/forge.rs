@@ -87,7 +87,7 @@ pub(crate) async fn list_forge_apps(State(state): State<ApiState>) -> Json<Vec<F
     Json(forge_apps(&state))
 }
 
-fn person(caller: &Caller) -> Result<&str, &'static str> {
+pub(crate) fn person(caller: &Caller) -> Result<&str, &'static str> {
     match (&caller.acting_as, caller.principals.user()) {
         (None, Some(Principal::User(login))) => Ok(login),
         (Some(_), _) => Err("a forge account links to a person; stop acting as a team first"),
@@ -141,12 +141,16 @@ fn account(state: &ApiState, forge: &str, host: &str) -> Result<(Forge, ForgeHos
     Ok((forge, host))
 }
 
-enum Whoami {
+pub(crate) enum Whoami {
     Refused(String),
     Unreachable(String),
 }
 
-async fn whoami(forge: Forge, host: &ForgeHost, token: &str) -> Result<(u64, String), Whoami> {
+pub(crate) async fn whoami(
+    forge: Forge,
+    host: &ForgeHost,
+    token: &str,
+) -> Result<(u64, String), Whoami> {
     match forge {
         Forge::Github => {
             let client =
@@ -180,7 +184,7 @@ fn gitlab_api(host: &ForgeHost) -> Result<crucible_ci::gitlab::Gitlab, Whoami> {
         .map_err(|e| Whoami::Refused(e.to_string()))
 }
 
-async fn issued_here(
+pub(crate) async fn issued_here(
     state: &ApiState,
     forge: Forge,
     host: &ForgeHost,

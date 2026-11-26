@@ -16,5 +16,6 @@ pub mod packs;
 pub mod plan_graph;
 pub mod preflight;
 pub mod preview;
+pub mod promotion;
 pub mod providers;
 pub mod registry;

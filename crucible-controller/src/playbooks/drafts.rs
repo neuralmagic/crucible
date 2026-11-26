@@ -12,7 +12,7 @@
 
 use crate::playbooks::pack_trees::PACK_COLS;
 use crate::playbooks::plan_graph::WorkflowGraphDto;
-use crate::playbooks::registry::{RegisterError, validate_id, validate_path};
+use crate::playbooks::registry::{RegisterError, validate_id};
 use anyhow::{Context, Result};
 use crucible_contract::pack_tree::{PackTree, TreeDigest};
 use serde::{Deserialize, Serialize};
@@ -1616,82 +1616,6 @@ pub fn publish_target(draft: &DraftRow, asked: Option<&str>) -> Result<String, D
     }
     validate_id(target).map_err(DraftError::Invalid)?;
     Ok(target.to_string())
-}
-
-/// Export a draft as a pull request: push its newest compiling version to `repo` under `path` as a
-/// branch pair, and open the draft PR. Idempotent — a draft already graduated and not yet retired
-/// keeps its stored url rather than opening a second PR.
-pub async fn graduate(
-    pool: &PgPool,
-    id: &str,
-    repo: &str,
-    path: &str,
-    token: Option<String>,
-) -> Result<String, DraftError> {
-    let draft = get(pool, id)
-        .await
-        .map_err(DraftError::Internal)?
-        .ok_or_else(|| DraftError::NotFound(format!("no draft {id:?}")))?;
-    if let Some(url) = draft.graduation_pr_url.as_deref()
-        && draft.retired_at.is_none()
-    {
-        return Err(DraftError::Conflict(url.to_string()));
-    }
-    validate_path(path).map_err(DraftError::Invalid)?;
-    if repo.trim().is_empty() || repo.starts_with('-') {
-        return Err(DraftError::Invalid(format!("repo {repo:?} is not a repo")));
-    }
-
-    let (version, tree) = newest_compiling(pool, id).await?;
-
-    let title = format!("[pack] {id}");
-    let body = format!(
-        "Exported from the controller's authoring studio: draft `{id}` at version {version}.\n\n\
-         The diff is the pack. Merge it, then import it at `{repo}`/`{path}` to register it; the \
-         draft retires when that import lands.\n"
-    );
-    let (branch_repo, branch_path, branch_key) =
-        (repo.to_string(), path.to_string(), format!("draft/{id}"));
-    let pushed = tokio::task::spawn_blocking(move || {
-        let scratch = tempfile::tempdir()
-            .context("draft export scratch dir")
-            .map_err(DraftError::Internal)?;
-        let out = if branch_path.is_empty() {
-            scratch.path().to_path_buf()
-        } else {
-            scratch.path().join(&branch_path)
-        };
-        crate::playbooks::packs::write_tree(&tree, &out).map_err(DraftError::Internal)?;
-        crate::runs::engine::open_draft_pr(
-            &branch_repo,
-            &branch_key,
-            scratch.path(),
-            &title,
-            &body,
-            token.as_deref(),
-        )
-        .map_err(|e| DraftError::Push(format!("{e:#}")))
-    })
-    .await
-    .context("joining the draft export worker")
-    .map_err(DraftError::Internal)?;
-    let url = pushed?;
-
-    sqlx::query(
-        r#"UPDATE playbook_drafts
-           SET graduation_repo = $2, graduation_path = $3, graduation_pr_url = $4, updated_at = $5
-           WHERE id = $1"#,
-    )
-    .bind(id)
-    .bind(repo)
-    .bind(path)
-    .bind(&url)
-    .bind(crate::clock::now_rfc3339())
-    .execute(pool)
-    .await
-    .context("storing the draft graduation")
-    .map_err(DraftError::Internal)?;
-    Ok(url)
 }
 
 #[cfg(test)]

@@ -115,7 +115,8 @@ pub(crate) mod tests;
         crate::playbooks::api::blueprints::list_blueprints,
         crate::playbooks::api::blueprints::use_blueprint,
         crate::playbooks::api::drafts::launch_playbook_draft,
-        crate::playbooks::api::drafts::graduate_playbook_draft,
+        crate::playbooks::promotion::api::promote_playbook_draft,
+        crate::playbooks::promotion::api::get_playbook_draft_promotion,
         crate::playbooks::api::drafts::publish_playbook_draft,
         crate::playbooks::api::registry::list_playbooks,
         crate::playbooks::api::registry::get_playbook,
@@ -295,8 +296,9 @@ pub(crate) mod tests;
         crate::playbooks::api::drafts::CreateDraftBody,
         crate::playbooks::api::drafts::SaveDraftBody,
         crate::playbooks::api::drafts::LaunchDraftBody,
-        crate::playbooks::api::drafts::GraduateDraftBody,
-        crate::playbooks::api::drafts::GraduateAck,
+        crate::playbooks::promotion::api::PromoteBody,
+        crate::playbooks::promotion::PromotionDto,
+        crate::playbooks::promotion::PromotionState,
         crate::playbooks::api::drafts::PublishDraftBody,
         crate::playbooks::api::drafts::RenameDraftBody,
         crate::playbooks::api::drafts::DraftRenamedDto,
@@ -577,7 +579,10 @@ pub fn router(state: ApiState) -> Router {
             crate::playbooks::api::drafts::launch_playbook_draft
         ))
         .routes(routes!(
-            crate::playbooks::api::drafts::graduate_playbook_draft
+            crate::playbooks::promotion::api::promote_playbook_draft
+        ))
+        .routes(routes!(
+            crate::playbooks::promotion::api::get_playbook_draft_promotion
         ))
         .routes(routes!(
             crate::playbooks::api::drafts::publish_playbook_draft

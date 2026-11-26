@@ -410,6 +410,7 @@ impl Checkout {
 #[derive(Clone, Default)]
 pub struct PackGit {
     token: Option<String>,
+    gitlab: Option<(String, String)>,
 }
 
 impl PackGit {
@@ -417,11 +418,24 @@ impl PackGit {
         app: Option<&crate::secrets::github_app::GithubAppTokenSource>,
     ) -> Result<Self> {
         let token = crate::runs::engine::resolve_pack_pr_token_for(app).await?;
-        Ok(PackGit { token })
+        Ok(PackGit {
+            token,
+            gitlab: None,
+        })
+    }
+
+    pub(crate) fn with_gitlab(mut self, host: &str, token: String) -> Self {
+        self.gitlab = Some((host.to_owned(), token));
+        self
     }
 
     fn clone_url(&self, repo: &str) -> String {
         let url = crate::runs::engine::repo_clone_url(repo);
+        if let Some((host, t)) = &self.gitlab
+            && url.starts_with(&format!("https://{host}/"))
+        {
+            return url.replacen("https://", &format!("https://oauth2:{t}@"), 1);
+        }
         match &self.token {
             Some(t) if url.starts_with("https://github.com/") => {
                 url.replacen("https://", &format!("https://x-access-token:{t}@"), 1)
@@ -432,9 +446,15 @@ impl PackGit {
 
     /// The token never leaves this value through an error message.
     fn scrub(&self, err: RegisterError) -> RegisterError {
-        match (err, &self.token) {
-            (RegisterError::Fetch(msg), Some(t)) => RegisterError::Fetch(msg.replace(t, "***")),
-            (err, _) => err,
+        match err {
+            RegisterError::Fetch(msg) => {
+                let secrets = self
+                    .token
+                    .iter()
+                    .chain(self.gitlab.as_ref().map(|(_, t)| t));
+                RegisterError::Fetch(secrets.fold(msg, |msg, t| msg.replace(t.as_str(), "***")))
+            }
+            err => err,
         }
     }
 
@@ -2801,6 +2821,7 @@ workflow(type = "playbook", tasks = [seed, options])
     fn a_github_clone_carries_the_token_and_nothing_else_does() {
         let git = PackGit {
             token: Some("ghs_secret".to_string()),
+            gitlab: None,
         };
         assert_eq!(
             git.clone_url("neuralmagic/crucible"),
@@ -2819,16 +2840,34 @@ workflow(type = "playbook", tasks = [seed, options])
             PackGit::default().clone_url("neuralmagic/crucible"),
             "https://github.com/neuralmagic/crucible.git"
         );
+        let gl = git.with_gitlab("gitlab.example.com", "glpat_secret".into());
+        assert_eq!(
+            gl.clone_url("https://gitlab.example.com/g/packs.git"),
+            "https://oauth2:glpat_secret@gitlab.example.com/g/packs.git"
+        );
+        assert_eq!(
+            gl.clone_url("https://gitlab.example.com.evil.io/g/packs.git"),
+            "https://gitlab.example.com.evil.io/g/packs.git"
+        );
+        assert_eq!(
+            gl.clone_url("https://gitlab.com/o/r.git"),
+            "https://gitlab.com/o/r.git"
+        );
     }
 
     #[test]
     fn a_failed_clone_never_echoes_the_token() {
         let git = PackGit {
             token: Some("ghs_secret".to_string()),
+            gitlab: Some(("gitlab.example.com".into(), "glpat_secret".into())),
         };
         let err = git.scrub(RegisterError::Fetch(
             "git clone failed: fatal: https://x-access-token:ghs_secret@github.com/o/r.git".into(),
         ));
+        let gl = git.scrub(RegisterError::Fetch(
+            "fatal: https://oauth2:glpat_secret@gitlab.example.com/g/p.git".into(),
+        ));
+        assert!(!gl.to_string().contains("glpat_secret"), "{gl}");
         let text = err.to_string();
         assert!(!text.contains("ghs_secret"), "{text}");
         assert!(text.contains("x-access-token:***@github.com"), "{text}");

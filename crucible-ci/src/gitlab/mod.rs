@@ -16,6 +16,7 @@
 pub mod access;
 pub mod graph;
 pub mod inputs;
+pub mod merge;
 pub mod model;
 
 use std::collections::BTreeMap;

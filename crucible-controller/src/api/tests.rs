@@ -3492,7 +3492,8 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/playbook-drafts/{id}/rename",
         "/api/playbook-drafts/{id}/clone",
         "/api/playbook-drafts/{id}/launch",
-        "/api/playbook-drafts/{id}/graduate",
+        "/api/playbook-drafts/{id}/promote",
+        "/api/playbook-drafts/{id}/promotion",
         "/api/playbook-drafts/{id}/publish",
         "/api/playbook-runs",
         "/api/runs/{run}/call-progress",
@@ -9813,7 +9814,7 @@ async fn a_draft_seeds_from_a_registered_pack(pool: PgPool) -> Result<()> {
     assert_eq!(draft["origin"]["moved"], false);
     assert!(
         draft["origin"]["repo"].is_string(),
-        "graduation pre-fills its target from here: {draft}"
+        "promotion pre-fills its target from here: {draft}"
     );
     Ok(())
 }
@@ -10302,329 +10303,92 @@ async fn a_launch_of_a_tampered_tree_is_refused_naming_the_tree(pool: PgPool) ->
     Ok(())
 }
 
-/// Put a recording `git` and `gh` on PATH for the duration of a body: graduation's push and PR
-/// open are the two shells, and this is what proves which refs it pushed. The `git` stub delegates
-/// everything but `push` to the real binary, so a test running beside this one still gets git.
-/// The stubs are never deleted: a test beside this one can resolve `git` to the stub just before
-/// PATH is restored and run it afterwards.
-async fn with_forge_stubs<F, Fut, T>(f: F) -> (T, String)
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = T>,
-{
-    let _g = crate::ENV_LOCK.lock().await;
-    let bin = tempfile::tempdir().expect("stub dir").keep();
-    let log = bin.join("calls.log");
-    let write = |name: &str, body: String| {
-        let path = bin.join(name);
-        crate::testing::write_exec(&path, &body);
-    };
-    let log_path = log.to_string_lossy().to_string();
-    let real_git = String::from_utf8(
-        std::process::Command::new("/usr/bin/env")
-            .args(["which", "git"])
-            .output()
-            .expect("which git")
-            .stdout,
-    )
-    .expect("utf8")
-    .trim()
-    .to_string();
-    write(
-        "git",
-        format!(
-            "#!/bin/sh\ncase \"$*\" in\n  *push*) echo \"git $*\" >> '{log_path}'; exit 0 ;;\nesac\nexec '{real_git}' \"$@\"\n"
-        ),
-    );
-    write(
-        "gh",
-        format!(
-            "#!/bin/sh\necho \"gh $*\" >> '{log_path}'\ncase \"$2\" in\n  create) echo https://github.com/owner/packs/pull/7 ;;\nesac\nexit 0\n"
-        ),
-    );
-
-    let original = std::env::var("PATH").unwrap_or_default();
-    unsafe {
-        std::env::set_var("PATH", format!("{}:{original}", bin.display()));
-    }
-    let out = f().await;
-    unsafe {
-        std::env::set_var("PATH", &original);
-    }
-    (out, std::fs::read_to_string(&log).unwrap_or_default())
-}
-
-/// One registry row for the graduation tests: `owner`'s secret `name` of `kind`.
-async fn seed_registry_secret(
-    pool: &PgPool,
-    id: &str,
-    owner: &str,
-    name: &str,
-    kind: crate::secrets::SecretKind,
-) {
-    let owner = crate::authz::model::Principal::parse(owner).expect("principal");
-    let name = crate::secrets::SecretName::parse(name).expect("name");
-    let mut conn = pool.acquire().await.expect("conn");
-    crate::secrets::store::insert(
-        &mut conn,
-        &crate::secrets::store::NewSecret {
-            id,
-            name: &name,
-            owner: &owner,
-            kind,
-            visibility: crate::secrets::Visibility::BrokerOnly,
-            consumer: kind.default_consumer(),
-            mode: crate::secrets::SecretMode::Managed,
-            vault_path: "crucible/registry/key",
-            current_version: Some(1),
-            created_by: Some("wren"),
-        },
-    )
-    .await
-    .expect("insert a secret");
-}
-
-/// Graduating as yourself pushes with your own `github_token` secret: the token comes out of the
-/// registry's reader, the read lands on the secret's audit trail as the caller's, and the picker's
-/// list is filtered by kind on the server. A secret of another kind, one owned by someone the
-/// caller does not act for, and an unknown id are refused before anything is pushed or read.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn graduating_as_yourself_pushes_with_your_own_github_token(pool: PgPool) -> Result<()> {
-    use crate::secrets::SecretKind;
-    let (db, _dir) = db_with(pool);
-    let app = router(ApiState {
-        roles: crate::identity::auth::Roles::new(vec!["wren".to_string()], vec![], vec![]),
-        secret_provider: Some(Arc::new(crate::secrets::provider::MapProvider::new([
-            ("wren-pat".to_string(), "ghp-wren-0123".to_string()),
-            ("notes".to_string(), "not a token".to_string()),
-            ("bob-pat".to_string(), "ghp-bob-4567".to_string()),
-        ]))),
-        ..ApiState::test(db.clone())
-    });
-    let (status, body) = post_admin(
+async fn a_merged_promotion_registers_its_pack_and_retires_the_draft(pool: PgPool) -> Result<()> {
+    use crate::playbooks::promotion::{Promotion, PromotionState};
+    let (db, dir) = db_with(pool);
+    let app = app_with_admins(db.clone(), vec!["wren".to_string()]);
+    let created = post_admin(
         &app,
         "/api/playbook-drafts",
         serde_json::json!({"id": "studio", "description": "a drafted pack"}),
     )
     .await;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
-    seed_registry_secret(
-        db.pool(),
-        "s-wren-pat",
-        "user:wren",
-        "wren-pat",
-        SecretKind::GithubToken,
-    )
-    .await;
-    seed_registry_secret(
-        db.pool(),
-        "s-notes",
-        "user:wren",
-        "notes",
-        SecretKind::Opaque,
-    )
-    .await;
-    seed_registry_secret(
-        db.pool(),
-        "s-bob-pat",
-        "user:bob",
-        "bob-pat",
-        SecretKind::GithubToken,
-    )
-    .await;
-
-    let (status, listed) = get_json_as(&app, "/api/secrets?kind=github_token", "wren").await;
-    assert_eq!(status, StatusCode::OK, "{listed:?}");
-    let ids: Vec<&str> = listed.iter().filter_map(|s| s["id"].as_str()).collect();
-    assert_eq!(ids, vec!["s-wren-pat"], "{listed:?}");
-
-    let uri = "/api/playbook-drafts/studio/graduate";
-    let with = |secret: &str| serde_json::json!({"repo": "owner/packs", "path": "packs/studio", "github_secret_id": secret});
-    let (outcomes, log) = with_forge_stubs(|| async {
-        let mut outcomes = Vec::new();
-        for secret in ["s-notes", "s-bob-pat", "s-missing", "s-wren-pat"] {
-            outcomes.push((secret, post_admin(&app, uri, with(secret)).await));
-        }
-        outcomes
-    })
-    .await;
-    let status_of = |secret: &str| {
-        outcomes
-            .iter()
-            .find(|(s, _)| *s == secret)
-            .map(|(_, (status, body))| (*status, body.clone()))
-            .expect("an outcome")
-    };
-    let (status, body) = status_of("s-notes");
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    assert!(
-        body["error"]
-            .as_str()
-            .is_some_and(|e| e.contains("github_token")),
-        "{body}"
-    );
-    let (status, body) = status_of("s-bob-pat");
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    let (status, body) = status_of("s-missing");
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    let (status, body) = status_of("s-wren-pat");
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["pr_url"], "https://github.com/owner/packs/pull/7");
-
-    assert!(
-        log.contains("x-access-token:ghp-wren-0123@github.com/owner/packs"),
-        "the push rides the caller's token: {log}"
-    );
-    assert!(!log.contains("ghp-bob-4567"), "{log}");
-    let audited: Vec<(String, String, Option<String>, Option<String>)> =
-        sqlx::query_as("SELECT secret_id, action, actor, detail FROM secret_audit ORDER BY id")
-            .fetch_all(db.pool())
-            .await?;
-    assert_eq!(
-        audited,
-        vec![(
-            "s-wren-pat".to_string(),
-            "hub_read".to_string(),
-            Some("user:wren".to_string()),
-            Some("pushes draft studio to owner/packs".to_string()),
-        )],
-        "one read, by the caller, of the token that was used"
-    );
-    Ok(())
-}
-
-/// Graduation exports the draft as a PR over the pack-PR push, is idempotent against a second
-/// attempt, and the import of the merged pack is what retires the draft.
-#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn graduation_opens_a_pr_and_the_import_retires_the_draft(pool: PgPool) -> Result<()> {
-    let (db, dir) = db_with(pool);
-    let app = app_with_admins(db.clone(), vec!["wren".to_string()]);
-    let created = {
-        post_admin(
-            &app,
-            "/api/playbook-drafts",
-            serde_json::json!({"id": "studio", "description": "a drafted pack"}),
-        )
-        .await
-    };
     assert_eq!(created.0, StatusCode::CREATED, "{}", created.1);
 
-    let ((first, second), log) = with_forge_stubs(|| async {
-        let first = post_admin(
-            &app,
-            "/api/playbook-drafts/studio/graduate",
-            serde_json::json!({"repo": "owner/packs", "path": "packs/studio"}),
-        )
-        .await;
-        let second = post_admin(
-            &app,
-            "/api/playbook-drafts/studio/graduate",
-            serde_json::json!({"repo": "owner/packs", "path": "packs/studio"}),
-        )
-        .await;
-        (first, second)
-    })
-    .await;
-    assert_eq!(first.0, StatusCode::OK, "{}", first.1);
-    assert_eq!(first.1["pr_url"], "https://github.com/owner/packs/pull/7");
-    assert!(
-        log.contains("crucible-pack/draft_studio")
-            && log.contains("crucible-pack/draft_studio-base"),
-        "the branch pair is pushed: {log}"
-    );
-    assert_eq!(
-        second.0,
-        StatusCode::CONFLICT,
-        "a graduated draft does not open a second PR"
-    );
-    assert!(
-        second.1["error"]
-            .as_str()
-            .is_some_and(|e| e.contains("pull/7")),
-        "the standing PR rides the refusal: {}",
-        second.1
-    );
-
-    // The other half of the loop: registering the graduated repo/path retires the draft.
-    let repo = {
-        let repo = playbook_fixture(&dir.path().join("merged"), LAUNCH_WORKFLOW);
-        let (status, _) = {
-            post_admin(
-                &app,
-                "/api/playbooks",
-                serde_json::json!({
-                    "id": "studio-pack",
-                    "description": "the merged pack",
-                    "repo": repo,
-                    "git_ref": "main",
-                }),
-            )
-            .await
-        };
-        assert_eq!(status, StatusCode::CREATED);
-        let registered = crate::playbooks::registry::get(db.pool(), "studio-pack")
-            .await?
-            .expect("row");
-        let crate::playbooks::registry::PlaybookSource::Git { repo, path, .. } = registered.source
-        else {
-            panic!("a git registration has a git source");
-        };
-        sqlx::query!(
-            "UPDATE playbook_drafts SET graduation_repo = $1, graduation_path = $2 WHERE id = 'studio'",
-            repo,
-            path,
-        )
-        .execute(db.pool())
-        .await?;
-        repo
+    let repo = playbook_fixture(&dir.path().join("merged"), LAUNCH_WORKFLOW);
+    let promotion = Promotion {
+        draft: "studio".into(),
+        forge: crate::identity::forge::Forge::Github,
+        host: crate::identity::forge::ForgeHost::github(),
+        project: repo.clone(),
+        path: String::new(),
+        base: "main".into(),
+        branch: crate::playbooks::promotion::branch_for("studio"),
+        number: 7,
+        url: "https://github.com/owner/packs/pull/7".into(),
+        version: 1,
+        digest: "sha256:x".into(),
+        author: "wren-gh".into(),
+        promoted_by: "wren".into(),
+        state: PromotionState::Merged,
+        note: String::new(),
+        etag: None,
+        created_at: crate::clock::now_rfc3339(),
+        updated_at: crate::clock::now_rfc3339(),
     };
+    crate::playbooks::promotion::store::record(db.pool(), &promotion, &crate::clock::now_rfc3339())
+        .await?;
+    let (status, shown) = send_as(
+        &app,
+        "GET",
+        "/api/playbook-drafts/studio/promotion",
+        "wren",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{shown}");
+    assert_eq!(shown["url"], "https://github.com/owner/packs/pull/7");
     assert!(
         crate::playbooks::drafts::get(db.pool(), "studio")
             .await?
             .expect("draft")
             .retired_at
             .is_none(),
-        "nothing retires until the graduated pack is imported"
+        "nothing retires until the promoted pack is registered"
     );
 
-    let repo_for_body = repo.clone();
-    let (status, _) = {
-        post_admin(
-            &app,
-            "/api/playbooks",
-            serde_json::json!({
-                "id": "studio-pack",
-                "description": "the merged pack",
-                "repo": repo_for_body,
-                "git_ref": "main",
-            }),
-        )
-        .await
-    };
-    assert_eq!(status, StatusCode::CREATED);
-    let retired = crate::playbooks::drafts::get(db.pool(), "studio")
+    let cfg = crate::testing::cfg_with(dir.path());
+    let (state, note) =
+        crate::playbooks::promotion::follow::import(db.pool(), &cfg, &promotion, None).await?;
+    assert_eq!((state, note.as_str()), (PromotionState::Imported, ""));
+    let registered = crate::playbooks::registry::get(db.pool(), "studio")
         .await?
-        .expect("draft");
+        .expect("the pack is registered under the draft's id");
+    assert!(matches!(
+        registered.source,
+        crate::playbooks::registry::PlaybookSource::Git { .. }
+    ));
     assert!(
-        retired.retired_at.is_some(),
-        "the merged import retires the draft"
+        crate::playbooks::drafts::get(db.pool(), "studio")
+            .await?
+            .expect("draft")
+            .retired_at
+            .is_some(),
+        "the registration retires the draft"
     );
-
-    // A retired draft is read-only.
-    let (status, _) = {
-        post_admin(
-            &app,
-            "/api/playbook-drafts/studio/versions",
-            serde_json::json!({"files": draft_files()}),
-        )
-        .await
-    };
-    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = post_admin(
+        &app,
+        "/api/playbook-drafts/studio/versions",
+        serde_json::json!({"files": draft_files()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "a retired draft is read-only");
     Ok(())
 }
 
 /// A team holding no platform role runs its own draft: members author and launch it, a maintainer
-/// graduates or deletes it, and a caller outside the team is told it does not exist.
+/// promotes or deletes it, and a caller outside the team is told it does not exist.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn a_team_with_no_platform_role_authors_and_launches_its_draft(pool: PgPool) -> Result<()> {
     let (db, _dir) = db_with(pool);
@@ -10731,27 +10495,21 @@ async fn a_team_with_no_platform_role_authors_and_launches_its_draft(pool: PgPoo
             .await?;
     assert_eq!(created_by.as_deref(), Some("kim"));
 
-    let graduate_uri = "/api/playbook-drafts/studio/graduate";
-    let target = serde_json::json!({"repo": "owner/packs", "path": "packs/studio"});
-    let (refusals, log) = with_forge_stubs(|| async {
-        let mut refusals = Vec::new();
-        for user in ["kim", "mallory"] {
-            refusals.push((
-                user,
-                send_as(&app, "POST", graduate_uri, user, target.clone()).await,
-            ));
-        }
-        refusals
-    })
-    .await;
-    for (user, (status, body)) in refusals {
-        let expected = if user == "mallory" {
-            StatusCode::NOT_FOUND
-        } else {
-            StatusCode::FORBIDDEN
-        };
+    let promote_uri = "/api/playbook-drafts/studio/promote";
+    let target = serde_json::json!({
+        "forge": "github",
+        "host": "github.com",
+        "project": "owner/packs",
+        "path": "packs/studio",
+        "token": "gho_not_checked",
+    });
+    for (user, expected) in [
+        ("kim", StatusCode::FORBIDDEN),
+        ("mallory", StatusCode::NOT_FOUND),
+    ] {
+        let (status, body) = send_as(&app, "POST", promote_uri, user, target.clone()).await;
         assert_eq!(status, expected, "{user}: {body}");
-        if user != "mallory" {
+        if user == "kim" {
             assert!(
                 body["error"]
                     .as_str()
@@ -10761,12 +10519,19 @@ async fn a_team_with_no_platform_role_authors_and_launches_its_draft(pool: PgPoo
             );
         }
     }
-    assert!(log.is_empty(), "a refused graduation pushes nothing: {log}");
-    let ((status, body), log) =
-        with_forge_stubs(|| send_as(&app, "POST", graduate_uri, "dana", target.clone())).await;
-    assert_eq!(status, StatusCode::OK, "a maintainer graduates: {body}");
-    assert_eq!(body["pr_url"], "https://github.com/owner/packs/pull/7");
-    assert!(log.contains("crucible-pack/draft_studio"), "{log}");
+    let (status, body) = send_as(&app, "POST", promote_uri, "dana", target.clone()).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a maintainer may promote, but only through a linked account: {body}"
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no github account on github.com linked"),
+        "{body}"
+    );
 
     let uri = "/api/playbook-drafts/studio";
     let (status, body) = send_as(&app, "DELETE", uri, "kim", serde_json::Value::Null).await;

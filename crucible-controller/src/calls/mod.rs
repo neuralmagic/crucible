@@ -190,13 +190,17 @@ impl CallRecord {
     }
 
     pub(crate) fn aging_cadence(&self, now: jiff::Timestamp) -> std::time::Duration {
-        let secs = match self.age(now).map(|a| a.as_secs()) {
-            Some(0..120) => 10,
-            Some(120..1800) | None => 30,
-            Some(_) => 60,
-        };
-        std::time::Duration::from_secs(secs)
+        aging_cadence(self.age(now))
     }
+}
+
+pub(crate) fn aging_cadence(age: Option<std::time::Duration>) -> std::time::Duration {
+    let secs = match age.map(|a| a.as_secs()) {
+        Some(0..120) => 10,
+        Some(120..1800) | None => 30,
+        Some(_) => 60,
+    };
+    std::time::Duration::from_secs(secs)
 }
 
 /// The operations every target kind implements (progress and outcome read in one
@@ -289,6 +293,27 @@ impl Backends {
                 .calls_tekton_clusters()
                 .and_then(tekton::TektonBackend::new),
         }
+    }
+
+    pub(crate) async fn github_read_token(&self, repo: &forge::github::Repo) -> Option<String> {
+        let backend = self.github.as_ref().ok()?;
+        backend
+            .token(repo)
+            .await
+            .ok()
+            .map(|t| t.expose().to_owned())
+    }
+
+    pub(crate) async fn gitlab_read_token(
+        &self,
+        host: &crate::identity::forge::ForgeHost,
+    ) -> Option<String> {
+        let backend = self.gitlab.as_ref().ok()?;
+        backend
+            .token(host)
+            .await
+            .ok()
+            .map(|t| t.expose().to_owned())
     }
 
     pub(crate) fn get(&self, kind: CallKind) -> Result<&dyn TargetBackend, CallError> {
