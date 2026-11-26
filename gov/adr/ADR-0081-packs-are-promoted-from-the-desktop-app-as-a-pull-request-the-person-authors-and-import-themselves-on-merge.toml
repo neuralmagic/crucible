@@ -1,0 +1,70 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0081"
+title = "Packs are promoted from the desktop app as a pull request the person authors, and import themselves on merge"
+status = "accepted"
+date = "2026-11-26"
+refs = [
+    "RFC-0003",
+    "RFC-0002",
+    "ADR-0027",
+    "ADR-0033",
+]
+
+[content]
+context = """
+A draft graduates today through `POST /api/playbook-drafts/{id}/graduate`. The controller clones the target repo with a token in the URL, pushes `draft/<id>`, and opens a pull request with `gh`. The token is a stored `github_token` secret the caller names, or the pack PR App's installation token, or the controller's own. The pull request is authored by whoever owns that token, so the person who promoted the pack is not its author and GitHub's review rules do not apply to them. In App mode nothing checks that the caller may write the target repository: `approve` on the draft is enough to push to any repository the App reaches. Only GitHub is supported. After the merge someone must import the pack at the same repo and path by hand; that import retires the draft. A second graduation of the same draft is refused.
+
+The desktop app now signs people in to GitHub and GitLab hosts with device-flow tokens issued to Crucible's own OAuth application, and the controller links those accounts to controller users (`forge_links`). [[RFC-0003:C-APPROVALS]] already requires a forge review to count only through such a verified link."""
+decision = """
+Promotion is a desktop-app action. The person picks a linked forge account, a repository (GitHub) or project (GitLab), a path and a base branch, and the desktop sends the controller its own token for that account with the request. The controller uses the token for that request only and does not store it.
+
+The controller checks, in order: the caller may `approve` the draft ([[RFC-0003:C-APPROVALS]]); the token belongs to the caller's linked account on that host, and on a controller that acts for people with its own App or bot, was issued by the controller's OAuth application; the account may push to the target. It then writes the draft's newest compiling version as one commit on `crucible/draft-<id>` through the forge's API (GitHub's Git Data API, GitLab's commits API) and opens a pull request or merge request authored by the person. It records the forge, host, repository, path, number, URL and the digest promoted, which is the approval [[RFC-0003:C-APPROVALS]] requires.
+
+Promoting again pushes a new commit to the same branch and keeps the open pull request; a closed one is replaced by a new one.
+
+The controller follows each open promotion by polling, with the same aging cadence and conditional requests as calls, using its own read credentials. When the pull request merges, the controller registers the pack from the merge commit at that repository and path, which retires the draft and publishes the revision ([[RFC-0002:C-PACK-PUBLISH]]). When it closes unmerged, the draft stays editable.
+
+The graduate endpoint, its stored-secret and App-token paths, and the `crux` and web UI graduation commands are removed. A local controller takes the same path with the token the desktop holds."""
+consequences = """
+The pull request is the person's: forge review rules, branch protection and CODEOWNERS apply to it as to any of theirs, and the controller needs no write credential for pack repositories. Write access is decided by the forge, so the confused-deputy path through the App is gone. GitLab merge requests work the same way as GitHub pull requests.
+
+Merge is the end of the flow: the import and the draft's retirement happen without a second step, and the desktop shows the review state on the draft.
+
+Promotion needs the desktop app and a linked account. There is no headless promotion, so an agent or CI job cannot graduate a draft; it can still open its own pull request against the pack repository and import it. The controller briefly holds a full-access user token per request. Following a promotion needs a read credential for private repositories, which a cluster controller has through its App or bot and a local one through the person's login."""
+
+[[content.alternatives]]
+text = "Desktop-only promotion: the person's token opens a pull request they author, and the controller follows it to the import"
+status = "accepted"
+pros = [
+    "Forge review rules, branch protection and CODEOWNERS apply to the person as author",
+    "The forge decides write access; the controller holds no write credential",
+]
+cons = [
+    "No headless promotion; needs the desktop app and a linked account",
+    "The controller sees a full-access user token for one request",
+]
+
+[[content.alternatives]]
+text = "The App or bot opens the pull request and credits the person in a Co-authored-by trailer"
+status = "rejected"
+pros = [
+    "No user token reaches the controller",
+    "Works headless",
+]
+cons = [
+    "The promoter is not the author, so a reviewer rule cannot stop them approving their own pack",
+    "The controller needs write access to every pack repository and must re-check each person's",
+]
+rejection_reason = "Authorship is what makes the forge's review rules apply to the person promoting."
+
+[[content.alternatives]]
+text = "Keep graduation as it is and add a merge watcher that imports"
+status = "rejected"
+pros = ["Smallest change"]
+cons = [
+    "Keeps stored personal tokens and the unchecked push through the App",
+    "Stays GitHub-only",
+]
+rejection_reason = "It leaves the authorization gap and the stored tokens in place."
