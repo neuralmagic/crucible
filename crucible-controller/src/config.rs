@@ -718,7 +718,14 @@ pub struct ControllerCfg {
     )]
     pub calls_github_token: Option<crate::calls::GithubToken>,
     #[arg(skip)]
-    pub github_signed_in: crate::identity::github_links::SignedIn,
+    pub forge_signed_in: crate::identity::forge::held::SignedIn,
+    #[arg(
+        long = "gitlab-hosts",
+        env = "CONTROLLER_GITLAB_HOSTS",
+        value_delimiter = ',',
+        default_value = ""
+    )]
+    pub gitlab_hosts: Vec<String>,
     #[arg(
         long = "github-logins",
         env = "CONTROLLER_GITHUB_LOGINS",
@@ -1051,6 +1058,23 @@ impl ControllerCfg {
             "CONTROLLER_DISPATCH_CLUSTER_BY_CONTRACT",
             "contract=cluster",
         )
+    }
+
+    pub(crate) fn gitlab_hosts(&self) -> Vec<crate::identity::forge::ForgeHost> {
+        self.gitlab_hosts
+            .iter()
+            .filter(|h| !h.trim().is_empty())
+            .filter_map(|h| {
+                let host = crate::identity::forge::ForgeHost::parse(h);
+                if host.is_none() {
+                    tracing::warn!(
+                        host = h,
+                        "CONTROLLER_GITLAB_HOSTS entry is not a host name; ignored"
+                    );
+                }
+                host
+            })
+            .collect()
     }
 
     pub(crate) fn github_logins(&self) -> crate::identity::github_logins::GithubLogins {

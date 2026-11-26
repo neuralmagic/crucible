@@ -2,7 +2,7 @@
 
 pub mod boot;
 #[cfg(not(target_arch = "wasm32"))]
-mod github;
+mod forge;
 mod launching;
 mod opening;
 mod pages;

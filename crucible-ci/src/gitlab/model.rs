@@ -3,6 +3,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// The account a token belongs to, as `GET /user` answers.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct User {
+    pub id: u64,
+    pub username: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Pipeline {
     pub id: u64,

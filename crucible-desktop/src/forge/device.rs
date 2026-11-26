@@ -1,41 +1,45 @@
-//! Signing in to GitHub through the GitHub App's device flow, keeping the user token where the
-//! app keeps keys, renewing it before it expires, and linking it to a controller.
-//!
-//! ```text
-//! POST github.com/login/device/code {client_id} ──▶ user_code, verification_uri
-//!   person enters the code at verification_uri
-//! POST github.com/login/oauth/access_token {device_code} every `interval` ──▶ ghu_ + ghr_
-//! PUT <controller>/api/me/github {token} ──▶ the controller records the login
-//! ```
+//! The OAuth device flow: asking for a code, waiting for the person, and renewing tokens.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::forge::Account;
 use crate::net::Handle;
-use crate::profile::Target;
 
-const DEVICE_CODE: &str = "https://github.com/login/device/code";
-const ACCESS_TOKEN: &str = "https://github.com/login/oauth/access_token";
-const USER: &str = "https://api.github.com/user";
 const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 const USER_AGENT: &str = "crucible-playbooks";
 const RENEW_BEFORE: i64 = 10 * 60;
 const SLOW_DOWN_STEP: u64 = 5;
 const TICK: Duration = Duration::from_millis(100);
 
-/// What the person types at GitHub, and where.
+/// What the person types at the forge, and where.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct DeviceCode {
     device_code: String,
     pub user_code: String,
     pub verification_uri: String,
+    #[serde(default)]
+    verification_uri_complete: Option<String>,
     expires_in: u64,
+    #[serde(default = "default_interval")]
     interval: u64,
 }
 
-/// A signed-in GitHub account's tokens. Never formatted.
+fn default_interval() -> u64 {
+    5
+}
+
+impl DeviceCode {
+    pub fn page(&self) -> &str {
+        self.verification_uri_complete
+            .as_deref()
+            .unwrap_or(&self.verification_uri)
+    }
+}
+
+/// A signed-in forge account's tokens. Never formatted.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tokens {
     pub login: String,
@@ -53,6 +57,10 @@ impl std::fmt::Debug for Tokens {
 }
 
 impl Tokens {
+    pub(crate) fn access(&self) -> &str {
+        &self.access
+    }
+
     fn due(&self, now: i64) -> bool {
         self.expires_at.is_some_and(|at| at - RENEW_BEFORE <= now)
     }
@@ -97,12 +105,12 @@ fn read_answer(answer: TokenAnswer, now: i64) -> Poll {
         (_, Some("authorization_pending")) => Poll::Pending,
         (_, Some("slow_down")) => Poll::SlowDown(answer.interval.unwrap_or(SLOW_DOWN_STEP)),
         (_, Some("expired_token")) => Poll::Failed("the code expired; sign in again".into()),
-        (_, Some("access_denied")) => Poll::Failed("the sign-in was denied at GitHub".into()),
+        (_, Some("access_denied")) => Poll::Failed("the sign-in was denied".into()),
         (_, Some(error)) => Poll::Failed(match answer.error_description {
-            Some(detail) if !detail.is_empty() => format!("GitHub refused: {detail}"),
-            _ => format!("GitHub refused: {error}"),
+            Some(detail) if !detail.is_empty() => format!("refused: {detail}"),
+            _ => format!("refused: {error}"),
         }),
-        _ => Poll::Failed("GitHub answered without a token".into()),
+        _ => Poll::Failed("answered without a token".into()),
     }
 }
 
@@ -110,12 +118,17 @@ fn now() -> i64 {
     jiff::Timestamp::now().as_second()
 }
 
+pub fn unix_now() -> i64 {
+    now()
+}
+
 fn client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(|e| format!("building the GitHub client: {e}"))
+        .map_err(|e| format!("building the HTTP client: {e}"))
 }
 
 async fn form<T: serde::de::DeserializeOwned>(
@@ -139,45 +152,57 @@ async fn form<T: serde::de::DeserializeOwned>(
         .await
         .map_err(|e| format!("{doing}: {}", e.without_url()))?;
     let status = resp.status();
-    if !status.is_success() {
-        return Err(format!("{doing}: GitHub answered {status}"));
-    }
-    resp.json()
+    let text = resp
+        .text()
         .await
-        .map_err(|e| format!("{doing}: {}", e.without_url()))
+        .map_err(|e| format!("{doing}: {}", e.without_url()))?;
+    match serde_json::from_str(&text) {
+        Ok(answer) => Ok(answer),
+        Err(_) if !status.is_success() => Err(format!("{doing}: answered {status}")),
+        Err(e) => Err(format!("{doing}: {e}")),
+    }
 }
 
 #[derive(Deserialize)]
-struct Account {
+struct Who {
+    #[serde(alias = "username")]
     login: String,
 }
 
-async fn login_of(http: &reqwest::Client, access: &str) -> Result<String, String> {
-    let doing = "reading the GitHub account";
+async fn login_of(
+    http: &reqwest::Client,
+    account: &Account,
+    access: &str,
+) -> Result<String, String> {
+    let doing = format!("reading the {} account", account.name());
     let resp = http
-        .get(USER)
+        .get(account.user_url())
         .bearer_auth(access)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header(reqwest::header::ACCEPT, "application/json")
         .send()
         .await
         .map_err(|e| format!("{doing}: {}", e.without_url()))?;
     let status = resp.status();
     if !status.is_success() {
-        return Err(format!("{doing}: GitHub answered {status}"));
+        return Err(format!("{doing}: answered {status}"));
     }
-    resp.json::<Account>()
+    resp.json::<Who>()
         .await
-        .map(|a| a.login)
+        .map(|who| who.login)
         .map_err(|e| format!("{doing}: {}", e.without_url()))
 }
 
-pub fn start(runtime: &Handle, client_id: &str) -> Result<DeviceCode, String> {
+pub fn start(runtime: &Handle, account: &Account, client_id: &str) -> Result<DeviceCode, String> {
     let http = client()?;
+    let mut fields = vec![("client_id", client_id)];
+    if let Some(scope) = account.scope() {
+        fields.push(("scope", scope));
+    }
     runtime.block_on(form(
         &http,
-        DEVICE_CODE,
-        &[("client_id", client_id)],
-        "asking GitHub for a sign-in code",
+        &account.device_url(),
+        &fields,
+        &format!("asking {} for a sign-in code", account.name()),
     ))
 }
 
@@ -194,6 +219,7 @@ fn pause(secs: u64, stop: &AtomicBool) -> Result<(), String> {
 
 pub fn finish(
     runtime: &Handle,
+    account: &Account,
     client_id: &str,
     code: &DeviceCode,
     stop: &AtomicBool,
@@ -201,6 +227,7 @@ pub fn finish(
     let http = client()?;
     let deadline = now() + i64::try_from(code.expires_in).unwrap_or(i64::MAX);
     let mut interval = code.interval.max(1);
+    let doing = format!("waiting for {}", account.name());
     loop {
         pause(interval, stop)?;
         if now() > deadline {
@@ -208,20 +235,20 @@ pub fn finish(
         }
         let answer: TokenAnswer = runtime.block_on(form(
             &http,
-            ACCESS_TOKEN,
+            &account.token_url(),
             &[
                 ("client_id", client_id),
                 ("device_code", &code.device_code),
                 ("grant_type", DEVICE_GRANT),
             ],
-            "waiting for GitHub",
+            &doing,
         ))?;
         match read_answer(answer, now()) {
             Poll::Pending => {}
             Poll::SlowDown(next) => interval = next.max(interval + SLOW_DOWN_STEP),
-            Poll::Failed(why) => return Err(why),
+            Poll::Failed(why) => return Err(format!("{}: {why}", account.name())),
             Poll::Issued(issued) => {
-                let login = runtime.block_on(login_of(&http, &issued.access))?;
+                let login = runtime.block_on(login_of(&http, account, &issued.access))?;
                 return Ok(Tokens {
                     login,
                     access: issued.access,
@@ -233,23 +260,31 @@ pub fn finish(
     }
 }
 
-pub fn current(runtime: &Handle, client_id: &str, tokens: Tokens) -> Result<Tokens, String> {
+pub fn current(
+    runtime: &Handle,
+    account: &Account,
+    client_id: &str,
+    tokens: Tokens,
+) -> Result<Tokens, String> {
     if !tokens.due(now()) {
         return Ok(tokens);
     }
     let Some(refresh) = tokens.refresh.as_deref() else {
-        return Err("the GitHub sign-in expired; sign in again".into());
+        return Err(format!(
+            "the {} sign-in expired; sign in again",
+            account.name()
+        ));
     };
     let http = client()?;
     let answer: TokenAnswer = runtime.block_on(form(
         &http,
-        ACCESS_TOKEN,
+        &account.token_url(),
         &[
             ("client_id", client_id),
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh),
         ],
-        "renewing the GitHub sign-in",
+        &format!("renewing the {} sign-in", account.name()),
     ))?;
     match read_answer(answer, now()) {
         Poll::Issued(issued) => Ok(Tokens {
@@ -258,85 +293,16 @@ pub fn current(runtime: &Handle, client_id: &str, tokens: Tokens) -> Result<Toke
             refresh: issued.refresh.or(tokens.refresh),
             expires_at: issued.expires_at,
         }),
-        Poll::Failed(why) => Err(why),
-        Poll::Pending | Poll::SlowDown(_) => Err("GitHub did not renew the sign-in".into()),
-    }
-}
-
-#[derive(Deserialize)]
-struct Linked {
-    login: String,
-}
-
-fn controller(target: &Target) -> Result<crux::Client, String> {
-    let config = target.config()?;
-    let wire = crux::client::HttpTransport::with_client(&config, target.http()?)
-        .map_err(|e| format!("{e:#}"))?;
-    Ok(crux::Client::new(std::sync::Arc::new(wire)))
-}
-
-pub fn link(runtime: &Handle, target: &Target, tokens: &Tokens) -> Result<String, String> {
-    let client = controller(target)?;
-    let body = serde_json::json!({ "token": tokens.access });
-    let linked: Linked = runtime.block_on(crate::net::within(
-        "linking the GitHub account",
-        client.put("/api/me/github", &body),
-    ))?;
-    Ok(linked.login)
-}
-
-pub fn unlink(runtime: &Handle, target: &Target) -> Result<(), String> {
-    let client = controller(target)?;
-    runtime.block_on(crate::net::within(
-        "unlinking the GitHub account",
-        client.delete("/api/me/github"),
-    ))
-}
-
-/// What a sign-in or link thread reports back.
-pub enum Event {
-    Code(DeviceCode),
-    SignedIn(Result<Tokens, String>),
-    Linked {
-        profile: String,
-        answer: Result<String, String>,
-        renew_at: Option<i64>,
-    },
-}
-
-/// The GitHub sign-in as the app shows it.
-#[derive(Default)]
-pub struct Session {
-    pub loaded: bool,
-    pub login: Option<String>,
-    pub code: Option<DeviceCode>,
-    pub busy: bool,
-    pub error: Option<String>,
-    pub linked: Option<(String, String)>,
-    pub next: Option<(String, i64)>,
-    pub events: Option<std::sync::mpsc::Receiver<Event>>,
-    pub cancel: Option<crate::signin::Cancel>,
-}
-
-impl Session {
-    pub fn due(&self, profile: &str, now: i64) -> bool {
-        if self.login.is_none() || self.busy {
-            return false;
-        }
-        match &self.next {
-            Some((at_profile, at)) if at_profile == profile => *at <= now,
-            _ => true,
+        Poll::Failed(why) => Err(format!("{}: {why}; sign in again", account.name())),
+        Poll::Pending | Poll::SlowDown(_) => {
+            Err(format!("{} did not renew the sign-in", account.name()))
         }
     }
-}
-
-pub fn unix_now() -> i64 {
-    now()
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::github::*;
+    use crate::forge::device::*;
 
     fn answer(json: serde_json::Value) -> TokenAnswer {
         serde_json::from_value(json).unwrap()
@@ -363,6 +329,24 @@ mod tests {
                 expires_at: Some(29_800),
             })
         );
+        let gitlab = read_answer(
+            answer(serde_json::json!({
+                "access_token": "gl_a",
+                "token_type": "Bearer",
+                "expires_in": 7200,
+                "refresh_token": "gl_r",
+                "created_at": 1_000,
+            })),
+            1_000,
+        );
+        assert_eq!(
+            gitlab,
+            Poll::Issued(Issued {
+                access: "gl_a".into(),
+                refresh: Some("gl_r".into()),
+                expires_at: Some(8_200),
+            })
+        );
         let lasting = read_answer(answer(serde_json::json!({"access_token": "gho_c"})), 5);
         assert_eq!(
             lasting,
@@ -385,10 +369,7 @@ mod tests {
         for (error, says) in [
             ("expired_token", "expired"),
             ("access_denied", "denied"),
-            (
-                "incorrect_client_credentials",
-                "incorrect_client_credentials",
-            ),
+            ("invalid_grant", "invalid_grant"),
         ] {
             match read_answer(answer(serde_json::json!({"error": error})), 0) {
                 Poll::Failed(why) => assert!(why.contains(says), "{error}: {why}"),
@@ -401,9 +382,7 @@ mod tests {
         }));
         assert_eq!(
             read_answer(described, 0),
-            Poll::Failed(
-                "GitHub refused: Device Flow must be explicitly enabled for this App".into()
-            )
+            Poll::Failed("refused: Device Flow must be explicitly enabled for this App".into())
         );
         assert!(matches!(
             read_answer(answer(serde_json::json!({})), 0),
@@ -432,8 +411,8 @@ mod tests {
     }
 
     #[test]
-    fn the_code_github_sends_reads() {
-        let code: DeviceCode = serde_json::from_value(serde_json::json!({
+    fn the_codes_both_forges_send_read() {
+        let github: DeviceCode = serde_json::from_value(serde_json::json!({
             "device_code": "3584d83530557fdd1f46af8289938c8ef79f9dc5",
             "user_code": "WDJB-MJHT",
             "verification_uri": "https://github.com/login/device",
@@ -441,22 +420,29 @@ mod tests {
             "interval": 5,
         }))
         .unwrap();
-        assert_eq!(code.user_code, "WDJB-MJHT");
-        assert_eq!(code.interval, 5);
+        assert_eq!(github.page(), "https://github.com/login/device");
+        let gitlab: DeviceCode = serde_json::from_value(serde_json::json!({
+            "device_code": "GmRhmhcxhwAzkoEqiMEg_DnyEysNkuNhszIySk9eS",
+            "user_code": "0A44L90H",
+            "verification_uri": "https://gitlab.example.com/oauth/device",
+            "verification_uri_complete": "https://gitlab.example.com/oauth/device?user_code=0A44L90H",
+            "expires_in": 300,
+        }))
+        .unwrap();
+        assert_eq!(
+            gitlab.page(),
+            "https://gitlab.example.com/oauth/device?user_code=0A44L90H"
+        );
+        assert_eq!(gitlab.interval, 5);
     }
 
     #[test]
-    fn a_link_is_due_once_per_profile_until_its_renewal_or_retry() {
-        let mut session = Session::default();
-        assert!(!session.due("local", 0));
-        session.login = Some("wren".into());
-        assert!(session.due("local", 0));
-        session.next = Some(("local".into(), 100));
-        assert!(!session.due("local", 99));
-        assert!(session.due("local", 100));
-        assert!(session.due("cluster", 0));
-        session.busy = true;
-        assert!(!session.due("cluster", 0));
+    fn a_user_answer_names_its_login_on_either_forge() {
+        let gh: Who =
+            serde_json::from_value(serde_json::json!({"login": "wren", "id": 1})).unwrap();
+        let gl: Who =
+            serde_json::from_value(serde_json::json!({"username": "wren-gl", "id": 1})).unwrap();
+        assert_eq!((gh.login.as_str(), gl.login.as_str()), ("wren", "wren-gl"));
     }
 
     #[test]

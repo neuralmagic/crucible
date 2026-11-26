@@ -520,6 +520,15 @@ impl crate::App {
         if self.keys_error.is_some() {
             return;
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.keys_error = from
+                .move_forge_tokens(&to, &self.settings.forge_accounts())
+                .err();
+            if self.keys_error.is_some() {
+                return;
+            }
+        }
         self.settings.set_keychain(on);
         self.targets.clear();
         self.retry_profile();

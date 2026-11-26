@@ -64,7 +64,7 @@ impl TargetError {
 /// Where the backend takes the token for a repository.
 #[derive(Clone, Debug)]
 pub(crate) enum TokenSource {
-    Person(crate::identity::github_links::SignedIn),
+    Person(crate::identity::forge::held::SignedIn),
     App {
         app: Box<GithubAppTokenSource>,
         logins: GithubLogins,
@@ -381,8 +381,11 @@ impl GithubWorkflowBackend {
 
     async fn token(&self, repo: &Repo) -> Result<Token, TargetError> {
         match &self.tokens {
-            TokenSource::Person(signed_in) => match signed_in.token() {
-                Some(token) => Ok(token),
+            TokenSource::Person(signed_in) => match signed_in.token(
+                crate::identity::forge::Forge::Github,
+                &crate::identity::forge::ForgeHost::github(),
+            ) {
+                Some(token) => Ok(Token::new(token)),
                 None => gh_cli_token().await,
             },
             TokenSource::App { app, .. } => {

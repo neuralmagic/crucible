@@ -119,9 +119,13 @@ pub(crate) fn init() -> App {
         release: update::Check::default(),
         scratch: TextEdit::new(""),
         #[cfg(not(target_arch = "wasm32"))]
-        github: crate::github::Session::default(),
+        forge: Default::default(),
         #[cfg(not(target_arch = "wasm32"))]
         github_client_id: TextEdit::new(&settings.github_client_id),
+        #[cfg(not(target_arch = "wasm32"))]
+        gitlab_host: TextEdit::new(""),
+        #[cfg(not(target_arch = "wasm32"))]
+        gitlab_client_id: TextEdit::new(""),
         settings,
         editor_command,
         drop_cost,
@@ -263,7 +267,7 @@ pub(crate) fn poll(app: &mut App, clock: f64, tx: &mut Tx) -> bool {
     changed |= app.finish_sign_in();
     #[cfg(not(target_arch = "wasm32"))]
     {
-        changed |= app.follow_github();
+        changed |= app.follow_forge_accounts();
     }
     changed |= app.finish_login_editor();
     changed |= app.finish_release_check();

@@ -581,8 +581,8 @@ mod tests {
                 "a3aa9b0e5edd435bb0ea3f1bdff5dc7432af1047c88292626c0be8561d4da9ad",
             ),
             (
-                "0093_github_links.sql",
-                "1d6ad74a839b4c6b5e8a53c3aabb6ddaec9702f478d1e2812703413ba40e239d",
+                "0093_forge_links.sql",
+                "5df4dd13b9061b783658d7e3f29ef3ab06390582f2c3a404cd1e2ce191c4cab5",
             ),
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");

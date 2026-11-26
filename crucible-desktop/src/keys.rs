@@ -6,10 +6,6 @@ use std::path::PathBuf;
 #[cfg(not(target_arch = "wasm32"))]
 /// The service the system credential store files keys under; the account is the profile's name.
 const SERVICE: &str = "crucible-playbooks";
-#[cfg(not(target_arch = "wasm32"))]
-const GITHUB: &str = "github.com";
-#[cfg(not(target_arch = "wasm32"))]
-const GITHUB_FILE: &str = "github.json";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Store {
@@ -90,57 +86,64 @@ impl Store {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn github(&self) -> Result<Option<crate::github::Tokens>, String> {
+    pub fn forge_tokens(
+        &self,
+        account: &crate::forge::Account,
+    ) -> Result<Option<crate::forge::device::Tokens>, String> {
         let text = match self {
             #[cfg(not(target_arch = "wasm32"))]
-            Store::Keychain => match entry(GITHUB)?.get_password() {
+            Store::Keychain => match entry(&account.store_key())?.get_password() {
                 Ok(text) => text,
                 Err(keyring::Error::NoEntry) => return Ok(None),
                 Err(error) => {
                     return Err(format!(
-                        "reading the GitHub sign-in from the keychain: {error}"
+                        "reading the forge sign-in from the keychain: {error}"
                     ));
                 }
             },
-            Store::Dir(dir) => match std::fs::read_to_string(dir.join(GITHUB_FILE)) {
+            Store::Dir(dir) => match std::fs::read_to_string(dir.join(forge_file(account))) {
                 Ok(text) => text,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(error) => return Err(format!("reading the GitHub sign-in: {error}")),
+                Err(error) => return Err(format!("reading the forge sign-in: {error}")),
             },
         };
         serde_json::from_str(&text)
             .map(Some)
-            .map_err(|error| format!("reading the GitHub sign-in: {error}"))
+            .map_err(|error| format!("reading the forge sign-in: {error}"))
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn save_github(&self, tokens: &crate::github::Tokens) -> Result<(), String> {
+    pub fn save_forge_tokens(
+        &self,
+        account: &crate::forge::Account,
+        tokens: &crate::forge::device::Tokens,
+    ) -> Result<(), String> {
         let text = serde_json::to_string(tokens)
-            .map_err(|error| format!("keeping the GitHub sign-in: {error}"))?;
+            .map_err(|error| format!("keeping the forge sign-in: {error}"))?;
         match self {
             #[cfg(not(target_arch = "wasm32"))]
-            Store::Keychain => entry(GITHUB)?
+            Store::Keychain => entry(&account.store_key())?
                 .set_password(&text)
-                .map_err(|error| format!("keeping the GitHub sign-in in the keychain: {error}")),
-            Store::Dir(dir) => private_write(&dir.join(GITHUB_FILE), &text)
-                .map_err(|error| format!("keeping the GitHub sign-in: {error}")),
+                .map_err(|error| format!("keeping the forge sign-in in the keychain: {error}")),
+            Store::Dir(dir) => private_write(&dir.join(forge_file(account)), &text)
+                .map_err(|error| format!("keeping the forge sign-in: {error}")),
         }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn forget_github(&self) -> Result<(), String> {
+    pub fn forget_forge_tokens(&self, account: &crate::forge::Account) -> Result<(), String> {
         match self {
             #[cfg(not(target_arch = "wasm32"))]
-            Store::Keychain => match entry(GITHUB)?.delete_credential() {
+            Store::Keychain => match entry(&account.store_key())?.delete_credential() {
                 Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
                 Err(error) => Err(format!(
-                    "removing the GitHub sign-in from the keychain: {error}"
+                    "removing the forge sign-in from the keychain: {error}"
                 )),
             },
-            Store::Dir(dir) => match std::fs::remove_file(dir.join(GITHUB_FILE)) {
+            Store::Dir(dir) => match std::fs::remove_file(dir.join(forge_file(account))) {
                 Ok(()) => Ok(()),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(format!("removing the GitHub sign-in: {error}")),
+                Err(error) => Err(format!("removing the forge sign-in: {error}")),
             },
         }
     }
@@ -165,21 +168,49 @@ impl Store {
                 }
             }
         }
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(tokens) = self.github()? {
-            if let Err(why) = to.save_github(&tokens) {
-                for profile in copied {
-                    let _ = to.forget(profile);
-                }
-                return Err(why);
-            }
-            self.forget_github()?;
-        }
         for profile in copied {
             self.forget(profile)?;
         }
         Ok(())
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn move_forge_tokens(
+        &self,
+        to: &Store,
+        accounts: &[crate::forge::Account],
+    ) -> Result<(), String> {
+        let mut copied = Vec::new();
+        for account in accounts {
+            let copy = self.forge_tokens(account).and_then(|tokens| match tokens {
+                Some(tokens) => to.save_forge_tokens(account, &tokens).map(|()| true),
+                None => Ok(false),
+            });
+            match copy {
+                Ok(true) => copied.push(account),
+                Ok(false) => {}
+                Err(why) => {
+                    for account in copied {
+                        let _ = to.forget_forge_tokens(account);
+                    }
+                    return Err(why);
+                }
+            }
+        }
+        for account in copied {
+            self.forget_forge_tokens(account)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn forge_file(account: &crate::forge::Account) -> String {
+    format!(
+        "{}-{}.json",
+        account.forge(),
+        account.host().replace(':', "_")
+    )
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -210,33 +241,43 @@ mod tests {
     }
 
     #[test]
-    fn the_github_sign_in_is_kept_private_and_moves_with_the_keys() {
+    fn forge_sign_ins_are_kept_private_per_account_and_move_together() {
+        use crate::forge::{Account, device::Tokens};
         let (held, store) = dir();
         let (_other_dir, other) = dir();
-        assert_eq!(store.github().unwrap(), None);
-        let tokens: crate::github::Tokens = serde_json::from_value(serde_json::json!({
-            "login": "wren",
-            "access": "ghu_a",
-            "refresh": "ghr_b",
-            "expires_at": 100,
-        }))
-        .unwrap();
-        store.save_github(&tokens).unwrap();
-        assert_eq!(store.github().unwrap(), Some(tokens.clone()));
-        let file = held.path().join("github.json");
+        let gh = Account::Github;
+        let gl = Account::Gitlab("gl.example.com:8443".into());
+        assert_eq!(store.forge_tokens(&gh).unwrap(), None);
+        let tokens = |login: &str| -> Tokens {
+            serde_json::from_value(serde_json::json!({
+                "login": login,
+                "access": "a",
+                "refresh": "r",
+                "expires_at": 100,
+            }))
+            .unwrap()
+        };
+        store.save_forge_tokens(&gh, &tokens("wren")).unwrap();
+        store.save_forge_tokens(&gl, &tokens("wren-gl")).unwrap();
+        assert_eq!(store.forge_tokens(&gh).unwrap(), Some(tokens("wren")));
+        assert_eq!(store.forge_tokens(&gl).unwrap(), Some(tokens("wren-gl")));
+        let file = held.path().join("gitlab-gl.example.com_8443.json");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&file).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
-        store.move_to(&other, &[]).unwrap();
-        assert_eq!(store.github().unwrap(), None);
+        store
+            .move_forge_tokens(&other, &[gh.clone(), gl.clone()])
+            .unwrap();
+        assert_eq!(store.forge_tokens(&gh).unwrap(), None);
         assert!(!file.exists());
-        assert_eq!(other.github().unwrap(), Some(tokens));
-        other.forget_github().unwrap();
-        other.forget_github().unwrap();
-        assert_eq!(other.github().unwrap(), None);
+        assert_eq!(other.forge_tokens(&gl).unwrap(), Some(tokens("wren-gl")));
+        other.forget_forge_tokens(&gl).unwrap();
+        other.forget_forge_tokens(&gl).unwrap();
+        assert_eq!(other.forge_tokens(&gl).unwrap(), None);
+        assert_eq!(other.forge_tokens(&gh).unwrap(), Some(tokens("wren")));
     }
 
     #[test]

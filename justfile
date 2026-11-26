@@ -138,13 +138,14 @@ controller-local port="8870" user=env_var("USER"):
         CONTROLLER_SESSION_SECURE=false \
         CONTROLLER_PLAYBOOK_EXECUTOR=local \
         CONTROLLER_CALLS_GITHUB_TOKEN=person \
+        CONTROLLER_GITLAB_HOSTS="${CONTROLLER_GITLAB_HOSTS:-gitlab.com}" \
         CONTROLLER_SCOPE_EXECUTOR=disabled \
         CONTROLLER_STATE_DIR="$state" \
         CRUCIBLE_BIN="$bin/crucible" \
         RUST_LOG="${RUST_LOG:-info}" \
         "$bin/crucible-controller" autopilot
 
-# The ci call dispatches CALLS_DEMO_REPO (owner/name) with the controller's `gh auth token`.
+# The ci call dispatches CALLS_DEMO_REPO (owner/name) with the linked GitHub token, else `gh auth token`.
 # Save examples/calls/{child,parent} as drafts on `just controller-local`, launch the parent.
 calls-example port="8870" max_cost="1" max_time="30m":
     #!/usr/bin/env bash

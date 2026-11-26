@@ -98,12 +98,17 @@ impl TargetBackend for GithubWorkflowBackend {
     ) -> Result<(), CallError> {
         let (repo, ..) = github_target(target)?;
         let linked = match who {
-            Principal::User(login) => crate::identity::github_links::get(ctx.db.pool(), login)
-                .await
-                .map_err(|e| CallError::Internal(e.into()))?,
+            Principal::User(login) => crate::identity::forge::links::get(
+                ctx.db.pool(),
+                login,
+                crate::identity::forge::Forge::Github,
+                &crate::identity::forge::ForgeHost::github(),
+            )
+            .await
+            .map_err(|e| CallError::Internal(e.into()))?,
             _ => None,
         };
-        let linked = linked.as_ref().map(|l| l.github_login.as_str());
+        let linked = linked.as_ref().map(|l| l.login.as_str());
         Ok(GithubWorkflowBackend::authorize(self, who, repo, linked).await?)
     }
 

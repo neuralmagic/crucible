@@ -197,6 +197,7 @@ pub struct Settings {
     /// A shell command with `{file}` and `{line}`, for editors that are not apps.
     pub editor_command: String,
     pub github_client_id: String,
+    pub gitlab_apps: BTreeMap<String, String>,
     /// Keys bound by hand, by command id; a command left out keeps its defaults.
     pub keys: BTreeMap<String, Vec<String>>,
     /// Check the shown pack file with crucible-lsp.
@@ -251,6 +252,8 @@ struct Config {
     editor_command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     github_client_id: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    gitlab_apps: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     keys: BTreeMap<String, Vec<String>>,
     checks: Option<bool>,
@@ -328,6 +331,7 @@ impl Settings {
             editor_custom: config.editor_custom.unwrap_or(false),
             editor_command: config.editor_command.unwrap_or_default(),
             github_client_id: config.github_client_id.unwrap_or_default(),
+            gitlab_apps: config.gitlab_apps,
             keys: config.keys,
             checks: config.checks.unwrap_or(true),
             view_plugins: config.view_plugins.unwrap_or(false),
@@ -556,6 +560,38 @@ impl Settings {
         self.save();
     }
 
+    pub fn set_gitlab_app(&mut self, host: &str, client_id: &str) {
+        self.gitlab_apps
+            .insert(host.to_string(), client_id.trim().to_string());
+        self.save();
+    }
+
+    pub fn remove_gitlab_app(&mut self, host: &str) {
+        self.gitlab_apps.remove(host);
+        self.save();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn forge_accounts(&self) -> Vec<crate::forge::Account> {
+        std::iter::once(crate::forge::Account::Github)
+            .chain(
+                self.gitlab_apps
+                    .keys()
+                    .map(|host| crate::forge::Account::Gitlab(host.clone())),
+            )
+            .collect()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn client_id(&self, account: &crate::forge::Account) -> String {
+        match account {
+            crate::forge::Account::Github => self.github_client_id.clone(),
+            crate::forge::Account::Gitlab(host) => {
+                self.gitlab_apps.get(host).cloned().unwrap_or_default()
+            }
+        }
+    }
+
     pub fn set_editor(&mut self, editor: Option<Editor>) {
         self.editor_custom = false;
         self.editor = editor;
@@ -611,6 +647,7 @@ impl Settings {
             editor_command: (!self.editor_command.is_empty()).then(|| self.editor_command.clone()),
             github_client_id: (!self.github_client_id.is_empty())
                 .then(|| self.github_client_id.clone()),
+            gitlab_apps: self.gitlab_apps.clone(),
             keys: self.keys.clone(),
             checks: Some(self.checks),
             view_plugins: Some(self.view_plugins),

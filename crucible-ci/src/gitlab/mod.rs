@@ -23,7 +23,7 @@ use serde_json::Value;
 use url::Url;
 
 use crate::commit::CommitId;
-use crate::gitlab::model::{Bridge, Job, Lint, Pipeline};
+use crate::gitlab::model::{Bridge, Job, Lint, Pipeline, User};
 use crate::token::BearerToken;
 
 const PER_PAGE: u32 = 100;
@@ -128,6 +128,16 @@ impl Gitlab {
             }
         }
         url
+    }
+
+    pub async fn user(&self, token: &BearerToken) -> Result<User, GitlabError> {
+        let mut url = self.api.clone();
+        if let Ok(mut segments) = url.path_segments_mut() {
+            segments.pop_if_empty();
+            segments.push("user");
+        }
+        self.get_json(token, "reading the token's account", url)
+            .await
     }
 
     pub async fn pipelines_for(

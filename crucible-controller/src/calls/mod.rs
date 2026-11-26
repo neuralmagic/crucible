@@ -225,7 +225,7 @@ impl Backends {
                 state.calls_github,
                 state.pack_pr_app.as_ref(),
                 &state.github_logins,
-                &state.github_signed_in,
+                &state.forge_signed_in,
                 &state.playbook_caps.max_time,
             ),
             tekton: state
@@ -242,7 +242,7 @@ impl Backends {
                 cfg.calls_github_token,
                 cfg.github_app.as_ref(),
                 &cfg.github_logins(),
-                &cfg.github_signed_in,
+                &cfg.forge_signed_in,
                 &cfg.playbook_max_time_cap,
             ),
             tekton: cfg
@@ -276,7 +276,7 @@ fn github_backend(
     token: Option<GithubToken>,
     app: Option<&crate::secrets::github_app::GithubAppTokenSource>,
     logins: &crate::identity::github_logins::GithubLogins,
-    signed_in: &crate::identity::github_links::SignedIn,
+    signed_in: &crate::identity::forge::held::SignedIn,
     max_time: &crate::model::MaxTime,
 ) -> Result<github::GithubWorkflowBackend, String> {
     let tokens = match (token, app) {
@@ -310,7 +310,7 @@ mod tests {
     fn every_kind_routes_to_its_backend_or_says_why_not() {
         let hours = crate::model::MaxTime::hours(4);
         let logins = crate::identity::github_logins::GithubLogins::default();
-        let signed_in = crate::identity::github_links::SignedIn::default();
+        let signed_in = crate::identity::forge::held::SignedIn::default();
         let refused = |token, app| match github_backend(token, app, &logins, &signed_in, &hours) {
             Err(reason) => reason,
             Ok(_) => panic!("built a GitHub backend"),
