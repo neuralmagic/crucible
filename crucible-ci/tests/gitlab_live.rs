@@ -28,11 +28,36 @@ async fn watch_finds_and_follows_the_pipelines_of_a_live_commit() {
     let project = ProjectPath::parse(&env("CRUCIBLE_CI_GITLAB_PROJECT")).expect("project parses");
     let token = BearerToken::new(env("CRUCIBLE_CI_GITLAB_TOKEN"));
 
+    let head = gl
+        .commit(&token, &project, "main")
+        .await
+        .expect("main resolves");
     let lint = gl
-        .lint(&token, &project, "main")
+        .lint(&token, &project, &head, "main")
         .await
         .expect("the configuration validates");
     assert!(lint.valid, "{:?}", lint.errors);
+    let branches = gl
+        .protected_branches(&token, &project)
+        .await
+        .expect("listing protected branches");
+    let tags = gl
+        .protected_tags(&token, &project)
+        .await
+        .expect("listing protected tags");
+    let me = gl.user(&token).await.expect("reading the token's account");
+    let member = gl
+        .member_access(&token, &project, me.id)
+        .await
+        .expect("reading the access")
+        .expect("the token's account is a member");
+    assert!(member.is_active());
+    println!(
+        "{} protected branches, {} protected tags, access {}",
+        branches.len(),
+        tags.len(),
+        member.access_level
+    );
     let shape = Shape::from_lint(&lint);
     println!(
         "stages {:?}, {} jobs with needs",
@@ -41,7 +66,7 @@ async fn watch_finds_and_follows_the_pipelines_of_a_live_commit() {
     );
 
     let config = gl
-        .file(&token, &project, ".gitlab-ci.yml", "main")
+        .file(&token, &project, ".gitlab-ci.yml", head.as_str(), 1 << 20)
         .await
         .expect("reading the configuration")
         .expect("the project has a .gitlab-ci.yml");
@@ -97,7 +122,7 @@ async fn watch_finds_and_follows_the_pipelines_of_a_live_commit() {
         .find(|j| j.status == "success")
         .expect("the latest pipeline has a passed job");
     let log = gl
-        .trace(&token, &project, job.id)
+        .trace(&token, &project, job.id, 1 << 20)
         .await
         .expect("reading the log");
     assert!(!log.is_empty());

@@ -232,7 +232,7 @@ impl GithubWorkflowBackend {
         &self,
         who: &Principal,
         repo: &GithubRepo,
-        linked: Option<&str>,
+        linked: Option<u64>,
     ) -> Result<(), TargetError> {
         let TokenSource::App { app, logins } = &self.tokens else {
             return Ok(());
@@ -246,11 +246,22 @@ impl GithubWorkflowBackend {
                  of {repo}"
             )));
         };
-        let mut paired = logins.github_logins(user);
-        if let Some(linked) = linked
-            && !paired.iter().any(|p| p.eq_ignore_ascii_case(linked))
-        {
-            paired.push(linked);
+        let mut paired: Vec<String> = logins
+            .github_logins(user)
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        if let Some(account_id) = linked {
+            let login = app
+                .account_login(&owner, api_repo.name(), account_id, CALL_PERMISSIONS)
+                .await
+                .map_err(app_failure)?;
+            if !paired
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(login.as_str()))
+            {
+                paired.push(login.as_str().to_owned());
+            }
         }
         if paired.is_empty() {
             return Err(TargetError::Refused(format!(
@@ -262,7 +273,7 @@ impl GithubWorkflowBackend {
         let mut held = Vec::with_capacity(paired.len());
         for login in paired {
             let login =
-                GithubOwner::parse(login).map_err(|e| TargetError::Refused(e.to_string()))?;
+                GithubOwner::parse(&login).map_err(|e| TargetError::Refused(e.to_string()))?;
             let role = app
                 .repo_role(&owner, api_repo.name(), &login, CALL_PERMISSIONS)
                 .await
@@ -581,6 +592,15 @@ mod tests {
             )
             .mount(server)
             .await;
+        for (id, login) in [(41u64, "mal-gh"), (42, "Ash-GH")] {
+            Mock::given(method("GET"))
+                .and(path(format!("/user/{id}")))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({"login": login, "id": id})),
+                )
+                .mount(server)
+                .await;
+        }
         for (login, role) in roles {
             Mock::given(method("GET"))
                 .and(path(format!(
@@ -642,12 +662,12 @@ mod tests {
         assert!(mallory.contains("no linked GitHub login"), "{mallory}");
         assert!(mallory.contains("CONTROLLER_GITHUB_LOGINS"), "{mallory}");
         backend
-            .authorize(&user("mallory"), &repo, Some("mal-gh"))
+            .authorize(&user("mallory"), &repo, Some(41))
             .await
             .unwrap();
         let ash_linked = refused(
             backend
-                .authorize(&user("ash"), &repo, Some("ASH-GH"))
+                .authorize(&user("ash"), &repo, Some(42))
                 .await
                 .unwrap_err(),
         );

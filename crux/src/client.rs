@@ -166,6 +166,38 @@ pub struct PackImportSource<'a> {
     pub variant: Option<&'a str>,
 }
 
+/// A controller answer outside 2xx: the status and the body as written.
+#[derive(Debug)]
+pub struct HttpStatus {
+    pub path: String,
+    pub status: reqwest::StatusCode,
+    pub body: String,
+    hint: String,
+}
+
+impl std::fmt::Display for HttpStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} -> HTTP {}: {}{}",
+            self.path, self.status, self.body, self.hint
+        )
+    }
+}
+
+impl std::error::Error for HttpStatus {}
+
+impl HttpStatus {
+    pub fn new(path: &str, status: reqwest::StatusCode, body: &str) -> Self {
+        HttpStatus {
+            path: path.to_owned(),
+            status,
+            body: body.to_owned(),
+            hint: String::new(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Client {
     transport: std::sync::Arc<dyn Transport>,
@@ -461,11 +493,13 @@ impl Client {
         if status.is_success() {
             return Ok(text);
         }
-        bail!(
-            "{path} -> HTTP {status}: {}{}",
-            text.trim(),
-            self.hint_for(status)
-        );
+        Err(HttpStatus {
+            path: path.to_owned(),
+            status,
+            body: text.trim().to_owned(),
+            hint: self.hint_for(status),
+        }
+        .into())
     }
 
     /// The failures whose raw body does not say what to do about it.

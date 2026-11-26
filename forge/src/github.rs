@@ -294,6 +294,19 @@ pub struct User {
     pub login: String,
 }
 
+/// An installation of the GitHub App a user token was issued by, as `GET /user/installations`
+/// answers.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct UserInstallation {
+    pub id: u64,
+    pub app_id: u64,
+}
+
+#[derive(Deserialize)]
+struct UserInstallations {
+    installations: Vec<UserInstallation>,
+}
+
 /// The run a dispatch created.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct DispatchedRun {
@@ -514,6 +527,37 @@ impl Client {
         let resp = self
             .send(
                 self.http.get(format!("{API}/user")),
+                token,
+                JSON_ACCEPT,
+                doing,
+            )
+            .await?;
+        resp.json().await.map_err(GithubError::http(doing))
+    }
+
+    pub async fn user_installations(
+        &self,
+        token: &Token,
+    ) -> Result<Vec<UserInstallation>, GithubError> {
+        let doing = "listing the installations the token's app shares with its account";
+        let resp = self
+            .send(
+                self.http
+                    .get(format!("{API}/user/installations?per_page=100")),
+                token,
+                JSON_ACCEPT,
+                doing,
+            )
+            .await?;
+        let page: UserInstallations = resp.json().await.map_err(GithubError::http(doing))?;
+        Ok(page.installations)
+    }
+
+    pub async fn user_by_id(&self, token: &Token, id: u64) -> Result<User, GithubError> {
+        let doing = "reading an account by id";
+        let resp = self
+            .send(
+                self.http.get(format!("{API}/user/{id}")),
                 token,
                 JSON_ACCEPT,
                 doing,

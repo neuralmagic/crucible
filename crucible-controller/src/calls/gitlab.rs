@@ -3,7 +3,7 @@
 //! pipeline's jobs, the outcome read from a declared job's artifacts, job logs, and cancel.
 //!
 //! ```text
-//! lock      GET  commits/{ref} ─▶ sha;  files/.gitlab-ci.yml@sha ─▶ inputs;  ci/lint@ref ─▶ graph
+//! lock      GET  commits/{ref} ─▶ sha;  files/.gitlab-ci.yml@sha ─▶ inputs;  ci/lint@sha ─▶ graph
 //! dispatch  POST pipeline {ref, inputs}            ─▶ handle {host, project, pipeline_id}
 //! poll      GET  pipelines/{id} + jobs + bridges   ─▶ progress, outcome
 //! result    GET  jobs/{job}/artifacts/result.json  ─▶ typed fields, files
@@ -16,6 +16,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crucible_ci::commit::CommitId;
+use crucible_ci::gitlab::access::{Runner, refused_by};
 use crucible_ci::gitlab::graph::{PipelineState, pipeline_graph, pipeline_state};
 use crucible_ci::gitlab::model::{Job, Pipeline};
 use crucible_ci::gitlab::{Gitlab, GitlabError, ProjectPath};
@@ -40,6 +42,7 @@ const CI_CONFIG: &str = ".gitlab-ci.yml";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 const DEVELOPER: u32 = 30;
 const MAX_LOG_BYTES: usize = 2 * 1024 * 1024;
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const GLAB_TIMEOUT: Duration = Duration::from_secs(20);
 const ERR_BODY_CHARS: usize = 300;
 
@@ -225,9 +228,7 @@ impl GitlabPipelineBackend {
         let commit = api
             .commit(&token, &place.project, place.git_ref.as_str())
             .await?;
-        let interface = self
-            .interface_at(&api, &token, &place, commit.as_str())
-            .await?;
+        let interface = self.interface_at(&api, &token, &place, &commit).await?;
         let pin = Pin::GitlabRef {
             host: place.host.as_str().to_owned(),
             project: place.project.as_str().to_owned(),
@@ -243,10 +244,16 @@ impl GitlabPipelineBackend {
         api: &Gitlab,
         token: &BearerToken,
         place: &Place<'_>,
-        commit: &str,
+        commit: &CommitId,
     ) -> Result<TargetInterface, TargetError> {
         let config = api
-            .file(token, &place.project, CI_CONFIG, commit)
+            .file(
+                token,
+                &place.project,
+                CI_CONFIG,
+                commit.as_str(),
+                MAX_CONFIG_BYTES,
+            )
             .await?
             .ok_or_else(|| {
                 TargetError::Refused(format!(
@@ -263,7 +270,7 @@ impl GitlabPipelineBackend {
             ))
         })?;
         let lint = api
-            .lint(token, &place.project, place.git_ref.as_str())
+            .lint(token, &place.project, commit, place.git_ref.as_str())
             .await?;
         if !lint.valid {
             return Err(TargetError::Refused(format!(
@@ -303,13 +310,30 @@ impl GitlabPipelineBackend {
         };
         let api = self.api(&place.host)?;
         let token = self.token(&place.host).await?;
-        match api.member_access(&token, &place.project, user_id).await? {
-            Some(level) if level >= DEVELOPER => Ok(()),
-            held => Err(TargetError::Refused(format!(
-                "{who} may not run the pipelines of {}: their GitLab access level is {}, and \
-                 running one needs Developer (30) or above",
-                place.project.as_str(),
-                held.map_or_else(|| "none".to_owned(), |l| l.to_string())
+        let member = match api.member_access(&token, &place.project, user_id).await? {
+            Some(member) if member.is_active() && member.access_level >= DEVELOPER => member,
+            held => {
+                return Err(TargetError::Refused(format!(
+                    "{who} may not run the pipelines of {}: their GitLab access level is {}, and \
+                     running one needs an active Developer (30) or above",
+                    place.project.as_str(),
+                    held.filter(|m| m.is_active())
+                        .map_or_else(|| "none".to_owned(), |m| m.access_level.to_string())
+                )));
+            }
+        };
+        let branches = api.protected_branches(&token, &place.project).await?;
+        let tags = api.protected_tags(&token, &place.project).await?;
+        let runner = Runner {
+            user_id,
+            access_level: member.access_level,
+        };
+        match refused_by(place.git_ref.as_str(), runner, &branches, &tags) {
+            None => Ok(()),
+            Some(rule) => Err(TargetError::Refused(format!(
+                "{who} may not run pipelines on {} of {}: {rule} does not allow them",
+                place.git_ref.as_str(),
+                place.project.as_str()
             ))),
         }
     }
@@ -337,9 +361,7 @@ impl GitlabPipelineBackend {
         let commit = api
             .commit(&token, &place.project, place.git_ref.as_str())
             .await?;
-        let current = self
-            .interface_at(&api, &token, &place, commit.as_str())
-            .await?;
+        let current = self.interface_at(&api, &token, &place, &commit).await?;
         if let Some(moved) = crate::calls::interface_moved(&locked.interface, &current) {
             return Err(TargetError::Refused(format!(
                 "{} at {} (commit {}) {moved} than calls.lock records",
@@ -474,11 +496,21 @@ impl GitlabPipelineBackend {
     ) -> Result<Result<(Value, Vec<ResultFile>), String>, TargetError> {
         let mut result = Map::new();
         if !outputs.fields.is_empty() {
-            let Some(bytes) = api
-                .artifact(token, &place.project, job, GITLAB_RESULT_FILE)
-                .await?
-            else {
+            let read = api
+                .artifact(
+                    token,
+                    &place.project,
+                    job,
+                    GITLAB_RESULT_FILE,
+                    MAX_FILE_PARAM_BYTES,
+                )
+                .await;
+            let Some(bytes) = settled(read, GITLAB_RESULT_FILE)? else {
                 return Ok(Err(format!("its artifacts hold no {GITLAB_RESULT_FILE}")));
+            };
+            let bytes = match bytes {
+                Ok(bytes) => bytes,
+                Err(note) => return Ok(Err(note)),
             };
             match fields(&bytes, outputs) {
                 Ok(read) => result = read,
@@ -487,15 +519,16 @@ impl GitlabPipelineBackend {
         }
         let mut files = Vec::with_capacity(outputs.files.len());
         for path in &outputs.files {
-            let Some(bytes) = api.artifact(token, &place.project, job, path).await? else {
+            let read = api
+                .artifact(token, &place.project, job, path, MAX_FILE_PARAM_BYTES)
+                .await;
+            let Some(bytes) = settled(read, path)? else {
                 return Ok(Err(format!("its artifacts hold no {path:?}")));
             };
-            if bytes.len() as u64 > MAX_FILE_PARAM_BYTES {
-                return Ok(Err(format!(
-                    "{path:?} is {} bytes, above the {MAX_FILE_PARAM_BYTES} a result file may be",
-                    bytes.len()
-                )));
-            }
+            let bytes = match bytes {
+                Ok(bytes) => bytes,
+                Err(note) => return Ok(Err(note)),
+            };
             files.push(ResultFile {
                 file: FileRef {
                     digest: format!("sha256:{:x}", Sha256::digest(&bytes)),
@@ -522,8 +555,10 @@ impl GitlabPipelineBackend {
         let Some(job) = latest_job(&jobs, node) else {
             return Ok(None);
         };
-        let log = api.trace(&token, &place.project, job.id).await?;
-        Ok(Some(tail(log, MAX_LOG_BYTES)))
+        let log = api
+            .trace(&token, &place.project, job.id, MAX_LOG_BYTES)
+            .await?;
+        Ok(Some(log))
     }
 
     pub async fn cancel(&self, target: &CallTarget, pipeline_id: u64) -> Result<(), TargetError> {
@@ -629,15 +664,17 @@ fn fields(bytes: &[u8], outputs: &GitlabOutputs) -> Result<Map<String, Value>, S
     Ok(result)
 }
 
-fn tail(log: String, max: usize) -> String {
-    if log.len() <= max {
-        return log;
+fn settled(
+    read: Result<Option<Vec<u8>>, GitlabError>,
+    path: &str,
+) -> Result<Option<Result<Vec<u8>, String>>, TargetError> {
+    match read {
+        Ok(found) => Ok(found.map(Ok)),
+        Err(GitlabError::TooLarge { cap, .. }) => Ok(Some(Err(format!(
+            "{path:?} is over the {cap} bytes a result file may be"
+        )))),
+        Err(e) => Err(e.into()),
     }
-    let mut start = log.len() - max;
-    while !log.is_char_boundary(start) {
-        start += 1;
-    }
-    log[start..].to_owned()
 }
 
 #[cfg(test)]
@@ -852,10 +889,34 @@ mod tests {
     }
 
     #[test]
-    fn a_long_log_keeps_its_end() {
-        assert_eq!(tail("abcdef".into(), 10), "abcdef");
-        assert_eq!(tail("abcdef".into(), 3), "def");
-        assert_eq!(tail("aé€".into(), 3), "€");
+    fn an_oversized_artifact_is_a_note_and_other_errors_stay_errors() {
+        assert_eq!(settled(Ok(None), "a").unwrap(), None);
+        assert_eq!(settled(Ok(Some(vec![1])), "a").unwrap(), Some(Ok(vec![1])));
+        let big = settled(
+            Err(GitlabError::TooLarge {
+                doing: "reading".into(),
+                cap: 4,
+            }),
+            "out/x",
+        )
+        .unwrap();
+        assert_eq!(
+            big,
+            Some(Err(
+                "\"out/x\" is over the 4 bytes a result file may be".into()
+            ))
+        );
+        assert!(
+            settled(
+                Err(GitlabError::Status {
+                    doing: "reading".into(),
+                    status: 500,
+                    body: String::new(),
+                }),
+                "a"
+            )
+            .is_err()
+        );
     }
 
     #[test]

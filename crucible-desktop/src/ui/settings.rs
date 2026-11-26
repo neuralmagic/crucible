@@ -364,6 +364,8 @@ fn account_control(app: &App, account: &crate::forge::Account, p: &Paint) -> El 
             .as_ref()
             .is_some_and(|(profile, _)| *profile == app.remote.target.name);
         let out = account.clone();
+        let link = account.clone();
+        let offered = !session.busy && !app.settings.forge_linked(&app.remote.target.name, account);
         return row()
             .gap(8.0)
             .center_y()
@@ -372,6 +374,14 @@ fn account_control(app: &App, account: &crate::forge::Account, p: &Paint) -> El 
                 text(format!("linked to {}", app.remote.target.name))
                     .font(p.k.ty.small)
                     .color(p.c.text_muted)
+            }))
+            .children(offered.then(|| {
+                Button::new(format!("Link to {}", app.remote.target.name))
+                    .variant(ButtonVariant::Neutral)
+                    .control_size(rune_kit::ControlSize::Small)
+                    .on_press(move |app: &mut App| app.forge_link_here(link.clone()))
+                    .build(p.k)
+                    .key(format!("forge-link-{key}"))
             }))
             .children(
                 session

@@ -382,6 +382,12 @@ fn unsent(error: &reqwest::Error) -> bool {
     error.is_timeout() || error.is_request()
 }
 
+pub async fn bounded<F: Future>(what: &str, call: F) -> Result<F::Output, String> {
+    timeout(TIMEOUT, call)
+        .await
+        .map_err(|_| format!("{what} timed out after {}s", TIMEOUT.as_secs()))
+}
+
 /// `call`'s answer, or that it timed out after [`TIMEOUT`].
 pub async fn within<T, E: std::fmt::Display>(
     what: &str,

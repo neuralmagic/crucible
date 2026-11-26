@@ -63,6 +63,13 @@ impl Account {
         }
     }
 
+    fn revoke_url(&self) -> Option<String> {
+        match self {
+            Account::Github => None,
+            Account::Gitlab(host) => Some(format!("https://{host}/oauth/revoke")),
+        }
+    }
+
     fn user_url(&self) -> String {
         match self {
             Account::Github => "https://api.github.com/user".into(),
@@ -114,6 +121,7 @@ mod tests {
         );
         assert_eq!(gh.user_url(), "https://api.github.com/user");
         assert_eq!(gh.scope(), None);
+        assert_eq!(gh.revoke_url(), None);
         assert_eq!(gh.link_path(), "/api/me/forge-accounts/github/github.com");
         assert_eq!(gh.store_key(), "github:github.com");
         let gl = Account::Gitlab("gitlab.example.com".into());
@@ -124,6 +132,10 @@ mod tests {
         assert_eq!(gl.token_url(), "https://gitlab.example.com/oauth/token");
         assert_eq!(gl.user_url(), "https://gitlab.example.com/api/v4/user");
         assert_eq!(gl.scope(), Some("api"));
+        assert_eq!(
+            gl.revoke_url().as_deref(),
+            Some("https://gitlab.example.com/oauth/revoke")
+        );
         assert_eq!(
             gl.link_path(),
             "/api/me/forge-accounts/gitlab/gitlab.example.com"

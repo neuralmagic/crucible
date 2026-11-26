@@ -110,6 +110,12 @@ pub(crate) enum RepoDenied {
     Lacks { repo: String, missing: String },
 }
 
+/// `GET /user/{id}` response (the fields we use).
+#[derive(Debug, Deserialize)]
+struct Account {
+    login: String,
+}
+
 /// `GET /repos/{owner}/{repo}/collaborators/{login}/permission` response (the fields we use).
 #[derive(Debug, Deserialize)]
 struct CollaboratorPermission {
@@ -317,6 +323,10 @@ impl GithubAppTokenSource {
                 .build(),
             identity: std::sync::Arc::new(tokio::sync::OnceCell::new()),
         }
+    }
+
+    pub fn app_id(&self) -> &str {
+        &self.app_id
     }
 
     /// Build from the three `CONTROLLER_GITHUB_APP_*` env vars. All unset ⇒ `Ok(None)` (the app
@@ -551,6 +561,33 @@ impl GithubAppTokenSource {
         }
         let answer: CollaboratorPermission = resp.json().await.with_context(doing)?;
         Ok(RepoRole::of(&answer))
+    }
+
+    pub(crate) async fn account_login(
+        &self,
+        owner: &GithubOwner,
+        repo: &str,
+        account_id: u64,
+        wants: &'static [(&'static str, Access)],
+    ) -> Result<GithubOwner> {
+        let token = self.repo_token(owner, repo, wants).await?;
+        let url = format!("{}/user/{account_id}", self.api_base.trim_end_matches('/'));
+        let doing = || format!("reading the login of GitHub account {account_id}");
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&token)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("User-Agent", "crucible-controller")
+            .send()
+            .await
+            .with_context(doing)?;
+        if !resp.status().is_success() {
+            bail!("{} returned {}", doing(), resp.status());
+        }
+        let account: Account = resp.json().await.with_context(doing)?;
+        GithubOwner::parse(&account.login).map_err(|e| anyhow::anyhow!("{}: {e}", doing()))
     }
 
     async fn mint_for_repo(

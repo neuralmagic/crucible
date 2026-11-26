@@ -6,12 +6,14 @@
 //!   dispatch POST /projects/{id}/pipeline {ref, inputs}
 //!   find     GET  /projects/{id}/pipelines?sha=…&source=…
 //!   follow   GET  /projects/{id}/pipelines/{p}  + …/jobs  + …/bridges
-//!   shape    GET  /projects/{id}/ci/lint?dry_run=true&include_jobs=true&ref=…
+//!   access   GET  /projects/{id}/members/all/{u}  + …/protected_branches  + …/protected_tags
+//!   shape    GET  /projects/{id}/ci/lint?dry_run=true&include_jobs=true&content_ref=…
 //!   logs     GET  /projects/{id}/jobs/{j}/trace
 //!   result   GET  /projects/{id}/jobs/{j}/artifacts/result.json
 //!   cancel   POST /projects/{id}/pipelines/{p}/cancel
 //! ```
 
+pub mod access;
 pub mod graph;
 pub mod inputs;
 pub mod model;
@@ -23,7 +25,9 @@ use serde_json::Value;
 use url::Url;
 
 use crate::commit::CommitId;
-use crate::gitlab::model::{Bridge, Commit, Job, Lint, Member, Pipeline, User};
+use crate::gitlab::model::{
+    Bridge, Commit, Job, Lint, Member, Pipeline, ProtectedBranch, ProtectedTag, TokenInfo, User,
+};
 use crate::token::BearerToken;
 
 const PER_PAGE: u32 = 100;
@@ -67,6 +71,8 @@ pub enum GitlabError {
         #[source]
         source: reqwest::Error,
     },
+    #[error("{doing}: the body is over {cap} bytes")]
+    TooLarge { doing: String, cap: u64 },
     #[error("{doing}: GitLab answered {status}: {body}")]
     Status {
         doing: String,
@@ -161,17 +167,44 @@ impl Gitlab {
         token: &BearerToken,
         project: &ProjectPath,
         user_id: u64,
-    ) -> Result<Option<u32>, GitlabError> {
+    ) -> Result<Option<Member>, GitlabError> {
         let doing = format!(
             "reading the access of user {user_id} to {}",
             project.as_str()
         );
         let url = self.url(project, &["members", "all", &user_id.to_string()], &[]);
         match self.get_json::<Member>(token, &doing, url).await {
-            Ok(member) => Ok(Some(member.access_level)),
+            Ok(member) => Ok(Some(member)),
             Err(GitlabError::Status { status: 404, .. }) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    pub async fn protected_branches(
+        &self,
+        token: &BearerToken,
+        project: &ProjectPath,
+    ) -> Result<Vec<ProtectedBranch>, GitlabError> {
+        let doing = format!("listing the protected branches of {}", project.as_str());
+        let url = self.url(project, &["protected_branches"], &[]);
+        self.pages(token, &doing, url).await
+    }
+
+    pub async fn protected_tags(
+        &self,
+        token: &BearerToken,
+        project: &ProjectPath,
+    ) -> Result<Vec<ProtectedTag>, GitlabError> {
+        let doing = format!("listing the protected tags of {}", project.as_str());
+        let url = self.url(project, &["protected_tags"], &[]);
+        self.pages(token, &doing, url).await
+    }
+
+    pub async fn token_info(&self, token: &BearerToken) -> Result<TokenInfo, GitlabError> {
+        let mut url = self.api.clone();
+        url.set_path("/oauth/token/info");
+        self.get_json(token, "reading which application the token belongs to", url)
+            .await
     }
 
     pub async fn pipelines_for(
@@ -264,11 +297,13 @@ impl Gitlab {
         &self,
         token: &BearerToken,
         project: &ProjectPath,
+        commit: &CommitId,
         git_ref: &str,
     ) -> Result<Lint, GitlabError> {
         let doing = format!(
-            "validating the CI configuration of {} at {git_ref}",
-            project.as_str()
+            "validating the CI configuration of {} at {}",
+            project.as_str(),
+            commit.short()
         );
         let url = self.url(
             project,
@@ -276,7 +311,8 @@ impl Gitlab {
             &[
                 ("dry_run", "true"),
                 ("include_jobs", "true"),
-                ("ref", git_ref),
+                ("content_ref", commit.as_str()),
+                ("dry_run_ref", git_ref),
             ],
         );
         self.get_json(token, &doing, url).await
@@ -288,6 +324,7 @@ impl Gitlab {
         project: &ProjectPath,
         path: &str,
         git_ref: &str,
+        cap: u64,
     ) -> Result<Option<String>, GitlabError> {
         let doing = format!("reading {path} of {} at {git_ref}", project.as_str());
         let url = self.url(
@@ -296,11 +333,16 @@ impl Gitlab {
             &[("ref", git_ref)],
         );
         match self.response(token, &doing, self.http.get(url)).await {
-            Ok(r) => r
-                .text()
-                .await
-                .map(Some)
-                .map_err(|source| GitlabError::Http { doing, source }),
+            Ok(r) => {
+                let bytes = capped(r, cap, &doing).await?;
+                String::from_utf8(bytes)
+                    .map(Some)
+                    .map_err(|_| GitlabError::Status {
+                        doing,
+                        status: 200,
+                        body: "the file is not UTF-8".to_owned(),
+                    })
+            }
             Err(GitlabError::Status { status: 404, .. }) => Ok(None),
             Err(e) => Err(e),
         }
@@ -345,14 +387,13 @@ impl Gitlab {
         token: &BearerToken,
         project: &ProjectPath,
         job: u64,
+        keep: usize,
     ) -> Result<String, GitlabError> {
         let doing = format!("reading the log of job {job}");
         let url = self.url(project, &["jobs", &job.to_string(), "trace"], &[]);
-        self.response(token, &doing, self.http.get(url))
-            .await?
-            .text()
-            .await
-            .map_err(|source| GitlabError::Http { doing, source })
+        let r = self.response(token, &doing, self.http.get(url)).await?;
+        let bytes = tail(r, keep, &doing).await?;
+        Ok(String::from_utf8_lossy(char_start(&bytes)).into_owned())
     }
 
     pub async fn artifact(
@@ -361,6 +402,7 @@ impl Gitlab {
         project: &ProjectPath,
         job: u64,
         path: &str,
+        cap: u64,
     ) -> Result<Option<Vec<u8>>, GitlabError> {
         let doing = format!("reading {path} from the artifacts of job {job}");
         let job_id = job.to_string();
@@ -368,11 +410,7 @@ impl Gitlab {
         rest.extend(path.split('/'));
         let url = self.url(project, &rest, &[]);
         match self.response(token, &doing, self.http.get(url)).await {
-            Ok(r) => r
-                .bytes()
-                .await
-                .map(|b| Some(b.to_vec()))
-                .map_err(|source| GitlabError::Http { doing, source }),
+            Ok(r) => capped(r, cap, &doing).await.map(Some),
             Err(GitlabError::Status { status: 404, .. }) => Ok(None),
             Err(e) => Err(e),
         }
@@ -452,9 +490,107 @@ impl Gitlab {
     }
 }
 
+async fn capped(mut r: reqwest::Response, cap: u64, doing: &str) -> Result<Vec<u8>, GitlabError> {
+    let over = || GitlabError::TooLarge {
+        doing: doing.to_owned(),
+        cap,
+    };
+    if r.content_length().is_some_and(|len| len > cap) {
+        return Err(over());
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = r.chunk().await.map_err(|source| GitlabError::Http {
+        doing: doing.to_owned(),
+        source,
+    })? {
+        if buf.len() as u64 + chunk.len() as u64 > cap {
+            return Err(over());
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+async fn tail(mut r: reqwest::Response, keep: usize, doing: &str) -> Result<Vec<u8>, GitlabError> {
+    let mut buf = Vec::new();
+    while let Some(chunk) = r.chunk().await.map_err(|source| GitlabError::Http {
+        doing: doing.to_owned(),
+        source,
+    })? {
+        buf.extend_from_slice(&chunk);
+        keep_last(&mut buf, keep);
+    }
+    Ok(buf)
+}
+
+fn char_start(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .take(4)
+        .position(|b| b & 0xC0 != 0x80)
+        .unwrap_or(0);
+    &bytes[start..]
+}
+
+fn keep_last(buf: &mut Vec<u8>, keep: usize) {
+    if buf.len() > keep {
+        buf.drain(..buf.len() - keep);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::gitlab::{Gitlab, GitlabError, ProjectPath};
+    use crate::gitlab::model::{Member, ProtectedBranch, TokenInfo};
+    use crate::gitlab::{Gitlab, GitlabError, ProjectPath, char_start, keep_last};
+
+    #[test]
+    fn a_log_tail_keeps_its_last_bytes_from_a_char_boundary() {
+        let mut buf = b"abcdef".to_vec();
+        keep_last(&mut buf, 10);
+        assert_eq!(buf, b"abcdef");
+        keep_last(&mut buf, 3);
+        assert_eq!(buf, b"def");
+        let mut buf = "aé€".as_bytes().to_vec();
+        keep_last(&mut buf, 4);
+        assert_eq!(String::from_utf8_lossy(char_start(&buf)), "€");
+        assert_eq!(char_start(b"plain"), b"plain");
+    }
+
+    #[test]
+    fn only_an_active_member_is_active() {
+        let member: Member = serde_json::from_value(serde_json::json!({
+            "access_level": 30, "state": "active", "membership_state": "active"
+        }))
+        .unwrap();
+        assert!(member.is_active());
+        let bare: Member = serde_json::from_value(serde_json::json!({"access_level": 30})).unwrap();
+        assert!(bare.is_active());
+        for (state, membership) in [("blocked", "active"), ("active", "awaiting")] {
+            let member: Member = serde_json::from_value(serde_json::json!({
+                "access_level": 30, "state": state, "membership_state": membership
+            }))
+            .unwrap();
+            assert!(!member.is_active(), "{state} {membership}");
+        }
+    }
+
+    #[test]
+    fn protected_refs_and_token_info_read_gitlabs_shapes() {
+        let branch: ProtectedBranch = serde_json::from_value(serde_json::json!({
+            "id": 1, "name": "release-*",
+            "push_access_levels": [{"access_level": 40, "access_level_description": "Maintainers"}],
+            "merge_access_levels": [{"access_level": 40, "user_id": 7, "group_id": null}]
+        }))
+        .unwrap();
+        assert_eq!(branch.push_access_levels[0].access_level, Some(40));
+        assert_eq!(branch.merge_access_levels[0].user_id, Some(7));
+        let info: TokenInfo = serde_json::from_value(serde_json::json!({
+            "resource_owner_id": 1, "scope": ["api"], "expires_in": 7200,
+            "application": {"uid": "abc"}, "created_at": 1
+        }))
+        .unwrap();
+        assert_eq!(info.application.map(|a| a.uid).as_deref(), Some("abc"));
+    }
 
     #[test]
     fn project_paths_have_a_namespace_and_safe_segments() {

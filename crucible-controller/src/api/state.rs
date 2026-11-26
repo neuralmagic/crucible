@@ -173,6 +173,8 @@ pub struct ApiState {
             String,
         >,
     >,
+    pub(crate) gitlab_client_ids:
+        Arc<std::collections::BTreeMap<crate::identity::forge::ForgeHost, String>>,
 }
 
 impl ApiState {
@@ -278,6 +280,7 @@ impl ApiState {
             gitlab_hosts: Arc::new(cfg.gitlab_hosts()),
             calls_gitlab: cfg.calls_gitlab_token,
             gitlab_token_files: Arc::new(cfg.gitlab_token_files()),
+            gitlab_client_ids: Arc::new(cfg.gitlab_client_ids().unwrap_or_default()),
         }
     }
 
@@ -417,6 +420,7 @@ impl ApiState {
             gitlab_hosts: Arc::new(Vec::new()),
             calls_gitlab: None,
             gitlab_token_files: Arc::new(Ok(Default::default())),
+            gitlab_client_ids: Arc::new(Default::default()),
         }
     }
 }

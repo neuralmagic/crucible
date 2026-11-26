@@ -3,7 +3,7 @@
 //! The sans is the theme's Inter. The mono slot and the log fonts are the theme's IBM Plex Mono (OFL)
 //! or a font read from this machine's font store at startup; no proprietary font is ever bundled.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -198,6 +198,7 @@ pub struct Settings {
     pub editor_command: String,
     pub github_client_id: String,
     pub gitlab_apps: BTreeMap<String, String>,
+    pub forge_links: BTreeMap<String, BTreeSet<String>>,
     /// Keys bound by hand, by command id; a command left out keeps its defaults.
     pub keys: BTreeMap<String, Vec<String>>,
     /// Check the shown pack file with crucible-lsp.
@@ -254,6 +255,8 @@ struct Config {
     github_client_id: Option<String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     gitlab_apps: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    forge_links: BTreeMap<String, BTreeSet<String>>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     keys: BTreeMap<String, Vec<String>>,
     checks: Option<bool>,
@@ -332,6 +335,7 @@ impl Settings {
             editor_command: config.editor_command.unwrap_or_default(),
             github_client_id: config.github_client_id.unwrap_or_default(),
             gitlab_apps: config.gitlab_apps,
+            forge_links: config.forge_links,
             keys: config.keys,
             checks: config.checks.unwrap_or(true),
             view_plugins: config.view_plugins.unwrap_or(false),
@@ -378,6 +382,7 @@ impl Settings {
     }
 
     pub fn remove_profile(&mut self, name: &str) {
+        self.forge_links.remove(name);
         if self.profiles.remove(name).is_some() {
             if self.profile.as_deref() == Some(name) {
                 self.profile = None;
@@ -583,6 +588,45 @@ impl Settings {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    pub fn forge_linked(&self, profile: &str, account: &crate::forge::Account) -> bool {
+        self.forge_links
+            .get(profile)
+            .is_some_and(|accounts| accounts.contains(&account.store_key()))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn forge_profiles(&self, account: &crate::forge::Account) -> Vec<String> {
+        let key = account.store_key();
+        self.forge_links
+            .iter()
+            .filter(|(_, accounts)| accounts.contains(&key))
+            .map(|(profile, _)| profile.clone())
+            .collect()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_forge_linked(&mut self, profile: &str, account: &crate::forge::Account, on: bool) {
+        let key = account.store_key();
+        match on {
+            true => {
+                self.forge_links
+                    .entry(profile.to_string())
+                    .or_default()
+                    .insert(key);
+            }
+            false => {
+                if let Some(accounts) = self.forge_links.get_mut(profile) {
+                    accounts.remove(&key);
+                    if accounts.is_empty() {
+                        self.forge_links.remove(profile);
+                    }
+                }
+            }
+        }
+        self.save();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn client_id(&self, account: &crate::forge::Account) -> String {
         match account {
             crate::forge::Account::Github => self.github_client_id.clone(),
@@ -648,6 +692,7 @@ impl Settings {
             github_client_id: (!self.github_client_id.is_empty())
                 .then(|| self.github_client_id.clone()),
             gitlab_apps: self.gitlab_apps.clone(),
+            forge_links: self.forge_links.clone(),
             keys: self.keys.clone(),
             checks: Some(self.checks),
             view_plugins: Some(self.view_plugins),

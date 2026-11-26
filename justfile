@@ -232,7 +232,8 @@ calls-gitlab-example port="8870" max_cost="1" max_time="30m":
 # Launch a Konflux demo pack: `konflux-watch` watches the pull request builds of a ModelExpress
 # commit (params '{"commit":"<sha>"}'); `konflux-pr` pushes to a reused pull request first, with
 # your own git and gh logins. Start `just controller-local` with
-# CONTROLLER_CALLS_TEKTON_CLUSTERS=konflux=<kubeconfig> and CONTROLLER_CALLS_TEKTON_RESULTS=konflux=<url>.
+# CONTROLLER_CALLS_TEKTON_CLUSTERS=konflux=<kubeconfig>, CONTROLLER_CALLS_TEKTON_RESULTS=konflux=<url>
+# and CONTROLLER_CALLS_TEKTON_GRANTS=konflux/<namespace>=user:<your login>.
 konflux-example pack params='{}' port="8870" max_time="2h":
     #!/usr/bin/env bash
     set -euo pipefail

@@ -6,7 +6,7 @@ use std::sync::mpsc::{Sender, channel};
 use crate::App;
 use crate::forge::Account;
 use crate::forge::device::{self, Tokens};
-use crate::forge::link;
+use crate::forge::link::{self, LinkError};
 use crate::forge::session::{Event, Session};
 use crate::profile::{Readiness, Target};
 
@@ -27,15 +27,15 @@ fn link_now(
     account: &Account,
     client_id: &str,
     tokens: Tokens,
-) -> (Result<String, String>, Option<i64>) {
+) -> (Result<String, LinkError>, Option<i64>) {
     let renewed = match device::current(runtime, account, client_id, tokens.clone()) {
         Ok(renewed) => renewed,
-        Err(why) => return (Err(why), None),
+        Err(why) => return (Err(LinkError::Failed(why)), None),
     };
     if renewed != tokens
         && let Err(why) = keys.save_forge_tokens(account, &renewed)
     {
-        return (Err(why), None);
+        return (Err(LinkError::Failed(why)), None);
     }
     let renew_at = renewed.renew_at();
     (link::link(runtime, target, account, &renewed), renew_at)
@@ -63,6 +63,7 @@ impl App {
             }
         };
         let target = self.remote.target.clone();
+        self.settings.set_forge_linked(&target.name, &account, true);
         let keys = self.settings.keys();
         let waker = self.waker.clone();
         let (tx, rx) = channel();
@@ -115,31 +116,56 @@ impl App {
         session.cancel = None;
     }
 
+    pub fn forge_link_here(&mut self, account: Account) {
+        let profile = self.remote.target.name.clone();
+        self.settings.set_forge_linked(&profile, &account, true);
+        let session = self.forge_session(&account);
+        session.next = None;
+        session.error = None;
+        if !session.busy {
+            self.forge_link(&account);
+        }
+    }
+
     pub fn forge_sign_out(&mut self, account: Account) {
         self.forge_cancel(account.clone());
-        if let Err(why) = self.settings.keys().forget_forge_tokens(&account) {
+        let keys = self.settings.keys();
+        let held = keys.forge_tokens(&account).ok().flatten();
+        if let Err(why) = keys.forget_forge_tokens(&account) {
             self.forge_session(&account).error = Some(why);
             return;
         }
         let session = self.forge_session(&account);
-        let linked = session.linked.take();
+        session.linked = None;
         session.login = None;
         session.next = None;
         session.error = None;
-        let Some((profile, _)) = linked else {
-            return;
-        };
-        if profile != self.remote.target.name {
-            return;
+        let usable = crate::profile::usable(&self.settings);
+        let mut targets = Vec::new();
+        for profile in self.settings.forge_profiles(&account) {
+            self.settings.set_forge_linked(&profile, &account, false);
+            match profile == self.remote.target.name {
+                true => targets.push(self.remote.target.clone()),
+                false => {
+                    if let Some(p) = usable.get(&profile) {
+                        targets.push(crate::profile::Target::new(&profile, p.clone(), &keys));
+                    }
+                }
+            }
         }
         let Ok(runtime) = self.net.handle() else {
             return;
         };
-        let target = self.remote.target.clone();
+        let client_id = self.settings.client_id(&account);
         let _ = std::thread::Builder::new()
             .name("crucible-playbooks-forge-unlink".into())
             .spawn(move || {
-                let _ = link::unlink(&runtime, &target, &account);
+                for target in &targets {
+                    let _ = link::unlink(&runtime, target, &account);
+                }
+                if let Some(tokens) = held {
+                    let _ = device::revoke(&runtime, &account, &client_id, &tokens);
+                }
             });
     }
 
@@ -248,7 +274,11 @@ impl App {
                         let at = renew_at.unwrap_or(now + RELINK_SECS);
                         session.next = Some((profile, at.max(now + 60)));
                     }
-                    Err(why) => {
+                    Err(LinkError::Refused(why)) => {
+                        session.error = Some(why);
+                        session.hold(&profile);
+                    }
+                    Err(LinkError::Failed(why)) => {
                         session.error = Some(why);
                         session.next = Some((profile, now + RETRY_SECS));
                     }
@@ -285,6 +315,7 @@ impl App {
                 changed = true;
             }
             if ready
+                && self.settings.forge_linked(&profile, &account)
                 && self
                     .forge_session(&account)
                     .due(&profile, device::unix_now())

@@ -117,15 +117,7 @@ async fn whoami(forge: Forge, host: &ForgeHost, token: &str) -> Result<(u64, Str
             }
         }
         Forge::Gitlab => {
-            let http = reqwest::Client::builder()
-                .timeout(FORGE_TIMEOUT)
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .map_err(|e| Whoami::Unreachable(e.to_string()))?;
-            let gitlab =
-                crucible_ci::gitlab::Gitlab::new(http, &format!("https://{}", host.as_str()))
-                    .map_err(|e| Whoami::Refused(e.to_string()))?;
-            match gitlab
+            match gitlab_api(host)?
                 .user(&crucible_ci::token::BearerToken::new(token))
                 .await
             {
@@ -134,6 +126,69 @@ async fn whoami(forge: Forge, host: &ForgeHost, token: &str) -> Result<(u64, Str
                 Err(e) => Err(Whoami::Refused(e.to_string())),
             }
         }
+    }
+}
+
+fn gitlab_api(host: &ForgeHost) -> Result<crucible_ci::gitlab::Gitlab, Whoami> {
+    let http = reqwest::Client::builder()
+        .timeout(FORGE_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| Whoami::Unreachable(e.to_string()))?;
+    crucible_ci::gitlab::Gitlab::new(http, &format!("https://{}", host.as_str()))
+        .map_err(|e| Whoami::Refused(e.to_string()))
+}
+
+async fn issued_here(
+    state: &ApiState,
+    forge: Forge,
+    host: &ForgeHost,
+    token: &str,
+) -> Result<(), Whoami> {
+    let not_ours = |what: &str| {
+        Whoami::Refused(format!(
+            "the token was not issued by {what}; sign in from the desktop app"
+        ))
+    };
+    match forge {
+        Forge::Github if state.calls_github == Some(crate::calls::GithubToken::AppInstallation) => {
+            let ours = state
+                .pack_pr_app
+                .as_ref()
+                .and_then(|app| app.app_id().parse::<u64>().ok())
+                .ok_or_else(|| Whoami::Refused("this controller has no GitHub App".to_owned()))?;
+            let client =
+                forge::github::Client::new().map_err(|e| Whoami::Unreachable(e.to_string()))?;
+            match client
+                .user_installations(&forge::github::Token::new(token))
+                .await
+            {
+                Ok(installs) if installs.iter().any(|i| i.app_id == ours) => Ok(()),
+                Ok(_) => Err(not_ours(
+                    "this controller's GitHub App on an installation the account can reach",
+                )),
+                Err(e) if e.is_transient() => Err(Whoami::Unreachable(e.to_string())),
+                Err(_) => Err(not_ours("this controller's GitHub App")),
+            }
+        }
+        Forge::Gitlab if state.calls_gitlab == Some(crate::calls::GitlabToken::Bot) => {
+            let ours = state.gitlab_client_ids.get(host).ok_or_else(|| {
+                Whoami::Refused(format!(
+                    "this controller names no OAuth application for {}",
+                    host.as_str()
+                ))
+            })?;
+            match gitlab_api(host)?
+                .token_info(&crucible_ci::token::BearerToken::new(token))
+                .await
+            {
+                Ok(info) if info.application.as_ref().is_some_and(|a| &a.uid == ours) => Ok(()),
+                Ok(_) => Err(not_ours("this controller's GitLab application")),
+                Err(e) if e.is_transient() => Err(Whoami::Unreachable(e.to_string())),
+                Err(_) => Err(not_ours("this controller's GitLab application")),
+            }
+        }
+        Forge::Github | Forge::Gitlab => Ok(()),
     }
 }
 
@@ -168,7 +223,7 @@ pub(crate) async fn list_forge_accounts(
     ),
     responses(
         (status = 200, description = "The forge named the token's account; it is now the caller's", body = ForgeAccountDto),
-        (status = 400, description = "The forge refused the token", body = ErrorBody),
+        (status = 400, description = "The forge refused the token, or it was not issued to this controller's forge application", body = ErrorBody),
         (status = 403, description = "The caller is not a person, or acts as a team", body = ErrorBody),
         (status = 404, description = "This controller links no accounts on that forge host", body = ErrorBody),
         (status = 409, description = "The account is linked to another person", body = ErrorBody),
@@ -193,7 +248,11 @@ pub(crate) async fn put_forge_account(
     if secret.is_empty() || secret.contains(char::is_whitespace) {
         return Ok(bad_request("token is one forge token"));
     }
-    let (account_id, login) = match whoami(forge, &host, secret).await {
+    let asked = match issued_here(&state, forge, &host, secret).await {
+        Ok(()) => whoami(forge, &host, secret).await,
+        Err(e) => Err(e),
+    };
+    let (account_id, login) = match asked {
         Ok(who) => who,
         Err(Whoami::Unreachable(e)) => {
             tracing::warn!(
@@ -308,6 +367,39 @@ mod tests {
             ]),
             ..ApiState::test(Db::new(pool))
         }
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_controller_acting_for_people_links_only_its_own_apps_tokens(pool: PgPool) {
+        let state = ApiState {
+            calls_github: Some(crate::calls::GithubToken::AppInstallation),
+            calls_gitlab: Some(crate::calls::GitlabToken::Bot),
+            gitlab_hosts: std::sync::Arc::new(vec![
+                ForgeHost::parse("gitlab.example.com").unwrap(),
+            ]),
+            ..ApiState::test(Db::new(pool.clone()))
+        };
+        let app = crate::api::router(state);
+        let token = Some(serde_json::json!({"token": "gho_anything"}));
+        let (status, body) = send(
+            &app,
+            "PUT",
+            "/api/me/forge-accounts/github/github.com",
+            token.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("no GitHub App"), "{body}");
+        let (status, body) = send(
+            &app,
+            "PUT",
+            "/api/me/forge-accounts/gitlab/gitlab.example.com",
+            token,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("names no OAuth application"), "{body}");
+        assert!(links::list(&pool, "wren").await.unwrap().is_empty());
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]

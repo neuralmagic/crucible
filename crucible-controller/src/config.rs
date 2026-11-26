@@ -733,6 +733,13 @@ pub struct ControllerCfg {
     )]
     pub gitlab_token_files: Vec<String>,
     #[arg(
+        long = "gitlab-client-id",
+        env = "CONTROLLER_GITLAB_CLIENT_IDS",
+        value_delimiter = ',',
+        default_value = ""
+    )]
+    pub gitlab_client_ids: Vec<String>,
+    #[arg(
         long = "gitlab-hosts",
         env = "CONTROLLER_GITLAB_HOSTS",
         value_delimiter = ',',
@@ -760,6 +767,13 @@ pub struct ControllerCfg {
         default_value = ""
     )]
     pub calls_tekton_results: Vec<String>,
+    #[arg(
+        long = "calls-tekton-grant",
+        env = "CONTROLLER_CALLS_TEKTON_GRANTS",
+        value_delimiter = ',',
+        default_value = ""
+    )]
+    pub calls_tekton_grants: Vec<String>,
     #[command(flatten)]
     pub profile: Profile,
 }
@@ -1079,26 +1093,27 @@ impl ControllerCfg {
         std::collections::BTreeMap<crate::identity::forge::ForgeHost, PathBuf>,
         String,
     > {
-        let mut files = std::collections::BTreeMap::new();
-        for entry in self
-            .gitlab_token_files
-            .iter()
-            .filter(|e| !e.trim().is_empty())
-        {
-            let (host, path) = entry.split_once('=').ok_or_else(|| {
-                format!("CONTROLLER_GITLAB_TOKEN_FILES entry {entry:?} is not <host>=<token file>")
-            })?;
-            let host = crate::identity::forge::ForgeHost::parse(host).ok_or_else(|| {
-                format!("CONTROLLER_GITLAB_TOKEN_FILES entry {entry:?} names no host")
-            })?;
-            if path.trim().is_empty() {
-                return Err(format!(
-                    "CONTROLLER_GITLAB_TOKEN_FILES entry {entry:?} names no token file"
-                ));
-            }
-            files.insert(host, PathBuf::from(path.trim()));
-        }
-        Ok(files)
+        Ok(host_map(
+            "CONTROLLER_GITLAB_TOKEN_FILES",
+            "token file",
+            &self.gitlab_token_files,
+        )?
+        .into_iter()
+        .map(|(host, path)| (host, PathBuf::from(path)))
+        .collect())
+    }
+
+    pub(crate) fn gitlab_client_ids(
+        &self,
+    ) -> std::result::Result<
+        std::collections::BTreeMap<crate::identity::forge::ForgeHost, String>,
+        String,
+    > {
+        host_map(
+            "CONTROLLER_GITLAB_CLIENT_IDS",
+            "client ID",
+            &self.gitlab_client_ids,
+        )
     }
 
     pub fn validate_calls_gitlab(&self, dev_identity: Option<&str>) -> Result<()> {
@@ -1119,12 +1134,23 @@ impl ControllerCfg {
             }
             Some(crate::calls::GitlabToken::Bot) => {
                 let files = self.gitlab_token_files().map_err(anyhow::Error::msg)?;
+                let clients = self.gitlab_client_ids().map_err(anyhow::Error::msg)?;
                 for host in self.gitlab_hosts() {
                     if !files.contains_key(&host) {
                         bail!(
                             "CONTROLLER_CALLS_GITLAB_TOKEN=bot needs a token file for every \
                              CONTROLLER_GITLAB_HOSTS host; {} has none \
                              (CONTROLLER_GITLAB_TOKEN_FILES)",
+                            host.as_str()
+                        );
+                    }
+                }
+                for host in self.gitlab_hosts() {
+                    if !clients.contains_key(&host) {
+                        bail!(
+                            "CONTROLLER_CALLS_GITLAB_TOKEN=bot needs the OAuth application people \
+                             sign in with on every CONTROLLER_GITLAB_HOSTS host; {} has none \
+                             (CONTROLLER_GITLAB_CLIENT_IDS)",
                             host.as_str()
                         );
                     }
@@ -1163,7 +1189,11 @@ impl ControllerCfg {
         std::collections::BTreeMap<String, crate::calls::tekton::TektonCluster>,
         String,
     > {
-        crate::calls::tekton::clusters(&self.calls_tekton_kubeconfigs, &self.calls_tekton_results)
+        crate::calls::tekton::clusters(
+            &self.calls_tekton_kubeconfigs,
+            &self.calls_tekton_results,
+            &self.calls_tekton_grants,
+        )
     }
 
     pub fn validate_calls_github(&self, dev_identity: Option<&str>) -> Result<()> {
@@ -1350,6 +1380,29 @@ pub fn refuse_retired_settings(env: impl Fn(&str) -> Option<String>) -> Result<(
         }
     }
     Ok(())
+}
+
+fn host_map(
+    env: &str,
+    what: &str,
+    entries: &[String],
+) -> std::result::Result<
+    std::collections::BTreeMap<crate::identity::forge::ForgeHost, String>,
+    String,
+> {
+    let mut out = std::collections::BTreeMap::new();
+    for entry in entries.iter().filter(|e| !e.trim().is_empty()) {
+        let (host, value) = entry
+            .split_once('=')
+            .ok_or_else(|| format!("{env} entry {entry:?} is not <host>=<{what}>"))?;
+        let host = crate::identity::forge::ForgeHost::parse(host)
+            .ok_or_else(|| format!("{env} entry {entry:?} names no host"))?;
+        if value.trim().is_empty() {
+            return Err(format!("{env} entry {entry:?} names no {what}"));
+        }
+        out.insert(host, value.trim().to_owned());
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1578,6 +1631,41 @@ mod tests {
         let hosts =
             crate::testing::cfg_from_args(["ctl", "--gitlab-hosts", "gitlab.com,not a host"]);
         assert_eq!(hosts.gitlab_hosts().len(), 1);
+
+        let unclient = crate::testing::cfg_from_args([
+            "ctl",
+            "--calls-gitlab-token",
+            "bot",
+            "--gitlab-hosts",
+            "gitlab.com",
+            "--gitlab-token-file",
+            "gitlab.com=/run/secrets/gl",
+        ]);
+        let err = unclient
+            .validate_calls_gitlab(None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("CONTROLLER_GITLAB_CLIENT_IDS"), "{err}");
+        let served = crate::testing::cfg_from_args([
+            "ctl",
+            "--calls-gitlab-token",
+            "bot",
+            "--gitlab-hosts",
+            "gitlab.com",
+            "--gitlab-token-file",
+            "gitlab.com=/run/secrets/gl",
+            "--gitlab-client-id",
+            "gitlab.com=abc123",
+        ]);
+        served.validate_calls_gitlab(None).unwrap();
+        assert_eq!(
+            served
+                .gitlab_client_ids()
+                .unwrap()
+                .get(&crate::identity::forge::ForgeHost::parse("gitlab.com").unwrap())
+                .map(String::as_str),
+            Some("abc123")
+        );
     }
 
     #[test]

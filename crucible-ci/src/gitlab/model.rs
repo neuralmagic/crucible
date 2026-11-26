@@ -18,6 +18,60 @@ pub struct Commit {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Member {
     pub access_level: u32,
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub membership_state: Option<String>,
+}
+
+impl Member {
+    pub fn is_active(&self) -> bool {
+        [&self.state, &self.membership_state]
+            .into_iter()
+            .all(|s| s.as_deref().is_none_or(|s| s == "active"))
+    }
+}
+
+/// Who may push, merge or create on a protected ref: an access level, one user, a group, or a
+/// deploy key.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RefAccess {
+    #[serde(default)]
+    pub access_level: Option<u32>,
+    #[serde(default)]
+    pub user_id: Option<u64>,
+    #[serde(default)]
+    pub group_id: Option<u64>,
+    #[serde(default)]
+    pub deploy_key_id: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ProtectedBranch {
+    pub name: String,
+    #[serde(default)]
+    pub push_access_levels: Vec<RefAccess>,
+    #[serde(default)]
+    pub merge_access_levels: Vec<RefAccess>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ProtectedTag {
+    pub name: String,
+    #[serde(default)]
+    pub create_access_levels: Vec<RefAccess>,
+}
+
+/// `GET /oauth/token/info`: the OAuth application a token was issued to.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TokenInfo {
+    #[serde(default)]
+    pub application: Option<TokenApplication>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TokenApplication {
+    pub uid: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]

@@ -13,6 +13,8 @@ const USER_AGENT: &str = "crucible-playbooks";
 const RENEW_BEFORE: i64 = 10 * 60;
 const SLOW_DOWN_STEP: u64 = 5;
 const TICK: Duration = Duration::from_millis(100);
+const MAX_EXPIRES_IN: u64 = 30 * 60;
+const MAX_INTERVAL: u64 = 60;
 
 /// What the person types at the forge, and where.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -36,6 +38,23 @@ impl DeviceCode {
         self.verification_uri_complete
             .as_deref()
             .unwrap_or(&self.verification_uri)
+    }
+
+    fn checked(mut self, account: &Account) -> Result<DeviceCode, String> {
+        let home = format!("https://{}/", account.host());
+        if !self.verification_uri.starts_with(&home) {
+            return Err(format!(
+                "{} sent a sign-in page off its own host: {:?}",
+                account.name(),
+                self.verification_uri
+            ));
+        }
+        self.verification_uri_complete = self
+            .verification_uri_complete
+            .filter(|page| page.starts_with(&home));
+        self.expires_in = self.expires_in.min(MAX_EXPIRES_IN);
+        self.interval = self.interval.clamp(1, MAX_INTERVAL);
+        Ok(self)
     }
 }
 
@@ -198,12 +217,13 @@ pub fn start(runtime: &Handle, account: &Account, client_id: &str) -> Result<Dev
     if let Some(scope) = account.scope() {
         fields.push(("scope", scope));
     }
-    runtime.block_on(form(
+    let code: DeviceCode = runtime.block_on(form(
         &http,
         &account.device_url(),
         &fields,
         &format!("asking {} for a sign-in code", account.name()),
-    ))
+    ))?;
+    code.checked(account)
 }
 
 fn pause(secs: u64, stop: &AtomicBool) -> Result<(), String> {
@@ -225,7 +245,7 @@ pub fn finish(
     stop: &AtomicBool,
 ) -> Result<Tokens, String> {
     let http = client()?;
-    let deadline = now() + i64::try_from(code.expires_in).unwrap_or(i64::MAX);
+    let deadline = now().saturating_add(i64::try_from(code.expires_in).unwrap_or(i64::MAX));
     let mut interval = code.interval.max(1);
     let doing = format!("waiting for {}", account.name());
     loop {
@@ -258,6 +278,27 @@ pub fn finish(
             }
         }
     }
+}
+
+pub fn revoke(
+    runtime: &Handle,
+    account: &Account,
+    client_id: &str,
+    tokens: &Tokens,
+) -> Result<(), String> {
+    let Some(url) = account.revoke_url() else {
+        return Ok(());
+    };
+    let http = client()?;
+    let doing = format!("revoking the {} token", account.name());
+    runtime
+        .block_on(form::<serde_json::Value>(
+            &http,
+            &url,
+            &[("client_id", client_id), ("token", tokens.access())],
+            &doing,
+        ))
+        .map(|_| ())
 }
 
 pub fn current(
@@ -434,6 +475,42 @@ mod tests {
             "https://gitlab.example.com/oauth/device?user_code=0A44L90H"
         );
         assert_eq!(gitlab.interval, 5);
+    }
+
+    #[test]
+    fn a_code_opens_only_the_forges_own_page_and_waits_a_bounded_time() {
+        let code = |page: &str, complete: Option<&str>, expires: u64, interval: u64| DeviceCode {
+            device_code: "d".into(),
+            user_code: "U".into(),
+            verification_uri: page.into(),
+            verification_uri_complete: complete.map(str::to_owned),
+            expires_in: expires,
+            interval,
+        };
+        let gl = Account::Gitlab("gitlab.example.com".into());
+        let ok = code(
+            "https://gitlab.example.com/oauth/device",
+            Some("https://evil.example.com/phish"),
+            u64::MAX,
+            0,
+        )
+        .checked(&gl)
+        .unwrap();
+        assert_eq!(ok.page(), "https://gitlab.example.com/oauth/device");
+        assert_eq!(ok.expires_in, MAX_EXPIRES_IN);
+        assert_eq!(ok.interval, 1);
+        for bad in [
+            "https://gitlab.example.com.evil.io/device",
+            "http://gitlab.example.com/oauth/device",
+            "file:///etc/passwd",
+            "https://github.com/login/device",
+        ] {
+            assert!(code(bad, None, 60, 5).checked(&gl).is_err(), "{bad}");
+        }
+        let gh = code("https://github.com/login/device", None, 900, 600)
+            .checked(&Account::Github)
+            .unwrap();
+        assert_eq!(gh.interval, MAX_INTERVAL);
     }
 
     #[test]

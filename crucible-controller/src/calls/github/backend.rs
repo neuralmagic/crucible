@@ -127,7 +127,7 @@ impl TargetBackend for GithubWorkflowBackend {
             .map_err(|e| CallError::Internal(e.into()))?,
             _ => None,
         };
-        let linked = linked.as_ref().map(|l| l.login.as_str());
+        let linked = linked.map(|l| l.account_id);
         Ok(GithubWorkflowBackend::authorize(self, who, repo, linked).await?)
     }
 

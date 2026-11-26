@@ -222,7 +222,10 @@ fn private_write(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    std::io::Write::write_all(&mut options.open(path)?, text.as_bytes())
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    std::io::Write::write_all(&mut file, text.as_bytes())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -267,6 +270,10 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&file).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+            store.save_forge_tokens(&gl, &tokens("wren-gl")).unwrap();
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "a rewrite tightens an existing file");
         }
         store
             .move_forge_tokens(&other, &[gh.clone(), gl.clone()])

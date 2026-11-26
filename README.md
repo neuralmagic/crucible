@@ -178,9 +178,11 @@ workflow(type = "playbook", tasks = [prep, ci, summary], result = summary)
 When it saves a pack, the controller writes `calls.lock`. The lock pins each target (a playbook
 revision, or a workflow file at a commit) and records its interface. A dispatch whose target's
 interface has moved since is refused. A cluster controller dispatches with the GitHub App or a
-GitLab bot token, and only for a person whose linked account may run the target's pipelines.
-People link their GitHub and GitLab accounts in the desktop app's Settings. A local controller
-uses your own login: the account you linked, or else `gh` and `glab`.
+GitLab bot token, and only for a person whose linked account may run the target's pipelines
+(on a protected branch or tag, that means push or merge). People link their GitHub and GitLab
+accounts in the desktop app's Settings, and the controller accepts only tokens issued by its own
+GitHub App or GitLab application. A Tekton watch needs an operator grant on its namespace. A local
+controller uses your own login: the account you linked, or else `gh` and `glab`.
 
 [`examples/calls`](examples/calls/README.md) calls a playbook, a GitHub workflow and a GitLab
 pipeline (`just calls-example`, `just calls-gitlab-example`). [`examples/konflux-pr`](examples/konflux-pr)
