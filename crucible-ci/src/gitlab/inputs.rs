@@ -1,5 +1,5 @@
 //! A CI configuration's `spec:inputs`, the parameters a pipeline created through the API takes
-//! (RFC-0008 C-GITLAB-PIPELINE interface).
+//!.
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -21,9 +21,7 @@ pub enum InputKind {
     },
     Number,
     Boolean,
-    /// An array whose default is a list of strings.
     StringList,
-    /// Any other array, taken as JSON.
     Json,
 }
 
@@ -47,8 +45,6 @@ struct Spec {
     inputs: serde_json::Map<String, Value>,
 }
 
-/// The inputs `config` declares in its header document, the first of its YAML documents when it
-/// has more than one. A configuration with no header declares none.
 pub fn inputs(config: &str) -> Result<Vec<Input>, InputsError> {
     let mut docs = serde_norway::Deserializer::from_str(config);
     let first = match docs.next() {

@@ -23,9 +23,7 @@ pub enum Kind {
     Choice(Vec<String>),
     /// Any of these values, sent as a list; the answer is its JSON array.
     MultiChoice(Vec<String>),
-    /// A JSON object or array, checked against the schema the params schema embeds for it.
     Json(Option<JsonSchema>),
-    /// A local file, uploaded before the launch; the answer is its path.
     File(FileSpec),
 }
 
@@ -33,7 +31,6 @@ pub enum Kind {
 #[derive(Clone, Debug, PartialEq)]
 pub struct FileSpec {
     pub max_bytes: u64,
-    /// The media types the file may have; empty admits any.
     pub media_types: Vec<String>,
 }
 
@@ -181,7 +178,6 @@ pub fn fields(schema: &Value) -> Vec<Field> {
         .collect()
 }
 
-/// The type a property's `x-param-type` names, for the types JSON Schema has no word for.
 fn param_type(prop: &Value) -> Option<&str> {
     prop.get("x-param-type").and_then(Value::as_str)
 }
@@ -422,7 +418,6 @@ pub fn params(fields: &[Field], answers: &[String]) -> Result<Value, Problems> {
     }
 }
 
-/// A json field's answer as its value, or why it cannot be sent.
 fn json_value(answer: &str, schema: Option<&JsonSchema>) -> Result<Value, String> {
     if answer.len() > MAX_JSON_PARAM_BYTES {
         return Err(format!("At most {} KiB", MAX_JSON_PARAM_BYTES / 1024));
@@ -437,7 +432,6 @@ fn json_value(answer: &str, schema: Option<&JsonSchema>) -> Result<Value, String
     }
 }
 
-/// The files the answers name, each checked against its field before anything is uploaded.
 pub fn uploads(fields: &[Field], answers: &[String]) -> Result<Vec<Upload>, Problems> {
     let mut out = Vec::new();
     let mut problems = Vec::new();
@@ -467,7 +461,6 @@ pub fn uploads(fields: &[Field], answers: &[String]) -> Result<Vec<Upload>, Prob
     }
 }
 
-/// The file at `path` as parameter `param`'s upload, or why `spec` refuses it.
 pub fn upload(param: &str, spec: &FileSpec, path: &Path) -> Result<Upload, String> {
     let size = std::fs::metadata(path)
         .ok()
@@ -491,7 +484,6 @@ pub fn upload(param: &str, spec: &FileSpec, path: &Path) -> Result<Upload, Strin
     })
 }
 
-/// Why `size` bytes is past `max_bytes`.
 pub fn too_large(size: u64, max_bytes: u64) -> Result<(), String> {
     if size > max_bytes {
         return Err(format!("At most {}", bytes(max_bytes)));
@@ -499,7 +491,6 @@ pub fn too_large(size: u64, max_bytes: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// `n` bytes the way a person reads it: `512 B`, `64 KiB`, `16 MiB`.
 fn bytes(n: u64) -> String {
     match n {
         n if n >= 1 << 20 && n % (1 << 20) == 0 => format!("{} MiB", n >> 20),
@@ -508,7 +499,6 @@ fn bytes(n: u64) -> String {
     }
 }
 
-/// The media type a file's extension names.
 fn media_type(path: &Path) -> Option<&'static str> {
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
     Some(match extension.as_str() {

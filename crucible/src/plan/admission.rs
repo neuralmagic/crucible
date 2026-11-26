@@ -194,7 +194,6 @@ impl Lane<'_> {
         self.deadline
     }
 
-    /// Append `event` to the session log and sync it, for a fact a resumed run must find.
     pub fn journal(&self, event: &SessionEvent) -> std::io::Result<()> {
         self.admission.append(event, true)
     }

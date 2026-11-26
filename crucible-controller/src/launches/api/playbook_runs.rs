@@ -76,7 +76,6 @@ pub struct PlaybookRunDto {
     pub transport_losses: i64,
     pub created_by: Option<String>,
     pub created_at: String,
-    /// The call that dispatched this launch's run; null for a launch nothing called.
     pub called_by: Option<crate::calls::store::CalledBy>,
 }
 
@@ -120,7 +119,6 @@ impl From<PlaybookRun> for PlaybookRunDto {
     }
 }
 
-/// `rows` with the call each was dispatched by.
 async fn with_callers(
     pool: &sqlx::PgPool,
     rows: Vec<PlaybookRun>,

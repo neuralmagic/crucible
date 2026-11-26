@@ -310,8 +310,6 @@ impl App {
         }
     }
 
-    /// Folds or unfolds a call's frame, `task`, or a group of its target, `task/group`.
-    /// Opens or closes the info card of call frame `key`.
     pub fn toggle_frame_info(&mut self, key: &str) {
         self.run.frame_info = match self.run.frame_info.take() {
             Some(open) if open == key => None,
@@ -325,13 +323,11 @@ impl App {
         }
     }
 
-    /// Shows the log of a node of a call's target graph in the Log pane.
     pub fn pick_call_node(&mut self, node: crate::live::calls::CallNode) {
         self.run.call_node = Some(node);
         self.show_pane(PaneKind::Log);
     }
 
-    /// Opens a task of a target run's launch, or a target's web page.
     pub fn jump(&mut self, jump: &crate::live::calls::Jump, tx: &mut rune::Tx) {
         match jump {
             crate::live::calls::Jump::Launch { launch, task } => {

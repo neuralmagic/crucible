@@ -9,7 +9,6 @@ use crucible_contract::link::ExternalUrl;
 use crucible_contract::session::TaskStatus;
 use forge::github::{Job, RunConclusion, RunStatus};
 
-/// The task status a job or step with this conclusion is drawn with.
 pub fn task_status(conclusion: RunConclusion) -> TaskStatus {
     match conclusion {
         RunConclusion::Success | RunConclusion::Neutral => TaskStatus::Pass,
@@ -27,15 +26,11 @@ pub fn task_status(conclusion: RunConclusion) -> TaskStatus {
 /// How a completed run settles its call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Settle {
-    /// Passing; `read_result` is false for a run that passes with an empty result.
-    Pass {
-        read_result: bool,
-    },
+    Pass { read_result: bool },
     Fail(String),
     Cancelled,
 }
 
-/// The conclusion mapping of RFC-0008:C-GITHUB-WORKFLOW.
 pub fn settle(conclusion: Option<RunConclusion>, caller_cancelled: bool) -> Settle {
     match conclusion {
         Some(RunConclusion::Success) => Settle::Pass { read_result: true },
@@ -51,7 +46,6 @@ pub fn settle(conclusion: Option<RunConclusion>, caller_cancelled: bool) -> Sett
     }
 }
 
-/// A node's status from a job's or step's status and conclusion.
 pub fn node_status(status: RunStatus, conclusion: Option<RunConclusion>) -> NodeStatus {
     match status {
         RunStatus::Completed => {
@@ -103,8 +97,6 @@ fn job_node(job: &Job, id: String, group: Option<String>) -> ProgressNode {
     }
 }
 
-/// The names a job of the run may be known by in the workflow: its own, without a matrix
-/// suffix `(a, b)`, and the caller job of a reusable workflow's `caller / callee`.
 fn job_names(name: &str) -> Vec<&str> {
     let bare = match name.rfind(" (") {
         Some(at) if name.ends_with(')') => name.get(..at).unwrap_or(name),
@@ -130,9 +122,6 @@ enum Placed<'a> {
     Static(&'a ProgressNode),
 }
 
-/// The locked static graph with each workflow job replaced by the run's jobs for it, and the
-/// node ids each workflow job became. A job with matrix legs becomes one node per leg in a group
-/// named by the workflow job; a run job no workflow job names is placed on its own.
 fn place<'a>(
     workflow: &'a ProgressGraph,
     jobs: &'a [Job],
@@ -190,7 +179,6 @@ fn place<'a>(
     (placed, ids)
 }
 
-/// A run's progress over the locked static graph of its workflow.
 pub fn run_graph(workflow: &ProgressGraph, jobs: &[Job]) -> ProgressGraph {
     let (placed, ids) = place(workflow, jobs);
     let nodes = placed
@@ -218,7 +206,6 @@ pub fn run_graph(workflow: &ProgressGraph, jobs: &[Job]) -> ProgressGraph {
     ProgressGraph::bounded(nodes, edges)
 }
 
-/// The id of the job [`run_graph`] draws as node `node`; `None` for a node no job is drawn as.
 pub fn job_of(workflow: &ProgressGraph, jobs: &[Job], node: &str) -> Option<u64> {
     place(workflow, jobs)
         .0

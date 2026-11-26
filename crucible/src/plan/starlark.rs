@@ -100,13 +100,9 @@ struct CompileContext {
     /// The first [`CompileError`] a constructor raised, parked while the marker error unwinds
     /// the evaluator.
     thrown: Option<CompileError>,
-    /// Each declared parameter's type, so `param()` of a json or file parameter yields a
-    /// reference rather than a value.
     param_types: BTreeMap<String, params::ParamType>,
-    /// The source's `calls` block.
     declared_calls:
         BTreeMap<crucible_contract::calls::CallAlias, crucible_contract::calls::CallTarget>,
-    /// The pack's `calls.lock`, read once and checked against `declared_calls`.
     calls_lock: Option<crucible_contract::calls::CallsLock>,
 }
 
@@ -354,8 +350,6 @@ impl CompileContext {
         Ok(String::from_utf8(bytes)?)
     }
 
-    /// The pack's `calls.lock`, read once and checked to pin every target the `calls` block
-    /// declares.
     fn calls_lock(&mut self) -> std::result::Result<&crucible_contract::calls::CallsLock, String> {
         use crucible_contract::calls::{CallsLock, LOCK_FILE};
         if self.calls_lock.is_none() {
@@ -374,7 +368,6 @@ impl CompileContext {
             .ok_or_else(|| format!("the pack has no {LOCK_FILE}"))
     }
 
-    /// The lock's entry for `alias`, or why there is none.
     fn locked_call(
         &mut self,
         alias: &crucible_contract::calls::CallAlias,
@@ -555,18 +548,13 @@ enum Value {
     Others,
     /// `task_defaults(...)`.
     Defaults(TaskDefaults),
-    /// `param(name)` of a json or file parameter. `shown` is what an agent prompt carries for
-    /// it, inside the external-input markers.
     ParamRef {
         name: String,
         ty: params::ParamType,
         shown: String,
     },
-    /// `producer.files["path"]`.
     CallFile(call::CallFile),
-    /// `item()`.
     Item,
-    /// `budget(...)`.
     Budget(crucible_contract::calls::CallBudget),
     /// A starlark value outside the DSL's own space: a dict, a function, a struct. The `take_*`
     /// helpers report it with the same wrong-type sentence a wrong scalar gets.
@@ -697,7 +685,7 @@ const SCORED_FUNCTIONS: &[&str] = &[
 /// Typed decisions, present in the playbook and custom lanes and absent from autoresearch.
 const ROUTED_FUNCTIONS: &[&str] = &[
     "budget", "call", "choice", "human", "item", "model", "noul", "optional", "output", "pick",
-    "route", "score",
+    "route", "score", "watch",
 ];
 
 /// The callable surface of one lane, for unknown-function suggestions. A playbook author is
@@ -865,6 +853,20 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "answers",
             "otherwise",
         ],
+        "watch" => &[
+            "name",
+            "target",
+            "commit",
+            "timeout",
+            "appear",
+            "depends_on",
+            "required",
+            "join",
+            "stage",
+            "when",
+            "answers",
+            "otherwise",
+        ],
         "budget" => &["cost", "wall_clock"],
         "item" => &[],
         "noul" => &["ask", "drop"],
@@ -900,7 +902,7 @@ fn constructor(
     at: &FileSpan,
 ) -> Result<Value> {
     match function {
-        "call" => {}
+        "call" | "watch" => {}
         "agent" => call::refuse_param_refs(&named, &["prompt"])?,
         "skill" => call::refuse_param_refs(&named, &["args"])?,
         _ => call::refuse_param_refs(&named, &[])?,
@@ -1095,6 +1097,7 @@ fn constructor(
             dsl_task(&mut named, state, name, kind, None)?
         }
         "call" => call::call_task(&mut named, state)?,
+        "watch" => call::watch_task(&mut named, state)?,
         "evaluate" => {
             let name = take_declared_name(&mut named, "name")?;
             let command = take_string(&mut named, "run")?;
@@ -3227,8 +3230,6 @@ pub fn declared_params(source: &str, filename: &Path) -> Result<serde_json::Valu
     Ok(read_params(source, filename)?.json_schema())
 }
 
-/// The targets a source's `calls` block declares, read without evaluating it, so a controller can
-/// pin them before the source compiles.
 #[tracing::instrument(skip_all, fields(source = %filename.display()), err)]
 pub fn declared_calls(
     source: &str,

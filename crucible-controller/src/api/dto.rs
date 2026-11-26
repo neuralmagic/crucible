@@ -265,12 +265,11 @@ impl From<Scope> for ScopeDto {
     }
 }
 
-/// The run and call task that dispatched a run (RFC-0008 C-VIEW).
+/// The run and call task that dispatched a run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct RunParentDto {
     pub run: String,
     pub task: String,
-    /// The mapped instance's item key; null for an unmapped call.
     pub instance: Option<String>,
 }
 
@@ -279,14 +278,11 @@ pub struct RunParentDto {
 pub struct RunChildDto {
     pub call: String,
     pub task: String,
-    /// The mapped instance's item key; null for an unmapped call.
     pub instance: Option<String>,
     pub attempt: u32,
     pub alias: String,
     pub kind: crucible_contract::calls::CallKind,
-    /// The target run, for a playbook target.
     pub run: Option<String>,
-    /// `pending`, `running`, `passed`, `failed`, or `cancelled`.
     pub status: String,
 }
 
@@ -332,9 +328,7 @@ pub struct RunDto {
     pub capability_digest: Option<String>,
     /// True when the run launched on the unverified-image override rather than a match.
     pub image_override: bool,
-    /// The run and call task that dispatched this run; null for a run no call made.
     pub parent: Option<RunParentDto>,
-    /// The target runs this run's calls dispatched, oldest first.
     pub children: Vec<RunChildDto>,
 }
 

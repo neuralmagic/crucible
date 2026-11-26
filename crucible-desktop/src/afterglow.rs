@@ -9,15 +9,12 @@ use std::collections::HashMap;
 
 use crucible_contract::calls::{CallId, CallStatus, CallView};
 
-/// Seconds a passed frame's glow takes to fade.
 pub const FADE: f64 = 3.0;
 
 /// How a passed frame's glow draws.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Glow {
-    /// Full, for one frame, so the next one has something to fade from.
     Lit,
-    /// Fading out.
     Fading,
 }
 
@@ -34,7 +31,6 @@ pub struct Afterglows {
 }
 
 impl Afterglows {
-    /// Lights each call `after` shows passed that `before` showed still going.
     pub fn saw(&mut self, before: &[CallView], after: &[CallView]) {
         for call in after
             .iter()
@@ -50,7 +46,6 @@ impl Afterglows {
         }
     }
 
-    /// Steps every glow on the window clock; true when what they draw changed.
     pub fn tick(&mut self, clock: f64) -> bool {
         let mut changed = false;
         self.calls.retain(|_, step| match *step {
@@ -70,8 +65,6 @@ impl Afterglows {
         changed
     }
 
-    /// When the poll must run again: the next frame while one is lit, else when the first
-    /// fading one goes out.
     pub fn due(&self, clock: f64) -> Option<f64> {
         self.calls
             .values()
@@ -82,7 +75,6 @@ impl Afterglows {
             .min_by(f64::total_cmp)
     }
 
-    /// The glow on `call`'s frame, if it has one.
     pub fn glow(&self, call: &CallId) -> Option<Glow> {
         self.calls.get(call).map(|step| match step {
             Step::Lit => Glow::Lit,

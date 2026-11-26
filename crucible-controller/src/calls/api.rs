@@ -21,7 +21,6 @@ use crate::calls::store::Claimed;
 use crate::calls::{Backends, CallCtx, CallError, CallRecord, DispatchSpec, Outcome};
 use crate::runs::pod_token::Grant;
 
-/// The routes a run reaches with its own pod token.
 pub(crate) fn run_routes(state: ApiState) -> Router {
     let db = state.db.clone();
     let file_cap = usize::try_from(MAX_FILE_PARAM_BYTES).unwrap_or(usize::MAX);
@@ -64,7 +63,6 @@ fn ctx(state: &ApiState) -> CallCtx {
 #[derive(Debug)]
 enum NotDispatched {
     Refused(String),
-    /// Another request holds the identity and has not finished dispatching.
     InFlight,
     Internal(anyhow::Error),
 }
@@ -335,12 +333,8 @@ async fn dispatch_call(
     }
 }
 
-/// How many times recording a started dispatch is tried before the dispatch answers failing.
 const RECORD_ATTEMPTS: u32 = 4;
 
-/// Record the target run a dispatch started, trying again when the write fails: the target run
-/// exists, and a call that does not record it cannot follow or stop it. Whether it must be
-/// stopped at once, as [`crate::calls::store::dispatched`] says.
 async fn recorded(
     pool: &PgPool,
     id: &crucible_contract::calls::CallId,
@@ -365,8 +359,6 @@ async fn recorded(
     }
 }
 
-/// Refuse a dispatch the calling run's plan does not declare: `request.task` must be a call task
-/// of `request.alias`, given an instance exactly when it is mapped.
 async fn planned(
     pool: &PgPool,
     parent: &crate::calls::Parent,
@@ -399,7 +391,6 @@ async fn planned(
     })
 }
 
-/// The refusal of a call whose target playbook is already running in the calling chain.
 async fn calling_again(
     pool: &PgPool,
     run: &str,
@@ -422,10 +413,8 @@ async fn calling_again(
     )))
 }
 
-/// How long a claimed call may go without a recorded target before its dispatch counts as lost.
 const DISPATCH_LOST_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
-/// Answer a dispatch whose identity another request already holds.
 async fn held(pool: &PgPool, record: &CallRecord) -> Result<DispatchResponse, NotDispatched> {
     if record.handle.is_some() {
         return answered(record);
@@ -549,8 +538,6 @@ async fn cancel(
     }
 }
 
-/// Ask the target's system to stop a call's target run. A failure that may pass is owed: the
-/// refresh loop asks again.
 pub(crate) async fn stop_target(
     backends: &Backends,
     ctx: &CallCtx,
@@ -576,8 +563,6 @@ pub(crate) async fn stop_target(
     }
 }
 
-/// Stop a call's target run and settle the call cancelled. A call still being dispatched is
-/// settled now, and its dispatch stops the target run it starts.
 pub(crate) async fn cancel_one(
     backends: &Backends,
     ctx: &CallCtx,
@@ -598,7 +583,6 @@ pub(crate) async fn cancel_one(
     reread(ctx, record).await
 }
 
-/// Cancel every open call of the runs of launch `key`: the launch is being cancelled.
 pub(crate) async fn cancel_for_launch(
     db: &crate::client::Db,
     cfg: &crate::config::ControllerCfg,
@@ -711,7 +695,6 @@ mod tests {
     use crucible_contract::calls::{CallAlias, NodeStatus, TargetHandle};
     use sqlx::PgPool;
 
-    /// One pass of the refresh loop at a time every call is due.
     async fn refreshed(state: &ApiState) {
         let later = jiff::Timestamp::now()
             .checked_add(jiff::SignedDuration::from_secs(60))
@@ -807,7 +790,6 @@ mod tests {
         files(crate::playbooks::drafts::SKELETON_MANIFEST, TARGET_WORKFLOW)
     }
 
-    /// Draft `draft`'s latest save launched as `key` for wren, with one running run `run`.
     async fn launched(pool: &PgPool, key: &str, run: &str, draft: &str) {
         let version = crate::playbooks::drafts::latest(pool, draft)
             .await
@@ -849,8 +831,6 @@ mod tests {
         running(pool, key, run, "running").await;
     }
 
-    /// The caller draft, saved with the lock its `[calls]` resolves to, launched as `key` with one
-    /// running run `run`. Returns the interface digest the lock records.
     async fn calling_run(state: &ApiState, key: &str, run: &str) -> String {
         let pool = state.db.pool();
         draft(pool, "target", target_files()).await;
@@ -962,8 +942,6 @@ mod tests {
 
     const CALLS: &str = "/api/runs/caller-run/calls";
 
-    /// A call dispatches one target run per identity: a resumed caller re-POSTing the same task,
-    /// instance and attempt gets the same call and handle back, and nothing new is launched.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_dispatch_is_idempotent_on_its_identity(pool: PgPool) {
         let state = state(pool.clone());
@@ -1043,8 +1021,6 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
-    /// A dispatch the controller lost before it recorded a target is refused once it is stale,
-    /// and a later attempt starts afresh instead of waiting on it forever.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_lost_dispatch_settles_failing_instead_of_holding_its_identity(pool: PgPool) {
         let state = state(pool.clone());
@@ -1103,7 +1079,6 @@ mod tests {
         assert_ne!(body["call"], json!(call));
     }
 
-    /// What the controller refuses settles the call failing with a note, and creates nothing.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_refused_dispatch_creates_no_target_run(pool: PgPool) {
         let state = state(pool.clone());
@@ -1148,8 +1123,6 @@ mod tests {
         assert!(child_launches(&pool).await.is_empty());
     }
 
-    /// A call follows its target run: pending on the locked graph before it runs, passed with the
-    /// result task's output once it finishes, and cancelled when its caller cancels it.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_call_follows_its_target_run_to_its_outcome(pool: PgPool) {
         let state = state(pool.clone());
@@ -1262,7 +1235,6 @@ mod tests {
         );
     }
 
-    /// A lock pins only what can be resolved, and a draft's head only from a draft pack.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_lock_refuses_what_it_cannot_pin(pool: PgPool) {
         let state = state(pool.clone());
@@ -1362,7 +1334,6 @@ mod tests {
         (status, String::from_utf8_lossy(&body).into_owned())
     }
 
-    /// The child launch a call's handle names, and that handle's run.
     async fn child_of(pool: &PgPool, handle: &Value) -> (String, String) {
         let run = handle["run"].as_str().expect("playbook handle").to_string();
         let key: String =
@@ -1383,8 +1354,6 @@ mod tests {
 
     const PLANNED_HELLO: &str = r#"{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":1.0,"tasks":[{"name":"hello","kind":"command","required":true}]}"#;
 
-    /// A reader of the calling run sees its calls, a reader of nothing else sees nothing, and a
-    /// playbook target run the reader may not read shows its nodes' labels and statuses only.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_calls_progress_is_served_only_to_readers_of_the_calling_run(pool: PgPool) {
         let state = state(pool.clone());
@@ -1494,8 +1463,6 @@ mod tests {
         );
     }
 
-    /// A dispatch names a call task of the run's plan, with the alias it calls, an instance only
-    /// when it is mapped, and values and files that fit the locked parameters.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_dispatch_must_match_the_plan_and_the_locked_types(pool: PgPool) {
         let state = state(pool.clone());
@@ -1571,8 +1538,6 @@ mod tests {
         assert!(child_launches(&pool).await.is_empty());
     }
 
-    /// A file a call binds becomes a blob the target launch owns, served to that launch's runs by
-    /// their own pod tokens and to nothing else.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_bound_file_reaches_the_target_launch_and_only_its_runs(pool: PgPool) {
         let state = state(pool.clone());
@@ -1636,7 +1601,6 @@ mod tests {
         );
     }
 
-    /// A run's call input uploads stop at their cap, and a repeat of one it holds still answers.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_runs_call_inputs_are_capped(pool: PgPool) {
         let state = state(pool.clone());
@@ -1665,7 +1629,6 @@ mod tests {
         );
     }
 
-    /// A call refuses a target already running somewhere up its chain of calling runs.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_call_never_targets_a_playbook_already_in_its_chain(pool: PgPool) {
         let state = state(pool.clone());
@@ -1731,7 +1694,6 @@ mod tests {
         assert!(child_launches(&pool).await.is_empty());
     }
 
-    /// Lock a pack whose workflow declares `calls` and nothing else, as `who`, for draft `me`.
     async fn lock_as(
         state: &ApiState,
         backends: &Backends,
@@ -1760,8 +1722,6 @@ mod tests {
         .await
     }
 
-    /// A lock names only targets its writer may read, refusing the rest as it refuses a target
-    /// that does not exist, and no chain of draft heads may lead back to the draft being locked.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_lock_names_only_readable_targets_and_no_draft_cycle(pool: PgPool) {
         let state = state(pool.clone());
@@ -1827,9 +1787,6 @@ mod tests {
         assert!(lock(wren, Some("other"), calling("loop-b")).await.is_ok());
     }
 
-    /// A target run passes on its verdict: early completion passes, and a result task that never
-    /// passed gives an empty result the note explains; a required task's failure fails the call
-    /// whatever the shutdown says.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_target_run_settles_on_its_verdict(pool: PgPool) {
         let state = state(pool.clone());
@@ -1903,8 +1860,6 @@ mod tests {
         "workflow(type = \"playbook\", tasks = [hello, ci], result = hello)\n",
     );
 
-    /// With the App, a GitHub workflow is dispatched only for a launch owner whose paired GitHub
-    /// login may write to the repository; a refusal starts nothing and keeps no call.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_github_call_needs_an_owner_who_may_write_to_the_repository(pool: PgPool) {
         use crucible_contract::calls::{
@@ -2013,7 +1968,6 @@ mod tests {
         assert_eq!(kept, 0, "a refused dispatch keeps no call");
     }
 
-    /// A target launch that ran again still settles its call from the run its handle names.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_call_settles_from_the_run_its_handle_names(pool: PgPool) {
         let state = state(pool.clone());

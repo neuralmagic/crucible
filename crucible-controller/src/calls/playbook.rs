@@ -1,4 +1,4 @@
-//! `playbook` targets (RFC-0008 C-TARGETS, C-CHILD-RUN): a target run is a launch of the target
+//! `playbook` targets: a target run is a launch of the target
 //! playbook of its own, made with the authority of the calling run's launch owner.
 
 use std::collections::BTreeMap;
@@ -32,7 +32,6 @@ impl PlaybookBackend {
     }
 }
 
-/// What a registered row pins: its tree, else its legacy bytes.
 fn revision_digest(row: &crate::playbooks::registry::PlaybookRow) -> String {
     row.tree_digest
         .as_ref()
@@ -66,7 +65,6 @@ fn draft_refusal(e: crate::playbooks::drafts::DraftError) -> CallError {
     }
 }
 
-/// A value as the launch form's text, which the target's params schema reads back.
 fn param_text(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
@@ -74,7 +72,6 @@ fn param_text(value: &Value) -> String {
     }
 }
 
-/// The bytes of each file the call binds, read from the calling run's uploads.
 async fn bound_files(
     ctx: &CallCtx,
     spec: &DispatchSpec<'_>,
@@ -107,7 +104,6 @@ async fn bound_files(
     Ok(found)
 }
 
-/// The note a refusing launch check answered with.
 async fn refused_by(response: axum::response::Response) -> CallError {
     let status = response.status();
     let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
@@ -143,7 +139,6 @@ async fn refused_by(response: axum::response::Response) -> CallError {
     CallError::Refused(format!("the target launch was refused ({status}): {note}"))
 }
 
-/// Refuse unless the calling run's launch owner may launch `target` (RFC-0003 C-DECISION).
 async fn authorize(
     state: &ApiState,
     parent: &Parent,
@@ -192,7 +187,6 @@ fn result_task(call: &CallRecord) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The target run the call's handle names: the run its launch reserved for its first dispatch.
 fn handle_run(call: &CallRecord) -> Result<&str, CallError> {
     match &call.handle {
         Some(TargetHandle::Playbook { run }) => Ok(run),
@@ -203,7 +197,6 @@ fn handle_run(call: &CallRecord) -> Result<&str, CallError> {
     }
 }
 
-/// The status of target run `run`, once it exists.
 async fn run_status(pool: &sqlx::PgPool, run: &str) -> anyhow::Result<Option<String>> {
     sqlx::query_scalar("SELECT status FROM runs WHERE run_id = $1")
         .bind(run)
@@ -212,7 +205,6 @@ async fn run_status(pool: &sqlx::PgPool, run: &str) -> anyhow::Result<Option<Str
         .context("reading a target run's status")
 }
 
-/// The run the call's handle names, once it exists.
 async fn started_run<'a>(
     ctx: &CallCtx,
     call: &'a CallRecord,
@@ -221,7 +213,6 @@ async fn started_run<'a>(
     Ok(run_status(ctx.db.pool(), run).await?.map(|_| run))
 }
 
-/// One captured file of run `run` by its `<task>/<path>` key.
 async fn run_file(ctx: &CallCtx, run: &str, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
     match crate::runs::blob_store::get_run_bundle(
         ctx.db.pool(),
@@ -239,8 +230,6 @@ fn file_key(task: &str, path: &str) -> Option<String> {
     crate::runs::task_evidence::task_segment(task).map(|dir| format!("{dir}/{path}"))
 }
 
-/// The outcome of target run `run` that ended with a valid verdict: its result task's output and
-/// files, or an empty result when the result task did not pass.
 async fn passed(
     ctx: &CallCtx,
     call: &CallRecord,
@@ -294,7 +283,6 @@ async fn passed(
     })
 }
 
-/// The target run's graph now.
 async fn progress(ctx: &CallCtx, call: &CallRecord) -> Result<ProgressGraph, CallError> {
     let Some(run) = started_run(ctx, call).await? else {
         return Ok(call.interface.graph.pending());
@@ -739,11 +727,8 @@ impl TargetBackend for PlaybookBackend {
     }
 }
 
-/// The most bytes of a target task's log served at once; the tail is kept.
 const MAX_TASK_LOG_BYTES: usize = 256 * 1024;
 
-/// Task `task`'s log in run `run`: its session events, one per line, then the engine log's lines
-/// that name it. `None` when neither mentions the task.
 fn task_log(session: &str, engine: Option<&str>, run: &str, task: &str) -> Option<String> {
     let events: Vec<&str> = session
         .lines()

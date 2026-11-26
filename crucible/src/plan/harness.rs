@@ -192,7 +192,6 @@ pub struct HarnessRunner {
     /// and materialized into that task's own root when it runs. A task with no entry is one the
     /// executor never staged, and its `inputs/` is left alone.
     pub staged: BTreeMap<TaskName, Vec<StagedInput>>,
-    /// The run's file parameters, laid down read-only under `inputs/params/` for agent tasks.
     pub param_files: Vec<crate::plan::param_files::ParamFile>,
     /// What the run may still spend, as the executor last reported it.
     pub budget_left: f64,

@@ -14,8 +14,6 @@ pub struct ResultFile {
     pub bytes: Vec<u8>,
 }
 
-/// The result fields and files `outputs` declares, read from the artifact's zip. `Err` is the
-/// note a call fails with.
 pub fn read_result(
     zip: &[u8],
     outputs: &GithubOutputs,
@@ -241,8 +239,6 @@ mod tests {
         }
     }
 
-    /// A zip as actions/upload-artifact writes it: deflated entries with a data descriptor, and
-    /// stored ones without.
     fn zip(entries: &[(&str, &[u8], bool)]) -> Vec<u8> {
         let mut out = Vec::new();
         let mut central = Vec::new();

@@ -492,7 +492,6 @@ fn header(pane: &Pane, app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
         )
 }
 
-/// `called by <run> › <task>`, for a launch a call dispatched; each part opens the caller.
 fn called_by(app: &App, p: &Paint) -> Option<El> {
     let by = app.selected_live()?.called_by.clone()?;
     let caller = app.remote.live.launch(&by.launch).map_or_else(

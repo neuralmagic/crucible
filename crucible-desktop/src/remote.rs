@@ -24,7 +24,6 @@ pub struct Remote {
     pub live_sent: Option<String>,
     /// The launch the Compare pane reads against, as last asked of the worker.
     pub compare_sent: Option<String>,
-    /// The call target node whose log the live worker was last asked for.
     pub node_sent: Option<crate::live::calls::NodeAsk>,
     /// That launch's run, once read.
     pub live_base: Option<live::Base>,

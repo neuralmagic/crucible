@@ -229,7 +229,6 @@ pub(crate) struct AuthorizedLaunch<P> {
     pub max_time: crate::model::MaxTime,
     /// The `{param: {run_id, digest}}` choice snapshots the values were validated against.
     pub choice_snapshots: serde_json::Value,
-    /// The file parameter values the launch owns.
     pub files: Vec<crate::launches::param_files::ParamFile>,
 }
 
@@ -262,9 +261,6 @@ pub(crate) async fn admit<P: Admissible>(
     admit_with_files(state, pack, request, FileValues::None).await
 }
 
-/// [`admit`] with the file parameter values `files` gives: each checked against its declaration
-/// and staged under the controller's scratch root, its staged reference the launch value, and
-/// its bytes in [`AuthorizedLaunch::files`] for the launch to own.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn admit_with_files<P: Admissible>(
     state: &ApiState,
@@ -319,7 +315,6 @@ pub(crate) async fn admit_with_files<P: Admissible>(
     })
 }
 
-/// `schema` with `names` no longer required, for values supplied apart from the launcher's.
 fn without_required<'a>(
     schema: &serde_json::Value,
     names: impl Iterator<Item = &'a String>,

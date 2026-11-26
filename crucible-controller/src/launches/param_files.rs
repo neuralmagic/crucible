@@ -1,4 +1,4 @@
-//! File parameter values (RFC-0008 C-PARAM-TYPES): a launcher's uploads, the blobs a launch
+//! File parameter values: a launcher's uploads, the blobs a launch
 //! owns, staging beside the pack on this controller's disk, and the pod-token route a run reads
 //! its launch's files through when they are not on its disk.
 
@@ -19,13 +19,10 @@ use crate::api::state::{ApiError, ApiState, ErrorBody};
 use crate::playbooks::registry::FieldError;
 use crate::runs::pod_token::Grant;
 
-/// The route a launcher uploads a file parameter's bytes to before the launch that names them.
 pub(crate) const UPLOAD_ROUTE: &str = "/api/param-files/{digest}";
 
-/// The most bytes one launcher's pending uploads may hold.
 pub(crate) const MAX_UPLOADS_BYTES: i64 = 64 * 1024 * 1024;
 
-/// How long an upload no launch took is kept.
 const UPLOAD_KEPT_FOR: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
 /// One file parameter value a launch owns.
@@ -41,7 +38,6 @@ pub(crate) struct ParamFile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Supplied {
     pub bytes: Vec<u8>,
-    /// The file name it is staged under.
     pub name: Option<String>,
     pub media_type: Option<String>,
 }
@@ -49,12 +45,8 @@ pub(crate) struct Supplied {
 /// Where a launch's file parameter values come from.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum FileValues<'a> {
-    /// None: a value given for a file parameter is refused.
     None,
-    /// A launcher's form: a file parameter's value is an [`UploadRef`] to one of `uploader`'s
-    /// uploads.
     Uploaded { uploader: &'a str },
-    /// A call's dispatch: each file parameter's bytes, read by the controller.
     Supplied(&'a BTreeMap<String, Supplied>),
 }
 
@@ -63,7 +55,6 @@ pub(crate) enum FileValues<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct UploadRef {
-    /// `sha256:<hex>` of the uploaded bytes.
     pub digest: String,
     #[serde(default)]
     pub name: Option<String>,
@@ -145,9 +136,6 @@ fn check(name: &str, spec: &FileSpec, file: &Supplied) -> Result<(), FieldError>
     }
 }
 
-/// The file parameter values of a launch against its params `schema`: `params` without them,
-/// and each one checked against its declaration. A value for a parameter that is not a file
-/// parameter, a text value for one that is, and a file past its declaration are refused.
 pub(crate) async fn split(
     pool: &sqlx::PgPool,
     schema: &Value,
@@ -218,8 +206,6 @@ pub(crate) async fn split(
     })
 }
 
-/// A file name safe to stage under: the last component of `name`, with anything but letters,
-/// digits, `.`, `-` and `_` replaced.
 fn staged_name(name: Option<&str>, param: &str) -> String {
     let base = name
         .and_then(|n| n.rsplit(['/', '\\']).next())
@@ -240,8 +226,6 @@ fn staged_name(name: Option<&str>, param: &str) -> String {
     }
 }
 
-/// Write `file` under the controller's scratch root, addressed by its digest, and answer the
-/// launch value the engine reads it by and the blob the launch owns.
 pub(crate) async fn stage(
     scratch_root: &Path,
     param: &str,
@@ -278,7 +262,6 @@ pub(crate) async fn stage(
     ))
 }
 
-/// Record the file values launch `launch` owns, in the transaction that mints it.
 pub(crate) async fn own(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     launch: &str,
@@ -303,7 +286,6 @@ pub(crate) async fn own(
     Ok(())
 }
 
-/// The bytes of the file of `digest` that the launch of run `run` owns.
 pub(crate) async fn of_run(
     pool: &sqlx::PgPool,
     run: &str,
@@ -320,8 +302,6 @@ pub(crate) async fn of_run(
     .context("reading a run's file parameter")
 }
 
-/// Store `bytes` as an upload of `uploader`. `Ok(false)` when it would take the uploader past
-/// [`MAX_UPLOADS_BYTES`]. Uploads older than a day are dropped first.
 pub(crate) async fn put_upload(
     pool: &sqlx::PgPool,
     uploader: &str,
@@ -357,7 +337,6 @@ pub(crate) async fn put_upload(
     Ok(stored.rows_affected() == 1)
 }
 
-/// The bytes of `uploader`'s upload of `digest`.
 pub(crate) async fn upload(
     pool: &sqlx::PgPool,
     uploader: &str,
@@ -375,8 +354,6 @@ fn refuse(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, Json(ErrorBody::new(msg))).into_response()
 }
 
-/// `GET` [`crucible_contract::calls::PARAM_FILE_PATH`]: a file parameter value of the run's own
-/// launch, to the run's own pod token.
 pub(crate) async fn serve(
     Extension(grant): Extension<Grant>,
     State(state): State<ApiState>,
@@ -409,8 +386,6 @@ pub(crate) struct UploadAck {
     pub size: u64,
 }
 
-/// `PUT /api/param-files/{digest}`: upload a file parameter's bytes, addressed by their
-/// `sha256:<hex>` digest, for a launch to name within a day.
 #[utoipa::path(
     put,
     path = "/api/param-files/{digest}",
@@ -459,7 +434,6 @@ pub(crate) async fn put(
     }
 }
 
-/// The body cap of [`UPLOAD_ROUTE`].
 pub(crate) fn upload_limit() -> axum::extract::DefaultBodyLimit {
     axum::extract::DefaultBodyLimit::max(
         usize::try_from(MAX_FILE_PARAM_BYTES).unwrap_or(usize::MAX),

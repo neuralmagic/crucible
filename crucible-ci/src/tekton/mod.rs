@@ -1,4 +1,4 @@
-//! Tekton and Konflux (RFC-0008 C-TEKTON): find the Pipelines-as-Code runs a commit started, map
+//! Tekton and Konflux: find the Pipelines-as-Code runs a commit started, map
 //! a run onto a progress graph, read its outcome and results, and read a step's log, all over a
 //! cluster's API with a bearer token.
 //!
@@ -30,9 +30,9 @@ use crate::token::BearerToken;
 const PIPELINE_RUNS: &str = "/apis/tekton.dev/v1/namespaces/{ns}/pipelineruns";
 const TASK_RUNS: &str = "/apis/tekton.dev/v1/namespaces/{ns}/taskruns";
 const PODS: &str = "/api/v1/namespaces/{ns}/pods";
+const SELF_REVIEWS: &str = "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews";
 const TASK_RUN_OWNER_LABEL: &str = "tekton.dev/pipelineRun";
 const ERR_BODY_CHARS: usize = 300;
-/// The status a cancel sets: stop the run's tasks and still run its finally tasks.
 pub const CANCEL_STATUS: &str = "CancelledRunFinally";
 
 /// A Kubernetes namespace name: a DNS-1123 label.
@@ -88,7 +88,6 @@ pub enum TektonError {
 }
 
 impl TektonError {
-    /// The token was refused or lacks the permission, which retrying will not change.
     pub fn is_denied(&self) -> bool {
         matches!(
             self,
@@ -99,7 +98,6 @@ impl TektonError {
         )
     }
 
-    /// Worth asking again: a connection failure, a rate limit, or a server error.
     pub fn is_transient(&self) -> bool {
         match self {
             TektonError::Http { .. } => true,
@@ -117,7 +115,6 @@ pub struct Cluster {
 }
 
 impl Cluster {
-    /// `api` is the API server's address, such as `https://api.example.com:6443`.
     pub fn new(http: reqwest::Client, api: &str) -> Result<Self, TektonError> {
         let url = Url::parse(api).map_err(|_| TektonError::Api(api.to_owned()))?;
         if url.scheme() != "https" || url.host_str().is_none() {
@@ -129,7 +126,6 @@ impl Cluster {
         })
     }
 
-    /// The PipelineRuns `filter` matches in `ns`.
     pub async fn find(
         &self,
         token: &BearerToken,
@@ -140,7 +136,6 @@ impl Cluster {
         Ok(runs.into_iter().filter(|r| filter.admits(r)).collect())
     }
 
-    /// The PipelineRuns in `ns` that the label selector `selector` matches.
     pub async fn pipeline_runs(
         &self,
         token: &BearerToken,
@@ -159,7 +154,6 @@ impl Cluster {
         Ok(list.items)
     }
 
-    /// PipelineRun `name` in `ns`, or `None` once the cluster has deleted it.
     pub async fn pipeline_run(
         &self,
         token: &BearerToken,
@@ -180,7 +174,6 @@ impl Cluster {
         }
     }
 
-    /// The TaskRuns PipelineRun `run` created.
     pub async fn task_runs(
         &self,
         token: &BearerToken,
@@ -199,8 +192,6 @@ impl Cluster {
         Ok(list.items)
     }
 
-    /// Create `run`, a PipelineRun built by [`dispatch::PipelineRunFile::render`], and return it
-    /// as the cluster stored it, with the name it generated.
     pub async fn create_pipeline_run(
         &self,
         token: &BearerToken,
@@ -221,7 +212,6 @@ impl Cluster {
         self.send(token, &doing, req).await
     }
 
-    /// Stop PipelineRun `name`, letting its finally tasks run.
     pub async fn cancel(
         &self,
         token: &BearerToken,
@@ -240,7 +230,6 @@ impl Cluster {
         Ok(())
     }
 
-    /// The last `tail_lines` lines of one step's log: container `container` of `pod`.
     pub async fn step_log(
         &self,
         token: &BearerToken,
@@ -268,6 +257,43 @@ impl Cluster {
             .map_err(|source| TektonError::Http { doing, source })
     }
 
+    pub async fn may(
+        &self,
+        token: &BearerToken,
+        ns: &Namespace,
+        verb: &str,
+    ) -> Result<bool, TektonError> {
+        let doing = format!(
+            "asking whether this token may {verb} PipelineRuns in {}",
+            ns.as_str()
+        );
+        let review = serde_json::json!({
+            "apiVersion": "authorization.k8s.io/v1",
+            "kind": "SelfSubjectAccessReview",
+            "spec": {"resourceAttributes": {
+                "group": "tekton.dev",
+                "resource": "pipelineruns",
+                "verb": verb,
+                "namespace": ns.as_str(),
+            }},
+        });
+        let body = serde_json::to_vec(&review).map_err(|e| TektonError::Body {
+            doing: doing.clone(),
+            message: e.to_string(),
+        })?;
+        let req = kube_core::Request::new(SELF_REVIEWS)
+            .create(&PostParams::default(), body)
+            .map_err(|source| TektonError::Request {
+                doing: doing.clone(),
+                source,
+            })?;
+        let answer: serde_json::Value = self.send(token, &doing, req).await?;
+        Ok(answer
+            .pointer("/status/allowed")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false))
+    }
+
     async fn send<T: DeserializeOwned>(
         &self,
         token: &BearerToken,
@@ -288,17 +314,22 @@ impl Cluster {
         req: http::Request<Vec<u8>>,
     ) -> Result<reqwest::Response, TektonError> {
         let url = format!("{}{}", self.api, req.uri());
-        let response = self
+        let (parts, body) = req.into_parts();
+        let mut builder = self
             .http
-            .request(req.method().clone(), url)
+            .request(parts.method, url)
             .bearer_auth(token.expose())
-            .header(reqwest::header::ACCEPT, "application/json")
-            .send()
-            .await
-            .map_err(|source| TektonError::Http {
-                doing: doing.to_owned(),
-                source,
-            })?;
+            .header(reqwest::header::ACCEPT, "application/json");
+        if let Some(kind) = parts.headers.get(http::header::CONTENT_TYPE) {
+            builder = builder.header(reqwest::header::CONTENT_TYPE, kind.clone());
+        }
+        if !body.is_empty() {
+            builder = builder.body(body);
+        }
+        let response = builder.send().await.map_err(|source| TektonError::Http {
+            doing: doing.to_owned(),
+            source,
+        })?;
         let status = response.status();
         if status.is_success() {
             return Ok(response);

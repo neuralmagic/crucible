@@ -1,4 +1,4 @@
-//! Matching the Pipelines-as-Code PipelineRuns a commit started (RFC-0008 C-TEKTON find).
+//! Matching the Pipelines-as-Code PipelineRuns a commit started.
 
 use std::collections::BTreeMap;
 
@@ -16,9 +16,7 @@ pub const RESULTS_RECORD_ANNOTATION: &str = "results.tekton.dev/record";
 /// Which Pipelines-as-Code events a watch follows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
-    /// A push to a branch.
     Push,
-    /// A pull request, including the runs a comment such as `/retest` starts on it.
     PullRequest,
 }
 
@@ -26,13 +24,11 @@ pub enum Event {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Filter {
     pub commit: CommitId,
-    /// The Repository resource's name, as Pipelines-as-Code labels its runs.
     pub repository: String,
     pub event: Option<Event>,
 }
 
 impl Filter {
-    /// The label selector the API server filters by.
     pub fn selector(&self) -> String {
         let mut terms = vec![
             format!("{SHA_LABEL}={}", self.commit),
@@ -46,8 +42,6 @@ impl Filter {
         terms.join(",")
     }
 
-    /// Whether `run` is one this filter matches, checked again on the client side so that a
-    /// selector the server ignores cannot widen the set.
     pub fn admits(&self, run: &PipelineRun) -> bool {
         let labels = &run.metadata.labels;
         let label = |key: &str| labels.get(key).map(String::as_str);
@@ -62,8 +56,6 @@ impl Filter {
     }
 }
 
-/// The name a matched run goes by: the PipelineRun name Pipelines-as-Code started it from, or
-/// the run's own name when it carries none.
 pub fn run_name(run: &PipelineRun) -> &str {
     run.metadata
         .labels
@@ -72,8 +64,6 @@ pub fn run_name(run: &PipelineRun) -> &str {
         .unwrap_or(&run.metadata.name)
 }
 
-/// The latest attempt of each name among `runs`: the run created last, a later name breaking a
-/// tie so the choice is stable.
 pub fn latest_by_name(runs: &[PipelineRun]) -> BTreeMap<String, &PipelineRun> {
     let mut latest: BTreeMap<String, &PipelineRun> = BTreeMap::new();
     for run in runs {

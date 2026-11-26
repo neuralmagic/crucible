@@ -17,11 +17,8 @@ use crate::github::workflow::{InputType, Workflow, WorkflowInput};
 use crate::github::{Client, DispatchedRun, GithubError, Repo, RunConclusion, RunStatus, Token};
 use crate::spec::{DigestKind, DigestSource};
 
-/// Operator configuration naming the github owners this engine may dispatch a `workflow_dispatch`
-/// build to, comma- or whitespace-separated.
 pub const ALLOWED_ORGS_ENV: &str = "FORGE_GITHUB_ALLOWED_ORGS";
 
-/// How often a dispatched build's run is read.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Why a build dispatch was refused or its run did not pass.
@@ -96,32 +93,21 @@ pub enum BuildFailure {
 /// indirection left.
 #[derive(Debug, Clone)]
 pub struct GithubBuildRequest {
-    /// The `[build.<name>]` name, for messages only.
     pub name: String,
-    /// The allowlist-cleared repository holding the build workflow.
     pub repo: RepoTarget,
-    /// The workflow file to dispatch (e.g. `crucible-build.yml`), under `.github/workflows/`.
     pub workflow: String,
-    /// The git ref to dispatch against (branch, tag, or SHA).
     pub git_ref: String,
-    /// The `workflow_dispatch` inputs, already template-expanded; nothing else is forwarded.
     pub inputs: BTreeMap<String, String>,
-    /// The id this dispatch passes as the contract-v1 `correlation_id` input.
     pub correlation_id: String,
-    /// How the pushed digest is discovered.
     pub digest: DigestSource,
-    /// The full `registry/repo:tag` the workflow pushes.
     pub image_ref: String,
-    /// Wall-clock cap on the whole dispatch-to-completion wait.
     pub timeout: Duration,
 }
 
-/// A fresh random correlation id (uuid v4).
 pub fn new_correlation_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// Dispatch the build and wait for its run to pass. The pushed digest is the caller's to pin.
 pub async fn run_build(
     client: &Client,
     req: &GithubBuildRequest,
@@ -176,9 +162,6 @@ pub async fn run_build(
     }
 }
 
-/// Read the workflow file at `git_ref` and check the manifest's declared input mapping against
-/// its inputs, after refusing an unsupported digest source. Any error refuses; the warnings are
-/// returned. `crucible build --check` runs exactly this.
 #[allow(clippy::too_many_arguments)]
 pub async fn preflight_workflow(
     client: &Client,
@@ -222,9 +205,6 @@ pub struct MappingReport {
     warnings: Vec<String>,
 }
 
-/// Check a manifest's input mapping against the workflow's inputs: fail on a required input with
-/// no value, fail on a mapped input the workflow does not declare, and warn on a boolean or
-/// number input, which receives a template-expanded string.
 fn validate_input_mapping(
     declared: &[WorkflowInput],
     mapped: &BTreeMap<String, String>,
@@ -288,7 +268,6 @@ pub struct OrgAllowlist {
 }
 
 impl OrgAllowlist {
-    /// Read the allowlist from operator configuration. Unset or empty permits nothing.
     pub fn from_env() -> Result<Self, GithubError> {
         match std::env::var(ALLOWED_ORGS_ENV) {
             Ok(raw) => Self::parse(&raw),
@@ -296,8 +275,6 @@ impl OrgAllowlist {
         }
     }
 
-    /// Parse a comma- or whitespace-separated owner list. Owners match case-insensitively, as
-    /// github logins do.
     pub fn parse(raw: &str) -> Result<Self, GithubError> {
         let mut owners = BTreeSet::new();
         for entry in raw.split([',', ' ', '\t', '\n', '\r']) {
@@ -320,7 +297,6 @@ impl OrgAllowlist {
         self.owners.iter().cloned().collect::<Vec<_>>().join(", ")
     }
 
-    /// Parse `repo` and check its owner against the allowlist.
     pub fn authorize(&self, repo: &str) -> Result<RepoTarget, GithubError> {
         let target = Repo::parse(repo)?;
         if self.owners.is_empty() {
@@ -341,8 +317,6 @@ impl OrgAllowlist {
     }
 }
 
-/// `workflow` must be a bare workflow filename (`[A-Za-z0-9._-]+\.ya?ml`, no `..`) before it is
-/// put in a URL.
 fn ensure_workflow_filename(workflow: &str) -> Result<(), BuildFailure> {
     let stem = workflow
         .strip_suffix(".yml")
@@ -362,8 +336,6 @@ fn ensure_workflow_filename(workflow: &str) -> Result<(), BuildFailure> {
     }
 }
 
-/// Only the registry-tag digest source is supported; the artifact form is refused before any
-/// dispatch.
 fn ensure_digest_supported(name: &str, digest: &DigestSource) -> Result<(), BuildFailure> {
     match digest {
         DigestSource::Kind(DigestKind::RegistryTag) => Ok(()),

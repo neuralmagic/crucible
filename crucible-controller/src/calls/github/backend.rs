@@ -22,12 +22,8 @@ impl From<TargetError> for CallError {
     }
 }
 
-/// How long a run this controller started may answer 404 before GitHub is believed.
 const FRESH_RUN: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
-/// What an error reading a run this controller already started means for its call. Being
-/// rate limited, or a new run GitHub does not list yet, is asked again on the next poll; only
-/// what stays wrong ends the call.
 fn following(e: TargetError, call: &CallRecord, now: jiff::Timestamp) -> CallError {
     let fresh = age(call, now).is_some_and(|age| age < FRESH_RUN);
     match &e {
@@ -41,7 +37,6 @@ fn following(e: TargetError, call: &CallRecord, now: jiff::Timestamp) -> CallErr
     }
 }
 
-/// How long ago the call was dispatched, when that is known.
 fn age(call: &CallRecord, now: jiff::Timestamp) -> Option<std::time::Duration> {
     let started = call.created_at.parse::<jiff::Timestamp>().ok()?;
     let secs = now.duration_since(started).as_secs();
@@ -58,8 +53,6 @@ fn run_of(call: &CallRecord) -> Result<(&GithubRepo, u64), CallError> {
     }
 }
 
-/// The commit a dispatch checked the interface at, while the run's own head is not yet checked
-/// against it.
 fn unchecked_commit(detail: &Value) -> Option<&str> {
     match detail.get("head_sha") {
         Some(_) => None,
@@ -68,7 +61,6 @@ fn unchecked_commit(detail: &Value) -> Option<&str> {
 }
 
 impl GithubWorkflowBackend {
-    /// Keep a completed run's result files and settle on its outcome.
     async fn kept(
         &self,
         ctx: &CallCtx,
@@ -303,8 +295,6 @@ mod tests {
         assert_eq!(unchecked_commit(&json!({})), None);
     }
 
-    /// A completed run's result files are served from the database, so a restart or another
-    /// replica still has them.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn result_files_are_served_from_the_database(pool: sqlx::PgPool) {
         use crate::calls::TargetBackend as _;

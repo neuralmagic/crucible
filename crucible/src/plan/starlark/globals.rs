@@ -252,6 +252,14 @@ pub(crate) fn routed(builder: &mut GlobalsBuilder) {
         dispatch("call", args, kwargs, eval)
     }
 
+    fn watch<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("watch", args, kwargs, eval)
+    }
+
     fn item<'v>(
         #[starlark(args)] args: UnpackTuple<Value<'v>>,
         #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,

@@ -28,7 +28,6 @@ pub(in crate::live) enum Msg {
     Compare(Option<String>),
     /// Which draft save to read the pack of; `None` stops.
     Draft(Option<(String, i64)>),
-    /// Which call target node to read the log of; `None` stops.
     NodeLog(Option<crate::live::calls::NodeAsk>),
 }
 
@@ -36,8 +35,6 @@ pub(in crate::live) enum Msg {
 pub(in crate::live) enum Action {
     /// Read a target's params schema and the admin caps, for a launch form.
     Prepare(Target),
-    /// Upload these files, then launch a target with this body (`params`, `max_cost`,
-    /// `max_time`, maybe `rerun`), each file its parameter's value.
     Launch {
         target: Target,
         body: Value,
@@ -374,8 +371,6 @@ async fn send_launch(
     Ok(ack.key)
 }
 
-/// Upload `upload`'s file, refusing it past its cap before anything is sent, and answer the
-/// value its parameter takes.
 async fn send_upload(c: &Connection, upload: &crate::form::Upload) -> Result<Value, String> {
     let bytes = std::fs::read(&upload.path)
         .map_err(|error| format!("{}: {error}", upload.path.display()))?;

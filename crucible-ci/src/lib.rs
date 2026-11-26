@@ -1,4 +1,4 @@
-//! Clients for the CI systems a playbook call or watch follows (RFC-0008).
+//! Clients for the CI systems a playbook call or watch follows.
 //!
 //! Each backend owns its requests, its response types, how its runs are matched to a commit, and
 //! how a run maps onto a [`crucible_contract::calls::ProgressGraph`]. Callers pass the

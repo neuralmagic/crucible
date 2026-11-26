@@ -1,4 +1,4 @@
-//! Who may read what of a call (RFC-0008 C-PROGRESS, RFC-0003 C-READ-SCOPING): a calling run's
+//! Who may read what of a call: a calling run's
 //! readers see its calls, a playbook target run's own content only when they may read that run
 //! too, and a lock names only targets its writer may read.
 
@@ -10,8 +10,6 @@ use crate::authz::action::{ResourceType, Verb};
 use crate::authz::decision::Resource;
 use crate::authz::model::Principal;
 
-/// Run `run` as the resource a read of it is decided on: owned by its launch's owner, else by
-/// the principal its spend is attributed to. `None` when no such run exists.
 pub(crate) async fn run_resource(
     pool: &sqlx::PgPool,
     run: &str,
@@ -34,8 +32,6 @@ pub(crate) async fn run_resource(
     }))
 }
 
-/// Whether `caller` may read run `run`, with the share they hold on it. An unknown run is
-/// unreadable.
 pub(crate) async fn may_read_run(
     state: &ApiState,
     caller: &Caller,
@@ -54,8 +50,6 @@ pub(crate) async fn may_read_run(
     ))
 }
 
-/// `graph` reduced to what a reader who may not read the target run may see: each node's label
-/// and status, and the edges between them.
 pub(crate) fn labels_only(graph: &ProgressGraph) -> ProgressGraph {
     ProgressGraph {
         nodes: graph
@@ -77,8 +71,6 @@ pub(crate) fn labels_only(graph: &ProgressGraph) -> ProgressGraph {
     }
 }
 
-/// The target run a reader must also be able to read to see inside a call: a playbook target's
-/// run. `None` for a kind whose target runs outside Crucible.
 pub(crate) fn guarded_run(kind: CallKind, handle: &TargetHandle) -> Option<&str> {
     match (kind, handle) {
         (CallKind::Playbook, TargetHandle::Playbook { run }) => Some(run),
@@ -86,8 +78,6 @@ pub(crate) fn guarded_run(kind: CallKind, handle: &TargetHandle) -> Option<&str>
     }
 }
 
-/// Whether `caller` may read the playbook `target` names. A target that does not exist and one
-/// the caller may not read answer the same.
 pub(crate) async fn may_read_target(
     state: &ApiState,
     caller: &Caller,

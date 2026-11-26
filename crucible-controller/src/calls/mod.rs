@@ -1,4 +1,4 @@
-//! Playbook calls (RFC-0008): the target backends a call dispatches through, one per target
+//! Playbook calls: the target backends a call dispatches through, one per target
 //! kind, the store of the target runs calls made, and the routes the engine and readers reach
 //! them by.
 //!
@@ -18,6 +18,7 @@ mod progress;
 pub(crate) mod reader;
 pub(crate) mod refresh;
 pub(crate) mod store;
+pub(crate) mod tekton;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -33,11 +34,8 @@ use crate::client::Db;
 /// Where the GitHub backend takes the token it dispatches with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum GithubToken {
-    /// `gh auth token`, run in-process at each dispatch and held in memory only. Local
-    /// controllers only.
     #[value(name = "gh")]
     GhCli,
-    /// The GitHub App installation on the target repository.
     #[value(name = "app")]
     AppInstallation,
 }
@@ -45,17 +43,12 @@ pub enum GithubToken {
 /// Why a backend operation did not do what it was asked.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CallError {
-    /// The call cannot be made as asked. No target run exists, and the call settles failing with
-    /// this note.
     #[error("{0}")]
     Refused(String),
-    /// This controller has no working backend for the kind.
     #[error("{kind} targets are not available on this controller: {reason}")]
     NotBuilt { kind: CallKind, reason: String },
-    /// The call's row lacks what its backend recorded at dispatch.
     #[error("call {call} recorded no {what}")]
     Unrecorded { call: CallId, what: &'static str },
-    /// A backend built to follow target runs was asked to start one.
     #[error("this {0} backend follows target runs and launches none")]
     FollowOnly(CallKind),
     #[error(transparent)]
@@ -63,7 +56,6 @@ pub(crate) enum CallError {
 }
 
 impl CallError {
-    /// The note a call that ends on this error settles with.
     pub(crate) fn note(&self) -> String {
         match self {
             CallError::Internal(e) => format!("{e:#}"),
@@ -76,7 +68,6 @@ impl CallError {
 #[derive(Clone)]
 pub(crate) struct CallCtx {
     pub db: Db,
-    /// The controller's scratch root, where a local run keeps its session and files.
     pub scratch_dir: PathBuf,
 }
 
@@ -91,15 +82,11 @@ pub(crate) struct Resolved {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Parent {
     pub run: String,
-    /// The calling run's launch key.
     pub launch: String,
-    /// The launch owner a target run is launched with the authority of.
     pub owner: Option<String>,
     pub groups: Option<Value>,
     pub created_by: Option<String>,
-    /// How many calling runs are above this one: 0 for a run no call made.
     pub depth: u32,
-    /// Whether the calling run's pack is a draft, the only kind that may pin a draft head.
     pub draft: bool,
 }
 
@@ -122,14 +109,12 @@ pub(crate) struct DispatchSpec<'a> {
 pub(crate) struct Dispatched {
     pub handle: TargetHandle,
     pub link: Option<NodeLink>,
-    /// What the backend keeps about the target run for its later operations.
     pub detail: Value,
 }
 
 /// How an ended target run came out.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Outcome {
-    /// [`CallStatus::Passed`] or [`CallStatus::Failed`].
     pub status: CallStatus,
     pub note: String,
     pub result: Value,
@@ -158,10 +143,7 @@ impl Outcome {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Polled {
     pub progress: ProgressGraph,
-    /// What the backend learned about the target run to keep in the call's detail, such as the
-    /// number the target's system shows for it.
     pub recorded: serde_json::Map<String, Value>,
-    /// `None` while the target run runs.
     pub outcome: Option<Outcome>,
 }
 
@@ -175,11 +157,8 @@ pub(crate) struct CallRecord {
     pub attempt: u32,
     pub alias: CallAlias,
     pub kind: CallKind,
-    /// The manifest entry the call was dispatched for.
     pub target: CallTarget,
-    /// The locked interface the call was dispatched against.
     pub interface: TargetInterface,
-    /// `None` while the dispatch is in flight.
     pub handle: Option<TargetHandle>,
     pub detail: Value,
     pub budget: Option<CallBudget>,
@@ -192,16 +171,13 @@ pub(crate) struct CallRecord {
     pub created_at: String,
 }
 
-/// The operations RFC-0008 C-TARGETS gives every target kind (progress and outcome read in one
+/// The operations every target kind implements (progress and outcome read in one
 /// poll), plus reading one result file.
 /// The engine performs none of them.
 #[async_trait::async_trait]
 pub(crate) trait TargetBackend: Send + Sync {
-    /// The target's pin and interface as its system holds them now.
     async fn interface(&self, ctx: &CallCtx, target: &CallTarget) -> Result<Resolved, CallError>;
 
-    /// Refuse unless `who` may have `target` run on their behalf: the requester of a lock, and
-    /// the launch owner of a dispatch.
     async fn authorize(
         &self,
         ctx: &CallCtx,
@@ -209,17 +185,14 @@ pub(crate) trait TargetBackend: Send + Sync {
         target: &CallTarget,
     ) -> Result<(), CallError>;
 
-    /// Start one target run with the bound values.
     async fn dispatch(
         &self,
         ctx: &CallCtx,
         spec: &DispatchSpec<'_>,
     ) -> Result<Dispatched, CallError>;
 
-    /// The target run's graph now, and how it ended once it has.
     async fn poll(&self, ctx: &CallCtx, call: &CallRecord) -> Result<Polled, CallError>;
 
-    /// The bytes of one result file of an ended target run; `None` when it has no such file.
     async fn result_file(
         &self,
         ctx: &CallCtx,
@@ -227,10 +200,8 @@ pub(crate) trait TargetBackend: Send + Sync {
         path: &str,
     ) -> Result<Option<Vec<u8>>, CallError>;
 
-    /// Stop the target run.
     async fn cancel(&self, ctx: &CallCtx, call: &CallRecord) -> Result<(), CallError>;
 
-    /// The text log of one node of the target run's progress graph.
     async fn node_log(
         &self,
         ctx: &CallCtx,
@@ -242,13 +213,11 @@ pub(crate) trait TargetBackend: Send + Sync {
 /// The backends of every target kind this controller implements.
 pub(crate) struct Backends {
     playbook: playbook::PlaybookBackend,
-    /// `Err` says why this controller dispatches no GitHub workflow.
     github: Result<github::GithubWorkflowBackend, String>,
+    tekton: Result<tekton::TektonBackend, String>,
 }
 
 impl Backends {
-    /// The backends an API request dispatches with: the playbook backend launches under the
-    /// request state's policy and caps.
     pub(crate) fn new(state: &crate::api::state::ApiState) -> Self {
         Backends {
             playbook: playbook::PlaybookBackend::new(Some(state.clone())),
@@ -258,10 +227,13 @@ impl Backends {
                 &state.github_logins,
                 &state.playbook_caps.max_time,
             ),
+            tekton: state
+                .calls_tekton
+                .clone()
+                .and_then(tekton::TektonBackend::new),
         }
     }
 
-    /// Backends that can follow and cancel target runs but launch nothing.
     pub(crate) fn following(cfg: &crate::config::ControllerCfg) -> Self {
         Backends {
             playbook: playbook::PlaybookBackend::new(None),
@@ -271,6 +243,9 @@ impl Backends {
                 &cfg.github_logins(),
                 &cfg.playbook_max_time_cap,
             ),
+            tekton: cfg
+                .calls_tekton_clusters()
+                .and_then(tekton::TektonBackend::new),
         }
     }
 
@@ -279,6 +254,13 @@ impl Backends {
             CallKind::Playbook => Ok(&self.playbook),
             CallKind::GithubWorkflow => match &self.github {
                 Ok(github) => Ok(github),
+                Err(reason) => Err(CallError::NotBuilt {
+                    kind,
+                    reason: reason.clone(),
+                }),
+            },
+            CallKind::Tekton => match &self.tekton {
+                Ok(tekton) => Ok(tekton),
                 Err(reason) => Err(CallError::NotBuilt {
                     kind,
                     reason: reason.clone(),

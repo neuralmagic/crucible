@@ -103,8 +103,6 @@ impl ForgeBuildBackend {
         })
     }
 
-    /// Build a `forge::github::build::GithubBuildRequest` from a github build + this backend's
-    /// config. The `inputs` are already template-expanded by [`drive_scope_builds`] before dispatch.
     fn github_request(
         &self,
         req: &BuildRequest,
@@ -667,9 +665,6 @@ fn classify_dispatch_error(err: &anyhow::Error) -> DispatchClass {
     DispatchClass::Transient
 }
 
-/// The GitHub backend split: config and workflow rejections and a failed run are permanent; a
-/// run still in flight, a rate limit, a server fault, and transport errors are transient.
-/// Exhaustive so a new variant forces a deliberate classification here.
 fn classify_github_error(err: &forge::github::GithubError) -> DispatchClass {
     use forge::github::GithubError as G;
     use forge::github::build::BuildFailure as B;

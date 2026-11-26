@@ -411,13 +411,9 @@ pub struct RunView {
     pub inspect: inspect::Inspect,
     /// Fan-outs the graph draws without their instances.
     pub folded: HashSet<String>,
-    /// Call frames and target groups folded or unfolded by hand, by frame or `frame/group`.
     pub call_folds: HashSet<String>,
-    /// The call frame under the pointer, by its subgraph id.
     pub frame_hover: Option<String>,
-    /// The call frame whose info card is open, by its frame key.
     pub frame_info: Option<String>,
-    /// The node of a call's target graph the Log pane shows the log of.
     pub call_node: Option<crate::live::calls::CallNode>,
     /// How far the graph is zoomed and moved.
     pub camera: camera::Camera,
@@ -525,9 +521,7 @@ pub struct App {
     pub geometry: Geometry,
     /// The flare on the run a launch just started.
     pub ignition: ignition::Ignition,
-    /// The call frames still glowing after their target runs passed.
     pub afterglows: afterglow::Afterglows,
-    /// Runs on the runs page showing the runs their calls dispatched, by launch key.
     pub runs_unfolded: HashSet<String>,
     /// Clicks on the molten logo, which slosh it.
     pub logo_clicks: u32,

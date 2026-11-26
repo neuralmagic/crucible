@@ -74,8 +74,6 @@ pub(in crate::ui::log) fn node_log(
         )
 }
 
-/// `frame › node` with a press that goes back to the run's log, then where the node opens and
-/// a copy of its log.
 fn head(node: &CallNode, log: Option<&NodeLog>, p: &Paint) -> El {
     let chip = row()
         .key("log-node")

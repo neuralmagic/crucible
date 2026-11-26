@@ -19,10 +19,8 @@ use crate::plan::starlark::error::CompileError;
 
 type Result<T> = std::result::Result<T, CompileError>;
 
-/// The names a source's header may bind, in any order, before its first other statement.
 const HEADER: [&str; 2] = ["params", "calls"];
 
-/// The leading statements of `module`.
 pub(crate) fn statements(module: &AstModule) -> &[starlark_syntax::syntax::ast::AstStmt] {
     let statement = module.statement();
     match &statement.node {
@@ -31,7 +29,6 @@ pub(crate) fn statements(module: &AstModule) -> &[starlark_syntax::syntax::ast::
     }
 }
 
-/// The top-level name a statement assigns, when it is a plain `name = ...`.
 pub(crate) fn assigned(statement: &Stmt) -> Option<&str> {
     match statement {
         Stmt::Assign(assign) => match &assign.lhs.node {
@@ -42,8 +39,6 @@ pub(crate) fn assigned(statement: &Stmt) -> Option<&str> {
     }
 }
 
-/// Where `name` is assigned at the top level, and whether every statement before it is
-/// another header block.
 pub(crate) fn header_position(module: &AstModule, name: &str) -> Option<(usize, bool)> {
     let statements = statements(module);
     let position = statements
@@ -55,7 +50,6 @@ pub(crate) fn header_position(module: &AstModule, name: &str) -> Option<(usize, 
     Some((position, leading))
 }
 
-/// The `calls` block of `module`: every target by its alias, or none when it declares none.
 pub(crate) fn read(module: &AstModule) -> Result<BTreeMap<CallAlias, CallTarget>> {
     let Some((position, leading)) = header_position(module, "calls") else {
         return Ok(BTreeMap::new());
@@ -94,7 +88,6 @@ pub(crate) fn read(module: &AstModule) -> Result<BTreeMap<CallAlias, CallTarget>
     Ok(calls)
 }
 
-/// A literal expression as JSON, or `None` when it is anything else.
 fn literal(expression: &Expr) -> Option<Value> {
     match expression {
         Expr::Literal(AstLiteral::String(s)) => Some(Value::String(s.node.clone())),

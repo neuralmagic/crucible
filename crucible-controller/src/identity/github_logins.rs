@@ -4,13 +4,10 @@
 /// entry `<github login>=<crucible login>`). Both sides match case-insensitively.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GithubLogins {
-    /// GitHub login (lowercased) to crucible login.
     by_github: std::collections::BTreeMap<String, String>,
 }
 
 impl GithubLogins {
-    /// The pairs among `entries`; an entry that is not `<github>=<crucible>` is logged and left
-    /// out.
     pub(crate) fn parse<'a>(entries: impl IntoIterator<Item = &'a str>) -> Self {
         let mut by_github = std::collections::BTreeMap::new();
         for entry in entries.into_iter().map(str::trim).filter(|e| !e.is_empty()) {
@@ -27,7 +24,6 @@ impl GithubLogins {
         GithubLogins { by_github }
     }
 
-    /// The crucible login paired with GitHub login `github`.
     #[cfg(feature = "autoresearch")]
     pub(crate) fn crucible_login(&self, github: &str) -> Option<&str> {
         self.by_github
@@ -35,7 +31,6 @@ impl GithubLogins {
             .map(String::as_str)
     }
 
-    /// Every GitHub login paired with crucible login `crucible`.
     pub(crate) fn github_logins(&self, crucible: &str) -> Vec<&str> {
         self.by_github
             .iter()

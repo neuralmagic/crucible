@@ -1,4 +1,4 @@
-//! Compiling a pack for what calls need of it: a target's interface (RFC-0008 C-TARGETS), the
+//! Compiling a pack for what calls need of it: a target's interface, the
 //! call tasks of a calling pack, and a finished playbook run's verdict (RFC-0002
 //! C-PLAYBOOK-LANE).
 
@@ -28,7 +28,6 @@ pub(crate) struct Compiled {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CallTask {
     pub alias: CallAlias,
-    /// Whether the call runs once per item of an upstream list.
     pub mapped: bool,
 }
 
@@ -56,7 +55,6 @@ struct PlanTask {
     over: Option<Value>,
 }
 
-/// Compile the pack at `root` with placeholder values. Blocking.
 pub(crate) fn compile(
     root: &Path,
     variant: Option<&crucible::manifest::variant::VariantName>,
@@ -159,7 +157,6 @@ fn compiled_of(params: Value, plan: Plan) -> Compiled {
     }
 }
 
-/// [`compile`] a stored tree off the async runtime. A pack that does not compile is a refusal.
 pub(crate) async fn compile_tree(
     tree: crucible_contract::pack_tree::PackTree,
     variant: Option<crucible::manifest::variant::VariantName>,
@@ -179,13 +176,9 @@ pub(crate) async fn compile_tree(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Verdict {
     Valid,
-    /// Why the run is invalid.
     Invalid(String),
 }
 
-/// The verdict of the run whose session log is `session`. Invalid when the run exhausted a
-/// ceiling, when a required main-graph task settled other than passing or not taken, or when one
-/// never settled and no task declared early completion.
 pub(crate) fn verdict(session: &str) -> Verdict {
     let mut required: Vec<String> = Vec::new();
     let mut settled: BTreeMap<String, TaskStatus> = BTreeMap::new();

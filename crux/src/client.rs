@@ -48,7 +48,6 @@ pub trait Transport: Send + Sync {
         Ok((status, text.into_bytes()))
     }
 
-    /// PUT a body that is not JSON, sent as `application/octet-stream`.
     async fn put_bytes(&self, path: &str, _body: Vec<u8>) -> Result<(reqwest::StatusCode, String)> {
         bail!("{path} takes raw bytes, and this transport cannot send them")
     }
@@ -998,8 +997,6 @@ impl Client {
             .await
     }
 
-    /// `PUT /api/param-files/{digest}`: upload a file parameter's bytes, `digest` being their
-    /// `sha256:<hex>`, for a launch to name.
     pub async fn put_param_file<T: DeserializeOwned>(
         &self,
         digest: &str,

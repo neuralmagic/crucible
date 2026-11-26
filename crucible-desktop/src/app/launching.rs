@@ -208,7 +208,6 @@ impl App {
             .launch(launcher.target.clone(), body, uploads);
     }
 
-    /// Set file field `i` to the file at `path`, saying now when the field refuses it.
     pub fn pick_param_file(&mut self, i: usize, path: &std::path::Path) {
         let Some(launcher) = &mut self.remote.launcher else {
             return;

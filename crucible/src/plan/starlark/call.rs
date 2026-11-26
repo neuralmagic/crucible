@@ -1,5 +1,5 @@
 //! `call(...)`, `budget(...)` and `item()`: a task that dispatches a `[calls]` target as its own
-//! run, compiled against the pack's `calls.lock` alone (RFC-0008 C-CALL).
+//! run, compiled against the pack's `calls.lock` alone.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Display};
@@ -19,7 +19,10 @@ use crate::plan::starlark::{
     parse_join, parse_stage, take_bool_default, take_declared_name, take_dependencies, take_fanout,
     take_string, take_string_default, take_when, wrong_type,
 };
-use crucible_contract::calls::{CallAlias, CallBudget, CallKind, MAX_CALL_FANOUT, TargetInterface};
+use crucible_contract::calls::{
+    CallAlias, CallBudget, CallKind, MAX_CALL_FANOUT, TargetInterface, WATCH_APPEAR_PARAM,
+    WATCH_COMMIT_PARAM,
+};
 use crucible_contract::emits::{FieldType, JsonSchema};
 
 /// `param(name)` of a json or file parameter. Its value reaches a command under `params`, a
@@ -30,7 +33,6 @@ pub(crate) struct ParamRefValue {
     pub(crate) name: String,
     #[allocative(skip)]
     pub(crate) ty: ParamType,
-    /// What an agent prompt carries for the value.
     pub(crate) shown: String,
 }
 
@@ -46,7 +48,6 @@ impl ParamRefValue {
 starlark_simple_value!(ParamRefValue);
 
 impl Display for ParamRefValue {
-    /// Text a constructor refuses, as converted external text is.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{CONVERTED}param({:?}){CONVERTED}", self.name)
     }
@@ -54,7 +55,6 @@ impl Display for ParamRefValue {
 
 #[starlark_value(type = "param")]
 impl<'v> StarlarkValue<'v> for ParamRefValue {
-    /// `param("config") + "text"`: external text, which only a prompt takes.
     fn add(
         &self,
         rhs: starlark::values::Value<'v>,
@@ -69,7 +69,6 @@ impl<'v> StarlarkValue<'v> for ParamRefValue {
         ))
     }
 
-    /// `"text" + param("config")`.
     fn radd(
         &self,
         lhs: starlark::values::Value<'v>,
@@ -85,8 +84,6 @@ impl<'v> StarlarkValue<'v> for ParamRefValue {
     }
 }
 
-/// What an agent prompt carries for a json or file parameter: a json value as JSON, and a file
-/// as the read-only path it is staged at under the task's root.
 pub(crate) fn param_text(name: &str, ty: ParamType, value: &serde_json::Value) -> String {
     if ty != ParamType::File {
         return serde_json::to_string_pretty(value).unwrap_or_default();
@@ -127,8 +124,6 @@ impl Display for FilesValue {
 
 #[starlark_value(type = "files")]
 impl<'v> StarlarkValue<'v> for FilesValue {
-    /// Any string indexes; whether the producer declares the path is decided where the file is
-    /// bound, which can name the call and the parameter.
     fn at(
         &self,
         index: starlark::values::Value<'v>,
@@ -148,7 +143,6 @@ impl<'v> StarlarkValue<'v> for FilesValue {
 pub(crate) struct CallFile {
     pub(crate) producer: TaskName,
     pub(crate) path: String,
-    /// The producer declares `path` in `emits_files`.
     pub(crate) declared: bool,
 }
 
@@ -196,7 +190,6 @@ impl Display for BudgetValue {
 #[starlark_value(type = "budget")]
 impl<'v> StarlarkValue<'v> for BudgetValue {}
 
-/// `budget(cost = usd, wall_clock = "30m")`.
 pub(crate) fn budget(named: &mut BTreeMap<String, Value>) -> Result<Value> {
     let invalid = |detail: &str| CompileError::BudgetInvalid {
         detail: detail.to_owned(),
@@ -228,7 +221,6 @@ pub(crate) fn budget(named: &mut BTreeMap<String, Value>) -> Result<Value> {
 struct TargetParam {
     ty: ParamType,
     required: bool,
-    /// A json parameter's own schema, as the target's params block embeds it.
     schema: Option<serde_json::Value>,
 }
 
@@ -261,7 +253,6 @@ fn target_params(interface: &TargetInterface) -> BTreeMap<String, TargetParam> {
         .unwrap_or_default()
 }
 
-/// The emits a call promises: the target's result fields, typed when the target types them all.
 fn result_emits(interface: &TargetInterface) -> Emits {
     let typed: Option<BTreeMap<OutputField, FieldType>> = interface
         .result
@@ -280,8 +271,52 @@ fn result_emits(interface: &TargetInterface) -> Emits {
     }
 }
 
-/// `call(name = ..., target = ..., params = {...}, ...)`.
+/// Whether a call task starts its target's run or follows the runs a commit started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Door {
+    Call,
+    Watch,
+}
+
+pub(crate) fn watch_task(
+    named: &mut BTreeMap<String, Value>,
+    state: &CompileState,
+) -> Result<Task> {
+    for taken in ["params", "budget", "over", "max_fanout"] {
+        if named.contains_key(taken) {
+            return Err(CompileError::BudgetInvalid {
+                detail: format!("watch() takes no {taken}"),
+            });
+        }
+    }
+    let commit = named
+        .remove("commit")
+        .ok_or_else(|| CompileError::MissingArgument {
+            argument: "commit".to_owned(),
+        })?;
+    let timeout = named
+        .remove("timeout")
+        .ok_or_else(|| CompileError::MissingArgument {
+            argument: "timeout".to_owned(),
+        })?;
+    let mut bound = BTreeMap::from([(WATCH_COMMIT_PARAM.to_owned(), commit)]);
+    if let Some(appear) = named.remove("appear").filter(|v| !matches!(v, Value::None)) {
+        bound.insert(WATCH_APPEAR_PARAM.to_owned(), appear);
+    }
+    let mut limits = BTreeMap::from([("wall_clock".to_owned(), timeout)]);
+    let budget = budget(&mut limits).map_err(|_| CompileError::BudgetInvalid {
+        detail: "watch timeout must be a duration such as \"30m\"".to_owned(),
+    })?;
+    named.insert("params".to_owned(), Value::Map(bound));
+    named.insert("budget".to_owned(), budget);
+    task(named, state, Door::Watch)
+}
+
 pub(crate) fn call_task(named: &mut BTreeMap<String, Value>, state: &CompileState) -> Result<Task> {
+    task(named, state, Door::Call)
+}
+
+fn task(named: &mut BTreeMap<String, Value>, state: &CompileState, door: Door) -> Result<Task> {
     let name = take_declared_name(named, "name")?;
     let target = take_string(named, "target")?;
     let refused = |detail: String| CompileError::CallTarget {
@@ -291,6 +326,20 @@ pub(crate) fn call_task(named: &mut BTreeMap<String, Value>, state: &CompileStat
     };
     let alias = CallAlias::parse(&target).map_err(|e| refused(e.to_string()))?;
     let locked = state.context_mut().locked_call(&alias).map_err(refused)?;
+    match (door, locked.kind == CallKind::Tekton) {
+        (Door::Call, true) => {
+            return Err(refused(
+                "a tekton target follows the runs a commit started; use watch()".to_owned(),
+            ));
+        }
+        (Door::Watch, false) => {
+            return Err(refused(format!(
+                "a {} target starts its own run; use call()",
+                locked.kind
+            )));
+        }
+        _ => {}
+    }
     let interface = &locked.interface;
     let declared = target_params(interface);
     if locked.kind == CallKind::GithubWorkflow
@@ -402,7 +451,6 @@ pub(crate) fn call_task(named: &mut BTreeMap<String, Value>, state: &CompileStat
     Ok(task)
 }
 
-/// The binding one value makes for a parameter of type `wanted`, or why it cannot.
 fn bind(
     wanted: &TargetParam,
     value: Value,
@@ -470,9 +518,6 @@ fn bind(
     }
 }
 
-/// Whether a field of type `ty` can feed a parameter, which is where the RFC's "a field's
-/// declared type matches the parameter's type" is decided. A GitHub workflow's string input
-/// also takes JSON, sent serialized.
 fn field_admits(
     wanted: &TargetParam,
     ty: &FieldType,
@@ -526,7 +571,6 @@ fn field_type_name(ty: &FieldType) -> &'static str {
     }
 }
 
-/// Whether a literal is of the parameter's type, and admitted by its schema when it has one.
 fn literal_admits(
     wanted: &TargetParam,
     value: &serde_json::Value,
@@ -557,7 +601,6 @@ fn literal_admits(
     }
 }
 
-/// A literal the source wrote, as the JSON a dispatch sends.
 fn literal_json(value: &Value) -> Option<serde_json::Value> {
     Some(match value {
         Value::Bool(b) => serde_json::Value::Bool(*b),
@@ -583,8 +626,6 @@ fn literal_json(value: &Value) -> Option<serde_json::Value> {
     })
 }
 
-/// Refuse a json or file parameter's `param(...)` anywhere but a call's params and the
-/// arguments in `prompts`, which mark it as external input.
 pub(crate) fn refuse_param_refs(named: &BTreeMap<String, Value>, prompts: &[&str]) -> Result<()> {
     fn find(value: &Value) -> Option<&str> {
         match value {
@@ -1123,7 +1164,6 @@ workflow(type = "playbook", tasks = [plan, t])
         }
     }
 
-    /// Every compile path checks the lock before it reads anything else of the source.
     #[test]
     fn every_compile_path_checks_the_lock_first() {
         let source = format!(
@@ -1205,5 +1245,137 @@ workflow(type = "autoresearch", tasks = [plan, t])
         )
         .unwrap_err();
         assert!(scored.contains("call"), "{scored}");
+    }
+
+    fn watch_pack() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let watched = TargetInterface {
+            params: json!({
+                "type": "object",
+                "properties": {
+                    "commit": {"type": "string"},
+                    "appear": {"type": "string", "default": "10m"},
+                },
+                "required": ["commit"],
+            }),
+            result: vec![
+                EmitWire {
+                    field: "runs".into(),
+                    ty: Some(FieldType::List),
+                },
+                EmitWire {
+                    field: "server".into(),
+                    ty: Some(FieldType::Object),
+                },
+            ],
+            result_files: vec![],
+            graph: ProgressGraph::default(),
+        };
+        let lock = CallsLock {
+            version: LOCK_VERSION,
+            calls: BTreeMap::from([
+                (
+                    CallAlias::parse("konflux").unwrap(),
+                    LockedCall::new(Pin::TektonWatch, watched).unwrap(),
+                ),
+                (
+                    CallAlias::parse("release").unwrap(),
+                    LockedCall::new(
+                        Pin::GithubRef {
+                            repo: GithubRepo::parse("acme/app").unwrap(),
+                            workflow: WorkflowPath::parse(".github/workflows/release.yml").unwrap(),
+                            git_ref: GitRefName::parse("main").unwrap(),
+                            commit: "abc".into(),
+                        },
+                        github_interface(false),
+                    )
+                    .unwrap(),
+                ),
+            ]),
+        };
+        std::fs::write(dir.path().join(LOCK_FILE), lock.render().unwrap()).unwrap();
+        dir
+    }
+
+    const WATCH_CALLS: &str = r#"calls = {
+    "konflux": {
+        "kind": "tekton",
+        "cluster": "konflux",
+        "namespace": "tenant",
+        "repository": "acme-app",
+        "expected": [{"name": "server", "results": ["IMAGE_DIGEST"]}],
+    },
+    "release": {
+        "kind": "github_workflow",
+        "repo": "acme/app",
+        "workflow": ".github/workflows/release.yml",
+        "ref": "main",
+        "outputs": {"artifact": "result"},
+    },
+}
+push = command(name = "push", run = "true", emits = {"commit": "string"})
+"#;
+
+    fn compile_watch(body: &str) -> Result<crate::plan::workflow::WorkflowCfg, String> {
+        let pack = watch_pack();
+        let source = format!("{WATCH_CALLS}\n{body}");
+        compile_source(&source, Path::new("workflow.star"), pack.path())
+            .map(|c| c.workflow)
+            .map_err(|e| e.message())
+    }
+
+    #[test]
+    fn a_watch_binds_its_commit_and_is_bounded_by_its_timeout() {
+        let workflow = compile_watch(
+            r#"
+w = watch(name = "builds", target = "konflux", commit = push.commit, timeout = "2h", appear = "5m")
+workflow(type = "playbook", tasks = [push, w], result = w)
+"#,
+        )
+        .expect("compiles");
+        let task = the_call(&workflow);
+        let TaskKind::Call {
+            bindings, budget, ..
+        } = &task.task
+        else {
+            panic!("a watch is a call");
+        };
+        assert_eq!(
+            bindings.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["appear", "commit"]
+        );
+        assert_eq!(budget.and_then(|b| b.wall_clock_secs), Some(7200));
+        assert!(task.depends_on.iter().any(|d| d.0 == "push"));
+        assert!(
+            matches!(&task.emits, Emits::Typed(fields) if fields.contains_key(&OutputField("server".into())))
+        );
+    }
+
+    #[test]
+    fn a_watch_and_a_call_each_refuse_the_others_target() {
+        let call = compile_watch(
+            r#"
+c = call(name = "builds", target = "konflux", params = {"commit": push.commit})
+workflow(type = "playbook", tasks = [push, c], result = c)
+"#,
+        )
+        .unwrap_err();
+        assert!(call.contains("use watch()"), "{call}");
+        let watch = compile_watch(
+            r#"
+w = watch(name = "rel", target = "release", commit = push.commit, timeout = "1h")
+workflow(type = "playbook", tasks = [push, w], result = w)
+"#,
+        )
+        .unwrap_err();
+        assert!(watch.contains("use call()"), "{watch}");
+        let untimed = compile_watch(
+            r#"
+w = watch(name = "builds", target = "konflux", commit = push.commit)
+workflow(type = "playbook", tasks = [push, w], result = w)
+"#,
+        )
+        .unwrap_err();
+        assert!(untimed.contains("timeout"), "{untimed}");
     }
 }

@@ -145,7 +145,6 @@ pub struct ExecCfg<'a> {
     /// What every task reads besides its dependencies' outputs. The loop's epilogue passes the
     /// kept candidate under [`crate::plan::ir::KEPT_INPUT`].
     pub run_inputs: Option<&'a BTreeMap<TaskName, Value>>,
-    /// The controller call tasks are dispatched through. `None` settles every call failing.
     pub calls: Option<&'a crate::plan::call_run::Controller>,
 }
 
@@ -188,8 +187,6 @@ pub struct Prior {
     /// What the attempts that started and never settled are charged, since their process died
     /// before it could say what they spent.
     pub reserved_usd: f64,
-    /// The calls the run dispatched, which a resumed run attaches to rather than dispatching
-    /// again.
     pub calls: BTreeMap<crate::plan::call_run::CallKey, crucible_contract::calls::CallId>,
 }
 

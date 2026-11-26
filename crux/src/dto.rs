@@ -1635,7 +1635,6 @@ pub struct PlaybookRun {
     pub description: Option<String>,
     #[serde(default)]
     pub created_at: String,
-    /// The call that dispatched this launch's run; absent for a launch nothing called.
     #[serde(default)]
     pub called_by: Option<CalledBy>,
 }
@@ -1643,13 +1642,9 @@ pub struct PlaybookRun {
 /// The calling run and call task a target run was dispatched by.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct CalledBy {
-    /// The calling run's id.
     pub run: String,
-    /// The calling run's launch key.
     pub launch: String,
-    /// The call task's name.
     pub task: String,
-    /// The mapped instance's item key; absent for an unmapped call.
     #[serde(default)]
     pub instance: Option<String>,
 }

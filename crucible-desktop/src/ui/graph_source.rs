@@ -11,8 +11,6 @@ use crate::session::{Instance, TaskState, TaskView};
 use crate::ui::Paint;
 use crate::ui::graph_call::{self, At, Targets};
 
-/// What a [`mermaid_source`] subgraph id frames: a fan-out or call `g<i>`, or the call of
-/// instance `k` of a mapped call, `g<i>k<k>`.
 pub(crate) fn graph_frame<'a>(tasks: &'a [TaskView], id: &str) -> Option<(At<'a>, &'a TaskView)> {
     let rest = id.strip_prefix('g')?;
     let (i, k) = match rest.split_once('k') {
@@ -40,7 +38,6 @@ pub(crate) enum Edit {
     Changed,
 }
 
-/// What a task is, apart from how it ran.
 fn definition(task: &TaskView) -> impl PartialEq + '_ {
     (
         (
@@ -60,7 +57,6 @@ fn definition(task: &TaskView) -> impl PartialEq + '_ {
     )
 }
 
-/// The compiled pack's tasks that are new or defined differently from the run's.
 pub(crate) fn edits(run: &[TaskView], compiled: &[TaskView]) -> HashMap<String, Edit> {
     compiled
         .iter()
@@ -74,8 +70,6 @@ pub(crate) fn edits(run: &[TaskView], compiled: &[TaskView]) -> HashMap<String, 
         .collect()
 }
 
-/// What a [`mermaid_source`] node id names: task `t<i>`, instance `t<i>i<k>` of it, or
-/// `t<i>more`, which stands for the task.
 pub(crate) fn graph_node<'a>(
     tasks: &'a [TaskView],
     id: &str,
@@ -113,18 +107,12 @@ pub(crate) struct Ink {
     fail: Swatch,
     running: Swatch,
     skipped: Swatch,
-    /// An external job's card; its outline takes its backend's accent or its status.
     job: Swatch,
-    /// The open task's outline.
     accent: Color,
-    /// Edges into a task the run passed over.
     faded: Color,
-    /// Edges on the critical path.
     critical: Color,
-    /// Outlines of tasks a preview adds and redefines.
     added: Color,
     changed: Color,
-    /// Edges from a reviser back to the tasks it revises.
     revise: Color,
 }
 
@@ -159,7 +147,6 @@ impl Ink {
     }
 }
 
-/// What runs a task, as the web graph marks it.
 fn glyph(task: &TaskView) -> &'static str {
     if task.call.is_some() {
         "\u{2197}"
@@ -178,12 +165,10 @@ fn glyph(task: &TaskView) -> &'static str {
     }
 }
 
-/// Text safe inside a quoted node label or a `|…|` edge label.
 fn clean(text: &str) -> String {
     text.replace(['"', '|'], "'")
 }
 
-/// When a task settled: its own time, else its last instance's.
 fn finished(task: &TaskView) -> Option<jiff::Timestamp> {
     task.result.as_ref().and_then(|r| r.at).or_else(|| {
         task.instances
@@ -193,9 +178,6 @@ fn finished(task: &TaskView) -> Option<jiff::Timestamp> {
     })
 }
 
-/// The chain of dependency edges, as `(from, to)` task indexes, that held the run up: back from
-/// the task that settled last, each step to the dependency that settled last. Empty when the
-/// run recorded no settle times.
 fn critical_path(tasks: &[TaskView]) -> HashSet<(usize, usize)> {
     let index = |name: &str| tasks.iter().position(|task| task.name == name);
     let mut path = HashSet::new();
@@ -222,7 +204,6 @@ fn critical_path(tasks: &[TaskView]) -> HashSet<(usize, usize)> {
     path
 }
 
-/// For each task, by index, every task it depends on through one or more others.
 fn ancestors(tasks: &[TaskView]) -> Vec<HashSet<usize>> {
     let index = |name: &str| tasks.iter().position(|task| task.name == name);
     (0..tasks.len())
@@ -243,17 +224,12 @@ fn ancestors(tasks: &[TaskView]) -> Vec<HashSet<usize>> {
         .collect()
 }
 
-/// The most instances the graph draws under one fan-out.
 const UNFOLDED: usize = 24;
 
-/// The nodes, edges and subgraphs rune-mermaid reads before it gives a source up.
 const ITEMS: usize = rune_mermaid::MAX_ITEMS;
 
-/// How many instances a fan-out draws side by side.
 const ROW: usize = 6;
 
-/// How many instances each unfolded fan-out can draw with the source still inside [`ITEMS`]:
-/// an instance is a node, the edge that places it, and at most an edge from each dependency.
 fn instances_each(tasks: &[TaskView], unfolded: impl Fn(&TaskView) -> bool, calls: usize) -> usize {
     let taken = taken(tasks, calls);
     let per: usize = tasks
@@ -264,8 +240,6 @@ fn instances_each(tasks: &[TaskView], unfolded: impl Fn(&TaskView) -> bool, call
     (ITEMS.saturating_sub(taken) / per.max(1)).min(UNFOLDED)
 }
 
-/// The items the source takes before any instance: tasks, their edges, fan-out frames and the
-/// `calls` frames.
 fn taken(tasks: &[TaskView], calls: usize) -> usize {
     let edges: usize = tasks
         .iter()
@@ -275,7 +249,6 @@ fn taken(tasks: &[TaskView], calls: usize) -> usize {
     tasks.len() + edges + 3 * framed.count() + calls
 }
 
-/// The labels a route's output records for `question`.
 fn answer(instance: &Instance, question: &str) -> Option<String> {
     let recorded = instance.result.as_ref()?.output.as_ref()?.get(question)?;
     let answer: Answer = serde_json::from_value(recorded.clone()).ok()?;
@@ -287,7 +260,6 @@ fn answer(instance: &Instance, question: &str) -> Option<String> {
     })
 }
 
-/// A route instance's first answer.
 fn first_answer(instance: &Instance) -> Option<String> {
     let output = instance.result.as_ref()?.output.as_ref()?.as_object()?;
     output
@@ -297,22 +269,15 @@ fn first_answer(instance: &Instance) -> Option<String> {
 
 /// What the graph shows beyond the tasks themselves.
 pub(crate) struct Shown<'a> {
-    /// The open task, outlined.
     pub(crate) open: Option<&'a str>,
-    /// Fan-outs drawn without their instances.
     pub(crate) folded: &'a HashSet<String>,
-    /// Tasks the compiled pack adds or redefines, outlined.
     pub(crate) marks: &'a HashMap<String, Edit>,
-    /// Each call's target graph.
     pub(crate) targets: &'a Targets<'a>,
-    /// Call frames and target groups folded or unfolded by hand.
     pub(crate) call_folds: &'a HashSet<String>,
-    /// The target node the Log pane shows, by its frame's key and its id.
     pub(crate) picked: Option<(&'a str, &'a str)>,
 }
 
 impl Shown<'_> {
-    /// Frame `at`'s target graph as the lines inside it, or none while it is folded.
     fn frame(
         &self,
         at: At,
@@ -337,26 +302,6 @@ impl Shown<'_> {
     }
 }
 
-/// The run's tasks as a mermaid flowchart, task `i` as node `t<i>`; a fan-out that ran is
-/// subgraph `g<i>` holding its node and, unless it is folded, its instances `t<i>i<k>` in rows
-/// under it.
-///
-/// ```text
-///   route  {{◇ name}}   fan-out  [[≡ name ×n]]   agent  (✦ name)   command  [› name]
-///   call   [[↗ name · alias · kind]], framed as `g<i>` with its target's graph inside
-///   a -->|version| c    c's parameter `version` is bound from a's output
-///   a --> b             b reads a, and no other dependency of b already leads back to a
-///   a ==>|each .f| b    b runs once per element of a.f
-///   a -->|.k| b         b gets its own entry of a.k
-///   a -->|yes / no| b   b runs on those answers of route a
-///   a -.-> b            b was not taken, faded
-///   a[k] -->|yes| b[k]  a and b spread over the same list and each fits one row, so b's
-///                       instance reads a's
-///   r -.->|revise 2/3| a  r failing sends a back for another round, of at most 3
-/// ```
-///
-/// Node colour carries each task's state, the open task has an accent outline, and the edges
-/// that held the run up are drawn heavier.
 pub(crate) fn mermaid_source<'a>(tasks: &'a [TaskView], shown: &Shown, ink: &Ink) -> String {
     let mut source = String::from("flowchart TD\n");
     for (class, s) in [
@@ -749,13 +694,10 @@ pub(crate) fn mermaid_source<'a>(tasks: &'a [TaskView], shown: &Shown, ink: &Ink
     source
 }
 
-/// The class prefix of `kind`'s job cards.
 fn job_class(kind: crucible_contract::calls::CallKind) -> String {
     format!("job_{}", kind.as_str())
 }
 
-/// The class of a node inside a call's frame: a task's state class, or a job card's in its
-/// backend's colour.
 fn frame_class(
     kind: crucible_contract::calls::CallKind,
     status: crucible_contract::calls::NodeStatus,
@@ -812,7 +754,6 @@ mod tests {
         "\n",
     );
 
-    /// `a` feeds `b` and the fan-out `c`, both feed `d`; `c` settles after `b`.
     const TIMED: &str = concat!(
         r#"{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":1.0,"tasks":["#,
         r#"{"name":"a","kind":"command","required":true},"#,
@@ -999,8 +940,6 @@ mod tests {
         )
     }
 
-    /// `scan` lists, route `triage` and `fix` both spread over the list, and `fix` runs where
-    /// `triage` said to.
     fn triaged(keys: &[&str], verdict: impl Fn(usize) -> &'static str) -> Vec<TaskView> {
         let mut lines = vec![
             concat!(
@@ -1242,7 +1181,6 @@ mod tests {
         );
     }
 
-    /// `a` feeds `b`, `b` feeds `c`, and `d` names all three, `a` for its own entry of `a.k`.
     const IMPLIED: &str = concat!(
         r#"{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":1.0,"tasks":["#,
         r#"{"name":"a","kind":"command","required":true},"#,
@@ -1329,7 +1267,6 @@ mod tests {
         }
     }
 
-    /// `build` binds `ship`'s `version`; `note` reads `ship` and was not taken.
     const CALLED: &str = concat!(
         r#"{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":1.0,"tasks":["#,
         r#"{"name":"build","kind":"command","required":true},"#,
@@ -1343,7 +1280,6 @@ mod tests {
         "\n",
     );
 
-    /// A workflow whose `test` job ran as a matrix of two legs after `lint`.
     fn workflow(lint: &str, legs: [&str; 2]) -> serde_json::Value {
         serde_json::json!({
             "nodes": [
@@ -1458,7 +1394,6 @@ mod tests {
         );
     }
 
-    /// `triage` calls a playbook once per item of `build`; instance `a` has dispatched.
     const MAPPED: &str = concat!(
         r#"{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":1.0,"tasks":["#,
         r#"{"name":"build","kind":"command","required":true},"#,

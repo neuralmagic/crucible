@@ -363,9 +363,7 @@ pub(crate) async fn record_emission(
 /// dispatches the launch without it.
 #[derive(Default)]
 pub(crate) struct Attached<'a> {
-    /// The call that dispatched the launch, and the run id its first dispatch takes.
     pub call: Option<crate::calls::store::ChildLink<'a>>,
-    /// The file parameter values the launch owns.
     pub files: &'a [crate::launches::param_files::ParamFile],
 }
 

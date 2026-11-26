@@ -207,13 +207,11 @@ impl Connector {
 #[derive(Clone)]
 pub struct Connection {
     pub client: crux::Client,
-    /// The transport under `client`, for a body that is not JSON.
     wire: Arc<dyn crux::client::Transport>,
     runtime: Handle,
 }
 
 impl Connection {
-    /// The text body of `path`, or why there is none.
     pub async fn text(&self, path: &str) -> Result<String, String> {
         let (status, bytes) = self
             .wire

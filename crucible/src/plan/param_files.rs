@@ -1,4 +1,4 @@
-//! File parameter values on this engine's disk (RFC-0008 C-PARAM-TYPES). A supplied value whose
+//! File parameter values on this engine's disk. A supplied value whose
 //! staged path is not readable here is fetched from the controller that launched the run by its
 //! digest, checked, and staged read-only under the run's state, beside the pack and never inside
 //! it. Agent tasks then find every file parameter under [`input_path`].
@@ -43,10 +43,8 @@ pub enum FetchError {
     },
 }
 
-/// The directory under a run's state that fetched file parameters are staged in.
 pub const STAGE_DIR: &str = "param-files";
 
-/// The directory under an agent task's `inputs/` that holds the run's file parameters.
 pub const INPUTS_DIR: &str = "params";
 
 /// One file parameter, as this engine reads it.
@@ -90,7 +88,6 @@ impl Staged {
     }
 }
 
-/// The file name a staged file keeps: its own, reduced to a plain name.
 fn base_name(path: &Path) -> String {
     let name: String = path
         .file_name()
@@ -110,21 +107,16 @@ fn base_name(path: &Path) -> String {
     }
 }
 
-/// Where an agent task finds file parameter `name` staged from `path`, relative to its root.
 pub fn input_path(name: &str, path: &Path) -> String {
     format!("{STAGED_INPUTS}/{INPUTS_DIR}/{name}/{}", base_name(path))
 }
 
-/// The hex of a `sha256:<hex>` digest, or `None` when it is anything else.
 fn digest_hex(digest: &str) -> Option<&str> {
     digest
         .strip_prefix("sha256:")
         .filter(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-/// Bind every supplied file parameter of the workflow at `source` to a file on this disk.
-/// A value that already names a readable file is kept. Anything this cannot read is left for the
-/// compiler to refuse.
 pub fn localize(
     source: &Path,
     supplied: &BTreeMap<String, String>,
@@ -181,8 +173,6 @@ pub fn localize(
     Ok(localized)
 }
 
-/// The file `digest` names, staged under `state`: kept when an earlier process of this run
-/// already staged it, fetched from `controller` otherwise.
 fn fetch(
     param: &str,
     state: &Path,
@@ -241,7 +231,6 @@ fn fetch(
     Ok(path)
 }
 
-/// Lay every file parameter down read-only under `<root>/inputs/params/<name>/`.
 pub fn materialize(root: &Path, files: &[ParamFile]) -> Result<(), String> {
     for file in files {
         let to = root.join(input_path(&file.name, &file.path));

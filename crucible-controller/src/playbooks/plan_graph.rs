@@ -106,7 +106,6 @@ pub struct GraphNodeDto {
     pub prompt: Option<String>,
     /// What a command task runs.
     pub command: Option<String>,
-    /// Set on a call task.
     #[serde(default)]
     pub call: Option<CallDto>,
 }

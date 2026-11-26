@@ -81,7 +81,6 @@ pub struct LintJob {
 }
 
 impl LintJob {
-    /// The jobs this one needs, whether GitLab lists them as names or as objects.
     pub fn needed(&self) -> Vec<String> {
         self.needs
             .iter()

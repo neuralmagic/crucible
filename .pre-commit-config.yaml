@@ -34,3 +34,10 @@ repos:
         language: system
         pass_filenames: false
         types: [rust]
+
+      - id: no-new-comments
+        name: no comments added to Rust beyond module and type docs
+        entry: python3 scripts/no-new-comments.py --staged
+        language: system
+        pass_filenames: false
+        types: [rust]

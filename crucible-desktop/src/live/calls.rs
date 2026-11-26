@@ -14,27 +14,23 @@ use crate::logline::{Body, LogLine};
 use crate::net::{Connection, within};
 use crate::session::TaskView;
 
-/// The route that answers one node of a call's target graph's log as text.
 pub const CALL_NODE_LOG_PATH: &str = "/api/runs/{run}/calls/{call}/nodes/{node}/log";
 
 /// One call of the run on screen.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LiveCall {
     pub view: CallView,
-    /// The launch key of a playbook target run, once the controller named it.
     pub launch: Option<String>,
 }
 
 impl LiveCall {
-    /// The target run's id, for a playbook target.
     pub fn target_run(&self) -> Option<&str> {
         match &self.view.state.handle {
             TargetHandle::Playbook { run } => Some(run),
-            TargetHandle::GithubWorkflow { .. } => None,
+            TargetHandle::GithubWorkflow { .. } | TargetHandle::TektonWatch { .. } => None,
         }
     }
 
-    /// Where `link` leads: a task of a launch the app can open, or a web page.
     pub fn jump(&self, link: &NodeLink) -> Option<Jump> {
         match link {
             NodeLink::External { url } => Some(Jump::Web(url.as_str().to_string())),
@@ -51,7 +47,6 @@ impl LiveCall {
         }
     }
 
-    /// The node `id` of its target's progress.
     pub fn node(&self, id: &str) -> Option<&ProgressNode> {
         self.view
             .state
@@ -61,7 +56,6 @@ impl LiveCall {
             .find(|node| node.id == id)
     }
 
-    /// Where the target run opens as a whole.
     pub fn open(&self) -> Option<Jump> {
         match (&self.launch, &self.view.state.link) {
             (Some(launch), _) => Some(Jump::Launch {
@@ -84,12 +78,10 @@ pub enum Jump {
     Web(String),
 }
 
-/// What opening a target run is called: a run in this app, or a workflow run on GitHub.
 pub fn open_label(kind: CallKind) -> &'static str {
     kind.presentation().open
 }
 
-/// Where unmapped call `task`'s target run opens, and what that action is called.
 pub fn target(task: &TaskView, calls: &[LiveCall]) -> Option<(&'static str, Jump)> {
     let call = task.call.as_ref()?;
     if let Some(live) = newest(calls, &task.name, None) {
@@ -112,7 +104,6 @@ pub struct NodeAsk {
 }
 
 impl NodeAsk {
-    /// The node's log route under `controller`.
     pub fn path(&self, controller: &str) -> String {
         crucible_contract::calls::url(controller, CALL_NODE_LOG_PATH, &self.run, Some(&self.call))
             .replace(
@@ -126,7 +117,6 @@ impl NodeAsk {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CallNode {
     pub ask: NodeAsk,
-    /// The call's task, `task` or `task[key]`.
     pub frame: String,
     pub label: String,
     pub jump: Option<Jump>,
@@ -139,7 +129,6 @@ pub struct NodeLog {
     pub text: Result<String, String>,
 }
 
-/// The log of node `ask`, as the controller has it now.
 pub(in crate::live) async fn node_log(
     connection: &Connection,
     ask: &NodeAsk,
@@ -147,7 +136,6 @@ pub(in crate::live) async fn node_log(
     within("the node's log", connection.text(&ask.path(""))).await
 }
 
-/// `task`, or `task[key]` for an instance of it.
 pub fn frame_name(task: &str, instance: Option<&str>) -> String {
     match instance {
         Some(key) => format!("{task}[{key}]"),
@@ -155,8 +143,6 @@ pub fn frame_name(task: &str, instance: Option<&str>) -> String {
     }
 }
 
-/// A call's life as log lines of its task: dispatched with where its target runs, running, and
-/// how it settled, with the result or the note.
 pub fn lifecycle(tasks: &[TaskView], calls: &[LiveCall]) -> Vec<LogLine> {
     let line = |task: &str, text: String, warning: bool| LogLine {
         at: None,
@@ -184,6 +170,15 @@ pub fn lifecycle(tasks: &[TaskView], calls: &[LiveCall]) -> Vec<LogLine> {
                 (None, TargetHandle::GithubWorkflow { repo, run_id }) => {
                     format!("{} run {run_id}", repo.as_str())
                 }
+                (
+                    None,
+                    TargetHandle::TektonWatch {
+                        namespace, commit, ..
+                    },
+                ) => format!(
+                    "the runs of {} in {namespace}",
+                    commit.get(..12).unwrap_or(commit)
+                ),
             };
             lines.push(line(
                 &frame,
@@ -218,7 +213,6 @@ pub fn lifecycle(tasks: &[TaskView], calls: &[LiveCall]) -> Vec<LogLine> {
     lines
 }
 
-/// A result's fields on one line.
 fn brief(result: &Value) -> String {
     match result {
         Value::Null => String::new(),
@@ -234,7 +228,6 @@ fn brief(result: &Value) -> String {
     }
 }
 
-/// The newest call of `task`, or of instance `instance` of it.
 pub fn newest<'a>(
     calls: &'a [LiveCall],
     task: &str,
@@ -246,7 +239,6 @@ pub fn newest<'a>(
         .max_by_key(|call| call.view.attempt)
 }
 
-/// Every call `run` dispatched, as the controller reports them.
 pub(in crate::live) async fn progress(
     connection: &Connection,
     run: &str,
@@ -278,7 +270,6 @@ pub struct Parent {
 }
 
 impl Parent {
-    /// The caller as a launch knows it, once the calling run's launch is known.
     pub fn called_by(self, launch: String) -> crux::dto::CalledBy {
         crux::dto::CalledBy {
             run: self.run,
@@ -289,7 +280,6 @@ impl Parent {
     }
 }
 
-/// What called run `run`: `Some(None)` when nothing did, `None` when the run could not be read.
 pub(in crate::live) async fn parent_of(
     connection: &Connection,
     run: &str,
@@ -298,7 +288,6 @@ pub(in crate::live) async fn parent_of(
     Some(detail.run.parent)
 }
 
-/// The launch key run `run` belongs to, read once and kept in `known`.
 pub(in crate::live) async fn launch_of(
     connection: &Connection,
     known: &mut HashMap<String, String>,
@@ -313,7 +302,6 @@ pub(in crate::live) async fn launch_of(
     Some(launch)
 }
 
-/// What `calls` of run `run`, launched as `launch`, say about each target launch's caller.
 pub(in crate::live) fn callers(
     calls: &[LiveCall],
     run: &str,
@@ -463,8 +451,6 @@ mod tests {
         );
     }
 
-    /// `ship` calls a workflow; `triage` calls a playbook once per item, and `b` has not
-    /// dispatched yet.
     const CALLS: &str = concat!(
         r#"{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":1.0,"tasks":["#,
         r#"{"name":"ship","kind":"call","required":true,"call":{"alias":"release","target":"github_workflow"}},"#,

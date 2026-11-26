@@ -1,4 +1,4 @@
-//! Playbook calls (RFC-0008): the manifest's `[calls]` entries, the `calls.lock` pack file, a
+//! Playbook calls: the manifest's `[calls]` entries, the `calls.lock` pack file, a
 //! target's interface, the progress graph every target kind reports, and the call API the engine
 //! reaches with its pod token. The engine, the controller and the desktop round-trip these types.
 
@@ -13,60 +13,38 @@ use crate::emits::{DeclaredFile, EmitWire, FieldType};
 use crate::link::ExternalUrl;
 use crate::session::TaskStatus;
 
-/// The lock file at a pack's root that pins every `[calls]` entry.
 pub const LOCK_FILE: &str = "calls.lock";
 
-/// The lock format this build reads and writes.
 pub const LOCK_VERSION: u32 = 1;
 
-/// The most target runs one mapped call may dispatch.
 pub const MAX_CALL_FANOUT: u32 = 64;
 
-/// The most nodes a progress graph carries.
 pub const MAX_PROGRESS_NODES: usize = 512;
 
-/// A run that is the fourth in a chain of calling runs dispatches no further call.
 pub const MAX_CALL_DEPTH: u32 = 4;
 
-/// The largest serialized json parameter value.
 pub const MAX_JSON_PARAM_BYTES: usize = 64 * 1024;
 
-/// The largest `max_bytes` a file parameter may declare.
 pub const MAX_FILE_PARAM_BYTES: u64 = 16 * 1024 * 1024;
 
-/// The most `workflow_dispatch` inputs GitHub accepts.
 pub const MAX_GITHUB_INPUTS: usize = 25;
 
-/// The file in a GitHub target's result artifact that holds its result fields.
 pub const GITHUB_RESULT_FILE: &str = "result.json";
 
-/// `POST` a [`DispatchRequest`]; answers [`DispatchResponse`], or [`CallRefused`] with 422.
-/// Pod token of `{run}` only.
 pub const CALLS_PATH: &str = "/api/runs/{run}/calls";
 
-/// `GET` a call's [`CallState`]. Pod token of `{run}` only.
 pub const CALL_PATH: &str = "/api/runs/{run}/calls/{call}";
 
-/// `POST` to cancel a call's target run; answers its [`CallState`]. Pod token of `{run}` only.
 pub const CALL_CANCEL_PATH: &str = "/api/runs/{run}/calls/{call}/cancel";
 
-/// `GET` the bytes of one of an ended call's result files. Pod token of `{run}` only.
 pub const CALL_RESULT_FILE_PATH: &str = "/api/runs/{run}/calls/{call}/files/{*path}";
 
-/// `PUT` the bytes of a file a call binds, addressed by its `sha256:<hex>` digest, before the
-/// dispatch that names it. Pod token of `{run}` only.
 pub const CALL_INPUT_FILE_PATH: &str = "/api/runs/{run}/call-files/{digest}";
 
-/// `GET` every call of `{run}` as a list of [`CallView`]. Anyone who may read `{run}`.
 pub const CALL_PROGRESS_PATH: &str = "/api/runs/{run}/call-progress";
 
-/// `GET` the text log of one progress node of a call of `{run}`: a GitHub job's log, or a
-/// playbook target task's log. Anyone who may read `{run}`, and for a playbook target the
-/// target run too.
 pub const CALL_NODE_LOG_PATH: &str = "/api/runs/{run}/calls/{call}/nodes/{node}/log";
 
-/// `GET` the bytes of a file parameter value stored for `{run}`'s launch, by its `sha256:<hex>`
-/// digest. Pod token of `{run}` only.
 pub const PARAM_FILE_PATH: &str = "/api/runs/{run}/param-files/{digest}";
 
 /// The kinds of target a call may name.
@@ -76,21 +54,24 @@ pub const PARAM_FILE_PATH: &str = "/api/runs/{run}/param-files/{digest}";
 pub enum CallKind {
     Playbook,
     GithubWorkflow,
+    Tekton,
 }
 
 impl CallKind {
-    /// Every kind, for a client that sets up each kind's look ahead of drawing.
-    pub const ALL: [CallKind; 2] = [CallKind::Playbook, CallKind::GithubWorkflow];
+    pub const ALL: [CallKind; 3] = [
+        CallKind::Playbook,
+        CallKind::GithubWorkflow,
+        CallKind::Tekton,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             CallKind::Playbook => "playbook",
             CallKind::GithubWorkflow => "github_workflow",
+            CallKind::Tekton => "tekton",
         }
     }
 
-    /// How a client draws this kind's target runs. A new kind sets its look here and every
-    /// client follows.
     pub fn presentation(self) -> Presentation {
         match self {
             CallKind::Playbook => Presentation {
@@ -109,6 +90,14 @@ impl CallKind {
                 icon: Some(BackendIcon::Github),
                 nodes: NodeLook::Jobs,
             },
+            CallKind::Tekton => Presentation {
+                name: "Tekton",
+                badge: "tekton",
+                open: "Open run page",
+                accent: Some(Rgb(0x1f, 0x6f, 0xc5)),
+                icon: Some(BackendIcon::Tekton),
+                nodes: NodeLook::Jobs,
+            },
         }
     }
 }
@@ -116,15 +105,10 @@ impl CallKind {
 /// How a client draws a target kind's runs: its name, its colour, its mark, and its nodes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Presentation {
-    /// The backend's name, as an info card shows it.
     pub name: &'static str,
-    /// The short word a call's label carries before its target has a name of its own.
     pub badge: &'static str,
-    /// What the press that opens a target run says.
     pub open: &'static str,
-    /// The frame, card and pulse colour; `None` draws with the client's own palette.
     pub accent: Option<Rgb>,
-    /// The backend's mark on the press that opens a target run outside the client.
     pub icon: Option<BackendIcon>,
     pub nodes: NodeLook,
 }
@@ -137,14 +121,13 @@ pub struct Rgb(pub u8, pub u8, pub u8);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendIcon {
     Github,
+    Tekton,
 }
 
 /// How a target graph's nodes are drawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeLook {
-    /// As the client draws its own run's tasks.
     Tasks,
-    /// As an external CI's jobs: rounded cards with a status mark and a duration.
     Jobs,
 }
 
@@ -288,7 +271,6 @@ impl WorkflowPath {
         &self.0
     }
 
-    /// The file name GitHub's dispatch endpoint takes as the workflow id.
     pub fn file_name(&self) -> &str {
         self.0.rsplit('/').next().unwrap_or(&self.0)
     }
@@ -406,14 +388,55 @@ pub enum CallTarget {
         git_ref: GitRefName,
         outputs: GithubOutputs,
     },
+    Tekton {
+        cluster: String,
+        namespace: String,
+        repository: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event: Option<PacEvent>,
+        #[serde(default)]
+        expected: Vec<TektonExpected>,
+    },
 }
+
+/// Which Pipelines-as-Code events a Tekton watch follows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PacEvent {
+    Push,
+    PullRequest,
+}
+
+/// One run a Tekton watch waits for.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TektonExpected {
+    pub name: String,
+    #[serde(default)]
+    pub results: Vec<String>,
+}
+
+impl TektonExpected {
+    pub fn field(&self) -> String {
+        self.name.replace('-', "_")
+    }
+}
+
+pub const WATCH_COMMIT_PARAM: &str = "commit";
+pub const WATCH_APPEAR_PARAM: &str = "appear";
+pub const WATCH_DEFAULT_APPEAR: &str = "10m";
 
 impl CallTarget {
     pub fn kind(&self) -> CallKind {
         match self {
             CallTarget::Playbook { .. } => CallKind::Playbook,
             CallTarget::GithubWorkflow { .. } => CallKind::GithubWorkflow,
+            CallTarget::Tekton { .. } => CallKind::Tekton,
         }
+    }
+
+    pub fn watches(&self) -> bool {
+        matches!(self, CallTarget::Tekton { .. })
     }
 }
 
@@ -421,12 +444,13 @@ impl CallTarget {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Pin {
-    /// A registered playbook's revision, by its digest. Never resolved again.
-    Revision { playbook: String, digest: String },
-    /// A draft's latest saved version that compiles, resolved at dispatch. Draft packs only.
-    DraftHead { draft: String },
-    /// A workflow at a branch or tag, resolved at dispatch; `commit` is what the ref named when
-    /// the lock was written.
+    Revision {
+        playbook: String,
+        digest: String,
+    },
+    DraftHead {
+        draft: String,
+    },
     GithubRef {
         repo: GithubRepo,
         workflow: WorkflowPath,
@@ -434,6 +458,7 @@ pub enum Pin {
         git_ref: GitRefName,
         commit: String,
     },
+    TektonWatch,
 }
 
 impl Pin {
@@ -441,15 +466,14 @@ impl Pin {
         match self {
             Pin::Revision { .. } | Pin::DraftHead { .. } => CallKind::Playbook,
             Pin::GithubRef { .. } => CallKind::GithubWorkflow,
+            Pin::TektonWatch => CallKind::Tekton,
         }
     }
 
-    /// Whether the pin is resolved again at dispatch.
     pub fn moves(&self) -> bool {
         matches!(self, Pin::DraftHead { .. } | Pin::GithubRef { .. })
     }
 
-    /// Whether this pin is what `target` names.
     pub fn pins(&self, target: &CallTarget) -> bool {
         match (self, target) {
             (
@@ -478,6 +502,7 @@ impl Pin {
                     ..
                 },
             ) => repo == r && workflow == w && git_ref == g,
+            (Pin::TektonWatch, CallTarget::Tekton { .. }) => true,
             _ => false,
         }
     }
@@ -487,21 +512,16 @@ impl Pin {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TargetInterface {
-    /// The target's parameters as the JSON Schema a params block emits.
     pub params: Value,
-    /// The result's fields, typed.
     #[serde(default)]
     pub result: Vec<EmitWire>,
-    /// The result's files.
     #[serde(default)]
     pub result_files: Vec<DeclaredFile>,
-    /// The target's graph, every node pending.
     #[serde(default)]
     pub graph: ProgressGraph,
 }
 
 impl TargetInterface {
-    /// `sha256:<hex>` over the interface's JSON with object keys sorted.
     pub fn digest(&self) -> Result<String, serde_json::Error> {
         let value = serde_json::to_value(self)?;
         let bytes = serde_json::to_vec(&sorted(value))?;
@@ -528,7 +548,6 @@ pub struct LockedCall {
     pub kind: CallKind,
     pub pin: Pin,
     pub interface: TargetInterface,
-    /// [`TargetInterface::digest`] of `interface`.
     pub interface_digest: String,
 }
 
@@ -601,16 +620,12 @@ impl CallsLock {
         Ok(lock)
     }
 
-    /// The lock as its file holds it: pretty JSON with a trailing newline.
     pub fn render(&self) -> Result<String, serde_json::Error> {
         let mut text = serde_json::to_string_pretty(self)?;
         text.push('\n');
         Ok(text)
     }
 
-    /// Refuse a lock that does not pin exactly the targets `calls` declares.
-    /// Whether the lock pins every target in `calls`. A lock may pin more: one lock serves every
-    /// workflow source of a pack.
     pub fn covers(&self, calls: &BTreeMap<CallAlias, CallTarget>) -> Result<(), LockError> {
         for (alias, target) in calls {
             let Some(locked) = self.calls.get(alias) else {
@@ -686,14 +701,14 @@ impl<'de> Deserialize<'de> for NodeStatus {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NodeLink {
-    /// A Crucible run, or one task of it.
     Run {
         run: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         task: Option<String>,
     },
-    /// A page outside the client.
-    External { url: ExternalUrl },
+    External {
+        url: ExternalUrl,
+    },
 }
 
 /// One step of a GitHub job.
@@ -711,26 +726,43 @@ pub struct JobStep {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NodeDetail {
-    /// A task of a playbook target run, by its task kind label.
     PlaybookTask { task_kind: String },
-    /// A job of a GitHub workflow run.
     GithubJob { steps: Vec<JobStep> },
+    TektonTask { task_runs: Vec<TektonTaskRun> },
+}
+
+/// One TaskRun of a Tekton task: its steps, and the pod a step's log is read from.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TektonTaskRun {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod: Option<String>,
+    pub steps: Vec<TektonStep>,
+}
+
+/// One step of a Tekton task, with the container its log is in.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TektonStep {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
+    pub status: NodeStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended: Option<String>,
 }
 
 /// One node of a progress graph.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProgressNode {
-    /// Unique within the graph.
     pub id: String,
     pub label: String,
     pub status: NodeStatus,
-    /// Nodes of one group fold together: a task's mapped instances, a job's matrix legs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
-    /// RFC 3339.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started: Option<String>,
-    /// RFC 3339.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -752,14 +784,11 @@ pub struct ProgressGraph {
     pub nodes: Vec<ProgressNode>,
     #[serde(default)]
     pub edges: Vec<ProgressEdge>,
-    /// How many nodes past [`MAX_PROGRESS_NODES`] were left out.
     #[serde(default)]
     pub omitted: u32,
 }
 
 impl ProgressGraph {
-    /// The graph of `nodes` and `edges`, keeping the first [`MAX_PROGRESS_NODES`] nodes and the
-    /// edges between kept nodes.
     pub fn bounded(mut nodes: Vec<ProgressNode>, edges: Vec<ProgressEdge>) -> Self {
         let omitted = nodes.len().saturating_sub(MAX_PROGRESS_NODES);
         nodes.truncate(MAX_PROGRESS_NODES);
@@ -775,7 +804,6 @@ impl ProgressGraph {
         }
     }
 
-    /// This graph before anything ran: every node pending, with no times.
     pub fn pending(&self) -> Self {
         let nodes = self
             .nodes
@@ -794,7 +822,6 @@ impl ProgressGraph {
         }
     }
 
-    /// The same graph with every link removed, for a reader who may not read the target run.
     pub fn unlinked(&self) -> Self {
         let nodes = self
             .nodes
@@ -828,8 +855,18 @@ impl std::fmt::Display for CallId {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TargetHandle {
-    Playbook { run: String },
-    GithubWorkflow { repo: GithubRepo, run_id: u64 },
+    Playbook {
+        run: String,
+    },
+    GithubWorkflow {
+        repo: GithubRepo,
+        run_id: u64,
+    },
+    TektonWatch {
+        cluster: String,
+        namespace: String,
+        commit: String,
+    },
 }
 
 impl TargetHandle {
@@ -837,6 +874,7 @@ impl TargetHandle {
         match self {
             TargetHandle::Playbook { .. } => CallKind::Playbook,
             TargetHandle::GithubWorkflow { .. } => CallKind::GithubWorkflow,
+            TargetHandle::TektonWatch { .. } => CallKind::Tekton,
         }
     }
 }
@@ -844,7 +882,6 @@ impl TargetHandle {
 /// A file a call binds or a target returns. `path` is where it was staged, when it was.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileRef {
-    /// `sha256:<hex>` of the bytes.
     pub digest: String,
     pub size: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -868,17 +905,13 @@ pub struct CallBudget {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DispatchRequest {
     pub task: String,
-    /// The mapped instance's item key; `None` for an unmapped call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance: Option<String>,
     pub attempt: u32,
     pub alias: CallAlias,
-    /// The locked interface the engine compiled the call against.
     pub interface_digest: String,
-    /// Every bound non-file parameter.
     #[serde(default)]
     pub values: BTreeMap<String, Value>,
-    /// Every bound file parameter, uploaded to [`CALL_INPUT_FILE_PATH`] first.
     #[serde(default)]
     pub files: BTreeMap<String, FileRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -908,7 +941,6 @@ pub enum CallStatus {
     Running,
     Passed,
     Failed,
-    /// The caller cancelled it.
     Cancelled,
 }
 
@@ -928,10 +960,8 @@ pub struct CallState {
     pub status: CallStatus,
     #[serde(default)]
     pub note: String,
-    /// The target's result fields once it ended passing; null before.
     #[serde(default)]
     pub result: Value,
-    /// The target's result files once it ended passing, fetched from [`CALL_RESULT_FILE_PATH`].
     #[serde(default)]
     pub result_files: Vec<FileRef>,
     #[serde(default)]
@@ -939,7 +969,6 @@ pub struct CallState {
     pub handle: TargetHandle,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<NodeLink>,
-    /// The number the target's own system shows for this run, such as a GitHub run number.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_number: Option<u64>,
 }
@@ -956,8 +985,6 @@ pub struct CallView {
     pub state: CallState,
 }
 
-/// `path` with `{run}`, `{call}` and `{digest}` replaced by escaped segments, appended to
-/// `controller`.
 pub fn url(controller: &str, path: &str, run: &str, call: Option<&CallId>) -> String {
     let mut out = path.replace("{run}", &crate::artifact::path_segment(run));
     if let Some(call) = call {

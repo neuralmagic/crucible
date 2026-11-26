@@ -4,7 +4,6 @@ use std::collections::BTreeSet;
 
 use serde_json::Value;
 
-/// The most inputs GitHub accepts on a `workflow_dispatch`.
 pub const MAX_INPUTS: usize = 25;
 
 /// Why a workflow file cannot be dispatched as written.
@@ -71,18 +70,14 @@ impl InputType {
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorkflowInput {
     pub name: String,
-    /// `type:` as written; `None` when the input names none.
     pub declared: Option<InputType>,
     pub description: Option<String>,
     pub required: bool,
-    /// `default:`, typed by the input's type.
     pub default: Option<Value>,
-    /// A choice input's options.
     pub options: Vec<String>,
 }
 
 impl WorkflowInput {
-    /// The input's type; an untyped input is a string.
     pub fn ty(&self) -> InputType {
         self.declared.unwrap_or(InputType::String)
     }
@@ -92,7 +87,6 @@ impl WorkflowInput {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkflowJob {
     pub key: String,
-    /// Its `name:`, or its key when the name is absent or an expression.
     pub label: String,
     pub needs: Vec<String>,
 }
@@ -100,16 +94,11 @@ pub struct WorkflowJob {
 /// What a workflow file declares that a dispatch reads.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Workflow {
-    /// In file order.
     pub inputs: Vec<WorkflowInput>,
-    /// In file order.
     pub jobs: Vec<WorkflowJob>,
 }
 
 impl Workflow {
-    /// Parse a workflow file. `on` may be a trigger name, a list of them, or a mapping; only the
-    /// mapping form carries inputs. YAML 1.1 parsers may read the bare `on` key as `true`, so both
-    /// keys are looked up.
     pub fn parse(text: &str) -> Result<Self, WorkflowError> {
         use serde_norway::Value as Yaml;
         let doc: Yaml =
@@ -240,7 +229,6 @@ fn job(key: &str, spec: &serde_norway::Value) -> WorkflowJob {
     }
 }
 
-/// A YAML boolean, real or quoted (`required: "true"`).
 fn parse_yaml_bool(value: &serde_norway::Value) -> Option<bool> {
     value.as_bool().or_else(
         || match value.as_str()?.trim().to_ascii_lowercase().as_str() {
@@ -284,7 +272,6 @@ mod tests {
 
     use crate::github::workflow::*;
 
-    /// The contract-v1 build workflow, parsed as dispatched.
     const CONTRACT_V1: &str = include_str!("../../../.github/workflows/crucible-build.yml");
 
     const JOBS: &str = "jobs:\n  a:\n    runs-on: x\n";

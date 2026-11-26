@@ -568,6 +568,8 @@ fn test_cfg(state_dir: &Path, repos: Vec<String>) -> ControllerCfg {
         local_secret_allowlist: Vec::new(),
         calls_github_token: None,
         github_logins: Vec::new(),
+        calls_tekton_kubeconfigs: Vec::new(),
+        calls_tekton_results: Vec::new(),
         state_dir: state_dir.to_path_buf(),
         scratch_dir: None,
         db: test_ledger_url(),

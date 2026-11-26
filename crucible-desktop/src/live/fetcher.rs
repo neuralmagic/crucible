@@ -61,15 +61,10 @@ pub(in crate::live) struct Fetcher {
     pub(in crate::live) registered: Vec<String>,
     pub(in crate::live) shareable: Vec<crux::client::Shared>,
     pub(in crate::live) catalog_at: Option<Instant>,
-    /// The launch each playbook target run belongs to, by run id.
     run_launches: HashMap<String, String>,
-    /// The call each target launch was dispatched by, as the calling runs' calls named it.
     callers: HashMap<String, crux::dto::CalledBy>,
-    /// The target node whose log the window shows.
     pub(in crate::live) node_ask: Option<calls::NodeAsk>,
-    /// Each target node's log as last read, and whether the node had ended then.
     node_logs: HashMap<calls::NodeAsk, (Result<String, String>, bool)>,
-    /// What each run's detail says called it, by run id; `None` when nothing did.
     parents: HashMap<String, Option<calls::Parent>>,
 }
 

@@ -174,7 +174,6 @@ pub struct List<T> {
     pub items: Vec<T>,
 }
 
-/// The `Succeeded` condition among `conditions`, which is the one Tekton reports a run's state in.
 pub fn succeeded(conditions: &[Condition]) -> Option<&Condition> {
     conditions.iter().find(|c| c.kind == SUCCEEDED)
 }

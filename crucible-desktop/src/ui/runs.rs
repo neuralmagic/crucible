@@ -446,8 +446,6 @@ struct Nested<'a> {
     open: bool,
 }
 
-/// `launches` newest first, each followed by the launches its calls dispatched while it is in
-/// `unfolded`. A launch whose caller is listed shows only under it.
 fn nested<'a>(
     launches: &[&'a LivePlaybook],
     live: &'a LiveView,
@@ -487,7 +485,6 @@ fn nested<'a>(
     rows
 }
 
-/// The deepest a dispatched launch nests.
 const MAX_DEPTH: usize = crucible_contract::calls::MAX_CALL_DEPTH as usize;
 
 /// Every launch, newest first, under its column heads.
@@ -582,12 +579,8 @@ fn result(launch: &LivePlaybook) -> String {
         .unwrap_or_else(|| launch.status.to_string())
 }
 
-/// One row of the list, keyed by position so a script can pick "run-0"; a launch a call
-/// dispatched sits under its caller's row as `run-<i>-<j>`, named `called` in place of its time.
-/// How far each nesting level indents.
 const INDENT: f32 = 16.0;
 
-/// The count of launches a launch's calls dispatched; a press shows or folds them.
 fn calls_badge(launch: &LivePlaybook, calls: usize, open: bool, p: &Paint) -> El {
     let key = launch.key.clone();
     row()

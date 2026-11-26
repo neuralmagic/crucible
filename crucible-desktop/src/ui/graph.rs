@@ -168,22 +168,16 @@ fn compact(app: &App) -> bool {
 
 const CANVAS: &str = "graph-canvas";
 
-/// The least and most a diagram is first drawn at to fit its pane.
 const FIT: (f32, f32) = (0.2, 1.5);
 
-/// Points kept clear around a fitted diagram.
 const MARGIN: f32 = 16.0;
 
-/// The scale that fits a `size` diagram whole in a `pane`, and how far down the pane its top
-/// edge sits so it shows in the middle.
 fn fit([across, down]: [f32; 2], [w, h]: [f32; 2]) -> (f32, f32) {
     let room = |pane: f32, length: f32| (pane - 2.0 * MARGIN).max(1.0) / length.max(1.0);
     let scale = room(across, w).min(room(down, h)).clamp(FIT.0, FIT.1);
     (scale, ((down - h * scale) / 2.0).max(MARGIN))
 }
 
-/// The diagram under the run's camera, fitted whole to the pane and in its middle, with the
-/// camera's controls over it.
 fn canvas(
     drawing: rune_mermaid::Drawing,
     found: &[Found],
@@ -384,7 +378,6 @@ fn controls(
         )
 }
 
-/// The side of the square at the corner of a frame that folds and unfolds it.
 pub(crate) const HANDLE: f32 = 16.0;
 
 /// The corner of a fan-out's frame: a press folds its instances away or shows them.

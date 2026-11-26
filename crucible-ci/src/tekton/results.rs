@@ -1,5 +1,5 @@
-//! Tekton Results, which keeps PipelineRuns and TaskRuns after the cluster prunes them (RFC-0008
-//! C-TEKTON). A record's id is the run's uid, and a PipelineRun's result holds its TaskRuns.
+//! Tekton Results, which keeps PipelineRuns and TaskRuns after the cluster prunes them. A
+//! record's id is the run's uid, and a PipelineRun's result holds its TaskRuns.
 //!
 //! ```text
 //!   GET {base}/apis/results.tekton.dev/v1alpha2/parents/{ns}/results/-/records
@@ -20,7 +20,6 @@ use crate::token::BearerToken;
 const PIPELINE_RUN_TYPE: &str = "tekton.dev/v1.PipelineRun";
 const TASK_RUN_TYPE: &str = "tekton.dev/v1.TaskRun";
 const PAGE_SIZE: u32 = 50;
-/// Pages read before a listing stops, so a filter that matches too much cannot run unbounded.
 pub const MAX_PAGES: u32 = 10;
 const ERR_BODY_CHARS: usize = 300;
 
@@ -53,8 +52,6 @@ pub struct Results {
 }
 
 impl Results {
-    /// `base` is the Results API's address, such as
-    /// `https://tekton-results-tekton-results.apps.example.com`.
     pub fn new(http: reqwest::Client, base: &str) -> Result<Self, TektonError> {
         let url = Url::parse(base).map_err(|_| TektonError::Api(base.to_owned()))?;
         if url.scheme() != "https" || url.host_str().is_none() {
@@ -66,7 +63,6 @@ impl Results {
         })
     }
 
-    /// The PipelineRuns Results recorded that `filter` matches, pruned or not.
     pub async fn find(
         &self,
         token: &BearerToken,
@@ -86,7 +82,6 @@ impl Results {
         Ok(runs.into_iter().filter(|r| filter.admits(r)).collect())
     }
 
-    /// The TaskRuns Results recorded for the PipelineRun whose uid is `run_uid`.
     pub async fn task_runs(
         &self,
         token: &BearerToken,
@@ -183,7 +178,6 @@ fn decode<T: DeserializeOwned>(
         .collect()
 }
 
-/// `raw` with the characters that would end or escape a CEL string literal escaped.
 fn cel_string(raw: &str) -> String {
     raw.replace('\\', "\\\\").replace('"', "\\\"")
 }

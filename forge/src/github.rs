@@ -26,15 +26,12 @@ use crate::github::build::BuildFailure;
 use crate::github::workflow::WorkflowError;
 
 const API: &str = "https://api.github.com";
-/// The REST API version every request asks for. From this version a dispatch answers 200 with
-/// the created run's details.
 const API_VERSION: &str = "2026-03-10";
 const USER_AGENT: &str = "crucible";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_WORKFLOW_BYTES: u64 = 1024 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
-/// How much of a job's log [`Client::job_log`] keeps: its last bytes.
 pub const MAX_JOB_LOG_BYTES: usize = 2 * 1024 * 1024;
 const MAX_JOB_PAGES: u32 = 10;
 const JOBS_PER_PAGE: u32 = 100;
@@ -46,7 +43,6 @@ const JSON_ACCEPT: &str = "application/vnd.github+json";
 const RAW_ACCEPT: &str = "application/vnd.github.raw";
 const SHA_ACCEPT: &str = "application/vnd.github.sha";
 
-/// Path characters left as they are: unreserved ones and `/`.
 const PATH: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'_')
@@ -74,7 +70,6 @@ pub enum GithubError {
         workflow: String,
         git_ref: String,
     },
-    /// GitHub answered with a status that is not success.
     #[error("GitHub answered {status} {doing}: {body}")]
     Api {
         doing: String,
@@ -86,13 +81,11 @@ pub enum GithubError {
         doing: String,
         cause: reqwest::Error,
     },
-    /// GitHub answered success with a body this client cannot use.
     #[error("GitHub {doing}: {detail}")]
     Response { doing: String, detail: String },
 }
 
 impl GithubError {
-    /// Whether the same operation may succeed when asked again later.
     pub fn is_transient(&self) -> bool {
         match self {
             GithubError::Http { .. } => true,
@@ -125,7 +118,6 @@ pub struct Repo {
 }
 
 impl Repo {
-    /// Exactly one `/`, with both halves non-empty.
     pub fn parse(repo: &str) -> Result<Self, GithubError> {
         match repo.split_once('/') {
             Some((owner, name)) if !owner.is_empty() && !name.is_empty() && !name.contains('/') => {
@@ -185,7 +177,6 @@ impl CommitSha {
         &self.0
     }
 
-    /// The first 12 characters, for messages.
     pub fn short(&self) -> &str {
         self.0.get(..12).unwrap_or(&self.0)
     }
@@ -268,7 +259,6 @@ pub struct WorkflowRun {
     pub head_sha: String,
     #[serde(default)]
     pub html_url: String,
-    /// The number GitHub shows for the run within its workflow, `#12`.
     #[serde(default)]
     pub run_number: Option<u64>,
 }
@@ -345,7 +335,6 @@ impl Client {
         Ok(Client { http })
     }
 
-    /// The commit `git_ref` names now.
     pub async fn resolve(
         &self,
         token: &Token,
@@ -362,7 +351,6 @@ impl Client {
             .ok_or_else(|| GithubError::response(doing, "the answer is not a commit sha"))
     }
 
-    /// The text of the file at `path` (`.github/workflows/x.yml`) at `git_ref`.
     pub async fn workflow_file(
         &self,
         token: &Token,
@@ -393,7 +381,6 @@ impl Client {
         String::from_utf8(bytes).map_err(|e| GithubError::response(doing, e))
     }
 
-    /// Dispatch the workflow `file_name` on `git_ref` and return the run GitHub created.
     pub async fn dispatch(
         &self,
         token: &Token,
@@ -414,8 +401,6 @@ impl Client {
         resp.json().await.map_err(GithubError::http(doing))
     }
 
-    /// The run `run_id`. A run id GitHub just handed out can answer 404 for a few seconds, so a
-    /// 404 is asked again before it is believed.
     pub async fn run(
         &self,
         token: &Token,
@@ -440,7 +425,6 @@ impl Client {
         }
     }
 
-    /// The jobs of the run's latest attempt, at most [`MAX_JOB_PAGES`] pages of them.
     pub async fn jobs(
         &self,
         token: &Token,
@@ -467,7 +451,6 @@ impl Client {
         Ok(jobs)
     }
 
-    /// The zip of the run's unexpired artifact `name`; `None` when it has none.
     pub async fn artifact(
         &self,
         token: &Token,
@@ -506,7 +489,6 @@ impl Client {
         capped(resp, MAX_ARTIFACT_BYTES, doing).await.map(Some)
     }
 
-    /// The last [`MAX_JOB_LOG_BYTES`] of job `job_id`'s log.
     pub async fn job_log(
         &self,
         token: &Token,
@@ -520,7 +502,6 @@ impl Client {
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
-    /// Ask GitHub to cancel the run. A run that already completed is left as it is.
     pub async fn cancel(&self, token: &Token, repo: &Repo, run_id: u64) -> Result<(), GithubError> {
         let url = format!("{API}/repos/{repo}/actions/runs/{run_id}/cancel");
         match self
@@ -537,7 +518,6 @@ impl Client {
         }
     }
 
-    /// One request with the token. Success, or a redirect for the callers that expect one.
     async fn send(
         &self,
         request: reqwest::RequestBuilder,
@@ -564,7 +544,6 @@ impl Client {
         })
     }
 
-    /// GET `url` with the token, then the signed URL it redirects to without it.
     async fn redirected(
         &self,
         url: String,
@@ -590,7 +569,6 @@ impl Client {
             .map_err(GithubError::http(doing))
     }
 
-    /// The request for a signed download URL: https only, and carrying no credential.
     fn signed(&self, location: &str, doing: &str) -> Result<reqwest::Request, GithubError> {
         let url = reqwest::Url::parse(location)
             .map_err(|e| GithubError::response(doing, format!("the redirect is not a URL: {e}")))?;
@@ -608,8 +586,6 @@ fn encode(path: &str) -> String {
     utf8_percent_encode(path, PATH).to_string()
 }
 
-/// rustls 0.23 picks no CryptoProvider when several are linked; choose one before any TLS
-/// handshake. A second install returns Err, which is fine.
 fn install_crypto_provider() {
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -635,7 +611,6 @@ async fn capped(
     Ok(buf)
 }
 
-/// The last `keep` bytes of the body.
 async fn tail(
     mut resp: reqwest::Response,
     keep: usize,
@@ -775,8 +750,6 @@ mod tests {
         assert_eq!(encode("feature/x#1"), "feature/x%231");
     }
 
-    /// Reads a public workflow file and its ref with your gh login.
-    /// `CRUCIBLE_GH_LIVE=1 GH_TOKEN=$(gh auth token) cargo test -p forge github -- --ignored`
     #[tokio::test]
     #[ignore = "reads GitHub; set CRUCIBLE_GH_LIVE=1 and GH_TOKEN"]
     async fn live_reads_of_a_workflow() {

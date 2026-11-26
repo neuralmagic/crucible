@@ -21,7 +21,6 @@ impl CommitId {
         &self.0
     }
 
-    /// The first 12 characters, as a client shows a commit.
     pub fn short(&self) -> &str {
         self.0.get(..12).unwrap_or(&self.0)
     }

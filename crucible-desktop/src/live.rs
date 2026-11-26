@@ -133,7 +133,6 @@ impl LiveView {
         rows
     }
 
-    /// The launches a call of launch `key` dispatched, oldest first.
     pub fn called_from(&self, key: &str) -> Vec<&LivePlaybook> {
         let mut called: Vec<&LivePlaybook> = self
             .launches()
@@ -210,7 +209,6 @@ pub struct LivePlaybook {
     pub description: Option<String>,
     pub landed: i64,
     pub landed_at: String,
-    /// The call that dispatched it, when one did.
     pub called_by: Option<crux::dto::CalledBy>,
 }
 
@@ -318,9 +316,7 @@ pub struct LiveDetail {
     pub run_id: Option<String>,
     /// The files its tasks captured, or why they could not be listed; `None` until read.
     pub files: Option<Result<Vec<Captured>, String>>,
-    /// Every call the run dispatched, with its target's progress.
     pub calls: Vec<calls::LiveCall>,
-    /// The log of the target node the window asked for.
     pub node_log: Option<calls::NodeLog>,
 }
 

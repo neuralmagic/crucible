@@ -20,7 +20,6 @@ fn schema_type(ty: InputType) -> &'static str {
     }
 }
 
-/// The parameters as the JSON Schema a params block emits.
 pub fn params_schema(workflow: &Workflow) -> Value {
     let mut properties = Map::new();
     let mut required = Vec::new();
@@ -51,7 +50,6 @@ pub fn params_schema(workflow: &Workflow) -> Value {
     })
 }
 
-/// The jobs as a graph, every node pending, with edges from `needs`.
 pub fn graph(workflow: &Workflow) -> ProgressGraph {
     let nodes = workflow
         .jobs
@@ -80,7 +78,6 @@ pub fn graph(workflow: &Workflow) -> ProgressGraph {
     ProgressGraph::bounded(nodes, edges)
 }
 
-/// The target's interface: the workflow's parameters and graph, and the result `outputs` declares.
 pub fn interface(workflow: &Workflow, outputs: &GithubOutputs) -> TargetInterface {
     TargetInterface {
         params: params_schema(workflow),
@@ -101,9 +98,6 @@ pub fn interface(workflow: &Workflow, outputs: &GithubOutputs) -> TargetInterfac
     }
 }
 
-/// The `inputs` of a dispatch: each bound value as the string GitHub takes, a json value as its
-/// serialized JSON. Refuses file parameters, undeclared inputs, missing required inputs, and
-/// values of the wrong type.
 pub fn dispatch_inputs(
     params: &Value,
     values: &BTreeMap<String, Value>,

@@ -517,10 +517,8 @@ fn form(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
         )
 }
 
-/// The width of a file field's Choose button.
 const CHOOSE: f32 = 84.0;
 
-/// A file field: its path, typed or chosen in the system's file dialog.
 fn file_pick(app: &App, i: usize, name: &str, invalid: bool, off: bool, p: &Paint) -> El {
     let answer = app
         .remote

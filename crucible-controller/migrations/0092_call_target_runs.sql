@@ -5,7 +5,7 @@ CREATE TABLE call_target_runs (
     instance     TEXT,
     attempt      INTEGER NOT NULL CHECK (attempt >= 0),
     alias        TEXT NOT NULL,
-    kind         TEXT NOT NULL CHECK (kind IN ('playbook', 'github_workflow')),
+    kind         TEXT NOT NULL CHECK (kind IN ('playbook', 'github_workflow', 'tekton')),
     target       JSONB NOT NULL,
     interface    JSONB NOT NULL,
     handle       JSONB,

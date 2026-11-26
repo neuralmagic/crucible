@@ -118,7 +118,6 @@ struct Shown {
     /// The task's definition can be opened in the editor.
     editable: bool,
     link: Option<String>,
-    /// Where a call's target run opens, and what that is called.
     target: Option<(&'static str, Jump)>,
 }
 

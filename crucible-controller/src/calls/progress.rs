@@ -1,4 +1,4 @@
-//! A playbook target run's progress (RFC-0008 C-PROGRESS), folded from its session log: one node
+//! A playbook target run's progress, folded from its session log: one node
 //! per task and per mapped instance, with the run's own statuses.
 
 use std::collections::BTreeMap;
@@ -15,8 +15,6 @@ struct Seen {
     settled: Option<(TaskStatus, Option<String>)>,
 }
 
-/// The graph of run `run` as its session log has it. `planned` stands in for the plan until the
-/// log admits one.
 pub(crate) fn fold(session: &str, run: &str, planned: &ProgressGraph) -> ProgressGraph {
     let mut plan: Option<Vec<PlanTaskWire>> = None;
     let mut seen: BTreeMap<String, Seen> = BTreeMap::new();

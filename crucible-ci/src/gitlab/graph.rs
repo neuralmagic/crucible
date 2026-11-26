@@ -1,5 +1,4 @@
-//! A GitLab pipeline's jobs as a progress graph, and how a pipeline ended (RFC-0008
-//! C-GITLAB-PIPELINE).
+//! A GitLab pipeline's jobs as a progress graph, and how a pipeline ended.
 
 use std::collections::BTreeMap;
 
@@ -13,12 +12,10 @@ use crate::gitlab::model::{Bridge, Job, Lint, Pipeline};
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Shape {
     pub stages: Vec<String>,
-    /// Job name to the jobs it needs. A job absent here waits on the stage before its own.
     pub needs: BTreeMap<String, Vec<String>>,
 }
 
 impl Shape {
-    /// The shape GitLab's lint reports for a ref.
     pub fn from_lint(lint: &Lint) -> Self {
         let mut stages: Vec<String> = Vec::new();
         let mut needs = BTreeMap::new();
@@ -39,7 +36,6 @@ impl Shape {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobDetail {
     pub job_id: u64,
-    /// The downstream pipeline a trigger job started.
     pub downstream: Option<u64>,
 }
 
@@ -49,7 +45,6 @@ pub struct RunGraph {
     pub jobs: BTreeMap<String, JobDetail>,
 }
 
-/// A job's status as a node status.
 pub fn job_status(status: &str, allow_failure: bool) -> NodeStatus {
     match status {
         "running" => NodeStatus::Running,
@@ -61,8 +56,6 @@ pub fn job_status(status: &str, allow_failure: bool) -> NodeStatus {
     }
 }
 
-/// The graph of a pipeline from its jobs and trigger jobs, with `shape` giving stage order and
-/// needs. Stages the shape does not name follow, ordered by their first job's id.
 pub fn pipeline_graph(jobs: &[Job], bridges: &[Bridge], shape: &Shape) -> RunGraph {
     struct Row<'a> {
         id: u64,
@@ -169,15 +162,12 @@ pub fn pipeline_graph(jobs: &[Job], bridges: &[Bridge], shape: &Shape) -> RunGra
 pub enum PipelineState {
     Running,
     Passed,
-    /// Skipped: passing with an empty result.
     Skipped,
     Failed(String),
     Cancelled,
-    /// Stopped on a manual job, which nothing will start.
     Blocked(String),
 }
 
-/// `pipeline`'s state; `jobs` names the manual job a blocked pipeline waits on.
 pub fn pipeline_state(pipeline: &Pipeline, jobs: &[Job]) -> PipelineState {
     match pipeline.status.as_str() {
         "success" => PipelineState::Passed,

@@ -1,5 +1,4 @@
-//! Building the PipelineRun a call creates from a repository's `.tekton` file (RFC-0008
-//! C-TEKTON dispatch).
+//! Building the PipelineRun a call creates from a repository's `.tekton` file.
 //!
 //! ```text
 //!   .tekton/x.yaml at the pinned commit
@@ -23,16 +22,12 @@ const GENERATE_NAME_MAX: usize = 57;
 /// Where the file was read from, which fills the Pipelines-as-Code variables it uses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Source {
-    /// The repository's HTTPS URL, such as `https://github.com/org/repo`.
     pub repo_url: String,
     pub owner: String,
     pub name: String,
-    /// The branch the pin's ref names.
     pub branch: String,
     pub commit: CommitId,
     pub namespace: String,
-    /// The Secret holding git credentials the file's `{{ git_auth_secret }}` names, when the
-    /// target declares one.
     pub git_auth_secret: Option<String>,
 }
 
@@ -103,7 +98,6 @@ impl PipelineRunFile {
         Ok(PipelineRunFile { doc })
     }
 
-    /// The name the file gives its PipelineRun.
     pub fn name(&self) -> &str {
         self.doc
             .pointer("/metadata/name")
@@ -111,7 +105,6 @@ impl PipelineRunFile {
             .unwrap_or("pipelinerun")
     }
 
-    /// The parameters the file sets, each with the file's value as its default.
     pub fn params(&self) -> Result<Vec<FileParam>, DispatchError> {
         let Some(items) = self.doc.pointer("/spec/params").and_then(Value::as_array) else {
             return Ok(Vec::new());
@@ -144,7 +137,6 @@ impl PipelineRunFile {
             .collect()
     }
 
-    /// The Pipelines-as-Code variables the file uses, such as `revision`.
     pub fn variables(&self) -> Vec<String> {
         let mut found = Vec::new();
         collect_variables(&self.doc, &mut found);
@@ -153,9 +145,6 @@ impl PipelineRunFile {
         found
     }
 
-    /// The PipelineRun to create: the file with its variables set from `source`, its
-    /// Pipelines-as-Code annotations removed, `values` replacing its params' defaults, and
-    /// `labels` added.
     pub fn render(
         &self,
         source: &Source,
@@ -267,7 +256,6 @@ fn truncated(name: &str, max: usize) -> &str {
     name.get(..end).unwrap_or(name).trim_end_matches('-')
 }
 
-/// Each `{{ name }}` in `text`, in order.
 fn placeholders(text: &str) -> Vec<(usize, usize, &str)> {
     let mut out = Vec::new();
     let mut from = 0;

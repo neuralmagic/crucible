@@ -189,6 +189,31 @@ calls-example port="8870" max_cost="1" max_time="30m":
         || { echo "calls-parent: the controller saved no calls.lock" >&2; exit 1; }
     "$crux" draft-launch calls-parent --max-cost {{max_cost}} --max-time {{max_time}} --json | jq -r .key
 
+# Launch a Konflux demo pack: `konflux-watch` watches the pull request builds of a ModelExpress
+# commit (params '{"commit":"<sha>"}'); `konflux-pr` pushes to a reused pull request first, with
+# your own git and gh logins. Start `just controller-local` with
+# CONTROLLER_CALLS_TEKTON_CLUSTERS=konflux=<kubeconfig> and CONTROLLER_CALLS_TEKTON_RESULTS=konflux=<url>.
+konflux-example pack params='{}' port="8870" max_time="2h":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [ -d "examples/{{pack}}" ] || { echo "no pack examples/{{pack}}" >&2; exit 1; }
+    SQLX_OFFLINE=true cargo build -q -p crux --bin crux
+    crux="${CARGO_TARGET_DIR:-$PWD/target}/debug/crux"
+    unset CONTROLLER_API_TOKEN
+    export CONTROLLER_URL=http://127.0.0.1:{{port}} CONTROLLER_CONFIG=/dev/null
+    id={{pack}}
+    if ! "$crux" draft-log "$id" --json >/dev/null 2>&1; then
+        "$crux" draft-create "$id" --description "Konflux demo: {{pack}}" --json >/dev/null
+    fi
+    base=$("$crux" draft-log "$id" --json | jq '[.[].version] | max')
+    saved=$("$crux" draft-push "$id" "examples/{{pack}}" --base-version "$base" --json)
+    if [ "$(jq -r '.error // empty' <<<"$saved")" ]; then
+        echo "$id: $(jq -r .error <<<"$saved")" >&2
+        exit 1
+    fi
+    jq -r --arg id "$id" '"\($id) v\(.version)" + ([.diagnostics[]? | "\n  \(.file // ""):\(.line // ""): \(.message)"] | join(""))' <<<"$saved"
+    "$crux" draft-launch "$id" --params '{{params}}' --max-cost 0.01 --max-time {{max_time}} --json | jq -r .key
+
 # Regenerate the controller UI's OpenAPI spec + typed client (build artifacts, not committed):
 # `cargo run -p crucible-controller --bin openapi-spec` -> openapi.json -> openapi-typescript.
 # The UI's dev/check/test/build scripts run this themselves via pre-hooks.

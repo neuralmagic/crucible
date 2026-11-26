@@ -74,7 +74,6 @@ pub struct TaskView {
     pub rounds: Vec<Round>,
     /// When its first attempt started, from logs that record it.
     pub started_at: Option<jiff::Timestamp>,
-    /// The target a call task dispatches, and the runs it dispatched.
     pub call: Option<CallTask>,
 }
 

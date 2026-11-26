@@ -17,8 +17,8 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use crucible_contract::calls::{
-    BackendIcon, CallKind, CallsLock, LOCK_FILE, NodeLink, NodeLook, NodeStatus, ProgressGraph,
-    TargetHandle,
+    BackendIcon, CallKind, CallsLock, LOCK_FILE, NodeDetail, NodeLink, NodeLook, NodeStatus,
+    ProgressGraph, TargetHandle,
 };
 use crucible_contract::session::TaskStatus;
 use rune::{El, Tx, el, icon, row, text};
@@ -32,10 +32,8 @@ use crate::session::{TaskState, TaskView};
 use crate::ui::graph::HANDLE;
 use crate::ui::{Paint, Pane, graph_fx};
 
-/// A call frame with at most this many nodes opens unfolded.
 pub(crate) const HANDFUL: usize = 6;
 
-/// The most target nodes one frame draws.
 const MOST: usize = 40;
 
 /// What the graph knows of every call's target.
@@ -45,7 +43,6 @@ pub(crate) struct Targets<'a> {
 }
 
 impl<'a> Targets<'a> {
-    /// `pack`'s lock is the graph each call draws before it dispatches.
     pub(crate) fn new(calls: &'a [LiveCall], pack: Option<&PackFiles>) -> Self {
         let lock = pack
             .and_then(|pack| pack.file(LOCK_FILE))
@@ -54,13 +51,11 @@ impl<'a> Targets<'a> {
         Targets { calls, lock }
     }
 
-    /// The target run of call `task`, or of its instance `instance`, once dispatched.
     pub(crate) fn call(&self, task: &TaskView, instance: Option<&str>) -> Option<&'a LiveCall> {
         task.call.as_ref()?;
         newest(self.calls, &task.name, instance)
     }
 
-    /// What a frame of `task` draws: its target run's progress, else the lock's graph, pending.
     pub(crate) fn graph(
         &self,
         task: &TaskView,
@@ -75,8 +70,6 @@ impl<'a> Targets<'a> {
     }
 }
 
-/// `↗ ship · release · github`: the task, its alias when that differs, and the target kind;
-/// `ci · snapshotd #10` once `live`, its target run, has a number.
 pub(crate) fn label(task: &TaskView, live: Option<&LiveCall>) -> Option<String> {
     let call = task.call.as_ref()?;
     let mut parts = vec![task.name.clone()];
@@ -91,11 +84,16 @@ pub(crate) fn label(task: &TaskView, live: Option<&LiveCall>) -> Option<String> 
                 .unwrap_or(repo.as_str())
                 .to_string(),
         ),
+        TargetHandle::TektonWatch { commit, .. } => {
+            Some(commit.get(..12).unwrap_or(commit).to_string())
+        }
         TargetHandle::Playbook { .. } => None,
     });
     match (repo, call.kind) {
         (Some(repo), _) => parts.push(repo),
-        (None, CallKind::GithubWorkflow) => parts.push(badge(call.kind).to_string()),
+        (None, CallKind::GithubWorkflow | CallKind::Tekton) => {
+            parts.push(badge(call.kind).to_string())
+        }
         (None, CallKind::Playbook) => {}
     }
     let mut label = parts.join(" \u{b7} ");
@@ -105,7 +103,6 @@ pub(crate) fn label(task: &TaskView, live: Option<&LiveCall>) -> Option<String> 
     Some(label)
 }
 
-/// The groups of `graph` with more than one node, by name, and their members' indexes.
 fn groups(graph: &ProgressGraph) -> HashMap<&str, Vec<usize>> {
     let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
     for (n, node) in graph.nodes.iter().enumerate() {
@@ -126,7 +123,6 @@ pub(crate) struct At<'a> {
 }
 
 impl At<'_> {
-    /// The id of the node the frame holds: `t<i>` or `t<i>i<k>`.
     pub(crate) fn anchor(&self) -> String {
         match self.instance {
             Some((k, _)) => format!("t{}i{k}", self.i),
@@ -134,7 +130,6 @@ impl At<'_> {
         }
     }
 
-    /// The frame's subgraph id: `g<i>` or `g<i>k<k>`.
     pub(crate) fn subgraph(&self) -> String {
         match self.instance {
             Some((k, _)) => format!("g{}k{k}", self.i),
@@ -142,18 +137,15 @@ impl At<'_> {
         }
     }
 
-    /// The key the frame's fold is kept under: `task` or `task[key]`.
     pub(crate) fn key(&self) -> String {
         frame_name(self.task, self.instance.map(|(_, key)| key))
     }
 }
 
-/// `frame/group`, the key a group's fold is kept under.
 pub(crate) fn group_key(frame: &str, group: &str) -> String {
     format!("{frame}/{group}")
 }
 
-/// For each node, the node drawn for it: itself, or its folded group's first member.
 fn drawn_as(task: &str, graph: &ProgressGraph, open: &HashSet<String>) -> Vec<usize> {
     let groups = groups(graph);
     graph
@@ -171,8 +163,6 @@ fn drawn_as(task: &str, graph: &ProgressGraph, open: &HashSet<String>) -> Vec<us
         .collect()
 }
 
-/// Whether frame `frame` draws its target's nodes: small graphs unless folded by hand, large
-/// ones only once unfolded by hand.
 pub(crate) fn unfolded(frame: &str, graph: &ProgressGraph, open: &HashSet<String>) -> bool {
     let shown: HashSet<usize> = drawn_as(frame, graph, open).into_iter().collect();
     (shown.len() <= HANDFUL) != open.contains(frame)
@@ -181,13 +171,10 @@ pub(crate) fn unfolded(frame: &str, graph: &ProgressGraph, open: &HashSet<String
 /// What a frame's target node `n` is when pressed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Pressed {
-    /// A folded group: show its members.
     Group(String),
-    /// A group shown whole or a plain node: open its link.
     Node(usize),
 }
 
-/// What pressing node `n` of frame `task`'s target graph does.
 pub(crate) fn pressed(
     task: &str,
     graph: &ProgressGraph,
@@ -214,7 +201,6 @@ pub(crate) struct NodeId {
     pub(crate) node: usize,
 }
 
-/// `t3c5` is node 5 of task 3's target graph, and `t3i2c5` node 5 of its instance 2's.
 pub(crate) fn node_id(id: &str) -> Option<NodeId> {
     let (frame, node) = id.strip_prefix('t')?.split_once('c')?;
     let (task, instance) = match frame.split_once('i') {
@@ -228,8 +214,6 @@ pub(crate) fn node_id(id: &str) -> Option<NodeId> {
     })
 }
 
-/// Where a whole group stands: running while any member runs or some are left, failing when one
-/// failed, else what all of them settled as.
 fn group_status(members: &[NodeStatus]) -> NodeStatus {
     let settled: Vec<TaskStatus> = members
         .iter()
@@ -261,15 +245,10 @@ fn group_status(members: &[NodeStatus]) -> NodeStatus {
 /// The lines a frame draws inside `subgraph g<i>`.
 pub(crate) struct Frame {
     pub(crate) body: String,
-    /// Each drawn node's id and status.
     pub(crate) states: Vec<(String, NodeStatus)>,
-    /// Nodes and edges, against the diagram's item limit.
     pub(crate) items: usize,
-    /// The edge lines in `body`, which `linkStyle` counts.
     pub(crate) links: usize,
-    /// The drawn id of the node the Log pane shows.
     pub(crate) picked: Option<String>,
-    /// The kind of the call whose target it draws, which decides its look.
     pub(crate) kind: CallKind,
 }
 
@@ -286,7 +265,6 @@ impl Default for Frame {
     }
 }
 
-/// An external job's status mark.
 fn mark(status: NodeStatus) -> &'static str {
     match status {
         NodeStatus::Pending => "\u{25cb}",
@@ -297,7 +275,6 @@ fn mark(status: NodeStatus) -> &'static str {
     }
 }
 
-/// `4s`, `1m 5s` or `2h 3m` between two RFC 3339 times, or nothing when either is missing.
 fn took(started: Option<&str>, ended: Option<&str>) -> Option<String> {
     let started: jiff::Timestamp = started?.parse().ok()?;
     let ended: jiff::Timestamp = ended?.parse().ok()?;
@@ -309,12 +286,10 @@ fn took(started: Option<&str>, ended: Option<&str>) -> Option<String> {
     })
 }
 
-/// Text safe inside a quoted node label.
 fn clean(text: &str) -> String {
     text.replace(['"', '|'], "'")
 }
 
-/// Frame `at`'s target graph as the lines inside its subgraph.
 pub(crate) fn frame(
     at: At,
     graph: &ProgressGraph,
@@ -370,7 +345,10 @@ pub(crate) fn frame(
                 let took = took(node.started.as_deref(), node.ended.as_deref())
                     .map(|t| format!(" \u{b7} {t}"))
                     .unwrap_or_default();
-                format!("    {id}(\"{} {label}{took}\")\n", mark(node.status))
+                let step = step_note(node.detail.as_ref(), node.status)
+                    .map(|s| format!(" \u{b7} {}", clean(&s)))
+                    .unwrap_or_default();
+                format!("    {id}(\"{} {label}{took}{step}\")\n", mark(node.status))
             } else {
                 format!("    {id}[\"{label}\"]\n")
             });
@@ -434,9 +412,6 @@ pub(crate) fn frame(
     }
 }
 
-/// A call's frame `at`: its target's look, and in its corner a press that folds its target's
-/// graph away or shows it, and one that opens the target run.
-/// The `(i)` press beside a call frame's corner that opens its info card.
 fn info_button(key: &str, p: &Paint) -> El {
     let key = key.to_string();
     el().key(format!("graph-call-info-{key}"))
@@ -450,7 +425,6 @@ fn info_button(key: &str, p: &Paint) -> El {
         .child(icon(&oc::INFO, 12.0).color(p.c.icon_faint))
 }
 
-/// What a call frame's info card says: what ran, where, and how it went.
 fn info_rows(call: &LiveCall) -> Vec<(&'static str, String)> {
     let state = &call.view.state;
     let mut rows = vec![
@@ -469,6 +443,15 @@ fn info_rows(call: &LiveCall) -> Vec<(&'static str, String)> {
                 },
             ));
         }
+        TargetHandle::TektonWatch {
+            cluster,
+            namespace,
+            commit,
+        } => {
+            rows.push(("Cluster", cluster.clone()));
+            rows.push(("Namespace", namespace.clone()));
+            rows.push(("Commit", commit.clone()));
+        }
     }
     rows.push(("Status", format!("{:?}", state.status).to_lowercase()));
     if call.view.attempt > 1 {
@@ -480,7 +463,6 @@ fn info_rows(call: &LiveCall) -> Vec<(&'static str, String)> {
     rows
 }
 
-/// The info card under a call frame's corner.
 fn info_card(call: &LiveCall, key: &str, p: &Paint) -> El {
     let rows = info_rows(call).into_iter().map(|(name, value)| {
         row()
@@ -506,7 +488,6 @@ fn info_card(call: &LiveCall, key: &str, p: &Paint) -> El {
         .children(rows)
 }
 
-/// `[mark] ↗` above the corner of a frame whose backend has a mark: opens its run outside the app.
 fn external_run(call: &LiveCall, key: &str, p: &Paint) -> Option<El> {
     let presentation = call.view.kind.presentation();
     let mark = mark_icon(presentation.icon?);
@@ -534,10 +515,46 @@ fn external_run(call: &LiveCall, key: &str, p: &Paint) -> Option<El> {
     )
 }
 
-/// The app's icon for a backend's mark.
+fn step_note(detail: Option<&NodeDetail>, status: NodeStatus) -> Option<String> {
+    let runs: Vec<Vec<(&str, NodeStatus)>> = match detail? {
+        NodeDetail::GithubJob { steps } => {
+            vec![steps.iter().map(|s| (s.name.as_str(), s.status)).collect()]
+        }
+        NodeDetail::TektonTask { task_runs } => task_runs
+            .iter()
+            .map(|run| {
+                run.steps
+                    .iter()
+                    .map(|s| (s.name.as_str(), s.status))
+                    .collect()
+            })
+            .collect(),
+        NodeDetail::PlaybookTask { .. } => return None,
+    };
+    let running = runs.iter().find_map(|steps| {
+        steps
+            .iter()
+            .position(|(_, s)| *s == NodeStatus::Running)
+            .and_then(|k| {
+                steps
+                    .get(k)
+                    .map(|(name, _)| format!("{name} {}/{}", k + 1, steps.len()))
+            })
+    });
+    if running.is_some() {
+        return running;
+    }
+    let failed = matches!(status, NodeStatus::Settled(s) if !s.passed());
+    runs.iter()
+        .flatten()
+        .find(|(_, s)| failed && matches!(s, NodeStatus::Settled(s) if !s.passed()))
+        .map(|(name, _)| format!("failed at {name}"))
+}
+
 fn mark_icon(mark: BackendIcon) -> &'static rune::Icon {
     match mark {
         BackendIcon::Github => &oc::GITHUB,
+        BackendIcon::Tekton => &oc::BRANCH_OUT,
     }
 }
 
@@ -619,8 +636,6 @@ pub(crate) fn frame_spot(
         })
 }
 
-/// A spot on node `id` of a call's target graph: a folded group shows its members, and any other
-/// node shows its log, or opens its link before its call is dispatched.
 pub(crate) fn target_spot(spot: El, pane: &Pane, targets: &Targets, app: &App, id: &str) -> El {
     let Some(NodeId {
         task: i,
@@ -690,7 +705,6 @@ pub(crate) fn target_spot(spot: El, pane: &Pane, targets: &Targets, app: &App, i
     }
 }
 
-/// A target node's status as the task state the graph colours.
 pub(crate) fn state(status: NodeStatus) -> TaskState {
     match status {
         NodeStatus::Pending => TaskState::Pending,
@@ -930,5 +944,47 @@ mod tests {
             &matrix(),
             &HashSet::from(["triage[b]".to_string()])
         ));
+    }
+
+    #[test]
+    fn a_job_node_names_its_running_or_failed_step() {
+        use crucible_contract::calls::{NodeDetail, NodeStatus, TektonStep, TektonTaskRun};
+        use crucible_contract::session::TaskStatus;
+        let step = |name: &str, status| TektonStep {
+            name: name.into(),
+            container: None,
+            status,
+            started: None,
+            ended: None,
+        };
+        let pass = NodeStatus::Settled(TaskStatus::Pass);
+        let fail = NodeStatus::Settled(TaskStatus::Fail);
+        let task = |steps| NodeDetail::TektonTask {
+            task_runs: vec![TektonTaskRun {
+                name: "tr".into(),
+                pod: None,
+                steps,
+            }],
+        };
+        let running = task(vec![
+            step("prepare", pass),
+            step("build", NodeStatus::Running),
+            step("push", NodeStatus::Pending),
+        ]);
+        assert_eq!(
+            crate::ui::graph_call::step_note(Some(&running), NodeStatus::Running).as_deref(),
+            Some("build 2/3")
+        );
+        let failed = task(vec![step("prepare", pass), step("build", fail)]);
+        assert_eq!(
+            crate::ui::graph_call::step_note(Some(&failed), fail).as_deref(),
+            Some("failed at build")
+        );
+        let done = task(vec![step("prepare", pass)]);
+        assert_eq!(crate::ui::graph_call::step_note(Some(&done), pass), None);
+        assert_eq!(
+            crate::ui::graph_call::step_note(None, NodeStatus::Running),
+            None
+        );
     }
 }

@@ -1,4 +1,4 @@
-//! The `github_workflow` call target (RFC-0008) over forge's GitHub Actions client: the
+//! The `github_workflow` call target over forge's GitHub Actions client: the
 //! interface read from the workflow file at a commit, dispatch, progress from the run's jobs,
 //! the outcome read from the declared artifact, job logs, and cancel.
 
@@ -31,7 +31,6 @@ const _: () = assert!(forge::github::workflow::MAX_INPUTS == MAX_GITHUB_INPUTS);
 const GH_CLI_TIMEOUT: Duration = Duration::from_secs(15);
 const ERR_BODY_CHARS: usize = 300;
 
-/// What a call's repository token may do: dispatch, read and cancel runs, and read the workflow.
 const CALL_PERMISSIONS: &[(&str, Access)] =
     &[("actions", Access::Write), ("contents", Access::Read)];
 
@@ -53,7 +52,6 @@ pub enum TargetError {
 }
 
 impl TargetError {
-    /// Whether retrying the same operation later may succeed.
     pub fn is_transient(&self) -> bool {
         match self {
             TargetError::Github(e) => e.is_transient(),
@@ -66,10 +64,7 @@ impl TargetError {
 /// Where the backend takes the token for a repository.
 #[derive(Clone, Debug)]
 pub(crate) enum TokenSource {
-    /// `gh auth token`, read at each operation. Local controllers only.
     GhCli,
-    /// An installation token of the GitHub App, scoped to the target repository, used only for
-    /// a launch owner whose paired GitHub login may write to it.
     App {
         app: Box<GithubAppTokenSource>,
         logins: GithubLogins,
@@ -81,7 +76,6 @@ pub(crate) enum TokenSource {
 pub struct GithubDispatched {
     pub handle: TargetHandle,
     pub link: Option<NodeLink>,
-    /// The commit the ref named when the interface was checked, which the run's head must keep.
     pub commit: String,
 }
 
@@ -90,7 +84,6 @@ pub struct GithubDispatched {
 pub struct GithubOutcome {
     pub status: CallStatus,
     pub note: String,
-    /// The declared fields once passed; null otherwise.
     pub result: Value,
     pub files: Vec<ResultFile>,
 }
@@ -108,7 +101,6 @@ pub struct RunPoll {
 pub struct GithubWorkflowBackend {
     client: Client,
     tokens: TokenSource,
-    /// The wall clock of a call that sets none, and the most one may set.
     max_wall_clock: Duration,
 }
 
@@ -121,7 +113,6 @@ impl GithubWorkflowBackend {
         })
     }
 
-    /// The wall clock a call with `budget` runs under: its own, within the controller's cap.
     pub fn wall_clock(&self, budget: Option<CallBudget>) -> Duration {
         budget
             .and_then(|b| b.wall_clock_secs)
@@ -130,7 +121,6 @@ impl GithubWorkflowBackend {
             .map_or(self.max_wall_clock, |own| own.min(self.max_wall_clock))
     }
 
-    /// The target's pin (the ref's commit now) and its interface at that commit.
     pub async fn interface(&self, target: &CallTarget) -> Result<LockedCall, TargetError> {
         let (repo, workflow, git_ref, outputs) = github_target(target)?;
         let api_repo = api_repo(repo)?;
@@ -152,8 +142,6 @@ impl GithubWorkflowBackend {
             .map_err(|e| TargetError::Refused(format!("hashing the interface: {e}")))
     }
 
-    /// Dispatch one run of `target` on its ref with `values`, after checking the interface at
-    /// the ref still is the locked one.
     pub async fn dispatch(
         &self,
         target: &CallTarget,
@@ -209,8 +197,6 @@ impl GithubWorkflowBackend {
         })
     }
 
-    /// How the workflow at `head`, the commit a run ran on, differs from the locked interface,
-    /// when `head` is not `commit`, the commit the dispatch checked; `None` when it does not.
     pub async fn moved_head(
         &self,
         target: &CallTarget,
@@ -240,9 +226,6 @@ impl GithubWorkflowBackend {
         }))
     }
 
-    /// Refuse unless `who` may dispatch the workflows of `repo`. With the App, a GitHub login
-    /// paired with `who` must hold write, maintain or admin on the repository, read through the
-    /// App's installation on it. The gh CLI's token is its own user's access, so it is not asked.
     pub async fn authorize(&self, who: &Principal, repo: &GithubRepo) -> Result<(), TargetError> {
         let TokenSource::App { app, logins } = &self.tokens else {
             return Ok(());
@@ -283,7 +266,6 @@ impl GithubWorkflowBackend {
         )))
     }
 
-    /// The run's progress over the locked `graph`, and its outcome once it completed.
     pub async fn poll(
         &self,
         repo: &GithubRepo,
@@ -312,8 +294,6 @@ impl GithubWorkflowBackend {
         })
     }
 
-    /// The log of the job that progress node `node` of the run draws; `None` when no job of
-    /// the run is drawn as `node`.
     pub async fn node_log(
         &self,
         repo: &GithubRepo,
@@ -330,7 +310,6 @@ impl GithubWorkflowBackend {
         Ok(Some(self.client.job_log(&token, &api_repo, job).await?))
     }
 
-    /// Ask GitHub to cancel the run. A run that already completed is left as it is.
     pub async fn cancel(&self, repo: &GithubRepo, run_id: u64) -> Result<(), TargetError> {
         let api_repo = api_repo(repo)?;
         let token = self.token(&api_repo).await?;
@@ -425,7 +404,6 @@ impl GithubWorkflowBackend {
     }
 }
 
-/// A failure of the App: a denial of the repository is final, anything else is asked again.
 fn app_failure(e: anyhow::Error) -> TargetError {
     match e.downcast_ref::<RepoDenied>() {
         Some(denied) => TargetError::Denied(denied.clone()),
@@ -451,7 +429,6 @@ fn github_target(
     }
 }
 
-/// Which parts of `now` differ from `locked`, as a phrase ("has a different params and graph").
 fn difference(locked: &TargetInterface, now: &TargetInterface) -> Option<String> {
     let mut parts = Vec::new();
     if locked.params != now.params {
@@ -469,7 +446,6 @@ fn difference(locked: &TargetInterface, now: &TargetInterface) -> Option<String>
     }
 }
 
-/// The gh CLI's token for github.com, read now and held only by the caller.
 async fn gh_cli_token() -> Result<Token, TargetError> {
     let run = tokio::process::Command::new("gh")
         .args(["auth", "token", "--hostname", "github.com"])
@@ -617,8 +593,6 @@ mod tests {
         Principal::User(login.into())
     }
 
-    /// With the App, only a person whose paired GitHub login may write to the repository may
-    /// dispatch its workflows.
     #[tokio::test]
     async fn an_app_dispatch_needs_an_owner_with_write_on_the_repository() {
         let dir = tempfile::tempdir().unwrap();
@@ -737,8 +711,6 @@ mod tests {
         ));
     }
 
-    /// Dispatches the demo workflow with your gh login and waits for it.
-    /// `CRUCIBLE_GH_LIVE=1 cargo test -p crucible-controller calls::github -- --ignored`
     #[tokio::test]
     #[ignore = "dispatches a real workflow; set CRUCIBLE_GH_LIVE=1"]
     async fn live_dispatch_of_the_demo_workflow() {

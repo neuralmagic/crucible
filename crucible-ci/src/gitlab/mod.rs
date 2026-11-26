@@ -1,4 +1,4 @@
-//! GitLab pipelines (RFC-0008 C-GITLAB-PIPELINE): create a pipeline with inputs, find the
+//! GitLab pipelines: create a pipeline with inputs, find the
 //! pipelines a commit started, map a pipeline onto a progress graph, read a job's log and result
 //! file, and cancel, over a host's REST API with a bearer token.
 //!
@@ -27,7 +27,6 @@ use crate::gitlab::model::{Bridge, Job, Lint, Pipeline};
 use crate::token::BearerToken;
 
 const PER_PAGE: u32 = 100;
-/// Pages read before a listing stops.
 pub const MAX_PAGES: u32 = 10;
 const ERR_BODY_CHARS: usize = 300;
 
@@ -104,7 +103,6 @@ pub struct Gitlab {
 }
 
 impl Gitlab {
-    /// `host` is the instance's address, such as `https://gitlab.example.com`.
     pub fn new(http: reqwest::Client, host: &str) -> Result<Self, GitlabError> {
         let mut api = Url::parse(host).map_err(|_| GitlabError::Host(host.to_owned()))?;
         if api.scheme() != "https" || api.host_str().is_none() {
@@ -115,7 +113,6 @@ impl Gitlab {
         Ok(Gitlab { http, api })
     }
 
-    /// `/projects/{id}/…` with the project path as its encoded id, and `query` appended.
     fn url(&self, project: &ProjectPath, rest: &[&str], query: &[(&str, &str)]) -> Url {
         let mut url = self.api.clone();
         if let Ok(mut segments) = url.path_segments_mut() {
@@ -133,8 +130,6 @@ impl Gitlab {
         url
     }
 
-    /// The pipelines of `project` for `commit`, newest first, restricted to `sources` when it
-    /// names any.
     pub async fn pipelines_for(
         &self,
         token: &BearerToken,
@@ -161,7 +156,6 @@ impl Gitlab {
             .collect())
     }
 
-    /// The newest pipeline on `git_ref`, if it has any.
     pub async fn latest_pipeline(
         &self,
         token: &BearerToken,
@@ -181,7 +175,6 @@ impl Gitlab {
         Ok(page.into_iter().next())
     }
 
-    /// Pipeline `id`, or `None` when it does not exist.
     pub async fn pipeline(
         &self,
         token: &BearerToken,
@@ -223,7 +216,6 @@ impl Gitlab {
         self.pages(token, &doing, url).await
     }
 
-    /// The jobs and stages GitLab would create for `git_ref`, without creating a pipeline.
     pub async fn lint(
         &self,
         token: &BearerToken,
@@ -246,7 +238,6 @@ impl Gitlab {
         self.get_json(token, &doing, url).await
     }
 
-    /// The raw text of `path` at `git_ref`, or `None` when the file does not exist there.
     pub async fn file(
         &self,
         token: &BearerToken,
@@ -271,7 +262,6 @@ impl Gitlab {
         }
     }
 
-    /// Create a pipeline on `git_ref` with `inputs`.
     pub async fn create_pipeline(
         &self,
         token: &BearerToken,
@@ -306,7 +296,6 @@ impl Gitlab {
         Ok(())
     }
 
-    /// The log of job `job`.
     pub async fn trace(
         &self,
         token: &BearerToken,
@@ -322,7 +311,6 @@ impl Gitlab {
             .map_err(|source| GitlabError::Http { doing, source })
     }
 
-    /// One file of job `job`'s artifacts, or `None` when the job kept no such file.
     pub async fn artifact(
         &self,
         token: &BearerToken,

@@ -110,7 +110,6 @@ impl<'v> StarlarkValue<'v> for TaskValue {
     }
 }
 
-/// `producer.files`, unless the producer emits a field of that name.
 const FILES_ATTRIBUTE: &str = "files";
 
 /// `producer.field` once checked against what the producer declares, with the type it declares

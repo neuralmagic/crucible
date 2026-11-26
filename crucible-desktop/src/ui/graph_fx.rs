@@ -10,7 +10,6 @@ use crate::gfx;
 use crate::live::calls::LiveCall;
 use crate::ui::{Paint, fx};
 
-/// A backend's accent as the compositor and the graph take it.
 pub(crate) fn accent(kind: CallKind) -> Option<Color> {
     kind.presentation().accent.map(|rgb| Color {
         r: f32::from(rgb.0) / 255.0,
@@ -20,23 +19,19 @@ pub(crate) fn accent(kind: CallKind) -> Option<Color> {
     })
 }
 
-/// How much brighter a frame under the pointer draws.
 const HOVER: f32 = 1.8;
 
-/// A frame's corner radius.
 const RADIUS: f32 = 6.0;
 
 /// What a call frame shows of its target run.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Look {
     Running(CallKind),
-    /// Passed, and glowing while the window has just seen it pass.
     Passed(Option<Glow>),
     Failed,
     Quiet,
 }
 
-/// The look of a frame whose target run is `call`.
 pub(crate) fn look(call: Option<&LiveCall>, glows: &Afterglows) -> Look {
     let Some(call) = call else {
         return Look::Quiet;
@@ -49,7 +44,6 @@ pub(crate) fn look(call: Option<&LiveCall>, glows: &Afterglows) -> Look {
     }
 }
 
-/// The effect slot that draws `look` over a frame, if it draws one.
 pub(crate) fn effect(look: Look, hovered: bool, p: &Paint) -> Option<El> {
     let lift = if hovered { HOVER } else { 1.0 };
     let slot = |kind: u32, color: Color, amount: f32, bleed: f32| {

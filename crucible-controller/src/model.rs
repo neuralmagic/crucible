@@ -454,7 +454,6 @@ pub(crate) enum LaunchOrigin {
     Watch,
     /// A webhook delivery a sender outside the controller made.
     Webhook,
-    /// A call task of another run (RFC-0008).
     Call,
 }
 

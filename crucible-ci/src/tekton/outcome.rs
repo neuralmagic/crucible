@@ -1,4 +1,4 @@
-//! How a PipelineRun ended, read from its `Succeeded` condition and results (RFC-0008 C-TEKTON).
+//! How a PipelineRun ended, read from its `Succeeded` condition and results.
 
 use std::collections::BTreeMap;
 
@@ -6,7 +6,6 @@ use serde_json::Value;
 
 use crate::tekton::model::{PipelineRun, succeeded};
 
-/// The reasons Tekton gives a run that was cancelled or stopped rather than failing on its own.
 const CANCELLED: [&str; 4] = [
     "Cancelled",
     "CancelledRunFinally",
@@ -17,7 +16,6 @@ const CANCELLED: [&str; 4] = [
 /// A PipelineRun's state.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RunState {
-    /// Not started, or still running.
     Running,
     Ended(Ended),
 }
@@ -25,9 +23,7 @@ pub enum RunState {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Ended {
     pub verdict: Verdict,
-    /// The condition's message, such as `Tasks Completed: 21 (Failed: 0, Cancelled 0), Skipped: 4`.
     pub note: String,
-    /// The run's results by name; a string result's value is a JSON string.
     pub results: BTreeMap<String, Value>,
 }
 
@@ -35,7 +31,6 @@ pub struct Ended {
 pub enum Verdict {
     Passed,
     Failed,
-    /// Cancelled or stopped by someone, which a call settles failing unless its caller did it.
     Cancelled,
 }
 
@@ -76,7 +71,6 @@ pub struct MissingResults {
     pub missing: Vec<String>,
 }
 
-/// The declared results of an ended run, each as a string, or which are missing.
 pub fn declared_results(
     run: &str,
     ended: &Ended,

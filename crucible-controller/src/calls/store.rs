@@ -88,7 +88,6 @@ pub(crate) struct NewCall<'a> {
     pub alias: &'a CallAlias,
     pub target: &'a CallTarget,
     pub interface: &'a TargetInterface,
-    /// The audit of the bound values: every value, and each file as its digest and size.
     pub bound: Value,
     pub budget: Option<CallBudget>,
 }
@@ -96,13 +95,10 @@ pub(crate) struct NewCall<'a> {
 /// What a claim found.
 #[derive(Debug)]
 pub(crate) enum Claimed {
-    /// This request holds the identity and dispatches.
     Fresh(CallId),
-    /// The identity already holds a call, dispatched or in flight.
     Existing(Box<CallRecord>),
 }
 
-/// Take the call identity (run, task, instance, attempt), or find who holds it.
 pub(crate) async fn claim(pool: &PgPool, new: &NewCall<'_>) -> Result<Claimed> {
     let id = uuid::Uuid::now_v7().to_string();
     let now = crate::clock::now_rfc3339();
@@ -148,7 +144,6 @@ pub(crate) async fn claim(pool: &PgPool, new: &NewCall<'_>) -> Result<Claimed> {
     Ok(Claimed::Existing(Box::new(decode(&row)?)))
 }
 
-/// The started, unended call an earlier attempt of the same call task and instance holds.
 pub(crate) async fn live_earlier(
     pool: &PgPool,
     run: &str,
@@ -173,8 +168,6 @@ pub(crate) async fn live_earlier(
     row.as_ref().map(decode).transpose()
 }
 
-/// Record what the dispatch of a claimed call started. `true` when the call ended while the
-/// dispatch ran, or its calling run was cancelled, so the target run must be stopped.
 pub(crate) async fn dispatched(pool: &PgPool, id: &CallId, started: &Dispatched) -> Result<bool> {
     let stop: Option<bool> = sqlx::query_scalar(
         "UPDATE call_target_runs c SET handle = $2, link = $3, detail = $4, updated_at = $5 \
@@ -198,7 +191,6 @@ pub(crate) async fn dispatched(pool: &PgPool, id: &CallId, started: &Dispatched)
     stop.with_context(|| format!("call {id} holds no claim to record a dispatch on"))
 }
 
-/// Give back a claimed identity whose dispatch started nothing.
 pub(crate) async fn release(pool: &PgPool, id: &CallId) -> Result<()> {
     sqlx::query("DELETE FROM call_target_runs WHERE id = $1 AND handle IS NULL")
         .bind(&id.0)
@@ -208,7 +200,6 @@ pub(crate) async fn release(pool: &PgPool, id: &CallId) -> Result<()> {
     Ok(())
 }
 
-/// One call of `run`.
 pub(crate) async fn get(pool: &PgPool, run: &str, id: &str) -> Result<Option<CallRecord>> {
     let row = sqlx::query(const_format::formatcp!(
         "SELECT {COLUMNS} FROM call_target_runs WHERE id = $1 AND parent_run = $2"
@@ -221,7 +212,6 @@ pub(crate) async fn get(pool: &PgPool, run: &str, id: &str) -> Result<Option<Cal
     row.as_ref().map(decode).transpose()
 }
 
-/// Every dispatched call of `run`, oldest first.
 pub(crate) async fn list(pool: &PgPool, run: &str) -> Result<Vec<CallRecord>> {
     let rows = sqlx::query(const_format::formatcp!(
         "SELECT {COLUMNS} FROM call_target_runs \
@@ -234,7 +224,6 @@ pub(crate) async fn list(pool: &PgPool, run: &str) -> Result<Vec<CallRecord>> {
     rows.iter().map(decode).collect()
 }
 
-/// The calls not yet ended of every run of launch `key`, those still being dispatched included.
 pub(crate) async fn open_for_launch(pool: &PgPool, key: &str) -> Result<Vec<CallRecord>> {
     let rows = sqlx::query(const_format::formatcp!(
         "SELECT {COLUMNS} FROM call_target_runs \
@@ -248,7 +237,6 @@ pub(crate) async fn open_for_launch(pool: &PgPool, key: &str) -> Result<Vec<Call
     rows.iter().map(decode).collect()
 }
 
-/// Merge what a backend learned about a call's target run into its detail.
 pub(crate) async fn noted(
     pool: &PgPool,
     id: &CallId,
@@ -265,7 +253,6 @@ pub(crate) async fn noted(
     Ok(())
 }
 
-/// Mark a call looked at now, so the refresh loop leaves it until its next turn.
 pub(crate) async fn touched(pool: &PgPool, id: &CallId) -> Result<()> {
     sqlx::query("UPDATE call_target_runs SET updated_at = $2 WHERE id = $1")
         .bind(&id.0)
@@ -276,8 +263,6 @@ pub(crate) async fn touched(pool: &PgPool, id: &CallId) -> Result<()> {
     Ok(())
 }
 
-/// Record whether a call's target run still has to be stopped: its call ended, but asking the
-/// target's system to stop it failed.
 pub(crate) async fn owe_cancel(pool: &PgPool, id: &CallId, owed: bool) -> Result<()> {
     sqlx::query("UPDATE call_target_runs SET cancel_owed = $2, updated_at = $3 WHERE id = $1")
         .bind(&id.0)
@@ -289,10 +274,8 @@ pub(crate) async fn owe_cancel(pool: &PgPool, id: &CallId, owed: bool) -> Result
     Ok(())
 }
 
-/// The calls the refresh loop has to look at: dispatched and unended, or owing a cancel.
 const DUE: &str = "handle IS NOT NULL AND (ended_at IS NULL OR cancel_owed)";
 
-/// When the earliest call the refresh loop has to look at was last looked at.
 pub(crate) async fn earliest_due(pool: &PgPool) -> Result<Option<String>> {
     sqlx::query_scalar(const_format::formatcp!(
         "SELECT MIN(updated_at) FROM call_target_runs WHERE {DUE}"
@@ -302,8 +285,6 @@ pub(crate) async fn earliest_due(pool: &PgPool) -> Result<Option<String>> {
     .context("reading when the next call is due")
 }
 
-/// The calls the refresh loop has to look at that were last looked at no later than `before`,
-/// longest waiting first.
 pub(crate) async fn due(
     pool: &PgPool,
     before: &str,
@@ -323,7 +304,6 @@ pub(crate) async fn due(
         .collect()
 }
 
-/// Keep the bytes of one result file of a call's target run.
 pub(crate) async fn put_result_file(
     pool: &PgPool,
     id: &CallId,
@@ -353,7 +333,6 @@ pub(crate) async fn put_result_file(
     Ok(())
 }
 
-/// The bytes of a call's result file at `path` with `digest`.
 pub(crate) async fn result_file(
     pool: &PgPool,
     id: &CallId,
@@ -371,7 +350,6 @@ pub(crate) async fn result_file(
     .context("reading a call result file")
 }
 
-/// Record a running call's latest progress.
 pub(crate) async fn progressed(
     pool: &PgPool,
     id: &CallId,
@@ -392,8 +370,6 @@ pub(crate) async fn progressed(
     Ok(())
 }
 
-/// Settle a call. A call already settled keeps its first settlement; returns whether this one
-/// landed.
 pub(crate) async fn settle(
     pool: &PgPool,
     id: &CallId,
@@ -418,11 +394,8 @@ pub(crate) async fn settle(
     Ok(done.rows_affected() == 1)
 }
 
-/// The most bytes of call input files one run may upload.
 pub(crate) const MAX_RUN_INPUT_BYTES: i64 = 64 * 1024 * 1024;
 
-/// Store the bytes of a file `run` binds, addressed by digest. `Ok(false)` when they would take
-/// the run's uploads past [`MAX_RUN_INPUT_BYTES`].
 pub(crate) async fn put_input_file(
     pool: &PgPool,
     run: &str,
@@ -454,7 +427,6 @@ pub(crate) async fn put_input_file(
         .map(|s| s.is_some())
 }
 
-/// The bytes of the file of `digest` that `run` uploaded.
 pub(crate) async fn input_file(pool: &PgPool, run: &str, digest: &str) -> Result<Option<Vec<u8>>> {
     sqlx::query_scalar("SELECT bytes FROM call_input_files WHERE run_id = $1 AND digest = $2")
         .bind(run)
@@ -464,7 +436,6 @@ pub(crate) async fn input_file(pool: &PgPool, run: &str, digest: &str) -> Result
         .context("reading a call input file")
 }
 
-/// The size of the file of `digest` that `run` uploaded; `None` when it uploaded none.
 pub(crate) async fn input_file_size(pool: &PgPool, run: &str, digest: &str) -> Result<Option<u64>> {
     let size: Option<i64> =
         sqlx::query_scalar("SELECT size FROM call_input_files WHERE run_id = $1 AND digest = $2")
@@ -477,8 +448,6 @@ pub(crate) async fn input_file_size(pool: &PgPool, run: &str, digest: &str) -> R
         .transpose()
 }
 
-/// The run `run_id` as a caller: its launch and that launch's owner and depth. `None` when the run
-/// belongs to no playbook launch.
 pub(crate) async fn parent(pool: &PgPool, run_id: &str) -> Result<Option<Parent>> {
     let row = sqlx::query(
         "SELECT l.key, l.owner, l.launcher_groups, l.created_by, l.call_depth, l.draft_version \
@@ -508,11 +477,9 @@ pub(crate) struct ChildLink<'a> {
     pub parent: &'a Parent,
     pub task: &'a str,
     pub instance: Option<&'a str>,
-    /// The run id the launch's first dispatch takes, which the call's handle names.
     pub reserved_run: &'a str,
 }
 
-/// Mark launch `key` as the target run of `link`'s call.
 pub(crate) async fn link_child(
     ex: impl PgExecutor<'_>,
     key: &str,
@@ -543,8 +510,6 @@ pub(crate) struct Chained {
     pub draft: bool,
 }
 
-/// The playbooks of run `run` and every run above it in its chain of calling runs, the run's own
-/// first.
 pub(crate) async fn chain(pool: &PgPool, run: &str) -> Result<Vec<Chained>> {
     let rows: Vec<(String, bool)> = sqlx::query_as(
         "WITH RECURSIVE chain (playbook, draft, parent, depth) AS ( \
@@ -567,7 +532,6 @@ pub(crate) async fn chain(pool: &PgPool, run: &str) -> Result<Vec<Chained>> {
         .collect())
 }
 
-/// The run id launch `key` reserved for its first dispatch, while no run holds it yet.
 pub(crate) async fn reserved_run(pool: &PgPool, key: &str) -> Result<Option<String>> {
     sqlx::query_scalar(
         "SELECT l.reserved_run FROM playbook_launches l WHERE l.key = $1 \
@@ -608,7 +572,6 @@ pub(crate) async fn called_from(pool: &PgPool, run_id: &str) -> Result<Option<Ca
     })
 }
 
-/// Where each of the launches `keys` was called from, for those a call made.
 pub(crate) async fn called_by(
     pool: &PgPool,
     keys: &[String],

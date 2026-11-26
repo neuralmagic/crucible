@@ -204,7 +204,6 @@ impl Client {
         self.start(Action::Prepare(target));
     }
 
-    /// Upload `uploads` and launch `target` naming them; the result comes back in a snapshot.
     pub fn launch(&self, target: Target, body: Value, uploads: Vec<crate::form::Upload>) {
         self.start(Action::Launch {
             target,
@@ -261,7 +260,6 @@ impl Client {
         let _ = self.tx.send(Msg::Draft(shown));
     }
 
-    /// Which call target node's log to keep current; `None` stops.
     pub fn node_log(&self, ask: Option<crate::live::calls::NodeAsk>) {
         let _ = self.tx.send(Msg::NodeLog(ask));
     }

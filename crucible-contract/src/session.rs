@@ -186,7 +186,6 @@ pub struct PlanTaskWire {
     /// What a `command` or `evaluate` task runs, as the pack wrote it; empty for other kinds.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub command: String,
-    /// The target a `call` task dispatches; absent for other kinds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call: Option<PlanCallWire>,
 }
@@ -196,7 +195,6 @@ pub struct PlanTaskWire {
 pub struct PlanCallWire {
     pub alias: crate::calls::CallAlias,
     pub target: crate::calls::CallKind,
-    /// Each parameter a dependency's output binds, by name, and the task that produces it.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub params: std::collections::BTreeMap<String, String>,
 }
@@ -615,18 +613,13 @@ pub enum SessionEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reused_from: Option<String>,
     },
-    /// A call task's target run was dispatched, or found already dispatched for the same task,
-    /// instance and attempt. Written before the call waits, so a resume attaches to `handle`
-    /// rather than dispatching again.
     CallDispatched {
         task: String,
-        /// The mapped instance's item key; absent for an unmapped call.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         instance: Option<String>,
         attempt: u32,
         alias: crate::calls::CallAlias,
         call: crate::calls::CallId,
-        /// The target run on its own system; its `kind` is the target kind.
         handle: crate::calls::TargetHandle,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         link: Option<crate::calls::NodeLink>,

@@ -10,10 +10,8 @@ use crate::client::Db;
 use crate::daemon::queue::{BoxFuture, DueSource, Pass, WorkQueue};
 use crucible_contract::calls::{CallStatus, NodeStatus};
 
-/// How long a call goes between looks at its target run.
 pub(crate) const REFRESH_EVERY: Duration = Duration::from_secs(5);
 
-/// The most calls one pass looks at.
 const PASS_LIMIT: i64 = 64;
 
 /// The launch-loop source that refreshes calls.
@@ -60,7 +58,6 @@ impl DueSource for CallRefresh {
     }
 }
 
-/// Look at every call due a look at `now`. Returns how many it looked at.
 pub(crate) async fn refresh_due(
     backends: &Backends,
     ctx: &CallCtx,
@@ -85,7 +82,6 @@ pub(crate) async fn refresh_due(
     Ok(count)
 }
 
-/// Ask again to stop the target run of an ended call. A refusal will not pass, so it is given up.
 async fn stop_again(backends: &Backends, ctx: &CallCtx, record: &CallRecord) -> anyhow::Result<()> {
     let pool = ctx.db.pool();
     let stopped = match backends.get(record.kind) {
@@ -105,7 +101,6 @@ async fn stop_again(backends: &Backends, ctx: &CallCtx, record: &CallRecord) -> 
     }
 }
 
-/// Bring a dispatched, unended call up to date with its target run.
 pub(crate) async fn refresh(
     backends: &Backends,
     ctx: &CallCtx,
@@ -153,7 +148,13 @@ pub(crate) async fn refresh(
                         true => CallStatus::Running,
                         false => record.status,
                     };
-                    crate::calls::store::progressed(pool, &record.id, status, &progress).await?;
+                    match status == record.status && progress == record.progress {
+                        true => crate::calls::store::touched(pool, &record.id).await?,
+                        false => {
+                            crate::calls::store::progressed(pool, &record.id, status, &progress)
+                                .await?
+                        }
+                    }
                 }
             }
         }
@@ -306,8 +307,6 @@ mod tests {
             .expect("call row")
     }
 
-    /// A claimed call serves its locked graph pending, is looked at only once it is due, and
-    /// settles from the run its handle names.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_call_is_looked_at_once_it_is_due(pool: PgPool) {
         let dir = tempfile::tempdir().expect("dir");
@@ -361,8 +360,6 @@ mod tests {
         );
     }
 
-    /// A cancel that did not reach the target's system is asked again by the loop, and given up
-    /// when the system cannot be asked at all.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn an_owed_cancel_is_asked_again(pool: PgPool) {
         let dir = tempfile::tempdir().expect("dir");
@@ -441,8 +438,6 @@ mod tests {
         );
     }
 
-    /// Cancelling a launch settles a call still being dispatched, and its dispatch then learns
-    /// to stop the target it started; so does a dispatch whose calling run was cancelled.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_cancel_during_dispatch_stops_the_target_it_started(pool: PgPool) {
         let dir = tempfile::tempdir().expect("dir");

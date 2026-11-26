@@ -1,4 +1,4 @@
-//! A PipelineRun and its TaskRuns as a progress graph (RFC-0008 C-TEKTON, C-PROGRESS).
+//! A PipelineRun and its TaskRuns as a progress graph.
 //!
 //! ```text
 //!   status.pipelineSpec.tasks/finally ─▶ one node per pipeline task (per TaskRun for a matrix)
@@ -16,7 +16,6 @@ use serde_json::Value;
 use crate::tekton::find::LOG_URL_ANNOTATION;
 use crate::tekton::model::{PipelineRun, PipelineTask, StepState, TaskRun, succeeded};
 
-/// The group every finally task is drawn in.
 pub const FINALLY_GROUP: &str = "finally";
 
 /// One step of a task, with the container its log is read from.
@@ -44,8 +43,6 @@ pub struct RunGraph {
     pub tasks: BTreeMap<String, TaskDetail>,
 }
 
-/// The graph of `run`, with `task_runs` the TaskRuns it created. A run that has not resolved its
-/// pipeline yet has no nodes.
 pub fn run_graph(run: &PipelineRun, task_runs: &[TaskRun]) -> RunGraph {
     let Some(status) = &run.status else {
         return empty();
@@ -158,9 +155,170 @@ pub fn run_graph(run: &PipelineRun, task_runs: &[TaskRun]) -> RunGraph {
             }
         }
     }
+    let sinks: Vec<&String> = spec
+        .tasks
+        .iter()
+        .filter(|t| {
+            !spec
+                .tasks
+                .iter()
+                .any(|other| dependencies(other).contains(&t.name))
+        })
+        .filter_map(|t| ids.get(t.name.as_str()))
+        .flatten()
+        .collect();
+    for f in &spec.finally {
+        let Some(to_ids) = ids.get(f.name.as_str()) else {
+            continue;
+        };
+        for from in &sinks {
+            for to in to_ids {
+                edges.push(ProgressEdge {
+                    from: (*from).clone(),
+                    to: to.clone(),
+                });
+            }
+        }
+    }
     RunGraph {
-        graph: ProgressGraph::bounded(nodes, edges),
+        graph: ProgressGraph::bounded(nodes, reduced(edges)),
         tasks,
+    }
+}
+
+pub fn fold_legs(graph: &RunGraph) -> FoldedGraph {
+    let mut nodes: Vec<ProgressNode> = Vec::new();
+    let mut tasks: BTreeMap<String, Vec<TaskDetail>> = BTreeMap::new();
+    let mut id_of: BTreeMap<&str, String> = BTreeMap::new();
+    for node in &graph.graph.nodes {
+        let leg_of = node
+            .id
+            .strip_suffix(']')
+            .and_then(|s| s.rsplit_once('['))
+            .map(|(task, _)| task)
+            .filter(|task| node.group.as_deref() == Some(*task));
+        let id = leg_of.unwrap_or(&node.id).to_owned();
+        id_of.insert(&node.id, id.clone());
+        if let Some(detail) = graph.tasks.get(&node.id) {
+            tasks.entry(id.clone()).or_default().push(detail.clone());
+        }
+        match nodes.iter_mut().find(|n| n.id == id) {
+            Some(held) => {
+                held.status = combined(held.status, node.status);
+                held.started = earliest(held.started.take(), node.started.clone());
+                held.ended = match (held.ended.take(), node.ended.clone()) {
+                    (Some(a), Some(b)) => Some(match later(&a, &b) {
+                        true => a,
+                        false => b,
+                    }),
+                    _ => None,
+                };
+                held.label = format!("{id} \u{d7}{}", tasks.get(&id).map_or(1, Vec::len));
+            }
+            None => nodes.push(ProgressNode {
+                id: id.clone(),
+                label: id.clone(),
+                group: match leg_of {
+                    Some(_) => None,
+                    None => node.group.clone(),
+                },
+                ..node.clone()
+            }),
+        }
+    }
+    let mut edges: Vec<ProgressEdge> = Vec::new();
+    for e in &graph.graph.edges {
+        let (Some(from), Some(to)) = (id_of.get(e.from.as_str()), id_of.get(e.to.as_str())) else {
+            continue;
+        };
+        let edge = ProgressEdge {
+            from: from.clone(),
+            to: to.clone(),
+        };
+        if !edges.contains(&edge) {
+            edges.push(edge);
+        }
+    }
+    FoldedGraph {
+        graph: ProgressGraph::bounded(nodes, reduced(edges)),
+        tasks,
+    }
+}
+
+/// A run's graph with matrix legs folded, and every TaskRun behind each node.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FoldedGraph {
+    pub graph: ProgressGraph,
+    pub tasks: BTreeMap<String, Vec<TaskDetail>>,
+}
+
+pub fn reduced(edges: Vec<ProgressEdge>) -> Vec<ProgressEdge> {
+    let mut out: Vec<ProgressEdge> = Vec::with_capacity(edges.len());
+    for e in edges {
+        if !out.contains(&e) {
+            out.push(e);
+        }
+    }
+    let mut next: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for e in &out {
+        next.entry(e.from.as_str()).or_default().push(e.to.as_str());
+    }
+    let reaches_without = |from: &str, to: &str| -> bool {
+        let mut stack: Vec<&str> = next
+            .get(from)
+            .map(|ns| ns.iter().copied().filter(|n| *n != to).collect())
+            .unwrap_or_default();
+        let mut seen: BTreeSet<&str> = stack.iter().copied().collect();
+        while let Some(n) = stack.pop() {
+            for m in next.get(n).into_iter().flatten() {
+                if *m == to {
+                    return true;
+                }
+                if seen.insert(m) {
+                    stack.push(m);
+                }
+            }
+        }
+        false
+    };
+    let keep: Vec<bool> = out
+        .iter()
+        .map(|e| !reaches_without(&e.from, &e.to))
+        .collect();
+    out.into_iter()
+        .zip(keep)
+        .filter_map(|(e, k)| k.then_some(e))
+        .collect()
+}
+
+fn combined(a: NodeStatus, b: NodeStatus) -> NodeStatus {
+    let rank = |s: NodeStatus| match s {
+        NodeStatus::Settled(TaskStatus::Fail) => 4,
+        NodeStatus::Running => 3,
+        NodeStatus::Pending => 2,
+        _ => 1,
+    };
+    match (a, b) {
+        (NodeStatus::Settled(TaskStatus::Pass), NodeStatus::Settled(TaskStatus::Pass)) => a,
+        _ if rank(a) >= rank(b) => a,
+        _ => b,
+    }
+}
+
+fn earliest(a: Option<String>, b: Option<String>) -> Option<String> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(match later(&a, &b) {
+            true => b,
+            false => a,
+        }),
+        (a, b) => a.or(b),
+    }
+}
+
+fn later(a: &str, b: &str) -> bool {
+    match (a.parse::<jiff::Timestamp>(), b.parse::<jiff::Timestamp>()) {
+        (Ok(a), Ok(b)) => a > b,
+        _ => false,
     }
 }
 
@@ -171,8 +329,6 @@ fn empty() -> RunGraph {
     }
 }
 
-/// The tasks `task` waits for: its runAfter, and every task whose results its params or when
-/// expressions read.
 pub fn dependencies(task: &PipelineTask) -> BTreeSet<String> {
     let mut deps: BTreeSet<String> = task.run_after.iter().cloned().collect();
     for param in &task.params {
@@ -208,8 +364,6 @@ fn result_refs(value: &Value, into: &mut BTreeSet<String>) {
     }
 }
 
-/// A TaskRun's state as a node status: not started is pending, an Unknown `Succeeded` running,
-/// True pass, False fail.
 pub fn task_run_status(task_run: &TaskRun) -> NodeStatus {
     let Some(status) = &task_run.status else {
         return NodeStatus::Pending;
@@ -255,7 +409,9 @@ mod tests {
     use crucible_contract::session::TaskStatus;
     use serde_json::json;
 
-    use crate::tekton::graph::{FINALLY_GROUP, dependencies, run_graph};
+    use crucible_contract::calls::ProgressEdge;
+
+    use crate::tekton::graph::{FINALLY_GROUP, dependencies, fold_legs, reduced, run_graph};
     use crate::tekton::model::{List, PipelineRun, PipelineTask, TaskRun};
 
     fn pipeline_run(name: &str) -> PipelineRun {
@@ -406,6 +562,106 @@ mod tests {
         );
         let leg = g.tasks.get("build-images[0]").expect("leg detail");
         assert!(leg.steps.iter().any(|s| s.status == NodeStatus::Running));
+    }
+
+    #[test]
+    fn finally_tasks_follow_the_runs_last_tasks() {
+        let run = pipeline_run("odh-openshell-sandbox-openclaw-on-push-wtb9f");
+        let trs = task_runs(include_str!(
+            "../../testdata/tekton/taskruns-odh-openshell-sandbox-openclaw-on-push-wtb9f.json"
+        ));
+        let g = run_graph(&run, &trs);
+        let finally: Vec<&str> = g
+            .graph
+            .nodes
+            .iter()
+            .filter(|n| n.group.as_deref() == Some(FINALLY_GROUP))
+            .map(|n| n.id.as_str())
+            .collect();
+        assert!(!finally.is_empty());
+        for f in finally {
+            assert!(
+                g.graph.edges.iter().any(|e| e.to == f),
+                "{f} has an edge from the tasks it runs after"
+            );
+        }
+    }
+
+    #[test]
+    fn folding_draws_a_matrix_task_as_one_node() {
+        let run = pipeline_run("odh-openshell-gateway-on-push-wcsxc");
+        let trs = task_runs(include_str!(
+            "../../testdata/tekton/taskruns-odh-openshell-gateway-on-push-wcsxc.json"
+        ));
+        let g = fold_legs(&run_graph(&run, &trs));
+        let build: Vec<_> = g
+            .graph
+            .nodes
+            .iter()
+            .filter(|n| n.id.starts_with("build-images"))
+            .collect();
+        assert_eq!(build.len(), 1);
+        assert_eq!(build[0].id, "build-images");
+        assert_eq!(build[0].label, "build-images \u{d7}2");
+        assert_eq!(build[0].group, None);
+        assert_eq!(build[0].status, NodeStatus::Running);
+        assert_eq!(g.tasks.get("build-images").map(Vec::len), Some(2));
+        assert!(
+            g.graph
+                .edges
+                .iter()
+                .any(|e| e.from == "prefetch-dependencies" && e.to == "build-images")
+        );
+        let spec = run
+            .status
+            .as_ref()
+            .and_then(|s| s.pipeline_spec.as_ref())
+            .expect("spec");
+        assert_eq!(g.graph.nodes.len(), spec.tasks.len() + spec.finally.len());
+        let ids: BTreeSet<&str> = g.graph.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids.len(), g.graph.nodes.len());
+        assert!(
+            g.graph
+                .edges
+                .iter()
+                .all(|e| ids.contains(e.from.as_str()) && ids.contains(e.to.as_str()))
+        );
+    }
+
+    #[test]
+    fn edges_another_path_implies_are_dropped() {
+        let e = |a: &str, b: &str| ProgressEdge {
+            from: a.into(),
+            to: b.into(),
+        };
+        let kept = reduced(vec![
+            e("init", "clone"),
+            e("clone", "build"),
+            e("init", "build"),
+            e("init", "build"),
+            e("build", "scan"),
+            e("init", "scan"),
+            e("init", "lint"),
+        ]);
+        assert_eq!(
+            kept,
+            [
+                e("init", "clone"),
+                e("clone", "build"),
+                e("build", "scan"),
+                e("init", "lint")
+            ]
+        );
+        let run = pipeline_run("odh-openshell-sandbox-openclaw-on-push-wtb9f");
+        let trs = task_runs(include_str!(
+            "../../testdata/tekton/taskruns-odh-openshell-sandbox-openclaw-on-push-wtb9f.json"
+        ));
+        let g = fold_legs(&run_graph(&run, &trs));
+        assert_eq!(
+            reduced(g.graph.edges.clone()),
+            g.graph.edges,
+            "the graph comes reduced"
+        );
     }
 
     #[test]

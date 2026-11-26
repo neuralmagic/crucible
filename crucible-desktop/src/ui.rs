@@ -316,9 +316,7 @@ struct Pane<'a> {
     previewing: bool,
     /// The run's tasks while the preview's are shown, for marking what the edit changed.
     run_tasks: &'a [TaskView],
-    /// The calls the run dispatched, with their targets' progress.
     calls: &'a [crate::live::calls::LiveCall],
-    /// The log of the call target node the window asked for.
     node_log: Option<&'a crate::live::calls::NodeLog>,
 }
 

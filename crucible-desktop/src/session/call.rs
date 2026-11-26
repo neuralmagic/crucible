@@ -9,16 +9,13 @@ use crucible_contract::session::PlanCallWire;
 pub struct CallTask {
     pub alias: CallAlias,
     pub kind: CallKind,
-    /// Each parameter a dependency binds, by name, and the task that produces it.
     pub params: BTreeMap<String, String>,
-    /// The newest dispatch of the task, or of each of its instances.
     pub dispatched: Vec<Dispatched>,
 }
 
 /// One target run, as the `call_dispatched` event recorded it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Dispatched {
-    /// The instance's item key; `None` for an unmapped call.
     pub instance: Option<String>,
     pub attempt: u32,
     pub call: CallId,
@@ -36,19 +33,16 @@ impl CallTask {
         }
     }
 
-    /// The target run of the task itself, or of instance `instance`.
     pub fn dispatch(&self, instance: Option<&str>) -> Option<&Dispatched> {
         self.dispatched
             .iter()
             .find(|d| d.instance.as_deref() == instance)
     }
 
-    /// Where the task's own target run opens.
     pub fn link(&self) -> Option<&NodeLink> {
         self.dispatch(None)?.link.as_ref()
     }
 
-    /// Records `dispatched`, replacing an older attempt of the same instance.
     pub fn record(&mut self, dispatched: Dispatched) {
         match self
             .dispatched
@@ -61,7 +55,6 @@ impl CallTask {
         }
     }
 
-    /// The parameters `producer` binds, by name.
     pub fn bound_by<'a>(&'a self, producer: &'a str) -> impl Iterator<Item = &'a str> + 'a {
         self.params
             .iter()
@@ -70,7 +63,6 @@ impl CallTask {
     }
 }
 
-/// The short name a graph badge gives a target kind.
 pub fn badge(kind: CallKind) -> &'static str {
     kind.presentation().badge
 }

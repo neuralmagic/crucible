@@ -1,4 +1,4 @@
-//! Writing and reading a pack's `calls.lock` (RFC-0008 C-LOCK) against the `calls` blocks of its
+//! Writing and reading a pack's `calls.lock` against the `calls` blocks of its
 //! workflow sources.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -11,7 +11,6 @@ use crucible_contract::calls::{
 
 use crate::calls::{Backends, CallCtx, CallError};
 
-/// The workflow sources a manifest names: `[workflow].file` and each `[variant.<name>.workflow].file`.
 fn workflow_files(manifest: &str) -> Vec<String> {
     let Ok(table) = manifest.parse::<toml::Table>() else {
         return Vec::new();
@@ -32,10 +31,6 @@ fn workflow_files(manifest: &str) -> Vec<String> {
     files
 }
 
-/// Every target the workflow sources of a pack declare in their `calls` blocks. `file` reads a
-/// pack file by its path. A manifest that is not TOML, or a source that is absent, declares
-/// nothing here: its compile reports that, not the lock. Two sources that give one name
-/// different targets are refused.
 pub(crate) fn declared(
     file: impl Fn(&str) -> Option<String>,
 ) -> Result<BTreeMap<CallAlias, CallTarget>, String> {
@@ -68,17 +63,11 @@ pub(crate) fn declared(
 /// Who a lock is written for, and of what.
 pub(crate) struct Locking<'a> {
     pub state: &'a crate::api::state::ApiState,
-    /// The requester, who must be able to read every playbook target.
     pub caller: &'a crate::authz::Caller,
-    /// Whether the pack is a draft, the only kind that may pin a draft head.
     pub draft_pack: bool,
-    /// The draft being locked, when it is one, which no chain of draft-head pins may lead back
-    /// to.
     pub draft: Option<&'a str>,
 }
 
-/// The refusal of a playbook target that does not exist for the requester, whether it is absent
-/// or unreadable.
 fn no_target(alias: &CallAlias, playbook: &PlaybookRef) -> String {
     match playbook {
         PlaybookRef::Registered(name) => {
@@ -88,8 +77,6 @@ fn no_target(alias: &CallAlias, playbook: &PlaybookRef) -> String {
     }
 }
 
-/// Resolve every declared target through its backend and lock it. `None` when nothing is
-/// declared.
 pub(crate) async fn write(
     backends: &Backends,
     ctx: &CallCtx,
@@ -149,8 +136,6 @@ pub(crate) async fn write(
     }))
 }
 
-/// A chain of draft-head pins from draft `start` that reaches `locking`, or reaches a draft it
-/// already passed, as the drafts along it. Each draft is read at its newest compiling save.
 async fn draft_cycle(
     ctx: &CallCtx,
     start: &str,
@@ -186,8 +171,6 @@ async fn draft_cycle(
     Ok(None)
 }
 
-/// Write the lock a draft's files need into them: the lock of its `calls` blocks, or no
-/// lock file at all when it declares none.
 pub(crate) async fn into_files(
     backends: &Backends,
     ctx: &CallCtx,
@@ -209,7 +192,6 @@ pub(crate) async fn into_files(
     Ok(())
 }
 
-/// The declared targets and lock of a stored pack, checked against each other.
 pub(crate) fn of_tree(
     tree: &crucible_contract::pack_tree::PackTree,
 ) -> Result<(BTreeMap<CallAlias, CallTarget>, Option<CallsLock>), String> {
@@ -234,8 +216,6 @@ pub(crate) fn of_tree(
     Ok((calls, lock))
 }
 
-/// Refuse a pack a registration or an import may not pin: its `calls.lock` is missing or does not
-/// match its `calls` blocks, or it pins a draft's head.
 pub(crate) fn registrable(tree: &crucible_contract::pack_tree::PackTree) -> Result<(), String> {
     let (_, lock) = of_tree(tree)?;
     let draft_head = lock
@@ -275,7 +255,6 @@ fn delta(what: &str, old: &BTreeSet<String>, new: &BTreeSet<String>) -> Option<S
     (!parts.is_empty()).then(|| format!("{what} {}", parts.join(", ")))
 }
 
-/// What changed between the locked interface and the one the target has now, in a few words.
 pub(crate) fn drift(old: &TargetInterface, new: &TargetInterface) -> String {
     let params = |i: &TargetInterface| names(&i.params, "properties");
     let required = |i: &TargetInterface| names(&i.params, "required");
@@ -304,8 +283,6 @@ pub(crate) fn drift(old: &TargetInterface, new: &TargetInterface) -> String {
     }
 }
 
-/// Refuse bound values the locked interface does not take, and a required parameter left
-/// unbound.
 pub(crate) fn check_bound<'a>(
     interface: &TargetInterface,
     bound: impl Iterator<Item = &'a String>,
@@ -327,8 +304,6 @@ pub(crate) fn check_bound<'a>(
     Ok(())
 }
 
-/// Whether each bound value and file fits the locked parameter types. A GitHub workflow's string
-/// input also takes a JSON object or list, which it receives serialized.
 pub(crate) fn check_values(
     kind: crucible_contract::calls::CallKind,
     interface: &TargetInterface,
@@ -585,8 +560,6 @@ workflow(type = "playbook", tasks = [])
         assert_eq!(of_tree(&bare).expect("no calls"), (BTreeMap::new(), None));
     }
 
-    /// A registration or import takes a pack only with a lock that matches its calls blocks and
-    /// pins no draft head.
     #[test]
     fn a_registered_pack_needs_a_current_lock_of_registered_pins() {
         let source = WORKFLOW.replace("draft:triage-draft", "triage");

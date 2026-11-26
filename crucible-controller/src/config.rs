@@ -711,17 +711,12 @@ pub struct ControllerCfg {
         default_value = ""
     )]
     pub local_secret_allowlist: Vec<String>,
-    /// Where a call's `github_workflow` target takes its token: `gh` runs `gh auth token` at each
-    /// operation (a local controller only), `app` mints a token scoped to the target repository
-    /// from the GitHub App's installation on it. Unset dispatches none.
     #[arg(
         long = "calls-github-token",
         env = "CONTROLLER_CALLS_GITHUB_TOKEN",
         value_enum
     )]
     pub calls_github_token: Option<crate::calls::GithubToken>,
-    /// The GitHub logins paired with crucible logins, each `<github login>=<crucible login>`. A
-    /// call to a GitHub workflow dispatches only for a launch owner paired here.
     #[arg(
         long = "github-logins",
         env = "CONTROLLER_GITHUB_LOGINS",
@@ -729,6 +724,20 @@ pub struct ControllerCfg {
         default_value = ""
     )]
     pub github_logins: Vec<String>,
+    #[arg(
+        long = "calls-tekton-cluster",
+        env = "CONTROLLER_CALLS_TEKTON_CLUSTERS",
+        value_delimiter = ',',
+        default_value = ""
+    )]
+    pub calls_tekton_kubeconfigs: Vec<String>,
+    #[arg(
+        long = "calls-tekton-results",
+        env = "CONTROLLER_CALLS_TEKTON_RESULTS",
+        value_delimiter = ',',
+        default_value = ""
+    )]
+    pub calls_tekton_results: Vec<String>,
     #[command(flatten)]
     pub profile: Profile,
 }
@@ -1042,16 +1051,21 @@ impl ControllerCfg {
         )
     }
 
-    /// The GitHub-to-crucible login pairs `github_logins` lists.
     pub(crate) fn github_logins(&self) -> crate::identity::github_logins::GithubLogins {
         crate::identity::github_logins::GithubLogins::parse(
             self.github_logins.iter().map(String::as_str),
         )
     }
 
-    /// Refuse a calls GitHub token source this deployment cannot use. `gh` hands out the token
-    /// of whoever runs the controller, so only a local controller (local playbook executor and a
-    /// dev identity) may use it; `app` needs the GitHub App configured.
+    pub(crate) fn calls_tekton_clusters(
+        &self,
+    ) -> std::result::Result<
+        std::collections::BTreeMap<String, crate::calls::tekton::TektonCluster>,
+        String,
+    > {
+        crate::calls::tekton::clusters(&self.calls_tekton_kubeconfigs, &self.calls_tekton_results)
+    }
+
     pub fn validate_calls_github(&self, dev_identity: Option<&str>) -> Result<()> {
         match self.calls_github_token {
             None => Ok(()),

@@ -36,7 +36,6 @@ pub const SHIMMER: u32 = 3;
 pub const GLOW: u32 = 4;
 /// Fine static film grain over the window. `data[3]` is the amount.
 pub const GRAIN: u32 = 5;
-/// A soft steady bloom around something settled. `data[3]` is the intensity.
 pub const HALO: u32 = 8;
 
 /// The crucible mark as particle lava. `data`: clicks so far, 1 while a run is live, then the
@@ -58,7 +57,7 @@ fn layer(kind: u32, d: [f32; 4], shape: Shape, t: f32) -> Option<(FxLayer, bool)
     let (fx, moving) = match kind {
         PULSE => (
             Fx::pulse(PulseParams {
-                style: PulseStyle::Breathe,
+                style: PulseStyle::Radar,
                 color,
                 period: 2.6,
                 reach: 10.0,

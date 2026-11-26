@@ -152,7 +152,8 @@ pub(crate) async fn get_run(
         .map(|c| RunChildDto {
             run: match &c.handle {
                 crucible_contract::calls::TargetHandle::Playbook { run } => Some(run.clone()),
-                crucible_contract::calls::TargetHandle::GithubWorkflow { .. } => None,
+                crucible_contract::calls::TargetHandle::GithubWorkflow { .. }
+                | crucible_contract::calls::TargetHandle::TektonWatch { .. } => None,
             },
             kind: c.handle.kind(),
             call: c.call.0,
@@ -598,6 +599,12 @@ pub(crate) async fn get_artifact(
     let if_none_match = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok());
+    if run.session_uri.is_none()
+        && path == "session.jsonl"
+        && let Some(live) = crate::runs::local_run::live_session(&state.scratch_dir, &run_id)
+    {
+        return crate::runs::artifacts::serve_live_session(&live, if_none_match).await;
+    }
     crate::runs::artifacts::serve_artifact(
         state.db.metrics(),
         Some(&state.contracts),

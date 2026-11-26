@@ -751,6 +751,56 @@ pub fn functions() -> Vec<Function> {
             ],
         },
         Function {
+            name: "watch",
+            lane: Lane::Routed,
+            purpose: "Engine-owned wait for the runs a commit started on a target's system, such \
+                      as the Pipelines-as-Code PipelineRuns a push or pull request triggered. The \
+                      target is a `{\"kind\": \"tekton\", \"cluster\", \"namespace\", \
+                      \"repository\", \"event\", \"expected\"}` entry of the `calls` block. \
+                      The watch adds every run that appears within `appear`, passes once every \
+                      matched run passed, fails as soon as one fails, and never cancels a run. Its \
+                      output has `runs` and, per expected run, the results it declares.",
+            positional: None,
+            kwargs: vec![
+                name_kwarg(),
+                Kwarg::new(
+                    "target",
+                    "str",
+                    "The name of a `tekton` target in the source's `calls` block.",
+                ),
+                Kwarg::new(
+                    "commit",
+                    "str",
+                    "The full commit id, as a literal, `param(name)`, or `producer.field`.",
+                ),
+                Kwarg::new(
+                    "timeout",
+                    "duration",
+                    "How long the watch waits in all before it fails.",
+                ),
+                Kwarg::new(
+                    "appear",
+                    "duration",
+                    "How long runs may take to appear; 10m when unset.",
+                ),
+                Kwarg::new(
+                    "depends_on",
+                    "list[task]",
+                    "Dependencies besides the producer its commit reads.",
+                ),
+                Kwarg::new("required", "bool", "False makes the watch advisory."),
+                Kwarg::new(
+                    "join",
+                    "\"all\" | \"passed\" | \"settled\"",
+                    "As on any task.",
+                ),
+                Kwarg::new("stage", "\"iteration\" | \"epilogue\"", "As on any task."),
+                when_kwarg(),
+                answers_kwarg(),
+                otherwise_kwarg(),
+            ],
+        },
+        Function {
             name: "budget",
             lane: Lane::Routed,
             purpose: "A call's ceilings for its target run.",

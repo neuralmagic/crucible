@@ -33,9 +33,7 @@ pub enum ParamType {
     /// Spelled as the declaration spells it, so the stored form and [`ParamType::parse`] agree.
     #[serde(rename = "list<string>")]
     StringList,
-    /// A JSON object or array.
     Json,
-    /// One uploaded file, delivered beside the pack.
     File,
 }
 
@@ -176,16 +174,12 @@ pub struct ParamSpec {
     /// The boolean parameter that must be true for this one to be supplied.
     #[serde(default)]
     pub enabled_by: Option<String>,
-    /// A json parameter's JSON Schema, as a path below the pack directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
-    /// The document `schema` names, once a compile has read it from the pack.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_document: Option<JsonSchema>,
-    /// The largest file a file parameter takes, in bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<u64>,
-    /// The media types a file parameter takes; empty takes any.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media_type: Vec<String>,
 }
@@ -263,20 +257,14 @@ impl ParamSpec {
     }
 }
 
-/// The JSON Schema keyword naming a json or file parameter's declared type.
 pub const PARAM_TYPE_KEY: &str = "x-param-type";
 
-/// The keyword naming a json parameter's schema file, when the schema itself is not embedded.
 pub const SCHEMA_PATH_KEY: &str = "x-schema-path";
 
-/// The keyword giving a file parameter's size limit in bytes.
 pub const MAX_BYTES_KEY: &str = "x-max-bytes";
 
-/// The keyword listing the media types a file parameter takes.
 pub const MEDIA_TYPE_KEY: &str = "x-media-type";
 
-/// A json parameter's schema as a property embeds it: the document without its dialect, which
-/// only a schema resource's root may name.
 pub fn embedded(schema: &JsonSchema) -> serde_json::Value {
     let mut document = schema.document().clone();
     if let Some(object) = document.as_object_mut() {
@@ -285,12 +273,10 @@ pub fn embedded(schema: &JsonSchema) -> serde_json::Value {
     document
 }
 
-/// The schema a property of [`Params::json_schema`] embeds for a json parameter.
 pub fn embedded_schema(property: &serde_json::Value) -> Option<&serde_json::Value> {
     property.get("allOf")?.as_array()?.first()
 }
 
-/// The digest a probe file value carries: SHA-256 of no bytes.
 pub const PROBE_DIGEST: &str =
     "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
@@ -451,8 +437,6 @@ impl Params {
         &self.0
     }
 
-    /// Read each json parameter's declared schema through `read`, which resolves a path below
-    /// the pack.
     pub(crate) fn read_schemas(
         &mut self,
         mut read: impl FnMut(&str) -> Result<JsonSchema>,
@@ -1067,8 +1051,6 @@ struct SuppliedFile {
     size: Option<u64>,
 }
 
-/// A file parameter's value: the staged file read, measured and digested, as the [`FileRef`]
-/// object a task receives.
 fn file_value(spec: &ParamSpec, raw: &str) -> Result<ParamValue> {
     let refused = |detail: String| CompileError::ParamConstraintFailed {
         param: spec.name.clone(),

@@ -1,6 +1,6 @@
 //! Running a call task: bind its values from its dependencies, ask the controller that launched
 //! this run to dispatch the target as a run of its own, wait for that run to end, and settle
-//! with its result (RFC-0008 C-CHILD-RUN). The engine never reaches the target's system itself.
+//! with its result. The engine never reaches the target's system itself.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -22,11 +22,9 @@ use crucible_contract::calls::{
 };
 use crucible_contract::session::SessionEvent;
 
-/// Overrides the default interval between two polls of a call's state.
 pub const POLL_ENV: &str = "CRUCIBLE_CALL_POLL_SECS";
 const DEFAULT_POLL: Duration = Duration::from_secs(3);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-/// Polls in a row that may fail before the call settles failing. The target run keeps going.
 const MAX_POLL_FAILURES: u32 = 20;
 const MAX_DISPATCH_TRIES: u32 = 10;
 const DISPATCH_BACKOFF: Duration = Duration::from_secs(1);
@@ -87,7 +85,6 @@ impl DispatchError {
 }
 
 impl Controller {
-    /// `None` unless the controller handed the run its URL, its run name and its pod token.
     pub fn from_env() -> Option<Self> {
         let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
         let interval = env(POLL_ENV)
@@ -197,7 +194,6 @@ impl Controller {
         .map(drop)
     }
 
-    /// The bytes of a file parameter value this run's launch holds, by its digest.
     pub fn param_file(&self, digest: &str) -> Result<Vec<u8>, String> {
         let url = self.at(PARAM_FILE_PATH, None).replace(
             "{digest}",
@@ -245,7 +241,6 @@ pub struct CallKey {
 }
 
 impl CallKey {
-    /// The key of `attempt` of the row named `name`, which is a call task or one of its items.
     pub fn of(name: &TaskName, attempt: u32) -> Self {
         match name.instance_of() {
             Some((task, key)) => CallKey {
@@ -265,9 +260,10 @@ impl CallKey {
 /// Where a bound file's bytes are read from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FileSource {
-    /// A file a dependency declared and this run captured.
-    Captured { producer: TaskName, path: String },
-    /// A file parameter of this run, staged beside the pack.
+    Captured {
+        producer: TaskName,
+        path: String,
+    },
     Staged {
         path: PathBuf,
         media_type: Option<String>,
@@ -281,8 +277,6 @@ pub enum Bound {
     File(FileSource),
 }
 
-/// Bind every parameter of `task` from what it read. A value missing from its producer's output
-/// is refused here, before any target run exists.
 pub fn resolve(
     task: &Task,
     inputs: &BTreeMap<TaskName, Value>,
@@ -363,7 +357,6 @@ pub fn resolve(
 pub struct CallCtx<'a> {
     pub controller: Option<&'a Controller>,
     pub files: Option<&'a CapturedFiles>,
-    /// Calls an interrupted run of this plan already dispatched.
     pub dispatched: Option<&'a BTreeMap<CallKey, CallId>>,
 }
 
@@ -471,7 +464,6 @@ fn failed(note: String) -> Attempt {
     Attempt::failed(0.0, note)
 }
 
-/// Run one attempt of the call `task`.
 pub fn run(
     task: &Task,
     attempt: u32,
@@ -606,8 +598,6 @@ pub fn run(
     }
 }
 
-/// Send `request` until the controller answers it, under one call identity, so a lost response
-/// finds the target the first send started instead of starting a second.
 fn dispatch_once(
     controller: &Controller,
     request: &DispatchRequest,
@@ -685,7 +675,6 @@ fn wait(
     }
 }
 
-/// Read a bound file and upload it, answering how the dispatch names it.
 fn send_file(
     controller: &Controller,
     call: &TaskName,
@@ -737,7 +726,6 @@ fn send_file(
     })
 }
 
-/// A result file's path, refused when it would leave the directory it is staged in.
 fn relative(path: &str) -> Option<PathBuf> {
     let candidate = Path::new(path);
     let clean = candidate
@@ -746,7 +734,6 @@ fn relative(path: &str) -> Option<PathBuf> {
     (clean && !path.is_empty()).then(|| candidate.to_path_buf())
 }
 
-/// Stage the target's result files as the call's declared files, whole or not at all.
 fn publish(
     controller: &Controller,
     task: &Task,

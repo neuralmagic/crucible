@@ -160,10 +160,9 @@ pub struct ApiState {
     pub(crate) cluster_links: Option<Arc<crate::identity::cluster_link::ClusterLinks>>,
     /// The issuer whose people grant the consent page decides; `None` when it serves no people.
     pub(crate) people_issuer: Option<Arc<crate::agent_auth::AgentAuth>>,
-    /// Where a call's GitHub workflow target takes its token; `None` dispatches none.
     pub(crate) calls_github: Option<crate::calls::GithubToken>,
-    /// The GitHub logins paired with crucible logins, which a GitHub workflow call authorizes its
-    /// launch owner by.
+    pub(crate) calls_tekton:
+        Result<std::collections::BTreeMap<String, crate::calls::tekton::TektonCluster>, String>,
     pub(crate) github_logins: crate::identity::github_logins::GithubLogins,
 }
 
@@ -264,6 +263,7 @@ impl ApiState {
             images_refresh: Arc::new(tokio::sync::Notify::new()),
             policy,
             calls_github: cfg.calls_github_token,
+            calls_tekton: cfg.calls_tekton_clusters(),
             github_logins: cfg.github_logins(),
         }
     }
@@ -398,6 +398,7 @@ impl ApiState {
             policy: crate::authz::policy::ActivePolicy::default_set()
                 .expect("the shipped default policy set loads"),
             calls_github: None,
+            calls_tekton: Ok(Default::default()),
             github_logins: Default::default(),
         }
     }

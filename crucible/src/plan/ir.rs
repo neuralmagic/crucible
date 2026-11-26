@@ -577,7 +577,6 @@ pub enum TaskKind {
         questions: BTreeMap<QuestionId, CompiledQuestion>,
         decider: Decider,
     },
-    /// Engine-owned dispatch of a `[calls]` target as its own run, waiting for its result.
     Call {
         alias: crucible_contract::calls::CallAlias,
         target: crucible_contract::calls::CallKind,
@@ -585,10 +584,8 @@ pub enum TaskKind {
         bindings: BTreeMap<String, crate::plan::call::Binding>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         budget: Option<crucible_contract::calls::CallBudget>,
-        /// The locked interface digest the call was compiled against.
         #[serde(default, skip_serializing_if = "String::is_empty")]
         interface_digest: String,
-        /// The bound parameters that carry a file rather than a value.
         #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
         file_params: BTreeSet<String>,
     },

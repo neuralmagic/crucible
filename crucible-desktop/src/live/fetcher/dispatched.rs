@@ -7,12 +7,9 @@ use crate::live::{LiveDetail, LivePlaybook, LiveView};
 use crate::net::Connection;
 use crate::session::RunFold;
 
-/// The origin of a launch a call dispatched.
 const CALLED: &str = "call";
 
 impl Fetcher {
-    /// The calls run `run` of `launch` dispatched, re-read on a poll while its plan has a call
-    /// task. Each target launch learns the call that dispatched it.
     pub(in crate::live::fetcher) async fn calls(
         &mut self,
         connection: &Connection,
@@ -31,7 +28,12 @@ impl Fetcher {
             return Vec::new();
         };
         let calling = fold.tasks.iter().any(|task| task.call.is_some());
-        if !poll || !calling {
+        let open = fold
+            .tasks
+            .iter()
+            .any(|task| task.call.is_some() && task.result.is_none())
+            || held.iter().any(|call| !call.view.state.status.ended());
+        if !poll || !calling || (!held.is_empty() && !open) {
             return held;
         }
         let Ok(views) = calls::progress(connection, run).await else {
@@ -43,7 +45,8 @@ impl Fetcher {
                 crucible_contract::calls::TargetHandle::Playbook { run } => {
                     calls::launch_of(connection, &mut self.run_launches, run).await
                 }
-                crucible_contract::calls::TargetHandle::GithubWorkflow { .. } => None,
+                crucible_contract::calls::TargetHandle::GithubWorkflow { .. }
+                | crucible_contract::calls::TargetHandle::TektonWatch { .. } => None,
             };
             read.push(LiveCall {
                 view,
@@ -64,9 +67,6 @@ impl Fetcher {
 }
 
 impl Fetcher {
-    /// The log of the node the window asked for, when it is a node of one of `detail`'s calls.
-    /// A node that had ended when its log was read is not read again; a running one is re-read
-    /// on each poll.
     pub(in crate::live::fetcher) async fn node_log(
         &mut self,
         connection: &Connection,
@@ -99,8 +99,6 @@ impl Fetcher {
         })
     }
 
-    /// Names the call that dispatched `launch`, as its run's detail says, when neither the
-    /// launch list nor a calling run on screen has. True when the list changed.
     pub(in crate::live::fetcher) async fn learn_caller(
         &mut self,
         connection: &Connection,
@@ -161,9 +159,6 @@ mod tests {
 
     const LOG: &str = "/api/runs/run-parent/calls/c-1/nodes/build%20it/log";
 
-    /// A controller holding a parent run that called `child` into a launch of its own, the
-    /// child launch's list row with no caller named, and one target node's log. Every request
-    /// path is counted.
     fn controller() -> (String, Arc<Mutex<HashMap<String, usize>>>) {
         let asked: Arc<Mutex<HashMap<String, usize>>> = Arc::default();
         let counted = Arc::clone(&asked);

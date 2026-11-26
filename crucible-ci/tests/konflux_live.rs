@@ -159,9 +159,6 @@ async fn a_step_log_reads_from_the_task_pod() {
     panic!("no ended step with a pod among the runs in {}", ns.as_str());
 }
 
-/// Needs `CRUCIBLE_CI_KONFLUX_RESULTS` (the Tekton Results address) and
-/// `CRUCIBLE_CI_KONFLUX_PRUNED_SHA`, a commit whose runs the cluster has pruned, and
-/// `CRUCIBLE_CI_KONFLUX_PRUNED_REPOSITORY`, their Pipelines-as-Code Repository.
 #[tokio::test]
 #[ignore = "reaches a live Konflux cluster"]
 async fn results_still_hold_a_pruned_commits_runs() {
@@ -213,4 +210,22 @@ async fn results_still_hold_a_pruned_commits_runs() {
         assert!(matches!(state, RunState::Ended(_)));
         assert!(!graph.graph.nodes.is_empty());
     }
+}
+
+#[tokio::test]
+#[ignore = "reaches a live Konflux cluster"]
+async fn a_tenant_token_may_list_but_not_create_pipeline_runs() {
+    let (cluster, ns, token) = cluster();
+    assert!(
+        cluster
+            .may(&token, &ns, "list")
+            .await
+            .expect("the review answers")
+    );
+    assert!(
+        !cluster
+            .may(&token, &ns, "create")
+            .await
+            .expect("the review answers")
+    );
 }

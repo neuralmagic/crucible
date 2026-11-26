@@ -445,7 +445,6 @@ impl JsonSchema {
         self.refusal(value).is_none()
     }
 
-    /// The schema document, keys sorted.
     pub fn document(&self) -> &Value {
         &self.0
     }

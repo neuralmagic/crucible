@@ -142,7 +142,6 @@ impl RepoRole {
         }
     }
 
-    /// Whether the role may push to the repository and run its workflows.
     pub(crate) fn may_write(self) -> bool {
         matches!(self, RepoRole::Admin | RepoRole::Maintain | RepoRole::Write)
     }
@@ -162,7 +161,6 @@ impl RepoRole {
     }
 }
 
-/// The permissions in `wants` that `granted` does not give, as `name: level`.
 fn missing(
     granted: &std::collections::BTreeMap<String, String>,
     wants: &[(&str, Access)],
@@ -174,7 +172,6 @@ fn missing(
         .collect()
 }
 
-/// The cache key of a repository token: the repository and the permissions it was minted with.
 fn repo_token_key(owner: &GithubOwner, repo: &str, wants: &[(&str, Access)]) -> String {
     let permissions: Vec<String> = wants
         .iter()
@@ -489,9 +486,6 @@ impl GithubAppTokenSource {
         Ok(None)
     }
 
-    /// A token for `owner/repo` alone with exactly `wants`, minted through the installation on
-    /// that repository and cached until near its expiry. A repository the App is not installed
-    /// on, or whose installation lacks one of `wants`, fails with a [`RepoDenied`] at the root.
     pub(crate) async fn repo_token(
         &self,
         owner: &GithubOwner,
@@ -515,8 +509,6 @@ impl GithubAppTokenSource {
         Ok(minted.token)
     }
 
-    /// `login`'s role on `owner/repo`, read with the repository token for `wants`. A login that
-    /// is not a collaborator, or no account at all, has [`RepoRole::None`].
     pub(crate) async fn repo_role(
         &self,
         owner: &GithubOwner,
@@ -625,7 +617,6 @@ impl GithubAppTokenSource {
         self.mint_with(installation_id, now, None).await
     }
 
-    /// [`Self::mint`], narrowed by `body` (`repositories`, `permissions`) when given.
     async fn mint_with(
         &self,
         installation_id: &str,
@@ -1174,8 +1165,6 @@ mod tests {
             .await;
     }
 
-    /// A person's role is read through the repository's installation token, minted once, and
-    /// only write, maintain and admin may write.
     #[tokio::test]
     async fn a_repo_role_is_read_with_the_repository_token() {
         let dir = tempfile::tempdir().unwrap();

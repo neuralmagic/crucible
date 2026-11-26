@@ -16,8 +16,6 @@ pub enum ParamValue {
     Number(f64),
     Bool(bool),
     StringList(Vec<String>),
-    /// A json parameter's object or array, or a file parameter's staged file as the
-    /// [`crucible_contract::calls::FileRef`] object a task receives.
     Json(serde_json::Value),
 }
 

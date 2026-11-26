@@ -117,18 +117,14 @@ struct Seen {
     uploads: BTreeMap<String, Vec<u8>>,
     cancelled: Vec<String>,
     unauthorized: u32,
-    /// File parameter values the run's launch holds, by digest.
     param_files: BTreeMap<String, Vec<u8>>,
-    /// Every file parameter the run fetched, by digest.
     fetched: Vec<String>,
 }
 
 struct Controller {
     url: String,
     seen: Arc<Mutex<Seen>>,
-    /// Keep every call running until cleared.
     hold: Arc<AtomicBool>,
-    /// How many dispatches to start and then hang up on without answering.
     lose_answers: Arc<AtomicU32>,
 }
 

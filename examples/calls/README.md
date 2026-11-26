@@ -1,6 +1,6 @@
 # calls
 
-A playbook that calls another playbook and a GitHub Actions workflow (RFC-0008), then folds
+A playbook that calls another playbook and a GitHub Actions workflow, then folds
 both results. Every task is a command, so the parent and child run without a model.
 
 ```text

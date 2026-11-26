@@ -1,6 +1,6 @@
 //! The call routes a person reaches: a run's calls with their progress, one progress node's log,
 //! and writing a lock for a pack held outside the controller. Each needs read on the calling run
-//! or on every playbook target (RFC-0008 C-PROGRESS, RFC-0003 C-READ-SCOPING).
+//! or on every playbook target.
 
 use std::collections::BTreeMap;
 
@@ -29,7 +29,6 @@ fn no_run(run: &str) -> Response {
     refuse(StatusCode::NOT_FOUND, format!("run not found: {run}"))
 }
 
-/// Refuse a reader who may not read `run` with the answer an unknown run gets.
 #[allow(clippy::result_large_err)]
 async fn readable_run(state: &ApiState, caller: &Caller, run: &str) -> Result<(), Response> {
     match crate::calls::access::may_read_run(state, caller, run).await {
@@ -39,8 +38,6 @@ async fn readable_run(state: &ApiState, caller: &Caller, run: &str) -> Result<()
     }
 }
 
-/// `record` as `caller` may see it: a playbook target run's link, times and details only when
-/// they may read that run too.
 async fn as_seen(
     state: &ApiState,
     caller: &Caller,
@@ -61,8 +58,6 @@ async fn as_seen(
     Ok(record)
 }
 
-/// `GET /api/runs/{run}/call-progress`: every call the run dispatched, as the refresh loop last
-/// saw it.
 #[utoipa::path(
     get,
     path = "/api/runs/{run}/call-progress",
@@ -113,8 +108,6 @@ pub(crate) async fn call_progress(
     axum::Json(views).into_response()
 }
 
-/// `GET /api/runs/{run}/calls/{call}/nodes/{node}/log`: the text log of one node of a call's
-/// progress graph.
 #[utoipa::path(
     get,
     path = "/api/runs/{run}/calls/{call}/nodes/{node}/log",
@@ -191,24 +184,18 @@ pub(crate) async fn node_log(
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub(crate) struct LockBody {
-    /// The pack's `crucible.toml` and workflow sources, by path.
     pub files: BTreeMap<String, String>,
-    /// Whether the pack is a draft, which alone may pin a draft's head.
     #[serde(default)]
     pub draft: bool,
-    /// The draft the pack is, when it is one, so a chain of draft heads back to it is refused.
     #[serde(default)]
     pub draft_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub(crate) struct LockAnswer {
-    /// The `calls.lock` text; null when the manifest declares no calls.
     pub lock: Option<String>,
 }
 
-/// `POST /api/calls/lock`: the lock a pack's `calls` blocks resolve to now, for a pack written
-/// outside the controller. Every playbook target must be one the caller may read.
 #[utoipa::path(
     post,
     path = "/api/calls/lock",
@@ -242,5 +229,4 @@ pub(crate) async fn write_lock(
     }
 }
 
-/// The route the human API writes a lock on.
 pub(crate) const LOCK_ROUTE: &str = "/api/calls/lock";

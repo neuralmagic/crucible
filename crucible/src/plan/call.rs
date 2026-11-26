@@ -1,4 +1,4 @@
-//! What a call task binds each of its target's parameters to (RFC-0008 C-CALL).
+//! What a call task binds each of its target's parameters to.
 
 use serde::{Deserialize, Serialize};
 
@@ -9,18 +9,20 @@ use crate::plan::ir::{OutputField, TaskName};
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "from", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Binding {
-    /// A literal of the parameter's type.
-    Literal { value: serde_json::Value },
-    /// A parameter of the calling workflow.
-    Param { name: String },
-    /// A field a direct dependency declares in `emits`.
+    Literal {
+        value: serde_json::Value,
+    },
+    Param {
+        name: String,
+    },
     Field {
         producer: TaskName,
         field: OutputField,
     },
-    /// A path a direct dependency declares in `emits_files`.
-    File { producer: TaskName, path: String },
-    /// A mapped call's item, or one field of it.
+    File {
+        producer: TaskName,
+        path: String,
+    },
     Item {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         field: Option<OutputField>,
@@ -28,7 +30,6 @@ pub enum Binding {
 }
 
 impl Binding {
-    /// The dependency the value is read from, when it is read from one.
     pub fn producer(&self) -> Option<&TaskName> {
         match self {
             Binding::Field { producer, .. } | Binding::File { producer, .. } => Some(producer),
