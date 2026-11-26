@@ -257,6 +257,8 @@ pub(crate) struct Frame {
     pub(crate) links: usize,
     pub(crate) picked: Option<String>,
     pub(crate) kind: CallKind,
+    pub(crate) entries: Vec<String>,
+    pub(crate) exits: Vec<String>,
 }
 
 impl Default for Frame {
@@ -268,6 +270,8 @@ impl Default for Frame {
             links: 0,
             picked: None,
             kind: CallKind::Playbook,
+            entries: Vec::new(),
+            exits: Vec::new(),
         }
     }
 }
@@ -383,6 +387,17 @@ pub(crate) fn frame(
         }
     }
     let fed: HashSet<usize> = edges.iter().map(|(_, to)| *to).collect();
+    let feeds: HashSet<usize> = edges.iter().map(|(from, _)| *from).collect();
+    let entries = shown
+        .iter()
+        .filter(|n| !fed.contains(n))
+        .map(|n| format!("{anchor}c{n}"))
+        .collect();
+    let exits = shown
+        .iter()
+        .filter(|n| !feeds.contains(n))
+        .map(|n| format!("{anchor}c{n}"))
+        .collect();
     let mut nodes = shown.len();
     let mut links = 0;
     let anchored = at.instance.is_some();
@@ -416,6 +431,8 @@ pub(crate) fn frame(
         links,
         picked,
         kind,
+        entries,
+        exits,
     }
 }
 

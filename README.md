@@ -172,7 +172,7 @@ workflow(type = "playbook", tasks = [prep, ci, summary], result = summary)
   <img src="docs/img/calls-gitlab.png" alt="A GitLab pipeline drawn in GitLab orange inside its caller's graph: build, a two-job test stage and report, titled crucible-call-demo #4, between the prep and report tasks." width="800">
 </p>
 <p align="center">
-  <img src="docs/img/calls-konflux.png" alt="A watch on Konflux: the two Pipelines-as-Code PipelineRuns a pull request commit started, both passed, feeding a report task that reads their image digests." width="800">
+  <img src="docs/img/calls-konflux.png" alt="A pr task pushes a pull request and hands its commit to a watch on Konflux, which waits for the two Pipelines-as-Code PipelineRuns that commit started. Both passed, and the report task reads their image digests." width="800">
 </p>
 
 When it saves a pack, the controller writes `calls.lock`. The lock pins each target (a playbook

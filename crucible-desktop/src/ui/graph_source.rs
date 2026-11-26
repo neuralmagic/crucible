@@ -517,6 +517,7 @@ pub(crate) fn mermaid_source<'a>(tasks: &'a [TaskView], shown: &Shown, ink: &Ink
     let critical = critical_path(tasks);
     let above = ancestors(tasks);
     let (mut faded, mut heavy) = (Vec::new(), Vec::new());
+    let mut ranks: Vec<String> = Vec::new();
     for (to, task) in tasks.iter().enumerate() {
         let passed_over = matches!(
             task.state(),
@@ -622,6 +623,20 @@ pub(crate) fn mermaid_source<'a>(tasks: &'a [TaskView], shown: &Shown, ink: &Ink
                 format!("t{to}")
             };
             source.push_str(&format!("  {source_id} {arrow}{label} {target_id}\n"));
+            if open_frame(to)
+                && let Some(frame) = frames.get(to).and_then(Option::as_ref)
+            {
+                for entry in &frame.entries {
+                    ranks.push(format!("  {source_id} ~~~ {entry}\n"));
+                }
+            }
+            if let Some(f) = from.filter(|&f| source_id == format!("g{f}") && open_frame(f))
+                && let Some(frame) = frames.get(f).and_then(Option::as_ref)
+            {
+                for exit in &frame.exits {
+                    ranks.push(format!("  {exit} ~~~ {target_id}\n"));
+                }
+            }
             if passed_over {
                 faded.push(edge.to_string());
             } else if from.is_some_and(|f| critical.contains(&(f, to))) {
@@ -701,6 +716,9 @@ pub(crate) fn mermaid_source<'a>(tasks: &'a [TaskView], shown: &Shown, ink: &Ink
             id(open),
             ink.accent.hex()
         ));
+    }
+    for rank in ranks {
+        source.push_str(&rank);
     }
     source
 }
@@ -1391,7 +1409,9 @@ mod tests {
         let open = called(&tasks, None, &[], &targets, &[]);
         contains_all(
             &open,
-            &["  subgraph g1 [\"ship \u{b7} release \u{b7} app #10\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\"]\n"],
+            &[
+                "  subgraph g1 [\"ship \u{b7} release \u{b7} app #10\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\"]\n",
+            ],
         );
         let folded = called(&tasks, None, &[], &targets, &["ship"]);
         contains_all(
@@ -1401,7 +1421,9 @@ mod tests {
         let unnumbered = called(&tasks, None, &[], &Targets::new(&shipping(), None), &[]);
         contains_all(
             &unnumbered,
-            &["  subgraph g1 [\"ship \u{b7} release \u{b7} app\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\"]\n"],
+            &[
+                "  subgraph g1 [\"ship \u{b7} release \u{b7} app\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\"]\n",
+            ],
         );
     }
 
@@ -1452,6 +1474,65 @@ mod tests {
         };
         assert!(stroke("job_gitlab_pipeline").is_some(), "{open}");
         assert_ne!(stroke("job_gitlab_pipeline"), stroke("job_github_workflow"));
+        let style = rune_mermaid::DiagramStyle::neutral(true);
+        assert!(
+            rune_mermaid::render_with_hover(&open, &style, rune_mermaid::Hover::Off, Color::WHITE)
+                .is_some(),
+            "{open}"
+        );
+    }
+
+    const WATCHED: &str = concat!(
+        r#"{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":1.0,"tasks":["#,
+        r#"{"name":"pr","kind":"command","required":true},"#,
+        r#"{"name":"builds","kind":"call","depends_on":["pr"],"required":true,"call":{"alias":"konflux","target":"tekton","params":{"commit":"pr"}}},"#,
+        r#"{"name":"report","kind":"command","depends_on":["builds"],"required":true}"#,
+        r#"]}"#,
+        "\n",
+        r#"{"v":1,"kind":"call_dispatched","task":"builds","attempt":1,"alias":"konflux","call":"c-1","handle":{"kind":"tekton_watch","cluster":"k","namespace":"tenant","commit":"abc"}}"#,
+        "\n",
+    );
+
+    #[test]
+    fn a_frame_of_unconnected_runs_ranks_each_between_its_callers_neighbours() {
+        let tasks = fold(WATCHED);
+        let view = serde_json::from_value(serde_json::json!({
+            "task": "builds",
+            "attempt": 1,
+            "alias": "konflux",
+            "kind": "tekton",
+            "state": {
+                "call": "c-1",
+                "status": "passed",
+                "handle": {"kind": "tekton_watch", "cluster": "k", "namespace": "tenant", "commit": "abc"},
+                "progress": {
+                    "nodes": [
+                        {"id": "server", "label": "server", "status": "pass"},
+                        {"id": "operator", "label": "operator", "status": "pass"}
+                    ],
+                    "edges": []
+                }
+            }
+        }))
+        .unwrap();
+        let calls = vec![LiveCall { view, launch: None }];
+        let targets = Targets::new(&calls, None);
+        let open = called(&tasks, None, &[], &targets, &[]);
+        let ranks = [
+            "  t0 ~~~ t1c0\n",
+            "  t0 ~~~ t1c1\n",
+            "  t1c0 ~~~ t2\n",
+            "  t1c1 ~~~ t2\n",
+        ];
+        contains_all(&open, &["t0 -->|commit| g1\n", "g1 --> t2\n"]);
+        contains_all(&open, &ranks);
+        let first_rank = ranks.iter().filter_map(|r| open.find(r)).min().unwrap();
+        let last_style = open.rfind("linkStyle").unwrap_or(0);
+        let last_class = open.rfind("  class ").unwrap_or(0);
+        assert!(
+            first_rank > last_style && first_rank > last_class,
+            "ranking links come after every styled edge: {open}"
+        );
         let style = rune_mermaid::DiagramStyle::neutral(true);
         assert!(
             rune_mermaid::render_with_hover(&open, &style, rune_mermaid::Hover::Off, Color::WHITE)
