@@ -12,7 +12,7 @@ struct Linked {
     login: String,
 }
 
-fn controller(target: &Target) -> Result<crux::Client, String> {
+pub(crate) fn controller(target: &Target) -> Result<crux::Client, String> {
     let config = target.config()?;
     let wire = crux::client::HttpTransport::with_client(&config, target.http()?)
         .map_err(|e| format!("{e:#}"))?;

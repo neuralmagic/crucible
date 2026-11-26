@@ -393,11 +393,9 @@ pub async fn within<T, E: std::fmt::Display>(
     what: &str,
     call: impl Future<Output = Result<T, E>>,
 ) -> Result<T, String> {
-    match timeout(TIMEOUT, call).await {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(error)) => Err(format!("{error:#}")),
-        Err(_) => Err(format!("{what} timed out after {}s", TIMEOUT.as_secs())),
-    }
+    bounded(what, call)
+        .await?
+        .map_err(|error| format!("{error:#}"))
 }
 
 #[cfg(test)]

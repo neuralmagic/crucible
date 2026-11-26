@@ -18,6 +18,7 @@ use crate::identity::forge::links::{self, ForgeLink, LinkError};
 use crate::identity::forge::{Forge, ForgeHost};
 
 pub(crate) const FORGE_ACCOUNTS_PATH: &str = "/api/me/forge-accounts";
+pub(crate) const FORGE_APPS_PATH: &str = "/api/me/forge-apps";
 pub(crate) const FORGE_ACCOUNT_PATH: &str = "/api/me/forge-accounts/{forge}/{host}";
 
 const FORGE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -44,6 +45,46 @@ impl From<ForgeLink> for ForgeAccountDto {
             id: link.account_id,
         }
     }
+}
+
+/// A forge host this controller links accounts on, and the OAuth client people sign in with.
+#[derive(Debug, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ForgeAppDto {
+    pub forge: Forge,
+    pub host: String,
+    pub client_id: Option<String>,
+    pub keeps_tokens: bool,
+}
+
+fn forge_apps(state: &ApiState) -> Vec<ForgeAppDto> {
+    let github = state.calls_github.map(|_| ForgeAppDto {
+        forge: Forge::Github,
+        host: ForgeHost::github().as_str().to_owned(),
+        client_id: state.github_client_id.clone(),
+        keeps_tokens: keeps_tokens(state, Forge::Github),
+    });
+    let gitlab = state
+        .gitlab_hosts
+        .iter()
+        .filter(|_| state.calls_gitlab.is_some())
+        .map(|host| ForgeAppDto {
+            forge: Forge::Gitlab,
+            host: host.as_str().to_owned(),
+            client_id: state.gitlab_client_ids.get(host).cloned(),
+            keeps_tokens: keeps_tokens(state, Forge::Gitlab),
+        });
+    github.into_iter().chain(gitlab).collect()
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/me/forge-apps",
+    responses(
+        (status = 200, description = "The forge hosts this controller links accounts on, with their OAuth clients", body = [ForgeAppDto])
+    )
+)]
+pub(crate) async fn list_forge_apps(State(state): State<ApiState>) -> Json<Vec<ForgeAppDto>> {
+    Json(forge_apps(&state))
 }
 
 fn person(caller: &Caller) -> Result<&str, &'static str> {
@@ -367,6 +408,51 @@ mod tests {
             ]),
             ..ApiState::test(Db::new(pool))
         }
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn the_controller_names_the_apps_people_sign_in_with(pool: PgPool) {
+        let gl = ForgeHost::parse("gitlab.example.com").unwrap();
+        let other = ForgeHost::parse("gl.other.io").unwrap();
+        let state = ApiState {
+            calls_github: Some(crate::calls::GithubToken::AppInstallation),
+            github_client_id: Some("Iv23abc".into()),
+            calls_gitlab: Some(crate::calls::GitlabToken::Bot),
+            gitlab_hosts: std::sync::Arc::new(vec![gl.clone(), other]),
+            gitlab_client_ids: std::sync::Arc::new([(gl, "glid".to_owned())].into()),
+            ..ApiState::test(Db::new(pool.clone()))
+        };
+        let app = crate::api::router(state);
+        let (status, body) = send(&app, "GET", FORGE_APPS_PATH, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let apps: Vec<ForgeAppDto> = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            apps,
+            [
+                ForgeAppDto {
+                    forge: Forge::Github,
+                    host: "github.com".into(),
+                    client_id: Some("Iv23abc".into()),
+                    keeps_tokens: false,
+                },
+                ForgeAppDto {
+                    forge: Forge::Gitlab,
+                    host: "gitlab.example.com".into(),
+                    client_id: Some("glid".into()),
+                    keeps_tokens: false,
+                },
+                ForgeAppDto {
+                    forge: Forge::Gitlab,
+                    host: "gl.other.io".into(),
+                    client_id: None,
+                    keeps_tokens: false,
+                },
+            ]
+        );
+
+        let quiet = crate::api::router(ApiState::test(Db::new(pool)));
+        let (status, body) = send(&quiet, "GET", FORGE_APPS_PATH, None).await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "[]"));
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]

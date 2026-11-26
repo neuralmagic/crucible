@@ -569,6 +569,8 @@ pub struct App {
     #[cfg(not(target_arch = "wasm32"))]
     pub forge: std::collections::BTreeMap<forge::Account, forge::session::Session>,
     #[cfg(not(target_arch = "wasm32"))]
+    pub forge_offers: forge::apps::Offers,
+    #[cfg(not(target_arch = "wasm32"))]
     pub github_client_id: TextEdit,
     #[cfg(not(target_arch = "wasm32"))]
     pub gitlab_host: TextEdit,

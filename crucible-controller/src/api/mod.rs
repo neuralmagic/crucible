@@ -59,6 +59,7 @@ pub(crate) mod tests;
         crate::calls::reader::node_log,
         crate::calls::reader::write_lock,
         crate::identity::api::forge::list_forge_accounts,
+        crate::identity::api::forge::list_forge_apps,
         crate::identity::api::forge::put_forge_account,
         crate::identity::api::forge::delete_forge_account,
         crate::launches::param_files::put,
@@ -218,6 +219,7 @@ pub(crate) mod tests;
     components(schemas(
         crate::identity::api::forge::ForgeTokenBody,
         crate::identity::api::forge::ForgeAccountDto,
+        crate::identity::api::forge::ForgeAppDto,
         crate::identity::forge::Forge,
         system::Health,
         system::Whoami,
@@ -805,6 +807,10 @@ pub fn router(state: ApiState) -> Router {
         .route(
             crate::identity::api::forge::FORGE_ACCOUNTS_PATH,
             get(crate::identity::api::forge::list_forge_accounts),
+        )
+        .route(
+            crate::identity::api::forge::FORGE_APPS_PATH,
+            get(crate::identity::api::forge::list_forge_apps),
         )
         .route(
             crate::identity::api::forge::FORGE_ACCOUNT_PATH,

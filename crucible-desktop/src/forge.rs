@@ -9,11 +9,12 @@
 //! PUT <controller>/api/me/forge-accounts/<forge>/<host> {token} ──▶ the controller records it
 //! ```
 
+pub mod apps;
 pub mod device;
 pub mod link;
 pub mod session;
 
-const GITHUB_HOST: &str = "github.com";
+pub(crate) const GITHUB_HOST: &str = "github.com";
 const GITLAB_SCOPE: &str = "api";
 
 /// An account on one forge host.

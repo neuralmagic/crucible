@@ -67,6 +67,8 @@ pub struct Tokens {
     refresh: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expires_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_id: Option<String>,
 }
 
 impl std::fmt::Debug for Tokens {
@@ -78,6 +80,10 @@ impl std::fmt::Debug for Tokens {
 impl Tokens {
     pub(crate) fn access(&self) -> &str {
         &self.access
+    }
+
+    pub fn client_id<'a>(&'a self, fallback: &'a str) -> &'a str {
+        self.client_id.as_deref().unwrap_or(fallback)
     }
 
     fn due(&self, now: i64) -> bool {
@@ -274,6 +280,7 @@ pub fn finish(
                     access: issued.access,
                     refresh: issued.refresh,
                     expires_at: issued.expires_at,
+                    client_id: Some(client_id.to_string()),
                 });
             }
         }
@@ -295,7 +302,10 @@ pub fn revoke(
         .block_on(form::<serde_json::Value>(
             &http,
             &url,
-            &[("client_id", client_id), ("token", tokens.access())],
+            &[
+                ("client_id", tokens.client_id(client_id)),
+                ("token", tokens.access()),
+            ],
             &doing,
         ))
         .map(|_| ())
@@ -316,12 +326,13 @@ pub fn current(
             account.name()
         ));
     };
+    let client_id = tokens.client_id(client_id).to_string();
     let http = client()?;
     let answer: TokenAnswer = runtime.block_on(form(
         &http,
         &account.token_url(),
         &[
-            ("client_id", client_id),
+            ("client_id", client_id.as_str()),
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh),
         ],
@@ -333,6 +344,7 @@ pub fn current(
             access: issued.access,
             refresh: issued.refresh.or(tokens.refresh),
             expires_at: issued.expires_at,
+            client_id: Some(client_id),
         }),
         Poll::Failed(why) => Err(format!("{}: {why}; sign in again", account.name())),
         Poll::Pending | Poll::SlowDown(_) => {
@@ -438,6 +450,7 @@ mod tests {
             access: "ghu_secret".into(),
             refresh: Some("ghr_secret".into()),
             expires_at: Some(10_000),
+            client_id: None,
         };
         assert!(!tokens.due(10_000 - RENEW_BEFORE - 1));
         assert!(tokens.due(10_000 - RENEW_BEFORE));
@@ -449,6 +462,17 @@ mod tests {
         assert!(!lasting.due(i64::MAX));
         let shown = format!("{tokens:?}");
         assert!(!shown.contains("secret"), "{shown}");
+        assert_eq!(tokens.client_id("set"), "set");
+        let issued = Tokens {
+            client_id: Some("issuer".into()),
+            ..tokens.clone()
+        };
+        assert_eq!(issued.client_id("set"), "issuer");
+        let kept: Tokens = serde_json::from_value(serde_json::json!({
+            "login": "wren", "access": "a"
+        }))
+        .unwrap();
+        assert_eq!(kept.client_id("set"), "set");
     }
 
     #[test]

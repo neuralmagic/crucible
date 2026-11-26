@@ -161,6 +161,7 @@ pub struct ApiState {
     /// The issuer whose people grant the consent page decides; `None` when it serves no people.
     pub(crate) people_issuer: Option<Arc<crate::agent_auth::AgentAuth>>,
     pub(crate) calls_github: Option<crate::calls::GithubToken>,
+    pub(crate) github_client_id: Option<String>,
     pub(crate) calls_tekton:
         Result<std::collections::BTreeMap<String, crate::calls::tekton::TektonCluster>, String>,
     pub(crate) github_logins: crate::identity::github_logins::GithubLogins,
@@ -274,6 +275,12 @@ impl ApiState {
             images_refresh: Arc::new(tokio::sync::Notify::new()),
             policy,
             calls_github: cfg.calls_github_token,
+            github_client_id: cfg
+                .github_client_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned),
             calls_tekton: cfg.calls_tekton_clusters(),
             github_logins: cfg.github_logins(),
             forge_signed_in: cfg.forge_signed_in.clone(),
@@ -414,6 +421,7 @@ impl ApiState {
             policy: crate::authz::policy::ActivePolicy::default_set()
                 .expect("the shipped default policy set loads"),
             calls_github: None,
+            github_client_id: None,
             calls_tekton: Ok(Default::default()),
             github_logins: Default::default(),
             forge_signed_in: Default::default(),

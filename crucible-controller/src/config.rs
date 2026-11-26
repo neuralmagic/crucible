@@ -753,6 +753,8 @@ pub struct ControllerCfg {
         default_value = ""
     )]
     pub github_logins: Vec<String>,
+    #[arg(long = "github-client-id", env = "CONTROLLER_GITHUB_CLIENT_ID")]
+    pub github_client_id: Option<String>,
     #[arg(
         long = "calls-tekton-cluster",
         env = "CONTROLLER_CALLS_TEKTON_CLUSTERS",

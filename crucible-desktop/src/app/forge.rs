@@ -5,6 +5,7 @@ use std::sync::mpsc::{Sender, channel};
 
 use crate::App;
 use crate::forge::Account;
+use crate::forge::apps::{self, Offered};
 use crate::forge::device::{self, Tokens};
 use crate::forge::link::{self, LinkError};
 use crate::forge::session::{Event, Session};
@@ -42,6 +43,56 @@ fn link_now(
 }
 
 impl App {
+    pub fn forge_offered(&self) -> &[Offered] {
+        self.forge_offers.of(&self.remote.target.name)
+    }
+
+    pub fn forge_accounts(&self) -> Vec<Account> {
+        let mut accounts = self.settings.forge_accounts();
+        for account in self.forge_offered().iter().filter_map(Offered::account) {
+            if !accounts.contains(&account) {
+                accounts.push(account);
+            }
+        }
+        accounts
+    }
+
+    pub fn forge_client_id(&self, account: &Account) -> String {
+        self.forge_offered()
+            .iter()
+            .filter(|o| o.account().as_ref() == Some(account))
+            .find_map(|o| o.client_id.clone())
+            .unwrap_or_else(|| self.settings.client_id(account))
+    }
+
+    fn follow_forge_apps(&mut self, ready: bool) -> bool {
+        let now = device::unix_now();
+        let mut changed = self.forge_offers.heard(now);
+        let profile = self.remote.target.name.clone();
+        if !ready || !self.forge_offers.due(&profile, now) {
+            return changed;
+        }
+        let Ok(runtime) = self.net.handle() else {
+            return changed;
+        };
+        let target = self.remote.target.clone();
+        let waker = self.waker.clone();
+        let (tx, rx) = channel();
+        let spawned = std::thread::Builder::new()
+            .name("crucible-playbooks-forge-apps".into())
+            .spawn(move || {
+                let _ = tx.send(apps::offered(&runtime, &target));
+                if let Some(waker) = waker {
+                    waker();
+                }
+            });
+        if spawned.is_ok() {
+            self.forge_offers.asking(&profile, rx);
+            changed = true;
+        }
+        changed
+    }
+
     fn forge_session(&mut self, account: &Account) -> &mut Session {
         self.forge.entry(account.clone()).or_default()
     }
@@ -50,7 +101,7 @@ impl App {
         if self.forge_session(&account).busy {
             return;
         }
-        let client_id = self.settings.client_id(&account);
+        let client_id = self.forge_client_id(&account);
         if client_id.is_empty() {
             self.forge_session(&account).error = Some("set the client ID first".into());
             return;
@@ -156,7 +207,7 @@ impl App {
         let Ok(runtime) = self.net.handle() else {
             return;
         };
-        let client_id = self.settings.client_id(&account);
+        let client_id = self.forge_client_id(&account);
         let _ = std::thread::Builder::new()
             .name("crucible-playbooks-forge-unlink".into())
             .spawn(move || {
@@ -208,7 +259,7 @@ impl App {
                 return;
             }
         };
-        let client_id = self.settings.client_id(account);
+        let client_id = self.forge_client_id(account);
         let target = self.remote.target.clone();
         let keys = self.settings.keys();
         let waker = self.waker.clone();
@@ -288,10 +339,10 @@ impl App {
     }
 
     pub(crate) fn follow_forge_accounts(&mut self) -> bool {
-        let mut changed = false;
         let ready = self.remote.target.readiness() == Readiness::Ready;
+        let mut changed = self.follow_forge_apps(ready);
         let profile = self.remote.target.name.clone();
-        for account in self.settings.forge_accounts() {
+        for account in self.forge_accounts() {
             if !self.forge_session(&account).loaded {
                 let login = self
                     .settings

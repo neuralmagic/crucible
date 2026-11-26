@@ -414,8 +414,15 @@ fn account_control(app: &App, account: &crate::forge::Account, p: &Paint) -> El 
 #[cfg(not(target_arch = "wasm32"))]
 fn accounts_section(app: &App, p: &Paint) -> Option<El> {
     use crate::forge::Account;
-    let mut rows = vec![
-        setting_row(
+    let offered: Vec<(Account, Option<String>)> = app
+        .forge_offered()
+        .iter()
+        .filter_map(|o| o.account().map(|a| (a, o.client_id.clone())))
+        .collect();
+    let named_here = |account: &Account| offered.iter().any(|(a, id)| a == account && id.is_some());
+    let mut rows = Vec::new();
+    if !named_here(&Account::Github) {
+        rows.push(setting_row(
             "GitHub App client ID",
             TextInput::new(&app.github_client_id)
                 .placeholder("Iv23\u{2026}")
@@ -428,11 +435,18 @@ fn accounts_section(app: &App, p: &Paint) -> Option<El> {
                 .build(p.k)
                 .key("github-client-id"),
             p,
-        ),
-        setting_row("GitHub", account_control(app, &Account::Github, p), p),
-    ];
-    for (host, client_id) in &app.settings.gitlab_apps {
-        let account = Account::Gitlab(host.clone());
+        ));
+    }
+    rows.push(setting_row(
+        "GitHub",
+        account_control(app, &Account::Github, p),
+        p,
+    ));
+    for account in app.forge_accounts() {
+        let Account::Gitlab(host) = &account else {
+            continue;
+        };
+        let own = app.settings.gitlab_apps.contains_key(host);
         let remove = host.clone();
         rows.push(rule(&format!("gitlab-sep-{host}"), false, p));
         rows.push(setting_row(
@@ -442,19 +456,19 @@ fn accounts_section(app: &App, p: &Paint) -> Option<El> {
                 .center_y()
                 .child(account_control(app, &account, p))
                 .child(
-                    text(client_id.clone())
+                    text(app.forge_client_id(&account))
                         .font(p.mono(11.0, 400.0))
                         .color(p.c.text_faint)
                         .truncate(),
                 )
-                .child(
+                .children((own && !named_here(&account)).then(|| {
                     Button::new("Remove")
                         .variant(ButtonVariant::Ghost)
                         .control_size(rune_kit::ControlSize::Small)
                         .on_press(move |app: &mut App| app.remove_gitlab_host(remove.clone()))
                         .build(p.k)
-                        .key(format!("gitlab-remove-{host}")),
-                ),
+                        .key(format!("gitlab-remove-{host}"))
+                })),
             p,
         ));
     }
@@ -494,7 +508,7 @@ fn accounts_section(app: &App, p: &Paint) -> Option<El> {
             ),
         p,
     ));
-    for account in app.settings.forge_accounts() {
+    for account in app.forge_accounts() {
         if let Some(why) = app.forge.get(&account).and_then(|s| s.error.as_ref()) {
             rows.push(
                 text(format!("{}: {why}", account.name()))

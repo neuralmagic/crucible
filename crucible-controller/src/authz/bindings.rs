@@ -230,6 +230,7 @@ pub static BINDINGS: &[Binding] = &[
         V::Read,
         Route,
     ),
+    bind("GET", "/api/me/forge-apps", R::UserPrefs, V::Read, Route),
     bind(
         "PUT",
         "/api/me/forge-accounts/{forge}/{host}",
