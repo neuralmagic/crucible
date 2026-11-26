@@ -43,6 +43,40 @@ pub struct RunGraph {
     pub tasks: BTreeMap<String, TaskDetail>,
 }
 
+pub const APPLICATION_LABEL: &str = "appstudio.openshift.io/application";
+
+pub fn run_link(run: &PipelineRun) -> Option<NodeLink> {
+    run.metadata
+        .annotations
+        .get(LOG_URL_ANNOTATION)
+        .and_then(|u| ExternalUrl::new(u).ok())
+        .map(|url| NodeLink::External { url })
+}
+
+pub fn task_run_link(run: &PipelineRun, task_run: &str) -> Option<NodeLink> {
+    let log_url = run.metadata.annotations.get(LOG_URL_ANNOTATION)?;
+    let page = url::Url::parse(log_url).ok()?;
+    let namespace = run.metadata.namespace.as_deref()?;
+    if !page.path().starts_with(&format!("/ns/{namespace}/")) {
+        return None;
+    }
+    let mut url = page.clone();
+    url.set_query(None);
+    url.set_fragment(None);
+    {
+        let mut segments = url.path_segments_mut().ok()?;
+        segments.clear().push("ns").push(namespace);
+        match run.metadata.labels.get(APPLICATION_LABEL) {
+            Some(app) => segments.push("applications").push(app),
+            None => segments.push("pipelineruns").push(&run.metadata.name),
+        };
+        segments.push("taskruns").push(task_run);
+    }
+    ExternalUrl::new(url.as_str())
+        .ok()
+        .map(|url| NodeLink::External { url })
+}
+
 pub fn run_graph(run: &PipelineRun, task_runs: &[TaskRun]) -> RunGraph {
     let Some(status) = &run.status else {
         return empty();
@@ -60,12 +94,7 @@ pub fn run_graph(run: &PipelineRun, task_runs: &[TaskRun]) -> RunGraph {
         .map(|s| s.name.as_str())
         .collect();
     let run_ended = succeeded(&status.conditions).is_some_and(|c| c.status != "Unknown");
-    let link = run
-        .metadata
-        .annotations
-        .get(LOG_URL_ANNOTATION)
-        .and_then(|u| ExternalUrl::new(u).ok())
-        .map(|url| NodeLink::External { url });
+    let link = run_link(run);
 
     let mut nodes = Vec::new();
     let mut tasks = BTreeMap::new();
@@ -123,7 +152,7 @@ pub fn run_graph(run: &PipelineRun, task_runs: &[TaskRun]) -> RunGraph {
                 started: st.start_time.clone(),
                 ended: st.completion_time.clone(),
                 detail: None,
-                link: link.clone(),
+                link: task_run_link(run, &task_run.metadata.name).or_else(|| link.clone()),
             });
             tasks.insert(
                 id,
@@ -689,5 +718,43 @@ mod tests {
         .expect("task parses");
         let deps: Vec<String> = dependencies(&task).into_iter().collect();
         assert_eq!(deps, ["clone", "gate", "init", "prefetch"]);
+    }
+
+    #[test]
+    fn task_nodes_link_their_konflux_task_run_page_under_the_runs_ui() {
+        use crate::tekton::graph::{run_link, task_run_link};
+        let run = |labels: serde_json::Value, log_url: &str| -> crate::tekton::model::PipelineRun {
+            serde_json::from_value(json!({
+                "metadata": {
+                    "name": "app-on-push-x1",
+                    "namespace": "tenant",
+                    "labels": labels,
+                    "annotations": {"pipelinesascode.tekton.dev/log-url": log_url},
+                },
+            }))
+            .unwrap()
+        };
+        let url = |link: Option<NodeLink>| match link {
+            Some(NodeLink::External { url }) => url.as_str().to_owned(),
+            other => panic!("{other:?}"),
+        };
+        let ui = "https://konflux.example.com/ns/tenant/pipelinerun/app-on-push-x1";
+        let with_app = run(json!({"appstudio.openshift.io/application": "my-app"}), ui);
+        assert_eq!(url(run_link(&with_app)), ui);
+        assert_eq!(
+            url(task_run_link(&with_app, "app-on-push-x1-build")),
+            "https://konflux.example.com/ns/tenant/applications/my-app/taskruns/app-on-push-x1-build"
+        );
+        let bare = run(json!({}), ui);
+        assert_eq!(
+            url(task_run_link(&bare, "tr")),
+            "https://konflux.example.com/ns/tenant/pipelineruns/app-on-push-x1/taskruns/tr"
+        );
+        let console = run(
+            json!({}),
+            "https://console.example.com/k8s/ns/tenant/tekton.dev~v1~PipelineRun/x",
+        );
+        assert!(task_run_link(&console, "tr").is_none());
+        assert!(task_run_link(&run(json!({}), "not a url"), "tr").is_none());
     }
 }

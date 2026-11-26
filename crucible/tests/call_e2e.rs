@@ -262,6 +262,7 @@ impl Controller {
                             "200 OK",
                             &CallState {
                                 run_number: None,
+                                links: Vec::new(),
                                 call: CallId(id.to_string()),
                                 status: if running {
                                     CallStatus::Running

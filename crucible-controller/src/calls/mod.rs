@@ -155,6 +155,16 @@ pub(crate) struct Polled {
     pub progress: ProgressGraph,
     pub recorded: serde_json::Map<String, Value>,
     pub outcome: Option<Outcome>,
+    pub link: Option<NodeLink>,
+}
+
+pub(crate) fn record_links(
+    recorded: &mut serde_json::Map<String, Value>,
+    links: &[crucible_contract::calls::NamedLink],
+) {
+    if let Ok(value) = serde_json::to_value(links) {
+        recorded.insert(crucible_contract::calls::LINKS_DETAIL_KEY.to_owned(), value);
+    }
 }
 
 /// A dispatched call as the store holds it, which every operation after dispatch reads.

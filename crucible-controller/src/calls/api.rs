@@ -468,6 +468,11 @@ pub(crate) async fn reread(ctx: &CallCtx, record: CallRecord) -> anyhow::Result<
 pub(crate) fn state_of(record: CallRecord) -> Option<CallState> {
     Some(CallState {
         run_number: record.detail.get("run_number").and_then(Value::as_u64),
+        links: record
+            .detail
+            .get(crucible_contract::calls::LINKS_DETAIL_KEY)
+            .and_then(|links| serde_json::from_value(links.clone()).ok())
+            .unwrap_or_default(),
         handle: record.handle?,
         call: record.id,
         status: record.status,

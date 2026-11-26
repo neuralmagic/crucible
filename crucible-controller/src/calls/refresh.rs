@@ -128,12 +128,16 @@ pub(crate) async fn refresh(
             progress,
             recorded,
             outcome,
+            link,
         }) => {
             let new = recorded
                 .iter()
                 .any(|(key, value)| record.detail.get(key) != Some(value));
             if new {
                 crate::calls::store::noted(pool, &record.id, &recorded).await?;
+            }
+            if let Some(link) = link.filter(|link| record.link.as_ref() != Some(link)) {
+                crate::calls::store::linked(pool, &record.id, &link).await?;
             }
             match outcome {
                 Some(outcome) => {

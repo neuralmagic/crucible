@@ -159,6 +159,7 @@ impl TargetBackend for GithubWorkflowBackend {
                     outcome: Some(Outcome::failed(format!(
                         "{moved}; run {run_id} was cancelled"
                     ))),
+                    link: None,
                 });
             }
         }
@@ -185,6 +186,7 @@ impl TargetBackend for GithubWorkflowBackend {
             progress: polled.progress,
             recorded,
             outcome,
+            link: None,
         })
     }
 

@@ -1038,7 +1038,19 @@ pub struct CallState {
     pub link: Option<NodeLink>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_number: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<NamedLink>,
 }
+
+/// A page of a target run's system worth opening, such as one of its runs, its commit or its
+/// pull request, under the name a reader sees.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamedLink {
+    pub label: String,
+    pub url: ExternalUrl,
+}
+
+pub const LINKS_DETAIL_KEY: &str = "links";
 
 /// One call of a run, as a reader of the run sees it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1429,6 +1441,10 @@ mod tests {
 
         let state = CallState {
             run_number: Some(12),
+            links: vec![NamedLink {
+                label: "Commit".into(),
+                url: ExternalUrl::new("https://github.com/acme/app/commit/abc").unwrap(),
+            }],
             call: CallId("c-1".into()),
             status: CallStatus::Passed,
             note: String::new(),

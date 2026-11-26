@@ -10,6 +10,8 @@
 //!   cancel   ─▶ nothing: a watch started none of the runs
 //! ```
 
+mod links;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -710,10 +712,23 @@ impl TargetBackend for TektonBackend {
             serde_json::to_value(&detail.results_read_at)
                 .map_err(|e| CallError::Internal(e.into()))?,
         );
+        let known: Vec<crucible_contract::calls::NamedLink> = call
+            .detail
+            .get(crucible_contract::calls::LINKS_DETAIL_KEY)
+            .and_then(|l| serde_json::from_value(l.clone()).ok())
+            .unwrap_or_default();
+        let runs: BTreeMap<String, String> = detail
+            .matched
+            .iter()
+            .map(|(name, m)| (name.clone(), m.pipeline_run.clone()))
+            .collect();
+        let (named, link) = links::watch_links(&runs, &candidates, &known);
+        crate::calls::record_links(&mut recorded, &named);
         Ok(Polled {
             progress: watch_graph(t.expected, &views),
             recorded,
             outcome,
+            link,
         })
     }
 

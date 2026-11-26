@@ -169,6 +169,7 @@ impl TargetBackend for GitlabPipelineBackend {
             progress: polled.progress,
             recorded,
             outcome,
+            link: None,
         })
     }
 

@@ -652,6 +652,7 @@ impl TargetBackend for PlaybookBackend {
             progress,
             recorded: serde_json::Map::new(),
             outcome: outcome(ctx, call).await?,
+            link: None,
         })
     }
 

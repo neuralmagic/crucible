@@ -253,6 +253,16 @@ pub(crate) async fn noted(
     Ok(())
 }
 
+pub(crate) async fn linked(pool: &PgPool, id: &CallId, link: &NodeLink) -> Result<()> {
+    sqlx::query("UPDATE call_target_runs SET link = $2 WHERE id = $1")
+        .bind(&id.0)
+        .bind(serde_json::to_value(link)?)
+        .execute(pool)
+        .await
+        .context("recording a call's target run page")?;
+    Ok(())
+}
+
 pub(crate) async fn touched(pool: &PgPool, id: &CallId) -> Result<()> {
     sqlx::query("UPDATE call_target_runs SET updated_at = $2 WHERE id = $1")
         .bind(&id.0)
