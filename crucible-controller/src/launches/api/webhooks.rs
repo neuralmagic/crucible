@@ -469,6 +469,7 @@ async fn authorize_webhook(
                 params,
                 max_cost: body.max_cost,
                 max_time,
+                files: Vec::new(),
             },
             verifier,
             derive,

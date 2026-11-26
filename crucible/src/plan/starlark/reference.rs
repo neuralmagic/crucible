@@ -481,7 +481,10 @@ pub fn functions() -> Vec<Function> {
                       input, or a skill argument; `str()`, `%`, `.format()`, and string methods \
                       on it are refused, as is a value carrying the marker text. A command or \
                       evaluate task reads it from `params` in the inputs JSON at \
-                      `CRUCIBLE_INPUTS_FILE` instead of its command line.",
+                      `CRUCIBLE_INPUTS_FILE` instead of its command line. A json or file \
+                      parameter binds a call's parameter, or reaches an agent's prompt or a skill \
+                      argument only inside the external-input markers: a json value as JSON, a \
+                      file as its read-only copy under `inputs/params/<name>/`.",
             positional: Some("name"),
             kwargs: vec![],
         },

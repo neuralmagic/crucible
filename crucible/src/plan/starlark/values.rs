@@ -466,7 +466,7 @@ impl ExternalText {
         }])
     }
 
-    fn joined(before: &[Segment], after: &[Segment]) -> Self {
+    pub(crate) fn joined(before: &[Segment], after: &[Segment]) -> Self {
         let mut segments: Vec<Segment> = Vec::with_capacity(before.len() + after.len());
         for segment in before.iter().chain(after) {
             match segments.last_mut() {
@@ -479,7 +479,7 @@ impl ExternalText {
         ExternalText(segments)
     }
 
-    fn plain(text: &str) -> Vec<Segment> {
+    pub(crate) fn plain(text: &str) -> Vec<Segment> {
         vec![Segment {
             text: text.to_owned(),
             external: false,

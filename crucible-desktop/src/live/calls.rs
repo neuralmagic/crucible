@@ -86,10 +86,7 @@ pub enum Jump {
 
 /// What opening a target run is called: a run in this app, or a workflow run on GitHub.
 pub fn open_label(kind: CallKind) -> &'static str {
-    match kind {
-        CallKind::Playbook => "Open run",
-        CallKind::GithubWorkflow => "Open on GitHub",
-    }
+    kind.presentation().open
 }
 
 /// Where unmapped call `task`'s target run opens, and what that action is called.

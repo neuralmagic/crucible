@@ -472,6 +472,8 @@ fn dispatch_autopilot(mut cfg: crucible_controller::ControllerCfg, once: bool) -
     // and `--once` share it; a partially-set config fails loudly at startup, never per-PR.
     cfg.github_app = crucible_controller::secrets::github_app::GithubAppTokenSource::from_env()
         .context("configuring the GitHub App pack-PR credential")?;
+    cfg.validate_calls_github(std::env::var("CONTROLLER_DEV_IDENTITY").ok().as_deref())
+        .context("validating the calls GitHub token source")?;
     // `--once` runs the reconcile core to quiescence (the dev/test/break-glass mode);
     // the no-flag path is the resident daemon.
     if once {

@@ -144,11 +144,27 @@ controller-local port="8870" user=env_var("USER"):
         RUST_LOG="${RUST_LOG:-info}" \
         "$bin/crucible-controller" autopilot
 
-# The ci call dispatches wseaton/snapshotd with the controller's `gh auth token`.
+# The ci call dispatches CALLS_DEMO_REPO (owner/name) with the controller's `gh auth token`.
 # Save examples/calls/{child,parent} as drafts on `just controller-local`, launch the parent.
 calls-example port="8870" max_cost="1" max_time="30m":
     #!/usr/bin/env bash
     set -euo pipefail
+    repo="${CALLS_DEMO_REPO:-}"
+    [[ "$repo" =~ ^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$ ]] || {
+        echo "set CALLS_DEMO_REPO to the owner/name of the repository the ci call dispatches (examples/calls/README.md)" >&2
+        exit 1
+    }
+    parent=$(mktemp -d)
+    trap 'rm -rf "${parent:?}"' EXIT
+    cp -R examples/calls/parent/. "$parent"
+    for file in workflow.star workflow-agent.star; do
+        sed -i.orig "s#OWNER/REPO#$repo#g" "$parent/$file"
+        rm "${parent:?}/${file:?}.orig"
+    done
+    if grep -rq "OWNER/REPO" "$parent"; then
+        echo "calls-parent: a file still names OWNER/REPO" >&2
+        exit 1
+    fi
     SQLX_OFFLINE=true cargo build -q -p crux --bin crux
     crux="${CARGO_TARGET_DIR:-$PWD/target}/debug/crux"
     unset CONTROLLER_API_TOKEN
@@ -168,7 +184,7 @@ calls-example port="8870" max_cost="1" max_time="30m":
         jq -r --arg id "$id" '"\($id) v\(.version)" + ([.diagnostics[]? | "\n  \(.file // ""):\(.line // ""): \(.message)"] | join(""))' <<<"$saved"
     }
     save calls-child examples/calls/child "Digest notes under a label and a JSON config"
-    save calls-parent examples/calls/parent "Call calls-child and a GitHub workflow"
+    save calls-parent "$parent" "Call calls-child and a GitHub workflow on $repo"
     "$crux" draft-files calls-parent --json | jq -e '.files | has("calls.lock")' >/dev/null \
         || { echo "calls-parent: the controller saved no calls.lock" >&2; exit 1; }
     "$crux" draft-launch calls-parent --max-cost {{max_cost}} --max-time {{max_time}} --json | jq -r .key

@@ -2,12 +2,18 @@ calls = {
     "child": {"kind": "playbook", "playbook": "draft:calls-child"},
     "ci": {
         "kind": "github_workflow",
-        "repo": "wseaton/snapshotd",
+        "repo": "OWNER/REPO",
         "workflow": ".github/workflows/crucible-call-demo.yml",
         "ref": "crucible-call-demo",
         "outputs": {
             "artifact": "crucible-result",
-            "fields": {"summary": "string", "flavor": "string", "loud": "boolean", "legs": "integer", "payload_keys": "list"},
+            "fields": {
+                "summary": "string",
+                "flavor": "string",
+                "loud": "boolean",
+                "legs": "integer",
+                "payload_keys": "list",
+            },
             "files": ["notes.md"],
         },
     },

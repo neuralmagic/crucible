@@ -162,6 +162,9 @@ pub struct ApiState {
     pub(crate) people_issuer: Option<Arc<crate::agent_auth::AgentAuth>>,
     /// Where a call's GitHub workflow target takes its token; `None` dispatches none.
     pub(crate) calls_github: Option<crate::calls::GithubToken>,
+    /// The GitHub logins paired with crucible logins, which a GitHub workflow call authorizes its
+    /// launch owner by.
+    pub(crate) github_logins: crate::identity::github_logins::GithubLogins,
 }
 
 impl ApiState {
@@ -261,6 +264,7 @@ impl ApiState {
             images_refresh: Arc::new(tokio::sync::Notify::new()),
             policy,
             calls_github: cfg.calls_github_token,
+            github_logins: cfg.github_logins(),
         }
     }
 
@@ -394,6 +398,7 @@ impl ApiState {
             policy: crate::authz::policy::ActivePolicy::default_set()
                 .expect("the shipped default policy set loads"),
             calls_github: None,
+            github_logins: Default::default(),
         }
     }
 }

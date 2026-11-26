@@ -13,7 +13,7 @@ use crate::plan::diag;
 use crate::plan::ir::{Emits, OutputField, Task, TaskKind, TaskName};
 use crate::plan::starlark::error::CompileError;
 use crate::plan::starlark::params::{ParamType, embedded, embedded_schema};
-use crate::plan::starlark::values::CONVERTED;
+use crate::plan::starlark::values::{CONVERTED, ExternalText, Segment};
 use crate::plan::starlark::{
     CompileState, Result, Value, check_fanout, imply_dependencies, note_explicit_required,
     parse_join, parse_stage, take_bool_default, take_declared_name, take_dependencies, take_fanout,
@@ -22,13 +22,25 @@ use crate::plan::starlark::{
 use crucible_contract::calls::{CallAlias, CallBudget, CallKind, MAX_CALL_FANOUT, TargetInterface};
 use crucible_contract::emits::{FieldType, JsonSchema};
 
-/// `param(name)` of a json or file parameter. Its value reaches a task only under `params`, or a
-/// call's target as a binding, never as text in the source.
+/// `param(name)` of a json or file parameter. Its value reaches a command under `params`, a
+/// call's target as a binding, and an agent only inside the external-input markers, never as
+/// text in the source.
 #[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
 pub(crate) struct ParamRefValue {
     pub(crate) name: String,
     #[allocative(skip)]
     pub(crate) ty: ParamType,
+    /// What an agent prompt carries for the value.
+    pub(crate) shown: String,
+}
+
+impl ParamRefValue {
+    fn segments(&self) -> Vec<Segment> {
+        vec![Segment {
+            text: self.shown.clone(),
+            external: true,
+        }]
+    }
 }
 
 starlark_simple_value!(ParamRefValue);
@@ -41,7 +53,61 @@ impl Display for ParamRefValue {
 }
 
 #[starlark_value(type = "param")]
-impl<'v> StarlarkValue<'v> for ParamRefValue {}
+impl<'v> StarlarkValue<'v> for ParamRefValue {
+    /// `param("config") + "text"`: external text, which only a prompt takes.
+    fn add(
+        &self,
+        rhs: starlark::values::Value<'v>,
+        heap: Heap<'v>,
+    ) -> Option<starlark::Result<starlark::values::Value<'v>>> {
+        let after = match rhs.unpack_str() {
+            Some(text) => ExternalText::plain(text),
+            None => ExternalText::from_value(rhs)?.0.clone(),
+        };
+        Some(Ok(
+            heap.alloc(ExternalText::joined(&self.segments(), &after))
+        ))
+    }
+
+    /// `"text" + param("config")`.
+    fn radd(
+        &self,
+        lhs: starlark::values::Value<'v>,
+        heap: Heap<'v>,
+    ) -> Option<starlark::Result<starlark::values::Value<'v>>> {
+        let before = match lhs.unpack_str() {
+            Some(text) => ExternalText::plain(text),
+            None => ExternalText::from_value(lhs)?.0.clone(),
+        };
+        Some(Ok(
+            heap.alloc(ExternalText::joined(&before, &self.segments()))
+        ))
+    }
+}
+
+/// What an agent prompt carries for a json or file parameter: a json value as JSON, and a file
+/// as the read-only path it is staged at under the task's root.
+pub(crate) fn param_text(name: &str, ty: ParamType, value: &serde_json::Value) -> String {
+    if ty != ParamType::File {
+        return serde_json::to_string_pretty(value).unwrap_or_default();
+    }
+    let path = value
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let mut text = format!(
+        "file parameter {name}, staged read-only at `{}`",
+        crate::plan::param_files::input_path(name, std::path::Path::new(path))
+    );
+    for (key, unit) in [("size", " bytes"), ("media_type", ""), ("digest", "")] {
+        match value.get(key) {
+            Some(serde_json::Value::Number(n)) => text.push_str(&format!(", {n}{unit}")),
+            Some(serde_json::Value::String(s)) => text.push_str(&format!(", {s}{unit}")),
+            _ => {}
+        }
+    }
+    text
+}
 
 /// `producer.files`: the files a task declares in `emits_files`, indexed by path.
 #[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
@@ -375,14 +441,15 @@ fn bind(
                 path: file.path,
             })
         }
-        Value::ParamRef { name, ty } if ty == wanted.ty => Ok(Binding::Param { name }),
+        Value::ParamRef { name, ty, .. } if ty == wanted.ty => Ok(Binding::Param { name }),
         Value::ParamRef {
             name,
             ty: ParamType::Json,
+            ..
         } if kind == CallKind::GithubWorkflow && wanted.ty == ParamType::String => {
             Ok(Binding::Param { name })
         }
-        Value::ParamRef { name, ty } => Err(format!(
+        Value::ParamRef { name, ty, .. } => Err(format!(
             "param({name:?}) is a {} parameter, not a {expected} one",
             ty.as_str()
         )),
@@ -516,8 +583,9 @@ fn literal_json(value: &Value) -> Option<serde_json::Value> {
     })
 }
 
-/// Refuse a json or file parameter's `param(...)` anywhere but a call's params.
-pub(crate) fn refuse_param_refs(named: &BTreeMap<String, Value>) -> Result<()> {
+/// Refuse a json or file parameter's `param(...)` anywhere but a call's params and the
+/// arguments in `prompts`, which mark it as external input.
+pub(crate) fn refuse_param_refs(named: &BTreeMap<String, Value>, prompts: &[&str]) -> Result<()> {
     fn find(value: &Value) -> Option<&str> {
         match value {
             Value::ParamRef { name, .. } => Some(name),
@@ -527,7 +595,11 @@ pub(crate) fn refuse_param_refs(named: &BTreeMap<String, Value>) -> Result<()> {
             _ => None,
         }
     }
-    match named.values().find_map(find) {
+    match named
+        .iter()
+        .filter(|(argument, _)| !prompts.contains(&argument.as_str()))
+        .find_map(|(_, value)| find(value))
+    {
         Some(name) => Err(CompileError::ParamNotAValue {
             name: name.to_owned(),
         }),
@@ -909,6 +981,186 @@ workflow(type = "playbook", tasks = [plan, t])
                 .unwrap_err()
                 .message();
         assert!(error.contains("json or file parameter"), "{error}");
+    }
+
+    #[test]
+    fn a_call_binds_another_calls_result_field_and_file() {
+        let pack = pack(false);
+        let chained = |second: &str| {
+            compile(
+                pack.path(),
+                &format!(
+                    "first = call(name = \"first\", target = \"triage\", params = {{\"repo\": plan.repo}})\n\
+                     second = call(name = \"second\", target = \"triage\", params = {second})\n\
+                     workflow(type = \"playbook\", tasks = [plan, first, second])"
+                ),
+            )
+        };
+        let workflow =
+            chained(r#"{"repo": first.verdict, "notes": first.files["report.md"]}"#).unwrap();
+        let second = workflow
+            .tasks
+            .iter()
+            .find(|t| t.name.0 == "second")
+            .unwrap();
+        let TaskKind::Call {
+            bindings,
+            file_params,
+            ..
+        } = &second.task
+        else {
+            panic!()
+        };
+        assert_eq!(
+            bindings["repo"],
+            Binding::Field {
+                producer: TaskName("first".into()),
+                field: OutputField("verdict".into()),
+            }
+        );
+        assert_eq!(
+            bindings["notes"],
+            Binding::File {
+                producer: TaskName("first".into()),
+                path: "report.md".into(),
+            }
+        );
+        assert!(file_params.contains("notes"));
+        assert_eq!(second.depends_on, [TaskName("first".into())]);
+
+        for (params, says) in [
+            (
+                r#"{"repo": first.verdict, "notes": first.files["notes.md"]}"#,
+                "does not declare",
+            ),
+            (
+                r#"{"repo": first.verdict, "count": first.score}"#,
+                "number field cannot feed",
+            ),
+            (
+                r#"{"repo": first.files["report.md"]}"#,
+                "only a file parameter",
+            ),
+        ] {
+            let error = chained(params).unwrap_err();
+            assert!(error.contains(says), "{params}: {error}");
+        }
+    }
+
+    #[test]
+    fn an_agent_reads_json_and_file_params_only_inside_the_external_markers() {
+        use crate::plan::starlark::{EXTERNAL_CLOSE, EXTERNAL_OPEN};
+        let pack = pack(false);
+        let notes = pack.path().join("notes.md");
+        std::fs::write(&notes, "hello").unwrap();
+        let supplied = BTreeMap::from([
+            ("matrix".to_owned(), r#"{"os": ["linux"]}"#.to_owned()),
+            ("notes".to_owned(), notes.display().to_string()),
+        ]);
+        let compiled = |body: &str| {
+            let source = format!(
+                "params = {{\n    \"matrix\": {{\"type\": \"json\", \"required\": True}},\n    \
+                 \"notes\": {{\"type\": \"file\", \"required\": True, \"max_bytes\": 1024}},\n}}\n\
+                 {body}"
+            );
+            compile_source_with(&source, Path::new("workflow.star"), pack.path(), &supplied)
+                .map(|c| c.workflow)
+                .map_err(|e| e.message())
+        };
+        let workflow = compiled(
+            "a = agent(name = \"a\", prompt = \"Plan for \" + param(\"matrix\") + \" using \" + param(\"notes\"))\n\
+             b = agent(name = \"b\", prompt = param(\"matrix\"))\n\
+             workflow(type = \"playbook\", tasks = [a, b])",
+        )
+        .unwrap();
+        let prompt = |name: &str| {
+            let task = workflow.tasks.iter().find(|t| t.name.0 == name).unwrap();
+            let TaskKind::Agent { prompt, .. } = &task.task else {
+                panic!()
+            };
+            prompt.clone()
+        };
+        let json = serde_json::to_string_pretty(&json!({"os": ["linux"]})).unwrap();
+        let file = format!(
+            "file parameter notes, staged read-only at `inputs/params/notes/notes.md`, 5 bytes, {}",
+            crucible_contract::artifact::content_digest(b"hello")
+        );
+        assert_eq!(
+            prompt("a"),
+            format!(
+                "Plan for {EXTERNAL_OPEN}{json}{EXTERNAL_CLOSE} using {EXTERNAL_OPEN}{file}{EXTERNAL_CLOSE}"
+            )
+        );
+        assert_eq!(
+            prompt("b"),
+            format!("{EXTERNAL_OPEN}{json}{EXTERNAL_CLOSE}")
+        );
+
+        for (body, says) in [
+            (
+                "a = agent(name = \"a\", prompt = \"Plan for %s\" % param(\"matrix\"))",
+                "",
+            ),
+            (
+                "a = agent(name = \"a\", prompt = \"Plan for \" + str(param(\"matrix\")))",
+                "",
+            ),
+            (
+                "a = command(name = \"a\", run = \"cat \" + param(\"notes\"))",
+                "prompt",
+            ),
+            (
+                "a = agent(name = \"a\", prompt = \"go\", emits = {\"x\": param(\"matrix\")})",
+                "json or file parameter",
+            ),
+        ] {
+            let error = compiled(&format!(
+                "{body}\nworkflow(type = \"playbook\", tasks = [a])"
+            ))
+            .unwrap_err();
+            assert!(error.contains(says), "{body}: {error}");
+            assert!(!error.contains("linux"), "{body} shows the value: {error}");
+        }
+    }
+
+    /// Every compile path checks the lock before it reads anything else of the source.
+    #[test]
+    fn every_compile_path_checks_the_lock_first() {
+        let source = format!(
+            "params = {{\"x\": {{\"type\": \"no such type\"}}}}\n{CALLS}{PLAN}\n\
+             workflow(type = \"playbook\", tasks = [plan])\n"
+        );
+        let unlocked = tempfile::tempdir().unwrap();
+        let stale = pack(false);
+        let mut lock =
+            CallsLock::parse(&std::fs::read_to_string(stale.path().join(LOCK_FILE)).unwrap())
+                .unwrap();
+        lock.calls.remove(&CallAlias::parse("release").unwrap());
+        std::fs::write(stale.path().join(LOCK_FILE), lock.render().unwrap()).unwrap();
+        for (dir, says) in [
+            (unlocked.path(), "cannot be read"),
+            (stale.path(), "release"),
+        ] {
+            let file = dir.join("workflow.star");
+            std::fs::write(&file, &source).unwrap();
+            let compiled = [
+                compile_source_with(&source, &file, dir, &BTreeMap::new()),
+                crate::plan::starlark::compile_launch_file(&file, dir, &BTreeMap::new()),
+                crate::plan::starlark::compile_file_with(&file, dir, &BTreeMap::new()),
+            ];
+            for result in compiled {
+                let error = result.unwrap_err();
+                assert!(
+                    matches!(
+                        error,
+                        crate::plan::starlark::error::CompileError::CallsUnpinned { .. }
+                    ),
+                    "{}",
+                    error.message()
+                );
+                assert!(error.message().contains(says), "{}", error.message());
+            }
+        }
     }
 
     #[test]

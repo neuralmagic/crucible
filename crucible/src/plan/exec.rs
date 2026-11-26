@@ -991,7 +991,7 @@ pub fn execute(
                     // Each instance settles in its own right, so a reader sees one row per item
                     // rather than one row standing for all of them.
                     let mut settled: Vec<(ItemKey, TaskResult)> = Vec::new();
-                    if node.isolation.is_some() {
+                    if node.isolation.is_some() || matches!(node.task, TaskKind::Call { .. }) {
                         let batch: Vec<BatchItem<'_>> = instances
                             .iter()
                             .zip(&keys)

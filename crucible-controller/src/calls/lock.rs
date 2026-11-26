@@ -5,7 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crucible_contract::calls::{
-    CallAlias, CallTarget, CallsLock, LOCK_FILE, LOCK_VERSION, LockedCall, Pin, TargetInterface,
+    CallAlias, CallTarget, CallsLock, LOCK_FILE, LOCK_VERSION, LockedCall, Pin, PlaybookRef,
+    TargetInterface,
 };
 
 use crate::calls::{Backends, CallCtx, CallError};
@@ -64,33 +65,79 @@ pub(crate) fn declared(
     Ok(calls)
 }
 
+/// Who a lock is written for, and of what.
+pub(crate) struct Locking<'a> {
+    pub state: &'a crate::api::state::ApiState,
+    /// The requester, who must be able to read every playbook target.
+    pub caller: &'a crate::authz::Caller,
+    /// Whether the pack is a draft, the only kind that may pin a draft head.
+    pub draft_pack: bool,
+    /// The draft being locked, when it is one, which no chain of draft-head pins may lead back
+    /// to.
+    pub draft: Option<&'a str>,
+}
+
+/// The refusal of a playbook target that does not exist for the requester, whether it is absent
+/// or unreadable.
+fn no_target(alias: &CallAlias, playbook: &PlaybookRef) -> String {
+    match playbook {
+        PlaybookRef::Registered(name) => {
+            format!("call target {alias}: no registered playbook {name:?}")
+        }
+        PlaybookRef::Draft(id) => format!("call target {alias}: no draft {id:?}"),
+    }
+}
+
 /// Resolve every declared target through its backend and lock it. `None` when nothing is
-/// declared. `draft_pack` is whether the pack is a draft, the only kind that may pin a draft head.
+/// declared.
 pub(crate) async fn write(
     backends: &Backends,
     ctx: &CallCtx,
     calls: &BTreeMap<CallAlias, CallTarget>,
-    draft_pack: bool,
+    locking: &Locking<'_>,
 ) -> Result<Option<CallsLock>, String> {
     if calls.is_empty() {
         return Ok(None);
     }
     let mut locked = BTreeMap::new();
     for (alias, target) in calls {
-        let resolved = backends
-            .get(target.kind())
-            .map_err(|e| format!("call target {alias}: {}", e.note()))?
-            .interface(ctx, target)
-            .await
-            .map_err(|e| match e {
-                CallError::Internal(e) => format!("call target {alias}: {e:#}"),
-                other => format!("call target {alias}: {}", other.note()),
-            })?;
-        if matches!(resolved.pin, Pin::DraftHead { .. }) && !draft_pack {
-            return Err(format!(
-                "call target {alias} pins a draft's head, which only a draft pack may do; register \
-                 the target and name it by its registered name"
-            ));
+        if let CallTarget::Playbook { playbook } = target {
+            let readable =
+                crate::calls::access::may_read_target(locking.state, locking.caller, playbook)
+                    .await
+                    .map_err(|e| format!("call target {alias}: {e:#}"))?;
+            if !readable {
+                return Err(no_target(alias, playbook));
+            }
+        }
+        let failed = |e: CallError| match e {
+            CallError::Internal(e) => format!("call target {alias}: {e:#}"),
+            other => format!("call target {alias}: {}", other.note()),
+        };
+        let backend = backends.get(target.kind()).map_err(failed)?;
+        let who = locking
+            .caller
+            .actor()
+            .cloned()
+            .unwrap_or_else(crate::authz::model::Principal::platform);
+        backend.authorize(ctx, &who, target).await.map_err(failed)?;
+        let resolved = backend.interface(ctx, target).await.map_err(failed)?;
+        if let Pin::DraftHead { draft } = &resolved.pin {
+            if !locking.draft_pack {
+                return Err(format!(
+                    "call target {alias} pins a draft's head, which only a draft pack may do; \
+                     register the target and name it by its registered name"
+                ));
+            }
+            if let Some(cycle) = draft_cycle(ctx, draft, locking.draft)
+                .await
+                .map_err(|e| format!("call target {alias}: {e:#}"))?
+            {
+                return Err(format!(
+                    "call target {alias} leads back to this draft through draft heads: {}",
+                    cycle.join(" -> ")
+                ));
+            }
         }
         let entry = LockedCall::new(resolved.pin, resolved.interface)
             .map_err(|e| format!("call target {alias}: digesting the interface: {e}"))?;
@@ -102,15 +149,53 @@ pub(crate) async fn write(
     }))
 }
 
+/// A chain of draft-head pins from draft `start` that reaches `locking`, or reaches a draft it
+/// already passed, as the drafts along it. Each draft is read at its newest compiling save.
+async fn draft_cycle(
+    ctx: &CallCtx,
+    start: &str,
+    locking: Option<&str>,
+) -> anyhow::Result<Option<Vec<String>>> {
+    let mut path: Vec<String> = locking.map(str::to_string).into_iter().collect();
+    let mut stack: Vec<(String, usize)> = vec![(start.to_string(), path.len())];
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    while let Some((draft, depth)) = stack.pop() {
+        path.truncate(depth);
+        if path.contains(&draft) {
+            path.push(draft);
+            return Ok(Some(path));
+        }
+        path.push(draft.clone());
+        if !seen.insert(draft.clone()) {
+            continue;
+        }
+        let tree = match crate::playbooks::drafts::newest_compiling(ctx.db.pool(), &draft).await {
+            Ok((_, tree)) => tree,
+            Err(crate::playbooks::drafts::DraftError::Internal(e)) => return Err(e),
+            Err(_) => continue,
+        };
+        let Ok((_, Some(lock))) = of_tree(&tree) else {
+            continue;
+        };
+        for entry in lock.calls.values() {
+            if let Pin::DraftHead { draft: next } = &entry.pin {
+                stack.push((next.clone(), path.len()));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Write the lock a draft's files need into them: the lock of its `calls` blocks, or no
 /// lock file at all when it declares none.
 pub(crate) async fn into_files(
     backends: &Backends,
     ctx: &CallCtx,
+    locking: &Locking<'_>,
     files: &mut BTreeMap<String, String>,
 ) -> Result<(), String> {
     let calls = declared(|path| files.get(path).cloned())?;
-    match write(backends, ctx, &calls, true).await? {
+    match write(backends, ctx, &calls, locking).await? {
         Some(lock) => {
             let text = lock
                 .render()
@@ -147,6 +232,23 @@ pub(crate) fn of_tree(
         }
     };
     Ok((calls, lock))
+}
+
+/// Refuse a pack a registration or an import may not pin: its `calls.lock` is missing or does not
+/// match its `calls` blocks, or it pins a draft's head.
+pub(crate) fn registrable(tree: &crucible_contract::pack_tree::PackTree) -> Result<(), String> {
+    let (_, lock) = of_tree(tree)?;
+    let draft_head = lock
+        .iter()
+        .flat_map(|l| l.calls.iter())
+        .find(|(_, entry)| matches!(entry.pin, Pin::DraftHead { .. }));
+    match draft_head {
+        Some((alias, _)) => Err(format!(
+            "{LOCK_FILE} pins call target {alias} to a draft's head, which only a draft pack may \
+             do; register the target and lock it by its registered name"
+        )),
+        None => Ok(()),
+    }
 }
 
 fn names(schema: &serde_json::Value, key: &str) -> BTreeSet<String> {
@@ -221,6 +323,97 @@ pub(crate) fn check_bound<'a>(
         .find(|r| !given.contains(r))
     {
         return Err(format!("required parameter {missing:?} is unbound"));
+    }
+    Ok(())
+}
+
+/// Whether each bound value and file fits the locked parameter types. A GitHub workflow's string
+/// input also takes a JSON object or list, which it receives serialized.
+pub(crate) fn check_values(
+    kind: crucible_contract::calls::CallKind,
+    interface: &TargetInterface,
+    values: &BTreeMap<String, serde_json::Value>,
+    files: &BTreeMap<String, crucible_contract::calls::FileRef>,
+) -> Result<(), String> {
+    use crucible::plan::starlark::params::{MAX_BYTES_KEY, MEDIA_TYPE_KEY, ParamType};
+    use serde_json::Value;
+    let property = |name: &str| {
+        interface
+            .params
+            .get("properties")
+            .and_then(|p| p.get(name))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    for (name, value) in values {
+        let ty = ParamType::from_schema(&property(name));
+        let fits = match ty {
+            ParamType::String => {
+                value.is_string()
+                    || (kind == crucible_contract::calls::CallKind::GithubWorkflow
+                        && (value.is_object() || value.is_array()))
+            }
+            ParamType::Int => value.as_i64().is_some_and(|n| i32::try_from(n).is_ok()),
+            ParamType::Number => value.as_f64().is_some_and(f64::is_finite),
+            ParamType::Bool => value.is_boolean(),
+            ParamType::StringList => value
+                .as_array()
+                .is_some_and(|items| items.iter().all(Value::is_string)),
+            ParamType::Json => {
+                (value.is_object() || value.is_array())
+                    && serde_json::to_vec(value)
+                        .is_ok_and(|b| b.len() <= crucible_contract::calls::MAX_JSON_PARAM_BYTES)
+            }
+            ParamType::File => {
+                return Err(format!(
+                    "parameter {name:?} takes a file, but the call binds a value"
+                ));
+            }
+        };
+        if !fits {
+            return Err(format!(
+                "parameter {name:?} takes {}, but the call binds {value}",
+                ty.as_str()
+            ));
+        }
+    }
+    for (name, file) in files {
+        let declared = property(name);
+        if ParamType::from_schema(&declared) != ParamType::File {
+            return Err(format!(
+                "parameter {name:?} is not a file parameter, but the call binds a file"
+            ));
+        }
+        let max = declared
+            .get(MAX_BYTES_KEY)
+            .and_then(Value::as_u64)
+            .unwrap_or(crucible_contract::calls::MAX_FILE_PARAM_BYTES)
+            .min(crucible_contract::calls::MAX_FILE_PARAM_BYTES);
+        if file.size > max {
+            return Err(format!(
+                "file parameter {name:?} takes at most {max} bytes, but the call binds {}",
+                file.size
+            ));
+        }
+        let media: Vec<&str> = declared
+            .get(MEDIA_TYPE_KEY)
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        if !media.is_empty()
+            && !file
+                .media_type
+                .as_deref()
+                .is_some_and(|m| media.contains(&m))
+        {
+            return Err(format!(
+                "file parameter {name:?} takes {}, but the call binds {}",
+                media.join(", "),
+                file.media_type
+                    .as_deref()
+                    .unwrap_or("a file of no media type")
+            ));
+        }
     }
     Ok(())
 }
@@ -392,6 +585,92 @@ workflow(type = "playbook", tasks = [])
         assert_eq!(of_tree(&bare).expect("no calls"), (BTreeMap::new(), None));
     }
 
+    /// A registration or import takes a pack only with a lock that matches its calls blocks and
+    /// pins no draft head.
+    #[test]
+    fn a_registered_pack_needs_a_current_lock_of_registered_pins() {
+        let source = WORKFLOW.replace("draft:triage-draft", "triage");
+        let tree = |lock: Option<&CallsLock>| {
+            let text = lock.map(|l| l.render().expect("render"));
+            let mut pairs: Vec<(&str, &[u8])> = vec![
+                ("crucible.toml", MANIFEST.as_bytes()),
+                ("workflow.star", source.as_bytes()),
+            ];
+            if let Some(text) = &text {
+                pairs.push((LOCK_FILE, text.as_bytes()));
+            }
+            PackTree::from_pairs(&pairs).expect("tree")
+        };
+        let entry = |pin: Pin| {
+            LockedCall::new(pin, interface(json!({"type": "object"}), &[])).expect("locked")
+        };
+        let triage = CallAlias::parse("triage").expect("alias");
+        let revision = Pin::Revision {
+            playbook: "triage".into(),
+            digest: "sha256:aa".into(),
+        };
+        let good = CallsLock {
+            version: LOCK_VERSION,
+            calls: BTreeMap::from([(triage.clone(), entry(revision.clone()))]),
+        };
+        assert_eq!(registrable(&tree(Some(&good))), Ok(()));
+
+        assert_eq!(
+            registrable(&tree(None)).expect_err("no lock"),
+            LockError::Missing.to_string()
+        );
+
+        let mut extra = good.clone();
+        extra.calls.insert(
+            CallAlias::parse("gone").expect("alias"),
+            entry(revision.clone()),
+        );
+        assert!(
+            registrable(&tree(Some(&extra)))
+                .expect_err("undeclared entry")
+                .contains("gone"),
+        );
+
+        let moved = CallsLock {
+            version: LOCK_VERSION,
+            calls: BTreeMap::from([(
+                triage.clone(),
+                entry(Pin::Revision {
+                    playbook: "other".into(),
+                    digest: "sha256:aa".into(),
+                }),
+            )]),
+        };
+        assert!(
+            registrable(&tree(Some(&moved)))
+                .expect_err("stale pin")
+                .contains("different target")
+        );
+
+        let draft_source = WORKFLOW;
+        let head = CallsLock {
+            version: LOCK_VERSION,
+            calls: BTreeMap::from([(
+                triage,
+                entry(Pin::DraftHead {
+                    draft: "triage-draft".into(),
+                }),
+            )]),
+        };
+        let text = head.render().expect("render");
+        let drafted = PackTree::from_pairs(&[
+            ("crucible.toml", MANIFEST.as_bytes()),
+            ("workflow.star", draft_source.as_bytes()),
+            (LOCK_FILE, text.as_bytes()),
+        ])
+        .expect("tree");
+        assert!(
+            registrable(&drafted)
+                .expect_err("draft head")
+                .contains("draft's head")
+        );
+    }
+
     #[test]
     fn drift_names_what_moved() {
         let old = interface(
@@ -433,6 +712,101 @@ workflow(type = "playbook", tasks = [])
         assert_eq!(
             check_bound(&locked, names(&["pr", "extra"]).iter()).expect_err("unknown"),
             r#"the target takes no parameter "extra""#
+        );
+    }
+
+    #[test]
+    fn bound_values_and_files_must_fit_the_locked_types() {
+        let locked = interface(
+            json!({"type": "object", "properties": {
+                "name": {"type": "string"},
+                "count": {"type": "integer"},
+                "ratio": {"type": "number"},
+                "loud": {"type": "boolean"},
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "config": {"type": "object", "x-param-type": "json"},
+                "notes": {"type": "object", "x-param-type": "file", "x-max-bytes": 10,
+                          "x-media-type": ["text/markdown"]},
+            }}),
+            &[],
+        );
+        let values = |v: serde_json::Value| -> BTreeMap<String, serde_json::Value> {
+            serde_json::from_value(v).expect("values")
+        };
+        let file = |size: u64, media: Option<&str>| {
+            BTreeMap::from([(
+                "notes".to_string(),
+                crucible_contract::calls::FileRef {
+                    digest: "sha256:aa".into(),
+                    size,
+                    path: None,
+                    media_type: media.map(str::to_string),
+                },
+            )])
+        };
+        let none = BTreeMap::new();
+        const PLAYBOOK: crucible_contract::calls::CallKind =
+            crucible_contract::calls::CallKind::Playbook;
+        let object = values(json!({"name": {"k": 1}}));
+        assert!(check_values(PLAYBOOK, &locked, &object, &none).is_err());
+        assert!(
+            check_values(
+                crucible_contract::calls::CallKind::GithubWorkflow,
+                &locked,
+                &object,
+                &none
+            )
+            .is_ok(),
+            "a GitHub string input takes JSON, serialized"
+        );
+        assert!(
+            check_values(
+                PLAYBOOK,
+                &locked,
+                &values(json!({"name": "a", "count": 3, "ratio": 0.5, "loud": true,
+                               "tags": ["x"], "config": {"k": [1]}})),
+                &file(10, Some("text/markdown")),
+            )
+            .is_ok()
+        );
+        for (bad, says) in [
+            (json!({"name": 1}), "takes string"),
+            (json!({"count": 1.5}), "takes int"),
+            (json!({"count": 4_000_000_000_i64}), "takes int"),
+            (json!({"loud": "yes"}), "takes bool"),
+            (json!({"tags": ["x", 1]}), "takes list<string>"),
+            (json!({"config": "text"}), "takes json"),
+            (json!({"notes": "text"}), "takes a file"),
+        ] {
+            let refused =
+                check_values(PLAYBOOK, &locked, &values(bad), &none).expect_err("refused");
+            assert!(refused.contains(says), "{says:?} in {refused}");
+        }
+        let big =
+            json!({"config": {"k": "x".repeat(crucible_contract::calls::MAX_JSON_PARAM_BYTES)}});
+        assert!(check_values(PLAYBOOK, &locked, &values(big), &none).is_err());
+        assert!(
+            check_values(
+                PLAYBOOK,
+                &locked,
+                &BTreeMap::new(),
+                &file(11, Some("text/markdown"))
+            )
+            .expect_err("too big")
+            .contains("at most 10 bytes")
+        );
+        assert!(
+            check_values(PLAYBOOK, &locked, &BTreeMap::new(), &file(1, None))
+                .expect_err("no media type")
+                .contains("no media type")
+        );
+        let mut misplaced = file(1, Some("text/markdown"));
+        let notes = misplaced.remove("notes").expect("notes");
+        misplaced.insert("name".into(), notes);
+        assert!(
+            check_values(PLAYBOOK, &locked, &BTreeMap::new(), &misplaced)
+                .expect_err("not a file parameter")
+                .contains("not a file parameter")
         );
     }
 }

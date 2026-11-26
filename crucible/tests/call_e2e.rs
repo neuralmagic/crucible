@@ -117,6 +117,10 @@ struct Seen {
     uploads: BTreeMap<String, Vec<u8>>,
     cancelled: Vec<String>,
     unauthorized: u32,
+    /// File parameter values the run's launch holds, by digest.
+    param_files: BTreeMap<String, Vec<u8>>,
+    /// Every file parameter the run fetched, by digest.
+    fetched: Vec<String>,
 }
 
 struct Controller {
@@ -261,6 +265,7 @@ impl Controller {
                             &mut conn,
                             "200 OK",
                             &CallState {
+                                run_number: None,
                                 call: CallId(id.to_string()),
                                 status: if running {
                                     CallStatus::Running
@@ -304,6 +309,16 @@ impl Controller {
                         }
                         None => reply(&mut conn, "404 Not Found", b"", "text/plain"),
                     },
+                    ("GET", ["param-files", digest]) => {
+                        let digest = digest.replace("%3A", ":");
+                        seen.fetched.push(digest.clone());
+                        match seen.param_files.get(&digest).cloned() {
+                            Some(bytes) => {
+                                reply(&mut conn, "200 OK", &bytes, "application/octet-stream")
+                            }
+                            None => reply(&mut conn, "404 Not Found", b"", "text/plain"),
+                        }
+                    }
                     ("PUT", ["call-files", digest]) => {
                         let digest = digest.replace("%3A", ":");
                         assert_eq!(
@@ -328,6 +343,15 @@ impl Controller {
 }
 
 fn command(dir: &Path, controller: Option<&Controller>, resume: bool) -> Command {
+    command_with(dir, controller, resume, &[])
+}
+
+fn command_with(
+    dir: &Path,
+    controller: Option<&Controller>,
+    resume: bool,
+    params: &[String],
+) -> Command {
     let mut args = vec![
         "plan",
         "run",
@@ -340,6 +364,10 @@ fn command(dir: &Path, controller: Option<&Controller>, resume: bool) -> Command
     ];
     if resume {
         args.push("--resume");
+    }
+    for param in params {
+        args.push("--param");
+        args.push(param);
     }
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_crucible"));
     cmd.args(args)
@@ -583,5 +611,150 @@ fn a_pack_whose_lock_does_not_match_its_calls_is_refused() {
         "{}",
         describe(&out)
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_call_binds_another_calls_result_field_and_file() {
+    let workflow = r#"
+calls = {"release": {"kind": "playbook", "playbook": "release"}}
+plan = command(name = "plan", run = "printf '{\"version\": \"1.2.3\"}\n'", emits = {"version": "string"})
+ship = call(name = "ship", target = "release", params = {"version": plan.version})
+again = call(
+    name = "again",
+    target = "release",
+    params = {"version": ship.verdict, "notes": ship.files["report.md"]},
+)
+workflow(type = "playbook", tasks = [plan, ship, again])
+"#;
+    let dir = pack("chained", workflow);
+    let controller = Controller::start();
+    let out = command(&dir, Some(&controller), false).output().unwrap();
+    assert!(out.status.success(), "{}", describe(&out));
+    let results = results(&dir);
+    assert_eq!(results["again"]["status"], "pass", "{:?}", results["again"]);
+
+    let seen = controller.seen.lock().unwrap();
+    let again = seen
+        .dispatched
+        .iter()
+        .find(|r| r.task == "again")
+        .expect("again dispatched");
+    assert_eq!(
+        again.values["version"], "ok",
+        "the second call reads the first call's result field"
+    );
+    let notes = &again.files["notes"];
+    assert_eq!(notes.path.as_deref(), Some("report.md"));
+    assert_eq!(
+        seen.uploads[&notes.digest], b"report for 1.2.3",
+        "the second call sends the first call's result file"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_file_param_off_the_engines_disk_is_fetched_from_the_controller() {
+    let workflow = r#"params = {"notes": {"type": "file", "required": True, "max_bytes": 4096}}
+calls = {"release": {"kind": "playbook", "playbook": "release"}}
+ship = call(name = "ship", target = "release", params = {"version": "1", "notes": param("notes")})
+workflow(type = "playbook", tasks = [ship])
+"#;
+    let dir = pack("param-file", workflow);
+    let controller = Controller::start();
+    let bytes = b"notes held by the controller\n".to_vec();
+    let digest = crucible_contract::artifact::content_digest(&bytes);
+    controller
+        .seen
+        .lock()
+        .unwrap()
+        .param_files
+        .insert(digest.clone(), bytes.clone());
+    let value = serde_json::json!({
+        "path": "/controller/scratch/param-files/notes.md",
+        "digest": digest,
+        "size": bytes.len(),
+        "media_type": "text/markdown",
+    });
+    let params = [format!("notes={value}")];
+    let out = command_with(&dir, Some(&controller), false, &params)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", describe(&out));
+    assert_eq!(results(&dir)["ship"]["status"], "pass");
+
+    let staged = dir
+        .join("state/param-files")
+        .join(digest.trim_start_matches("sha256:"))
+        .join("notes.md");
+    assert_eq!(std::fs::read(&staged).unwrap(), bytes);
+    assert!(
+        std::fs::metadata(&staged).unwrap().permissions().readonly(),
+        "a fetched file parameter is staged read-only"
+    );
+    {
+        let seen = controller.seen.lock().unwrap();
+        assert_eq!(seen.fetched, std::slice::from_ref(&digest));
+        let ship = seen.dispatched.iter().find(|r| r.task == "ship").unwrap();
+        assert_eq!(ship.files["notes"].digest, digest);
+        assert_eq!(
+            ship.files["notes"].media_type.as_deref(),
+            Some("text/markdown")
+        );
+        assert_eq!(seen.uploads[&digest], bytes);
+    }
+
+    let tampered = serde_json::json!({
+        "path": "/controller/scratch/param-files/other.md",
+        "digest": crucible_contract::artifact::content_digest(b"something else"),
+    });
+    let dir = pack("param-file-missing", workflow);
+    let out = command_with(
+        &dir,
+        Some(&controller),
+        false,
+        &[format!("notes={tampered}")],
+    )
+    .output()
+    .unwrap();
+    assert!(!out.status.success(), "{}", describe(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("404"),
+        "{}",
+        describe(&out)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_mapped_call_dispatches_its_instances_together() {
+    let workflow = r#"
+calls = {"release": {"kind": "playbook", "playbook": "release"}}
+plan = command(name = "plan", run = "printf '{\"repos\": [\"a\", \"b\", \"c\"]}\n'", emits = {"repos": "list"})
+fan = call(name = "fan", target = "release", params = {"version": item()}, over = each(plan.repos, max = 4))
+workflow(type = "playbook", tasks = [plan, fan])
+"#;
+    let dir = pack("concurrent", workflow);
+    let controller = Controller::start();
+    controller.hold.store(true, Ordering::SeqCst);
+    let mut run = command(&dir, Some(&controller), false).spawn().unwrap();
+    let started = std::time::Instant::now();
+    while controller.seen.lock().unwrap().calls.len() < 3 {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "every instance is dispatched while the first is still running"
+        );
+        if run.try_wait().unwrap().is_some() {
+            panic!("the run ended before its calls were released");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    controller.hold.store(false, Ordering::SeqCst);
+    let status = run.wait().unwrap();
+    assert!(status.success());
+    let results = results(&dir);
+    for task in ["fan[a]", "fan[b]", "fan[c]"] {
+        assert_eq!(results[task]["status"], "pass", "{task}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

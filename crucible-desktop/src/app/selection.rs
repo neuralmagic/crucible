@@ -311,6 +311,14 @@ impl App {
     }
 
     /// Folds or unfolds a call's frame, `task`, or a group of its target, `task/group`.
+    /// Opens or closes the info card of call frame `key`.
+    pub fn toggle_frame_info(&mut self, key: &str) {
+        self.run.frame_info = match self.run.frame_info.take() {
+            Some(open) if open == key => None,
+            _ => Some(key.to_string()),
+        };
+    }
+
     pub fn toggle_call(&mut self, key: &str) {
         if !self.run.call_folds.remove(key) {
             self.run.call_folds.insert(key.to_string());

@@ -9,18 +9,16 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Extension, Router};
 use crucible_contract::calls::{
-    CALL_CANCEL_PATH, CALL_INPUT_FILE_PATH, CALL_PATH, CALL_RESULT_FILE_PATH, CALLS_PATH, CallKind,
-    CallRefused, CallState, CallStatus, CallView, DispatchRequest, DispatchResponse,
-    MAX_CALL_DEPTH, MAX_FILE_PARAM_BYTES, NodeStatus, Pin, ProgressGraph,
+    CALL_CANCEL_PATH, CALL_INPUT_FILE_PATH, CALL_PATH, CALL_RESULT_FILE_PATH, CALLS_PATH,
+    CallRefused, CallState, CallStatus, CallTarget, DispatchRequest, DispatchResponse,
+    MAX_CALL_DEPTH, MAX_FILE_PARAM_BYTES, PARAM_FILE_PATH, Pin, PlaybookRef, ProgressGraph,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::Digest as _;
 use sqlx::PgPool;
 
 use crate::api::state::{ApiError, ApiState, ErrorBody, Json};
 use crate::calls::store::Claimed;
-use crate::calls::{Backends, CallCtx, CallError, CallRecord, DispatchSpec, Outcome, Polled};
+use crate::calls::{Backends, CallCtx, CallError, CallRecord, DispatchSpec, Outcome};
 use crate::runs::pod_token::Grant;
 
 /// The routes a run reaches with its own pod token.
@@ -36,6 +34,7 @@ pub(crate) fn run_routes(state: ApiState) -> Router {
             CALL_INPUT_FILE_PATH,
             put(input_file).layer(axum::extract::DefaultBodyLimit::max(file_cap)),
         )
+        .route(PARAM_FILE_PATH, get(crate::launches::param_files::serve))
         .layer(axum::middleware::from_fn_with_state(
             db,
             crate::decisions::require_run_token,
@@ -168,19 +167,44 @@ async fn dispatch_call(
             request.alias
         ));
     }
+    if let Err(note) = planned(pool, &parent, tree.clone(), request).await? {
+        return refused(note);
+    }
     if let Err(note) = crate::calls::lock::check_bound(
         &locked.interface,
         request.values.keys().chain(request.files.keys()),
-    ) {
+    )
+    .and_then(|()| {
+        crate::calls::lock::check_values(
+            target.kind(),
+            &locked.interface,
+            &request.values,
+            &request.files,
+        )
+    }) {
         return refused(note);
     }
     for (name, file) in &request.files {
-        if !crate::calls::store::has_input_file(pool, run, &file.digest).await? {
-            return refused(format!(
-                "file parameter {name:?} names {}, which this run did not upload",
-                file.digest
-            ));
+        match crate::calls::store::input_file_size(pool, run, &file.digest).await? {
+            Some(size) if size == file.size => {}
+            Some(size) => {
+                return refused(format!(
+                    "parameter {name:?} says {} bytes, but this run uploaded {size}",
+                    file.size
+                ));
+            }
+            None => {
+                return refused(format!(
+                    "parameter {name:?} names {}, which this run did not upload",
+                    file.digest
+                ));
+            }
         }
+    }
+    if let CallTarget::Playbook { playbook } = target
+        && let Some(note) = calling_again(pool, run, &request.alias, playbook).await?
+    {
+        return refused(note);
     }
     let bound = json!({
         "values": request.values,
@@ -225,6 +249,8 @@ async fn dispatch_call(
     let ctx = ctx(state);
     let checked = async {
         let backend = backends.get(target.kind())?;
+        let owner = crate::authz::model::Principal::stored(parent.owner.as_deref());
+        backend.authorize(&ctx, &owner, target).await?;
         if locked.pin.moves() {
             let now = backend.interface(&ctx, target).await?;
             let digest = now
@@ -268,8 +294,19 @@ async fn dispatch_call(
         .await;
     match started {
         Ok(started) => {
-            crate::calls::store::dispatched(pool, &id, &started).await?;
+            let stop = recorded(pool, &id, &started).await?;
             tracing::info!(%run, task = %request.task, alias = %request.alias, call = %id, "call dispatched");
+            if stop && let Some(record) = crate::calls::store::get(pool, run, &id.0).await? {
+                tracing::info!(%run, call = %id, "call cancelled while it was dispatched; stopping its target run");
+                stop_target(&backends, &ctx, &record).await?;
+                crate::calls::store::settle(
+                    pool,
+                    &id,
+                    &Outcome::cancelled("cancelled while it was dispatched"),
+                    &record.progress,
+                )
+                .await?;
+            }
             Ok(DispatchResponse {
                 call: id,
                 handle: started.handle,
@@ -296,6 +333,93 @@ async fn dispatch_call(
             Err(e.into())
         }
     }
+}
+
+/// How many times recording a started dispatch is tried before the dispatch answers failing.
+const RECORD_ATTEMPTS: u32 = 4;
+
+/// Record the target run a dispatch started, trying again when the write fails: the target run
+/// exists, and a call that does not record it cannot follow or stop it. Whether it must be
+/// stopped at once, as [`crate::calls::store::dispatched`] says.
+async fn recorded(
+    pool: &PgPool,
+    id: &crucible_contract::calls::CallId,
+    started: &crate::calls::Dispatched,
+) -> anyhow::Result<bool> {
+    let mut attempt = 1;
+    loop {
+        match crate::calls::store::dispatched(pool, id, started).await {
+            Ok(stop) => return Ok(stop),
+            Err(e) if attempt < RECORD_ATTEMPTS => {
+                tracing::warn!(call = %id, attempt, error = %format!("{e:#}"), "recording a started dispatch failed; trying again");
+                tokio::time::sleep(std::time::Duration::from_millis(250) * attempt).await;
+                attempt += 1;
+            }
+            Err(e) => {
+                return Err(e.context(format!(
+                    "call {id} started {:?} but could not record it",
+                    started.handle
+                )));
+            }
+        }
+    }
+}
+
+/// Refuse a dispatch the calling run's plan does not declare: `request.task` must be a call task
+/// of `request.alias`, given an instance exactly when it is mapped.
+async fn planned(
+    pool: &PgPool,
+    parent: &crate::calls::Parent,
+    tree: crucible_contract::pack_tree::PackTree,
+    request: &DispatchRequest,
+) -> anyhow::Result<Result<(), String>> {
+    let variant = crate::launches::store::launch_variant(pool, &parent.launch).await?;
+    let compiled = match crate::calls::compile::compile_tree(tree, variant).await {
+        Ok(compiled) => compiled,
+        Err(CallError::Internal(e)) => return Err(e),
+        Err(refused) => return Ok(Err(refused.note())),
+    };
+    let task = &request.task;
+    Ok(match compiled.calls.get(task) {
+        None => Err(format!(
+            "run {}'s plan has no call task {task:?}",
+            parent.run
+        )),
+        Some(call) if call.alias != request.alias => Err(format!(
+            "call task {task:?} calls target {}, not {}",
+            call.alias, request.alias
+        )),
+        Some(call) if call.mapped && request.instance.is_none() => Err(format!(
+            "call task {task:?} is mapped, so a dispatch names its instance"
+        )),
+        Some(call) if !call.mapped && request.instance.is_some() => Err(format!(
+            "call task {task:?} is not mapped, so a dispatch names no instance"
+        )),
+        Some(_) => Ok(()),
+    })
+}
+
+/// The refusal of a call whose target playbook is already running in the calling chain.
+async fn calling_again(
+    pool: &PgPool,
+    run: &str,
+    alias: &crucible_contract::calls::CallAlias,
+    target: &PlaybookRef,
+) -> anyhow::Result<Option<String>> {
+    let (id, draft) = match target {
+        PlaybookRef::Registered(name) => (name.as_str(), false),
+        PlaybookRef::Draft(id) => (id.as_str(), true),
+    };
+    let chain = crate::calls::store::chain(pool, run).await?;
+    if !chain.iter().any(|c| c.playbook == id && c.draft == draft) {
+        return Ok(None);
+    }
+    let names: Vec<&str> = chain.iter().rev().map(|c| c.playbook.as_str()).collect();
+    Ok(Some(format!(
+        "call target {alias} is playbook {id}, which is already in this chain of calling runs \
+         ({} -> {id})",
+        names.join(" -> ")
+    )))
 }
 
 /// How long a claimed call may go without a recorded target before its dispatch counts as lost.
@@ -344,97 +468,7 @@ fn ordinal(n: u32) -> String {
     }
 }
 
-/// Whether a call's own wall clock ran out. A playbook target run carries the same ceiling
-/// itself, so only other kinds are cut off here.
-fn past_wall_clock(record: &CallRecord, now: jiff::Timestamp) -> Option<u64> {
-    if record.kind == CallKind::Playbook {
-        return None;
-    }
-    let secs = record.budget.and_then(|b| b.wall_clock_secs)?;
-    let started: jiff::Timestamp = record.created_at.parse().ok()?;
-    let elapsed = now.duration_since(started).as_secs();
-    (u64::try_from(elapsed).unwrap_or(0) > secs).then_some(secs)
-}
-
-/// Bring a dispatched, unended call up to date with its target run.
-pub(crate) async fn refresh(
-    backends: &Backends,
-    ctx: &CallCtx,
-    record: CallRecord,
-) -> anyhow::Result<CallRecord> {
-    if record.status.ended() || record.handle.is_none() {
-        return Ok(record);
-    }
-    let pool = ctx.db.pool();
-    let backend = match backends.get(record.kind) {
-        Ok(backend) => backend,
-        Err(e) => {
-            crate::calls::store::settle(
-                pool,
-                &record.id,
-                &Outcome::failed(e.note()),
-                &record.progress,
-            )
-            .await?;
-            return reread(ctx, record).await;
-        }
-    };
-    if let Some(secs) = past_wall_clock(&record, jiff::Timestamp::now()) {
-        if let Err(e) = backend.cancel(ctx, &record).await {
-            tracing::warn!(call = %record.id, error = %e.note(), "cancelling a call past its wall clock failed");
-        }
-        crate::calls::store::settle(
-            pool,
-            &record.id,
-            &Outcome::failed(format!(
-                "the target run ran past the call's wall clock of {secs}s"
-            )),
-            &record.progress,
-        )
-        .await?;
-        return reread(ctx, record).await;
-    }
-    match backend.poll(ctx, &record).await {
-        Ok(Polled {
-            progress,
-            outcome: Some(outcome),
-        }) => {
-            crate::calls::store::settle(pool, &record.id, &outcome, &progress).await?;
-        }
-        Ok(Polled {
-            progress,
-            outcome: None,
-        }) => {
-            let status = match progress
-                .nodes
-                .iter()
-                .any(|n| n.status != NodeStatus::Pending)
-            {
-                true => CallStatus::Running,
-                false => record.status,
-            };
-            crate::calls::store::progressed(pool, &record.id, status, &progress).await?;
-        }
-        Err(CallError::Internal(e)) => {
-            tracing::warn!(call = %record.id, error = %format!("{e:#}"), "following a call's target run failed; its last state stands");
-        }
-        Err(refused) => {
-            if let Err(e) = backend.cancel(ctx, &record).await {
-                tracing::warn!(call = %record.id, error = %e.note(), "cancelling a call whose target run cannot be followed failed");
-            }
-            crate::calls::store::settle(
-                pool,
-                &record.id,
-                &Outcome::failed(refused.note()),
-                &record.progress,
-            )
-            .await?;
-        }
-    }
-    reread(ctx, record).await
-}
-
-async fn reread(ctx: &CallCtx, record: CallRecord) -> anyhow::Result<CallRecord> {
+pub(crate) async fn reread(ctx: &CallCtx, record: CallRecord) -> anyhow::Result<CallRecord> {
     Ok(
         crate::calls::store::get(ctx.db.pool(), &record.parent_run, &record.id.0)
             .await?
@@ -442,8 +476,9 @@ async fn reread(ctx: &CallCtx, record: CallRecord) -> anyhow::Result<CallRecord>
     )
 }
 
-fn state_of(record: CallRecord) -> Option<CallState> {
+pub(crate) fn state_of(record: CallRecord) -> Option<CallState> {
     Some(CallState {
+        run_number: record.detail.get("run_number").and_then(Value::as_u64),
         handle: record.handle?,
         call: record.id,
         status: record.status,
@@ -482,13 +517,9 @@ async fn poll(
     if !grant.may_write_run(&run) {
         return not_this_run();
     }
-    let record = match found(&state, &run, &call).await {
-        Ok(record) => record,
-        Err(response) => return response,
-    };
-    match refresh(&Backends::new(&state), &ctx(&state), record).await {
+    match found(&state, &run, &call).await {
         Ok(record) => answer(record),
-        Err(e) => ApiError::from(e).into_response(),
+        Err(response) => response,
     }
 }
 
@@ -518,7 +549,35 @@ async fn cancel(
     }
 }
 
-/// Stop a call's target run and settle the call cancelled.
+/// Ask the target's system to stop a call's target run. A failure that may pass is owed: the
+/// refresh loop asks again.
+pub(crate) async fn stop_target(
+    backends: &Backends,
+    ctx: &CallCtx,
+    record: &CallRecord,
+) -> anyhow::Result<()> {
+    if record.handle.is_none() {
+        return Ok(());
+    }
+    let stopped = match backends.get(record.kind) {
+        Ok(backend) => backend.cancel(ctx, record).await,
+        Err(e) => Err(e),
+    };
+    match stopped {
+        Ok(()) => Ok(()),
+        Err(CallError::Internal(e)) => {
+            tracing::warn!(call = %record.id, error = %format!("{e:#}"), "stopping a call's target run failed; the refresh loop asks again");
+            crate::calls::store::owe_cancel(ctx.db.pool(), &record.id, true).await
+        }
+        Err(e) => {
+            tracing::warn!(call = %record.id, error = %e.note(), "a call's target run cannot be stopped");
+            Ok(())
+        }
+    }
+}
+
+/// Stop a call's target run and settle the call cancelled. A call still being dispatched is
+/// settled now, and its dispatch stops the target run it starts.
 pub(crate) async fn cancel_one(
     backends: &Backends,
     ctx: &CallCtx,
@@ -528,25 +587,11 @@ pub(crate) async fn cancel_one(
     if record.status.ended() {
         return Ok(record);
     }
-    match backends.get(record.kind) {
-        Ok(backend) => {
-            if let Err(e) = backend.cancel(ctx, &record).await {
-                tracing::warn!(call = %record.id, error = %e.note(), "cancelling a call's target run failed");
-            }
-        }
-        Err(e) => {
-            tracing::warn!(call = %record.id, error = %e.note(), "no backend to cancel a call's target run")
-        }
-    }
+    stop_target(backends, ctx, &record).await?;
     crate::calls::store::settle(
         ctx.db.pool(),
         &record.id,
-        &Outcome {
-            status: CallStatus::Cancelled,
-            note: note.to_string(),
-            result: Value::Null,
-            result_files: Vec::new(),
-        },
+        &Outcome::cancelled(note),
         &record.progress,
     )
     .await?;
@@ -559,17 +604,34 @@ pub(crate) async fn cancel_for_launch(
     cfg: &crate::config::ControllerCfg,
     key: &str,
 ) -> anyhow::Result<usize> {
-    let backends = Backends::following(cfg.calls_github_token);
+    let backends = Backends::following(cfg);
     let ctx = CallCtx {
         db: db.clone(),
         scratch_dir: cfg.scratch_root().to_path_buf(),
     };
     let open = crate::calls::store::open_for_launch(db.pool(), key).await?;
     let count = open.len();
+    let mut failed = Vec::new();
     for record in open {
-        cancel_one(&backends, &ctx, record, "cancelled with its calling run").await?;
+        let id = record.id.clone();
+        if let Err(e) = cancel_one(&backends, &ctx, record, "cancelled with its calling run").await
+        {
+            tracing::warn!(call = %id, error = %format!("{e:#}"), "cancelling a call with its launch failed");
+            failed.push(format!("{id}: {e:#}"));
+        }
     }
-    Ok(count)
+    match failed.is_empty() {
+        true => Ok(count),
+        false => Err(CancelsFailed { count, failed }.into()),
+    }
+}
+
+/// Some of a launch's calls could not be cancelled; the rest were.
+#[derive(Debug, thiserror::Error)]
+#[error("cancelling {} of {count} calls failed: {}", failed.len(), failed.join("; "))]
+pub(crate) struct CancelsFailed {
+    count: usize,
+    failed: Vec<String>,
 }
 
 async fn result_file(
@@ -619,7 +681,7 @@ async fn input_file(
     if !grant.may_write_run(&run) {
         return not_this_run();
     }
-    let actual = format!("sha256:{:x}", sha2::Sha256::digest(&body));
+    let actual = crucible_contract::artifact::content_digest(&body);
     if actual != digest {
         return refuse(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -627,108 +689,17 @@ async fn input_file(
         );
     }
     match crate::calls::store::put_input_file(state.db.pool(), &run, &digest, &body).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => refuse(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "run {run}'s call input files would pass {} bytes",
+                crate::calls::store::MAX_RUN_INPUT_BYTES
+            ),
+        ),
         Err(e) => ApiError::from(e).into_response(),
     }
 }
-
-/// `GET /api/runs/{run}/call-progress`: every call the run dispatched, each brought up to date.
-#[utoipa::path(
-    get,
-    path = "/api/runs/{run}/call-progress",
-    params(("run" = String, Path, description = "Calling run")),
-    responses(
-        (status = 200, description = "The run's calls with their progress", body = [Object]),
-        (status = 500, description = "Reading the calls failed", body = ErrorBody)
-    )
-)]
-pub(crate) async fn call_progress(
-    State(state): State<ApiState>,
-    Path(run): Path<String>,
-) -> Response {
-    let pool = state.db.pool();
-    let records = match crate::calls::store::list(pool, &run).await {
-        Ok(records) => records,
-        Err(e) => return ApiError::from(e).into_response(),
-    };
-    let backends = Backends::new(&state);
-    let ctx = ctx(&state);
-    let mut views = Vec::with_capacity(records.len());
-    for record in records {
-        let record = match refresh(&backends, &ctx, record.clone()).await {
-            Ok(fresh) => fresh,
-            Err(e) => {
-                tracing::warn!(call = %record.id, error = format!("{e:#}"), "refreshing a call for a reader failed");
-                record
-            }
-        };
-        let (task, instance, attempt, alias, kind) = (
-            record.task.clone(),
-            record.instance.clone(),
-            record.attempt,
-            record.alias.clone(),
-            record.kind,
-        );
-        if let Some(state) = state_of(record) {
-            views.push(CallView {
-                task,
-                instance,
-                attempt,
-                alias,
-                kind,
-                state,
-            });
-        }
-    }
-    axum::Json(views).into_response()
-}
-
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub(crate) struct LockBody {
-    /// The pack's `crucible.toml` and workflow sources, by path.
-    pub files: BTreeMap<String, String>,
-    /// Whether the pack is a draft, which alone may pin a draft's head.
-    #[serde(default)]
-    pub draft: bool,
-}
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub(crate) struct LockAnswer {
-    /// The `calls.lock` text; null when the manifest declares no calls.
-    pub lock: Option<String>,
-}
-
-/// `POST /api/calls/lock`: the lock a pack's `calls` blocks resolve to now, for a pack written
-/// outside the controller.
-#[utoipa::path(
-    post,
-    path = "/api/calls/lock",
-    request_body = LockBody,
-    responses(
-        (status = 200, description = "The calls.lock text", body = LockAnswer),
-        (status = 422, description = "A target could not be pinned", body = ErrorBody)
-    )
-)]
-pub(crate) async fn write_lock(
-    State(state): State<ApiState>,
-    Json(body): Json<LockBody>,
-) -> Response {
-    let calls = match crate::calls::lock::declared(|path| body.files.get(path).cloned()) {
-        Ok(calls) => calls,
-        Err(note) => return refuse(StatusCode::UNPROCESSABLE_ENTITY, note),
-    };
-    match crate::calls::lock::write(&Backends::new(&state), &ctx(&state), &calls, body.draft).await
-    {
-        Ok(lock) => match lock.map(|l| l.render()).transpose() {
-            Ok(lock) => axum::Json(LockAnswer { lock }).into_response(),
-            Err(e) => ApiError::from(anyhow::Error::from(e)).into_response(),
-        },
-        Err(note) => refuse(StatusCode::UNPROCESSABLE_ENTITY, note),
-    }
-}
-
-/// The route the human API writes a lock on.
-pub(crate) const LOCK_ROUTE: &str = "/api/calls/lock";
 
 #[cfg(test)]
 mod tests {
@@ -737,8 +708,18 @@ mod tests {
     use crate::client::Db;
     use axum::body::Body;
     use axum::http::Request;
-    use crucible_contract::calls::{CallAlias, TargetHandle};
+    use crucible_contract::calls::{CallAlias, NodeStatus, TargetHandle};
     use sqlx::PgPool;
+
+    /// One pass of the refresh loop at a time every call is due.
+    async fn refreshed(state: &ApiState) {
+        let later = jiff::Timestamp::now()
+            .checked_add(jiff::SignedDuration::from_secs(60))
+            .expect("a minute on");
+        crate::calls::refresh::refresh_due(&Backends::new(state), &ctx(state), later)
+            .await
+            .expect("refresh pass");
+    }
 
     const TARGET_WORKFLOW: &str = concat!(
         "params = {\"topic\": {\"type\": \"string\", \"required\": True}}\n",
@@ -751,13 +732,36 @@ mod tests {
 
     const CALLER_WORKFLOW: &str = concat!(
         "params = {}\n",
-        "calls = {\"target\": {\"kind\": \"playbook\", \"playbook\": \"draft:target\"}}\n",
-        "hello = command(name = \"hello\", run = \"echo hello\")\n",
-        "workflow(type = \"playbook\", tasks = [hello], result = hello)\n",
+        "calls = {\"target\": {\"kind\": \"playbook\", \"playbook\": \"draft:target\"}, ",
+        "\"filer\": {\"kind\": \"playbook\", \"playbook\": \"draft:filer\"}}\n",
+        "hello = command(name = \"hello\", run = \"echo hello\", emits_files = [\"NOTES.md\"])\n",
+        "ask = call(name = \"ask\", target = \"target\", params = {\"topic\": \"attention\"})\n",
+        "file = call(name = \"file\", target = \"filer\", ",
+        "params = {\"notes\": hello.files[\"NOTES.md\"]}, depends_on = [hello])\n",
+        "workflow(type = \"playbook\", tasks = [hello, ask, file], result = hello)\n",
+    );
+
+    const FILER_WORKFLOW: &str = concat!(
+        "params = {\"notes\": {\"type\": \"file\", \"required\": True, \"max_bytes\": 64, ",
+        "\"media_type\": [\"text/markdown\"]}}\n",
+        "read = command(name = \"read\", run = \"true\")\n",
+        "workflow(type = \"playbook\", tasks = [read])\n",
     );
 
     fn wren() -> crate::authz::model::Principal {
         crate::authz::model::Principal::User("wren".into())
+    }
+
+    async fn caller(pool: &PgPool, login: &str) -> crate::authz::Caller {
+        crate::authz::resolve_caller(
+            pool,
+            &crate::identity::auth::Roles::new(vec![], vec![], vec![]),
+            Some(login),
+            &[],
+            crate::identity::auth::AuthPath::Open,
+        )
+        .await
+        .expect("caller")
     }
 
     fn state(pool: PgPool) -> ApiState {
@@ -766,6 +770,7 @@ mod tests {
                 max_cost: 10.0,
                 max_time: crate::model::MaxTime::parse("2h").expect("cap"),
             },
+            scratch_dir: std::env::temp_dir().join(format!("calls-{}", uuid::Uuid::now_v7())),
             ..ApiState::test(Db::new(pool))
         }
     }
@@ -802,18 +807,9 @@ mod tests {
         files(crate::playbooks::drafts::SKELETON_MANIFEST, TARGET_WORKFLOW)
     }
 
-    /// The caller draft, saved with the lock its `[calls]` resolves to, launched as `key` with one
-    /// running run `run`. Returns the interface digest the lock records.
-    async fn calling_run(state: &ApiState, key: &str, run: &str) -> String {
-        let pool = state.db.pool();
-        draft(pool, "target", target_files()).await;
-        let mut caller = files(CALLER_MANIFEST, CALLER_WORKFLOW);
-        crate::calls::lock::into_files(&Backends::new(state), &ctx(state), &mut caller)
-            .await
-            .expect("lock written");
-        assert!(caller.contains_key("calls.lock"));
-        draft(pool, "caller", caller).await;
-        let version = crate::playbooks::drafts::latest(pool, "caller")
+    /// Draft `draft`'s latest save launched as `key` for wren, with one running run `run`.
+    async fn launched(pool: &PgPool, key: &str, run: &str, draft: &str) {
+        let version = crate::playbooks::drafts::latest(pool, draft)
             .await
             .expect("latest")
             .expect("saved")
@@ -827,9 +823,9 @@ mod tests {
                 key,
                 &crate::launches::model::NewPlaybookLaunch {
                     choice_snapshots: None,
-                    playbook: "caller",
+                    playbook: draft,
                     repo: "(draft)",
-                    title: "caller",
+                    title: draft,
                     params: &params,
                     schema_digest: "sha256:schema",
                     max_cost: 1.0,
@@ -851,6 +847,37 @@ mod tests {
         );
         tx.commit().await.expect("commit");
         running(pool, key, run, "running").await;
+    }
+
+    /// The caller draft, saved with the lock its `[calls]` resolves to, launched as `key` with one
+    /// running run `run`. Returns the interface digest the lock records.
+    async fn calling_run(state: &ApiState, key: &str, run: &str) -> String {
+        let pool = state.db.pool();
+        draft(pool, "target", target_files()).await;
+        draft(
+            pool,
+            "filer",
+            files(crate::playbooks::drafts::SKELETON_MANIFEST, FILER_WORKFLOW),
+        )
+        .await;
+        let wren = caller(pool, "wren").await;
+        let mut caller = files(CALLER_MANIFEST, CALLER_WORKFLOW);
+        crate::calls::lock::into_files(
+            &Backends::new(state),
+            &ctx(state),
+            &crate::calls::lock::Locking {
+                state,
+                caller: &wren,
+                draft_pack: true,
+                draft: Some("caller"),
+            },
+            &mut caller,
+        )
+        .await
+        .expect("lock written");
+        assert!(caller.contains_key("calls.lock"));
+        draft(pool, "caller", caller).await;
+        launched(pool, key, run, "caller").await;
         let tree = crate::runs::blob_store::get_pack(pool, &crate::model::sanitize_key(key))
             .await
             .expect("pack")
@@ -1156,15 +1183,25 @@ mod tests {
             &pool,
             &target_run,
             concat!(
+                r#"{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":1.0,"tasks":[{"name":"hello","kind":"command","required":true}]}"#,
+                "\n",
                 r#"{"v":1,"kind":"task_started","task":"hello","attempt":1,"estimate_usd":0.0}"#,
                 "\n",
                 r#"{"v":1,"kind":"task_result","task":"hello","status":"pass","output":{"greeting":"hi"}}"#,
+                "\n",
+                r#"{"v":1,"kind":"shutdown","outcome":"finished","reason":""}"#,
                 "\n",
             )
             .as_bytes(),
         )
         .await
         .expect("session");
+        let (_, unrefreshed) = crate::testing::call(&app, get(&poll, &token)).await;
+        assert_eq!(
+            unrefreshed["status"], "pending",
+            "a GET reads the store and settles nothing"
+        );
+        refreshed(&state).await;
         let (_, passed) = crate::testing::call(&app, get(&poll, &token)).await;
         let passed: CallState = serde_json::from_value(passed).expect("state");
         assert_eq!(passed.status, CallStatus::Passed, "{}", passed.note);
@@ -1194,11 +1231,17 @@ mod tests {
             "the cancelled call's target launch is cancelled"
         );
 
-        let listed = call_progress(State(state.clone()), Path("caller-run".to_string())).await;
+        let listed = crate::calls::reader::call_progress(
+            State(state.clone()),
+            caller(&pool, "wren").await,
+            Path("caller-run".to_string()),
+        )
+        .await;
         let body = axum::body::to_bytes(listed.into_body(), usize::MAX)
             .await
             .expect("body");
-        let views: Vec<CallView> = serde_json::from_slice(&body).expect("views");
+        let views: Vec<crucible_contract::calls::CallView> =
+            serde_json::from_slice(&body).expect("views");
         assert_eq!(views.len(), 2);
         assert_eq!(views[0].state.status, CallStatus::Passed);
         assert_eq!(views[1].state.status, CallStatus::Cancelled);
@@ -1224,13 +1267,20 @@ mod tests {
     async fn a_lock_refuses_what_it_cannot_pin(pool: PgPool) {
         let state = state(pool.clone());
         let backends = Backends::new(&state);
+        let wren = caller(&pool, "wren").await;
+        let locking = |draft_pack| crate::calls::lock::Locking {
+            state: &state,
+            caller: &wren,
+            draft_pack,
+            draft: None,
+        };
         let missing = crate::calls::lock::declared(|path| {
             (path == "crucible.toml")
                 .then(|| CALLER_MANIFEST.to_string())
                 .or_else(|| (path == "workflow.star").then(|| "calls = {\"gone\": {\"kind\": \"playbook\", \"playbook\": \"draft:nowhere\"}}\n".to_string()))
         })
         .expect("declared");
-        let refused = crate::calls::lock::write(&backends, &ctx(&state), &missing, true)
+        let refused = crate::calls::lock::write(&backends, &ctx(&state), &missing, &locking(true))
             .await
             .expect_err("unresolvable");
         assert!(refused.starts_with("call target gone"), "{refused}");
@@ -1242,11 +1292,11 @@ mod tests {
                 .or_else(|| (path == "workflow.star").then(|| "calls = {\"target\": {\"kind\": \"playbook\", \"playbook\": \"draft:target\"}}\n".to_string()))
         })
         .expect("declared");
-        let refused = crate::calls::lock::write(&backends, &ctx(&state), &head, false)
+        let refused = crate::calls::lock::write(&backends, &ctx(&state), &head, &locking(false))
             .await
             .expect_err("a registered pack may not pin a draft head");
         assert!(refused.contains("only a draft pack"), "{refused}");
-        let lock = crate::calls::lock::write(&backends, &ctx(&state), &head, true)
+        let lock = crate::calls::lock::write(&backends, &ctx(&state), &head, &locking(true))
             .await
             .expect("a draft pack may")
             .expect("declared calls lock");
@@ -1272,7 +1322,7 @@ mod tests {
                 })
         })
         .expect("declared");
-        let refused = crate::calls::lock::write(&backends, &ctx(&state), &github, true)
+        let refused = crate::calls::lock::write(&backends, &ctx(&state), &github, &locking(true))
             .await
             .expect_err("no token source");
         assert!(
@@ -1281,61 +1331,744 @@ mod tests {
         );
     }
 
-    fn record(kind: CallKind, created_at: &str) -> CallRecord {
-        CallRecord {
-            id: crucible_contract::calls::CallId("c".into()),
-            parent_run: "r".into(),
-            task: "t".into(),
-            instance: None,
-            attempt: 1,
-            alias: alias(),
-            kind,
-            target: crucible_contract::calls::CallTarget::Playbook {
-                playbook: crucible_contract::calls::PlaybookRef::Draft("d".into()),
-            },
-            interface: crucible_contract::calls::TargetInterface {
-                params: json!({}),
-                result: vec![],
-                result_files: vec![],
-                graph: Default::default(),
-            },
-            handle: None,
-            detail: json!({}),
-            budget: Some(crucible_contract::calls::CallBudget {
-                cost_usd: None,
-                wall_clock_secs: Some(60),
-            }),
-            status: CallStatus::Running,
-            note: String::new(),
-            result: Value::Null,
-            result_files: vec![],
-            progress: Default::default(),
-            link: None,
-            created_at: created_at.to_string(),
-        }
+    async fn digest_of(pool: &PgPool, key: &str, alias: &str) -> String {
+        let tree = crate::runs::blob_store::get_pack(pool, &crate::model::sanitize_key(key))
+            .await
+            .expect("pack")
+            .expect("stored");
+        let (_, lock) = crate::calls::lock::of_tree(&tree).expect("lock");
+        lock.expect("locked").calls[&CallAlias::parse(alias).expect("alias")]
+            .interface_digest
+            .clone()
     }
 
-    #[test]
-    fn a_call_past_its_wall_clock_is_found_only_for_kinds_without_their_own() {
-        let now: jiff::Timestamp = "2026-11-25T10:02:00Z".parse().expect("now");
-        assert_eq!(
-            past_wall_clock(
-                &record(CallKind::GithubWorkflow, "2026-11-25T10:00:00Z"),
-                now
+    fn with_files(digest: &str, task: &str, alias: &str, files: Value) -> DispatchRequest {
+        serde_json::from_value(json!({
+            "task": task,
+            "attempt": 1,
+            "alias": alias,
+            "interface_digest": digest,
+            "files": files,
+        }))
+        .expect("request")
+    }
+
+    async fn read_as(app: &axum::Router, user: &str, path: &str) -> (StatusCode, String) {
+        let req = Request::get(path)
+            .header("x-auth-request-user", user)
+            .body(Body::empty())
+            .expect("request");
+        let (status, body) = crate::testing::oneshot_bytes(app, req).await;
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// The child launch a call's handle names, and that handle's run.
+    async fn child_of(pool: &PgPool, handle: &Value) -> (String, String) {
+        let run = handle["run"].as_str().expect("playbook handle").to_string();
+        let key: String =
+            sqlx::query_scalar("SELECT key FROM playbook_launches WHERE reserved_run = $1")
+                .bind(&run)
+                .fetch_one(pool)
+                .await
+                .expect("child launch");
+        (key, run)
+    }
+
+    async fn finished_with(pool: &PgPool, key: &str, run: &str, session: &str) {
+        running(pool, key, run, "finished").await;
+        crate::runs::blob_store::put_run_session(pool, run, session.as_bytes())
+            .await
+            .expect("session");
+    }
+
+    const PLANNED_HELLO: &str = r#"{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":1.0,"tasks":[{"name":"hello","kind":"command","required":true}]}"#;
+
+    /// A reader of the calling run sees its calls, a reader of nothing else sees nothing, and a
+    /// playbook target run the reader may not read shows its nodes' labels and statuses only.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_calls_progress_is_served_only_to_readers_of_the_calling_run(pool: PgPool) {
+        let state = state(pool.clone());
+        let digest = calling_run(&state, "playbook:caller:1", "caller-run").await;
+        let token = mint_token(&pool, "caller-run").await;
+        let pod = run_routes(state.clone());
+        let (status, body) = crate::testing::call(
+            &pod,
+            post(
+                CALLS,
+                &token,
+                &request(&digest, 1, json!({"topic": "attention"})),
             ),
-            Some(60)
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let call = body["call"].as_str().expect("call").to_string();
+        let (child, target_run) = child_of(&pool, &body["handle"]).await;
+        finished_with(
+            &pool,
+            &child,
+            &target_run,
+            &format!(
+                "{PLANNED_HELLO}\n{}\n",
+                r#"{"v":1,"kind":"task_result","task":"hello","status":"pass","output":{"greeting":"hi"}}"#
+            ),
+        )
+        .await;
+        refreshed(&state).await;
+        let app = crate::api::router(state.clone());
+        let progress = "/api/runs/caller-run/call-progress";
+
+        let (status, seen) = read_as(&app, "wren", progress).await;
+        assert_eq!(status, StatusCode::OK, "{seen}");
+        let views: Vec<crucible_contract::calls::CallView> =
+            serde_json::from_str(&seen).expect("views");
+        assert_eq!(views.len(), 1);
+        assert!(views[0].state.link.is_some());
+        assert!(views[0].state.progress.nodes[0].link.is_some());
+
+        let (status, _) = read_as(&app, "mallory", progress).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "not a reader of the calling run"
         );
+        let (status, _) = read_as(&app, "mallory", "/api/runs/nowhere/call-progress").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let log = format!("/api/runs/caller-run/calls/{call}/nodes/hello/log");
+        let (status, text) = read_as(&app, "wren", &log).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert!(text.contains(r#""task":"hello""#), "{text}");
+        let (status, _) = read_as(&app, "mallory", &log).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = read_as(
+            &app,
+            "wren",
+            &format!("/api/runs/caller-run/calls/{call}/nodes/nope/log"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, launches) = read_as(&app, "wren", "/api/playbook-runs").await;
+        assert_eq!(status, StatusCode::OK, "{launches}");
+        let launches: Vec<Value> = serde_json::from_str(&launches).expect("launches");
+        let called = launches
+            .iter()
+            .find(|l| l["key"] == json!(child))
+            .expect("the child launch is listed");
         assert_eq!(
-            past_wall_clock(
-                &record(CallKind::GithubWorkflow, "2026-11-25T10:01:30Z"),
-                now
+            called["called_by"],
+            json!({"run": "caller-run", "launch": "playbook:caller:1", "task": "ask", "instance": null})
+        );
+        let caller_row = launches
+            .iter()
+            .find(|l| l["key"] == json!("playbook:caller:1"))
+            .expect("the caller is listed");
+        assert_eq!(caller_row["called_by"], Value::Null);
+
+        sqlx::query("UPDATE playbook_launches SET owner = 'user:ash' WHERE key = $1")
+            .bind(&child)
+            .execute(&pool)
+            .await
+            .expect("hand the target run to ash");
+        let (status, seen) = read_as(&app, "wren", progress).await;
+        assert_eq!(status, StatusCode::OK, "{seen}");
+        let views: Vec<crucible_contract::calls::CallView> =
+            serde_json::from_str(&seen).expect("views");
+        let node = &views[0].state.progress.nodes[0];
+        assert_eq!(node.label, "hello");
+        assert!(node.status.ended());
+        assert_eq!(node.link, None, "no link into a run wren may not read");
+        assert_eq!(node.detail, None);
+        assert_eq!(views[0].state.link, None);
+        let (status, _) = read_as(&app, "wren", &log).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "no log of a run wren may not read"
+        );
+        let (status, _) = read_as(&app, "ash", progress).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "reading the target is not reading the caller"
+        );
+    }
+
+    /// A dispatch names a call task of the run's plan, with the alias it calls, an instance only
+    /// when it is mapped, and values and files that fit the locked parameters.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_dispatch_must_match_the_plan_and_the_locked_types(pool: PgPool) {
+        let state = state(pool.clone());
+        let digest = calling_run(&state, "playbook:caller:1", "caller-run").await;
+        let filer = digest_of(&pool, "playbook:caller:1", "filer").await;
+        let token = mint_token(&pool, "caller-run").await;
+        let app = run_routes(state.clone());
+        let notes = b"# notes\n".to_vec();
+        let notes_digest = crucible_contract::artifact::content_digest(&notes);
+        let put = Request::put(format!("/api/runs/caller-run/call-files/{notes_digest}"))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(notes.clone()))
+            .expect("request");
+        let (status, _) = crate::testing::call(&app, put).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let file = |media: &str, size: usize| json!({"notes": {"digest": notes_digest, "size": size, "path": "NOTES.md", "media_type": media}});
+        let mut not_a_call = request(&digest, 1, json!({"topic": "a"}));
+        not_a_call.task = "hello".into();
+        let mut instanced = request(&digest, 1, json!({"topic": "a"}));
+        instanced.instance = Some("x".into());
+        let mut wrong_alias =
+            with_files(&filer, "ask", "filer", file("text/markdown", notes.len()));
+        wrong_alias.task = "ask".into();
+        for (refused, says) in [
+            (not_a_call, "no call task \"hello\""),
+            (wrong_alias, "calls target target, not filer"),
+            (instanced, "not mapped"),
+            (request(&digest, 1, json!({"topic": 3})), "takes string"),
+            (
+                with_files(
+                    &digest,
+                    "ask",
+                    "target",
+                    json!({"topic": {"digest": notes_digest, "size": notes.len()}}),
+                ),
+                "not a file parameter",
             ),
+            (
+                serde_json::from_value(json!({
+                    "task": "file", "attempt": 1, "alias": "filer",
+                    "interface_digest": filer, "values": {"notes": "text"},
+                }))
+                .expect("request"),
+                "takes a file",
+            ),
+            (
+                with_files(&filer, "file", "filer", file("image/png", notes.len())),
+                "takes text/markdown",
+            ),
+            (
+                with_files(&filer, "file", "filer", file("text/markdown", 3)),
+                "this run uploaded 8",
+            ),
+            (
+                with_files(&filer, "file", "filer", file("text/markdown", 65)),
+                "at most 64 bytes",
+            ),
+            (
+                with_files(
+                    &filer,
+                    "file",
+                    "filer",
+                    json!({"notes": {"digest": "sha256:00", "size": 1, "media_type": "text/markdown"}}),
+                ),
+                "did not upload",
+            ),
+        ] {
+            let (status, body) = crate::testing::call(&app, post(CALLS, &token, &refused)).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+            let note = body["note"].as_str().unwrap_or_default();
+            assert!(note.contains(says), "{says:?} in {note}");
+        }
+        assert!(child_launches(&pool).await.is_empty());
+    }
+
+    /// A file a call binds becomes a blob the target launch owns, served to that launch's runs by
+    /// their own pod tokens and to nothing else.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_bound_file_reaches_the_target_launch_and_only_its_runs(pool: PgPool) {
+        let state = state(pool.clone());
+        calling_run(&state, "playbook:caller:1", "caller-run").await;
+        let filer = digest_of(&pool, "playbook:caller:1", "filer").await;
+        let token = mint_token(&pool, "caller-run").await;
+        let app = run_routes(state.clone());
+        let notes = b"# notes\n".to_vec();
+        let digest = crucible_contract::artifact::content_digest(&notes);
+        let put = Request::put(format!("/api/runs/caller-run/call-files/{digest}"))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(notes.clone()))
+            .expect("request");
+        assert_eq!(
+            crate::testing::call(&app, put).await.0,
+            StatusCode::NO_CONTENT
+        );
+        let dispatch = with_files(
+            &filer,
+            "file",
+            "filer",
+            json!({"notes": {"digest": digest, "size": notes.len(), "path": "NOTES.md", "media_type": "text/markdown"}}),
+        );
+        let (status, body) = crate::testing::call(&app, post(CALLS, &token, &dispatch)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (child, target_run) = child_of(&pool, &body["handle"]).await;
+        let params: Value =
+            sqlx::query_scalar("SELECT params FROM playbook_launches WHERE key = $1")
+                .bind(&child)
+                .fetch_one(&pool)
+                .await
+                .expect("params");
+        let reference: Value =
+            serde_json::from_str(params["notes"].as_str().expect("staged")).expect("reference");
+        assert_eq!(reference["digest"], json!(digest));
+        assert_eq!(reference["media_type"], json!("text/markdown"));
+        let staged = reference["path"].as_str().expect("path");
+        assert!(staged.ends_with("/NOTES.md"), "{staged}");
+        assert_eq!(std::fs::read(staged).expect("staged on disk"), notes);
+
+        running(&pool, &child, &target_run, "running").await;
+        let child_token = mint_token(&pool, &target_run).await;
+        let served = format!("/api/runs/{target_run}/param-files/{digest}");
+        let (status, bytes) = crate::testing::oneshot_bytes(&app, get(&served, &child_token)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(bytes.as_ref(), notes.as_slice());
+        let (status, _) = crate::testing::call(&app, get(&served, &token)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "another run's token");
+        let (status, _) = crate::testing::call(
+            &app,
+            get(
+                &format!("/api/runs/caller-run/param-files/{digest}"),
+                &token,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "the caller's own launch holds no file"
+        );
+    }
+
+    /// A run's call input uploads stop at their cap, and a repeat of one it holds still answers.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_runs_call_inputs_are_capped(pool: PgPool) {
+        let state = state(pool.clone());
+        calling_run(&state, "playbook:caller:1", "caller-run").await;
+        let half = usize::try_from(crate::calls::store::MAX_RUN_INPUT_BYTES / 2 + 1).expect("size");
+        let first = vec![1u8; half];
+        let second = vec![2u8; half];
+        let d = |b: &[u8]| crucible_contract::artifact::content_digest(b);
+        let put = |bytes: &[u8]| {
+            let pool = pool.clone();
+            let bytes = bytes.to_vec();
+            async move {
+                crate::calls::store::put_input_file(&pool, "caller-run", &d(&bytes), &bytes)
+                    .await
+                    .expect("put")
+            }
+        };
+        assert!(put(&first).await);
+        assert!(!put(&second).await, "past the cap");
+        assert!(put(&first).await, "a file the run holds answers again");
+        assert_eq!(
+            crate::calls::store::input_file_size(&pool, "caller-run", &d(&second))
+                .await
+                .expect("size"),
             None
         );
+    }
+
+    /// A call refuses a target already running somewhere up its chain of calling runs.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_call_never_targets_a_playbook_already_in_its_chain(pool: PgPool) {
+        let state = state(pool.clone());
+        let digest = calling_run(&state, "playbook:caller:1", "caller-run").await;
+        let token = mint_token(&pool, "caller-run").await;
+        let app = run_routes(state.clone());
+        let max_time = crate::model::MaxTime::parse("30m").expect("duration");
+        let params = json!({});
+        let mut tx = pool.begin().await.expect("tx");
+        crate::launches::store::insert_playbook_launch_with(
+            &mut tx,
+            "playbook:target:0",
+            &crate::launches::model::NewPlaybookLaunch {
+                choice_snapshots: None,
+                playbook: "target",
+                repo: "(draft)",
+                title: "grand",
+                params: &params,
+                schema_digest: "sha256:schema",
+                max_cost: 1.0,
+                max_time: &max_time,
+                advance_dedupe: false,
+                dedupe_schedule: None,
+                origin: crate::model::LaunchOrigin::Draft,
+                draft_version: Some(1),
+                created_by: Some("wren"),
+                owner: Some("user:wren"),
+                launcher_groups: None,
+                rerun: None,
+                dispatch: Default::default(),
+            },
+            &crate::playbooks::exposure::Extraction::Absent,
+        )
+        .await
+        .expect("grand launch");
+        tx.commit().await.expect("commit");
+        running(&pool, "playbook:target:0", "grand-run", "running").await;
+        sqlx::query(
+            "UPDATE playbook_launches SET parent_run = 'grand-run', parent_task = 'up', \
+             call_depth = 1 WHERE key = 'playbook:caller:1'",
+        )
+        .execute(&pool)
+        .await
+        .expect("chain");
         assert_eq!(
-            past_wall_clock(&record(CallKind::Playbook, "2026-11-25T10:00:00Z"), now),
-            None,
-            "a playbook target run holds the same ceiling itself"
+            crate::calls::store::chain(&pool, "caller-run")
+                .await
+                .expect("chain")
+                .into_iter()
+                .map(|c| (c.playbook, c.draft))
+                .collect::<Vec<_>>(),
+            vec![("caller".to_string(), true), ("target".to_string(), true)]
+        );
+        let (status, body) = crate::testing::call(
+            &app,
+            post(CALLS, &token, &request(&digest, 1, json!({"topic": "a"}))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let note = body["note"].as_str().unwrap_or_default();
+        assert!(note.contains("already in this chain"), "{note}");
+        assert!(note.contains("target -> caller -> target"), "{note}");
+        assert!(child_launches(&pool).await.is_empty());
+    }
+
+    /// Lock a pack whose workflow declares `calls` and nothing else, as `who`, for draft `me`.
+    async fn lock_as(
+        state: &ApiState,
+        backends: &Backends,
+        who: &crate::authz::Caller,
+        me: Option<&str>,
+        calls: String,
+    ) -> Result<Option<crucible_contract::calls::CallsLock>, String> {
+        let workflow = format!("{calls}workflow(type = \"playbook\", tasks = [])\n");
+        let declared = crate::calls::lock::declared(|path| match path {
+            "crucible.toml" => Some(CALLER_MANIFEST.to_string()),
+            "workflow.star" => Some(workflow.clone()),
+            _ => None,
+        })
+        .expect("declared");
+        crate::calls::lock::write(
+            backends,
+            &ctx(state),
+            &declared,
+            &crate::calls::lock::Locking {
+                state,
+                caller: who,
+                draft_pack: true,
+                draft: me,
+            },
+        )
+        .await
+    }
+
+    /// A lock names only targets its writer may read, refusing the rest as it refuses a target
+    /// that does not exist, and no chain of draft heads may lead back to the draft being locked.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_lock_names_only_readable_targets_and_no_draft_cycle(pool: PgPool) {
+        let state = state(pool.clone());
+        let backends = Backends::new(&state);
+        draft(&pool, "target", target_files()).await;
+        let ash = caller(&pool, "ash").await;
+        let wren = caller(&pool, "wren").await;
+        let calling = |draft: &str| {
+            format!(
+                "calls = {{\"t\": {{\"kind\": \"playbook\", \"playbook\": \"draft:{draft}\"}}}}\n"
+            )
+        };
+        let lock = |who, me, body| lock_as(&state, &backends, who, me, body);
+        let (ash, wren) = (&ash, &wren);
+        let hidden = lock(ash, None, calling("target"))
+            .await
+            .expect_err("ash may not read it");
+        let absent = lock(ash, None, calling("nowhere"))
+            .await
+            .expect_err("absent");
+        assert_eq!(hidden, "call target t: no draft \"target\"");
+        assert_eq!(absent, "call target t: no draft \"nowhere\"");
+        assert!(lock(wren, None, calling("target")).await.is_ok());
+
+        let plain = |name: &str| {
+            files(
+                CALLER_MANIFEST,
+                &format!(
+                    "{name} = command(name = \"{name}\", run = \"true\")\nworkflow(type = \"playbook\", tasks = [{name}])\n"
+                ),
+            )
+        };
+        draft(&pool, "loop-a", plain("a")).await;
+        let mut loop_b = files(
+            CALLER_MANIFEST,
+            &format!(
+                "{}b = command(name = \"b\", run = \"true\")\nworkflow(type = \"playbook\", tasks = [b])\n",
+                calling("loop-a")
+            ),
+        );
+        crate::calls::lock::into_files(
+            &backends,
+            &ctx(&state),
+            &crate::calls::lock::Locking {
+                state: &state,
+                caller: wren,
+                draft_pack: true,
+                draft: Some("loop-b"),
+            },
+            &mut loop_b,
+        )
+        .await
+        .expect("loop-b locks loop-a");
+        draft(&pool, "loop-b", loop_b).await;
+        let refused = lock(wren, Some("loop-a"), calling("loop-b"))
+            .await
+            .expect_err("a cycle back to loop-a");
+        assert!(refused.contains("loop-a -> loop-b -> loop-a"), "{refused}");
+        let refused = lock(wren, Some("loop-a"), calling("loop-a"))
+            .await
+            .expect_err("a draft calling itself");
+        assert!(refused.contains("loop-a -> loop-a"), "{refused}");
+        assert!(lock(wren, Some("other"), calling("loop-b")).await.is_ok());
+    }
+
+    /// A target run passes on its verdict: early completion passes, and a result task that never
+    /// passed gives an empty result the note explains; a required task's failure fails the call
+    /// whatever the shutdown says.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_target_run_settles_on_its_verdict(pool: PgPool) {
+        let state = state(pool.clone());
+        let digest = calling_run(&state, "playbook:caller:1", "caller-run").await;
+        let token = mint_token(&pool, "caller-run").await;
+        let app = run_routes(state.clone());
+        let mut settled = Vec::new();
+        for (attempt, session) in [
+            (
+                1,
+                format!(
+                    "{PLANNED_HELLO}\n{}\n{}\n",
+                    r#"{"v":1,"kind":"task_result","task":"hello","status":"fail"}"#,
+                    r#"{"v":1,"kind":"shutdown","outcome":"finished","reason":""}"#
+                ),
+            ),
+            (
+                2,
+                format!(
+                    "{PLANNED_HELLO}\n{}\n",
+                    r#"{"v":1,"kind":"shutdown","outcome":"complete","reason":"nothing to do"}"#
+                ),
+            ),
+        ] {
+            let (status, body) = crate::testing::call(
+                &app,
+                post(
+                    CALLS,
+                    &token,
+                    &request(&digest, attempt, json!({"topic": "a"})),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let call = body["call"].as_str().expect("call").to_string();
+            let (child, target_run) = child_of(&pool, &body["handle"]).await;
+            finished_with(&pool, &child, &target_run, &session).await;
+            refreshed(&state).await;
+            let (_, polled) =
+                crate::testing::call(&app, get(&format!("{CALLS}/{call}"), &token)).await;
+            settled.push(serde_json::from_value::<CallState>(polled).expect("state"));
+        }
+        assert_eq!(settled[0].status, CallStatus::Failed, "{}", settled[0].note);
+        assert!(
+            settled[0].note.contains("invalid verdict"),
+            "{}",
+            settled[0].note
+        );
+        assert!(
+            settled[0].note.contains("required task hello settled fail"),
+            "{}",
+            settled[0].note
+        );
+        assert_eq!(settled[1].status, CallStatus::Passed, "{}", settled[1].note);
+        assert_eq!(settled[1].result, json!({}));
+        assert!(
+            settled[1].note.contains("result task hello")
+                && settled[1].note.contains("never settled"),
+            "{}",
+            settled[1].note
+        );
+    }
+
+    const GITHUB_CALLER: &str = concat!(
+        "params = {}\n",
+        "calls = {\"ci\": {\"kind\": \"github_workflow\", \"repo\": \"acme/app\", ",
+        "\"workflow\": \".github/workflows/ci.yml\", \"ref\": \"main\", ",
+        "\"outputs\": {\"artifact\": \"result\"}}}\n",
+        "hello = command(name = \"hello\", run = \"echo hello\")\n",
+        "ci = call(name = \"ci\", target = \"ci\", params = {})\n",
+        "workflow(type = \"playbook\", tasks = [hello, ci], result = hello)\n",
+    );
+
+    /// With the App, a GitHub workflow is dispatched only for a launch owner whose paired GitHub
+    /// login may write to the repository; a refusal starts nothing and keeps no call.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_github_call_needs_an_owner_who_may_write_to_the_repository(pool: PgPool) {
+        use crucible_contract::calls::{
+            CallsLock, GitRefName, GithubRepo, LOCK_VERSION, LockedCall, TargetInterface,
+            WorkflowPath,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/app/installation"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": 7,
+                "permissions": {"actions": "write", "contents": "read"},
+            })))
+            .mount(&server)
+            .await;
+        let in_an_hour = jiff::Timestamp::from_second(jiff::Timestamp::now().as_second() + 3600)
+            .expect("an hour on")
+            .to_string();
+        Mock::given(method("POST"))
+            .and(path("/app/installations/7/access_tokens"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(json!({"token": "ghs_repo", "expires_at": in_an_hour})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/app/collaborators/wren-gh/permission"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"permission": "read", "role_name": "read"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let keys = tempfile::tempdir().expect("dir");
+        let state = ApiState {
+            calls_github: Some(crate::calls::GithubToken::AppInstallation),
+            pack_pr_app: Some(crate::secrets::github_app::GithubAppTokenSource::new(
+                "1",
+                "2",
+                crate::secrets::github_app::testkey::write_test_key(keys.path()),
+                server.uri(),
+            )),
+            github_logins: crate::identity::github_logins::GithubLogins::parse(["wren-gh=wren"]),
+            ..state(pool.clone())
+        };
+        let interface = TargetInterface {
+            params: json!({"type": "object", "properties": {}, "required": []}),
+            result: vec![],
+            result_files: vec![],
+            graph: Default::default(),
+        };
+        let locked = LockedCall::new(
+            crucible_contract::calls::Pin::GithubRef {
+                repo: GithubRepo::parse("acme/app").expect("repo"),
+                workflow: WorkflowPath::parse(".github/workflows/ci.yml").expect("workflow"),
+                git_ref: GitRefName::parse("main").expect("ref"),
+                commit: "a".repeat(40),
+            },
+            interface,
+        )
+        .expect("locked");
+        let digest = locked.interface_digest.clone();
+        let lock = CallsLock {
+            version: LOCK_VERSION,
+            calls: BTreeMap::from([(CallAlias::parse("ci").expect("alias"), locked)]),
+        };
+        let mut caller = files(CALLER_MANIFEST, GITHUB_CALLER);
+        caller.insert("calls.lock".into(), lock.render().expect("render"));
+        draft(&pool, "gh-caller", caller).await;
+        launched(&pool, "playbook:gh-caller:1", "caller-run", "gh-caller").await;
+        let token = mint_token(&pool, "caller-run").await;
+        let app = run_routes(state.clone());
+        let dispatch: DispatchRequest = serde_json::from_value(json!({
+            "task": "ci",
+            "attempt": 1,
+            "alias": "ci",
+            "interface_digest": digest,
+            "values": {},
+        }))
+        .expect("request");
+
+        let (status, body) = crate::testing::call(&app, post(CALLS, &token, &dispatch)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let note = body["note"].as_str().expect("note");
+        assert!(note.contains("wren-gh has read"), "{note}");
+        assert!(note.contains("write, maintain or admin"), "{note}");
+
+        sqlx::query("UPDATE playbook_launches SET owner = 'user:mallory' WHERE key = $1")
+            .bind("playbook:gh-caller:1")
+            .execute(&pool)
+            .await
+            .expect("hand the launch to mallory");
+        let (status, body) = crate::testing::call(&app, post(CALLS, &token, &dispatch)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let note = body["note"].as_str().expect("note");
+        assert!(note.contains("no linked GitHub login"), "{note}");
+
+        let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM call_target_runs")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(kept, 0, "a refused dispatch keeps no call");
+    }
+
+    /// A target launch that ran again still settles its call from the run its handle names.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_call_settles_from_the_run_its_handle_names(pool: PgPool) {
+        let state = state(pool.clone());
+        let digest = calling_run(&state, "playbook:caller:1", "caller-run").await;
+        let token = mint_token(&pool, "caller-run").await;
+        let app = run_routes(state.clone());
+        let (status, body) = crate::testing::call(
+            &app,
+            post(CALLS, &token, &request(&digest, 1, json!({"topic": "a"}))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let call = body["call"].as_str().expect("call").to_string();
+        let (child, target_run) = child_of(&pool, &body["handle"]).await;
+        finished_with(
+            &pool,
+            &child,
+            &target_run,
+            &format!(
+                "{PLANNED_HELLO}\n{}\n{}\n",
+                r#"{"v":1,"kind":"task_result","task":"hello","status":"pass","output":{"greeting":"mine"}}"#,
+                r#"{"v":1,"kind":"shutdown","outcome":"finished","reason":""}"#
+            ),
+        )
+        .await;
+        running(&pool, &child, "a-later-run", "running").await;
+        refreshed(&state).await;
+        let (_, polled) = crate::testing::call(&app, get(&format!("{CALLS}/{call}"), &token)).await;
+        let polled: CallState = serde_json::from_value(polled).expect("state");
+        assert_eq!(polled.status, CallStatus::Passed, "{}", polled.note);
+        assert_eq!(polled.result, json!({"greeting": "mine"}));
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_dispatch_it_cannot_record_answers_failing_after_retries(pool: PgPool) {
+        let started = crate::calls::Dispatched {
+            handle: TargetHandle::Playbook { run: "t-1".into() },
+            link: None,
+            detail: json!({}),
+        };
+        let began = std::time::Instant::now();
+        let error = recorded(
+            &pool,
+            &crucible_contract::calls::CallId("unclaimed".into()),
+            &started,
+        )
+        .await
+        .expect_err("no claim to record on");
+        assert!(
+            format!("{error:#}").contains("could not record"),
+            "{error:#}"
+        );
+        assert!(
+            began.elapsed() >= std::time::Duration::from_millis(250 * 6),
+            "every attempt was made"
         );
     }
 

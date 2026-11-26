@@ -18,7 +18,7 @@ use crucible_contract::TransportCause;
 use crucible_contract::calls::{
     CALL_CANCEL_PATH, CALL_INPUT_FILE_PATH, CALL_PATH, CALL_RESULT_FILE_PATH, CALLS_PATH, CallId,
     CallRefused, CallState, CallStatus, DispatchRequest, DispatchResponse, FileRef,
-    MAX_FILE_PARAM_BYTES,
+    MAX_FILE_PARAM_BYTES, PARAM_FILE_PATH,
 };
 use crucible_contract::session::SessionEvent;
 
@@ -195,6 +195,30 @@ impl Controller {
                 .send(),
         )
         .map(drop)
+    }
+
+    /// The bytes of a file parameter value this run's launch holds, by its digest.
+    pub fn param_file(&self, digest: &str) -> Result<Vec<u8>, String> {
+        let url = self.at(PARAM_FILE_PATH, None).replace(
+            "{digest}",
+            &crucible_contract::artifact::path_segment(digest),
+        );
+        let resp = Self::checked(self.client.get(url).bearer_auth(&self.token).send())?;
+        if resp
+            .content_length()
+            .is_some_and(|len| len > MAX_FILE_PARAM_BYTES)
+        {
+            return Err(format!(
+                "the controller sent more than {MAX_FILE_PARAM_BYTES} bytes"
+            ));
+        }
+        let bytes = resp.bytes().map_err(|e| e.to_string())?;
+        if bytes.len() as u64 > MAX_FILE_PARAM_BYTES {
+            return Err(format!(
+                "the controller sent more than {MAX_FILE_PARAM_BYTES} bytes"
+            ));
+        }
+        Ok(bytes.to_vec())
     }
 
     fn result_file(&self, call: &CallId, path: &str) -> Result<Vec<u8>, String> {
@@ -411,6 +435,15 @@ impl TaskRunner for WithCalls<'_, '_> {
                 inputs: b.inputs.clone(),
             })
             .collect();
+        let calls: Vec<BatchItem<'_>> = batch
+            .iter()
+            .filter(|b| is_call(b.task))
+            .map(|b| BatchItem {
+                task: b.task,
+                attempt: b.attempt,
+                inputs: b.inputs.clone(),
+            })
+            .collect();
         let mut others = if others.is_empty() {
             Vec::new()
         } else {
@@ -418,13 +451,17 @@ impl TaskRunner for WithCalls<'_, '_> {
         }
         .into_iter();
         let ctx = self.ctx;
+        let mut calls = admission
+            .run_all(&calls, |b, lane| {
+                run(b.task, b.attempt, &b.inputs, Some(lane), ctx)
+            })
+            .into_iter();
+        let missing = || Ok(Attempt::failed(0.0, "no result".to_string()));
         batch
             .iter()
             .map(|b| match is_call(b.task) {
-                true => admission.run(b, |lane| run(b.task, b.attempt, &b.inputs, Some(lane), ctx)),
-                false => others
-                    .next()
-                    .unwrap_or_else(|| Ok(Attempt::failed(0.0, "no result".to_string()))),
+                true => calls.next().unwrap_or_else(missing),
+                false => others.next().unwrap_or_else(missing),
             })
             .collect()
     }

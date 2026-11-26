@@ -71,9 +71,8 @@ pub mod build;
 /// on the GPU (benchmark / lm_eval / profile) to a terminal state and collects its logs.
 pub mod measure_job;
 
-/// The GithubActions build backend: the thin GitHub REST client that dispatches a
-/// `workflow_dispatch`, correlates + polls the resulting run, and validates the manifest's declared
-/// input mapping against the workflow's introspected inputs.
+/// The GitHub Actions client: workflow reads, `workflow_dispatch` with run details, run and job
+/// reads, artifact and job-log downloads, and cancel, plus the image-build backend on top of it.
 pub mod github;
 
 /// How to build + push a candidate image. `registry`/`authfile` are mandatory (a build can't proceed

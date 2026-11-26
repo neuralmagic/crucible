@@ -6,7 +6,7 @@ both results. Every task is a command, so the parent and child run without a mod
 ```text
                  ┌─> child  call  calls-child (playbook)        ─┐
   prep ──────────┤     label, config (json), notes (file)        ├─> summary
- (command)       └─> ci     call  wseaton/snapshotd (github)    ─┘   (command)
+ (command)       └─> ci     call  $CALLS_DEMO_REPO (github)     ─┘   (command)
                        message, payload (json as string), flavor, loud
 ```
 
@@ -20,16 +20,21 @@ controller writes `calls.lock` when it saves it. A registered child would be
 `playbook = "<registered id>"` and pin its revision digest instead.
 
 The `ci` target names `.github/workflows/crucible-call-demo.yml` on the `crucible-call-demo`
-branch of `wseaton/snapshotd`. It takes `message`, `flavor` (choice), `loud` (boolean) and
-`payload` (a JSON object as a string), runs `prepare`, a two-leg matrix `build`, and `report`,
-and uploads `result.json` and `notes.md` as the `crucible-result` artifact.
+branch of a repository you choose. The sources name it `OWNER/REPO`, and `just calls-example`
+writes `CALLS_DEMO_REPO` in its place in the draft it pushes. The workflow takes `message`,
+`flavor` (choice), `loud` (boolean) and `payload` (a JSON object as a string), runs `prepare`, a
+two-leg matrix `build`, and `report`, and uploads `result.json` and `notes.md` as the
+`crucible-result` artifact.
 
 ## Run
 
 ```sh
-just controller-local          # in one terminal
-just calls-example             # in another: saves both drafts, launches calls-parent
+just controller-local                          # in one terminal
+CALLS_DEMO_REPO=you/demo just calls-example    # in another: saves both drafts, launches calls-parent
 ```
+
+`CALLS_DEMO_REPO` is required: the owner/name of a repository that has the demo workflow on its
+`crucible-call-demo` branch and that your `gh` login can dispatch on.
 
 The local controller dispatches the ci call with the token `gh auth token` prints, held in
 memory for the dispatch. It never reaches the run.

@@ -7,68 +7,20 @@ use crucible_contract::calls::{
 };
 use crucible_contract::link::ExternalUrl;
 use crucible_contract::session::TaskStatus;
-use serde::Deserialize;
+use forge::github::{Job, RunConclusion, RunStatus};
 
-/// A workflow run's or job's `status`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RunStatus {
-    Requested,
-    Queued,
-    Pending,
-    Waiting,
-    InProgress,
-    Completed,
-    #[serde(other)]
-    Unknown,
-}
-
-/// A completed workflow run's or job's `conclusion`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RunConclusion {
-    Success,
-    Failure,
-    Neutral,
-    Cancelled,
-    Skipped,
-    TimedOut,
-    ActionRequired,
-    StartupFailure,
-    Stale,
-    #[serde(other)]
-    Unknown,
-}
-
-impl RunConclusion {
-    fn as_str(self) -> &'static str {
-        match self {
-            RunConclusion::Success => "success",
-            RunConclusion::Failure => "failure",
-            RunConclusion::Neutral => "neutral",
-            RunConclusion::Cancelled => "cancelled",
-            RunConclusion::Skipped => "skipped",
-            RunConclusion::TimedOut => "timed_out",
-            RunConclusion::ActionRequired => "action_required",
-            RunConclusion::StartupFailure => "startup_failure",
-            RunConclusion::Stale => "stale",
-            RunConclusion::Unknown => "an unknown conclusion",
-        }
-    }
-
-    /// The task status a job or step with this conclusion is drawn with.
-    pub fn task_status(self) -> TaskStatus {
-        match self {
-            RunConclusion::Success | RunConclusion::Neutral => TaskStatus::Pass,
-            RunConclusion::Skipped => TaskStatus::Skipped,
-            RunConclusion::ActionRequired => TaskStatus::Blocked,
-            RunConclusion::StartupFailure => TaskStatus::Transport,
-            RunConclusion::Failure
-            | RunConclusion::Cancelled
-            | RunConclusion::TimedOut
-            | RunConclusion::Stale
-            | RunConclusion::Unknown => TaskStatus::Fail,
-        }
+/// The task status a job or step with this conclusion is drawn with.
+pub fn task_status(conclusion: RunConclusion) -> TaskStatus {
+    match conclusion {
+        RunConclusion::Success | RunConclusion::Neutral => TaskStatus::Pass,
+        RunConclusion::Skipped => TaskStatus::Skipped,
+        RunConclusion::ActionRequired => TaskStatus::Blocked,
+        RunConclusion::StartupFailure => TaskStatus::Transport,
+        RunConclusion::Failure
+        | RunConclusion::Cancelled
+        | RunConclusion::TimedOut
+        | RunConclusion::Stale
+        | RunConclusion::Unknown => TaskStatus::Fail,
     }
 }
 
@@ -103,7 +55,7 @@ pub fn settle(conclusion: Option<RunConclusion>, caller_cancelled: bool) -> Sett
 pub fn node_status(status: RunStatus, conclusion: Option<RunConclusion>) -> NodeStatus {
     match status {
         RunStatus::Completed => {
-            NodeStatus::Settled(conclusion.map_or(TaskStatus::Fail, RunConclusion::task_status))
+            NodeStatus::Settled(conclusion.map_or(TaskStatus::Fail, task_status))
         }
         RunStatus::InProgress => NodeStatus::Running,
         RunStatus::Requested
@@ -114,40 +66,7 @@ pub fn node_status(status: RunStatus, conclusion: Option<RunConclusion>) -> Node
     }
 }
 
-/// A workflow run as `GET .../actions/runs/{id}` answers.
-#[derive(Clone, Debug, Deserialize)]
-pub struct ApiRun {
-    pub id: u64,
-    pub status: Option<RunStatus>,
-    pub conclusion: Option<RunConclusion>,
-    pub head_sha: String,
-}
-
-/// One job as `GET .../actions/runs/{id}/jobs` answers.
-#[derive(Clone, Debug, Deserialize)]
-pub struct ApiJob {
-    pub id: u64,
-    pub name: String,
-    pub status: RunStatus,
-    pub conclusion: Option<RunConclusion>,
-    pub started_at: Option<String>,
-    pub completed_at: Option<String>,
-    pub html_url: Option<String>,
-    #[serde(default)]
-    pub steps: Vec<ApiStep>,
-}
-
-/// One step of an [`ApiJob`].
-#[derive(Clone, Debug, Deserialize)]
-pub struct ApiStep {
-    pub name: String,
-    pub status: RunStatus,
-    pub conclusion: Option<RunConclusion>,
-    pub started_at: Option<String>,
-    pub completed_at: Option<String>,
-}
-
-fn job_node(job: &ApiJob, id: String, group: Option<String>) -> ProgressNode {
+fn job_node(job: &Job, id: String, group: Option<String>) -> ProgressNode {
     let status = node_status(job.status, job.conclusion);
     let steps = job
         .steps
@@ -200,11 +119,25 @@ fn job_names(name: &str) -> Vec<&str> {
     names
 }
 
-/// A run's progress: the locked static graph with each workflow job replaced by the run's jobs
-/// for it. A job with matrix legs becomes one node per leg in a group named by the workflow job;
-/// a run job no workflow job names is added on its own.
-pub fn run_graph(workflow: &ProgressGraph, jobs: &[ApiJob]) -> ProgressGraph {
-    let mut matched: BTreeMap<&str, Vec<&ApiJob>> = BTreeMap::new();
+/// Where one node of a run's progress comes from: a job of the run, or the static node of a
+/// workflow job the run has no job for yet.
+enum Placed<'a> {
+    Job {
+        id: String,
+        group: Option<String>,
+        job: &'a Job,
+    },
+    Static(&'a ProgressNode),
+}
+
+/// The locked static graph with each workflow job replaced by the run's jobs for it, and the
+/// node ids each workflow job became. A job with matrix legs becomes one node per leg in a group
+/// named by the workflow job; a run job no workflow job names is placed on its own.
+fn place<'a>(
+    workflow: &'a ProgressGraph,
+    jobs: &'a [Job],
+) -> (Vec<Placed<'a>>, BTreeMap<&'a str, Vec<String>>) {
+    let mut matched: BTreeMap<&str, Vec<&Job>> = BTreeMap::new();
     let mut unmatched = Vec::new();
     for job in jobs {
         let names = job_names(&job.name);
@@ -220,32 +153,53 @@ pub fn run_graph(workflow: &ProgressGraph, jobs: &[ApiJob]) -> ProgressGraph {
         }
     }
     let mut ids: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    let mut nodes = Vec::new();
+    let mut placed = Vec::new();
     for static_node in &workflow.nodes {
         let key = static_node.id.as_str();
         match matched.get(key).map(Vec::as_slice) {
             None | Some([]) => {
                 ids.entry(key).or_default().push(key.to_owned());
-                nodes.push(static_node.clone());
+                placed.push(Placed::Static(static_node));
             }
             Some([only]) if only.name == static_node.label => {
                 ids.entry(key).or_default().push(key.to_owned());
-                nodes.push(job_node(only, key.to_owned(), None));
+                placed.push(Placed::Job {
+                    id: key.to_owned(),
+                    group: None,
+                    job: only,
+                });
             }
             Some(legs) => {
                 for leg in legs {
                     let id = format!("{key}/{}", leg.id);
                     ids.entry(key).or_default().push(id.clone());
-                    nodes.push(job_node(leg, id, Some(key.to_owned())));
+                    placed.push(Placed::Job {
+                        id,
+                        group: Some(key.to_owned()),
+                        job: leg,
+                    });
                 }
             }
         }
     }
-    nodes.extend(
-        unmatched
-            .into_iter()
-            .map(|job| job_node(job, format!("job-{}", job.id), None)),
-    );
+    placed.extend(unmatched.into_iter().map(|job| Placed::Job {
+        id: format!("job-{}", job.id),
+        group: None,
+        job,
+    }));
+    (placed, ids)
+}
+
+/// A run's progress over the locked static graph of its workflow.
+pub fn run_graph(workflow: &ProgressGraph, jobs: &[Job]) -> ProgressGraph {
+    let (placed, ids) = place(workflow, jobs);
+    let nodes = placed
+        .into_iter()
+        .map(|placed| match placed {
+            Placed::Job { id, group, job } => job_node(job, id, group),
+            Placed::Static(node) => node.clone(),
+        })
+        .collect();
     let mut edges = Vec::new();
     for edge in &workflow.edges {
         let (Some(froms), Some(tos)) = (ids.get(edge.from.as_str()), ids.get(edge.to.as_str()))
@@ -264,16 +218,27 @@ pub fn run_graph(workflow: &ProgressGraph, jobs: &[ApiJob]) -> ProgressGraph {
     ProgressGraph::bounded(nodes, edges)
 }
 
+/// The id of the job [`run_graph`] draws as node `node`; `None` for a node no job is drawn as.
+pub fn job_of(workflow: &ProgressGraph, jobs: &[Job], node: &str) -> Option<u64> {
+    place(workflow, jobs)
+        .0
+        .into_iter()
+        .find_map(|placed| match placed {
+            Placed::Job { id, job, .. } if id == node => Some(job.id),
+            _ => None,
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use crucible_contract::calls::{NodeDetail, NodeLink, NodeStatus, ProgressEdge};
     use crucible_contract::session::TaskStatus;
-    use serde_json::json;
 
-    use crate::calls::github::progress::{
-        ApiJob, ApiStep, RunConclusion, RunStatus, Settle, node_status, run_graph, settle,
-    };
-    use crate::calls::github::workflow::Workflow;
+    use forge::github::workflow::Workflow;
+    use forge::github::{Job, RunConclusion, RunStatus, Step};
+
+    use crate::calls::github::progress::{Settle, job_of, node_status, run_graph, settle};
+    use crate::calls::github::workflow::graph;
 
     const DEMO: &str = r#"
 on: workflow_dispatch
@@ -361,9 +326,6 @@ jobs:
             node_status(RunStatus::Completed, None),
             NodeStatus::Settled(TaskStatus::Fail)
         );
-        let wire: Vec<RunConclusion> =
-            serde_json::from_value(json!(["success", "timed_out", "brand_new"])).unwrap();
-        assert_eq!(wire, [C::Success, C::TimedOut, C::Unknown]);
     }
 
     fn edge(from: &str, to: &str) -> ProgressEdge {
@@ -373,13 +335,8 @@ jobs:
         }
     }
 
-    fn api_job(
-        id: u64,
-        name: &str,
-        status: RunStatus,
-        conclusion: Option<RunConclusion>,
-    ) -> ApiJob {
-        ApiJob {
+    fn api_job(id: u64, name: &str, status: RunStatus, conclusion: Option<RunConclusion>) -> Job {
+        Job {
             id,
             name: name.to_owned(),
             status,
@@ -387,7 +344,7 @@ jobs:
             started_at: Some("2026-11-25T10:00:00Z".to_owned()),
             completed_at: conclusion.map(|_| "2026-11-25T10:01:00Z".to_owned()),
             html_url: Some(format!("https://github.com/o/r/actions/runs/1/job/{id}")),
-            steps: vec![ApiStep {
+            steps: vec![Step {
                 name: "Run true".to_owned(),
                 status,
                 conclusion,
@@ -400,7 +357,7 @@ jobs:
     #[test]
     fn jobs_map_to_nodes_with_matrix_legs_grouped() {
         use RunConclusion as C;
-        let graph = Workflow::parse(DEMO).unwrap().graph();
+        let graph = graph(&Workflow::parse(DEMO).unwrap());
         let jobs = [
             api_job(11, "prepare", RunStatus::Completed, Some(C::Success)),
             api_job(
@@ -477,15 +434,20 @@ jobs:
         assert_eq!(running.ended, None);
         let queued = &progress.nodes[4];
         assert_eq!(queued.started, None, "a queued job has not started");
+
+        assert_eq!(job_of(&graph, &jobs, "prepare"), Some(11));
+        assert_eq!(job_of(&graph, &jobs, "build/13"), Some(13));
+        assert_eq!(job_of(&graph, &jobs, "job-14"), Some(14));
+        assert_eq!(job_of(&graph, &jobs, "build"), None, "a group is no job");
+        assert_eq!(job_of(&graph, &jobs, "report"), None, "not started yet");
+        assert_eq!(job_of(&graph, &jobs, "ghost"), None);
     }
 
     #[test]
     fn reusable_workflow_jobs_and_name_only_matches_find_their_workflow_job() {
-        let graph = Workflow::parse(
+        let graph = graph(&Workflow::parse(
             "on: workflow_dispatch\njobs:\n  call:\n    uses: o/r/.github/workflows/x.yml@main\n  after:\n    needs: call\n    runs-on: x\n",
-        )
-        .unwrap()
-        .graph();
+        ).unwrap());
         let jobs = [
             api_job(1, "call / inner (a)", RunStatus::InProgress, None),
             api_job(2, "call / inner (b)", RunStatus::InProgress, None),
@@ -502,10 +464,10 @@ jobs:
 
     #[test]
     fn a_run_graph_is_bounded() {
-        let graph = Workflow::parse("on: workflow_dispatch\njobs:\n  big:\n    runs-on: x\n")
-            .unwrap()
-            .graph();
-        let jobs: Vec<ApiJob> = (0..600)
+        let graph = graph(
+            &Workflow::parse("on: workflow_dispatch\njobs:\n  big:\n    runs-on: x\n").unwrap(),
+        );
+        let jobs: Vec<Job> = (0..600)
             .map(|i| api_job(i, &format!("big ({i})"), RunStatus::Queued, None))
             .collect();
         let progress = run_graph(&graph, &jobs);

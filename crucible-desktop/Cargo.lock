@@ -2799,6 +2799,7 @@ dependencies = [
  "kube 5.0.0",
  "libc",
  "oci-client",
+ "percent-encoding",
  "reqwest",
  "rustls",
  "serde",

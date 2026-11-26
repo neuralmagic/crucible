@@ -415,6 +415,8 @@ pub struct RunView {
     pub call_folds: HashSet<String>,
     /// The call frame under the pointer, by its subgraph id.
     pub frame_hover: Option<String>,
+    /// The call frame whose info card is open, by its frame key.
+    pub frame_info: Option<String>,
     /// The node of a call's target graph the Log pane shows the log of.
     pub call_node: Option<crate::live::calls::CallNode>,
     /// How far the graph is zoomed and moved.

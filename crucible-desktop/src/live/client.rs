@@ -204,9 +204,13 @@ impl Client {
         self.start(Action::Prepare(target));
     }
 
-    /// Launch `target`; the result comes back in a snapshot.
-    pub fn launch(&self, target: Target, body: Value) {
-        self.start(Action::Launch { target, body });
+    /// Upload `uploads` and launch `target` naming them; the result comes back in a snapshot.
+    pub fn launch(&self, target: Target, body: Value, uploads: Vec<crate::form::Upload>) {
+        self.start(Action::Launch {
+            target,
+            body,
+            uploads,
+        });
     }
 
     pub fn drop_pack(&self, dir: PathBuf, max_cost: f64, max_time: String) {

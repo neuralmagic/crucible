@@ -1495,7 +1495,8 @@ mod tests {
                 &pool,
                 key,
                 &launch,
-                PackRevision::Tree(&authorized)
+                PackRevision::Tree(&authorized),
+                &Default::default()
             )
             .await?,
             crate::launches::store::AdoptPlaybookOutcome::Adopted
@@ -1511,7 +1512,8 @@ mod tests {
                 &pool,
                 stale,
                 &launch,
-                PackRevision::Tree(&authorized)
+                PackRevision::Tree(&authorized),
+                &Default::default()
             )
             .await?,
             crate::launches::store::AdoptPlaybookOutcome::Repinned { ref rev } if rev == "def456"
@@ -2265,7 +2267,8 @@ mod tests {
                     rerun: None,
                     dispatch: Default::default(),
                 },
-                crate::playbooks::registry::PackRevision::Bytes("sha256:tar")
+                crate::playbooks::registry::PackRevision::Bytes("sha256:tar"),
+                &Default::default()
             )
             .await?,
             crate::launches::store::AdoptPlaybookOutcome::Adopted

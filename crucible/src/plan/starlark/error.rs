@@ -307,8 +307,8 @@ pub enum CompileError {
     #[error("file parameter {param:?} declares max_bytes above the {max} byte limit")]
     ParamMaxBytesTooLarge { param: String, max: u64 },
     #[error(
-        "param({name:?}) is a json or file parameter; tasks receive it under params, not as a \
-         value in the source"
+        "param({name:?}) is a json or file parameter; tasks receive it under params, a call as a \
+         binding, and an agent prompt as external input, not as a value in the source"
     )]
     ParamNotAValue { name: String },
     #[error("workflow evaluation failed: {0}")]

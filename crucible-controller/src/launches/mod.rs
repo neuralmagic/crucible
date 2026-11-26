@@ -7,6 +7,7 @@ pub mod emission;
 pub mod jira;
 pub mod model;
 pub mod one_shots;
+pub(crate) mod param_files;
 pub mod pending;
 pub mod schedules;
 pub mod standing;

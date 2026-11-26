@@ -48,6 +48,11 @@ pub trait Transport: Send + Sync {
         Ok((status, text.into_bytes()))
     }
 
+    /// PUT a body that is not JSON, sent as `application/octet-stream`.
+    async fn put_bytes(&self, path: &str, _body: Vec<u8>) -> Result<(reqwest::StatusCode, String)> {
+        bail!("{path} takes raw bytes, and this transport cannot send them")
+    }
+
     /// GET a server-sent event stream, handing each event to `on_event` as it arrives, until the
     /// server closes it. A non-2xx comes back as its status and body, with no events.
     async fn events(
@@ -268,6 +273,23 @@ impl Transport for HttpTransport {
             act_as.note_refusal(&body);
         }
         Ok((status, body))
+    }
+
+    async fn put_bytes(&self, path: &str, body: Vec<u8>) -> Result<(reqwest::StatusCode, String)> {
+        let resp = self
+            .req(reqwest::Method::PUT, path)
+            .header("content-type", "application/octet-stream")
+            .body(body)
+            .send()
+            .await
+            .with_context(|| format!("requesting {path}"))?;
+        let status = resp.status();
+        let refused = self.refused_by(&resp);
+        let text = resp.text().await.unwrap_or_default();
+        if let Some(act_as) = refused {
+            act_as.note_refusal(&text);
+        }
+        Ok((status, text))
     }
 
     async fn get_bytes(&self, path: &str) -> Result<(reqwest::StatusCode, Vec<u8>)> {
@@ -974,6 +996,25 @@ impl Client {
     pub async fn launch<T: DeserializeOwned>(&self, id: &str, body: &impl Serialize) -> Result<T> {
         self.post(&format!("/api/playbooks/{}/launch", encode(id)), Some(body))
             .await
+    }
+
+    /// `PUT /api/param-files/{digest}`: upload a file parameter's bytes, `digest` being their
+    /// `sha256:<hex>`, for a launch to name.
+    pub async fn put_param_file<T: DeserializeOwned>(
+        &self,
+        digest: &str,
+        bytes: Vec<u8>,
+    ) -> Result<T> {
+        let path = format!("/api/param-files/{}", encode(digest));
+        let (status, text) = self.transport.put_bytes(&path, bytes).await?;
+        if !status.is_success() {
+            bail!(
+                "{path} -> HTTP {status}: {}{}",
+                text.trim(),
+                self.hint_for(status)
+            );
+        }
+        parse(text, &path)
     }
 
     /// What rerunning finished run `run_id` from `from` would reuse and dispatch again. An empty

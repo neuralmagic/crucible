@@ -10,13 +10,15 @@ use crate::gfx;
 use crate::live::calls::LiveCall;
 use crate::ui::{Paint, fx};
 
-/// GitHub Actions' purple.
-const GITHUB: Color = Color {
-    r: 130.0 / 255.0,
-    g: 80.0 / 255.0,
-    b: 223.0 / 255.0,
-    a: 1.0,
-};
+/// A backend's accent as the compositor and the graph take it.
+pub(crate) fn accent(kind: CallKind) -> Option<Color> {
+    kind.presentation().accent.map(|rgb| Color {
+        r: f32::from(rgb.0) / 255.0,
+        g: f32::from(rgb.1) / 255.0,
+        b: f32::from(rgb.2) / 255.0,
+        a: 1.0,
+    })
+}
 
 /// How much brighter a frame under the pointer draws.
 const HOVER: f32 = 1.8;
@@ -55,10 +57,7 @@ pub(crate) fn effect(look: Look, hovered: bool, p: &Paint) -> Option<El> {
     };
     match look {
         Look::Running(kind) => {
-            let color = match kind {
-                CallKind::Playbook => p.live,
-                CallKind::GithubWorkflow => GITHUB,
-            };
+            let color = accent(kind).unwrap_or(p.live);
             Some(slot(gfx::PULSE, color, p.tune.pulse, p.tune.pulse_bleed))
         }
         Look::Failed => Some(slot(gfx::HALO, p.fail, p.tune.glow, p.tune.glow_bleed)),

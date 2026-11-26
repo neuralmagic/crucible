@@ -938,6 +938,7 @@ async fn store(
     extracted: Extracted,
     actor: Option<&str>,
 ) -> Result<Registered, RegisterError> {
+    crate::calls::lock::registrable(row.pack.tree()).map_err(RegisterError::Invalid)?;
     let Extracted {
         schema,
         schema_digest,

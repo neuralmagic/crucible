@@ -578,7 +578,7 @@ mod tests {
             ),
             (
                 "0092_call_target_runs.sql",
-                "aa7d52e615176826af7623c1325d7b95cc20a7f449adbf8ff7450873c4c0f72f",
+                "8469e50dba28876968bbe5615477429781fa9216ed95bbd672cffdd8b2ac084d",
             ),
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");

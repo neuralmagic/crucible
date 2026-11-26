@@ -567,6 +567,7 @@ fn test_cfg(state_dir: &Path, repos: Vec<String>) -> ControllerCfg {
         runtime: Default::default(),
         local_secret_allowlist: Vec::new(),
         calls_github_token: None,
+        github_logins: Vec::new(),
         state_dir: state_dir.to_path_buf(),
         scratch_dir: None,
         db: test_ledger_url(),

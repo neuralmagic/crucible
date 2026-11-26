@@ -3,6 +3,7 @@
 
 use crate::api::dto::*;
 use crate::api::state::*;
+use crate::launches::param_files::FileValues;
 use crate::playbooks::registry::{FieldError, PlaybookRow};
 use axum::response::{IntoResponse, Response};
 
@@ -228,6 +229,8 @@ pub(crate) struct AuthorizedLaunch<P> {
     pub max_time: crate::model::MaxTime,
     /// The `{param: {run_id, digest}}` choice snapshots the values were validated against.
     pub choice_snapshots: serde_json::Value,
+    /// The file parameter values the launch owns.
+    pub files: Vec<crate::launches::param_files::ParamFile>,
 }
 
 /// What a pack whose manifest never parsed is refused with. A launch would fail at the engine's
@@ -249,24 +252,25 @@ pub(crate) fn undispatchable(refusal: String) -> Response {
 
 /// Admit `request` against `pack`: the schema it was rendered against, whether this deployment
 /// can dispatch the pack's agent, the ceilings, the values, and the graph those values compile.
-/// `Err` is the response to answer with.
+/// A value for a file parameter is refused. `Err` is the response to answer with.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn admit<P: Admissible>(
     state: &ApiState,
     pack: P,
     request: LaunchRequest<'_>,
 ) -> Result<AuthorizedLaunch<P>, Response> {
-    admit_staged(state, pack, request, &std::collections::BTreeMap::new()).await
+    admit_with_files(state, pack, request, FileValues::None).await
 }
 
-/// [`admit`] with file parameters the controller staged itself: `{name: staged file reference}`.
-/// A launcher's own values never name a file; only a call's dispatch stages one.
+/// [`admit`] with the file parameter values `files` gives: each checked against its declaration
+/// and staged under the controller's scratch root, its staged reference the launch value, and
+/// its bytes in [`AuthorizedLaunch::files`] for the launch to own.
 #[allow(clippy::result_large_err)]
-pub(crate) async fn admit_staged<P: Admissible>(
+pub(crate) async fn admit_with_files<P: Admissible>(
     state: &ApiState,
     pack: P,
     request: LaunchRequest<'_>,
-    staged: &std::collections::BTreeMap<String, String>,
+    files: FileValues<'_>,
 ) -> Result<AuthorizedLaunch<P>, Response> {
     let target = pack.target();
     let (schema, max_time) = admit_pack(state, target, request).await?;
@@ -274,15 +278,29 @@ pub(crate) async fn admit_staged<P: Admissible>(
         crate::playbooks::choices::attach(state.db.pool(), target.id(), &schema)
             .await
             .map_err(|e| ApiError::from(e).into_response())?;
+    let (text, supplied) =
+        match crate::launches::param_files::split(state.db.pool(), &schema, request.params, files)
+            .await
+        {
+            Ok(Ok(split)) => split,
+            Ok(Err(fields)) => return Err(invalid_fields(fields)),
+            Err(e) => return Err(ApiError::from(e).into_response()),
+        };
     let mut params = crate::playbooks::registry::validate_params(
-        &without_required(&schema, staged.keys()),
-        request.params,
+        &without_required(&schema, supplied.keys()),
+        &text,
     )
     .map_err(invalid_fields)?;
-    if let Some(values) = params.as_object_mut() {
-        for (name, reference) in staged {
-            values.insert(name.clone(), serde_json::Value::String(reference.clone()));
+    let mut owned = Vec::with_capacity(supplied.len());
+    for (name, file) in supplied {
+        let (reference, file) =
+            crate::launches::param_files::stage(&state.scratch_dir, &name, file)
+                .await
+                .map_err(|e| ApiError::from(e).into_response())?;
+        if let Some(values) = params.as_object_mut() {
+            values.insert(name, serde_json::Value::String(reference));
         }
+        owned.push(file);
     }
     check_plan(
         target.tree(state.db.pool()).await?,
@@ -297,6 +315,7 @@ pub(crate) async fn admit_staged<P: Admissible>(
         max_cost: request.max_cost,
         max_time,
         choice_snapshots,
+        files: owned,
     })
 }
 

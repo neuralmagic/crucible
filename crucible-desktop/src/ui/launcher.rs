@@ -366,15 +366,18 @@ fn form(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
         };
         let offered = field.offered(&launcher.fields, &texts);
         let control = match (&field.kind, offered) {
-            (Kind::Multiline, _) => TextArea::new(launcher.answers.get(i).unwrap_or(&app.scratch))
-                .placeholder(field.placeholder(&launcher.fields, &texts))
-                .rows(8)
-                .width(Some(INNER))
-                .invalid(issue.is_some())
-                .disabled(off)
-                .on_edit(move |app: &mut App| edit(app, Slot::Answer(i)))
-                .build(p.k)
-                .key(format!("launch-param-{}", field.name)),
+            (Kind::File(_), _) => file_pick(app, i, &field.name, issue.is_some(), off, p),
+            (Kind::Multiline | Kind::Json(_), _) => {
+                TextArea::new(launcher.answers.get(i).unwrap_or(&app.scratch))
+                    .placeholder(field.placeholder(&launcher.fields, &texts))
+                    .rows(8)
+                    .width(Some(INNER))
+                    .invalid(issue.is_some())
+                    .disabled(off)
+                    .on_edit(move |app: &mut App| edit(app, Slot::Answer(i)))
+                    .build(p.k)
+                    .key(format!("launch-param-{}", field.name))
+            }
             (Kind::Bool, _) => Switch::new(answer == "true")
                 .label(field.name.clone())
                 .hide_label()
@@ -511,6 +514,57 @@ fn form(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
                 .schedule
                 .as_ref()
                 .map(|s| schedule_fields(s, app, p)),
+        )
+}
+
+/// The width of a file field's Choose button.
+const CHOOSE: f32 = 84.0;
+
+/// A file field: its path, typed or chosen in the system's file dialog.
+fn file_pick(app: &App, i: usize, name: &str, invalid: bool, off: bool, p: &Paint) -> El {
+    let answer = app
+        .remote
+        .launcher
+        .as_ref()
+        .and_then(|launcher| launcher.answers.get(i))
+        .unwrap_or(&app.scratch);
+    let title = name.to_string();
+    row()
+        .key(format!("launch-file-{name}"))
+        .w_full()
+        .gap(8.0)
+        .center_y()
+        .child(
+            TextInput::new(answer)
+                .width(Some(INNER - CHOOSE - 8.0))
+                .invalid(invalid)
+                .disabled(off)
+                .on_edit(move |app: &mut App| edit(app, Slot::Answer(i)))
+                .build(p.k)
+                .key(format!("launch-param-{name}")),
+        )
+        .child(
+            Button::new("Choose")
+                .variant(ButtonVariant::Neutral)
+                .disabled(off)
+                .on_press_tx(move |_: &mut App, tx: &mut Tx| {
+                    let options = rune::FileDialogOptions {
+                        title: title.clone(),
+                        ..Default::default()
+                    };
+                    tx.open_file(options, move |app: &mut App, result, _| match result {
+                        Ok(Some(path)) => app.pick_param_file(i, &path),
+                        Ok(None) => {}
+                        Err(error) => {
+                            if let Some(launcher) = app.remote.launcher.as_mut() {
+                                launcher.refusal = Some(error.to_string());
+                            }
+                        }
+                    });
+                })
+                .build(p.k)
+                .w(CHOOSE)
+                .key(format!("launch-choose-{name}")),
         )
 }
 

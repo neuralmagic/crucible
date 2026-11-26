@@ -387,6 +387,7 @@ fn harness_runner(args: &Args, p: &Paths) -> crate::plan::harness::HarnessRunner
         commit_per_task: false,
         captured_bytes: std::sync::atomic::AtomicU64::new(0),
         staged: Default::default(),
+        param_files: Vec::new(),
         budget_left: f64::INFINITY,
     }
 }

@@ -276,6 +276,7 @@ async fn authorize_watch(
             params,
             max_cost: body.max_cost,
             max_time,
+            files: Vec::new(),
         },
         kind,
         since,

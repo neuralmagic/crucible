@@ -16,13 +16,16 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
-use crucible_contract::calls::{CallsLock, LOCK_FILE, NodeStatus, ProgressGraph};
+use crucible_contract::calls::{
+    BackendIcon, CallKind, CallsLock, LOCK_FILE, NodeLink, NodeLook, NodeStatus, ProgressGraph,
+    TargetHandle,
+};
 use crucible_contract::session::TaskStatus;
-use rune::{El, Tx, el, icon, row};
+use rune::{El, Tx, el, icon, row, text};
 use rune_theme_opencode::icons as oc;
 
 use crate::App;
-use crate::live::calls::{CallNode, LiveCall, NodeAsk, frame_name, newest, open_label};
+use crate::live::calls::{CallNode, Jump, LiveCall, NodeAsk, frame_name, newest, open_label};
 use crate::pack::PackFiles;
 use crate::session::call::badge;
 use crate::session::{TaskState, TaskView};
@@ -72,15 +75,34 @@ impl<'a> Targets<'a> {
     }
 }
 
-/// `↗ ship · release · github`: the task, its alias when that differs, and the target kind.
-pub(crate) fn label(task: &TaskView) -> Option<String> {
+/// `↗ ship · release · github`: the task, its alias when that differs, and the target kind;
+/// `ci · snapshotd #10` once `live`, its target run, has a number.
+pub(crate) fn label(task: &TaskView, live: Option<&LiveCall>) -> Option<String> {
     let call = task.call.as_ref()?;
     let mut parts = vec![task.name.clone()];
     if call.alias.as_str() != task.name {
         parts.push(call.alias.to_string());
     }
-    parts.push(badge(call.kind).to_string());
-    Some(parts.join(" \u{b7} "))
+    let repo = call.dispatched.iter().rev().find_map(|d| match &d.handle {
+        TargetHandle::GithubWorkflow { repo, .. } => Some(
+            repo.as_str()
+                .rsplit('/')
+                .next()
+                .unwrap_or(repo.as_str())
+                .to_string(),
+        ),
+        TargetHandle::Playbook { .. } => None,
+    });
+    match (repo, call.kind) {
+        (Some(repo), _) => parts.push(repo),
+        (None, CallKind::GithubWorkflow) => parts.push(badge(call.kind).to_string()),
+        (None, CallKind::Playbook) => {}
+    }
+    let mut label = parts.join(" \u{b7} ");
+    if let Some(number) = live.and_then(|live| live.view.state.run_number) {
+        label.push_str(&format!(" #{number}"));
+    }
+    Some(label)
 }
 
 /// The groups of `graph` with more than one node, by name, and their members' indexes.
@@ -236,8 +258,7 @@ fn group_status(members: &[NodeStatus]) -> NodeStatus {
         .map_or(NodeStatus::Pending, NodeStatus::Settled)
 }
 
-/// The lines a frame draws inside `subgraph g<i>` after the call's own node.
-#[derive(Default)]
+/// The lines a frame draws inside `subgraph g<i>`.
 pub(crate) struct Frame {
     pub(crate) body: String,
     /// Each drawn node's id and status.
@@ -248,6 +269,44 @@ pub(crate) struct Frame {
     pub(crate) links: usize,
     /// The drawn id of the node the Log pane shows.
     pub(crate) picked: Option<String>,
+    /// The kind of the call whose target it draws, which decides its look.
+    pub(crate) kind: CallKind,
+}
+
+impl Default for Frame {
+    fn default() -> Self {
+        Frame {
+            body: String::new(),
+            states: Vec::new(),
+            items: 0,
+            links: 0,
+            picked: None,
+            kind: CallKind::Playbook,
+        }
+    }
+}
+
+/// An external job's status mark.
+fn mark(status: NodeStatus) -> &'static str {
+    match status {
+        NodeStatus::Pending => "\u{25cb}",
+        NodeStatus::Running => "\u{25cf}",
+        NodeStatus::Settled(status) if status.passed() => "\u{2713}",
+        NodeStatus::Settled(TaskStatus::Skipped | TaskStatus::NotTaken) => "\u{2013}",
+        NodeStatus::Settled(_) => "\u{2717}",
+    }
+}
+
+/// `4s`, `1m 5s` or `2h 3m` between two RFC 3339 times, or nothing when either is missing.
+fn took(started: Option<&str>, ended: Option<&str>) -> Option<String> {
+    let started: jiff::Timestamp = started?.parse().ok()?;
+    let ended: jiff::Timestamp = ended?.parse().ok()?;
+    let secs = ended.duration_since(started).as_secs().max(0);
+    Some(match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m {}s", secs / 60, secs % 60),
+        _ => format!("{}h {}m", secs / 3600, secs % 3600 / 60),
+    })
 }
 
 /// Text safe inside a quoted node label.
@@ -261,7 +320,9 @@ pub(crate) fn frame(
     graph: &ProgressGraph,
     open: &HashSet<String>,
     picked: Option<&str>,
+    kind: CallKind,
 ) -> Frame {
+    let jobs = kind.presentation().nodes == NodeLook::Jobs;
     let (anchor, key) = (at.anchor(), at.key());
     let drawn = drawn_as(&key, graph, open);
     let mut body = String::new();
@@ -295,14 +356,24 @@ pub(crate) fn frame(
                 .iter()
                 .filter(|s| matches!(s, NodeStatus::Settled(status) if status.passed()))
                 .count();
-            body.push_str(&format!(
-                "    {id}[[\"\u{2261} {} \u{d7}{} ({ok} ok)\"]]\n",
-                clean(group),
-                members.len()
-            ));
-            states.push((id, group_status(&members)));
+            let status = group_status(&members);
+            let label = format!("{} \u{d7}{} ({ok} ok)", clean(group), members.len());
+            body.push_str(&if jobs {
+                format!("    {id}([\"{} {label}\"])\n", mark(status))
+            } else {
+                format!("    {id}[[\"\u{2261} {label}\"]]\n")
+            });
+            states.push((id, status));
         } else {
-            body.push_str(&format!("    {id}[\"{}\"]\n", clean(&node.label)));
+            let label = clean(&node.label);
+            body.push_str(&if jobs {
+                let took = took(node.started.as_deref(), node.ended.as_deref())
+                    .map(|t| format!(" \u{b7} {t}"))
+                    .unwrap_or_default();
+                format!("    {id}(\"{} {label}{took}\")\n", mark(node.status))
+            } else {
+                format!("    {id}[\"{label}\"]\n")
+            });
             states.push((id, node.status));
         }
     }
@@ -329,7 +400,8 @@ pub(crate) fn frame(
     let fed: HashSet<usize> = edges.iter().map(|(_, to)| *to).collect();
     let mut nodes = shown.len();
     let mut links = 0;
-    for &n in shown.iter().filter(|n| !fed.contains(n)) {
+    let anchored = at.instance.is_some();
+    for &n in shown.iter().filter(|n| !fed.contains(n) && anchored) {
         body.push_str(&format!("    {anchor} ~~~ {anchor}c{n}\n"));
         links += 1;
     }
@@ -340,11 +412,12 @@ pub(crate) fn frame(
     let more = (drawn.len() - drawn.iter().filter(|rep| kept.contains(rep)).count())
         + graph.omitted as usize;
     if more > 0 {
-        body.push_str(&format!(
-            "    {anchor}cmore[\"+{more} more\"]\n    {anchor} ~~~ {anchor}cmore\n"
-        ));
+        body.push_str(&format!("    {anchor}cmore[\"+{more} more\"]\n"));
         nodes += 1;
-        links += 1;
+        if anchored {
+            body.push_str(&format!("    {anchor} ~~~ {anchor}cmore\n"));
+            links += 1;
+        }
     }
     let picked = picked
         .and_then(|id| graph.nodes.iter().position(|node| node.id == id))
@@ -357,11 +430,117 @@ pub(crate) fn frame(
         items: nodes + links,
         links,
         picked,
+        kind,
     }
 }
 
 /// A call's frame `at`: its target's look, and in its corner a press that folds its target's
 /// graph away or shows it, and one that opens the target run.
+/// The `(i)` press beside a call frame's corner that opens its info card.
+fn info_button(key: &str, p: &Paint) -> El {
+    let key = key.to_string();
+    el().key(format!("graph-call-info-{key}"))
+        .role("button")
+        .label("Call info")
+        .size(HANDLE, HANDLE)
+        .center()
+        .cursor(rune::Cursor::Pointer)
+        .help("Info")
+        .on_press(move |app: &mut App| app.toggle_frame_info(&key))
+        .child(icon(&oc::INFO, 12.0).color(p.c.icon_faint))
+}
+
+/// What a call frame's info card says: what ran, where, and how it went.
+fn info_rows(call: &LiveCall) -> Vec<(&'static str, String)> {
+    let state = &call.view.state;
+    let mut rows = vec![
+        ("Call", call.view.alias.as_str().to_string()),
+        ("Backend", call.view.kind.presentation().name.to_string()),
+    ];
+    match &state.handle {
+        TargetHandle::Playbook { run } => rows.push(("Run", run.clone())),
+        TargetHandle::GithubWorkflow { repo, run_id } => {
+            rows.push(("Repo", repo.as_str().to_string()));
+            rows.push((
+                "Run",
+                match state.run_number {
+                    Some(number) => format!("#{number} ({run_id})"),
+                    None => run_id.to_string(),
+                },
+            ));
+        }
+    }
+    rows.push(("Status", format!("{:?}", state.status).to_lowercase()));
+    if call.view.attempt > 1 {
+        rows.push(("Attempt", call.view.attempt.to_string()));
+    }
+    if !state.note.is_empty() {
+        rows.push(("Note", state.note.clone()));
+    }
+    rows
+}
+
+/// The info card under a call frame's corner.
+fn info_card(call: &LiveCall, key: &str, p: &Paint) -> El {
+    let rows = info_rows(call).into_iter().map(|(name, value)| {
+        row()
+            .gap(8.0)
+            .child(text(name).font(p.k.ty.ui).color(p.c.text_muted).w(64.0))
+            .child(
+                text(value)
+                    .font(p.k.ty.ui)
+                    .color(p.c.text_base)
+                    .wrap()
+                    .grow(1.0),
+            )
+    });
+    rune::col()
+        .key(format!("graph-call-info-card-{key}"))
+        .pin(None, Some(4.0), Some(4.0), None)
+        .w(260.0)
+        .gap(4.0)
+        .padding(10.0)
+        .radius(8.0)
+        .fill(p.c.layer_02)
+        .border(0.5, p.c.border_base)
+        .children(rows)
+}
+
+/// `[mark] ↗` above the corner of a frame whose backend has a mark: opens its run outside the app.
+fn external_run(call: &LiveCall, key: &str, p: &Paint) -> Option<El> {
+    let presentation = call.view.kind.presentation();
+    let mark = mark_icon(presentation.icon?);
+    let Some(NodeLink::External { url }) = &call.view.state.link else {
+        return None;
+    };
+    let jump = Jump::Web(url.as_str().to_string());
+    Some(
+        row()
+            .key(format!("graph-call-external-{key}"))
+            .role("link")
+            .label(presentation.open)
+            .gap(3.0)
+            .px(5.0)
+            .py(2.0)
+            .center_y()
+            .radius(6.0)
+            .fill(p.c.layer_02)
+            .border(0.5, p.c.border_base)
+            .cursor(rune::Cursor::Pointer)
+            .help(url.as_str().to_string())
+            .on_press_tx(move |app: &mut App, tx: &mut Tx| app.jump(&jump, tx))
+            .child(icon(mark, 12.0).color(p.c.icon_base))
+            .child(icon(&oc::ARROW_UP_RIGHT, 10.0).color(p.c.icon_faint)),
+    )
+}
+
+/// The app's icon for a backend's mark.
+fn mark_icon(mark: BackendIcon) -> &'static rune::Icon {
+    match mark {
+        BackendIcon::Github => &oc::GITHUB,
+    }
+}
+
 pub(crate) fn frame_spot(
     spot: El,
     at: At,
@@ -376,6 +555,7 @@ pub(crate) fn frame_spot(
     let hovered = app.run.frame_hover.as_deref() == Some(id.as_str());
     let look = graph_fx::look(call, &app.afterglows);
     let key = at.key();
+    let key_for_info = key.clone();
     let unfolded = targets
         .graph(task, instance)
         .is_some_and(|graph| unfolded(&key, &graph, &app.run.call_folds));
@@ -406,8 +586,30 @@ pub(crate) fn frame_spot(
                 .child(icon(&oc::ARROW_UP_RIGHT, 12.0).color(p.c.icon_faint))
         })
     });
+    let open = call
+        .and_then(|call| external_run(call, &at.key(), p))
+        .or(open);
+    let spot = match call.and_then(|call| graph_fx::accent(call.view.kind)) {
+        Some(accent) => spot
+            .fill(accent.alpha(0.07))
+            .border(1.0, accent.alpha(0.5))
+            .radius(8.0),
+        None => spot,
+    };
     spot.children(graph_fx::effect(look, hovered, p))
-        .child(row().absolute(0.0, 0.0).child(fold).children(open))
+        .child(
+            row()
+                .pin(None, Some(-22.0), Some(0.0), None)
+                .gap(2.0)
+                .center_y()
+                .children(open)
+                .children(call.map(|_| info_button(&key_for_info, p)))
+                .child(fold),
+        )
+        .children(
+            call.filter(|_| app.run.frame_info.as_deref() == Some(key_for_info.as_str()))
+                .map(|call| info_card(call, &key_for_info, p)),
+        )
         .on_hover_change(move |app: &mut App, inside: bool, _: &mut Tx| {
             if inside {
                 app.run.frame_hover = Some(id.clone());
@@ -501,12 +703,13 @@ pub(crate) fn state(status: NodeStatus) -> TaskState {
 mod tests {
     use std::collections::HashSet;
 
-    use crucible_contract::calls::{NodeStatus, ProgressGraph};
+    use crucible_contract::calls::{CallKind, NodeStatus, ProgressGraph};
     use crucible_contract::session::TaskStatus;
     use serde_json::json;
 
     use crate::ui::graph_call::{
-        At, HANDFUL, NodeId, Pressed, frame, group_key, group_status, node_id, pressed, unfolded,
+        At, HANDFUL, NodeId, Pressed, frame, group_key, group_status, node_id, pressed, took,
+        unfolded,
     };
 
     fn at(i: usize, task: &str) -> At<'_> {
@@ -540,24 +743,56 @@ mod tests {
     }
 
     #[test]
+    fn a_github_frame_draws_jobs_as_marked_cards_with_their_duration() {
+        let mut jobs = matrix();
+        jobs.nodes[0].started = Some("2026-11-25T12:00:00Z".into());
+        jobs.nodes[0].ended = Some("2026-11-25T12:01:05Z".into());
+        let drawn = frame(
+            at(2, "ship"),
+            &jobs,
+            &HashSet::new(),
+            None,
+            CallKind::GithubWorkflow,
+        );
+        assert!(
+            drawn.body.starts_with(concat!(
+                "    t2c0(\"\u{2713} build \u{b7} 1m 5s\")\n",
+                "    t2c1([\"\u{25cf} test \u{d7}3 (1 ok)\"])\n",
+                "    t2c4(\"\u{25cb} ship 'it'\")\n",
+            )),
+            "{}",
+            drawn.body
+        );
+        assert_eq!(drawn.kind, CallKind::GithubWorkflow);
+        assert_eq!(
+            took(Some("2026-11-25T12:00:00Z"), Some("2026-11-25T12:00:04Z")).as_deref(),
+            Some("4s")
+        );
+        assert_eq!(
+            took(Some("2026-11-25T10:00:00Z"), Some("2026-11-25T12:03:00Z")).as_deref(),
+            Some("2h 3m")
+        );
+        assert_eq!(took(Some("2026-11-25T12:00:00Z"), None), None);
+    }
+
+    #[test]
     fn a_matrix_group_folds_to_one_node_until_it_is_opened() {
         let none = HashSet::new();
-        let folded = frame(at(2, "ship"), &matrix(), &none, None);
+        let folded = frame(at(2, "ship"), &matrix(), &none, None, CallKind::Playbook);
         assert_eq!(
             folded.body,
             concat!(
                 "    t2c0[\"build\"]\n",
                 "    t2c1[[\"\u{2261} test \u{d7}3 (1 ok)\"]]\n",
                 "    t2c4[\"ship 'it'\"]\n",
-                "    t2 ~~~ t2c0\n",
                 "    t2c0 --> t2c1\n",
                 "    t2c1 --> t2c4\n",
             )
         );
         assert_eq!(folded.states[1], ("t2c1".to_string(), NodeStatus::Running));
-        assert_eq!(folded.items, 6);
+        assert_eq!(folded.items, 5);
         let open = HashSet::from([group_key("ship", "test")]);
-        let shown = frame(at(2, "ship"), &matrix(), &open, None);
+        let shown = frame(at(2, "ship"), &matrix(), &open, None, CallKind::Playbook);
         for part in ["t2c2[\"test (mac)\"]", "t2c0 --> t2c3", "t2c3 --> t2c4"] {
             assert!(shown.body.contains(part), "{part} in\n{}", shown.body);
         }
@@ -591,7 +826,7 @@ mod tests {
             .map(|n| json!({"id": format!("n{n}"), "label": format!("n{n}"), "status": "pass"}))
             .collect();
         let big = graph(json!({"nodes": nodes, "omitted": 3}));
-        let drawn = frame(at(0, "t"), &big, &HashSet::new(), None);
+        let drawn = frame(at(0, "t"), &big, &HashSet::new(), None, CallKind::Playbook);
         assert!(drawn.body.contains("t0c39[\"n39\"]"), "{}", drawn.body);
         assert!(!drawn.body.contains("t0c40["), "{}", drawn.body);
         assert!(
@@ -668,7 +903,13 @@ mod tests {
                 "triage[b]".to_string()
             )
         );
-        let drawn = frame(instance, &matrix(), &HashSet::new(), None);
+        let drawn = frame(
+            instance,
+            &matrix(),
+            &HashSet::new(),
+            None,
+            CallKind::Playbook,
+        );
         for part in [
             "    t4i1c0[\"build\"]\n",
             "    t4i1 ~~~ t4i1c0\n",
@@ -677,7 +918,7 @@ mod tests {
             assert!(drawn.body.contains(part), "{part} in\n{}", drawn.body);
         }
         let open = HashSet::from([group_key("triage[b]", "test")]);
-        let legs = frame(instance, &matrix(), &open, None);
+        let legs = frame(instance, &matrix(), &open, None, CallKind::Playbook);
         assert!(
             legs.body.contains("t4i1c3[\"test (win)\"]"),
             "{}",

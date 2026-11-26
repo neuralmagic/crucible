@@ -76,6 +76,8 @@ pub struct PlaybookRunDto {
     pub transport_losses: i64,
     pub created_by: Option<String>,
     pub created_at: String,
+    /// The call that dispatched this launch's run; null for a launch nothing called.
+    pub called_by: Option<crate::calls::store::CalledBy>,
 }
 
 impl From<PlaybookRun> for PlaybookRunDto {
@@ -113,8 +115,28 @@ impl From<PlaybookRun> for PlaybookRunDto {
             transport_losses: r.transport_losses,
             created_by: r.created_by,
             created_at: r.created_at,
+            called_by: None,
         }
     }
+}
+
+/// `rows` with the call each was dispatched by.
+async fn with_callers(
+    pool: &sqlx::PgPool,
+    rows: Vec<PlaybookRun>,
+) -> anyhow::Result<Vec<PlaybookRunDto>> {
+    let keys: Vec<String> = rows.iter().map(|r| r.key.clone()).collect();
+    let mut callers = crate::calls::store::called_by(pool, &keys).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let called_by = callers.remove(&row.key);
+            PlaybookRunDto {
+                called_by,
+                ..PlaybookRunDto::from(row)
+            }
+        })
+        .collect())
 }
 
 /// How many launches the runs list returns.
@@ -166,11 +188,7 @@ pub(crate) async fn list_playbook_runs(
     let filter = q.into_filter().map_err(ApiError::BadRequest)?;
     let rows =
         crate::launches::store::list_playbook_runs(state.db.pool(), &filter, RUNS_LIMIT).await?;
-    Ok(Json(
-        rows.into_iter()
-            .map(PlaybookRunDto::from)
-            .collect::<Vec<_>>(),
-    ))
+    Ok(Json(with_callers(state.db.pool(), rows).await?))
 }
 
 /// Where a launch's engine is. A launch is authorized, then dispatched; nothing else stands
@@ -262,6 +280,9 @@ pub(crate) async fn get_playbook_run(
     let Some(row) = rows.into_iter().next() else {
         return Ok(not_found(format!("no playbook launch {key:?}")));
     };
+    let called_by = crate::calls::store::called_by(state.db.pool(), std::slice::from_ref(&key))
+        .await?
+        .remove(&key);
     let (source_exists, launch, runs, events) = tokio::try_join!(
         async {
             anyhow::Ok(match row.draft_version {
@@ -298,7 +319,10 @@ pub(crate) async fn get_playbook_run(
         })
         .collect();
     Ok(Json(PlaybookLaunchDetailDto {
-        launch: PlaybookRunDto::from(row),
+        launch: PlaybookRunDto {
+            called_by,
+            ..PlaybookRunDto::from(row)
+        },
         source_exists,
         dispatch,
         runs,

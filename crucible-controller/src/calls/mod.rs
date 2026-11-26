@@ -3,15 +3,20 @@
 //! them by.
 //!
 //! ```text
-//!   engine (pod token) ──POST /calls──▶ api ──▶ Backends::get(kind) ──▶ TargetBackend::dispatch
-//!                      ──GET  /calls/x─▶ api ──▶ progress + outcome ──▶ call_target_runs row
+//!   engine (pod token) ──POST /calls──▶ api ──▶ TargetBackend::authorize + dispatch ──▶ row
+//!   engine, readers    ──GET  ...─────▶ api ──▶ call_target_runs row
+//!   refresh loop (every few seconds) ──▶ TargetBackend::poll / cancel ──▶ row
 //! ```
 
+pub(crate) mod access;
 pub(crate) mod api;
+pub(crate) mod compile;
 mod github;
 pub(crate) mod lock;
 mod playbook;
 mod progress;
+pub(crate) mod reader;
+pub(crate) mod refresh;
 pub(crate) mod store;
 
 use std::collections::BTreeMap;
@@ -140,12 +145,22 @@ impl Outcome {
             result_files: Vec::new(),
         }
     }
+
+    pub(crate) fn cancelled(note: impl Into<String>) -> Self {
+        Outcome {
+            status: CallStatus::Cancelled,
+            ..Outcome::failed(note)
+        }
+    }
 }
 
 /// One look at a target run.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Polled {
     pub progress: ProgressGraph,
+    /// What the backend learned about the target run to keep in the call's detail, such as the
+    /// number the target's system shows for it.
+    pub recorded: serde_json::Map<String, Value>,
     /// `None` while the target run runs.
     pub outcome: Option<Outcome>,
 }
@@ -185,6 +200,15 @@ pub(crate) trait TargetBackend: Send + Sync {
     /// The target's pin and interface as its system holds them now.
     async fn interface(&self, ctx: &CallCtx, target: &CallTarget) -> Result<Resolved, CallError>;
 
+    /// Refuse unless `who` may have `target` run on their behalf: the requester of a lock, and
+    /// the launch owner of a dispatch.
+    async fn authorize(
+        &self,
+        ctx: &CallCtx,
+        who: &crate::authz::model::Principal,
+        target: &CallTarget,
+    ) -> Result<(), CallError>;
+
     /// Start one target run with the bound values.
     async fn dispatch(
         &self,
@@ -205,12 +229,21 @@ pub(crate) trait TargetBackend: Send + Sync {
 
     /// Stop the target run.
     async fn cancel(&self, ctx: &CallCtx, call: &CallRecord) -> Result<(), CallError>;
+
+    /// The text log of one node of the target run's progress graph.
+    async fn node_log(
+        &self,
+        ctx: &CallCtx,
+        call: &CallRecord,
+        node: &str,
+    ) -> Result<String, CallError>;
 }
 
 /// The backends of every target kind this controller implements.
 pub(crate) struct Backends {
     playbook: playbook::PlaybookBackend,
-    github: Option<Result<github::GithubWorkflowBackend, String>>,
+    /// `Err` says why this controller dispatches no GitHub workflow.
+    github: Result<github::GithubWorkflowBackend, String>,
 }
 
 impl Backends {
@@ -219,15 +252,25 @@ impl Backends {
     pub(crate) fn new(state: &crate::api::state::ApiState) -> Self {
         Backends {
             playbook: playbook::PlaybookBackend::new(Some(state.clone())),
-            github: state.calls_github.map(github_backend),
+            github: github_backend(
+                state.calls_github,
+                state.pack_pr_app.as_ref(),
+                &state.github_logins,
+                &state.playbook_caps.max_time,
+            ),
         }
     }
 
     /// Backends that can follow and cancel target runs but launch nothing.
-    pub(crate) fn following(token: Option<GithubToken>) -> Self {
+    pub(crate) fn following(cfg: &crate::config::ControllerCfg) -> Self {
         Backends {
             playbook: playbook::PlaybookBackend::new(None),
-            github: token.map(github_backend),
+            github: github_backend(
+                cfg.calls_github_token,
+                cfg.github_app.as_ref(),
+                &cfg.github_logins(),
+                &cfg.playbook_max_time_cap,
+            ),
         }
     }
 
@@ -235,24 +278,43 @@ impl Backends {
         match kind {
             CallKind::Playbook => Ok(&self.playbook),
             CallKind::GithubWorkflow => match &self.github {
-                Some(Ok(github)) => Ok(github),
-                Some(Err(reason)) => Err(CallError::NotBuilt {
+                Ok(github) => Ok(github),
+                Err(reason) => Err(CallError::NotBuilt {
                     kind,
                     reason: reason.clone(),
-                }),
-                None => Err(CallError::NotBuilt {
-                    kind,
-                    reason: "no GitHub token source is configured \
-                             (CONTROLLER_CALLS_GITHUB_TOKEN)"
-                        .to_string(),
                 }),
             },
         }
     }
 }
 
-fn github_backend(token: GithubToken) -> Result<github::GithubWorkflowBackend, String> {
-    github::GithubWorkflowBackend::new(token).map_err(|e| e.to_string())
+fn github_backend(
+    token: Option<GithubToken>,
+    app: Option<&crate::secrets::github_app::GithubAppTokenSource>,
+    logins: &crate::identity::github_logins::GithubLogins,
+    max_time: &crate::model::MaxTime,
+) -> Result<github::GithubWorkflowBackend, String> {
+    let tokens = match (token, app) {
+        (None, _) => {
+            return Err(
+                "no GitHub token source is configured (CONTROLLER_CALLS_GITHUB_TOKEN)".to_owned(),
+            );
+        }
+        (Some(GithubToken::GhCli), _) => github::TokenSource::GhCli,
+        (Some(GithubToken::AppInstallation), Some(app)) => github::TokenSource::App {
+            app: Box::new(app.clone()),
+            logins: logins.clone(),
+        },
+        (Some(GithubToken::AppInstallation), None) => {
+            return Err(
+                "CONTROLLER_CALLS_GITHUB_TOKEN=app, but no GitHub App is configured \
+                 (CONTROLLER_GITHUB_APP_*)"
+                    .to_owned(),
+            );
+        }
+    };
+    let max_wall_clock = std::time::Duration::from_secs(max_time.secs());
+    github::GithubWorkflowBackend::new(tokens, max_wall_clock).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -261,22 +323,49 @@ mod tests {
 
     #[test]
     fn every_kind_routes_to_its_backend_or_says_why_not() {
-        let without = Backends::following(None);
+        let hours = crate::model::MaxTime::hours(4);
+        let logins = crate::identity::github_logins::GithubLogins::default();
+        let refused = |token, app| match github_backend(token, app, &logins, &hours) {
+            Err(reason) => reason,
+            Ok(_) => panic!("built a GitHub backend"),
+        };
+        assert!(refused(None, None).contains("CONTROLLER_CALLS_GITHUB_TOKEN"));
+        assert!(
+            refused(Some(GithubToken::AppInstallation), None).contains("CONTROLLER_GITHUB_APP_")
+        );
+        assert!(github_backend(Some(GithubToken::GhCli), None, &logins, &hours).is_ok());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = crate::secrets::github_app::GithubAppTokenSource::new(
+            "1",
+            "2",
+            crate::secrets::github_app::testkey::write_test_key(dir.path()),
+            "https://api.github.com",
+        );
+        assert!(
+            github_backend(
+                Some(GithubToken::AppInstallation),
+                Some(&app),
+                &logins,
+                &hours
+            )
+            .is_ok()
+        );
+
+        let cfg = crate::testing::cfg_with(dir.path());
+        let without = Backends::following(&cfg);
         assert!(without.get(CallKind::Playbook).is_ok());
-        let refused = without
+        let not_built = without
             .get(CallKind::GithubWorkflow)
             .err()
             .expect("no token source");
         assert!(matches!(
-            refused,
+            not_built,
             CallError::NotBuilt {
                 kind: CallKind::GithubWorkflow,
                 ..
             }
         ));
-        assert!(refused.note().contains("CONTROLLER_CALLS_GITHUB_TOKEN"));
-        let with = Backends::following(Some(GithubToken::GhCli));
-        assert!(with.get(CallKind::GithubWorkflow).is_ok());
+        assert!(not_built.note().contains("CONTROLLER_CALLS_GITHUB_TOKEN"));
     }
 
     #[test]

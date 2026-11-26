@@ -6,15 +6,14 @@ use std::path::Path;
 
 use anyhow::Context as _;
 use crucible_contract::calls::{
-    CallKind, CallStatus, CallTarget, FileRef, NodeDetail, NodeLink, NodeStatus, Pin, PlaybookRef,
-    ProgressEdge, ProgressGraph, ProgressNode, TargetHandle, TargetInterface,
+    CallKind, CallStatus, CallTarget, FileRef, NodeLink, Pin, PlaybookRef, ProgressGraph,
+    TargetHandle,
 };
-use crucible_contract::emits::{DeclaredFile, EmitWire};
-use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::Digest as _;
 
 use crate::api::state::ApiState;
+use crate::calls::compile::{Verdict, compile_tree};
 use crate::calls::{
     CallCtx, CallError, CallRecord, DispatchSpec, Dispatched, Outcome, Parent, Polled, Resolved,
     TargetBackend,
@@ -31,138 +30,6 @@ impl PlaybookBackend {
     pub(crate) fn new(state: Option<ApiState>) -> Self {
         PlaybookBackend { state }
     }
-}
-
-/// A compiled target pack: its interface and the task whose output is its result.
-#[derive(Debug, Clone, PartialEq)]
-struct Compiled {
-    interface: TargetInterface,
-    result: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct Plan {
-    #[serde(default)]
-    result: Option<String>,
-    #[serde(default, rename = "task")]
-    tasks: Vec<PlanTask>,
-}
-
-#[derive(Deserialize)]
-struct PlanTask {
-    name: String,
-    kind: String,
-    #[serde(default)]
-    depends_on: Vec<String>,
-    #[serde(default)]
-    emits: crucible::plan::ir::Emits,
-    #[serde(default)]
-    emits_files: Vec<DeclaredFile>,
-}
-
-/// The interface of the pack at `root`: its params block, its result task's emits and
-/// emits_files, and its compiled graph with every node pending. Blocking.
-fn compile(
-    root: &Path,
-    variant: Option<&crucible::manifest::variant::VariantName>,
-) -> Result<Compiled, String> {
-    let source = crate::playbooks::registry::workflow_source_for(
-        root,
-        crate::playbooks::registry::PackWorkflowKind::Playbook,
-        variant,
-    )
-    .map_err(|e| e.to_string())?;
-    let text = std::fs::read_to_string(&source)
-        .map_err(|e| format!("reading {}: {e}", source.display()))?;
-    let schema = crucible::plan::starlark::declared_params(&text, &source)
-        .map_err(|e| crucible::errors::report(&e))?;
-    let values = crate::playbooks::preview::effective(
-        Some(&schema),
-        &BTreeMap::new(),
-        crate::playbooks::preview::Unvalued::Placeholder,
-    );
-    let compiled = crucible::plan::starlark::compile_file_with(
-        &source,
-        crucible::plan::starlark::parent_or_cwd(&source),
-        &values,
-    )
-    .map_err(|e| crucible::errors::report(&e))?;
-    let plan: Plan = serde_json::from_str(&compiled.canonical_json)
-        .map_err(|e| format!("the engine's compiled plan did not parse: {e}"))?;
-    Ok(interface_of(schema, plan))
-}
-
-fn interface_of(params: Value, plan: Plan) -> Compiled {
-    let result_task = plan
-        .result
-        .as_deref()
-        .and_then(|r| plan.tasks.iter().find(|t| t.name == r));
-    let result = result_task
-        .map(|t| {
-            t.emits
-                .fields()
-                .into_iter()
-                .map(|(field, ty)| EmitWire {
-                    field: field.0.clone(),
-                    ty: ty.cloned(),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let result_files = result_task
-        .map(|t| t.emits_files.clone())
-        .unwrap_or_default();
-    let edges = plan
-        .tasks
-        .iter()
-        .flat_map(|t| {
-            t.depends_on.iter().map(|dep| ProgressEdge {
-                from: dep.clone(),
-                to: t.name.clone(),
-            })
-        })
-        .collect();
-    let nodes = plan
-        .tasks
-        .iter()
-        .map(|t| ProgressNode {
-            id: t.name.clone(),
-            label: t.name.clone(),
-            status: NodeStatus::Pending,
-            group: None,
-            started: None,
-            ended: None,
-            detail: Some(NodeDetail::PlaybookTask {
-                task_kind: t.kind.clone(),
-            }),
-            link: None,
-        })
-        .collect();
-    Compiled {
-        interface: TargetInterface {
-            params,
-            result,
-            result_files,
-            graph: ProgressGraph::bounded(nodes, edges),
-        },
-        result: plan.result,
-    }
-}
-
-/// [`compile`] a stored tree off the async runtime. A pack that does not compile is a refusal.
-async fn compile_tree(
-    tree: crucible_contract::pack_tree::PackTree,
-    variant: Option<crucible::manifest::variant::VariantName>,
-) -> Result<Compiled, CallError> {
-    tokio::task::spawn_blocking(move || {
-        let scratch = tempfile::tempdir().context("a scratch dir for the target pack")?;
-        let root = scratch.path().join("pack");
-        crate::playbooks::packs::write_checked_tree(&tree, &root)?;
-        Ok::<_, anyhow::Error>(compile(&root, variant.as_ref()))
-    })
-    .await
-    .context("joining the target compile")??
-    .map_err(|e| CallError::Refused(format!("the target pack does not compile: {e}")))
 }
 
 /// What a registered row pins: its tree, else its legacy bytes.
@@ -207,13 +74,12 @@ fn param_text(value: &Value) -> String {
     }
 }
 
-/// Write each file the call binds where the target run reads it, under the controller's scratch
-/// root, and answer the launch value of each: the staged file's reference as JSON.
-async fn stage_files(
+/// The bytes of each file the call binds, read from the calling run's uploads.
+async fn bound_files(
     ctx: &CallCtx,
     spec: &DispatchSpec<'_>,
-) -> Result<BTreeMap<String, String>, CallError> {
-    let mut staged = BTreeMap::new();
+) -> Result<BTreeMap<String, crate::launches::param_files::Supplied>, CallError> {
+    let mut found = BTreeMap::new();
     for (param, file) in spec.files {
         let bytes = crate::calls::store::input_file(ctx.db.pool(), &spec.parent.run, &file.digest)
             .await?
@@ -228,30 +94,17 @@ async fn stage_files(
             .as_deref()
             .and_then(|p| Path::new(p).file_name())
             .and_then(|n| n.to_str())
-            .unwrap_or(param.as_str());
-        let dir = ctx
-            .scratch_dir
-            .join("call-inputs")
-            .join(&spec.call.0)
-            .join(param);
-        tokio::fs::create_dir_all(&dir)
-            .await
-            .with_context(|| format!("creating {}", dir.display()))?;
-        let path = dir.join(name);
-        tokio::fs::write(&path, &bytes)
-            .await
-            .with_context(|| format!("staging {}", path.display()))?;
-        let mut reference = json!({
-            "path": path.to_string_lossy(),
-            "digest": file.digest,
-            "size": file.size,
-        });
-        if let Some(media_type) = &file.media_type {
-            reference["media_type"] = json!(media_type);
-        }
-        staged.insert(param.clone(), reference.to_string());
+            .map(str::to_string);
+        found.insert(
+            param.clone(),
+            crate::launches::param_files::Supplied {
+                bytes,
+                name,
+                media_type: file.media_type.clone(),
+            },
+        );
     }
-    Ok(staged)
+    Ok(found)
 }
 
 /// The note a refusing launch check answered with.
@@ -339,13 +192,33 @@ fn result_task(call: &CallRecord) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The newest run of launch `key` and its status.
-async fn latest_run(pool: &sqlx::PgPool, key: &str) -> anyhow::Result<Option<(String, String)>> {
-    sqlx::query_as("SELECT run_id, status FROM runs WHERE issue = $1 ORDER BY seq DESC LIMIT 1")
-        .bind(key)
+/// The target run the call's handle names: the run its launch reserved for its first dispatch.
+fn handle_run(call: &CallRecord) -> Result<&str, CallError> {
+    match &call.handle {
+        Some(TargetHandle::Playbook { run }) => Ok(run),
+        _ => Err(CallError::Unrecorded {
+            call: call.id.clone(),
+            what: "target run",
+        }),
+    }
+}
+
+/// The status of target run `run`, once it exists.
+async fn run_status(pool: &sqlx::PgPool, run: &str) -> anyhow::Result<Option<String>> {
+    sqlx::query_scalar("SELECT status FROM runs WHERE run_id = $1")
+        .bind(run)
         .fetch_optional(pool)
         .await
-        .context("reading a target launch's newest run")
+        .context("reading a target run's status")
+}
+
+/// The run the call's handle names, once it exists.
+async fn started_run<'a>(
+    ctx: &CallCtx,
+    call: &'a CallRecord,
+) -> Result<Option<&'a str>, CallError> {
+    let run = handle_run(call)?;
+    Ok(run_status(ctx.db.pool(), run).await?.map(|_| run))
 }
 
 /// One captured file of run `run` by its `<task>/<path>` key.
@@ -366,21 +239,35 @@ fn file_key(task: &str, path: &str) -> Option<String> {
     crate::runs::task_evidence::task_segment(task).map(|dir| format!("{dir}/{path}"))
 }
 
-async fn passed(ctx: &CallCtx, call: &CallRecord, run: &str) -> Result<Outcome, CallError> {
-    let Some(task) = result_task(call) else {
-        return Ok(Outcome {
-            status: CallStatus::Passed,
-            note: String::new(),
-            result: json!({}),
-            result_files: Vec::new(),
-        });
+/// The outcome of target run `run` that ended with a valid verdict: its result task's output and
+/// files, or an empty result when the result task did not pass.
+async fn passed(
+    ctx: &CallCtx,
+    call: &CallRecord,
+    run: &str,
+    session: &str,
+) -> Result<Outcome, CallError> {
+    let empty = |note: String| Outcome {
+        status: CallStatus::Passed,
+        note,
+        result: json!({}),
+        result_files: Vec::new(),
     };
-    let session = crate::runs::task_evidence::run_session(ctx.db.pool(), &ctx.scratch_dir, run)
-        .await?
-        .unwrap_or_default();
-    let result = crate::runs::task_evidence::session_result(&session, &task)
-        .and_then(|r| r.payload)
-        .unwrap_or_else(|| json!({}));
+    let Some(task) = result_task(call) else {
+        return Ok(empty(String::new()));
+    };
+    let settled = match crate::runs::task_evidence::session_result(session, &task) {
+        Some(settled) if settled.passed() => settled,
+        other => {
+            let how = other.map_or("never settled".to_string(), |s| {
+                format!("settled {}", s.status.as_str())
+            });
+            return Ok(empty(format!(
+                "result task {task} of target run {run} {how}, so the result is empty"
+            )));
+        }
+    };
+    let result = settled.payload.unwrap_or_else(|| json!({}));
     let mut result_files = Vec::new();
     for declared in &call.interface.result_files {
         let Some(key) = file_key(&task, &declared.path) else {
@@ -409,16 +296,15 @@ async fn passed(ctx: &CallCtx, call: &CallRecord, run: &str) -> Result<Outcome, 
 
 /// The target run's graph now.
 async fn progress(ctx: &CallCtx, call: &CallRecord) -> Result<ProgressGraph, CallError> {
-    let launch = launch_of(call)?;
-    let Some((run, _)) = latest_run(ctx.db.pool(), &launch).await? else {
+    let Some(run) = started_run(ctx, call).await? else {
         return Ok(call.interface.graph.pending());
     };
-    let session = crate::runs::task_evidence::run_session(ctx.db.pool(), &ctx.scratch_dir, &run)
+    let session = crate::runs::task_evidence::run_session(ctx.db.pool(), &ctx.scratch_dir, run)
         .await?
         .unwrap_or_default();
     Ok(crate::calls::progress::fold(
         &session,
-        &run,
+        run,
         &call.interface.graph,
     ))
 }
@@ -438,19 +324,31 @@ async fn outcome(ctx: &CallCtx, call: &CallRecord) -> Result<Option<Outcome>, Ca
             Some(_) => None,
         })
     };
-    match latest_run(pool, &launch).await? {
-        None => Ok(parked()
-            .await?
-            .map(|why| Outcome::failed(format!("the target launch did not start: {why}")))),
-        Some((_, status)) if status == "running" => Ok(None),
-        Some((run, status)) if status == "finished" => passed(ctx, call, &run).await.map(Some),
-        Some((run, status)) => {
+    let run = handle_run(call)?;
+    let status = match run_status(pool, run).await? {
+        None => {
+            return Ok(parked()
+                .await?
+                .map(|why| Outcome::failed(format!("the target launch did not start: {why}"))));
+        }
+        Some(status) if status == "running" => return Ok(None),
+        Some(status) => status,
+    };
+    let session = crate::runs::task_evidence::run_session(pool, &ctx.scratch_dir, run).await?;
+    match session.as_deref().map(crate::calls::compile::verdict) {
+        Some(Verdict::Valid) => passed(ctx, call, run, session.as_deref().unwrap_or_default())
+            .await
+            .map(Some),
+        Some(Verdict::Invalid(why)) => Ok(Some(Outcome::failed(format!(
+            "target run {run} ended {status} with an invalid verdict: {why}"
+        )))),
+        None => {
             let why = parked()
                 .await?
                 .map(|w| format!(": {w}"))
                 .unwrap_or_default();
             Ok(Some(Outcome::failed(format!(
-                "target run {run} ended {status}{why}"
+                "target run {run} ended {status} without a session log{why}"
             ))))
         }
     }
@@ -490,6 +388,15 @@ impl TargetBackend for PlaybookBackend {
                 })
             }
         }
+    }
+
+    async fn authorize(
+        &self,
+        _ctx: &CallCtx,
+        _who: &crate::authz::model::Principal,
+        _target: &CallTarget,
+    ) -> Result<(), CallError> {
+        Ok(())
     }
 
     async fn dispatch(
@@ -588,8 +495,8 @@ impl TargetBackend for PlaybookBackend {
             .iter()
             .map(|(k, v)| (k.clone(), param_text(v)))
             .collect();
-        let staged = stage_files(ctx, spec).await?;
-        let authorized = match crate::playbooks::api::admission::admit_staged(
+        let files = bound_files(ctx, spec).await?;
+        let authorized = match crate::playbooks::api::admission::admit_with_files(
             state,
             pack,
             LaunchRequest {
@@ -598,7 +505,7 @@ impl TargetBackend for PlaybookBackend {
                 max_time: &max_time,
                 schema_digest: None,
             },
-            &staged,
+            crate::launches::param_files::FileValues::Supplied(&files),
         )
         .await
         {
@@ -648,6 +555,15 @@ impl TargetBackend for PlaybookBackend {
             rerun: None,
             dispatch: Default::default(),
         };
+        let attached = crate::launches::store::Attached {
+            call: Some(crate::calls::store::ChildLink {
+                parent: spec.parent,
+                task: spec.task,
+                instance: spec.instance,
+                reserved_run: &reserved,
+            }),
+            files: &authorized.files,
+        };
         let adopted = match &authorized.pack {
             LaunchPack::Registered(row) => {
                 use crate::launches::store::AdoptPlaybookOutcome;
@@ -656,6 +572,7 @@ impl TargetBackend for PlaybookBackend {
                     &key,
                     &launch,
                     row.revision(),
+                    &attached,
                 )
                 .await?
                 {
@@ -682,8 +599,10 @@ impl TargetBackend for PlaybookBackend {
                         .ok_or_else(|| {
                             CallError::Refused(format!("no draft {:?}", head.draft.id))
                         })?;
-                match crate::launches::store::adopt_draft_launch(pool, &key, &launch, &exposure)
-                    .await?
+                match crate::launches::store::adopt_draft_launch(
+                    pool, &key, &launch, &exposure, &attached,
+                )
+                .await?
                 {
                     AdoptDraftOutcome::Adopted => Ok(()),
                     AdoptDraftOutcome::UnknownDraft => Err(format!("no draft {:?}", head.draft.id)),
@@ -695,15 +614,6 @@ impl TargetBackend for PlaybookBackend {
             }
         };
         adopted.map_err(CallError::Refused)?;
-        crate::calls::store::link_child(
-            pool,
-            &key,
-            spec.parent,
-            spec.task,
-            spec.instance,
-            &reserved,
-        )
-        .await?;
         state
             .audit(
                 crate::event_log::Event::now(
@@ -752,6 +662,7 @@ impl TargetBackend for PlaybookBackend {
         };
         Ok(Polled {
             progress,
+            recorded: serde_json::Map::new(),
             outcome: outcome(ctx, call).await?,
         })
     }
@@ -773,14 +684,13 @@ impl TargetBackend for PlaybookBackend {
         {
             return Ok(None);
         }
-        let launch = launch_of(call)?;
-        let Some((run, _)) = latest_run(ctx.db.pool(), &launch).await? else {
+        let Some(run) = started_run(ctx, call).await? else {
             return Ok(None);
         };
         let Some(key) = file_key(&task, path) else {
             return Ok(None);
         };
-        Ok(run_file(ctx, &run, &key).await?)
+        Ok(run_file(ctx, run, &key).await?)
     }
 
     async fn cancel(&self, ctx: &CallCtx, call: &CallRecord) -> Result<(), CallError> {
@@ -801,71 +711,85 @@ impl TargetBackend for PlaybookBackend {
         }
         Ok(())
     }
+
+    async fn node_log(
+        &self,
+        ctx: &CallCtx,
+        call: &CallRecord,
+        node: &str,
+    ) -> Result<String, CallError> {
+        let pool = ctx.db.pool();
+        let Some(run) = started_run(ctx, call).await? else {
+            return Err(CallError::Refused(format!(
+                "the target run of call {} has not started",
+                call.id
+            )));
+        };
+        let session = crate::runs::task_evidence::run_session(pool, &ctx.scratch_dir, run)
+            .await?
+            .unwrap_or_default();
+        let engine = match crate::runs::blob_store::get_run_engine_log(pool, run).await? {
+            Some(log) => Some(log),
+            None => crate::runs::task_evidence::engine_log_bytes(&ctx.scratch_dir, run)
+                .await
+                .map(|b| String::from_utf8_lossy(&b).into_owned()),
+        };
+        task_log(&session, engine.as_deref(), run, node)
+            .ok_or_else(|| CallError::Refused(format!("target run {run} has no task {node:?}")))
+    }
+}
+
+/// The most bytes of a target task's log served at once; the tail is kept.
+const MAX_TASK_LOG_BYTES: usize = 256 * 1024;
+
+/// Task `task`'s log in run `run`: its session events, one per line, then the engine log's lines
+/// that name it. `None` when neither mentions the task.
+fn task_log(session: &str, engine: Option<&str>, run: &str, task: &str) -> Option<String> {
+    let events: Vec<&str> = session
+        .lines()
+        .filter(|line| {
+            serde_json::from_str::<Value>(line)
+                .ok()
+                .and_then(|v| v.get("task").and_then(Value::as_str).map(|t| t == task))
+                .unwrap_or(false)
+        })
+        .collect();
+    let engine: Vec<&str> = engine
+        .into_iter()
+        .flat_map(str::lines)
+        .filter(|line| line.contains(task))
+        .collect();
+    if events.is_empty() && engine.is_empty() {
+        return None;
+    }
+    let mut out = format!("# task {task} of run {run}\n");
+    if !events.is_empty() {
+        out.push_str("\n## session\n");
+        for line in events {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !engine.is_empty() {
+        out.push_str("\n## engine log\n");
+        for line in engine {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if out.len() > MAX_TASK_LOG_BYTES {
+        let mut cut = out.len() - MAX_TASK_LOG_BYTES;
+        while !out.is_char_boundary(cut) {
+            cut += 1;
+        }
+        out = format!("[{cut} earlier bytes left out]\n{}", &out[cut..]);
+    }
+    Some(out)
 }
 
 #[cfg(test)]
 mod tests {
     use crate::calls::playbook::*;
-    use crate::testing::fixtures::write_playbook_pack;
-
-    #[test]
-    fn a_pack_compiles_to_its_params_result_and_graph() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = write_playbook_pack(
-            dir.path(),
-            "params = {\"pr\": {\"type\": \"int\", \"required\": True}}\n\
-             scan = command(name = \"scan\", run = \"true\")\n\
-             report = command(name = \"report\", run = \"true\", depends_on = [scan], \
-             emits = {\"verdict\": \"string\"}, emits_files = [\"report.md\"])\n\
-             workflow(type = \"playbook\", tasks = [scan, report], result = report)\n",
-        );
-        let compiled = compile(&root, None).expect("compiles");
-        assert_eq!(compiled.result.as_deref(), Some("report"));
-        let interface = &compiled.interface;
-        assert!(
-            interface.params["properties"]["pr"].is_object(),
-            "{}",
-            interface.params
-        );
-        assert_eq!(interface.result.len(), 1);
-        assert_eq!(interface.result[0].field, "verdict");
-        assert!(interface.result[0].ty.is_some());
-        assert_eq!(interface.result_files[0].path, "report.md");
-        let ids: Vec<&str> = interface
-            .graph
-            .nodes
-            .iter()
-            .map(|n| n.id.as_str())
-            .collect();
-        assert_eq!(ids, ["scan", "report"]);
-        assert!(
-            interface
-                .graph
-                .nodes
-                .iter()
-                .all(|n| n.status == NodeStatus::Pending)
-        );
-        assert_eq!(interface.graph.edges.len(), 1);
-        assert_eq!(
-            compile(&root, None).expect("again").interface.digest().ok(),
-            interface.digest().ok(),
-            "the same pack compiles to the same interface"
-        );
-    }
-
-    #[test]
-    fn a_pack_with_no_result_has_an_empty_result() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = write_playbook_pack(
-            dir.path(),
-            "a = command(name = \"a\", run = \"true\")\n\
-             workflow(type = \"playbook\", tasks = [a])\n",
-        );
-        let compiled = compile(&root, None).expect("compiles");
-        assert_eq!(compiled.result, None);
-        assert!(compiled.interface.result.is_empty());
-        assert!(compiled.interface.result_files.is_empty());
-    }
 
     #[test]
     fn values_reach_the_form_as_text_it_reads_back() {
@@ -874,5 +798,29 @@ mod tests {
         assert_eq!(param_text(&json!(true)), "true");
         assert_eq!(param_text(&json!({"a": [1]})), r#"{"a":[1]}"#);
         assert_eq!(param_text(&json!(["x", "y,z"])), r#"["x","y,z"]"#);
+    }
+
+    #[test]
+    fn a_task_log_carries_its_session_events_and_the_engine_lines_naming_it() {
+        let session = concat!(
+            r#"{"v":1,"kind":"task_started","task":"scan","attempt":1}"#,
+            "\n",
+            r#"{"v":1,"kind":"task_started","task":"report","attempt":1}"#,
+            "\n",
+            r#"{"v":1,"kind":"task_result","task":"scan","status":"pass"}"#,
+            "\n",
+        );
+        let engine = "starting\nscan: running true\nreport: running true\n";
+        let log = task_log(session, Some(engine), "r1", "scan").expect("log");
+        assert!(log.starts_with("# task scan of run r1"), "{log}");
+        assert_eq!(log.matches("\"task\":\"scan\"").count(), 2, "{log}");
+        assert!(!log.contains("\"report\""), "{log}");
+        assert!(log.contains("scan: running true"), "{log}");
+        assert!(!log.contains("report: running"), "{log}");
+        assert_eq!(task_log(session, None, "r1", "nope"), None);
+        let long = "x".repeat(MAX_TASK_LOG_BYTES * 2);
+        let big = task_log("", Some(&format!("scan {long}")), "r1", "scan").expect("log");
+        assert!(big.len() < MAX_TASK_LOG_BYTES + 64);
+        assert!(big.starts_with('['), "the tail is kept");
     }
 }

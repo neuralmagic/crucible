@@ -6813,7 +6813,8 @@ async fn adopt_launch_with_groups(
                     rerun: None,
                     dispatch: Default::default(),
                 },
-                registered.revision()
+                registered.revision(),
+                &Default::default()
             )
             .await
             .expect("adopt"),
@@ -6887,6 +6888,7 @@ async fn scheduled_launch_with_cursor(db: &Db, key: &str) -> String {
             dispatch: Default::default(),
         },
         registered.revision(),
+        &Default::default(),
     )
     .await
     .expect("adopt");

@@ -1,10 +1,3 @@
--- 0092_call_target_runs.sql — playbook calls (RFC-0008): one row per target run a call
--- dispatched, and the parent linkage of a playbook launch a call created.
---
--- A target run is identified by the calling run, the call task, the mapped instance and the
--- attempt; the unique index is what keeps a resumed caller from dispatching a second one.
--- `bound` is the audit of what left the calling run: every bound value, and each bound file as
--- its digest and size, never its bytes. `handle` is NULL while the dispatch is in flight.
 CREATE TABLE call_target_runs (
     id           TEXT PRIMARY KEY,
     parent_run   TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
@@ -28,13 +21,15 @@ CREATE TABLE call_target_runs (
     link         JSONB,
     created_at   TEXT NOT NULL,
     updated_at   TEXT NOT NULL,
-    ended_at     TEXT
+    ended_at     TEXT,
+    cancel_owed  BOOLEAN NOT NULL DEFAULT false
 );
 CREATE UNIQUE INDEX call_target_runs_identity
     ON call_target_runs (parent_run, task, (COALESCE(instance, '')), attempt);
 CREATE INDEX call_target_runs_open ON call_target_runs (parent_run) WHERE ended_at IS NULL;
+CREATE INDEX call_target_runs_due ON call_target_runs (updated_at)
+    WHERE handle IS NOT NULL AND (ended_at IS NULL OR cancel_owed);
 
--- The bytes of a file a call binds, uploaded by the calling run before the dispatch that names it.
 CREATE TABLE call_input_files (
     run_id     TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
     digest     TEXT NOT NULL,
@@ -44,9 +39,6 @@ CREATE TABLE call_input_files (
     PRIMARY KEY (run_id, digest)
 );
 
--- A launch a call created: the run and call task that dispatched it, how deep in a chain of
--- calling runs it is (0 for a launch no call made), and the run id its first dispatch takes, so
--- the call's handle names the run before it exists.
 ALTER TABLE playbook_launches
     ADD COLUMN parent_run TEXT,
     ADD COLUMN parent_task TEXT,
@@ -60,3 +52,32 @@ ALTER TABLE playbook_launches DROP CONSTRAINT playbook_launches_origin_check;
 ALTER TABLE playbook_launches
     ADD CONSTRAINT playbook_launches_origin_check
     CHECK (origin IN ('manual', 'deferred', 'schedule', 'draft', 'watch', 'webhook', 'call'));
+
+CREATE TABLE launch_param_files (
+    launch     TEXT NOT NULL REFERENCES playbook_launches(key) ON DELETE CASCADE,
+    digest     TEXT NOT NULL,
+    size       BIGINT NOT NULL CHECK (size >= 0),
+    media_type TEXT,
+    bytes      BYTEA NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (launch, digest)
+);
+
+CREATE TABLE param_file_uploads (
+    uploader   TEXT NOT NULL,
+    digest     TEXT NOT NULL,
+    size       BIGINT NOT NULL CHECK (size >= 0),
+    bytes      BYTEA NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (uploader, digest)
+);
+
+CREATE TABLE call_result_files (
+    call_id    TEXT NOT NULL REFERENCES call_target_runs(id) ON DELETE CASCADE,
+    path       TEXT NOT NULL,
+    digest     TEXT NOT NULL,
+    size       BIGINT NOT NULL CHECK (size >= 0),
+    bytes      BYTEA NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (call_id, path)
+);

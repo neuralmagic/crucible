@@ -605,6 +605,7 @@ fn convert_at(value: Value<'_>, depth: usize) -> dsl::Result<dsl::Value> {
         return Ok(dsl::Value::ParamRef {
             name: param.name.clone(),
             ty: param.ty,
+            shown: param.shown.clone(),
         });
     }
     if let Some(file) = CallFileValue::from_value(value) {
@@ -679,7 +680,7 @@ fn alloc_at<'v>(heap: Heap<'v>, value: dsl::Value, depth: usize) -> Value<'v> {
         dsl::Value::Decider(decider) => heap.alloc(DeciderValue(decider)),
         dsl::Value::Others => heap.alloc(OthersValue),
         dsl::Value::Defaults(defaults) => heap.alloc(TaskDefaultsValue(defaults)),
-        dsl::Value::ParamRef { name, ty } => heap.alloc(ParamRefValue { name, ty }),
+        dsl::Value::ParamRef { name, ty, shown } => heap.alloc(ParamRefValue { name, ty, shown }),
         dsl::Value::CallFile(file) => heap.alloc(CallFileValue(file)),
         dsl::Value::Item => heap.alloc(ItemValue),
         dsl::Value::Budget(budget) => heap.alloc(BudgetValue(budget)),

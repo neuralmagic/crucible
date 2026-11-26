@@ -1,6 +1,6 @@
-//! The `github_workflow` call target (RFC-0008): the interface read from the workflow file at a
-//! commit, dispatch with run details, progress from the run's jobs, the outcome read from the
-//! declared artifact, and cancel.
+//! The `github_workflow` call target (RFC-0008) over forge's GitHub Actions client: the
+//! interface read from the workflow file at a commit, dispatch, progress from the run's jobs,
+//! the outcome read from the declared artifact, job logs, and cancel.
 
 pub mod artifact;
 mod backend;
@@ -11,139 +11,69 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use crucible_contract::calls::{
-    CallStatus, CallTarget, FileRef, GitRefName, GithubOutputs, GithubRepo, LockedCall, NodeLink,
-    Pin, ProgressGraph, TargetHandle, TargetInterface, WorkflowPath,
+    CallBudget, CallStatus, CallTarget, FileRef, GitRefName, GithubOutputs, GithubRepo, LockedCall,
+    MAX_GITHUB_INPUTS, NodeLink, Pin, ProgressGraph, TargetHandle, TargetInterface, WorkflowPath,
 };
 use crucible_contract::link::ExternalUrl;
-use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
-use serde::Deserialize;
+use forge::github::workflow::Workflow;
+use forge::github::{Client, CommitSha, GithubError, Repo, RunStatus, Token, WorkflowRun};
 use serde_json::{Value, json};
 
-use crate::calls::GithubToken;
+use crate::authz::model::Principal;
 use crate::calls::github::artifact::{ResultFile, read_result};
-use crate::calls::github::progress::{ApiJob, ApiRun, RunStatus, Settle, run_graph, settle};
-use crate::calls::github::workflow::{Workflow, WorkflowError, dispatch_inputs};
+use crate::calls::github::progress::{Settle, job_of, run_graph, settle};
+use crate::calls::github::workflow::{dispatch_inputs, interface};
+use crate::identity::github_logins::GithubLogins;
+use crate::secrets::github_app::{Access, GithubAppTokenSource, GithubOwner, RepoDenied};
 
-const API: &str = "https://api.github.com";
-const API_VERSION: &str = "2022-11-28";
-const USER_AGENT: &str = "crucible-controller";
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const _: () = assert!(forge::github::workflow::MAX_INPUTS == MAX_GITHUB_INPUTS);
+
 const GH_CLI_TIMEOUT: Duration = Duration::from_secs(15);
-const MAX_WORKFLOW_BYTES: u64 = 512 * 1024;
-const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_JOB_PAGES: u32 = 10;
-const RUN_READ_ATTEMPTS: u32 = 5;
-const RUN_READ_BACKOFF: Duration = Duration::from_secs(2);
-const JOBS_PER_PAGE: u32 = 100;
 const ERR_BODY_CHARS: usize = 300;
 
-const JSON_ACCEPT: &str = "application/vnd.github+json";
-const RAW_ACCEPT: &str = "application/vnd.github.raw";
-const SHA_ACCEPT: &str = "application/vnd.github.sha";
-
-/// Path characters left as they are: unreserved ones and `/`.
-const PATH: &AsciiSet = &NON_ALPHANUMERIC
-    .remove(b'-')
-    .remove(b'_')
-    .remove(b'.')
-    .remove(b'~')
-    .remove(b'/');
+/// What a call's repository token may do: dispatch, read and cancel runs, and read the workflow.
+const CALL_PERMISSIONS: &[(&str, Access)] =
+    &[("actions", Access::Write), ("contents", Access::Read)];
 
 /// Why a GitHub target operation failed.
 #[derive(Debug, thiserror::Error)]
-pub enum GithubError {
-    #[error(
-        "dispatching through the GitHub App installation is not supported by this controller; \
-         run the local controller, which dispatches with your gh login"
-    )]
-    AppInstallation,
+pub enum TargetError {
+    #[error(transparent)]
+    Github(#[from] GithubError),
     #[error("`gh auth token` failed: {0}")]
     GhCli(String),
+    #[error("{0}")]
+    Denied(RepoDenied),
+    #[error("minting a GitHub App token: {0:#}")]
+    AppToken(anyhow::Error),
     #[error("{0} is not a github_workflow target")]
     WrongKind(String),
     #[error("{0}")]
     Refused(String),
-    #[error("workflow {workflow} at {commit}: {error}")]
-    Workflow {
-        workflow: String,
-        commit: String,
-        error: WorkflowError,
-    },
-    #[error("GitHub answered {status} {doing}: {body}")]
-    Api {
-        doing: String,
-        status: u16,
-        body: String,
-    },
-    #[error("GitHub {doing}: {source}")]
-    Http {
-        doing: String,
-        source: reqwest::Error,
-    },
-    #[error("GitHub {doing}: {detail}")]
-    Response { doing: String, detail: String },
 }
 
-impl GithubError {
+impl TargetError {
     /// Whether retrying the same operation later may succeed.
     pub fn is_transient(&self) -> bool {
         match self {
-            GithubError::Http { .. } | GithubError::GhCli(_) => true,
-            GithubError::Api { status, .. } => *status == 429 || *status >= 500,
-            _ => false,
-        }
-    }
-
-    fn http(doing: &str) -> impl FnOnce(reqwest::Error) -> Self {
-        let doing = doing.to_owned();
-        move |source| GithubError::Http {
-            doing,
-            source: source.without_url(),
-        }
-    }
-
-    fn response(doing: &str, detail: impl std::fmt::Display) -> Self {
-        GithubError::Response {
-            doing: doing.to_owned(),
-            detail: detail.to_string(),
+            TargetError::Github(e) => e.is_transient(),
+            TargetError::GhCli(_) | TargetError::AppToken(_) => true,
+            TargetError::Denied(_) | TargetError::WrongKind(_) | TargetError::Refused(_) => false,
         }
     }
 }
 
-/// A GitHub token, held in memory for one operation. Never formatted.
-struct Token(String);
-
-impl std::fmt::Debug for Token {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Token(..)")
-    }
-}
-
-#[derive(Deserialize)]
-struct ApiJobs {
-    total_count: u64,
-    jobs: Vec<ApiJob>,
-}
-
-#[derive(Deserialize)]
-struct ApiArtifacts {
-    artifacts: Vec<ApiArtifact>,
-}
-
-#[derive(Deserialize)]
-struct ApiArtifact {
-    id: u64,
-    name: String,
-    size_in_bytes: u64,
-    #[serde(default)]
-    expired: bool,
-}
-
-/// The body of a dispatch with `return_run_details`.
-#[derive(Deserialize)]
-struct Dispatched {
-    workflow_run_id: u64,
-    html_url: String,
+/// Where the backend takes the token for a repository.
+#[derive(Clone, Debug)]
+pub(crate) enum TokenSource {
+    /// `gh auth token`, read at each operation. Local controllers only.
+    GhCli,
+    /// An installation token of the GitHub App, scoped to the target repository, used only for
+    /// a launch owner whose paired GitHub login may write to it.
+    App {
+        app: Box<GithubAppTokenSource>,
+        logins: GithubLogins,
+    },
 }
 
 /// What a dispatch created.
@@ -151,8 +81,8 @@ struct Dispatched {
 pub struct GithubDispatched {
     pub handle: TargetHandle,
     pub link: Option<NodeLink>,
-    /// The commit the run runs on.
-    pub head_sha: String,
+    /// The commit the ref named when the interface was checked, which the run's head must keep.
+    pub commit: String,
 }
 
 /// A completed run's settlement.
@@ -170,43 +100,56 @@ pub struct GithubOutcome {
 pub struct RunPoll {
     pub progress: ProgressGraph,
     pub head_sha: String,
+    pub run_number: Option<u64>,
     pub outcome: Option<GithubOutcome>,
 }
 
 /// The `github_workflow` target backend.
 pub struct GithubWorkflowBackend {
-    token: GithubToken,
-    http: reqwest::Client,
+    client: Client,
+    tokens: TokenSource,
+    /// The wall clock of a call that sets none, and the most one may set.
+    max_wall_clock: Duration,
 }
 
 impl GithubWorkflowBackend {
-    pub fn new(token: GithubToken) -> Result<Self, GithubError> {
-        crate::install_crypto_provider();
-        let http = reqwest::Client::builder()
-            .user_agent(USER_AGENT)
-            .timeout(REQUEST_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(GithubError::http("building the client"))?;
-        Ok(GithubWorkflowBackend { token, http })
+    pub(crate) fn new(tokens: TokenSource, max_wall_clock: Duration) -> Result<Self, TargetError> {
+        Ok(GithubWorkflowBackend {
+            client: Client::new()?,
+            tokens,
+            max_wall_clock,
+        })
+    }
+
+    /// The wall clock a call with `budget` runs under: its own, within the controller's cap.
+    pub fn wall_clock(&self, budget: Option<CallBudget>) -> Duration {
+        budget
+            .and_then(|b| b.wall_clock_secs)
+            .filter(|secs| *secs > 0)
+            .map(Duration::from_secs)
+            .map_or(self.max_wall_clock, |own| own.min(self.max_wall_clock))
     }
 
     /// The target's pin (the ref's commit now) and its interface at that commit.
-    pub async fn interface(&self, target: &CallTarget) -> Result<LockedCall, GithubError> {
+    pub async fn interface(&self, target: &CallTarget) -> Result<LockedCall, TargetError> {
         let (repo, workflow, git_ref, outputs) = github_target(target)?;
-        let token = self.token().await?;
-        let commit = self.resolve(&token, repo, git_ref.as_str()).await?;
+        let api_repo = api_repo(repo)?;
+        let token = self.token(&api_repo).await?;
+        let commit = self
+            .client
+            .resolve(&token, &api_repo, git_ref.as_str())
+            .await?;
         let interface = self
-            .interface_at(&token, repo, workflow, &commit, outputs)
+            .interface_at(&token, &api_repo, workflow, &commit, outputs)
             .await?;
         let pin = Pin::GithubRef {
             repo: repo.clone(),
             workflow: workflow.clone(),
             git_ref: git_ref.clone(),
-            commit,
+            commit: commit.to_string(),
         };
         LockedCall::new(pin, interface)
-            .map_err(|e| GithubError::response("hashing the interface", e))
+            .map_err(|e| TargetError::Refused(format!("hashing the interface: {e}")))
     }
 
     /// Dispatch one run of `target` on its ref with `values`, after checking the interface at
@@ -217,65 +160,127 @@ impl GithubWorkflowBackend {
         locked: &LockedCall,
         values: &BTreeMap<String, Value>,
         files: &BTreeMap<String, FileRef>,
-    ) -> Result<GithubDispatched, GithubError> {
+    ) -> Result<GithubDispatched, TargetError> {
         let (repo, workflow, git_ref, outputs) = github_target(target)?;
         if !locked.pin.pins(target) {
-            return Err(GithubError::Refused(format!(
+            return Err(TargetError::Refused(format!(
                 "calls.lock pins a different target than {repo} {} at {}",
                 workflow.as_str(),
                 git_ref.as_str()
             )));
         }
-        let inputs = dispatch_inputs(&locked.interface.params, values, files)?;
-        let token = self.token().await?;
-        let commit = self.resolve(&token, repo, git_ref.as_str()).await?;
+        let api_repo = api_repo(repo)?;
+        let token = self.token(&api_repo).await?;
+        let commit = self
+            .client
+            .resolve(&token, &api_repo, git_ref.as_str())
+            .await?;
         let current = self
-            .interface_at(&token, repo, workflow, &commit, outputs)
+            .interface_at(&token, &api_repo, workflow, &commit, outputs)
             .await?;
         if let Some(moved) = difference(&locked.interface, &current) {
-            return Err(GithubError::Refused(format!(
+            return Err(TargetError::Refused(format!(
                 "{repo} {} at {} (commit {}) {moved} than calls.lock records",
                 workflow.as_str(),
                 git_ref.as_str(),
-                short(&commit)
+                commit.short()
             )));
         }
-        let url = format!(
-            "{API}/repos/{repo}/actions/workflows/{}/dispatches",
-            encode(workflow.file_name())
-        );
-        let body = json!({"ref": git_ref.as_str(), "inputs": inputs, "return_run_details": true});
-        let doing = "dispatching the workflow";
-        let resp = self
-            .send(self.http.post(url).json(&body), &token, JSON_ACCEPT, doing)
+        let inputs = dispatch_inputs(&locked.interface.params, values, files)?;
+        let created = self
+            .client
+            .dispatch(
+                &token,
+                &api_repo,
+                workflow.file_name(),
+                git_ref.as_str(),
+                &inputs,
+            )
             .await?;
-        let created: Dispatched = resp.json().await.map_err(GithubError::http(doing))?;
-        let run = self.run(&token, repo, created.workflow_run_id).await?;
-        if run.head_sha != commit {
-            let at_head = self
-                .interface_at(&token, repo, workflow, &run.head_sha, outputs)
-                .await?;
-            if let Some(moved) = difference(&locked.interface, &at_head) {
-                self.cancel_with(&token, repo, run.id).await?;
-                return Err(GithubError::Refused(format!(
-                    "{} moved to commit {} during dispatch, whose workflow {moved} than \
-                     calls.lock records; run {} was cancelled",
-                    git_ref.as_str(),
-                    short(&run.head_sha),
-                    run.id
-                )));
-            }
-        }
         Ok(GithubDispatched {
             handle: TargetHandle::GithubWorkflow {
                 repo: repo.clone(),
-                run_id: created.workflow_run_id,
+                run_id: created.run_id,
             },
             link: ExternalUrl::new(created.html_url)
                 .ok()
                 .map(|url| NodeLink::External { url }),
-            head_sha: run.head_sha,
+            commit: commit.to_string(),
         })
+    }
+
+    /// How the workflow at `head`, the commit a run ran on, differs from the locked interface,
+    /// when `head` is not `commit`, the commit the dispatch checked; `None` when it does not.
+    pub async fn moved_head(
+        &self,
+        target: &CallTarget,
+        locked: &TargetInterface,
+        commit: &str,
+        head: &str,
+    ) -> Result<Option<String>, TargetError> {
+        if head == commit {
+            return Ok(None);
+        }
+        let (repo, workflow, git_ref, outputs) = github_target(target)?;
+        let Some(head_sha) = CommitSha::parse(head) else {
+            return Ok(Some(format!("ran on an unreadable head commit {head:?}")));
+        };
+        let api_repo = api_repo(repo)?;
+        let token = self.token(&api_repo).await?;
+        let at_head = self
+            .interface_at(&token, &api_repo, workflow, &head_sha, outputs)
+            .await?;
+        Ok(difference(locked, &at_head).map(|moved| {
+            format!(
+                "{} moved to commit {} during dispatch, whose workflow {moved} than calls.lock \
+                 records",
+                git_ref.as_str(),
+                head_sha.short()
+            )
+        }))
+    }
+
+    /// Refuse unless `who` may dispatch the workflows of `repo`. With the App, a GitHub login
+    /// paired with `who` must hold write, maintain or admin on the repository, read through the
+    /// App's installation on it. The gh CLI's token is its own user's access, so it is not asked.
+    pub async fn authorize(&self, who: &Principal, repo: &GithubRepo) -> Result<(), TargetError> {
+        let TokenSource::App { app, logins } = &self.tokens else {
+            return Ok(());
+        };
+        let api_repo = api_repo(repo)?;
+        let owner = GithubOwner::parse(api_repo.owner())
+            .map_err(|e| TargetError::Refused(e.to_string()))?;
+        let Principal::User(user) = who else {
+            return Err(TargetError::Refused(format!(
+                "{who} is not a person with a GitHub login, so it may not dispatch the workflows \
+                 of {repo}"
+            )));
+        };
+        let paired = logins.github_logins(user);
+        if paired.is_empty() {
+            return Err(TargetError::Refused(format!(
+                "{who} has no linked GitHub login (CONTROLLER_GITHUB_LOGINS pairs one), so it \
+                 may not dispatch the workflows of {repo}"
+            )));
+        }
+        let mut held = Vec::with_capacity(paired.len());
+        for login in paired {
+            let login =
+                GithubOwner::parse(login).map_err(|e| TargetError::Refused(e.to_string()))?;
+            let role = app
+                .repo_role(&owner, api_repo.name(), &login, CALL_PERMISSIONS)
+                .await
+                .map_err(app_failure)?;
+            if role.may_write() {
+                return Ok(());
+            }
+            held.push(format!("{login} has {}", role.as_str()));
+        }
+        Err(TargetError::Refused(format!(
+            "{who} may not dispatch the workflows of {repo}: GitHub login {}, and dispatching \
+             needs write, maintain or admin",
+            held.join(", ")
+        )))
     }
 
     /// The run's progress over the locked `graph`, and its outcome once it completed.
@@ -286,60 +291,60 @@ impl GithubWorkflowBackend {
         graph: &ProgressGraph,
         outputs: &GithubOutputs,
         caller_cancelled: bool,
-    ) -> Result<RunPoll, GithubError> {
-        let token = self.token().await?;
-        let run = self.run(&token, repo, run_id).await?;
-        let jobs = self.jobs(&token, repo, run_id).await?;
+    ) -> Result<RunPoll, TargetError> {
+        let api_repo = api_repo(repo)?;
+        let token = self.token(&api_repo).await?;
+        let run = self.client.run(&token, &api_repo, run_id).await?;
+        let jobs = self.client.jobs(&token, &api_repo, run_id).await?;
         let progress = run_graph(graph, &jobs);
         let outcome = match run.status {
             Some(RunStatus::Completed) => Some(
-                self.outcome(&token, repo, &run, outputs, caller_cancelled)
+                self.outcome(&token, &api_repo, &run, outputs, caller_cancelled)
                     .await?,
             ),
             _ => None,
         };
         Ok(RunPoll {
             progress,
+            run_number: run.run_number,
             head_sha: run.head_sha,
             outcome,
         })
     }
 
-    /// Ask GitHub to cancel the run. A run that already completed is left as it is.
-    pub async fn cancel(&self, repo: &GithubRepo, run_id: u64) -> Result<(), GithubError> {
-        let token = self.token().await?;
-        self.cancel_with(&token, repo, run_id).await
-    }
-
-    async fn cancel_with(
+    /// The log of the job that progress node `node` of the run draws; `None` when no job of
+    /// the run is drawn as `node`.
+    pub async fn node_log(
         &self,
-        token: &Token,
         repo: &GithubRepo,
         run_id: u64,
-    ) -> Result<(), GithubError> {
-        let url = format!("{API}/repos/{repo}/actions/runs/{run_id}/cancel");
-        match self
-            .send(
-                self.http.post(url),
-                token,
-                JSON_ACCEPT,
-                "cancelling the run",
-            )
-            .await
-        {
-            Err(GithubError::Api { status: 409, .. }) | Ok(_) => Ok(()),
-            Err(e) => Err(e),
-        }
+        graph: &ProgressGraph,
+        node: &str,
+    ) -> Result<Option<String>, TargetError> {
+        let api_repo = api_repo(repo)?;
+        let token = self.token(&api_repo).await?;
+        let jobs = self.client.jobs(&token, &api_repo, run_id).await?;
+        let Some(job) = job_of(graph, &jobs, node) else {
+            return Ok(None);
+        };
+        Ok(Some(self.client.job_log(&token, &api_repo, job).await?))
+    }
+
+    /// Ask GitHub to cancel the run. A run that already completed is left as it is.
+    pub async fn cancel(&self, repo: &GithubRepo, run_id: u64) -> Result<(), TargetError> {
+        let api_repo = api_repo(repo)?;
+        let token = self.token(&api_repo).await?;
+        Ok(self.client.cancel(&token, &api_repo, run_id).await?)
     }
 
     async fn outcome(
         &self,
         token: &Token,
-        repo: &GithubRepo,
-        run: &ApiRun,
+        repo: &Repo,
+        run: &WorkflowRun,
         outputs: &GithubOutputs,
         caller_cancelled: bool,
-    ) -> Result<GithubOutcome, GithubError> {
+    ) -> Result<GithubOutcome, TargetError> {
         let failed = |note: String| GithubOutcome {
             status: CallStatus::Failed,
             note,
@@ -362,6 +367,7 @@ impl GithubWorkflowBackend {
             }),
             Settle::Pass { read_result: true } => {
                 let Some(zip) = self
+                    .client
                     .artifact(token, repo, run.id, &outputs.artifact)
                     .await?
                 else {
@@ -383,201 +389,57 @@ impl GithubWorkflowBackend {
         }
     }
 
-    async fn token(&self) -> Result<Token, GithubError> {
-        match &self.token {
-            GithubToken::GhCli => gh_cli_token().await,
-            GithubToken::AppInstallation => Err(GithubError::AppInstallation),
-        }
-    }
-
-    async fn send(
-        &self,
-        request: reqwest::RequestBuilder,
-        token: &Token,
-        accept: &str,
-        doing: &str,
-    ) -> Result<reqwest::Response, GithubError> {
-        let resp = request
-            .bearer_auth(&token.0)
-            .header(reqwest::header::ACCEPT, accept)
-            .header("X-GitHub-Api-Version", API_VERSION)
-            .send()
-            .await
-            .map_err(GithubError::http(doing))?;
-        let status = resp.status();
-        if status.is_success() || status.is_redirection() {
-            return Ok(resp);
-        }
-        let body = resp.text().await.unwrap_or_default();
-        Err(GithubError::Api {
-            doing: doing.to_owned(),
-            status: status.as_u16(),
-            body: body.chars().take(ERR_BODY_CHARS).collect(),
-        })
-    }
-
-    async fn resolve(
-        &self,
-        token: &Token,
-        repo: &GithubRepo,
-        git_ref: &str,
-    ) -> Result<String, GithubError> {
-        let url = format!("{API}/repos/{repo}/commits/{}", encode(git_ref));
-        let doing = "resolving the ref";
-        let resp = self
-            .send(self.http.get(url), token, SHA_ACCEPT, doing)
-            .await?;
-        let sha = resp.text().await.map_err(GithubError::http(doing))?;
-        let sha = sha.trim();
-        match sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()) {
-            true => Ok(sha.to_owned()),
-            false => Err(GithubError::response(
-                doing,
-                "the answer is not a commit sha",
-            )),
+    async fn token(&self, repo: &Repo) -> Result<Token, TargetError> {
+        match &self.tokens {
+            TokenSource::GhCli => gh_cli_token().await,
+            TokenSource::App { app, .. } => {
+                let owner = GithubOwner::parse(repo.owner())
+                    .map_err(|e| TargetError::Refused(e.to_string()))?;
+                app.repo_token(&owner, repo.name(), CALL_PERMISSIONS)
+                    .await
+                    .map(Token::new)
+                    .map_err(app_failure)
+            }
         }
     }
 
     async fn interface_at(
         &self,
         token: &Token,
-        repo: &GithubRepo,
+        repo: &Repo,
         workflow: &WorkflowPath,
-        commit: &str,
+        commit: &CommitSha,
         outputs: &GithubOutputs,
-    ) -> Result<TargetInterface, GithubError> {
-        let url = format!(
-            "{API}/repos/{repo}/contents/{}?ref={commit}",
-            encode(workflow.as_str())
-        );
-        let doing = "reading the workflow file";
-        let resp = self
-            .send(self.http.get(url), token, RAW_ACCEPT, doing)
+    ) -> Result<TargetInterface, TargetError> {
+        let text = self
+            .client
+            .workflow_file(token, repo, workflow.as_str(), commit.as_str())
             .await?;
-        let bytes = capped(resp, MAX_WORKFLOW_BYTES, doing).await?;
-        let text = String::from_utf8(bytes).map_err(|e| GithubError::response(doing, e))?;
         let parsed = Workflow::parse(&text).map_err(|error| GithubError::Workflow {
+            repo: repo.to_string(),
             workflow: workflow.as_str().to_owned(),
-            commit: short(commit).to_owned(),
-            error,
+            git_ref: commit.short().to_owned(),
+            error: Box::new(error),
         })?;
-        Ok(parsed.interface(outputs))
+        Ok(interface(&parsed, outputs))
     }
+}
 
-    /// The run GitHub named. A run id GitHub just handed out can answer 404 for a few seconds,
-    /// so a 404 is asked again before it is believed.
-    async fn run(
-        &self,
-        token: &Token,
-        repo: &GithubRepo,
-        run_id: u64,
-    ) -> Result<ApiRun, GithubError> {
-        let url = format!("{API}/repos/{repo}/actions/runs/{run_id}");
-        let doing = "reading the run";
-        let mut attempt = 1;
-        loop {
-            match self
-                .send(self.http.get(&url), token, JSON_ACCEPT, doing)
-                .await
-            {
-                Ok(resp) => return resp.json().await.map_err(GithubError::http(doing)),
-                Err(GithubError::Api { status: 404, .. }) if attempt < RUN_READ_ATTEMPTS => {
-                    tokio::time::sleep(RUN_READ_BACKOFF * attempt).await;
-                    attempt += 1;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+/// A failure of the App: a denial of the repository is final, anything else is asked again.
+fn app_failure(e: anyhow::Error) -> TargetError {
+    match e.downcast_ref::<RepoDenied>() {
+        Some(denied) => TargetError::Denied(denied.clone()),
+        None => TargetError::AppToken(e),
     }
+}
 
-    async fn jobs(
-        &self,
-        token: &Token,
-        repo: &GithubRepo,
-        run_id: u64,
-    ) -> Result<Vec<ApiJob>, GithubError> {
-        let doing = "listing the run's jobs";
-        let mut jobs = Vec::new();
-        for page in 1..=MAX_JOB_PAGES {
-            let url = format!(
-                "{API}/repos/{repo}/actions/runs/{run_id}/jobs?per_page={JOBS_PER_PAGE}&page={page}"
-            );
-            let resp = self
-                .send(self.http.get(url), token, JSON_ACCEPT, doing)
-                .await?;
-            let batch: ApiJobs = resp.json().await.map_err(GithubError::http(doing))?;
-            let done = batch.jobs.len() < JOBS_PER_PAGE as usize
-                || jobs.len() as u64 + batch.jobs.len() as u64 >= batch.total_count;
-            jobs.extend(batch.jobs);
-            if done {
-                break;
-            }
-        }
-        Ok(jobs)
-    }
-
-    /// The zip of the run's artifact named `name`; `None` when the run has no such artifact.
-    async fn artifact(
-        &self,
-        token: &Token,
-        repo: &GithubRepo,
-        run_id: u64,
-        name: &str,
-    ) -> Result<Option<Vec<u8>>, GithubError> {
-        let doing = "listing the run's artifacts";
-        let url = format!(
-            "{API}/repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100&name={}",
-            encode(name)
-        );
-        let resp = self
-            .send(self.http.get(url), token, JSON_ACCEPT, doing)
-            .await?;
-        let listed: ApiArtifacts = resp.json().await.map_err(GithubError::http(doing))?;
-        let Some(artifact) = listed
-            .artifacts
-            .into_iter()
-            .find(|a| a.name == name && !a.expired)
-        else {
-            return Ok(None);
-        };
-        let doing = "downloading the artifact";
-        if artifact.size_in_bytes > MAX_ARTIFACT_BYTES {
-            return Err(GithubError::response(
-                doing,
-                format!(
-                    "{} bytes is over the {MAX_ARTIFACT_BYTES} byte limit",
-                    artifact.size_in_bytes
-                ),
-            ));
-        }
-        let url = format!("{API}/repos/{repo}/actions/artifacts/{}/zip", artifact.id);
-        let resp = self
-            .send(self.http.get(url), token, JSON_ACCEPT, doing)
-            .await?;
-        let resp = match resp.status().is_redirection() {
-            false => resp,
-            true => {
-                let location = resp
-                    .headers()
-                    .get(reqwest::header::LOCATION)
-                    .and_then(|v| v.to_str().ok())
-                    .ok_or_else(|| GithubError::response(doing, "a redirect with no location"))?
-                    .to_owned();
-                self.http
-                    .get(location)
-                    .send()
-                    .await
-                    .and_then(reqwest::Response::error_for_status)
-                    .map_err(GithubError::http(doing))?
-            }
-        };
-        capped(resp, MAX_ARTIFACT_BYTES, doing).await.map(Some)
-    }
+fn api_repo(repo: &GithubRepo) -> Result<Repo, TargetError> {
+    Ok(Repo::parse(repo.as_str())?)
 }
 
 fn github_target(
     target: &CallTarget,
-) -> Result<(&GithubRepo, &WorkflowPath, &GitRefName, &GithubOutputs), GithubError> {
+) -> Result<(&GithubRepo, &WorkflowPath, &GitRefName, &GithubOutputs), TargetError> {
     match target {
         CallTarget::GithubWorkflow {
             repo,
@@ -585,11 +447,11 @@ fn github_target(
             git_ref,
             outputs,
         } => Ok((repo, workflow, git_ref, outputs)),
-        other => Err(GithubError::WrongKind(other.kind().to_string())),
+        other => Err(TargetError::WrongKind(other.kind().to_string())),
     }
 }
 
-/// Which parts of `now` differ from `locked`, as a phrase ("has different params and graph").
+/// Which parts of `now` differ from `locked`, as a phrase ("has a different params and graph").
 fn difference(locked: &TargetInterface, now: &TargetInterface) -> Option<String> {
     let mut parts = Vec::new();
     if locked.params != now.params {
@@ -607,35 +469,8 @@ fn difference(locked: &TargetInterface, now: &TargetInterface) -> Option<String>
     }
 }
 
-fn short(sha: &str) -> &str {
-    sha.get(..12).unwrap_or(sha)
-}
-
-fn encode(path: &str) -> String {
-    utf8_percent_encode(path, PATH).to_string()
-}
-
-async fn capped(
-    mut resp: reqwest::Response,
-    cap: u64,
-    doing: &str,
-) -> Result<Vec<u8>, GithubError> {
-    let over = || GithubError::response(doing, format!("the body is over {cap} bytes"));
-    if resp.content_length().is_some_and(|len| len > cap) {
-        return Err(over());
-    }
-    let mut buf = Vec::new();
-    while let Some(chunk) = resp.chunk().await.map_err(GithubError::http(doing))? {
-        if buf.len() as u64 + chunk.len() as u64 > cap {
-            return Err(over());
-        }
-        buf.extend_from_slice(&chunk);
-    }
-    Ok(buf)
-}
-
 /// The gh CLI's token for github.com, read now and held only by the caller.
-async fn gh_cli_token() -> Result<Token, GithubError> {
+async fn gh_cli_token() -> Result<Token, TargetError> {
     let run = tokio::process::Command::new("gh")
         .args(["auth", "token", "--hostname", "github.com"])
         .stdin(std::process::Stdio::null())
@@ -643,62 +478,262 @@ async fn gh_cli_token() -> Result<Token, GithubError> {
         .output();
     let out = tokio::time::timeout(GH_CLI_TIMEOUT, run)
         .await
-        .map_err(|_| GithubError::GhCli(format!("no answer in {GH_CLI_TIMEOUT:?}")))?
-        .map_err(|e| GithubError::GhCli(e.to_string()))?;
+        .map_err(|_| TargetError::GhCli(format!("no answer in {GH_CLI_TIMEOUT:?}")))?
+        .map_err(|e| TargetError::GhCli(e.to_string()))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(GithubError::GhCli(
+        return Err(TargetError::GhCli(
             stderr.trim().chars().take(ERR_BODY_CHARS).collect(),
         ));
     }
     let token = String::from_utf8(out.stdout)
-        .map_err(|_| GithubError::GhCli("the token is not UTF-8".to_owned()))?;
+        .map_err(|_| TargetError::GhCli("the token is not UTF-8".to_owned()))?;
     let token = token.trim();
     match token.is_empty() || token.contains(char::is_whitespace) {
-        true => Err(GithubError::GhCli(
+        true => Err(TargetError::GhCli(
             "gh printed no token; run `gh auth login`".to_owned(),
         )),
-        false => Ok(Token(token.to_owned())),
+        false => Ok(Token::new(token)),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::time::Duration;
 
     use crucible_contract::calls::{
-        CallStatus, CallTarget, GithubRepo, ProgressGraph, TargetHandle,
+        CallBudget, CallStatus, CallTarget, GithubRepo, ProgressGraph, TargetHandle,
     };
     use serde_json::json;
 
-    use crate::calls::GithubToken;
-    use crate::calls::github::{GithubError, GithubWorkflowBackend, Token};
+    use crate::authz::model::Principal;
+    use crate::calls::github::{GithubWorkflowBackend, TargetError, TokenSource};
+    use crate::secrets::github_app::RepoDenied;
+
+    fn backend() -> GithubWorkflowBackend {
+        GithubWorkflowBackend::new(TokenSource::GhCli, Duration::from_secs(4 * 3600)).unwrap()
+    }
 
     #[test]
-    fn a_token_never_formats() {
-        let token = Token("ghp_secretvalue".to_owned());
-        assert_eq!(format!("{token:?}"), "Token(..)");
+    fn a_call_without_its_own_wall_clock_gets_the_controllers() {
+        let backend = backend();
+        let budget = |secs| {
+            Some(CallBudget {
+                cost_usd: None,
+                wall_clock_secs: secs,
+            })
+        };
+        assert_eq!(backend.wall_clock(None), Duration::from_secs(4 * 3600));
+        assert_eq!(
+            backend.wall_clock(budget(None)),
+            Duration::from_secs(4 * 3600)
+        );
+        assert_eq!(
+            backend.wall_clock(budget(Some(0))),
+            Duration::from_secs(4 * 3600)
+        );
+        assert_eq!(
+            backend.wall_clock(budget(Some(60))),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            backend.wall_clock(budget(Some(10 * 3600))),
+            Duration::from_secs(4 * 3600),
+            "a call's own wall clock stays within the controller's"
+        );
+    }
+
+    #[test]
+    fn denials_are_final_and_token_faults_are_retried() {
+        assert!(!TargetError::Denied(RepoDenied::NotInstalled("o/r".into())).is_transient());
+        assert!(
+            TargetError::AppToken(anyhow::Error::new(std::io::Error::other("connect refused")))
+                .is_transient()
+        );
+        assert!(TargetError::GhCli("timeout".into()).is_transient());
+        assert!(!TargetError::Refused("no".into()).is_transient());
+    }
+
+    fn app_backend(server: &wiremock::MockServer, dir: &std::path::Path) -> GithubWorkflowBackend {
+        let app = crate::secrets::github_app::GithubAppTokenSource::new(
+            "1",
+            "2",
+            crate::secrets::github_app::testkey::write_test_key(dir),
+            server.uri(),
+        );
+        let logins = crate::identity::github_logins::GithubLogins::parse([
+            "wren-gh=wren",
+            "ash-gh=ash",
+            "ash-alt=ash",
+        ]);
+        GithubWorkflowBackend::new(
+            TokenSource::App {
+                app: Box::new(app),
+                logins,
+            },
+            Duration::from_secs(3600),
+        )
+        .unwrap()
+    }
+
+    async fn mount_repo(server: &wiremock::MockServer, roles: &[(&str, &str)]) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/app/installation"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": 7,
+                "permissions": {"actions": "write", "contents": "read"},
+            })))
+            .mount(server)
+            .await;
+        let in_an_hour = jiff::Timestamp::from_second(jiff::Timestamp::now().as_second() + 3600)
+            .unwrap()
+            .to_string();
+        Mock::given(method("POST"))
+            .and(path("/app/installations/7/access_tokens"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(json!({"token": "ghs_repo", "expires_at": in_an_hour})),
+            )
+            .mount(server)
+            .await;
+        for (login, role) in roles {
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/repos/acme/app/collaborators/{login}/permission"
+                )))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"permission": role, "role_name": role})),
+                )
+                .mount(server)
+                .await;
+        }
+    }
+
+    fn user(login: &str) -> Principal {
+        Principal::User(login.into())
+    }
+
+    /// With the App, only a person whose paired GitHub login may write to the repository may
+    /// dispatch its workflows.
+    #[tokio::test]
+    async fn an_app_dispatch_needs_an_owner_with_write_on_the_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = wiremock::MockServer::start().await;
+        mount_repo(
+            &server,
+            &[
+                ("wren-gh", "write"),
+                ("ash-gh", "read"),
+                ("ash-alt", "triage"),
+            ],
+        )
+        .await;
+        let backend = app_backend(&server, dir.path());
+        let repo = GithubRepo::parse("acme/app").unwrap();
+
+        backend.authorize(&user("wren"), &repo).await.unwrap();
+        backend.authorize(&user("WREN"), &repo).await.unwrap();
+
+        let refused = |e: TargetError| match e {
+            TargetError::Refused(note) => note,
+            other => panic!("not a refusal: {other}"),
+        };
+        let ash = refused(backend.authorize(&user("ash"), &repo).await.unwrap_err());
+        assert!(ash.contains("ash-alt has triage"), "{ash}");
+        assert!(ash.contains("ash-gh has read"), "{ash}");
+        assert!(ash.contains("needs write, maintain or admin"), "{ash}");
+
+        let mallory = refused(
+            backend
+                .authorize(&user("mallory"), &repo)
+                .await
+                .unwrap_err(),
+        );
+        assert!(mallory.contains("no linked GitHub login"), "{mallory}");
+        assert!(mallory.contains("CONTROLLER_GITHUB_LOGINS"), "{mallory}");
+
+        let team = Principal::Team(crate::authz::model::TeamSlug::parse("ops").unwrap());
+        let team = refused(backend.authorize(&team, &repo).await.unwrap_err());
+        assert!(team.contains("not a person"), "{team}");
     }
 
     #[tokio::test]
-    async fn the_app_installation_path_is_refused_clearly() {
-        let backend = GithubWorkflowBackend::new(GithubToken::AppInstallation).unwrap();
+    async fn an_app_dispatch_to_a_repository_without_the_app_is_denied() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let dir = tempfile::tempdir().unwrap();
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/app/installation"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let backend = app_backend(&server, dir.path());
+        let denied = backend
+            .authorize(&user("wren"), &GithubRepo::parse("acme/app").unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&denied, TargetError::Denied(RepoDenied::NotInstalled(r)) if r == "acme/app"),
+            "{denied}"
+        );
+        assert!(!denied.is_transient());
+    }
+
+    #[tokio::test]
+    async fn the_gh_cli_token_is_its_users_own_access() {
+        let team = Principal::Team(crate::authz::model::TeamSlug::parse("ops").unwrap());
+        backend()
+            .authorize(&team, &GithubRepo::parse("acme/app").unwrap())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_run_on_the_checked_commit_has_not_moved() {
         let target: CallTarget = serde_json::from_value(json!({
             "kind": "github_workflow",
-            "repo": "o/r",
+            "repo": "acme/app",
             "workflow": ".github/workflows/x.yml",
             "ref": "main",
-            "outputs": {"artifact": "a"},
+            "outputs": {"artifact": "result"},
         }))
         .unwrap();
-        let err = backend.interface(&target).await.unwrap_err();
-        assert!(matches!(err, GithubError::AppInstallation));
-        assert!(err.to_string().contains("not supported"));
+        let locked = crucible_contract::calls::TargetInterface {
+            params: json!({}),
+            result: vec![],
+            result_files: vec![],
+            graph: ProgressGraph::default(),
+        };
+        let sha = "a".repeat(40);
+        assert_eq!(
+            backend()
+                .moved_head(&target, &locked, &sha, &sha)
+                .await
+                .unwrap(),
+            None
+        );
+        let unreadable = backend()
+            .moved_head(&target, &locked, &sha, "not-a-sha")
+            .await
+            .unwrap();
+        assert!(
+            unreadable.is_some_and(|n| n.contains("unreadable head")),
+            "a head that is no commit has moved"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_target_of_another_kind_is_refused() {
         let playbook: CallTarget =
             serde_json::from_value(json!({"kind": "playbook", "playbook": "triage"})).unwrap();
         assert!(matches!(
-            backend.interface(&playbook).await,
-            Err(GithubError::WrongKind(kind)) if kind == "playbook"
+            backend().interface(&playbook).await,
+            Err(TargetError::WrongKind(kind)) if kind == "playbook"
         ));
     }
 
@@ -725,7 +760,7 @@ mod tests {
         let CallTarget::GithubWorkflow { outputs, .. } = &target else {
             unreachable!()
         };
-        let backend = GithubWorkflowBackend::new(GithubToken::GhCli).unwrap();
+        let backend = backend();
         let locked = backend.interface(&target).await.unwrap();
         assert_eq!(
             locked.interface.params["required"],
@@ -756,10 +791,10 @@ mod tests {
             panic!("not a github handle");
         };
         assert_eq!(repo, &GithubRepo::parse("wseaton/snapshotd").unwrap());
-        eprintln!("dispatched run {run_id} on {}", dispatched.head_sha);
+        eprintln!("dispatched run {run_id} at {}", dispatched.commit);
 
         let mut seen_legs = false;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(900);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(900);
         let outcome = loop {
             let poll = backend
                 .poll(repo, *run_id, &locked.interface.graph, outputs, false)
@@ -772,13 +807,6 @@ mod tests {
                 .filter(|n| n.group.as_deref() == Some("build"))
                 .count()
                 == 2;
-            let statuses: Vec<String> = poll
-                .progress
-                .nodes
-                .iter()
-                .map(|n| format!("{}={}", n.id, n.status.as_str()))
-                .collect();
-            eprintln!("{}", statuses.join(" "));
             if let Some(outcome) = poll.outcome {
                 break outcome;
             }
@@ -786,7 +814,7 @@ mod tests {
                 tokio::time::Instant::now() < deadline,
                 "the run did not finish"
             );
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            tokio::time::sleep(Duration::from_secs(10)).await;
         };
         assert!(seen_legs, "the matrix legs were never drawn as a group");
         assert_eq!(outcome.status, CallStatus::Passed, "{}", outcome.note);
@@ -802,6 +830,20 @@ mod tests {
         );
         assert_eq!(outcome.files.len(), 1);
         assert!(String::from_utf8_lossy(&outcome.files[0].bytes).contains("hello from crucible"));
+
+        let log = backend
+            .node_log(repo, *run_id, &locked.interface.graph, "prepare")
+            .await
+            .unwrap()
+            .expect("the prepare job's log");
+        assert!(!log.is_empty());
+        assert!(
+            backend
+                .node_log(repo, *run_id, &locked.interface.graph, "ghost")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         let unused = ProgressGraph::default();
         let again = backend

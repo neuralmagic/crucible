@@ -70,6 +70,123 @@ struct AccountResponse {
     login: String,
 }
 
+/// `GET /repos/{owner}/{repo}/installation` response (the fields we use).
+#[derive(Debug, Deserialize)]
+struct RepoInstallationResponse {
+    id: u64,
+    #[serde(default)]
+    permissions: std::collections::BTreeMap<String, String>,
+}
+
+/// An installation permission level a repository token asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Access {
+    Read,
+    Write,
+}
+
+impl Access {
+    fn as_str(self) -> &'static str {
+        match self {
+            Access::Read => "read",
+            Access::Write => "write",
+        }
+    }
+
+    fn granted_by(self, level: Option<&str>) -> bool {
+        match self {
+            Access::Read => matches!(level, Some("read" | "write")),
+            Access::Write => level == Some("write"),
+        }
+    }
+}
+
+/// Why the App cannot act on a repository.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum RepoDenied {
+    #[error("the GitHub App is not installed on {0}")]
+    NotInstalled(String),
+    #[error("the GitHub App's installation on {repo} lacks {missing}")]
+    Lacks { repo: String, missing: String },
+}
+
+/// `GET /repos/{owner}/{repo}/collaborators/{login}/permission` response (the fields we use).
+#[derive(Debug, Deserialize)]
+struct CollaboratorPermission {
+    #[serde(default)]
+    permission: String,
+    #[serde(default)]
+    role_name: String,
+}
+
+/// A person's role on a repository. A custom role reads as the base permission it builds on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RepoRole {
+    Admin,
+    Maintain,
+    Write,
+    Triage,
+    Read,
+    None,
+}
+
+impl RepoRole {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            RepoRole::Admin => "admin",
+            RepoRole::Maintain => "maintain",
+            RepoRole::Write => "write",
+            RepoRole::Triage => "triage",
+            RepoRole::Read => "read",
+            RepoRole::None => "no access",
+        }
+    }
+
+    /// Whether the role may push to the repository and run its workflows.
+    pub(crate) fn may_write(self) -> bool {
+        matches!(self, RepoRole::Admin | RepoRole::Maintain | RepoRole::Write)
+    }
+
+    fn of(answer: &CollaboratorPermission) -> Self {
+        let named = |name: &str| match name {
+            "admin" => Some(RepoRole::Admin),
+            "maintain" => Some(RepoRole::Maintain),
+            "write" => Some(RepoRole::Write),
+            "triage" => Some(RepoRole::Triage),
+            "read" => Some(RepoRole::Read),
+            _ => None,
+        };
+        named(&answer.role_name)
+            .or_else(|| named(&answer.permission))
+            .unwrap_or(RepoRole::None)
+    }
+}
+
+/// The permissions in `wants` that `granted` does not give, as `name: level`.
+fn missing(
+    granted: &std::collections::BTreeMap<String, String>,
+    wants: &[(&str, Access)],
+) -> Vec<String> {
+    wants
+        .iter()
+        .filter(|(name, access)| !access.granted_by(granted.get(*name).map(String::as_str)))
+        .map(|(name, access)| format!("{name}: {}", access.as_str()))
+        .collect()
+}
+
+/// The cache key of a repository token: the repository and the permissions it was minted with.
+fn repo_token_key(owner: &GithubOwner, repo: &str, wants: &[(&str, Access)]) -> String {
+    let permissions: Vec<String> = wants
+        .iter()
+        .map(|(name, access)| format!("{name}={}", access.as_str()))
+        .collect();
+    format!(
+        "repo:{owner}/{}:{}",
+        repo.to_ascii_lowercase(),
+        permissions.join(",")
+    )
+}
+
 /// `GET /app/installations` page size; GitHub's maximum.
 const INSTALLATIONS_PER_PAGE: usize = 100;
 
@@ -290,7 +407,7 @@ impl GithubAppTokenSource {
     /// One authenticated GET against the API base. `bearer` is an app JWT or an installation
     /// token, whichever the route takes.
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str, bearer: &str) -> Result<T> {
-        self.call(reqwest::Method::GET, path, bearer).await
+        self.call(reqwest::Method::GET, path, bearer, None).await
     }
 
     async fn call<T: serde::de::DeserializeOwned>(
@@ -298,11 +415,14 @@ impl GithubAppTokenSource {
         method: reqwest::Method,
         path: &str,
         bearer: &str,
+        body: Option<&serde_json::Value>,
     ) -> Result<T> {
         let url = format!("{}{path}", self.api_base.trim_end_matches('/'));
-        let resp = self
-            .http
-            .request(method.clone(), &url)
+        let mut request = self.http.request(method.clone(), &url);
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let resp = request
             .bearer_auth(bearer)
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
@@ -369,13 +489,154 @@ impl GithubAppTokenSource {
         Ok(None)
     }
 
+    /// A token for `owner/repo` alone with exactly `wants`, minted through the installation on
+    /// that repository and cached until near its expiry. A repository the App is not installed
+    /// on, or whose installation lacks one of `wants`, fails with a [`RepoDenied`] at the root.
+    pub(crate) async fn repo_token(
+        &self,
+        owner: &GithubOwner,
+        repo: &str,
+        wants: &'static [(&'static str, Access)],
+    ) -> Result<String> {
+        let key = repo_token_key(owner, repo, wants);
+        let this = self.clone();
+        let owner = owner.clone();
+        let repo = repo.to_owned();
+        let minted = self
+            .cache
+            .try_get_with(key, async move {
+                this.mint_for_repo(&owner, &repo, wants).await
+            })
+            .await
+            .map_err(|e| match e.downcast_ref::<RepoDenied>() {
+                Some(denied) => anyhow::Error::new(denied.clone()),
+                None => anyhow::anyhow!("{e:#}"),
+            })?;
+        Ok(minted.token)
+    }
+
+    /// `login`'s role on `owner/repo`, read with the repository token for `wants`. A login that
+    /// is not a collaborator, or no account at all, has [`RepoRole::None`].
+    pub(crate) async fn repo_role(
+        &self,
+        owner: &GithubOwner,
+        repo: &str,
+        login: &GithubOwner,
+        wants: &'static [(&'static str, Access)],
+    ) -> Result<RepoRole> {
+        let token = self.repo_token(owner, repo, wants).await?;
+        let url = format!(
+            "{}/repos/{}/{}/collaborators/{}/permission",
+            self.api_base.trim_end_matches('/'),
+            encode_segment(owner.as_str()),
+            encode_segment(repo),
+            encode_segment(login.as_str())
+        );
+        let doing = || format!("reading {login}'s permission on {owner}/{repo}");
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&token)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("User-Agent", "crucible-controller")
+            .send()
+            .await
+            .with_context(doing)?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(RepoRole::None);
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body: String = resp
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(500)
+                .collect();
+            bail!("{} returned {status}: {body}", doing());
+        }
+        let answer: CollaboratorPermission = resp.json().await.with_context(doing)?;
+        Ok(RepoRole::of(&answer))
+    }
+
+    async fn mint_for_repo(
+        &self,
+        owner: &GithubOwner,
+        repo: &str,
+        wants: &[(&str, Access)],
+    ) -> Result<CachedToken> {
+        let full = format!("{owner}/{repo}");
+        let jwt = app_jwt(&self.app_id, &self.read_key()?, Timestamp::now())?;
+        let url = format!(
+            "{}/repos/{}/{}/installation",
+            self.api_base.trim_end_matches('/'),
+            encode_segment(owner.as_str()),
+            encode_segment(repo)
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&jwt)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("User-Agent", "crucible-controller")
+            .send()
+            .await
+            .with_context(|| format!("finding the GitHub App's installation on {full}"))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(RepoDenied::NotInstalled(full).into());
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body: String = resp
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(500)
+                .collect();
+            bail!("finding the GitHub App's installation on {full} returned {status}: {body}");
+        }
+        let installation: RepoInstallationResponse = resp
+            .json()
+            .await
+            .with_context(|| format!("decoding the GitHub App's installation on {full}"))?;
+        let lacking = missing(&installation.permissions, wants);
+        if !lacking.is_empty() {
+            return Err(RepoDenied::Lacks {
+                repo: full,
+                missing: lacking.join(", "),
+            }
+            .into());
+        }
+        let permissions: serde_json::Map<String, serde_json::Value> = wants
+            .iter()
+            .map(|(name, access)| ((*name).to_owned(), access.as_str().into()))
+            .collect();
+        let body = serde_json::json!({"repositories": [repo], "permissions": permissions});
+        self.mint_with(&installation.id.to_string(), Timestamp::now(), Some(&body))
+            .await
+    }
+
     /// Sign the app JWT and exchange it for an installation token.
     async fn mint(&self, installation_id: &str, now: Timestamp) -> Result<CachedToken> {
+        self.mint_with(installation_id, now, None).await
+    }
+
+    /// [`Self::mint`], narrowed by `body` (`repositories`, `permissions`) when given.
+    async fn mint_with(
+        &self,
+        installation_id: &str,
+        now: Timestamp,
+        body: Option<&serde_json::Value>,
+    ) -> Result<CachedToken> {
         let pem = self.read_key().context("minting the installation token")?;
         let jwt = app_jwt(&self.app_id, &pem, now)?;
         let path = format!("/app/installations/{installation_id}/access_tokens");
         let body: InstallationTokenResponse = self
-            .call(reqwest::Method::POST, &path, &jwt)
+            .call(reqwest::Method::POST, &path, &jwt, body)
             .await
             .context("minting the installation token")?;
         let expires_at: Timestamp = body.expires_at.parse().with_context(|| {
@@ -612,6 +873,85 @@ mod tests {
     }
 
     #[test]
+    fn a_repo_token_needs_every_permission_it_asks_for() {
+        let granted = |pairs: &[(&str, &str)]| -> std::collections::BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        let wants = [("actions", Access::Write), ("contents", Access::Read)];
+        assert!(
+            missing(
+                &granted(&[("actions", "write"), ("contents", "read")]),
+                &wants
+            )
+            .is_empty()
+        );
+        assert!(
+            missing(
+                &granted(&[("actions", "write"), ("contents", "write")]),
+                &wants
+            )
+            .is_empty(),
+            "write grants read"
+        );
+        assert_eq!(
+            missing(
+                &granted(&[("actions", "read"), ("contents", "read")]),
+                &wants
+            ),
+            ["actions: write"]
+        );
+        assert_eq!(
+            missing(&granted(&[("metadata", "read")]), &wants),
+            ["actions: write", "contents: read"]
+        );
+        let denied = RepoDenied::Lacks {
+            repo: "o/r".into(),
+            missing: "actions: write".into(),
+        };
+        assert_eq!(
+            denied.to_string(),
+            "the GitHub App's installation on o/r lacks actions: write"
+        );
+        assert_eq!(
+            RepoDenied::NotInstalled("o/r".into()).to_string(),
+            "the GitHub App is not installed on o/r"
+        );
+    }
+
+    #[test]
+    fn a_repo_token_is_cached_per_repository_and_permissions() {
+        let acme = owner("acme");
+        let call = [("actions", Access::Write), ("contents", Access::Read)];
+        assert_eq!(
+            repo_token_key(&acme, "App", &call),
+            "repo:acme/app:actions=write,contents=read"
+        );
+        assert_eq!(
+            repo_token_key(&acme, "App", &call),
+            repo_token_key(&acme, "app", &call)
+        );
+        assert_ne!(
+            repo_token_key(&acme, "app", &call),
+            repo_token_key(&acme, "app", &[("actions", Access::Write)])
+        );
+        assert_ne!(
+            repo_token_key(&acme, "app", &call),
+            repo_token_key(
+                &acme,
+                "app",
+                &[("actions", Access::Write), ("contents", Access::Write)]
+            )
+        );
+        assert_ne!(
+            repo_token_key(&acme, "app", &call),
+            repo_token_key(&acme, "other", &call)
+        );
+    }
+
+    #[test]
     fn freshness_margin_is_five_minutes() {
         let now: Timestamp = "2026-07-05T12:00:00Z".parse().unwrap();
         let plus = |secs: i64| Timestamp::from_second(now.as_second() + secs).unwrap();
@@ -815,6 +1155,182 @@ mod tests {
             "ghs_rhds"
         );
         assert_eq!(source.cache.entry_count(), 0);
+    }
+
+    const DISPATCH: &[(&str, Access)] = &[("actions", Access::Write), ("contents", Access::Read)];
+
+    async fn mount_role(server: &MockServer, login: &str, status: u16, body: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/repos/acme/app/collaborators/{login}/permission"
+            )))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer ghs_repo",
+            ))
+            .respond_with(ResponseTemplate::new(status).set_body_json(body))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    /// A person's role is read through the repository's installation token, minted once, and
+    /// only write, maintain and admin may write.
+    #[tokio::test]
+    async fn a_repo_role_is_read_with_the_repository_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/app/installation"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 7,
+                "permissions": {"actions": "write", "contents": "read", "metadata": "read"},
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let in_an_hour = Timestamp::from_second(Timestamp::now().as_second() + 3600).unwrap();
+        Mock::given(method("POST"))
+            .and(path("/app/installations/7/access_tokens"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "repositories": ["app"],
+                "permissions": {"actions": "write", "contents": "read"},
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "token": "ghs_repo",
+                "expires_at": in_an_hour.to_string(),
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let answers = [
+            (
+                "owner",
+                200,
+                serde_json::json!({"permission": "admin", "role_name": "admin"}),
+                RepoRole::Admin,
+            ),
+            (
+                "keeper",
+                200,
+                serde_json::json!({"permission": "write", "role_name": "maintain"}),
+                RepoRole::Maintain,
+            ),
+            (
+                "dev",
+                200,
+                serde_json::json!({"permission": "write", "role_name": "write"}),
+                RepoRole::Write,
+            ),
+            (
+                "custom",
+                200,
+                serde_json::json!({"permission": "write", "role_name": "release-manager"}),
+                RepoRole::Write,
+            ),
+            (
+                "sorter",
+                200,
+                serde_json::json!({"permission": "read", "role_name": "triage"}),
+                RepoRole::Triage,
+            ),
+            (
+                "viewer",
+                200,
+                serde_json::json!({"permission": "read", "role_name": "read"}),
+                RepoRole::Read,
+            ),
+            (
+                "outsider",
+                200,
+                serde_json::json!({"permission": "none", "role_name": ""}),
+                RepoRole::None,
+            ),
+            (
+                "ghost",
+                404,
+                serde_json::json!({"message": "Not Found"}),
+                RepoRole::None,
+            ),
+        ];
+        for (login, status, body, _) in &answers {
+            mount_role(&server, login, *status, body.clone()).await;
+        }
+        let source =
+            GithubAppTokenSource::new("4210340", "99", write_test_key(dir.path()), server.uri());
+        for (login, _, _, role) in answers {
+            let read = source
+                .repo_role(&owner("acme"), "app", &owner(login), DISPATCH)
+                .await
+                .unwrap();
+            assert_eq!(read, role, "{login}");
+            assert_eq!(
+                read.may_write(),
+                matches!(role, RepoRole::Admin | RepoRole::Maintain | RepoRole::Write),
+                "{login}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_repo_role_on_a_repository_without_the_app_is_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/app/installation"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let source =
+            GithubAppTokenSource::new("4210340", "99", write_test_key(dir.path()), server.uri());
+        let err = source
+            .repo_role(&owner("acme"), "app", &owner("dev"), DISPATCH)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<RepoDenied>(),
+            Some(&RepoDenied::NotInstalled("acme/app".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_role_read_is_an_error_not_a_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/app/installation"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 7,
+                "permissions": {"actions": "write", "contents": "read"},
+            })))
+            .mount(&server)
+            .await;
+        let in_an_hour = Timestamp::from_second(Timestamp::now().as_second() + 3600).unwrap();
+        Mock::given(method("POST"))
+            .and(path("/app/installations/7/access_tokens"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "token": "ghs_repo",
+                "expires_at": in_an_hour.to_string(),
+            })))
+            .mount(&server)
+            .await;
+        mount_role(
+            &server,
+            "dev",
+            502,
+            serde_json::json!({"message": "bad gateway"}),
+        )
+        .await;
+        let source =
+            GithubAppTokenSource::new("4210340", "99", write_test_key(dir.path()), server.uri());
+        let err = format!(
+            "{:#}",
+            source
+                .repo_role(&owner("acme"), "app", &owner("dev"), DISPATCH)
+                .await
+                .unwrap_err()
+        );
+        assert!(err.contains("502"), "{err}");
     }
 
     #[tokio::test]

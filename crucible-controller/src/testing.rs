@@ -79,6 +79,7 @@ pub(crate) fn cfg_with(state_dir: &std::path::Path) -> crate::config::Controller
         runtime: Default::default(),
         local_secret_allowlist: Vec::new(),
         calls_github_token: None,
+        github_logins: Vec::new(),
         state_dir: state_dir.to_path_buf(),
         scratch_dir: None,
         db: "postgres://unused.invalid/none".to_string(),

@@ -2055,6 +2055,13 @@ pub struct WebhookCheck {
     pub diagnostics: Vec<CelDiagnostic>,
 }
 
+/// What a file parameter upload stored.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct UploadAck {
+    pub digest: String,
+    pub size: u64,
+}
+
 /// The launch acknowledgement: which issue the launch became.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LaunchAck {

@@ -72,8 +72,5 @@ impl CallTask {
 
 /// The short name a graph badge gives a target kind.
 pub fn badge(kind: CallKind) -> &'static str {
-    match kind {
-        CallKind::Playbook => "playbook",
-        CallKind::GithubWorkflow => "github",
-    }
+    kind.presentation().badge
 }

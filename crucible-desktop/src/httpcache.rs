@@ -426,6 +426,10 @@ impl Transport for CachedTransport {
         self.read(path).await
     }
 
+    async fn put_bytes(&self, path: &str, body: Vec<u8>) -> Result<(StatusCode, String)> {
+        self.inner.put_bytes(path, body).await
+    }
+
     async fn events(
         &self,
         path: &str,

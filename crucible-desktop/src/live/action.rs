@@ -36,10 +36,12 @@ pub(in crate::live) enum Msg {
 pub(in crate::live) enum Action {
     /// Read a target's params schema and the admin caps, for a launch form.
     Prepare(Target),
-    /// Launch a target with this body (`params`, `max_cost`, `max_time`, maybe `rerun`).
+    /// Upload these files, then launch a target with this body (`params`, `max_cost`,
+    /// `max_time`, maybe `rerun`), each file its parameter's value.
     Launch {
         target: Target,
         body: Value,
+        uploads: Vec<crate::form::Upload>,
     },
     /// What rerunning a finished run from these tasks would reuse.
     Rerun {
@@ -149,8 +151,12 @@ impl Action {
                 let result = prepare(&c, &target).await;
                 Reply::Prepared { target, result }
             }
-            Action::Launch { target, body } => {
-                let result = send_launch(&c, &target, &body).await;
+            Action::Launch {
+                target,
+                body,
+                uploads,
+            } => {
+                let result = send_launch(&c, &target, body, &uploads).await;
                 Reply::Launched {
                     playbook: target.id().to_string(),
                     result,
@@ -346,12 +352,49 @@ pub(in crate::live) async fn prepare(c: &Connection, target: &Target) -> Result<
 }
 
 /// Launch `target` with `body`, for the new launch's key.
-async fn send_launch(c: &Connection, target: &Target, body: &Value) -> Result<String, String> {
+async fn send_launch(
+    c: &Connection,
+    target: &Target,
+    mut body: Value,
+    uploads: &[crate::form::Upload],
+) -> Result<String, String> {
+    for upload in uploads {
+        let value = send_upload(c, upload).await?;
+        match body.get_mut("params").and_then(Value::as_object_mut) {
+            Some(params) => {
+                params.insert(upload.param.clone(), value);
+            }
+            None => return Err("the launch body holds no params".to_string()),
+        }
+    }
     let ack: crux::dto::LaunchAck = match target {
-        Target::Playbook(id) => within("the launch", c.client.launch(id, body)).await?,
-        Target::Draft(id) => within("the launch", c.client.launch_draft(id, body)).await?,
+        Target::Playbook(id) => within("the launch", c.client.launch(id, &body)).await?,
+        Target::Draft(id) => within("the launch", c.client.launch_draft(id, &body)).await?,
     };
     Ok(ack.key)
+}
+
+/// Upload `upload`'s file, refusing it past its cap before anything is sent, and answer the
+/// value its parameter takes.
+async fn send_upload(c: &Connection, upload: &crate::form::Upload) -> Result<Value, String> {
+    let bytes = std::fs::read(&upload.path)
+        .map_err(|error| format!("{}: {error}", upload.path.display()))?;
+    crate::form::too_large(
+        u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        upload.max_bytes,
+    )
+    .map_err(|why| format!("{}: {why}", upload.param))?;
+    let digest = crucible_contract::artifact::content_digest(&bytes);
+    let ack: crux::dto::UploadAck =
+        within(&upload.param, c.client.put_param_file(&digest, bytes)).await?;
+    let mut value = serde_json::json!({ "digest": ack.digest });
+    if let Some(name) = upload.path.file_name().and_then(|name| name.to_str()) {
+        value["name"] = Value::from(name);
+    }
+    if let Some(media_type) = &upload.media_type {
+        value["media_type"] = Value::from(media_type.as_str());
+    }
+    Ok(value)
 }
 
 /// Pull `draft`'s newest save into its working copy under `drafts`, creating it from `template`

@@ -296,11 +296,12 @@ impl CompileContext {
                 ParamValue::StringList(items) => {
                     Value::List(items.iter().cloned().map(Value::String).collect())
                 }
-                ParamValue::Json(_) => match self.param_types.get(name) {
+                ParamValue::Json(value) => match self.param_types.get(name) {
                     Some(ty @ (params::ParamType::Json | params::ParamType::File)) => {
                         Value::ParamRef {
                             name: name.to_owned(),
                             ty: *ty,
+                            shown: call::param_text(name, *ty, value),
                         }
                     }
                     _ => {
@@ -554,10 +555,12 @@ enum Value {
     Others,
     /// `task_defaults(...)`.
     Defaults(TaskDefaults),
-    /// `param(name)` of a json or file parameter.
+    /// `param(name)` of a json or file parameter. `shown` is what an agent prompt carries for
+    /// it, inside the external-input markers.
     ParamRef {
         name: String,
         ty: params::ParamType,
+        shown: String,
     },
     /// `producer.files["path"]`.
     CallFile(call::CallFile),
@@ -896,8 +899,11 @@ fn constructor(
     state: &CompileState,
     at: &FileSpan,
 ) -> Result<Value> {
-    if function != "call" {
-        call::refuse_param_refs(&named)?;
+    match function {
+        "call" => {}
+        "agent" => call::refuse_param_refs(&named, &["prompt"])?,
+        "skill" => call::refuse_param_refs(&named, &["args"])?,
+        _ => call::refuse_param_refs(&named, &[])?,
     }
     if function == "workflow" {
         let workflow_type = match take_string_default(&mut named, "type", "autoresearch")?.as_str()
@@ -2649,6 +2655,10 @@ fn take_prompt(named: &mut BTreeMap<String, Value>, name: &str) -> Result<String
     match take_value(named, name)? {
         Value::String(value) => Ok(value),
         Value::External(segments) => render_prompt(&segments),
+        Value::ParamRef { shown, .. } => render_prompt(&[values::Segment {
+            text: shown,
+            external: true,
+        }]),
         _ => Err(wrong_type(name, "a string")),
     }
 }
@@ -2779,6 +2789,10 @@ fn argument_segments(value: &Value, task: &str, key: &str) -> Result<Vec<values:
         Value::Float(n) => plain(n.to_string()),
         Value::Bool(b) => plain(b.to_string()),
         Value::External(segments) => Ok(segments.clone()),
+        Value::ParamRef { shown, .. } => Ok(vec![values::Segment {
+            text: shown.clone(),
+            external: true,
+        }]),
         Value::List(items) => {
             let mut out = Vec::new();
             for (index, item) in items.iter().enumerate() {
@@ -3452,8 +3466,6 @@ fn compile_source_here(
     let idents = idents::scan(&ast, lane);
     let globals = lane_globals(lane);
     let state = CompileState::new(pack_dir, filename);
-    let mut declared_params = params::Params::read(&ast)?;
-    let declares_params = !declared_params.is_empty();
     {
         let mut context = state.context_mut();
         context.declared_calls = targets::read(&ast)?;
@@ -3462,6 +3474,11 @@ fn compile_source_here(
                 .calls_lock()
                 .map_err(|detail| CompileError::CallsUnpinned { detail })?;
         }
+    }
+    let mut declared_params = params::Params::read(&ast)?;
+    let declares_params = !declared_params.is_empty();
+    {
+        let mut context = state.context_mut();
         declared_params.read_schemas(|path| context.schema_file(path).map(|file| file.schema))?;
         context.param_types = declared_params
             .specs()

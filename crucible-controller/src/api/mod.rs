@@ -55,8 +55,10 @@ pub(crate) mod tests;
         crate::runs::api::cluster_view::list_clusters,
         crate::runs::api::cluster_view::list_dispatch_targets,
         crate::runs::api::runs::get_run,
-        crate::calls::api::call_progress,
-        crate::calls::api::write_lock,
+        crate::calls::reader::call_progress,
+        crate::calls::reader::node_log,
+        crate::calls::reader::write_lock,
+        crate::launches::param_files::put,
         crate::runs::api::runs::get_run_iterations,
         crate::runs::api::runs::get_run_graph,
         crate::runs::api::evidence::get_task_evidence,
@@ -788,11 +790,20 @@ pub fn router(state: ApiState) -> Router {
         )
         .route(
             crucible_contract::calls::CALL_PROGRESS_PATH,
-            get(crate::calls::api::call_progress),
+            get(crate::calls::reader::call_progress),
         )
         .route(
-            crate::calls::api::LOCK_ROUTE,
-            axum::routing::post(crate::calls::api::write_lock),
+            crucible_contract::calls::CALL_NODE_LOG_PATH,
+            get(crate::calls::reader::node_log),
+        )
+        .route(
+            crate::calls::reader::LOCK_ROUTE,
+            axum::routing::post(crate::calls::reader::write_lock),
+        )
+        .route(
+            crate::launches::param_files::UPLOAD_ROUTE,
+            axum::routing::put(crate::launches::param_files::put)
+                .layer(crate::launches::param_files::upload_limit()),
         )
         .route("/api/openapi.json", get(move || async { Json(api) }))
         .layer(axum::middleware::from_fn_with_state(

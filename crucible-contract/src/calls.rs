@@ -60,6 +60,15 @@ pub const CALL_INPUT_FILE_PATH: &str = "/api/runs/{run}/call-files/{digest}";
 /// `GET` every call of `{run}` as a list of [`CallView`]. Anyone who may read `{run}`.
 pub const CALL_PROGRESS_PATH: &str = "/api/runs/{run}/call-progress";
 
+/// `GET` the text log of one progress node of a call of `{run}`: a GitHub job's log, or a
+/// playbook target task's log. Anyone who may read `{run}`, and for a playbook target the
+/// target run too.
+pub const CALL_NODE_LOG_PATH: &str = "/api/runs/{run}/calls/{call}/nodes/{node}/log";
+
+/// `GET` the bytes of a file parameter value stored for `{run}`'s launch, by its `sha256:<hex>`
+/// digest. Pod token of `{run}` only.
+pub const PARAM_FILE_PATH: &str = "/api/runs/{run}/param-files/{digest}";
+
 /// The kinds of target a call may name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -70,12 +79,73 @@ pub enum CallKind {
 }
 
 impl CallKind {
+    /// Every kind, for a client that sets up each kind's look ahead of drawing.
+    pub const ALL: [CallKind; 2] = [CallKind::Playbook, CallKind::GithubWorkflow];
+
     pub fn as_str(self) -> &'static str {
         match self {
             CallKind::Playbook => "playbook",
             CallKind::GithubWorkflow => "github_workflow",
         }
     }
+
+    /// How a client draws this kind's target runs. A new kind sets its look here and every
+    /// client follows.
+    pub fn presentation(self) -> Presentation {
+        match self {
+            CallKind::Playbook => Presentation {
+                name: "Crucible playbook",
+                badge: "playbook",
+                open: "Open run",
+                accent: None,
+                icon: None,
+                nodes: NodeLook::Tasks,
+            },
+            CallKind::GithubWorkflow => Presentation {
+                name: "GitHub Actions",
+                badge: "github",
+                open: "Open on GitHub",
+                accent: Some(Rgb(0x82, 0x50, 0xdf)),
+                icon: Some(BackendIcon::Github),
+                nodes: NodeLook::Jobs,
+            },
+        }
+    }
+}
+
+/// How a client draws a target kind's runs: its name, its colour, its mark, and its nodes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Presentation {
+    /// The backend's name, as an info card shows it.
+    pub name: &'static str,
+    /// The short word a call's label carries before its target has a name of its own.
+    pub badge: &'static str,
+    /// What the press that opens a target run says.
+    pub open: &'static str,
+    /// The frame, card and pulse colour; `None` draws with the client's own palette.
+    pub accent: Option<Rgb>,
+    /// The backend's mark on the press that opens a target run outside the client.
+    pub icon: Option<BackendIcon>,
+    pub nodes: NodeLook,
+}
+
+/// An sRGB colour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rgb(pub u8, pub u8, pub u8);
+
+/// A backend's mark, which a client maps to its own icon set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackendIcon {
+    Github,
+}
+
+/// How a target graph's nodes are drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeLook {
+    /// As the client draws its own run's tasks.
+    Tasks,
+    /// As an external CI's jobs: rounded cards with a status mark and a duration.
+    Jobs,
 }
 
 impl std::fmt::Display for CallKind {
@@ -869,6 +939,9 @@ pub struct CallState {
     pub handle: TargetHandle,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<NodeLink>,
+    /// The number the target's own system shows for this run, such as a GitHub run number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_number: Option<u64>,
 }
 
 /// One call of a run, as a reader of the run sees it.
@@ -1244,7 +1317,7 @@ mod tests {
             "task": "ship", "attempt": 1, "alias": "release", "interface_digest": "sha256:ab"
         }))
         .unwrap();
-        assert!(minimal.values.is_empty() && minimal.budget.is_none());
+        assert!(minimal.values.is_empty() && minimal.files.is_empty() && minimal.budget.is_none());
 
         let handle = TargetHandle::GithubWorkflow {
             repo: GithubRepo::parse("acme/app").unwrap(),
@@ -1261,6 +1334,7 @@ mod tests {
         assert_eq!(round_trip(&response), response);
 
         let state = CallState {
+            run_number: Some(12),
             call: CallId("c-1".into()),
             status: CallStatus::Passed,
             note: String::new(),
@@ -1304,6 +1378,29 @@ mod tests {
         assert_eq!(
             url("http://h", CALLS_PATH, "r", None),
             "http://h/api/runs/r/calls"
+        );
+    }
+
+    #[test]
+    fn every_kind_says_how_it_is_drawn() {
+        for kind in CallKind::ALL {
+            let look = kind.presentation();
+            assert!(!look.name.is_empty() && !look.badge.is_empty() && !look.open.is_empty());
+            if look.nodes == NodeLook::Jobs {
+                assert!(
+                    look.accent.is_some(),
+                    "{kind:?} draws jobs in its own colour"
+                );
+                assert!(
+                    look.icon.is_some(),
+                    "{kind:?} opens its runs under its own mark"
+                );
+            }
+        }
+        assert_eq!(CallKind::Playbook.presentation().nodes, NodeLook::Tasks);
+        assert_eq!(
+            CallKind::GithubWorkflow.presentation().accent,
+            Some(Rgb(0x82, 0x50, 0xdf))
         );
     }
 }

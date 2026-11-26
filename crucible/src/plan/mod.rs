@@ -17,6 +17,7 @@ pub mod machine;
 pub mod options;
 pub mod output;
 pub mod param;
+pub mod param_files;
 pub mod record;
 pub mod rerun;
 pub mod resume;

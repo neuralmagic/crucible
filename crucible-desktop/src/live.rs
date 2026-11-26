@@ -2209,6 +2209,109 @@ mod tests {
     }
 
     #[test]
+    fn a_launch_uploads_each_file_first_and_names_it_by_digest() {
+        use crate::testserver::{Reply, serve_replies};
+
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes.md");
+        std::fs::write(&notes, "# hi").unwrap();
+        let digest = crucible_contract::artifact::content_digest(b"# hi");
+        #[derive(Clone, Debug)]
+        struct Sent {
+            line: String,
+            content_type: Option<String>,
+            body: String,
+        }
+        let asked: Arc<Mutex<Vec<Sent>>> = Arc::default();
+        let seen = Arc::clone(&asked);
+        let acked = digest.clone();
+        let (url, _) = serve_replies(move |request| {
+            let line = request.line.clone();
+            if line.starts_with("PUT ") || line.starts_with("POST ") {
+                seen.lock().unwrap().push(Sent {
+                    line: line.clone(),
+                    content_type: request.header("content-type").map(str::to_string),
+                    body: request.body.clone(),
+                });
+            }
+            Reply::ok(if line.starts_with("PUT ") {
+                serde_json::json!({"digest": acked, "size": 4}).to_string()
+            } else if line.starts_with("POST ") {
+                r#"{"key":"playbook:demo:3"}"#.into()
+            } else if line.starts_with("GET /api/whoami") {
+                r#"{"user":"wren","role":"user"}"#.into()
+            } else {
+                "[]".into()
+            })
+        });
+        let keys = tempfile::tempdir().unwrap();
+        let net = crate::net::Net::uncached_for_tests();
+        let client = Client::spawn_with(
+            net.connector(crate::testserver::target("t", &url, keys.path())),
+            no_dirs(),
+        );
+        let fields = crate::form::fields(&serde_json::json!({
+            "type": "object",
+            "properties": {
+                "notes": {"type": "object", "x-param-type": "file", "x-max-bytes": 16,
+                          "x-media-type": ["text/markdown"]}
+            },
+            "required": ["notes"]
+        }));
+        let answers = [notes.display().to_string()];
+        let uploads = crate::form::uploads(&fields, &answers).unwrap();
+
+        client.launch(
+            Target::Playbook("demo".into()),
+            serde_json::json!({"params": {"n": 1}}),
+            uploads.clone(),
+        );
+        let launched = snapshot_when(&client, Duration::from_secs(5), |s| s.launched.is_some())
+            .launched
+            .unwrap();
+        assert_eq!(launched.result, Ok("playbook:demo:3".to_string()));
+        let sent = asked.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        let hex = digest.trim_start_matches("sha256:");
+        assert_eq!(
+            sent[0].line,
+            format!("PUT /api/param-files/sha256%3A{hex} HTTP/1.1")
+        );
+        assert_eq!(
+            sent[0].content_type.as_deref(),
+            Some("application/octet-stream")
+        );
+        assert_eq!(sent[0].body, "# hi");
+        assert_eq!(sent[1].line, "POST /api/playbooks/demo/launch HTTP/1.1");
+        let body: serde_json::Value = serde_json::from_str(&sent[1].body).unwrap();
+        assert_eq!(
+            body["params"],
+            serde_json::json!({
+                "n": 1,
+                "notes": {"digest": digest, "name": "notes.md", "media_type": "text/markdown"}
+            })
+        );
+
+        std::fs::write(&notes, "# grown past the cap").unwrap();
+        client.launch(
+            Target::Playbook("demo".into()),
+            serde_json::json!({"params": {}}),
+            uploads,
+        );
+        let refused = snapshot_when(&client, Duration::from_secs(5), |s| {
+            s.launched.as_ref().is_some_and(|l| l.seq > launched.seq)
+        })
+        .launched
+        .unwrap();
+        assert_eq!(refused.result, Err("notes: At most 16 B".to_string()));
+        assert_eq!(
+            asked.lock().unwrap().len(),
+            2,
+            "nothing is sent past the cap"
+        );
+    }
+
+    #[test]
     fn a_launch_lands_while_the_launch_list_is_still_being_read() {
         let listing = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let url = slow_list_server(Duration::from_secs(4), Arc::clone(&listing));
@@ -2228,6 +2331,7 @@ mod tests {
         client.launch(
             Target::Playbook("demo".into()),
             serde_json::json!({"params": {}}),
+            Vec::new(),
         );
         client.prepare(Target::Playbook("demo".into()));
         let snapshot = snapshot_when(&client, Duration::from_secs(2), |s| {

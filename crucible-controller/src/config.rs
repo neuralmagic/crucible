@@ -712,13 +712,23 @@ pub struct ControllerCfg {
     )]
     pub local_secret_allowlist: Vec<String>,
     /// Where a call's `github_workflow` target takes its token: `gh` runs `gh auth token` at each
-    /// dispatch (a local controller), `app` the GitHub App installation. Unset dispatches none.
+    /// operation (a local controller only), `app` mints a token scoped to the target repository
+    /// from the GitHub App's installation on it. Unset dispatches none.
     #[arg(
         long = "calls-github-token",
         env = "CONTROLLER_CALLS_GITHUB_TOKEN",
         value_enum
     )]
     pub calls_github_token: Option<crate::calls::GithubToken>,
+    /// The GitHub logins paired with crucible logins, each `<github login>=<crucible login>`. A
+    /// call to a GitHub workflow dispatches only for a launch owner paired here.
+    #[arg(
+        long = "github-logins",
+        env = "CONTROLLER_GITHUB_LOGINS",
+        value_delimiter = ',',
+        default_value = ""
+    )]
+    pub github_logins: Vec<String>,
     #[command(flatten)]
     pub profile: Profile,
 }
@@ -1030,6 +1040,42 @@ impl ControllerCfg {
             "CONTROLLER_DISPATCH_CLUSTER_BY_CONTRACT",
             "contract=cluster",
         )
+    }
+
+    /// The GitHub-to-crucible login pairs `github_logins` lists.
+    pub(crate) fn github_logins(&self) -> crate::identity::github_logins::GithubLogins {
+        crate::identity::github_logins::GithubLogins::parse(
+            self.github_logins.iter().map(String::as_str),
+        )
+    }
+
+    /// Refuse a calls GitHub token source this deployment cannot use. `gh` hands out the token
+    /// of whoever runs the controller, so only a local controller (local playbook executor and a
+    /// dev identity) may use it; `app` needs the GitHub App configured.
+    pub fn validate_calls_github(&self, dev_identity: Option<&str>) -> Result<()> {
+        match self.calls_github_token {
+            None => Ok(()),
+            Some(crate::calls::GithubToken::GhCli) => {
+                let local = self.playbook_executor == PlaybookExecutor::Local;
+                let dev = dev_identity.is_some_and(|login| !login.trim().is_empty());
+                if !(local && dev) {
+                    bail!(
+                        "CONTROLLER_CALLS_GITHUB_TOKEN=gh is for a local controller only: it needs \
+                         CONTROLLER_PLAYBOOK_EXECUTOR=local and CONTROLLER_DEV_IDENTITY; a \
+                         deployment dispatches with the GitHub App (CONTROLLER_CALLS_GITHUB_TOKEN=app)"
+                    );
+                }
+                Ok(())
+            }
+            Some(crate::calls::GithubToken::AppInstallation) => match self.github_app {
+                Some(_) => Ok(()),
+                None => bail!(
+                    "CONTROLLER_CALLS_GITHUB_TOKEN=app needs the GitHub App: set \
+                     CONTROLLER_GITHUB_APP_ID, CONTROLLER_GITHUB_APP_INSTALLATION_ID and \
+                     CONTROLLER_GITHUB_APP_KEY_PATH"
+                ),
+            },
+        }
     }
 
     /// Validate the [`ScopeExecutor`] prerequisites at startup, mirroring [`validate_grounded`].
@@ -1380,6 +1426,53 @@ mod tests {
             cfg!(feature = "autoresearch"),
             "switching the lane on needs a build that carries it"
         );
+    }
+
+    #[test]
+    fn the_gh_token_source_is_for_a_local_controller_only() {
+        let local = crate::testing::cfg_from_args([
+            "ctl",
+            "--calls-github-token",
+            "gh",
+            "--playbook-executor",
+            "local",
+        ]);
+        local
+            .validate_calls_github(Some("wren"))
+            .expect("a local controller with a dev identity");
+        for dev in [None, Some(""), Some("  ")] {
+            let err = local.validate_calls_github(dev).unwrap_err().to_string();
+            assert!(err.contains("CONTROLLER_DEV_IDENTITY"), "{err}");
+        }
+        let pod = crate::testing::cfg_from_args([
+            "ctl",
+            "--calls-github-token",
+            "gh",
+            "--playbook-executor",
+            "pod",
+        ]);
+        let err = pod
+            .validate_calls_github(Some("wren"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("CONTROLLER_PLAYBOOK_EXECUTOR=local"), "{err}");
+
+        let mut app = crate::testing::cfg_from_args(["ctl", "--calls-github-token", "app"]);
+        let err = app.validate_calls_github(None).unwrap_err().to_string();
+        assert!(err.contains("CONTROLLER_GITHUB_APP_ID"), "{err}");
+        let dir = tempfile::tempdir().expect("tempdir");
+        app.github_app = Some(crate::secrets::github_app::GithubAppTokenSource::new(
+            "1",
+            "2",
+            crate::secrets::github_app::testkey::write_test_key(dir.path()),
+            "https://api.github.com",
+        ));
+        app.validate_calls_github(None)
+            .expect("the App is configured");
+
+        crate::testing::cfg_from_args(["ctl"])
+            .validate_calls_github(None)
+            .expect("no token source dispatches nothing");
     }
 
     #[test]

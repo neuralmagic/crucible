@@ -477,7 +477,25 @@ pub(crate) fn prep_plan_runner_with_params(
 ) -> Result<(crate::plan::harness::HarnessRunner, manifest::Manifest)> {
     let mut m = manifest::Manifest::load_frozen_variant(manifest_path, variant)?;
     let manifest_dir = manifest::manifest_dir(manifest_path);
-    m.resolve_workflow_with(&manifest_dir, params)?;
+    let source = m
+        .workflow
+        .as_ref()
+        .filter(|w| w.is_unresolved())
+        .and_then(|w| w.file.as_ref())
+        .map(|file| manifest_dir.join(file));
+    let localized = match source {
+        Some(source) => crate::plan::param_files::localize(
+            &source,
+            params,
+            &state_dir(manifest_path),
+            crate::plan::call_run::Controller::from_env().as_ref(),
+        )?,
+        None => crate::plan::param_files::Localized {
+            supplied: params.clone(),
+            files: Vec::new(),
+        },
+    };
+    m.resolve_workflow_with(&manifest_dir, &localized.supplied)?;
     warn_inherited_env(crate::exposure::inherits_engine_env(&m));
     if let Some(all) = m.launch.all() {
         for (setting, flag, value) in [
@@ -581,6 +599,7 @@ pub(crate) fn prep_plan_runner_with_params(
             commit_per_task,
             captured_bytes: std::sync::atomic::AtomicU64::new(0),
             staged: Default::default(),
+            param_files: localized.files,
             budget_left: f64::INFINITY,
         },
         m,
