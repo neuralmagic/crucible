@@ -1,0 +1,12 @@
+{
+ "id": 19748029,
+ "iid": 153003,
+ "project_id": 1,
+ "sha": "94f78d23cec2d77a5a4629144b48def720236e29",
+ "ref": "main",
+ "status": "success",
+ "source": "push",
+ "created_at": "2026-11-25T23:24:36.409Z",
+ "updated_at": "2026-11-25T23:26:50.395Z",
+ "web_url": "https://gitlab.example.com/acme/app/-/pipelines/19748029"
+}

@@ -2106,6 +2106,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "crucible-ci"
+version = "0.8.2"
+dependencies = [
+ "base64 0.23.1",
+ "crucible-contract",
+ "http",
+ "jiff",
+ "k8s-openapi 0.29.0",
+ "kube-core 5.0.0",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_norway",
+ "thiserror 2.0.21",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "crucible-contract"
 version = "0.8.2"
 dependencies = [

@@ -445,6 +445,7 @@ desktop-web-check:
     sh crucible-desktop/js-engine.sh
     rustup target add wasm32-unknown-unknown
     cargo clippy -p crux --no-default-features --target wasm32-unknown-unknown -- -D warnings
+    cargo clippy -p crucible-ci --target wasm32-unknown-unknown -- -D warnings
     cd crucible-desktop && cargo clippy --lib --locked --target wasm32-unknown-unknown -- -D warnings
 
 # Build the desktop app for the browser (dev profile) and serve it on http://localhost:8765,

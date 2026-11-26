@@ -1,0 +1,24 @@
+[package]
+name = "crucible-ci"
+description = "Clients for the CI systems a playbook call or watch follows: requests, response types, run matching, and the mapping of a run onto a progress graph. A token is passed per call and a reqwest client is passed in, so the controller and the desktop app (wasm included) share one implementation."
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+
+[dependencies]
+base64 = "0.23"
+crucible-contract = { path = "../crucible-contract" }
+http = "1"
+jiff.workspace = true
+k8s-openapi.workspace = true
+kube-core = { version = "5.0", default-features = false }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+serde.workspace = true
+serde_norway = "0.9"
+serde_json.workspace = true
+thiserror.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+tokio = { workspace = true }
