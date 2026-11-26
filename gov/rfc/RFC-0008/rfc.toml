@@ -24,6 +24,9 @@ clauses = [
     "clauses/C-GITHUB-WORKFLOW.toml",
     "clauses/C-PROGRESS.toml",
     "clauses/C-VIEW.toml",
+    "clauses/C-WATCH.toml",
+    "clauses/C-GITLAB-PIPELINE.toml",
+    "clauses/C-TEKTON.toml",
 ]
 
 [[changelog]]

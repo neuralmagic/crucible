@@ -14,10 +14,14 @@ A pin MUST be one of:
 
 - the digest of a registered playbook's revision;
 - a draft's head, which only a draft pack MAY pin, resolved at dispatch to the draft's latest saved version that compiles; or
-- for a GitHub workflow, the repo, workflow path and ref, with the commit the ref named when the lock was written.
+- for a GitHub workflow or GitLab pipeline, the repository, the workflow path for GitHub, and the ref, with the commit the ref named when the lock was written;
+- for a Tekton pipeline, the bundle digest, or the Pipeline's uid and generation; or
+- for a target only watches use, no pin.
 
 The controller MUST write the lock when it saves a draft version, and MUST refuse to save, register, or import a pack whose lock is missing, names a target no workflow source declares, omits one a source declares, or records an interface that differs from what the target's interface operation returns for its pin at that time. A crucible command MUST be able to write the lock for a pack in a source repository, given a controller.
 
 The engine MUST check, before compiling anything else, that the lock pins every target its source declares, and MUST compile a call against the lock alone. It MUST NOT contact a target's system to compile, and a compile MUST NOT need the result of another compile.
 
-A pin that moves, a draft head or a git ref, MUST be resolved again at dispatch. The controller MUST refuse to dispatch a target whose interface at dispatch differs from the locked interface, and the call MUST settle failing with a note naming the target and the difference, before any target run is created. A registered pin MUST NOT be resolved again. The controller MUST refuse to register or import a pack whose lock pins a draft head."""
+A pin that moves, a draft head or a git ref, MUST be resolved again at dispatch. The controller MUST refuse to dispatch a target whose interface at dispatch differs from the locked interface, and the call MUST settle failing with a note naming the target and the difference, before any target run is created. A registered pin MUST NOT be resolved again. The controller MUST refuse to register or import a pack whose lock pins a draft head.
+
+A target only watches use MUST be locked with its declared filters, expected names, and results as its interface, and MUST NOT be resolved again or refused for drift when a watch starts. A watch reads the runs a commit started, whose definitions are those at that commit, not at any pin."""

@@ -8,16 +8,19 @@ status = "active"
 
 [content]
 text = """
-A workflow source MAY declare the targets it calls in a calls block: an assignment to calls that comes before every statement but the params block of [[RFC-0002:C-PLAYBOOK-PARAMS]], whose value is a dictionary literal from a target name to a dictionary literal built only from dictionaries, lists, strings, numbers, and booleans. The engine and the controller MUST be able to read the block without evaluating the source, MUST refuse a calls assignment anywhere else, and MUST refuse a block that is not such a literal. A target name MUST be unique in the block and every target MUST carry a kind. The engine and the controller MUST refuse a target whose kind they do not implement, and MUST implement the kinds "playbook" and "github_workflow". A manifest MUST NOT declare call targets.
+A workflow source MAY declare the targets it calls or watches in a calls block: an assignment to calls that comes before every statement but the params block of [[RFC-0002:C-PLAYBOOK-PARAMS]], whose value is a dictionary literal from a target name to a dictionary literal built only from dictionaries, lists, strings, numbers, and booleans. The engine and the controller MUST be able to read the block without evaluating the source, MUST refuse a calls assignment anywhere else, and MUST refuse a block that is not such a literal. A target name MUST be unique in the block and every target MUST carry a kind. The engine and the controller MUST refuse a target whose kind they do not implement. They MUST implement the kinds "playbook" and "github_workflow", and MAY implement "gitlab_pipeline" and "tekton". A manifest MUST NOT declare call targets.
 
-A "playbook" target MUST name a playbook by its registered name, or by a draft the pack's owner may read. A "github_workflow" target MUST name a repo as owner/name, a workflow file path under .github/workflows, a ref that is a branch or tag, and the outputs [[RFC-0008:C-GITHUB-WORKFLOW]] reads.
+A "playbook" target MUST name a playbook by its registered name, or by a draft the pack's owner may read. A "github_workflow" target MUST name a repo as owner/name, a workflow file path under .github/workflows, a ref that is a branch or tag, and the outputs [[RFC-0008:C-GITHUB-WORKFLOW]] reads. A "gitlab_pipeline" target MUST carry the fields [[RFC-0008:C-GITLAB-PIPELINE]] gives it, and a "tekton" target those [[RFC-0008:C-TEKTON]] gives it.
 
 For each kind the controller MUST implement these operations, and the engine MUST NOT perform any of them itself:
 
 - interface: the target's parameters as a schema of the types [[RFC-0002:C-PLAYBOOK-PARAMS]] and [[RFC-0008:C-PARAM-TYPES]] admit; its result as the fields and files it declares; and its static graph as [[RFC-0008:C-PROGRESS]] shapes it.
-- dispatch: start one target run with bound values and return a handle that identifies it on its system.
-- progress: the target run's current graph as [[RFC-0008:C-PROGRESS]] shapes it.
-- outcome: once the target run ends, its status, its note, its result fields, and its result files.
-- cancel: stop the target run.
+- dispatch, for a kind and declaration that can start runs: start one target run with bound values and return a handle that identifies it on its system.
+- find, for a kind and declaration that can watch: the runs the target's system records for a commit, each with its name and handle ([[RFC-0008:C-WATCH]]).
+- progress: a target run's current graph as [[RFC-0008:C-PROGRESS]] shapes it.
+- outcome: once a target run ends, its status, its note, its result fields, and its result files.
+- cancel: stop a target run that a dispatch started.
+
+The engine MUST refuse at compile time a call whose target's declaration lacks the fields its kind needs to dispatch, naming the task and the target. One declaration MAY carry the fields for both and serve a call and a watch. Progress and outcome MUST read a run a find matched as they read a run a dispatch started.
 
 For a "playbook" target, the interface MUST be the target pack's params block, its workflow result task's emits and emits_files, and its compiled graph; the outcome MUST be its result task's output and files, and its status the run's verdict. A target playbook that declares no result MUST have an empty result."""

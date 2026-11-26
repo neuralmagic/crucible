@@ -1,0 +1,110 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0083"
+title = "A watch follows the runs a commit started through the same target backends a call dispatches through"
+status = "proposed"
+date = "2026-11-25"
+refs = [
+    "RFC-0008",
+    "RFC-0008:C-WATCH",
+    "RFC-0008:C-TEKTON",
+    "RFC-0008:C-GITLAB-PIPELINE",
+    "ADR-0081",
+]
+
+[content]
+context = """
+Much CI cannot be dispatched. A Konflux component builds through Pipelines-as-Code on push and pull request events, and its tenant's users cannot create PipelineRuns. Most GitHub workflows trigger on push or pull_request and declare no workflow_dispatch. What a playbook needs from them is the same: after its own tasks commit and push, block until the pipelines that commit started have ended, and use their results, such as a built image's digest, in later tasks.
+
+The backends [[ADR-0081]] introduced assume the controller starts the run. Their other operations do not: reading a run's graph, mapping its statuses, reading its outcome and results, and drawing it are the same whoever started it.
+
+Facts that shape matching:
+
+- Pipelines-as-Code labels each PipelineRun with the commit, the event type, the pull request number, the Repository, and the original PipelineRun name. A pull request push on ModelExpress starts two runs, server and operator, under one commit.
+- `status.pipelineSpec` holds the resolved task graph, and `status.results` holds IMAGE_URL and IMAGE_DIGEST.
+- The cluster prunes runs within hours. Older runs are only in Tekton Results, whose record each run names in an annotation.
+- GitHub lists workflow runs by head commit, and GitLab lists pipelines by commit and source.
+- Runs appear seconds to minutes after the push that triggers them."""
+decision = """
+A watch is a second front door on the same backends ([[RFC-0008:C-TARGETS]]). Each kind implements one core, interface, authorize, progress, and outcome, and adds dispatch with cancel for calls, find for watches, or both. A run a find matched is followed by exactly the code that follows a run a dispatch started.
+
+A watch names a target and a commit. The controller matches the runs the system records for that commit and the target's filters, keeps adding runs during an appearance window, and settles passing only when the window has closed and every matched run passed ([[RFC-0008:C-WATCH]]). Its output is the matched runs and the results the target declares for each expected run name, typed by the lock. A watch never cancels a run: it started none.
+
+The lock records a watch-only target's filters, expected names, and results, with no pin, because the runs it will see are defined by the watched commit. The engine refuses a call or watch on a kind or declaration that lacks that door, from the lock alone."""
+consequences = """
+- Konflux builds and push-triggered GitHub and GitLab pipelines become typed, drawn steps of a run, and a digest a build produced can bind into a later call or task.
+- Every new kind is mostly shared code: adding find to a kind is one operation.
+- A watch that expects nothing waits the whole appearance window before it can fail empty, which sets a latency floor on a misconfigured filter.
+- A watch depends on runs it does not own. Someone else cancelling or re-running them changes its outcome, and a re-run replaces the earlier attempt.
+- Expected names in the source go stale when a repository renames a pipeline. The watch then fails naming the missing run, which is explicit but needs a source change.
+- A controller that falls behind can lose a pruned run's outcome where the cluster has no Tekton Results.
+- A watch needs a commit pushed where the system sees it. A playbook gets one there before its end only through a task that opens a pull request itself; a mid-run push task is a separate decision."""
+
+[[content.alternatives]]
+text = "Separate watch backends per system"
+status = "rejected"
+pros = ["Each can be shaped for following alone."]
+cons = ["Status mapping, outcome, results, and drawing are written twice per system and drift apart."]
+rejection_reason = "The only operation that differs is how a run is obtained."
+
+[[content.alternatives]]
+text = "Let an agent or command poll CI itself"
+status = "rejected"
+pros = ["No new task kind."]
+cons = [
+    "Needs a system credential in the sandbox or task.",
+    "The result is untyped and the runs are not drawn.",
+]
+rejection_reason = "It gives up the credential boundary and the typed, drawn graph a call keeps."
+
+[[content.alternatives]]
+text = "Start Konflux runs with a call that creates PipelineRuns like Pipelines-as-Code does"
+status = "rejected"
+pros = ["One task kind for everything."]
+cons = [
+    "Tenant users cannot create PipelineRuns.",
+    "It bypasses the repository's own pipeline definitions, integration tests, and provenance, and builds the same commit twice.",
+]
+rejection_reason = "The pipelines already run on push; the playbook needs to follow them, not duplicate them."
+
+[[content.alternatives]]
+text = "Follow GitHub check runs on the commit, which Pipelines-as-Code also posts, with one GitHub finder for every system"
+status = "considered"
+pros = ["One finder covers Konflux, GitHub Actions, and other CI that reports checks."]
+cons = [
+    "Check runs carry no Tekton results and no task graph.",
+    "Only GitHub-hosted repositories post them.",
+]
+rejection_reason = "Kept as a possible coarse finder for systems with no other API; it cannot return a digest."
+
+[[content.alternatives]]
+text = "Settle on the first matched run, or on the runs present when the watch starts"
+status = "rejected"
+cons = [
+    "A ModelExpress pull request starts two runs.",
+    "Runs appear after the push, so a set fixed at start races the trigger.",
+]
+rejection_reason = "Only an appearance window and an every-run rule give a deterministic answer."
+
+[[content.alternatives]]
+text = "Match runs from webhook deliveries alone"
+status = "rejected"
+pros = ["No listing calls."]
+cons = [
+    "A lost delivery loses a run.",
+    "The controller receives no deliveries from the Konflux cluster.",
+]
+rejection_reason = "Finding by commit is needed anyway; deliveries can only accelerate it."
+
+[[content.alternatives]]
+text = "Watch is a find front door on the call backends, matching by commit with an appearance window"
+status = "accepted"
+pros = [
+    "One following path per kind.",
+    "Typed results from runs the playbook did not start.",
+]
+cons = [
+    "Appearance window latency.",
+    "Outcome depends on runs others can cancel.",
+]

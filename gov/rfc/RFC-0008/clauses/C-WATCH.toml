@@ -1,0 +1,33 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-WATCH"
+title = "The watch task"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+A playbook or custom workflow MAY declare a watch task with watch(). A watch takes a name, a target, a commit, and a timeout, and optionally appear, depends_on, required, join, stage, and when, with the meanings [[RFC-0002:C-PLAYBOOK-SHAPE]] and the DSL reference give them on any task. A watch MUST NOT take params, over, or budget. An autoresearch workflow MUST NOT declare one.
+
+target MUST name a target the calls block declares ([[RFC-0008:C-TARGETS]]) whose kind can find runs and whose declaration carries the fields its kind needs to find them. The kinds that can find runs are "tekton" and "gitlab_pipeline". The engine MUST refuse any other watch target at compile time, from the calls block and the lock alone, naming the task and the target. commit MUST be a literal string, param(name), or producer.field of a direct dependency whose declared type is string. The engine MUST bind it when the watch becomes ready, and MUST settle the watch failing before it asks the controller anything when the value is not a full commit identifier of 40 or 64 lowercase hexadecimal characters.
+
+timeout MUST be a duration of at most 24 hours. appear MUST be a duration no longer than timeout and defaults to 10 minutes. The engine MUST refuse a source that breaks either bound.
+
+When a watch becomes ready, the engine MUST ask the controller, authenticated as its own run, to start the watch, and MUST then wait inside the watch's own execution until the controller reports it settled. The controller MUST identify a watch by the calling run, the task, and the attempt, and MUST create at most one watch per identity. A resumed caller MUST attach to the watch its identity names.
+
+A target run matches a watch when the target's system records it as run for the watched commit and it passes every filter the target declares. Each matched run MUST carry a name its kind defines. The appearance window opens when the watch starts and closes appear later. The controller MUST add each matching run to the watch's matched set when it first sees it while the window is open. After the window closes, the set MUST NOT gain a name it did not hold, and a run under a name it holds MUST replace the earlier run only when the target's system records it as a later attempt for the same commit.
+
+The watch MUST settle:
+
+- failing, when the window closes and the set is empty or lacks a name the target declares as expected, with a note naming what is missing;
+- failing, as soon as any matched run ends failing, with that run's name and note;
+- passing, once the window has closed and every matched run ended passing;
+- failing, at timeout, with a note naming the matched runs that had not ended; and
+- cancelled, when its caller is cancelled.
+
+A watch MUST NOT cancel any target run. Settling, timing out, and the caller's cancellation or interruption MUST leave every matched run as it was.
+
+A watch's output MUST be an object with a field runs, a list giving each matched run's name, handle, status, and link, and one field per expected name the target declares, holding the results the target declares for that run, typed as the call lock records them ([[RFC-0008:C-LOCK]]). A result the target declares that the ended run does not carry MUST settle the watch failing with a note naming it. A watch MUST NOT declare emits_files.
+
+A watch MUST NOT set complete, and MUST NOT be a member of a revise loop body or a session. The controller MUST serve a watch's progress as [[RFC-0008:C-PROGRESS]] shapes it, with one group per matched run."""
