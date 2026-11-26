@@ -14,6 +14,7 @@ both results. Every task is a command, so the parent and child run without a mod
 | --- | --- |
 | `child/` | `string`, `json` and `file` parameters read from `params` in the inputs JSON; a result task with typed `emits` and one `emits_files` |
 | `parent/` | a `calls` block at the top of `workflow.star` declaring `child` (`"kind": "playbook"`) and `ci` (`"kind": "github_workflow"`); `call()` binding a field, a json field and a file of `prep`; `summary` reading both calls' fields and their staged files under `inputs/child/` and `inputs/ci/` |
+| `gitlab/` | a `gitlab_pipeline` target: typed `spec:inputs` bound from `prep`, the `report` job's `result.json` fields, and `out/notes.md` staged under `inputs/pipeline/` for `report`; `ci/.gitlab-ci.yml` is the pipeline to push to the project |
 
 The `child` target pins `draft:calls-child`, the draft head, so the parent is a draft pack and the
 controller writes `calls.lock` when it saves it. A registered child would be
