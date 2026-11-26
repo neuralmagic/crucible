@@ -93,6 +93,10 @@ impl App {
     }
 
     fn reconnect(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.github.next = None;
+        }
         self.remote.live_client.reconnect();
         self.remote.admin_client.reconnect();
     }

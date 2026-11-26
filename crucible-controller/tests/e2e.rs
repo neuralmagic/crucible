@@ -567,6 +567,7 @@ fn test_cfg(state_dir: &Path, repos: Vec<String>) -> ControllerCfg {
         runtime: Default::default(),
         local_secret_allowlist: Vec::new(),
         calls_github_token: None,
+        github_signed_in: Default::default(),
         github_logins: Vec::new(),
         calls_tekton_kubeconfigs: Vec::new(),
         calls_tekton_results: Vec::new(),

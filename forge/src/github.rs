@@ -287,6 +287,13 @@ pub struct Step {
     pub completed_at: Option<String>,
 }
 
+/// The account a token belongs to, as `GET /user` answers.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct User {
+    pub id: u64,
+    pub login: String,
+}
+
 /// The run a dispatch created.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct DispatchedRun {
@@ -500,6 +507,19 @@ impl Client {
         let resp = self.redirected(url, token, doing).await?;
         let bytes = tail(resp, MAX_JOB_LOG_BYTES, doing).await?;
         Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    pub async fn user(&self, token: &Token) -> Result<User, GithubError> {
+        let doing = "reading the token's account";
+        let resp = self
+            .send(
+                self.http.get(format!("{API}/user")),
+                token,
+                JSON_ACCEPT,
+                doing,
+            )
+            .await?;
+        resp.json().await.map_err(GithubError::http(doing))
     }
 
     pub async fn cancel(&self, token: &Token, repo: &Repo, run_id: u64) -> Result<(), GithubError> {

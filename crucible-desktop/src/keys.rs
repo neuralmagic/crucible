@@ -6,6 +6,10 @@ use std::path::PathBuf;
 #[cfg(not(target_arch = "wasm32"))]
 /// The service the system credential store files keys under; the account is the profile's name.
 const SERVICE: &str = "crucible-playbooks";
+#[cfg(not(target_arch = "wasm32"))]
+const GITHUB: &str = "github.com";
+#[cfg(not(target_arch = "wasm32"))]
+const GITHUB_FILE: &str = "github.json";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Store {
@@ -85,6 +89,62 @@ impl Store {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn github(&self) -> Result<Option<crate::github::Tokens>, String> {
+        let text = match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Store::Keychain => match entry(GITHUB)?.get_password() {
+                Ok(text) => text,
+                Err(keyring::Error::NoEntry) => return Ok(None),
+                Err(error) => {
+                    return Err(format!(
+                        "reading the GitHub sign-in from the keychain: {error}"
+                    ));
+                }
+            },
+            Store::Dir(dir) => match std::fs::read_to_string(dir.join(GITHUB_FILE)) {
+                Ok(text) => text,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(format!("reading the GitHub sign-in: {error}")),
+            },
+        };
+        serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|error| format!("reading the GitHub sign-in: {error}"))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn save_github(&self, tokens: &crate::github::Tokens) -> Result<(), String> {
+        let text = serde_json::to_string(tokens)
+            .map_err(|error| format!("keeping the GitHub sign-in: {error}"))?;
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Store::Keychain => entry(GITHUB)?
+                .set_password(&text)
+                .map_err(|error| format!("keeping the GitHub sign-in in the keychain: {error}")),
+            Store::Dir(dir) => private_write(&dir.join(GITHUB_FILE), &text)
+                .map_err(|error| format!("keeping the GitHub sign-in: {error}")),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn forget_github(&self) -> Result<(), String> {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Store::Keychain => match entry(GITHUB)?.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                Err(error) => Err(format!(
+                    "removing the GitHub sign-in from the keychain: {error}"
+                )),
+            },
+            Store::Dir(dir) => match std::fs::remove_file(dir.join(GITHUB_FILE)) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(format!("removing the GitHub sign-in: {error}")),
+            },
+        }
+    }
+
     /// Move the keys of `profiles` (name, URL) to `to`. Nothing leaves this store unless every
     /// key was copied; on a failure the copies already made are dropped again.
     pub fn move_to(&self, to: &Store, profiles: &[(String, String)]) -> Result<(), String> {
@@ -105,11 +165,33 @@ impl Store {
                 }
             }
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(tokens) = self.github()? {
+            if let Err(why) = to.save_github(&tokens) {
+                for profile in copied {
+                    let _ = to.forget(profile);
+                }
+                return Err(why);
+            }
+            self.forget_github()?;
+        }
         for profile in copied {
             self.forget(profile)?;
         }
         Ok(())
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn private_write(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    std::io::Write::write_all(&mut options.open(path)?, text.as_bytes())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -125,6 +207,36 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::Dir(dir.path().to_path_buf());
         (dir, store)
+    }
+
+    #[test]
+    fn the_github_sign_in_is_kept_private_and_moves_with_the_keys() {
+        let (held, store) = dir();
+        let (_other_dir, other) = dir();
+        assert_eq!(store.github().unwrap(), None);
+        let tokens: crate::github::Tokens = serde_json::from_value(serde_json::json!({
+            "login": "wren",
+            "access": "ghu_a",
+            "refresh": "ghr_b",
+            "expires_at": 100,
+        }))
+        .unwrap();
+        store.save_github(&tokens).unwrap();
+        assert_eq!(store.github().unwrap(), Some(tokens.clone()));
+        let file = held.path().join("github.json");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        store.move_to(&other, &[]).unwrap();
+        assert_eq!(store.github().unwrap(), None);
+        assert!(!file.exists());
+        assert_eq!(other.github().unwrap(), Some(tokens));
+        other.forget_github().unwrap();
+        other.forget_github().unwrap();
+        assert_eq!(other.github().unwrap(), None);
     }
 
     #[test]

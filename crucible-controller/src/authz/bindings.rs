@@ -223,6 +223,9 @@ pub static BINDINGS: &[Binding] = &[
         Route,
     ),
     bind("POST", "/api/calls/lock", R::Playbook, V::Read, Route),
+    bind("GET", "/api/me/github", R::UserPrefs, V::Read, Route),
+    bind("PUT", "/api/me/github", R::UserPrefs, V::Update, Route),
+    bind("DELETE", "/api/me/github", R::UserPrefs, V::Update, Route),
     bind(
         "PUT",
         "/api/param-files/{digest}",

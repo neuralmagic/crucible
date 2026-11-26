@@ -58,6 +58,9 @@ pub(crate) mod tests;
         crate::calls::reader::call_progress,
         crate::calls::reader::node_log,
         crate::calls::reader::write_lock,
+        crate::identity::api::github_link::get_github_link,
+        crate::identity::api::github_link::put_github_link,
+        crate::identity::api::github_link::delete_github_link,
         crate::launches::param_files::put,
         crate::runs::api::runs::get_run_iterations,
         crate::runs::api::runs::get_run_graph,
@@ -213,6 +216,8 @@ pub(crate) mod tests;
         crate::authz::shares::revoke_provider_share,
     ),
     components(schemas(
+        crate::identity::api::github_link::GithubLinkBody,
+        crate::identity::api::github_link::GithubLinkDto,
         system::Health,
         system::Whoami,
         system::Features,
@@ -795,6 +800,12 @@ pub fn router(state: ApiState) -> Router {
         .route(
             crucible_contract::calls::CALL_NODE_LOG_PATH,
             get(crate::calls::reader::node_log),
+        )
+        .route(
+            crate::identity::api::github_link::GITHUB_LINK_PATH,
+            get(crate::identity::api::github_link::get_github_link)
+                .put(crate::identity::api::github_link::put_github_link)
+                .delete(crate::identity::api::github_link::delete_github_link),
         )
         .route(
             crate::calls::reader::LOCK_ROUTE,

@@ -57,6 +57,7 @@ pub(crate) fn settings_pane(app: &App, p: &Paint) -> El {
             profiles::rows(app, p),
             p,
         ))
+        .children(github_section(app, p))
         .child(settings_section(
             "appearance",
             "Appearance",
@@ -310,6 +311,115 @@ fn key_rows(app: &App, p: &Paint) -> Vec<El> {
         rows.push(setting_row(&command.title(), control, p));
     }
     rows
+}
+
+#[cfg(target_arch = "wasm32")]
+fn github_section(_app: &App, _p: &Paint) -> Option<El> {
+    None
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn github_section(app: &App, p: &Paint) -> Option<El> {
+    let session = &app.github;
+    let account = if let Some(code) = &session.code {
+        let uri = code.verification_uri.clone();
+        row()
+            .gap(8.0)
+            .center_y()
+            .child(
+                text(code.user_code.clone())
+                    .font(p.mono(15.0, 600.0))
+                    .color(p.c.text_base)
+                    .selectable(true),
+            )
+            .child(
+                Button::new("Open GitHub")
+                    .variant(ButtonVariant::Neutral)
+                    .control_size(rune_kit::ControlSize::Small)
+                    .on_press(move |app: &mut App| {
+                        if let Err(why) = crate::editor::open_url(&uri) {
+                            app.github.error = Some(why);
+                        }
+                    })
+                    .build(p.k)
+                    .key("github-open"),
+            )
+            .child(
+                Button::new("Cancel")
+                    .variant(ButtonVariant::Ghost)
+                    .control_size(rune_kit::ControlSize::Small)
+                    .on_press(|app: &mut App| app.github_cancel())
+                    .build(p.k)
+                    .key("github-cancel"),
+            )
+    } else if let Some(login) = &session.login {
+        let here = session
+            .linked
+            .as_ref()
+            .filter(|(profile, _)| *profile == app.remote.target.name)
+            .is_some();
+        row()
+            .gap(8.0)
+            .center_y()
+            .child(text(login.clone()).font(p.k.ty.ui).color(p.c.text_base))
+            .children(here.then(|| {
+                text(format!("linked to {}", app.remote.target.name))
+                    .font(p.k.ty.small)
+                    .color(p.c.text_muted)
+            }))
+            .children(
+                session
+                    .busy
+                    .then(|| rune_kit::Spinner::new().size(12.0).build(p.k)),
+            )
+            .child(
+                Button::new("Sign out")
+                    .variant(ButtonVariant::Ghost)
+                    .control_size(rune_kit::ControlSize::Small)
+                    .on_press(|app: &mut App| app.github_sign_out())
+                    .build(p.k)
+                    .key("github-sign-out"),
+            )
+    } else if session.busy {
+        row().child(rune_kit::Spinner::new().size(12.0).build(p.k))
+    } else {
+        row().child(
+            Button::new("Sign in with GitHub")
+                .variant(ButtonVariant::Submit)
+                .control_size(rune_kit::ControlSize::Small)
+                .on_press(|app: &mut App| app.github_sign_in())
+                .build(p.k)
+                .key("github-sign-in"),
+        )
+    };
+    let mut rows = vec![
+        setting_row(
+            "App client ID",
+            TextInput::new(&app.github_client_id)
+                .placeholder("Iv23\u{2026}")
+                .width(Some(240.0))
+                .on_edit(|app: &mut App| &mut app.github_client_id)
+                .on_change(|app: &mut App, _: &mut Tx| {
+                    let id = app.github_client_id.text.clone();
+                    app.settings.set_github_client_id(&id);
+                })
+                .build(p.k)
+                .key("github-client-id"),
+            p,
+        ),
+        rule("github-sep", false, p),
+        setting_row("Account", account, p),
+    ];
+    if let Some(why) = &session.error {
+        rows.push(
+            text(why.clone())
+                .font(p.k.ty.small)
+                .color(p.fail)
+                .wrap()
+                .py(6.0),
+        );
+    }
+    Some(settings_section("github", "GitHub", rows, p))
 }
 
 /// The ceilings a pack folder dropped on the Dock icon is test-fired under.

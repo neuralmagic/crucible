@@ -717,6 +717,8 @@ pub struct ControllerCfg {
         value_enum
     )]
     pub calls_github_token: Option<crate::calls::GithubToken>,
+    #[arg(skip)]
+    pub github_signed_in: crate::identity::github_links::SignedIn,
     #[arg(
         long = "github-logins",
         env = "CONTROLLER_GITHUB_LOGINS",
@@ -1069,12 +1071,12 @@ impl ControllerCfg {
     pub fn validate_calls_github(&self, dev_identity: Option<&str>) -> Result<()> {
         match self.calls_github_token {
             None => Ok(()),
-            Some(crate::calls::GithubToken::GhCli) => {
+            Some(crate::calls::GithubToken::Person) => {
                 let local = self.playbook_executor == PlaybookExecutor::Local;
                 let dev = dev_identity.is_some_and(|login| !login.trim().is_empty());
                 if !(local && dev) {
                     bail!(
-                        "CONTROLLER_CALLS_GITHUB_TOKEN=gh is for a local controller only: it needs \
+                        "CONTROLLER_CALLS_GITHUB_TOKEN=person is for a local controller only: it needs \
                          CONTROLLER_PLAYBOOK_EXECUTOR=local and CONTROLLER_DEV_IDENTITY; a \
                          deployment dispatches with the GitHub App (CONTROLLER_CALLS_GITHUB_TOKEN=app)"
                     );

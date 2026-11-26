@@ -164,6 +164,7 @@ pub struct ApiState {
     pub(crate) calls_tekton:
         Result<std::collections::BTreeMap<String, crate::calls::tekton::TektonCluster>, String>,
     pub(crate) github_logins: crate::identity::github_logins::GithubLogins,
+    pub(crate) github_signed_in: crate::identity::github_links::SignedIn,
 }
 
 impl ApiState {
@@ -265,6 +266,7 @@ impl ApiState {
             calls_github: cfg.calls_github_token,
             calls_tekton: cfg.calls_tekton_clusters(),
             github_logins: cfg.github_logins(),
+            github_signed_in: cfg.github_signed_in.clone(),
         }
     }
 
@@ -400,6 +402,7 @@ impl ApiState {
             calls_github: None,
             calls_tekton: Ok(Default::default()),
             github_logins: Default::default(),
+            github_signed_in: Default::default(),
         }
     }
 }

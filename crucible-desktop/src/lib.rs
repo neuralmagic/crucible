@@ -20,6 +20,8 @@ mod finder;
 mod fleet;
 mod form;
 mod gfx;
+#[cfg(not(target_arch = "wasm32"))]
+mod github;
 mod handoff;
 mod history;
 mod html_preview;
@@ -564,6 +566,10 @@ pub struct App {
     opening: Option<Open>,
     /// The editor command field in Settings.
     pub editor_command: TextEdit,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub github: github::Session,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub github_client_id: TextEdit,
     /// The drop ceilings as typed in Settings, and why the last pair did not take.
     pub drop_cost: TextEdit,
     pub drop_time: TextEdit,

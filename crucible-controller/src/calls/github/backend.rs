@@ -92,12 +92,19 @@ impl TargetBackend for GithubWorkflowBackend {
 
     async fn authorize(
         &self,
-        _ctx: &CallCtx,
+        ctx: &CallCtx,
         who: &Principal,
         target: &CallTarget,
     ) -> Result<(), CallError> {
         let (repo, ..) = github_target(target)?;
-        Ok(GithubWorkflowBackend::authorize(self, who, repo).await?)
+        let linked = match who {
+            Principal::User(login) => crate::identity::github_links::get(ctx.db.pool(), login)
+                .await
+                .map_err(|e| CallError::Internal(e.into()))?,
+            _ => None,
+        };
+        let linked = linked.as_ref().map(|l| l.github_login.as_str());
+        Ok(GithubWorkflowBackend::authorize(self, who, repo, linked).await?)
     }
 
     async fn dispatch(
@@ -352,7 +359,7 @@ mod tests {
             scratch_dir: dir.to_path_buf(),
         };
         let backend = crate::calls::github::GithubWorkflowBackend::new(
-            crate::calls::github::TokenSource::GhCli,
+            crate::calls::github::TokenSource::Person(Default::default()),
             std::time::Duration::from_secs(60),
         )
         .unwrap();

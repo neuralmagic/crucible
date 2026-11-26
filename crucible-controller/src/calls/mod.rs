@@ -34,8 +34,8 @@ use crate::client::Db;
 /// Where the GitHub backend takes the token it dispatches with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum GithubToken {
-    #[value(name = "gh")]
-    GhCli,
+    #[value(name = "person", alias = "gh")]
+    Person,
     #[value(name = "app")]
     AppInstallation,
 }
@@ -225,6 +225,7 @@ impl Backends {
                 state.calls_github,
                 state.pack_pr_app.as_ref(),
                 &state.github_logins,
+                &state.github_signed_in,
                 &state.playbook_caps.max_time,
             ),
             tekton: state
@@ -241,6 +242,7 @@ impl Backends {
                 cfg.calls_github_token,
                 cfg.github_app.as_ref(),
                 &cfg.github_logins(),
+                &cfg.github_signed_in,
                 &cfg.playbook_max_time_cap,
             ),
             tekton: cfg
@@ -274,6 +276,7 @@ fn github_backend(
     token: Option<GithubToken>,
     app: Option<&crate::secrets::github_app::GithubAppTokenSource>,
     logins: &crate::identity::github_logins::GithubLogins,
+    signed_in: &crate::identity::github_links::SignedIn,
     max_time: &crate::model::MaxTime,
 ) -> Result<github::GithubWorkflowBackend, String> {
     let tokens = match (token, app) {
@@ -282,7 +285,7 @@ fn github_backend(
                 "no GitHub token source is configured (CONTROLLER_CALLS_GITHUB_TOKEN)".to_owned(),
             );
         }
-        (Some(GithubToken::GhCli), _) => github::TokenSource::GhCli,
+        (Some(GithubToken::Person), _) => github::TokenSource::Person(signed_in.clone()),
         (Some(GithubToken::AppInstallation), Some(app)) => github::TokenSource::App {
             app: Box::new(app.clone()),
             logins: logins.clone(),
@@ -307,7 +310,8 @@ mod tests {
     fn every_kind_routes_to_its_backend_or_says_why_not() {
         let hours = crate::model::MaxTime::hours(4);
         let logins = crate::identity::github_logins::GithubLogins::default();
-        let refused = |token, app| match github_backend(token, app, &logins, &hours) {
+        let signed_in = crate::identity::github_links::SignedIn::default();
+        let refused = |token, app| match github_backend(token, app, &logins, &signed_in, &hours) {
             Err(reason) => reason,
             Ok(_) => panic!("built a GitHub backend"),
         };
@@ -315,7 +319,9 @@ mod tests {
         assert!(
             refused(Some(GithubToken::AppInstallation), None).contains("CONTROLLER_GITHUB_APP_")
         );
-        assert!(github_backend(Some(GithubToken::GhCli), None, &logins, &hours).is_ok());
+        assert!(
+            github_backend(Some(GithubToken::Person), None, &logins, &signed_in, &hours).is_ok()
+        );
         let dir = tempfile::tempdir().expect("tempdir");
         let app = crate::secrets::github_app::GithubAppTokenSource::new(
             "1",
@@ -328,6 +334,7 @@ mod tests {
                 Some(GithubToken::AppInstallation),
                 Some(&app),
                 &logins,
+                &signed_in,
                 &hours
             )
             .is_ok()
@@ -355,7 +362,7 @@ mod tests {
         use clap::ValueEnum;
         assert_eq!(
             GithubToken::from_str("gh", false).ok(),
-            Some(GithubToken::GhCli)
+            Some(GithubToken::Person)
         );
         assert_eq!(
             GithubToken::from_str("app", false).ok(),

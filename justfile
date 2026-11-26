@@ -137,7 +137,7 @@ controller-local port="8870" user=env_var("USER"):
         CONTROLLER_ADMINS={{user}} \
         CONTROLLER_SESSION_SECURE=false \
         CONTROLLER_PLAYBOOK_EXECUTOR=local \
-        CONTROLLER_CALLS_GITHUB_TOKEN=gh \
+        CONTROLLER_CALLS_GITHUB_TOKEN=person \
         CONTROLLER_SCOPE_EXECUTOR=disabled \
         CONTROLLER_STATE_DIR="$state" \
         CRUCIBLE_BIN="$bin/crucible" \

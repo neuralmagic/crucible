@@ -64,7 +64,7 @@ impl TargetError {
 /// Where the backend takes the token for a repository.
 #[derive(Clone, Debug)]
 pub(crate) enum TokenSource {
-    GhCli,
+    Person(crate::identity::github_links::SignedIn),
     App {
         app: Box<GithubAppTokenSource>,
         logins: GithubLogins,
@@ -226,7 +226,12 @@ impl GithubWorkflowBackend {
         }))
     }
 
-    pub async fn authorize(&self, who: &Principal, repo: &GithubRepo) -> Result<(), TargetError> {
+    pub async fn authorize(
+        &self,
+        who: &Principal,
+        repo: &GithubRepo,
+        linked: Option<&str>,
+    ) -> Result<(), TargetError> {
         let TokenSource::App { app, logins } = &self.tokens else {
             return Ok(());
         };
@@ -239,11 +244,17 @@ impl GithubWorkflowBackend {
                  of {repo}"
             )));
         };
-        let paired = logins.github_logins(user);
+        let mut paired = logins.github_logins(user);
+        if let Some(linked) = linked
+            && !paired.iter().any(|p| p.eq_ignore_ascii_case(linked))
+        {
+            paired.push(linked);
+        }
         if paired.is_empty() {
             return Err(TargetError::Refused(format!(
-                "{who} has no linked GitHub login (CONTROLLER_GITHUB_LOGINS pairs one), so it \
-                 may not dispatch the workflows of {repo}"
+                "{who} has no linked GitHub login (sign in to GitHub in the desktop app, or \
+                 CONTROLLER_GITHUB_LOGINS pairs one), so it may not dispatch the workflows of \
+                 {repo}"
             )));
         }
         let mut held = Vec::with_capacity(paired.len());
@@ -370,7 +381,10 @@ impl GithubWorkflowBackend {
 
     async fn token(&self, repo: &Repo) -> Result<Token, TargetError> {
         match &self.tokens {
-            TokenSource::GhCli => gh_cli_token().await,
+            TokenSource::Person(signed_in) => match signed_in.token() {
+                Some(token) => Ok(token),
+                None => gh_cli_token().await,
+            },
             TokenSource::App { app, .. } => {
                 let owner = GithubOwner::parse(repo.owner())
                     .map_err(|e| TargetError::Refused(e.to_string()))?;
@@ -488,7 +502,11 @@ mod tests {
     use crate::secrets::github_app::RepoDenied;
 
     fn backend() -> GithubWorkflowBackend {
-        GithubWorkflowBackend::new(TokenSource::GhCli, Duration::from_secs(4 * 3600)).unwrap()
+        GithubWorkflowBackend::new(
+            TokenSource::Person(Default::default()),
+            Duration::from_secs(4 * 3600),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -603,35 +621,56 @@ mod tests {
                 ("wren-gh", "write"),
                 ("ash-gh", "read"),
                 ("ash-alt", "triage"),
+                ("mal-gh", "maintain"),
             ],
         )
         .await;
         let backend = app_backend(&server, dir.path());
         let repo = GithubRepo::parse("acme/app").unwrap();
 
-        backend.authorize(&user("wren"), &repo).await.unwrap();
-        backend.authorize(&user("WREN"), &repo).await.unwrap();
+        backend.authorize(&user("wren"), &repo, None).await.unwrap();
+        backend.authorize(&user("WREN"), &repo, None).await.unwrap();
 
         let refused = |e: TargetError| match e {
             TargetError::Refused(note) => note,
             other => panic!("not a refusal: {other}"),
         };
-        let ash = refused(backend.authorize(&user("ash"), &repo).await.unwrap_err());
+        let ash = refused(
+            backend
+                .authorize(&user("ash"), &repo, None)
+                .await
+                .unwrap_err(),
+        );
         assert!(ash.contains("ash-alt has triage"), "{ash}");
         assert!(ash.contains("ash-gh has read"), "{ash}");
         assert!(ash.contains("needs write, maintain or admin"), "{ash}");
 
         let mallory = refused(
             backend
-                .authorize(&user("mallory"), &repo)
+                .authorize(&user("mallory"), &repo, None)
                 .await
                 .unwrap_err(),
         );
         assert!(mallory.contains("no linked GitHub login"), "{mallory}");
         assert!(mallory.contains("CONTROLLER_GITHUB_LOGINS"), "{mallory}");
+        backend
+            .authorize(&user("mallory"), &repo, Some("mal-gh"))
+            .await
+            .unwrap();
+        let ash_linked = refused(
+            backend
+                .authorize(&user("ash"), &repo, Some("ASH-GH"))
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(
+            ash_linked.matches("ash-gh has read").count(),
+            1,
+            "{ash_linked}"
+        );
 
         let team = Principal::Team(crate::authz::model::TeamSlug::parse("ops").unwrap());
-        let team = refused(backend.authorize(&team, &repo).await.unwrap_err());
+        let team = refused(backend.authorize(&team, &repo, None).await.unwrap_err());
         assert!(team.contains("not a person"), "{team}");
     }
 
@@ -648,7 +687,7 @@ mod tests {
             .await;
         let backend = app_backend(&server, dir.path());
         let denied = backend
-            .authorize(&user("wren"), &GithubRepo::parse("acme/app").unwrap())
+            .authorize(&user("wren"), &GithubRepo::parse("acme/app").unwrap(), None)
             .await
             .unwrap_err();
         assert!(
@@ -662,7 +701,7 @@ mod tests {
     async fn the_gh_cli_token_is_its_users_own_access() {
         let team = Principal::Team(crate::authz::model::TeamSlug::parse("ops").unwrap());
         backend()
-            .authorize(&team, &GithubRepo::parse("acme/app").unwrap())
+            .authorize(&team, &GithubRepo::parse("acme/app").unwrap(), None)
             .await
             .unwrap();
     }
