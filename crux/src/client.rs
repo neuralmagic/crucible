@@ -1486,21 +1486,6 @@ impl Client {
             .await
     }
 
-    /// Export the newest compiling version as a PR against `repo`.
-    pub async fn graduate_draft<T: DeserializeOwned>(
-        &self,
-        id: &str,
-        repo: &str,
-        path: Option<&str>,
-    ) -> Result<T> {
-        let body = serde_json::json!({ "repo": repo, "path": path });
-        self.post(
-            &format!("/api/playbook-drafts/{}/graduate", encode(id)),
-            Some(&body),
-        )
-        .await
-    }
-
     /// Register the newest compiling version as `playbook` with no review. `None` re-pins the
     /// playbook the draft last published into, else the one it was seeded from.
     pub async fn publish_draft<T: DeserializeOwned>(

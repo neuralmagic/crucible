@@ -8,8 +8,8 @@
 use crate::client::Client;
 use crate::ops::blueprints::{BlueprintUse, Blueprints};
 use crate::ops::drafts::{
-    DraftCreate, DraftDelete, DraftDiff, DraftFiles, DraftGraduate, DraftLaunch, DraftLog,
-    DraftPreview, DraftPublish, DraftPull, DraftPush, DraftSaveFiles,
+    DraftCreate, DraftDelete, DraftDiff, DraftFiles, DraftLaunch, DraftLog, DraftPreview,
+    DraftPublish, DraftPull, DraftPush, DraftSaveFiles,
 };
 use crate::ops::issues::{
     Adopt, ApprovalDetail, Approvals, Approve, Bump, Contracts, Issue, Issues, Park, Reconcile,
@@ -204,7 +204,7 @@ impl CrucibleMcp {
         description = "Create a draft pack in the authoring studio, seeded from a registered \
         playbook or a minimal skeleton. Returns version 1, its diagnostics, and the studio link; \
         author with crucible_draft_pull and crucible_draft_push from there, test-fire it with \
-        crucible_draft_launch, and promote it with crucible_draft_graduate."
+        crucible_draft_launch. A person promotes it to a pack repository from the desktop app."
     )]
     async fn crucible_draft_create(&self, Parameters(a): Parameters<DraftCreate>) -> String {
         self.run(&a).await
@@ -303,20 +303,10 @@ impl CrucibleMcp {
     }
 
     #[tool(
-        description = "Graduate a draft to a registered playbook: push its newest compiling \
-        version as a branch under repo/path and open the export PR. Returns the PR URL. The draft \
-        retires itself once that merged pack is imported. A draft already graduated is refused \
-        with the open PR in the refusal."
-    )]
-    async fn crucible_draft_graduate(&self, Parameters(a): Parameters<DraftGraduate>) -> String {
-        self.run(&a).await
-    }
-
-    #[tool(
         description = "Publish a draft with no review: register its newest compiling version \
         as a registered playbook. The draft stays live and publishing it again re-pins the same \
         playbook. Only principals the active policy grants playbook_draft:publish may; everyone \
-        else graduates through crucible_draft_graduate."
+        else has a person promote it from the desktop app."
     )]
     async fn crucible_draft_publish(&self, Parameters(a): Parameters<DraftPublish>) -> String {
         self.run(&a).await
@@ -526,7 +516,7 @@ mod tests {
             .into_iter()
             .map(|t| t.name.to_string())
             .collect();
-        assert_eq!(names.len(), 50, "tools: {names:?}");
+        assert_eq!(names.len(), 49, "tools: {names:?}");
         for required in [
             "crucible_issues",
             "crucible_draft_delete",
@@ -561,7 +551,6 @@ mod tests {
             "crucible_draft_save",
             "crucible_draft_preview",
             "crucible_draft_launch",
-            "crucible_draft_graduate",
             "crucible_draft_publish",
             "crucible_blueprints",
             "crucible_blueprint_use",
@@ -633,13 +622,13 @@ mod tests {
     }
 
     /// The authoring loop only closes if a model can find the next step from the tool it just
-    /// called: create points at launch and graduate, and a launch carries the digest the preview
+    /// called: create points at launch, and a launch carries the digest the preview
     /// printed so a save that landed since refuses it.
     #[test]
     fn the_draft_lifecycle_tools_point_at_each_other_and_carry_the_digest() {
         let (_, create) = tool_of("crucible_draft_create");
         assert!(create.contains("crucible_draft_launch"), "{create}");
-        assert!(create.contains("crucible_draft_graduate"), "{create}");
+        assert!(create.contains("desktop app"), "{create}");
 
         let (launch_schema, launch) = tool_of("crucible_draft_launch");
         assert!(launch_schema.contains("schema_digest"), "{launch_schema}");
@@ -662,10 +651,6 @@ mod tests {
         let (preview_schema, preview) = tool_of("crucible_draft_preview");
         assert!(preview_schema.contains("version"), "{preview_schema}");
         assert!(preview.contains("crucible_draft_launch"), "{preview}");
-
-        let (graduate_schema, _) = tool_of("crucible_draft_graduate");
-        assert!(graduate_schema.contains("repo"), "{graduate_schema}");
-        assert!(graduate_schema.contains("path"), "{graduate_schema}");
 
         let (publish_schema, publish) = tool_of("crucible_draft_publish");
         assert!(publish_schema.contains("playbook"), "{publish_schema}");

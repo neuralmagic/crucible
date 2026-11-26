@@ -26,7 +26,6 @@ import {
   Note,
   Notice,
   NumberInputField,
-  SelectField,
   TextField,
 } from './formControls';
 import { useMediaQuery } from '../useMediaQuery';
@@ -73,7 +72,6 @@ import {
 
 type CompileDto = components['schemas']['DraftCompileDto'];
 type LeftBinding = components['schemas']['LeftBindingDto'];
-type SecretDto = components['schemas']['SecretDto'];
 
 /// The stored tree, read outside the query cache so the buffers are not reloaded.
 async function fetchDraftFiles(id: string): Promise<Record<string, string>> {
@@ -116,12 +114,11 @@ function DraftStudio({ id }: { id: string }) {
     params: { path: { id } },
   });
   const caps = $api.useQuery('get', '/api/config/playbook-caps');
-  const whoami = $api.useQuery('get', '/api/whoami');
-  const githubTokens = $api.useQuery(
+  const promotion = $api.useQuery(
     'get',
-    '/api/secrets',
-    { params: { query: { kind: 'github_token' } } },
-    { enabled: whoami.data?.user != null },
+    '/api/playbook-drafts/{id}/promotion',
+    { params: { path: { id } } },
+    { retry: false },
   );
   const origin = draft.data?.origin ?? null;
   const moved = originMovedLabel(origin);
@@ -137,7 +134,6 @@ function DraftStudio({ id }: { id: string }) {
   const rename = $api.useMutation('post', '/api/playbook-drafts/{id}/rename');
   const clone = $api.useMutation('post', '/api/playbook-drafts/{id}/clone');
   const launch = $api.useMutation('post', '/api/playbook-drafts/{id}/launch');
-  const graduate = $api.useMutation('post', '/api/playbook-drafts/{id}/graduate');
   const publish = $api.useMutation('post', '/api/playbook-drafts/{id}/publish');
 
   const [state, dispatch] = useReducer(studioReducer, EMPTY_STUDIO);
@@ -163,12 +159,6 @@ function DraftStudio({ id }: { id: string }) {
   const [launchError, setLaunchError] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<ReadonlyMap<string, string>>(NO_ERRORS);
 
-  const [gradRepo, setGradRepo] = useState('');
-  const [gradPath, setGradPath] = useState('');
-  const [gradSecretId, setGradSecretId] = useState('');
-  const [gradError, setGradError] = useState<string | null>(null);
-  const [prUrl, setPrUrl] = useState<string | null>(null);
-
   const [publishTo, setPublishTo] = useState('');
   const [publishError, setPublishError] = useState<string | null>(null);
   const [publishedRev, setPublishedRev] = useState<string | null>(null);
@@ -179,30 +169,11 @@ function DraftStudio({ id }: { id: string }) {
     dispatch({ kind: 'load', files: loaded.files, version: loaded.version });
   }, [loaded]);
 
-  const target = origin?.repo ?? null;
-  const targetPath = origin?.path ?? null;
-  useEffect(() => {
-    if (target === null) return;
-    setGradRepo((previous) => (previous.length === 0 ? target : previous));
-    setGradPath((previous) => (previous.length === 0 ? (targetPath ?? '') : previous));
-  }, [target, targetPath]);
-
   const publishTarget = draft.data?.published_playbook ?? origin?.playbook ?? null;
   useEffect(() => {
     if (publishTarget === null) return;
     setPublishTo((previous) => (previous.length === 0 ? publishTarget : previous));
   }, [publishTarget]);
-
-  const githubSecretOptions = useMemo(
-    () => [
-      { value: '', label: 'Controller identity' },
-      ...(githubTokens.data ?? []).map((secret: SecretDto) => ({
-        value: secret.id,
-        label: `${secret.name} (${secret.owner})`,
-      })),
-    ],
-    [githubTokens.data],
-  );
 
   const first = stored.data;
   useEffect(() => {
@@ -358,24 +329,6 @@ function DraftStudio({ id }: { id: string }) {
     }
   };
 
-  const handleGraduate = async () => {
-    setGradError(null);
-    try {
-      const ack = await graduate.mutateAsync({
-        params: { path: { id } },
-        body: {
-          repo: gradRepo.trim(),
-          path: gradPath.trim(),
-          ...(gradSecretId === '' ? {} : { github_secret_id: gradSecretId }),
-        },
-      });
-      setPrUrl(ack.pr_url);
-      void draft.refetch();
-    } catch (err: unknown) {
-      setGradError(formatError(err));
-    }
-  };
-
   const handlePublish = async () => {
     setPublishError(null);
     try {
@@ -405,8 +358,6 @@ function DraftStudio({ id }: { id: string }) {
       </>
     );
   }
-
-  const openUrl = draft.data?.graduation_pr_url ?? prUrl;
 
   const sourceColumn = (
     <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto">
@@ -776,74 +727,16 @@ function DraftStudio({ id }: { id: string }) {
       </Section>
 
       <Section>
-        <SectionHeader title="Graduate" />
+        <SectionHeader title="Promotion" />
         <SectionBody>
-          <Note>
-            Exports the newest compiling save as a pull request. Once that pack is merged and
-            imported, this draft retires.
-          </Note>
-        </SectionBody>
-        {openUrl === null || openUrl === undefined ? (
-          <>
-            <SectionBody>
-              <FormGrid>
-                <TextField
-                  id="studio-grad-repo"
-                  label="Repo"
-                  mono
-                  required
-                  value={gradRepo}
-                  onChange={setGradRepo}
-                  hint="owner/repo the export PR opens against."
-                />
-                <TextField
-                  id="studio-grad-path"
-                  label="Path"
-                  mono
-                  value={gradPath}
-                  onChange={setGradPath}
-                  hint="The pack directory inside that repo. Blank is the repo root."
-                />
-                <SelectField
-                  id="studio-grad-secret"
-                  label="GitHub credential"
-                  value={gradSecretId}
-                  onChange={setGradSecretId}
-                  options={githubSecretOptions}
-                  hint="A github_token secret pushes and opens the PR as its account."
-                />
-              </FormGrid>
-            </SectionBody>
-            {gradError === null ? null : (
-              <SectionBody>
-                <FormError>{gradError}</FormError>
-              </SectionBody>
-            )}
-            <FormActions>
-              <Button
-                variant="filled"
-                className="uppercase"
-                disabled={
-                  !actions.includes('approve') ||
-                  retired ||
-                  gradRepo.trim().length === 0 ||
-                  graduate.isPending
-                }
-                onClick={() => {
-                  void handleGraduate();
-                }}
-              >
-                {graduate.isPending ? 'Exporting…' : 'Graduate'}
-              </Button>
-            </FormActions>
-          </>
-        ) : (
-          <SectionBody>
-            <a href={openUrl} target="_blank" rel="noreferrer" className="font-mono text-data">
-              {openUrl}
+          {promotion.data === undefined ? (
+            <span className="text-data">Promote from the desktop app</span>
+          ) : (
+            <a href={promotion.data.url} target="_blank" rel="noreferrer" className="font-mono text-data">
+              {promotion.data.url} · {promotion.data.state}
             </a>
-          </SectionBody>
-        )}
+          )}
+        </SectionBody>
       </Section>
 
       {actions.includes('publish') ? (

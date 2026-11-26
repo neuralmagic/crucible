@@ -270,9 +270,6 @@ enum Command {
 
     /// Publish a draft: register its newest compiling version as a playbook, with no review.
     DraftPublish(ops::drafts::DraftPublish),
-
-    /// Graduate a draft: push its newest compiling version and open the export PR.
-    DraftGraduate(ops::drafts::DraftGraduate),
 }
 
 /// The flags of `adopt`. The body comes from a file or stdin rather than an argument by default:
@@ -555,7 +552,6 @@ pub async fn run() -> Result<()> {
         Command::BlueprintPublic(op) => op.run(&c).await?,
         Command::BlueprintPrivate(op) => op.run(&c).await?,
         Command::DraftPublish(op) => op.run(&c).await?,
-        Command::DraftGraduate(op) => op.run(&c).await?,
     };
     println!("{}", out.trim_end());
     Ok(())
@@ -1121,10 +1117,9 @@ mod tests {
         }
     }
 
-    /// A test-fire spends money, so it carries both ceilings or it does not parse; a graduation
-    /// opens a PR somewhere, so it carries the repo.
+    /// A test-fire spends money, so it carries both ceilings or it does not parse.
     #[test]
-    fn a_test_fire_carries_its_ceilings_and_a_graduation_carries_its_repo() {
+    fn a_test_fire_carries_its_ceilings() {
         assert!(
             Cli::try_parse_from(["crux", "draft-launch", "calibrate"]).is_err(),
             "a launch with no ceilings parsed"
@@ -1212,27 +1207,6 @@ mod tests {
             .is_err(),
             "--from without --rerun-of parsed"
         );
-
-        assert!(
-            Cli::try_parse_from(["crux", "draft-graduate", "calibrate"]).is_err(),
-            "a graduation with no repo parsed"
-        );
-        match Cli::try_parse_from([
-            "crux",
-            "draft-graduate",
-            "calibrate",
-            "--repo",
-            "wren/packs",
-        ])
-        .expect("parses")
-        .command
-        {
-            Command::DraftGraduate(op) => {
-                assert_eq!(op.repo, "wren/packs");
-                assert_eq!(op.path, None);
-            }
-            _ => panic!("expected draft-graduate"),
-        }
     }
 
     /// Both launch surfaces pin a provider the same way: `--model` rides on `--provider`, since a

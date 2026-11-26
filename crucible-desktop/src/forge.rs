@@ -12,6 +12,7 @@
 pub mod apps;
 pub mod device;
 pub mod link;
+pub mod promote;
 pub mod session;
 
 pub(crate) const GITHUB_HOST: &str = "github.com";

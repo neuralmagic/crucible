@@ -572,6 +572,10 @@ pub struct App {
     #[cfg(not(target_arch = "wasm32"))]
     pub forge_offers: forge::apps::Offers,
     #[cfg(not(target_arch = "wasm32"))]
+    pub promoting: Option<app::promote::Promoting>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub promote_form: app::promote::PromoteForm,
+    #[cfg(not(target_arch = "wasm32"))]
     pub github_client_id: TextEdit,
     #[cfg(not(target_arch = "wasm32"))]
     pub gitlab_host: TextEdit,

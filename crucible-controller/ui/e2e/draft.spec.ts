@@ -369,10 +369,6 @@ test.describe('draft authoring studio', () => {
     await expect(diff.locator('.monaco-diff-editor')).toBeVisible();
     await expect(diff).toContainText('# re-pinned upstream');
 
-    // Graduation opens on where that pack lives, rather than asking for it again.
-    await expect(page.locator('#studio-grad-repo')).toHaveValue('neuralmagic/packs');
-    await expect(page.locator('#studio-grad-path')).toHaveValue('packs/survey');
-
     // And any save is downloadable as the pack it is.
     await expect(page.getByTestId('draft-tarball')).toHaveAttribute(
       'href',
@@ -553,37 +549,38 @@ test.describe('draft authoring studio', () => {
     await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeDisabled();
     await expect(page.getByRole('button', { name: 'Delete draft' })).toBeDisabled();
     await expect(page.getByRole('button', { name: 'Launch draft' })).toBeEnabled();
-    await page.getByLabel('Repo').fill('owner/packs');
-    await expect(page.getByRole('button', { name: 'Graduate' })).toBeDisabled();
   });
 
-  /// Graduating is the draft owner's call: a platform viewer who owns the draft exports it.
-  test('a draft owner with no platform role graduates it', async ({ page }) => {
+  /// Promotion happens in the desktop app; the studio shows where it stands.
+  test('the studio shows a promotion and its state', async ({ page }) => {
     await stubApi(page);
-    const whoami = ROUTES['/api/whoami'];
-    if (typeof whoami !== 'object' || whoami === null || Array.isArray(whoami)) {
-      throw new Error('the whoami fixture is an object');
-    }
-    await page.route('**/api/whoami', (route: Route) =>
-      route.fulfill({ json: { ...whoami, role: 'viewer' } }),
-    );
-    const graduations: unknown[] = [];
-    await page.route('**/api/playbook-drafts/studio/graduate', (route: Route) => {
-      graduations.push(route.request().postDataJSON());
-      return route.fulfill({ json: { pr_url: 'https://github.com/owner/packs/pull/7' } });
-    });
     await ready(page, STUDIO);
+    await expect(page.getByText('Promote from the desktop app')).toBeVisible();
 
-    const graduate = page.getByRole('button', { name: 'Graduate' });
-    await page.getByLabel('Repo').fill('');
-    await expect(graduate).toBeDisabled();
-    await page.getByLabel('Repo').fill('owner/packs');
-    await page.getByLabel('Path').fill('packs/studio');
-    await graduate.click();
+    await page.route('**/api/playbook-drafts/studio/promotion', (route: Route) =>
+      route.fulfill({
+        json: {
+          forge: 'github',
+          host: 'github.com',
+          project: 'owner/packs',
+          path: 'packs/studio',
+          base: 'main',
+          number: 7,
+          url: 'https://github.com/owner/packs/pull/7',
+          version: 3,
+          digest: 'tree1:0123',
+          author: 'wren-gh',
+          promoted_by: 'wren',
+          state: 'open',
+          note: '',
+          updated_at: '2026-11-26T12:00:00Z',
+        },
+      }),
+    );
+    await ready(page, STUDIO);
     await expect(
-      page.getByRole('link', { name: 'https://github.com/owner/packs/pull/7' }),
+      page.getByRole('link', { name: 'https://github.com/owner/packs/pull/7 · open' }),
     ).toBeVisible();
-    expect(graduations).toEqual([{ repo: 'owner/packs', path: 'packs/studio' }]);
   });
 
   /// Publishing skips review, so the studio offers it only where the policy grants it, and a
