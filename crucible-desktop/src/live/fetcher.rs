@@ -316,39 +316,50 @@ impl Fetcher {
         let Ok(connection) = self.connection().await else {
             return false;
         };
-        let Ok(playbooks) = within(
-            "the playbooks",
-            connection.client.playbooks::<Vec<crux::dto::Playbook>>(),
-        )
-        .await
-        else {
-            return false;
+        let (playbooks, drafts) = tokio::join!(
+            within(
+                "the playbooks",
+                connection.client.playbooks::<Vec<crux::dto::Playbook>>(),
+            ),
+            within(
+                "the drafts",
+                connection
+                    .client
+                    .playbook_drafts::<Vec<crux::dto::PlaybookDraft>>(),
+            ),
+        );
+        let ids = match playbooks {
+            Ok(playbooks) => {
+                let mut ids: Vec<String> = playbooks.into_iter().map(|p| p.id).collect();
+                ids.sort();
+                ids
+            }
+            Err(_) => self.registered.clone(),
         };
-        let mut ids: Vec<String> = playbooks.into_iter().map(|p| p.id).collect();
-        ids.sort();
-        #[derive(serde::Deserialize)]
-        struct Draft {
-            id: String,
-        }
-        let drafts = within(
-            "the drafts",
-            connection.client.get::<Vec<Draft>>("/api/playbook-drafts"),
-        )
-        .await;
         let mut shareable: Vec<_> = ids
             .iter()
             .cloned()
             .map(crux::client::Shared::Playbook)
             .collect();
-        if let Ok(mut drafts) = drafts {
-            drafts.sort_by(|a, b| a.id.cmp(&b.id));
-            shareable.extend(
-                drafts
-                    .into_iter()
-                    .map(|d| crux::client::Shared::Draft(d.id)),
-            );
+        let mut drafts_changed = false;
+        if let Ok(drafts) = drafts {
+            let mut draft_ids: Vec<String> = drafts.iter().map(|d| d.id.clone()).collect();
+            draft_ids.sort();
+            shareable.extend(draft_ids.into_iter().map(crux::client::Shared::Draft));
+            if let Some((_, identity)) = &self.identity {
+                let owned = owned(drafts, identity);
+                drafts_changed = owned != self.drafts;
+                self.drafts = owned;
+            }
         }
-        let changed = ids != self.registered || shareable != self.shareable;
+        if drafts_changed
+            && let LiveView::Ready {
+                launches, drafts, ..
+            } = &mut self.view
+        {
+            *drafts = unlaunched(&self.drafts, launches);
+        }
+        let changed = drafts_changed || ids != self.registered || shareable != self.shareable;
         self.registered = ids;
         self.shareable = shareable;
         changed
@@ -492,17 +503,11 @@ impl Fetcher {
         let (endpoint, identity) = self.identity.clone().unwrap_or_default();
 
         let connection = self.connection().await?;
-        let (launches, drafts) = tokio::join!(
-            reaching(
-                "the launch list",
-                connection.client.playbook_runs(None, None),
-            ),
-            within("the drafts", connection.client.playbook_drafts()),
-        );
-        let launches: Vec<crux::dto::PlaybookRun> = launches?;
-        if let Ok(drafts) = drafts {
-            self.drafts = owned(drafts, &identity);
-        }
+        let launches: Vec<crux::dto::PlaybookRun> = reaching(
+            "the launch list",
+            connection.client.playbook_runs(None, None),
+        )
+        .await?;
         let zone = TimeZone::system();
         let mut launches: Vec<LivePlaybook> = launches
             .into_iter()

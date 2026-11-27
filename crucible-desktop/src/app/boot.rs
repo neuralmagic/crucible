@@ -83,6 +83,7 @@ pub(crate) fn init() -> App {
         keys_refused,
         palette: None,
         pane_focus: None,
+        window_focused: true,
         notifier: None,
         rerun_wanted: None,
         clicks: None,

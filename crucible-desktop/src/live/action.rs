@@ -22,6 +22,7 @@ pub(in crate::live) enum Msg {
     Streamed,
     /// Read the launch list now.
     Refresh,
+    Focus(bool),
     /// Drop the connection and who it named, and read crux's config afresh.
     Reconnect,
     /// Which launch to read as the base of a comparison; `None` stops.

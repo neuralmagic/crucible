@@ -484,6 +484,7 @@ pub struct App {
     pub palette: Option<palette::Palette>,
     /// The pane keyboard navigation starts from.
     pub pane_focus: Option<PaneKind>,
+    pub window_focused: bool,
     /// Posts notifications once the app's loop is up.
     notifier: Option<notify::Notifier>,
     /// The launch a notification's Rerun button was pressed on, until its rerun form can open.

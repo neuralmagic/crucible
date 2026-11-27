@@ -22,6 +22,7 @@ pub struct Remote {
     pub live_detail: Option<Arc<LiveDetail>>,
     /// The launch key the live worker was last told to read.
     pub live_sent: Option<String>,
+    pub focus_sent: Option<bool>,
     /// The launch the Compare pane reads against, as last asked of the worker.
     pub compare_sent: Option<String>,
     pub node_sent: Option<crate::live::calls::NodeAsk>,
@@ -118,6 +119,7 @@ impl Remote {
             live: Arc::default(),
             live_detail: None,
             live_sent: None,
+            focus_sent: None,
             compare_sent: None,
             node_sent: None,
             live_base: None,

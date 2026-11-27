@@ -18,7 +18,9 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 /// How often what is on screen is read again.
 const SHOWN: Duration = Duration::from_secs(15);
 /// How often the decision queue is read while nothing shows it, for the badge and notifications.
-const QUEUE: Duration = Duration::from_secs(30);
+const QUEUE: Duration = Duration::from_secs(60);
+const SHOWN_AWAY: Duration = Duration::from_secs(60);
+const TEAMS: Duration = Duration::from_secs(300);
 /// How many of a webhook's newest deliveries are read.
 const DELIVERIES: i64 = 20;
 /// How many of the newest transitions the Activity page reads.
@@ -30,6 +32,7 @@ enum Msg {
     Watch(Watch),
     Act(Action),
     Reconnect,
+    Focus(bool),
 }
 
 /// The UI-side handle to the worker. Dropping it ends its task.
@@ -87,6 +90,10 @@ impl Client {
 
     pub fn reconnect(&self) {
         let _ = self.tx.send(Msg::Reconnect);
+    }
+
+    pub fn focus(&self, focused: bool) {
+        let _ = self.tx.send(Msg::Focus(focused));
     }
 
     pub fn take(&self, seen: u64) -> Option<(u64, AdminView)> {
@@ -485,6 +492,8 @@ async fn run(connector: Connector, mut rx: UnboundedReceiver<Msg>, shared: Arc<M
     };
     let mut watch = Watch::default();
     let mut next = Instant::now();
+    let mut focused = true;
+    let mut teams_at: Option<Instant> = None;
     loop {
         let wait = next
             .saturating_duration_since(Instant::now())
@@ -498,6 +507,7 @@ async fn run(connector: Connector, mut rx: UnboundedReceiver<Msg>, shared: Arc<M
             }
             Ok(Some(Msg::Act(action))) => {
                 worker.act(action).await;
+                teams_at = None;
                 next = Instant::now();
             }
             Ok(Some(Msg::Reconnect)) => {
@@ -506,7 +516,14 @@ async fn run(connector: Connector, mut rx: UnboundedReceiver<Msg>, shared: Arc<M
                     acted: worker.view.acted.take(),
                     ..AdminView::default()
                 };
+                teams_at = None;
                 next = Instant::now();
+            }
+            Ok(Some(Msg::Focus(now))) => {
+                if now && !focused {
+                    next = Instant::now();
+                }
+                focused = now;
             }
             Ok(None) => return,
             Err(_) => {}
@@ -518,15 +535,23 @@ async fn run(connector: Connector, mut rx: UnboundedReceiver<Msg>, shared: Arc<M
             next = Instant::now() + QUEUE;
             continue;
         }
-        worker.refresh(&watch).await;
+        let teams_due = watch.team_audit.is_some()
+            || (focused && teams_at.is_none_or(|at| at.elapsed() >= TEAMS));
+        let asked = Watch {
+            teams: watch.teams && teams_due,
+            ..watch.clone()
+        };
+        worker.refresh(&asked).await;
+        if asked.teams {
+            teams_at = Some(Instant::now());
+        }
         publish(&shared, worker.view.clone());
         let shown = watch.schedules
             || watch.secrets
             || watch.secret.is_some()
-            || watch.shares.is_some()
             || watch.decision.is_some()
             || watch.keys
-            || watch.teams
+            || watch.team_audit.is_some()
             || watch.webhooks
             || watch.webhook_form.is_some()
             || watch.providers
@@ -535,6 +560,11 @@ async fn run(connector: Connector, mut rx: UnboundedReceiver<Msg>, shared: Arc<M
             || watch.admin
             || watch.policy
             || watch.issues.is_some();
-        next = Instant::now() + if shown { SHOWN } else { QUEUE };
+        next = Instant::now()
+            + match (shown, focused) {
+                (true, true) => SHOWN,
+                (true, false) => SHOWN_AWAY,
+                (false, _) => QUEUE,
+            };
     }
 }
