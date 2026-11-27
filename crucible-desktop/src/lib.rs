@@ -8,6 +8,8 @@ mod afterglow;
 mod agent;
 mod apikeys;
 mod app;
+#[cfg(test)]
+mod budget;
 mod camera;
 mod captured;
 mod commands;

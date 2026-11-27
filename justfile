@@ -515,6 +515,16 @@ desktop-check:
     sh crucible-desktop/js-engine.sh
     cd crucible-desktop && cargo fmt --check && cargo clippy --all-targets --all-features --locked -- -D warnings && cargo test --locked
 
+# Run `desktops` idle desktop apps' workers against the controller at `url` for `secs` and print
+# each route's requests a minute per desktop and its 304s; fails over the idle budget
+# (crucible-desktop/src/budget.rs). `just desktop-budget http://127.0.0.1:8870 20`.
+desktop-budget url desktops="1" secs="120" focused="true":
+    sh crucible-desktop/rune-patches.sh
+    sh crucible-desktop/js-engine.sh
+    cd crucible-desktop && CRUCIBLE_BUDGET_URL={{ url }} CRUCIBLE_BUDGET_DESKTOPS={{ desktops }} \
+        CRUCIBLE_BUDGET_SECS={{ secs }} CRUCIBLE_BUDGET_FOCUSED={{ focused }} \
+        cargo test --release --lib budget::tests::idle_desktops_against_a_controller -- --ignored --nocapture
+
 # Lint the desktop app's library, and the crux client under it, for the browser (wasm32, Rune's
 # web target).
 desktop-web-check:

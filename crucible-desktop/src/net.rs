@@ -72,6 +72,11 @@ impl Net {
         Net::with_store(None)
     }
 
+    #[cfg(test)]
+    pub fn cached_for_tests(store: Arc<Store>) -> Net {
+        Net::with_store(Some(store))
+    }
+
     fn with_store(store: Option<Arc<Store>>) -> Net {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
