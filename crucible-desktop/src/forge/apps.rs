@@ -12,7 +12,7 @@ use crate::net::Handle;
 use crate::profile::Target;
 
 const APPS_PATH: &str = "/api/me/forge-apps";
-const RETRY_SECS: i64 = 300;
+const REREAD_SECS: i64 = 300;
 
 type Answer = Result<Vec<Offered>, String>;
 
@@ -86,10 +86,10 @@ impl Offers {
         match answer {
             Ok(apps) => {
                 self.by_profile.insert(profile.clone(), apps);
-                self.next.insert(profile, i64::MAX);
+                self.next.insert(profile, now + REREAD_SECS);
             }
             Err(_) => {
-                self.next.insert(profile, now + RETRY_SECS);
+                self.next.insert(profile, now + REREAD_SECS);
             }
         }
         true
@@ -136,7 +136,7 @@ mod tests {
     }
 
     #[test]
-    fn a_profile_is_read_once_and_a_failed_read_retried_later() {
+    fn a_profile_is_reread_and_keeps_its_last_answer_through_a_failed_read() {
         let mut offers = Offers::default();
         assert!(offers.due("cluster", 0));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -145,15 +145,25 @@ mod tests {
         assert!(!offers.heard(0));
         tx.send(Err("down".into())).unwrap();
         assert!(offers.heard(10));
-        assert!(!offers.due("cluster", 10 + RETRY_SECS - 1));
-        assert!(offers.due("cluster", 10 + RETRY_SECS));
+        assert!(!offers.due("cluster", 10 + REREAD_SECS - 1));
+        assert!(offers.due("cluster", 10 + REREAD_SECS));
         let (tx, rx) = std::sync::mpsc::channel();
         offers.asking("cluster", rx);
         tx.send(Ok(vec![offer("github", "github.com", Some("Iv23"))]))
             .unwrap();
         assert!(offers.heard(400));
         assert_eq!(offers.of("cluster").len(), 1);
-        assert!(!offers.due("cluster", i64::MAX - 1));
+        assert!(!offers.due("cluster", 400 + REREAD_SECS - 1));
+        assert!(offers.due("cluster", 400 + REREAD_SECS));
+        let (tx, rx) = std::sync::mpsc::channel();
+        offers.asking("cluster", rx);
+        tx.send(Err("restarting".into())).unwrap();
+        assert!(offers.heard(800));
+        assert_eq!(
+            offers.of("cluster").len(),
+            1,
+            "a failed reread keeps the last answer"
+        );
         assert!(offers.of("local").is_empty());
         offers.forget("cluster");
         assert!(offers.due("cluster", 0));
