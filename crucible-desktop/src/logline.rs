@@ -11,7 +11,7 @@
 //! plan v1: completed — spent $0.0000 of $50                      Summary
 //! ```
 
-use crucible_contract::console::strip_ansi;
+use crucible_contract::console::{Pen, Run, Styled};
 use crucible_contract::event::AgentEvent;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -97,6 +97,8 @@ pub enum Body {
         stderr: bool,
         text: String,
     },
+    /// A line a call's target job printed: a CI job's log, or a pipeline step's.
+    Job(String),
     Plain(String),
 }
 
@@ -107,7 +109,11 @@ pub struct LogLine {
     /// The task or fan-out instance an agent line came from.
     pub task: Option<String>,
     pub body: Body,
+    /// The line's text without its escapes.
     pub raw: String,
+    /// The colors and attributes its escapes gave byte ranges of `raw`; kept for the bodies
+    /// that show `raw` as it is: output, job and plain lines.
+    pub runs: Vec<Run>,
 }
 
 /// `lines` as text, one each. A line whose text does not name its task gets the console's
@@ -148,10 +154,11 @@ pub enum Group {
 impl LogLine {
     /// The lines a command task printed, from one `task_output` event, each a line for `task`.
     pub fn from_output(task: &str, stderr: bool, lines: &[String]) -> Vec<Self> {
+        let mut pen = Pen::default();
         lines
             .iter()
             .map(|text| {
-                let text = strip_ansi(text).into_owned();
+                let Styled { text, runs } = pen.write(text);
                 LogLine {
                     at: None,
                     task: Some(task.to_string()),
@@ -160,6 +167,7 @@ impl LogLine {
                         text: text.clone(),
                     },
                     raw: text,
+                    runs,
                 }
             })
             .collect()
@@ -176,6 +184,7 @@ impl LogLine {
                 warning: true,
             },
             raw: text,
+            runs: Vec::new(),
         }
     }
 
@@ -283,19 +292,33 @@ impl LogLine {
             task: Some(task.to_string()),
             body,
             raw: String::new(),
+            runs: Vec::new(),
         };
         line.raw = line.summary().unwrap_or_default();
         Some(line)
     }
 
     pub fn parse(raw: &str) -> Self {
-        let raw = strip_ansi(raw.trim_end()).into_owned();
+        Self::styled(Pen::default().write(raw.trim_end()))
+    }
+
+    /// A line of a call target's log. One the engine did not write is the job's own.
+    pub fn job(text: Styled) -> Self {
+        let mut line = Self::styled(text);
+        if let Body::Plain(text) = &mut line.body {
+            line.body = Body::Job(std::mem::take(text));
+        }
+        line
+    }
+
+    fn styled(Styled { text: raw, runs }: Styled) -> Self {
         let (task, rest) = task_prefix(&raw);
         let mut line = LogLine {
             at: None,
             task: None,
             body: Body::Plain(raw.clone()),
             raw: raw.clone(),
+            runs,
         };
         if let Some(text) = raw.strip_prefix("[crucible] ") {
             line.body = Body::Notice {
@@ -313,6 +336,9 @@ impl LogLine {
         } else if raw.starts_with("plan v") || raw.starts_with("verdict: ") {
             line.body = Body::Summary(raw.clone());
         }
+        if !matches!(line.body, Body::Plain(_)) {
+            line.runs.clear();
+        }
         line
     }
 
@@ -322,7 +348,7 @@ impl LogLine {
             Body::Notice { .. } | Body::Trace { .. } | Body::Summary(_) | Body::Plain(_) => {
                 Group::Engine
             }
-            Body::TaskRow { .. } | Body::Output { .. } => Group::Task,
+            Body::TaskRow { .. } | Body::Output { .. } | Body::Job(_) => Group::Task,
             _ => Group::Agent,
         }
     }
@@ -467,6 +493,7 @@ impl LogLine {
             | Body::Summary(text)
             | Body::Note(text)
             | Body::Output { text, .. }
+            | Body::Job(text)
             | Body::Plain(text) => text.clone(),
             Body::Trace { text, .. } => text.clone(),
             Body::TaskRow { name, status, .. } => format!("{name} {status}"),
@@ -622,6 +649,8 @@ fn task_row(raw: &str) -> Option<Body> {
 
 #[cfg(test)]
 mod tests {
+    use crucible_contract::console::{Color, Pen, Run, Style};
+
     use crate::logline::{Activity, Body, Group, Level, LogLine, LogView, activity, copy_text};
 
     #[test]
@@ -667,7 +696,17 @@ mod tests {
         assert!(!line.raw.contains('\u{1b}'));
         assert_eq!(line.group(), Group::Chatter);
 
-        let output = LogLine::from_output("seed", true, &["\u{1b}[31merror\u{1b}[0m: no".into()]);
+        assert!(line.runs.is_empty(), "a trace draws in its level's ink");
+
+        let output = LogLine::from_output(
+            "seed",
+            true,
+            &[
+                "\u{1b}[31merror\u{1b}[0m: no".into(),
+                "\u{1b}[1;33mwarning: carried".into(),
+                "onto this line\u{1b}[0m".into(),
+            ],
+        );
         assert_eq!(
             output[0].body,
             Body::Output {
@@ -675,6 +714,53 @@ mod tests {
                 text: "error: no".into()
             }
         );
+        let red = Style {
+            fg: Some(Color::Palette(1)),
+            ..Style::default()
+        };
+        assert_eq!(
+            output[0].runs,
+            vec![Run {
+                start: 0,
+                end: 5,
+                style: red
+            }]
+        );
+        let bold_yellow = Style {
+            fg: Some(Color::Palette(3)),
+            bold: true,
+            ..Style::default()
+        };
+        assert_eq!(output[2].raw, "onto this line");
+        assert_eq!(
+            output[2].runs,
+            vec![Run {
+                start: 0,
+                end: 14,
+                style: bold_yellow
+            }],
+            "style carries across one event's lines"
+        );
+    }
+
+    #[test]
+    fn plain_and_job_lines_keep_their_runs_and_engine_lines_drop_them() {
+        let plain = LogLine::parse("\u{1b}[32m\u{2714}\u{1b}[0m done  ");
+        assert_eq!(plain.body, Body::Plain("\u{2714} done".into()));
+        assert_eq!(plain.runs.len(), 1);
+        assert_eq!(plain.runs[0].end, "\u{2714}".len());
+
+        let agent = LogLine::parse("\u{1b}[31m[edit] \u{1f527} Bash $ ls\u{1b}[0m");
+        assert!(matches!(agent.body, Body::Tool { .. }));
+        assert!(agent.runs.is_empty());
+
+        let job = LogLine::job(Pen::default().write("\u{1b}[32;1m$ make\u{1b}[0;m"));
+        assert_eq!(job.body, Body::Job("$ make".into()));
+        assert_eq!(job.runs.len(), 1);
+        assert_eq!(job.group(), Group::Task);
+        assert_eq!(job.summary().as_deref(), Some("$ make"));
+        let engine = LogLine::job(Pen::default().write("[crucible] OTLP span export enabled"));
+        assert!(matches!(engine.body, Body::Notice { .. }));
     }
 
     #[test]

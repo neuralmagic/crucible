@@ -324,6 +324,9 @@ impl App {
     }
 
     pub fn pick_call_node(&mut self, node: crate::live::calls::CallNode) {
+        if self.run.call_node.as_ref().map(|shown| &shown.ask) != Some(&node.ask) {
+            self.run.node_folds.clear();
+        }
         self.run.call_node = Some(node);
         self.show_pane(PaneKind::Log);
     }

@@ -436,6 +436,8 @@ pub struct RunView {
     pub log_task: Option<String>,
     /// Log blocks opened or folded by hand, by task or instance name.
     pub log_folds: HashMap<String, bool>,
+    /// Sections of the call node's log opened or folded by hand, by where each starts.
+    pub node_folds: HashMap<usize, bool>,
     /// The pack file the Pack tab shows; the manifest when none is picked.
     pub pack_file: Option<String>,
     /// The pack the user picked to show; `None` shows a draft run's working copy.
