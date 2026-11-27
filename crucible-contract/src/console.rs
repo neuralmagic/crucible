@@ -17,8 +17,6 @@ pub enum Color {
 }
 
 impl Color {
-    /// The sRGB bytes of palette entries 16–255 and of RGB; `None` for 0–15, whose look is the
-    /// renderer's theme.
     pub fn fixed_rgb(self) -> Option<(u8, u8, u8)> {
         match self {
             Color::Rgb(r, g, b) => Some((r, g, b)),
@@ -52,7 +50,6 @@ impl Style {
         *self == Style::default()
     }
 
-    /// Applies one SGR sequence's parameters, `0;32;1` or `38:2::255:0:0`.
     fn apply(&mut self, params: &str) {
         let mut codes = params.split(';').map(|param| {
             param
@@ -111,8 +108,6 @@ impl Style {
     }
 }
 
-/// `5;n` or `2;r;g;b` after a 38 or 48; the colon form may put an empty color space id before
-/// `r` (`2::r:g:b`).
 fn extended(args: &[Option<u16>]) -> Option<Color> {
     let byte = |v: Option<u16>| v.and_then(|v| u8::try_from(v).ok());
     match args.first().copied().flatten()? {
@@ -176,8 +171,6 @@ pub struct Pen {
 }
 
 impl Pen {
-    /// `raw` as styled text. A carriage return followed by more text starts the line over, so a
-    /// progress bar shows its last state.
     pub fn write(&mut self, raw: &str) -> Styled {
         let mut out = Styled::default();
         let mut chars = raw.chars().peekable();
@@ -239,7 +232,6 @@ impl Pen {
     }
 }
 
-/// `text` without its escape sequences.
 pub fn plain(text: &str) -> String {
     Pen::default().write(text).text
 }

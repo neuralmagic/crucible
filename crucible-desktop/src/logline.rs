@@ -97,7 +97,6 @@ pub enum Body {
         stderr: bool,
         text: String,
     },
-    /// A line a call's target job printed: a CI job's log, or a pipeline step's.
     Job(String),
     Plain(String),
 }
@@ -109,10 +108,7 @@ pub struct LogLine {
     /// The task or fan-out instance an agent line came from.
     pub task: Option<String>,
     pub body: Body,
-    /// The line's text without its escapes.
     pub raw: String,
-    /// The colors and attributes its escapes gave byte ranges of `raw`; kept for the bodies
-    /// that show `raw` as it is: output, job and plain lines.
     pub runs: Vec<Run>,
 }
 
@@ -302,7 +298,6 @@ impl LogLine {
         Self::styled(Pen::default().write(raw.trim_end()))
     }
 
-    /// A line of a call target's log. One the engine did not write is the job's own.
     pub fn job(text: Styled) -> Self {
         let mut line = Self::styled(text);
         if let Body::Plain(text) = &mut line.body {

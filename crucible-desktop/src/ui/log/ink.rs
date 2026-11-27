@@ -4,19 +4,16 @@ use crucible_contract::console::{self, Run};
 use rune::color::srgb_decode;
 use rune::{Color, Span};
 
-/// The sixteen ANSI colors on a dark background: normal 0–7, bright 8–15.
 const DARK: [u32; 16] = [
     0x484f58, 0xff7b72, 0x3fb950, 0xd29922, 0x58a6ff, 0xbc8cff, 0x39c5cf, 0xb1bac4, 0x6e7681,
     0xffa198, 0x56d364, 0xe3b341, 0x79c0ff, 0xd2a8ff, 0x56d4dd, 0xffffff,
 ];
 
-/// The sixteen ANSI colors on a light background.
 const LIGHT: [u32; 16] = [
     0x24292f, 0xcf222e, 0x116329, 0x4d2d00, 0x0969da, 0x8250df, 0x1b7c83, 0x6e7781, 0x57606a,
     0xa40e26, 0x1a7f37, 0x633c01, 0x218bff, 0xa475f9, 0x3192aa, 0x8c959f,
 ];
 
-/// How much of its ink dim text keeps.
 const DIM: f32 = 0.6;
 
 fn srgb(r: u8, g: u8, b: u8) -> Color {
@@ -41,7 +38,6 @@ pub(crate) fn color(color: console::Color, dark: bool) -> Color {
     srgb(r, g, b)
 }
 
-/// `runs` as spans over the same text, whose unstyled ink is `ink`.
 pub(crate) fn spans(runs: &[Run], ink: Color, dark: bool) -> Vec<Span> {
     runs.iter()
         .map(|run| {

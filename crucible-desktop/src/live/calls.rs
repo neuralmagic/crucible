@@ -130,7 +130,6 @@ pub struct CallNode {
 pub struct NodeLog {
     pub ask: NodeAsk,
     pub text: Result<String, String>,
-    /// The log's lines and the sections a GitLab runner marked in them; empty on an error.
     pub trace: Vec<gitlab::Item>,
 }
 

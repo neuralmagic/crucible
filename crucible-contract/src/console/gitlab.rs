@@ -17,7 +17,6 @@ use crate::console::{Pen, Styled};
 /// One line of a trace.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Line {
-    /// The RFC 3339 time the runner stamped the line with, on runners that stamp.
     pub at: Option<String>,
     pub stderr: bool,
     pub text: Styled,
@@ -28,9 +27,7 @@ pub struct Line {
 pub struct Section {
     pub name: String,
     pub header: Line,
-    /// Shown folded unless opened, as the job asked with `collapsed=true`.
     pub collapsed: bool,
-    /// Seconds from start to end; `None` while it runs or when the job hides it.
     pub duration: Option<u64>,
     pub items: Vec<Item>,
 }
@@ -41,7 +38,6 @@ pub enum Item {
     Section(Section),
 }
 
-/// `trace` as lines and the sections around them, in order.
 pub fn parse(trace: &str) -> Vec<Item> {
     let mut tree = Tree::default();
     let mut pen = Pen::default();
@@ -65,7 +61,6 @@ pub fn parse(trace: &str) -> Vec<Item> {
     tree.finish()
 }
 
-/// Physical lines with their stamps read off and `+` continuations joined onto the line before.
 fn joined(trace: &str) -> Vec<(Option<String>, bool, String)> {
     let mut lines: Vec<(Option<String>, bool, String)> = Vec::new();
     if trace.is_empty() {
@@ -91,7 +86,6 @@ struct Stamp<'a> {
     text: &'a str,
 }
 
-/// `2026-11-27T01:58:22.651300Z 00O+text`.
 fn stamped(line: &str) -> Option<Stamp<'_>> {
     let (at, rest) = line.split_once(' ')?;
     let bytes = at.as_bytes();
@@ -136,7 +130,6 @@ enum Mark {
 
 const MARK_END: &str = "\r\u{1b}[0K";
 
-/// The first section marker in `text`: the text before it, the marker, and the text after.
 fn next_mark(text: &str) -> Option<(&str, Mark, &str)> {
     let mut from = 0;
     while let Some(found) = text[from..].find("section_") {
@@ -149,7 +142,6 @@ fn next_mark(text: &str) -> Option<(&str, Mark, &str)> {
     None
 }
 
-/// A marker at the start of `text`, and its length in bytes.
 fn mark(text: &str) -> Option<(Mark, usize)> {
     let (start, rest) = if let Some(rest) = text.strip_prefix("section_start:") {
         (true, rest)
@@ -218,8 +210,6 @@ impl Tree {
         }
     }
 
-    /// Applies a line's markers in order, then places its text: as the header of the last
-    /// section it opened, else as a line of whatever is open.
     fn add(&mut self, marks: Vec<Mark>, line: Line) {
         let marked = !marks.is_empty();
         let mut header = None;
@@ -266,7 +256,6 @@ impl Tree {
         }
     }
 
-    /// The header of open section `index`: `line` when it has text, else the section's name.
     fn fill_header(&mut self, index: usize, line: Option<Line>) {
         let Some(open) = self.open.get_mut(index) else {
             return;
@@ -278,7 +267,6 @@ impl Tree {
         }
     }
 
-    /// Ends the innermost open section named `name` and every section inside it.
     fn close(&mut self, name: &str, at: Option<u64>) {
         let Some(index) = self.open.iter().rposition(|o| o.section.name == name) else {
             return;
@@ -310,8 +298,6 @@ mod tests {
     use crate::console::gitlab::{Item, Line, Section, parse};
     use crate::console::{Color, Run, Style};
 
-    /// The start of a markdown lint job's trace from a gitlab-runner 19.5 Kubernetes runner,
-    /// as `GET /projects/:id/jobs/:job/trace` returns it.
     const STAMPED: &str = "2026-11-27T01:58:22.651300Z 00O \u{1b}[0KRunning with gitlab-runner 19.5.1 (f411f264)\u{1b}[0;m
 2026-11-27T01:58:22.651376Z 00O \u{1b}[0K\u{1b}[36;1mResolving secrets\u{1b}[0;m\u{1b}[0;m
 2026-11-27T01:58:22.651636Z 00O section_start:1795744702:prepare_executor\r\u{1b}[0K
@@ -337,8 +323,6 @@ mod tests {
 2026-11-27T01:59:21.459815Z 00O \u{1b}[32;1mJob succeeded\u{1b}[0;m
 ";
 
-    /// The same shape from a runner that predates timestamps, with a job's own nested
-    /// sections, one collapsed and one hiding its duration.
     const CLASSIC: &str = "\u{1b}[0KRunning with gitlab-runner 16.11.0 (91a27b2a)\u{1b}[0;m
 section_start:1700000000:prepare_script\r\u{1b}[0K\u{1b}[0K\u{1b}[36;1mPreparing environment\u{1b}[0;m
 Running on runner-abc...

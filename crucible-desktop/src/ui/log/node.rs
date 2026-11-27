@@ -148,7 +148,6 @@ enum Row<'a> {
     },
 }
 
-/// The rows of `items`, in order, skipping what folded sections hold.
 fn flatten<'a>(
     items: &'a [Item],
     depth: usize,
@@ -253,7 +252,6 @@ fn head_row(
         }))
 }
 
-/// Every line of the log as text, section headers included and nothing folded away.
 fn copy_text(items: &[Item]) -> String {
     fn walk(items: &[Item], out: &mut Vec<String>) {
         for item in items {
