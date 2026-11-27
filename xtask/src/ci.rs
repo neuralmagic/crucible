@@ -444,7 +444,7 @@ impl Reads {
                     }
                 }
                 Found::Literal(literal) => {
-                    if !looks_like_path(&literal) {
+                    if !looks_like_path(&literal) || under(&literal, ".github") {
                         continue;
                     }
                     for base in [krate.dir.as_str(), ""] {
@@ -1554,10 +1554,10 @@ mod tests {
         let forge =
             "-p crucible -p crucible-broker -p crucible-controller -p crucible-lsp -p forge";
         let forge_and_dependents = format!("packages={forge} doc_packages={forge} {engine_jobs}");
-        let contract = "packages=-p buildit -p crucible -p crucible-broker -p crucible-contract \
-                        -p crucible-controller -p crucible-git -p crucible-harness -p crucible-kueue \
-                        -p crucible-kueue-client -p crucible-lsp -p crucible-mcp-auth -p crux \
-                        doc_packages=-p crucible -p crucible-broker -p crucible-contract \
+        let contract = "packages=-p buildit -p crucible -p crucible-broker -p crucible-ci \
+                        -p crucible-contract -p crucible-controller -p crucible-git -p crucible-harness \
+                        -p crucible-kueue -p crucible-kueue-client -p crucible-lsp -p crucible-mcp-auth \
+                        -p crux doc_packages=-p crucible -p crucible-broker -p crucible-ci -p crucible-contract \
                         -p crucible-controller -p crucible-harness -p crucible-kueue \
                         -p crucible-kueue-client -p crucible-lsp -p crucible-mcp-auth -p crux \
                         default_packages=-p crucible -p crucible-controller -p crux \
