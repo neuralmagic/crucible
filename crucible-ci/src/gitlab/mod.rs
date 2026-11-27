@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use tracing::Instrument as _;
 use url::Url;
 
 use crate::commit::CommitId;
@@ -567,14 +568,19 @@ impl Gitlab {
         doing: &str,
         req: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, GitlabError> {
-        let r = req
-            .bearer_auth(token.expose())
-            .send()
+        let http = |source| GitlabError::Http {
+            doing: doing.to_owned(),
+            source,
+        };
+        let request = req.bearer_auth(token.expose()).build().map_err(http)?;
+        let span = crate::trace::request("gitlab", doing, &request);
+        let r = self
+            .http
+            .execute(request)
+            .instrument(span.clone())
             .await
-            .map_err(|source| GitlabError::Http {
-                doing: doing.to_owned(),
-                source,
-            })?;
+            .map_err(http)?;
+        crate::trace::response(&span, &r);
         let status = r.status();
         if status.is_success() || status == reqwest::StatusCode::NOT_MODIFIED {
             return Ok(r);

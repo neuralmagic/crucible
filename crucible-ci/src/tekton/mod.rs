@@ -22,6 +22,7 @@ pub mod results;
 use kube_core::params::{GetParams, ListParams, Patch, PatchParams, PostParams};
 use kube_core::subresource::LogParams;
 use serde::de::DeserializeOwned;
+use tracing::Instrument as _;
 use url::Url;
 
 use crate::tekton::find::Filter;
@@ -327,10 +328,19 @@ impl Cluster {
         if !body.is_empty() {
             builder = builder.body(body);
         }
-        let response = builder.send().await.map_err(|source| TektonError::Http {
+        let http = |source| TektonError::Http {
             doing: doing.to_owned(),
             source,
-        })?;
+        };
+        let request = builder.build().map_err(http)?;
+        let span = crate::trace::request("tekton", doing, &request);
+        let response = self
+            .http
+            .execute(request)
+            .instrument(span.clone())
+            .await
+            .map_err(http)?;
+        crate::trace::response(&span, &response);
         let status = response.status();
         if status.is_success() {
             return Ok(response);

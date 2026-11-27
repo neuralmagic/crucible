@@ -9,3 +9,4 @@ pub mod commit;
 pub mod gitlab;
 pub mod tekton;
 pub mod token;
+mod trace;

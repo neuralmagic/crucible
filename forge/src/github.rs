@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::Deserialize;
+use tracing::Instrument as _;
 
 use crate::github::build::BuildFailure;
 use crate::github::workflow::WorkflowError;
@@ -666,13 +667,30 @@ impl Client {
         accept: &str,
         doing: &str,
     ) -> Result<reqwest::Response, GithubError> {
-        let resp = request
+        let request = request
             .bearer_auth(&token.0)
             .header(reqwest::header::ACCEPT, accept)
             .header("X-GitHub-Api-Version", API_VERSION)
-            .send()
+            .build()
+            .map_err(GithubError::http(doing))?;
+        let span = tracing::info_span!(
+            "github.request",
+            "otel.name" = doing,
+            "otel.kind" = "client",
+            "http.request.method" = %request.method(),
+            "url.path" = request.url().path(),
+            "http.response.status_code" = tracing::field::Empty,
+            "github.ratelimit.resource" = tracing::field::Empty,
+            "github.ratelimit.remaining" = tracing::field::Empty,
+            "github.ratelimit.used" = tracing::field::Empty,
+        );
+        let resp = self
+            .http
+            .execute(request)
+            .instrument(span.clone())
             .await
             .map_err(GithubError::http(doing))?;
+        record_response(&span, &resp);
         let status = resp.status();
         if status.is_success() || status.is_redirection() {
             return Ok(resp);
@@ -736,6 +754,27 @@ impl Client {
         }
         self.http.get(url).build().map_err(GithubError::http(doing))
     }
+}
+
+fn record_response(span: &tracing::Span, resp: &reqwest::Response) {
+    let status = resp.status().as_u16();
+    span.record("http.response.status_code", status);
+    let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok());
+    for (field, name) in [
+        ("github.ratelimit.resource", "x-ratelimit-resource"),
+        ("github.ratelimit.remaining", "x-ratelimit-remaining"),
+        ("github.ratelimit.used", "x-ratelimit-used"),
+    ] {
+        if let Some(value) = header(name) {
+            span.record(field, value);
+        }
+    }
+    tracing::debug!(
+        parent: span,
+        status,
+        remaining = header("x-ratelimit-remaining"),
+        "github request"
+    );
 }
 
 fn encode(path: &str) -> String {

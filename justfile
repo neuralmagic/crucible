@@ -103,6 +103,17 @@ dev-pg:
     fi
     echo "DATABASE_URL=postgres://postgres:ci@localhost:55432/crucible"
 
+# Run Jaeger on http://localhost:16686, taking OTLP spans on :4318. Start `just controller-local`
+# with OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 to send it every call poll and forge request.
+traces:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! podman container exists crucible-jaeger; then
+        podman run -d --rm --name crucible-jaeger -p 16686:16686 -p 4318:4318 \
+            docker.io/jaegertracing/jaeger:2.23.0 >/dev/null
+    fi
+    echo "http://localhost:16686"
+
 # See docs/controller-local.md.
 # Run the controller on this machine: embedded Postgres, no auth, no Vault, no cluster.
 controller-local port="8870" user=env_var("USER"):

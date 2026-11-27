@@ -4,6 +4,7 @@
 //! loop polls target systems, settles, or cuts a call off.
 
 use std::time::Duration;
+use tracing::Instrument as _;
 
 use crate::calls::{Backends, CallCtx, CallError, CallRecord, Outcome, Polled};
 use crate::client::Db;
@@ -70,11 +71,23 @@ pub(crate) async fn refresh_due(
             .map_or(REFRESH_EVERY, |b| b.cadence(&record, now));
         let next = now.checked_add(jiff::SignedDuration::try_from(every)?)?;
         crate::calls::store::poll_at(ctx.db.pool(), &id, &crate::clock::stamp(next)).await?;
-        let looked = match record.status.ended() {
-            true if cancel_owed => stop_again(backends, ctx, &record).await,
-            true => Ok(()),
-            false => refresh(backends, ctx, record).await.map(drop),
-        };
+        let span = tracing::info_span!(
+            "calls.poll",
+            call = %id,
+            kind = %record.kind,
+            run = %record.parent_run,
+            task = %record.task,
+            "calls.next_poll_secs" = every.as_secs(),
+        );
+        let looked = async {
+            match record.status.ended() {
+                true if cancel_owed => stop_again(backends, ctx, &record).await,
+                true => Ok(()),
+                false => refresh(backends, ctx, record).await.map(drop),
+            }
+        }
+        .instrument(span)
+        .await;
         if let Err(e) = looked {
             tracing::warn!(call = %id, error = %format!("{e:#}"), "refreshing a call failed");
             crate::calls::store::touched(ctx.db.pool(), &id).await?;

@@ -17,6 +17,7 @@ serde.workspace = true
 serde_norway = "0.9"
 serde_json.workspace = true
 thiserror.workspace = true
+tracing = "0.1"
 url.workspace = true
 
 [dev-dependencies]

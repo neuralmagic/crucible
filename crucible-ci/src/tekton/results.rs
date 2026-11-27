@@ -10,6 +10,7 @@
 use base64::Engine;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use tracing::Instrument as _;
 use url::Url;
 
 use crate::tekton::find::{Filter, REPOSITORY_LABEL, SHA_LABEL};
@@ -122,16 +123,24 @@ impl Results {
                     q.append_pair("page_token", next);
                 }
             }
-            let response = self
+            let http = |source| TektonError::Http {
+                doing: doing.clone(),
+                source,
+            };
+            let request = self
                 .http
                 .get(url)
                 .bearer_auth(token.expose())
-                .send()
+                .build()
+                .map_err(http)?;
+            let span = crate::trace::request("tekton-results", &doing, &request);
+            let response = self
+                .http
+                .execute(request)
+                .instrument(span.clone())
                 .await
-                .map_err(|source| TektonError::Http {
-                    doing: doing.clone(),
-                    source,
-                })?;
+                .map_err(http)?;
+            crate::trace::response(&span, &response);
             let status = response.status();
             if !status.is_success() {
                 let body = response.text().await.unwrap_or_default();
