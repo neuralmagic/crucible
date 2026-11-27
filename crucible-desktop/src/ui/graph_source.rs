@@ -295,19 +295,22 @@ impl Shown<'_> {
         task: &TaskView,
     ) -> graph_call::Frame {
         let key = at.key();
-        if !graph_call::unfolded(&key, graph, self.call_folds) {
-            return graph_call::Frame::default();
-        }
-        let picked = self
-            .picked
-            .filter(|(frame, _)| *frame == key)
-            .map(|(_, node)| node);
         let kind = task
             .call
             .as_ref()
             .map_or(crucible_contract::calls::CallKind::Playbook, |call| {
                 call.kind
             });
+        if !graph_call::unfolded(&key, graph, self.call_folds) {
+            return graph_call::Frame {
+                kind,
+                ..graph_call::Frame::default()
+            };
+        }
+        let picked = self
+            .picked
+            .filter(|(frame, _)| *frame == key)
+            .map(|(_, node)| node);
         graph_call::frame(at, graph, self.call_folds, picked, kind)
     }
 }
@@ -450,9 +453,10 @@ pub(crate) fn mermaid_source<'a>(tasks: &'a [TaskView], shown: &Shown, ink: &Ink
                     }
                     picked.extend(frame.picked.clone());
                 }
-                Some(_) => {
-                    source.push_str(&format!("  subgraph g{i} [\" \"]\n    {node}\n  end\n"))
-                }
+                Some(frame) => source.push_str(&format!(
+                    "  subgraph g{i} [\"{}\"]\n    {node}\n  end\n",
+                    title_pad(frame.kind)
+                )),
                 None => source.push_str(&format!("  {node}\n")),
             }
             continue;
@@ -1383,7 +1387,7 @@ mod tests {
         contains_all(
             &folded,
             &[
-                "  subgraph g1 [\" \"]\n    t1[[\"\u{2197} ship \u{b7} release \u{b7} app\"]]\n  end\n",
+                "  subgraph g1 [\"\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\"]\n    t1[[\"\u{2197} ship \u{b7} release \u{b7} app\"]]\n  end\n",
                 "t0 -->|version| t1\n",
                 "linkStyle 1 stroke:",
             ],
