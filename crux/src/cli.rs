@@ -1117,7 +1117,6 @@ mod tests {
         }
     }
 
-    /// A test-fire spends money, so it carries both ceilings or it does not parse.
     #[test]
     fn a_test_fire_carries_its_ceilings() {
         assert!(
