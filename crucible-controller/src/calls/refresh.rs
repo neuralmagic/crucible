@@ -3,15 +3,12 @@
 //! whose call ended while stopping it failed. Readers and the engine read the store; only this
 //! loop polls target systems, settles, or cuts a call off.
 
-use std::time::Duration;
 use tracing::Instrument as _;
 
-use crate::calls::{Backends, CallCtx, CallError, CallRecord, Outcome, Polled};
+use crate::calls::{Backends, CallCtx, CallError, CallRecord, Outcome, Polled, REFRESH_EVERY};
 use crate::client::Db;
 use crate::daemon::queue::{BoxFuture, DueSource, Pass, WorkQueue};
 use crucible_contract::calls::{CallStatus, NodeStatus};
-
-pub(crate) const REFRESH_EVERY: Duration = Duration::from_secs(5);
 
 const PASS_LIMIT: i64 = 64;
 

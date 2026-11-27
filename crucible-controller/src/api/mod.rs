@@ -24,6 +24,7 @@ mod autoresearch;
 pub(crate) mod dto;
 pub(crate) mod events;
 pub(crate) mod metrics;
+pub(crate) mod param_files;
 pub(crate) mod system;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -62,7 +63,7 @@ pub(crate) mod tests;
         crate::identity::api::forge::list_forge_apps,
         crate::identity::api::forge::put_forge_account,
         crate::identity::api::forge::delete_forge_account,
-        crate::launches::param_files::put,
+        crate::api::param_files::put,
         crate::runs::api::runs::get_run_iterations,
         crate::runs::api::runs::get_run_graph,
         crate::runs::api::evidence::get_task_evidence,
@@ -823,8 +824,8 @@ pub fn router(state: ApiState) -> Router {
         )
         .route(
             crate::launches::param_files::UPLOAD_ROUTE,
-            axum::routing::put(crate::launches::param_files::put)
-                .layer(crate::launches::param_files::upload_limit()),
+            axum::routing::put(crate::api::param_files::put)
+                .layer(crate::api::param_files::upload_limit()),
         )
         .route("/api/openapi.json", get(move || async { Json(api) }))
         .layer(axum::middleware::from_fn_with_state(

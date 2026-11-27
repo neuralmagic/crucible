@@ -18,9 +18,9 @@ use crate::crucible::Direction;
 use crate::deadline::Deadline;
 use crate::plan::admission::Lane;
 use crate::plan::attempt::{Attempt, AttemptOutcome, own_note};
-use crate::plan::exec::TaskRunner;
 use crate::plan::ir::{Decider, Task, TaskKind, TaskName};
 use crate::plan::output::{Finished, Output, json_line, run_echoed};
+use crate::plan::task_runner::TaskRunner;
 use crucible_contract::TransportCause;
 use crucible_contract::inference::{ENV_INFERENCE, InferenceRole};
 
@@ -504,7 +504,7 @@ mod tests {
         plan: &crate::plan::ir::ValidPlan,
         substrate: &Substrate,
         cfg: ExecCfg,
-        runner: &mut dyn crate::plan::exec::TaskRunner,
+        runner: &mut dyn crate::plan::task_runner::TaskRunner,
         on_result: impl FnMut(&crate::plan::ir::Task, &crate::plan::exec::TaskResult),
     ) -> crate::plan::exec::PlanOutcome {
         crate::plan::exec::execute(plan, substrate, cfg, runner, on_result)

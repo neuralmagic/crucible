@@ -661,8 +661,9 @@ pub fn run(
     manifest: Option<&Path>,
     opts: RunOpts,
 ) -> Result<()> {
-    use crate::plan::exec::{ExecCfg, PlanExit, TaskRunner, execute};
+    use crate::plan::exec::{ExecCfg, PlanExit, execute};
     use crate::plan::runner::ShellRunner;
+    use crate::plan::task_runner::TaskRunner;
     let RunOpts {
         ceilings,
         compute_driver,

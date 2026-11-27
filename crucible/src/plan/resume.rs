@@ -685,9 +685,10 @@ mod tests {
     #[test]
     fn a_task_that_kills_its_process_every_attempt_is_stopped_by_the_cost_ceiling() {
         use crate::plan::attempt::{Attempt, AttemptOutcome};
-        use crate::plan::exec::{ExecCfg, PlanExit, Substrate, TaskRunner, execute};
+        use crate::plan::exec::{ExecCfg, PlanExit, Substrate, execute};
         use crate::plan::ir::Task;
         use crate::plan::machine::BlockedReason;
+        use crate::plan::task_runner::TaskRunner;
         use std::collections::BTreeMap;
         use std::num::NonZeroUsize;
 

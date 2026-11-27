@@ -214,13 +214,14 @@ pub(crate) async fn write_lock(
         Ok(calls) => calls,
         Err(note) => return refuse(StatusCode::UNPROCESSABLE_ENTITY, note),
     };
-    let locking = crate::calls::lock::Locking {
+    let locking = crate::calls::locking::Locking {
         state: &state,
         caller: &caller,
         draft_pack: body.draft,
         draft: body.draft_id.as_deref(),
     };
-    match crate::calls::lock::write(&Backends::new(&state), &ctx(&state), &calls, &locking).await {
+    match crate::calls::locking::write(&Backends::new(&state), &ctx(&state), &calls, &locking).await
+    {
         Ok(lock) => match lock.map(|l| l.render()).transpose() {
             Ok(lock) => axum::Json(LockAnswer { lock }).into_response(),
             Err(e) => ApiError::from(anyhow::Error::from(e)).into_response(),

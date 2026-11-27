@@ -8,9 +8,9 @@ use allocative::Allocative;
 use starlark::starlark_simple_value;
 use starlark::values::{Heap, NoSerialize, ProvidesStaticType, StarlarkValue, starlark_value};
 
-use crate::plan::call::Binding;
 use crate::plan::diag;
-use crate::plan::ir::{Emits, OutputField, Task, TaskKind, TaskName};
+use crate::plan::ir::Binding;
+use crate::plan::ir::{Emits, OutputField, Task, TaskKind};
 use crate::plan::starlark::error::CompileError;
 use crate::plan::starlark::params::{ParamType, embedded, embedded_schema};
 use crate::plan::starlark::targets;
@@ -105,60 +105,6 @@ pub(crate) fn param_text(name: &str, ty: ParamType, value: &serde_json::Value) -
     }
     text
 }
-
-/// `producer.files`: the files a task declares in `emits_files`, indexed by path.
-#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
-pub(crate) struct FilesValue {
-    #[allocative(skip)]
-    pub(crate) task: TaskName,
-    pub(crate) declared: Vec<String>,
-}
-
-starlark_simple_value!(FilesValue);
-
-impl Display for FilesValue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.files", self.task)
-    }
-}
-
-#[starlark_value(type = "files")]
-impl<'v> StarlarkValue<'v> for FilesValue {
-    fn at(
-        &self,
-        index: starlark::values::Value<'v>,
-        heap: Heap<'v>,
-    ) -> starlark::Result<starlark::values::Value<'v>> {
-        let path = index.unpack_str().unwrap_or_default().to_owned();
-        Ok(heap.alloc(CallFileValue(CallFile {
-            producer: self.task.clone(),
-            declared: self.declared.contains(&path),
-            path,
-        })))
-    }
-}
-
-/// `producer.files["path"]`.
-#[derive(Clone, Debug)]
-pub(crate) struct CallFile {
-    pub(crate) producer: TaskName,
-    pub(crate) path: String,
-    pub(crate) declared: bool,
-}
-
-#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
-pub(crate) struct CallFileValue(#[allocative(skip)] pub(crate) CallFile);
-
-starlark_simple_value!(CallFileValue);
-
-impl Display for CallFileValue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.files[{:?}]", self.0.producer, self.0.path)
-    }
-}
-
-#[starlark_value(type = "file")]
-impl<'v> StarlarkValue<'v> for CallFileValue {}
 
 /// `item()`: a mapped call's own item.
 #[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
@@ -779,7 +725,7 @@ pub(crate) fn refuse_param_refs(named: &BTreeMap<String, Value>, prompts: &[&str
 
 #[cfg(test)]
 mod tests {
-    use crate::plan::call::Binding;
+    use crate::plan::ir::Binding;
     use crate::plan::ir::{Emits, OutputField, TaskKind, TaskName};
     use crate::plan::starlark::params::PARAM_TYPE_KEY as TYPE_KEY;
     use crate::plan::starlark::{compile_source, compile_source_with};

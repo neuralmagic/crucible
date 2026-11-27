@@ -186,7 +186,7 @@ pub(crate) async fn dispatched(pool: &PgPool, id: &CallId, started: &Dispatched)
     .bind(&started.detail)
     .bind(crate::clock::now_rfc3339())
     .bind(crate::clock::stamp(jiff::Timestamp::now().checked_add(
-        jiff::SignedDuration::try_from(crate::calls::refresh::REFRESH_EVERY)?,
+        jiff::SignedDuration::try_from(crate::calls::REFRESH_EVERY)?,
     )?))
     .fetch_optional(pool)
     .await

@@ -33,7 +33,7 @@ pub(crate) fn run_routes(state: ApiState) -> Router {
             CALL_INPUT_FILE_PATH,
             put(input_file).layer(axum::extract::DefaultBodyLimit::max(file_cap)),
         )
-        .route(PARAM_FILE_PATH, get(crate::launches::param_files::serve))
+        .route(PARAM_FILE_PATH, get(crate::api::param_files::serve))
         .layer(axum::middleware::from_fn_with_state(
             db,
             crate::decisions::require_run_token,
@@ -691,6 +691,32 @@ async fn input_file(
     }
 }
 
+impl Backends {
+    pub(crate) fn new(state: &crate::api::state::ApiState) -> Self {
+        Backends {
+            playbook: crate::calls::playbook::PlaybookBackend::new(Some(state.clone())),
+            github: crate::calls::github_backend(
+                state.calls_github,
+                state.pack_pr_app.as_ref(),
+                &state.github_logins,
+                &state.forge_signed_in,
+                &state.playbook_caps.max_time,
+            ),
+            gitlab: crate::calls::gitlab_backend(
+                state.calls_gitlab,
+                &state.gitlab_token_files,
+                state.gitlab_hosts.as_ref().clone(),
+                &state.forge_signed_in,
+                &state.playbook_caps.max_time,
+            ),
+            tekton: state
+                .calls_tekton
+                .clone()
+                .and_then(crate::calls::tekton::TektonBackend::new),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::api::state::ApiState;
@@ -849,10 +875,10 @@ mod tests {
         .await;
         let wren = caller(pool, "wren").await;
         let mut caller = files(CALLER_MANIFEST, CALLER_WORKFLOW);
-        crate::calls::lock::into_files(
+        crate::calls::locking::into_files(
             &Backends::new(state),
             &ctx(state),
-            &crate::calls::lock::Locking {
+            &crate::calls::locking::Locking {
                 state,
                 caller: &wren,
                 draft_pack: true,
@@ -1247,7 +1273,7 @@ mod tests {
         let state = state(pool.clone());
         let backends = Backends::new(&state);
         let wren = caller(&pool, "wren").await;
-        let locking = |draft_pack| crate::calls::lock::Locking {
+        let locking = |draft_pack| crate::calls::locking::Locking {
             state: &state,
             caller: &wren,
             draft_pack,
@@ -1259,9 +1285,10 @@ mod tests {
                 .or_else(|| (path == "workflow.star").then(|| "load(\"@crucible//calls\", \"playbook\")\ngone = playbook(\"draft:nowhere\")\n".to_string()))
         })
         .expect("declared");
-        let refused = crate::calls::lock::write(&backends, &ctx(&state), &missing, &locking(true))
-            .await
-            .expect_err("unresolvable");
+        let refused =
+            crate::calls::locking::write(&backends, &ctx(&state), &missing, &locking(true))
+                .await
+                .expect_err("unresolvable");
         assert!(refused.starts_with("call target gone"), "{refused}");
 
         draft(&pool, "target", target_files()).await;
@@ -1271,11 +1298,11 @@ mod tests {
                 .or_else(|| (path == "workflow.star").then(|| "load(\"@crucible//calls\", \"playbook\")\ntarget = playbook(\"draft:target\")\n".to_string()))
         })
         .expect("declared");
-        let refused = crate::calls::lock::write(&backends, &ctx(&state), &head, &locking(false))
+        let refused = crate::calls::locking::write(&backends, &ctx(&state), &head, &locking(false))
             .await
             .expect_err("a registered pack may not pin a draft head");
         assert!(refused.contains("only a draft pack"), "{refused}");
-        let lock = crate::calls::lock::write(&backends, &ctx(&state), &head, &locking(true))
+        let lock = crate::calls::locking::write(&backends, &ctx(&state), &head, &locking(true))
             .await
             .expect("a draft pack may")
             .expect("declared calls lock");
@@ -1301,9 +1328,10 @@ mod tests {
                 })
         })
         .expect("declared");
-        let refused = crate::calls::lock::write(&backends, &ctx(&state), &github, &locking(true))
-            .await
-            .expect_err("no token source");
+        let refused =
+            crate::calls::locking::write(&backends, &ctx(&state), &github, &locking(true))
+                .await
+                .expect_err("no token source");
         assert!(
             refused.contains("CONTROLLER_CALLS_GITHUB_TOKEN"),
             "{refused}"
@@ -1715,11 +1743,11 @@ mod tests {
             _ => None,
         })
         .expect("declared");
-        crate::calls::lock::write(
+        crate::calls::locking::write(
             backends,
             &ctx(state),
             &declared,
-            &crate::calls::lock::Locking {
+            &crate::calls::locking::Locking {
                 state,
                 caller: who,
                 draft_pack: true,
@@ -1767,10 +1795,10 @@ mod tests {
                 calling("loop-a")
             ),
         );
-        crate::calls::lock::into_files(
+        crate::calls::locking::into_files(
             &backends,
             &ctx(&state),
-            &crate::calls::lock::Locking {
+            &crate::calls::locking::Locking {
                 state: &state,
                 caller: wren,
                 draft_pack: true,
@@ -1904,7 +1932,7 @@ mod tests {
             .await;
         let keys = tempfile::tempdir().expect("dir");
         let state = ApiState {
-            calls_github: Some(crate::calls::GithubToken::AppInstallation),
+            calls_github: Some(crate::config::GithubToken::AppInstallation),
             pack_pr_app: Some(crate::secrets::github_app::GithubAppTokenSource::new(
                 "1",
                 "2",

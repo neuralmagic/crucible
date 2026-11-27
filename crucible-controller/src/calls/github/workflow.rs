@@ -10,8 +10,6 @@ use crucible_contract::emits::{DeclaredFile, EmitWire, value_type};
 use forge::github::workflow::{InputType, Workflow};
 use serde_json::{Map, Value, json};
 
-use crate::calls::github::TargetError;
-
 fn schema_type(ty: InputType) -> &'static str {
     match ty {
         InputType::String | InputType::Choice | InputType::Environment => "string",
@@ -102,13 +100,13 @@ pub fn dispatch_inputs(
     params: &Value,
     values: &BTreeMap<String, Value>,
     files: &BTreeMap<String, FileRef>,
-) -> Result<BTreeMap<String, String>, TargetError> {
+) -> Result<BTreeMap<String, String>, String> {
     if !files.is_empty() {
         let names: Vec<&str> = files.keys().map(String::as_str).collect();
-        return Err(TargetError::Refused(format!(
+        return Err(format!(
             "a GitHub workflow takes no file parameter, but the call binds {}",
             names.join(", ")
-        )));
+        ));
     }
     let empty = Map::new();
     let properties = params
@@ -118,9 +116,7 @@ pub fn dispatch_inputs(
     let mut inputs = BTreeMap::new();
     for (name, value) in values {
         let Some(property) = properties.get(name) else {
-            return Err(TargetError::Refused(format!(
-                "the workflow declares no input {name:?}"
-            )));
+            return Err(format!("the workflow declares no input {name:?}"));
         };
         let ty = property
             .get("type")
@@ -133,18 +129,16 @@ pub fn dispatch_inputs(
             ("string", Value::String(s)) => s.clone(),
             ("string", json @ (Value::Object(_) | Value::Array(_))) => json.to_string(),
             (ty, other) => {
-                return Err(TargetError::Refused(format!(
+                return Err(format!(
                     "input {name:?} takes a {ty}, not {}",
                     value_type(other)
-                )));
+                ));
             }
         };
         if let Some(options) = property.get("enum").and_then(Value::as_array)
             && !options.iter().any(|o| o.as_str() == Some(text.as_str()))
         {
-            return Err(TargetError::Refused(format!(
-                "input {name:?} is not one of its choices"
-            )));
+            return Err(format!("input {name:?} is not one of its choices"));
         }
         inputs.insert(name.clone(), text);
     }
@@ -156,16 +150,14 @@ pub fn dispatch_inputs(
         .filter_map(Value::as_str);
     for name in required {
         if !inputs.contains_key(name) {
-            return Err(TargetError::Refused(format!(
-                "required input {name:?} is not bound"
-            )));
+            return Err(format!("required input {name:?} is not bound"));
         }
     }
     if inputs.len() > MAX_GITHUB_INPUTS {
-        return Err(TargetError::Refused(format!(
+        return Err(format!(
             "the call binds {} inputs; GitHub accepts at most {MAX_GITHUB_INPUTS}",
             inputs.len()
-        )));
+        ));
     }
     Ok(inputs)
 }
@@ -180,7 +172,6 @@ mod tests {
 
     use forge::github::workflow::Workflow;
 
-    use crate::calls::github::TargetError;
     use crate::calls::github::workflow::{dispatch_inputs, graph, interface, params_schema};
 
     const DEMO: &str = r#"
@@ -399,7 +390,7 @@ jobs:
                 })
                 .collect();
             match dispatch_inputs(&params, &values, &files) {
-                Err(TargetError::Refused(note)) => note,
+                Err(note) => note,
                 other => panic!("expected a refusal, got {other:?}"),
             }
         };
@@ -414,7 +405,7 @@ jobs:
         missing.remove("message");
         assert!(matches!(
             dispatch_inputs(&params, &missing, &BTreeMap::new()),
-            Err(TargetError::Refused(note)) if note.contains("\"message\" is not bound")
+            Err(note) if note.contains("\"message\" is not bound")
         ));
     }
 

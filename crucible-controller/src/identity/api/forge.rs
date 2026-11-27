@@ -97,8 +97,8 @@ fn person(caller: &Caller) -> Result<&str, &'static str> {
 
 fn keeps_tokens(state: &ApiState, forge: Forge) -> bool {
     match forge {
-        Forge::Github => state.calls_github == Some(crate::calls::GithubToken::Person),
-        Forge::Gitlab => state.calls_gitlab == Some(crate::calls::GitlabToken::Person),
+        Forge::Github => state.calls_github == Some(crate::config::GithubToken::Person),
+        Forge::Gitlab => state.calls_gitlab == Some(crate::config::GitlabToken::Person),
     }
 }
 
@@ -192,7 +192,9 @@ async fn issued_here(
         ))
     };
     match forge {
-        Forge::Github if state.calls_github == Some(crate::calls::GithubToken::AppInstallation) => {
+        Forge::Github
+            if state.calls_github == Some(crate::config::GithubToken::AppInstallation) =>
+        {
             let ours = state
                 .pack_pr_app
                 .as_ref()
@@ -212,7 +214,7 @@ async fn issued_here(
                 Err(_) => Err(not_ours("this controller's GitHub App")),
             }
         }
-        Forge::Gitlab if state.calls_gitlab == Some(crate::calls::GitlabToken::Bot) => {
+        Forge::Gitlab if state.calls_gitlab == Some(crate::config::GitlabToken::Bot) => {
             let ours = state.gitlab_client_ids.get(host).ok_or_else(|| {
                 Whoami::Refused(format!(
                     "this controller names no OAuth application for {}",
@@ -401,8 +403,8 @@ mod tests {
 
     fn person_state(pool: PgPool) -> ApiState {
         ApiState {
-            calls_github: Some(crate::calls::GithubToken::Person),
-            calls_gitlab: Some(crate::calls::GitlabToken::Person),
+            calls_github: Some(crate::config::GithubToken::Person),
+            calls_gitlab: Some(crate::config::GitlabToken::Person),
             gitlab_hosts: std::sync::Arc::new(vec![
                 ForgeHost::parse("gitlab.example.com").unwrap(),
             ]),
@@ -415,9 +417,9 @@ mod tests {
         let gl = ForgeHost::parse("gitlab.example.com").unwrap();
         let other = ForgeHost::parse("gl.other.io").unwrap();
         let state = ApiState {
-            calls_github: Some(crate::calls::GithubToken::AppInstallation),
+            calls_github: Some(crate::config::GithubToken::AppInstallation),
             github_client_id: Some("Iv23abc".into()),
-            calls_gitlab: Some(crate::calls::GitlabToken::Bot),
+            calls_gitlab: Some(crate::config::GitlabToken::Bot),
             gitlab_hosts: std::sync::Arc::new(vec![gl.clone(), other]),
             gitlab_client_ids: std::sync::Arc::new([(gl, "glid".to_owned())].into()),
             ..ApiState::test(Db::new(pool.clone()))
@@ -458,8 +460,8 @@ mod tests {
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_controller_acting_for_people_links_only_its_own_apps_tokens(pool: PgPool) {
         let state = ApiState {
-            calls_github: Some(crate::calls::GithubToken::AppInstallation),
-            calls_gitlab: Some(crate::calls::GitlabToken::Bot),
+            calls_github: Some(crate::config::GithubToken::AppInstallation),
+            calls_gitlab: Some(crate::config::GitlabToken::Bot),
             gitlab_hosts: std::sync::Arc::new(vec![
                 ForgeHost::parse("gitlab.example.com").unwrap(),
             ]),
@@ -582,8 +584,8 @@ mod tests {
         let mut state = person_state(pool);
         assert!(keeps_tokens(&state, Forge::Github));
         assert!(keeps_tokens(&state, Forge::Gitlab));
-        state.calls_github = Some(crate::calls::GithubToken::AppInstallation);
-        state.calls_gitlab = Some(crate::calls::GitlabToken::Bot);
+        state.calls_github = Some(crate::config::GithubToken::AppInstallation);
+        state.calls_gitlab = Some(crate::config::GitlabToken::Bot);
         assert!(!keeps_tokens(&state, Forge::Github));
         assert!(!keeps_tokens(&state, Forge::Gitlab));
         state.calls_github = None;

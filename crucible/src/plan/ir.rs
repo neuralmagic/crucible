@@ -524,6 +524,40 @@ impl Join {
     }
 }
 
+/// Where one target parameter's value comes from. Every value is bound when the call becomes
+/// ready, never at compile time.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "from", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Binding {
+    Literal {
+        value: serde_json::Value,
+    },
+    Param {
+        name: String,
+    },
+    Field {
+        producer: TaskName,
+        field: OutputField,
+    },
+    File {
+        producer: TaskName,
+        path: String,
+    },
+    Item {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        field: Option<OutputField>,
+    },
+}
+
+impl Binding {
+    pub fn producer(&self) -> Option<&TaskName> {
+        match self {
+            Binding::Field { producer, .. } | Binding::File { producer, .. } => Some(producer),
+            Binding::Literal { .. } | Binding::Param { .. } | Binding::Item { .. } => None,
+        }
+    }
+}
+
 /// What a task *is*. The executor owns advancement; agents only ever run inside `Agent` tasks.
 ///
 /// Internally tagged so TOML and JSON authoring read naturally:
@@ -581,7 +615,7 @@ pub enum TaskKind {
         alias: crucible_contract::calls::CallAlias,
         target: crucible_contract::calls::CallKind,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        bindings: BTreeMap<String, crate::plan::call::Binding>,
+        bindings: BTreeMap<String, Binding>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         budget: Option<crucible_contract::calls::CallBudget>,
         #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -2870,6 +2904,7 @@ impl Plan {
 #[cfg(test)]
 mod tests {
     use crate::plan::ir::*;
+    use serde_json::json;
 
     fn agent(name: &str, deps: &[&str]) -> Task {
         Task {
@@ -6683,5 +6718,53 @@ emits = ["lines"]
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn bindings_round_trip_by_source() {
+        for (binding, wire) in [
+            (
+                Binding::Literal {
+                    value: json!({"a": [1]}),
+                },
+                json!({"from": "literal", "value": {"a": [1]}}),
+            ),
+            (
+                Binding::Param {
+                    name: "repo".into(),
+                },
+                json!({"from": "param", "name": "repo"}),
+            ),
+            (
+                Binding::Field {
+                    producer: TaskName("plan".into()),
+                    field: OutputField("version".into()),
+                },
+                json!({"from": "field", "producer": "plan", "field": "version"}),
+            ),
+            (
+                Binding::File {
+                    producer: TaskName("plan".into()),
+                    path: "notes.md".into(),
+                },
+                json!({"from": "file", "producer": "plan", "path": "notes.md"}),
+            ),
+            (Binding::Item { field: None }, json!({"from": "item"})),
+        ] {
+            assert_eq!(serde_json::to_value(&binding).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<Binding>(wire).unwrap(),
+                binding.clone()
+            );
+        }
+        assert_eq!(
+            Binding::File {
+                producer: TaskName("p".into()),
+                path: "x".into()
+            }
+            .producer(),
+            Some(&TaskName("p".into()))
+        );
+        assert!(serde_json::from_value::<Binding>(json!({"from": "env"})).is_err());
     }
 }

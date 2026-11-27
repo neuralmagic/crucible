@@ -5,7 +5,6 @@
 pub mod admission;
 pub mod admitted;
 pub mod attempt;
-pub mod call;
 pub mod call_run;
 pub mod decide;
 pub mod diag;
@@ -24,6 +23,7 @@ pub mod resume;
 pub mod route;
 pub mod runner;
 pub mod starlark;
+pub mod task_runner;
 pub mod term_img;
 pub mod workflow;
 pub mod worktree;

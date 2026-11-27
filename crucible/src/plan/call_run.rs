@@ -10,10 +10,10 @@ use serde_json::Value;
 
 use crate::plan::admission::{Admission, Lane, Refusal};
 use crate::plan::attempt::{Attempt, AttemptOutcome, BatchItem, TransportFailure};
-use crate::plan::call::Binding;
-use crate::plan::exec::TaskRunner;
 use crate::plan::files::CapturedFiles;
+use crate::plan::ir::Binding;
 use crate::plan::ir::{ITEM_INPUT, Join, PARAMS_INPUT, Task, TaskKind, TaskName};
+use crate::plan::task_runner::TaskRunner;
 use crucible_contract::TransportCause;
 use crucible_contract::calls::{
     CALL_CANCEL_PATH, CALL_INPUT_FILE_PATH, CALL_PATH, CALL_RESULT_FILE_PATH, CALLS_PATH, CallId,
@@ -786,8 +786,8 @@ fn publish(
 
 #[cfg(test)]
 mod tests {
-    use crate::plan::call::Binding;
     use crate::plan::call_run::{Bound, CallKey, DispatchError, FileSource, resolve};
+    use crate::plan::ir::Binding;
     use crate::plan::ir::{Join, OutputField, Stage, Task, TaskKind, TaskName};
     use crucible_contract::calls::{CallAlias, CallKind};
     use serde_json::{Value, json};

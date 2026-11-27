@@ -13,6 +13,24 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// Where the GitHub backend takes the token it dispatches with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum GithubToken {
+    #[value(name = "person", alias = "gh")]
+    Person,
+    #[value(name = "app")]
+    AppInstallation,
+}
+
+/// Where the GitLab backend takes the token it creates pipelines with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum GitlabToken {
+    #[value(name = "person")]
+    Person,
+    #[value(name = "bot")]
+    Bot,
+}
+
 /// How grounded ranking turns run. Replaces the old silent `CONTROLLER_SANDBOX_IMAGE`-presence gate
 /// (which failed closed in-cluster: env unset → `local` backend → no `claude` binary → every grounded
 /// escalation died to the text verdict). Now an explicit choice whose prerequisites are checked
@@ -716,7 +734,7 @@ pub struct ControllerCfg {
         env = "CONTROLLER_CALLS_GITHUB_TOKEN",
         value_enum
     )]
-    pub calls_github_token: Option<crate::calls::GithubToken>,
+    pub calls_github_token: Option<crate::config::GithubToken>,
     #[arg(skip)]
     pub forge_signed_in: crate::identity::forge::held::SignedIn,
     #[arg(
@@ -724,7 +742,7 @@ pub struct ControllerCfg {
         env = "CONTROLLER_CALLS_GITLAB_TOKEN",
         value_enum
     )]
-    pub calls_gitlab_token: Option<crate::calls::GitlabToken>,
+    pub calls_gitlab_token: Option<crate::config::GitlabToken>,
     #[arg(
         long = "gitlab-token-file",
         env = "CONTROLLER_GITLAB_TOKEN_FILES",
@@ -1121,7 +1139,7 @@ impl ControllerCfg {
     pub fn validate_calls_gitlab(&self, dev_identity: Option<&str>) -> Result<()> {
         match self.calls_gitlab_token {
             None => Ok(()),
-            Some(crate::calls::GitlabToken::Person) => {
+            Some(crate::config::GitlabToken::Person) => {
                 let local = self.playbook_executor == PlaybookExecutor::Local;
                 let dev = dev_identity.is_some_and(|login| !login.trim().is_empty());
                 if !(local && dev) {
@@ -1134,7 +1152,7 @@ impl ControllerCfg {
                 }
                 Ok(())
             }
-            Some(crate::calls::GitlabToken::Bot) => {
+            Some(crate::config::GitlabToken::Bot) => {
                 let files = self.gitlab_token_files().map_err(anyhow::Error::msg)?;
                 let clients = self.gitlab_client_ids().map_err(anyhow::Error::msg)?;
                 for host in self.gitlab_hosts() {
@@ -1188,10 +1206,10 @@ impl ControllerCfg {
     pub(crate) fn calls_tekton_clusters(
         &self,
     ) -> std::result::Result<
-        std::collections::BTreeMap<String, crate::calls::tekton::TektonCluster>,
+        std::collections::BTreeMap<String, crate::calls::tekton::cluster::TektonCluster>,
         String,
     > {
-        crate::calls::tekton::clusters(
+        crate::calls::tekton::cluster::clusters(
             &self.calls_tekton_kubeconfigs,
             &self.calls_tekton_results,
             &self.calls_tekton_grants,
@@ -1201,7 +1219,7 @@ impl ControllerCfg {
     pub fn validate_calls_github(&self, dev_identity: Option<&str>) -> Result<()> {
         match self.calls_github_token {
             None => Ok(()),
-            Some(crate::calls::GithubToken::Person) => {
+            Some(crate::config::GithubToken::Person) => {
                 let local = self.playbook_executor == PlaybookExecutor::Local;
                 let dev = dev_identity.is_some_and(|login| !login.trim().is_empty());
                 if !(local && dev) {
@@ -1213,7 +1231,7 @@ impl ControllerCfg {
                 }
                 Ok(())
             }
-            Some(crate::calls::GithubToken::AppInstallation) => match self.github_app {
+            Some(crate::config::GithubToken::AppInstallation) => match self.github_app {
                 Some(_) => Ok(()),
                 None => bail!(
                     "CONTROLLER_CALLS_GITHUB_TOKEN=app needs the GitHub App: set \

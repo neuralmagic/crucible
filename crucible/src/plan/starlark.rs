@@ -553,7 +553,7 @@ enum Value {
         ty: params::ParamType,
         shown: String,
     },
-    CallFile(call::CallFile),
+    CallFile(values::CallFile),
     Item,
     Budget(crucible_contract::calls::CallBudget),
     Target(targets::Built),

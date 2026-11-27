@@ -95,7 +95,7 @@ impl<'v> StarlarkValue<'v> for TaskValue {
             });
         }
         if attribute == FILES_ATTRIBUTE && !self.0.emits.names().iter().any(|f| f == attribute) {
-            return Some(heap.alloc(crate::plan::starlark::call::FilesValue {
+            return Some(heap.alloc(FilesValue {
                 task: self.0.name.clone(),
                 declared: self.0.emits_files.iter().map(|f| f.path.clone()).collect(),
             }));
@@ -653,3 +653,57 @@ impl Display for TaskDefaultsValue {
 
 #[starlark_value(type = "task_defaults")]
 impl<'v> StarlarkValue<'v> for TaskDefaultsValue {}
+
+/// `producer.files`: the files a task declares in `emits_files`, indexed by path.
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+pub(crate) struct FilesValue {
+    #[allocative(skip)]
+    pub(crate) task: TaskName,
+    pub(crate) declared: Vec<String>,
+}
+
+starlark_simple_value!(FilesValue);
+
+impl Display for FilesValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.files", self.task)
+    }
+}
+
+#[starlark_value(type = "files")]
+impl<'v> StarlarkValue<'v> for FilesValue {
+    fn at(
+        &self,
+        index: starlark::values::Value<'v>,
+        heap: Heap<'v>,
+    ) -> starlark::Result<starlark::values::Value<'v>> {
+        let path = index.unpack_str().unwrap_or_default().to_owned();
+        Ok(heap.alloc(CallFileValue(CallFile {
+            producer: self.task.clone(),
+            declared: self.declared.contains(&path),
+            path,
+        })))
+    }
+}
+
+/// `producer.files["path"]`.
+#[derive(Clone, Debug)]
+pub(crate) struct CallFile {
+    pub(crate) producer: TaskName,
+    pub(crate) path: String,
+    pub(crate) declared: bool,
+}
+
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+pub(crate) struct CallFileValue(#[allocative(skip)] pub(crate) CallFile);
+
+starlark_simple_value!(CallFileValue);
+
+impl Display for CallFileValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.files[{:?}]", self.0.producer, self.0.path)
+    }
+}
+
+#[starlark_value(type = "file")]
+impl<'v> StarlarkValue<'v> for CallFileValue {}

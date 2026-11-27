@@ -915,13 +915,13 @@ pub(crate) async fn save_playbook_draft(
         Err(refusal) => return refusal,
     };
     let mut files = body.files;
-    if let Err(refusal) = crate::calls::lock::into_files(
+    if let Err(refusal) = crate::calls::locking::into_files(
         &crate::calls::Backends::new(&state),
         &crate::calls::CallCtx {
             db: state.db.clone(),
             scratch_dir: state.scratch_dir.clone(),
         },
-        &crate::calls::lock::Locking {
+        &crate::calls::locking::Locking {
             state: &state,
             caller: &caller,
             draft_pack: true,

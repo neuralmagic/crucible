@@ -160,14 +160,16 @@ pub struct ApiState {
     pub(crate) cluster_links: Option<Arc<crate::identity::cluster_link::ClusterLinks>>,
     /// The issuer whose people grant the consent page decides; `None` when it serves no people.
     pub(crate) people_issuer: Option<Arc<crate::agent_auth::AgentAuth>>,
-    pub(crate) calls_github: Option<crate::calls::GithubToken>,
+    pub(crate) calls_github: Option<crate::config::GithubToken>,
     pub(crate) github_client_id: Option<String>,
-    pub(crate) calls_tekton:
-        Result<std::collections::BTreeMap<String, crate::calls::tekton::TektonCluster>, String>,
+    pub(crate) calls_tekton: Result<
+        std::collections::BTreeMap<String, crate::calls::tekton::cluster::TektonCluster>,
+        String,
+    >,
     pub(crate) github_logins: crate::identity::github_logins::GithubLogins,
     pub(crate) forge_signed_in: crate::identity::forge::held::SignedIn,
     pub(crate) gitlab_hosts: Arc<Vec<crate::identity::forge::ForgeHost>>,
-    pub(crate) calls_gitlab: Option<crate::calls::GitlabToken>,
+    pub(crate) calls_gitlab: Option<crate::config::GitlabToken>,
     pub(crate) gitlab_token_files: Arc<
         Result<
             std::collections::BTreeMap<crate::identity::forge::ForgeHost, std::path::PathBuf>,

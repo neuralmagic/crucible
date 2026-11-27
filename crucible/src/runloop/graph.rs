@@ -20,11 +20,12 @@ use crate::agent;
 use crate::control;
 use crate::plan::admission::{Admission, Lane, Refusal};
 use crate::plan::attempt::{Attempt, AttemptOutcome, BatchItem};
-use crate::plan::exec::{ExecCfg, Substrate, TaskRunner, execute};
+use crate::plan::exec::{ExecCfg, Substrate, execute};
 use crate::plan::harness::CandidateEvent;
 use crate::plan::ir::{
     EngineOp, Isolation, Join, Plan, PlanBudget, Stage, Task, TaskKind, TaskName, ValidPlan,
 };
+use crate::plan::task_runner::TaskRunner;
 use crate::plan::workflow::{WorkflowCaps, WorkflowCfg};
 use crate::process::STOP;
 use crate::report::reporter::Reporter;

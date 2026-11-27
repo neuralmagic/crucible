@@ -1,7 +1,8 @@
 """Refuse comments added to Rust files, other than module docs (`//!`) and the rustdoc of a struct,
 enum, trait, type alias or module. Comments are found with ast-grep (tree-sitter), so `//` inside
-a string is not a comment. Only added comments count: a comment already in the file, moved or not,
-passes, and so does a new line in a comment block that was already there.
+a string is not a comment. Only added comments count: a comment already in the file, or moved
+from another file in the same change, passes, and so does a new line in a comment block that was
+already there.
 
   no-new-comments.py --staged      the staged Rust files against HEAD (pre-commit)
   no-new-comments.py --base REF    the working tree's Rust files against REF (CI)
@@ -87,15 +88,18 @@ def blocks(found: List[Tuple[int, str]]) -> List[List[Tuple[int, str]]]:
     return out
 
 
-def added(before: str, after: str) -> List[Tuple[int, str]]:
+def added(before: str, after: str, moved: Optional[Counter] = None) -> List[Tuple[int, str]]:
     had = Counter(text for _, text in comments(before))
+    moved = Counter() if moved is None else moved
     lines = after.split("\n")
     out = []
     for block in blocks(comments(after)):
-        kept = [had[text] > 0 for _, text in block]
+        kept = []
         for _, text in block:
-            if had[text] > 0:
-                had[text] -= 1
+            pool = had if had[text] > 0 else moved
+            kept.append(pool[text] > 0)
+            if pool[text] > 0:
+                pool[text] -= 1
         if any(kept):
             continue
         for line, text in block:
@@ -123,22 +127,36 @@ def report(found: List[Tuple[str, int, str]]) -> int:
     return 1
 
 
-def staged() -> int:
-    paths = git("diff", "--cached", "--name-only", "--diff-filter=ACMR", "--", "*.rs").split()
+def removed(pairs: List[Tuple[str, str, str]]) -> Counter:
+    out: Counter = Counter()
+    for _, before, after in pairs:
+        out += Counter(t for _, t in comments(before)) - Counter(t for _, t in comments(after))
+    return out
+
+
+def check(pairs: List[Tuple[str, str, str]]) -> int:
+    moved = removed(pairs)
     found = []
-    for path in paths:
-        found += [(path, n, t) for n, t in added(blob(f"HEAD:{path}"), blob(f":{path}"))]
+    for path, before, after in pairs:
+        if Path(path).suffix == ".rs" and after:
+            found += [(path, n, t) for n, t in added(before, after, moved)]
     return report(found)
+
+
+def staged() -> int:
+    paths = git("diff", "--cached", "--name-only", "--diff-filter=ACMRD", "--", "*.rs").split()
+    return check([(p, blob(f"HEAD:{p}"), blob(f":{p}")) for p in paths])
 
 
 def against(base: str) -> int:
     merge_base = git("merge-base", base, "HEAD").strip()
-    paths = git("diff", "--name-only", "--diff-filter=ACMR", merge_base, "--", "*.rs").split()
-    found = []
-    for path in paths:
-        after = Path(path).read_text()
-        found += [(path, n, t) for n, t in added(blob(f"{merge_base}:{path}"), after)]
-    return report(found)
+    paths = git("diff", "--name-only", "--diff-filter=ACMRD", merge_base, "--", "*.rs").split()
+    return check(
+        [
+            (p, blob(f"{merge_base}:{p}"), Path(p).read_text() if Path(p).is_file() else "")
+            for p in paths
+        ]
+    )
 
 
 def after_edit(tool: str, given: dict, before: str) -> Optional[str]:

@@ -14,6 +14,7 @@ pub(crate) mod compile;
 mod github;
 mod gitlab;
 pub(crate) mod lock;
+pub(crate) mod locking;
 mod playbook;
 mod progress;
 pub(crate) mod reader;
@@ -31,24 +32,9 @@ use crucible_contract::calls::{
 use serde_json::Value;
 
 use crate::client::Db;
+use crate::config::{GithubToken, GitlabToken};
 
-/// Where the GitHub backend takes the token it dispatches with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum GithubToken {
-    #[value(name = "person", alias = "gh")]
-    Person,
-    #[value(name = "app")]
-    AppInstallation,
-}
-
-/// Where the GitLab backend takes the token it creates pipelines with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum GitlabToken {
-    #[value(name = "person")]
-    Person,
-    #[value(name = "bot")]
-    Bot,
-}
+pub(crate) const REFRESH_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Why a backend operation did not do what it was asked.
 #[derive(Debug, thiserror::Error)]
@@ -236,7 +222,7 @@ pub(crate) trait TargetBackend: Send + Sync {
     async fn poll(&self, ctx: &CallCtx, call: &CallRecord) -> Result<Polled, CallError>;
 
     fn cadence(&self, _call: &CallRecord, _now: jiff::Timestamp) -> std::time::Duration {
-        crate::calls::refresh::REFRESH_EVERY
+        REFRESH_EVERY
     }
 
     async fn result_file(
@@ -282,30 +268,6 @@ pub(crate) struct Backends {
 }
 
 impl Backends {
-    pub(crate) fn new(state: &crate::api::state::ApiState) -> Self {
-        Backends {
-            playbook: playbook::PlaybookBackend::new(Some(state.clone())),
-            github: github_backend(
-                state.calls_github,
-                state.pack_pr_app.as_ref(),
-                &state.github_logins,
-                &state.forge_signed_in,
-                &state.playbook_caps.max_time,
-            ),
-            gitlab: gitlab_backend(
-                state.calls_gitlab,
-                &state.gitlab_token_files,
-                state.gitlab_hosts.as_ref().clone(),
-                &state.forge_signed_in,
-                &state.playbook_caps.max_time,
-            ),
-            tekton: state
-                .calls_tekton
-                .clone()
-                .and_then(tekton::TektonBackend::new),
-        }
-    }
-
     pub(crate) fn following(cfg: &crate::config::ControllerCfg) -> Self {
         Backends {
             playbook: playbook::PlaybookBackend::new(None),

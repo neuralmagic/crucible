@@ -191,7 +191,8 @@ impl GithubWorkflowBackend {
                 commit.short()
             )));
         }
-        let inputs = dispatch_inputs(&locked.interface.params, values, files)?;
+        let inputs = dispatch_inputs(&locked.interface.params, values, files)
+            .map_err(TargetError::Refused)?;
         let created = self
             .client
             .dispatch(
