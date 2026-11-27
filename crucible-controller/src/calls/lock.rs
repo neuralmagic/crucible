@@ -500,6 +500,14 @@ ci = github_workflow(repo = "acme/app", workflow = ".github/workflows/ci.yml", r
                 .expect("not toml")
                 .is_empty()
         );
+        assert!(
+            declared(pack(&[
+                ("crucible.toml", MANIFEST),
+                ("workflow.star", "this is not starlark (\n"),
+            ]))
+            .expect("the compile step reports the parse error")
+            .is_empty()
+        );
         let refused = declared(pack(&[
             ("crucible.toml", MANIFEST),
             (

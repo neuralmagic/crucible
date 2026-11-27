@@ -3243,13 +3243,14 @@ pub fn declared_calls(
             });
         }
         reject_deep_nesting(source, filename)?;
-        let ast = AstModule::parse(
+        match AstModule::parse(
             &filename.display().to_string(),
             source.to_owned(),
             &dialect(),
-        )
-        .map_err(parse_error)?;
-        targets::read(&ast)
+        ) {
+            Ok(ast) => targets::read(&ast),
+            Err(_) => Ok(BTreeMap::new()),
+        }
     })
 }
 

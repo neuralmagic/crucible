@@ -41,7 +41,7 @@ fn the_message_and_the_anchor_are_separate() {
     );
     assert_eq!(
         error.message(),
-        "params must be the source's first statement"
+        "params must come before every statement but load()"
     );
     assert!(!error.message().contains("workflow.star"));
 }
