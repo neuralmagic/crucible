@@ -212,7 +212,9 @@ impl HttpTransport {
     /// resolver overrides before handing it to [`HttpTransport::with_client`].
     #[cfg(not(target_arch = "wasm32"))]
     pub fn builder() -> reqwest::ClientBuilder {
-        reqwest::Client::builder().timeout(Duration::from_secs(120))
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .user_agent(concat!("crux/", env!("CARGO_PKG_VERSION")))
     }
 
     /// The browser's fetch has no client-wide timeout.
