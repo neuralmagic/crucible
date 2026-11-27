@@ -17,6 +17,7 @@ crucible-desktop/assets/js-engine/
 __pycache__/
 *.pyc
 .venv/
+.env
 # mdBook render output.
 /book/
 # Operator steer scratch (consumed at runtime).
