@@ -1635,6 +1635,18 @@ pub struct PlaybookRun {
     pub description: Option<String>,
     #[serde(default)]
     pub created_at: String,
+    #[serde(default)]
+    pub called_by: Option<CalledBy>,
+}
+
+/// The calling run and call task a target run was dispatched by.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct CalledBy {
+    pub run: String,
+    pub launch: String,
+    pub task: String,
+    #[serde(default)]
+    pub instance: Option<String>,
 }
 
 /// One launch whole: what it was launched with, where its engine went, and the runs it
@@ -2036,6 +2048,13 @@ pub struct CelDiagnostic {
 pub struct WebhookCheck {
     #[serde(default)]
     pub diagnostics: Vec<CelDiagnostic>,
+}
+
+/// What a file parameter upload stored.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct UploadAck {
+    pub digest: String,
+    pub size: u64,
 }
 
 /// The launch acknowledgement: which issue the launch became.

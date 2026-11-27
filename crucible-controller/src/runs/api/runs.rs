@@ -137,8 +137,36 @@ pub(crate) async fn get_run(
             .unwrap_or_default(),
         None => AgentPinDto::default(),
     };
+    let (parent, children) = tokio::try_join!(
+        crate::calls::store::called_from(state.db.pool(), &run_id),
+        crate::calls::store::children(state.db.pool(), &run_id),
+    )?;
+    let mut run = RunDto::from_parts(run, issue_key, repo, agent, transport_losses);
+    run.parent = parent.map(|p| RunParentDto {
+        run: p.run,
+        task: p.task,
+        instance: p.instance,
+    });
+    run.children = children
+        .into_iter()
+        .map(|c| RunChildDto {
+            run: match &c.handle {
+                crucible_contract::calls::TargetHandle::Playbook { run } => Some(run.clone()),
+                crucible_contract::calls::TargetHandle::GithubWorkflow { .. }
+                | crucible_contract::calls::TargetHandle::GitlabPipeline { .. }
+                | crucible_contract::calls::TargetHandle::TektonWatch { .. } => None,
+            },
+            kind: c.handle.kind(),
+            call: c.call.0,
+            task: c.task,
+            instance: c.instance,
+            attempt: c.attempt,
+            alias: c.alias.to_string(),
+            status: crate::calls::store::status_str(c.status).to_string(),
+        })
+        .collect();
     let detail = RunDetail {
-        run: RunDto::from_parts(run, issue_key, repo, agent, transport_losses),
+        run,
         candidates: candidates.into_iter().map(CandidateDto::from).collect(),
         agent_tools,
     };
@@ -572,6 +600,12 @@ pub(crate) async fn get_artifact(
     let if_none_match = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok());
+    if run.session_uri.is_none()
+        && path == "session.jsonl"
+        && let Some(live) = crate::runs::local_run::live_session(&state.scratch_dir, &run_id)
+    {
+        return crate::runs::artifacts::serve_live_session(&live, if_none_match).await;
+    }
     crate::runs::artifacts::serve_artifact(
         state.db.metrics(),
         Some(&state.contracts),

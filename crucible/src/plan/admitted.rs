@@ -63,6 +63,26 @@ pub fn plan_admitted(
                     | crate::plan::ir::TaskKind::Evaluate { command, .. } => command.clone(),
                     _ => String::new(),
                 },
+                call: match &t.task {
+                    crate::plan::ir::TaskKind::Call {
+                        alias,
+                        target,
+                        bindings,
+                        ..
+                    } => Some(crucible_contract::session::PlanCallWire {
+                        alias: alias.clone(),
+                        target: *target,
+                        params: bindings
+                            .iter()
+                            .filter_map(|(param, binding)| {
+                                binding
+                                    .producer()
+                                    .map(|producer| (param.clone(), producer.0.clone()))
+                            })
+                            .collect(),
+                    }),
+                    _ => None,
+                },
             })
             .collect(),
         history_record: history_record.map(|t| t.0.clone()).unwrap_or_default(),

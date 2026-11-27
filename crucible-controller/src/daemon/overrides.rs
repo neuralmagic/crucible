@@ -74,7 +74,7 @@ impl OverrideStore {
         OverrideStore { pool }
     }
 
-    async fn stash(&self, ov: Override) -> Result<()> {
+    pub(crate) async fn stash(&self, ov: Override) -> Result<()> {
         let (kind, justification, max_cost) = match &ov.kind {
             OverrideKind::Park => ("park", None, None),
             OverrideKind::Cancel => ("cancel", None, None),

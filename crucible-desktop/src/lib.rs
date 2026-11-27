@@ -4,6 +4,7 @@
 
 mod activity;
 mod admin;
+mod afterglow;
 mod agent;
 mod apikeys;
 mod app;
@@ -17,6 +18,8 @@ mod editor;
 mod filter;
 mod finder;
 mod fleet;
+#[cfg(not(target_arch = "wasm32"))]
+mod forge;
 mod form;
 mod gfx;
 mod handoff;
@@ -410,6 +413,10 @@ pub struct RunView {
     pub inspect: inspect::Inspect,
     /// Fan-outs the graph draws without their instances.
     pub folded: HashSet<String>,
+    pub call_folds: HashSet<String>,
+    pub frame_hover: Option<String>,
+    pub frame_info: Option<String>,
+    pub call_node: Option<crate::live::calls::CallNode>,
     /// How far the graph is zoomed and moved.
     pub camera: camera::Camera,
     /// Whether the graph is drawn compact; `None` takes the setting.
@@ -429,6 +436,7 @@ pub struct RunView {
     pub log_task: Option<String>,
     /// Log blocks opened or folded by hand, by task or instance name.
     pub log_folds: HashMap<String, bool>,
+    pub node_folds: HashMap<usize, bool>,
     /// The pack file the Pack tab shows; the manifest when none is picked.
     pub pack_file: Option<String>,
     /// The pack the user picked to show; `None` shows a draft run's working copy.
@@ -516,6 +524,8 @@ pub struct App {
     pub geometry: Geometry,
     /// The flare on the run a launch just started.
     pub ignition: ignition::Ignition,
+    pub afterglows: afterglow::Afterglows,
+    pub runs_unfolded: HashSet<String>,
     /// Clicks on the molten logo, which slosh it.
     pub logo_clicks: u32,
     /// The logo's top-left on screen, in points; a window move sloshes it.
@@ -557,6 +567,16 @@ pub struct App {
     opening: Option<Open>,
     /// The editor command field in Settings.
     pub editor_command: TextEdit,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub forge: std::collections::BTreeMap<forge::Account, forge::session::Session>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub forge_offers: forge::apps::Offers,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub github_client_id: TextEdit,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub gitlab_host: TextEdit,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub gitlab_client_id: TextEdit,
     /// The drop ceilings as typed in Settings, and why the last pair did not take.
     pub drop_cost: TextEdit,
     pub drop_time: TextEdit,
@@ -667,6 +687,7 @@ pub fn run() {
             // `CRUCIBLE_LINK=<crucible-playbooks:// link>` follows a link as the system would.
             // `CRUCIBLE_RANGE=<from>..<to>` picks the saves the History pane compares, and
             // `CRUCIBLE_DIFF=split` draws them side by side.
+            // `CRUCIBLE_FRAME_INFO=<frame>` opens that call frame's info card.
             // `CRUCIBLE_RUNS_TAB=report` shows the runs page's Report tab, and
             // `CRUCIBLE_VIEW_PLUGIN=<file>`, in any scene, draws live runs and runs pages with
             // that plugin file in place of the pack's.
@@ -686,6 +707,7 @@ pub fn run() {
                 {
                     app.follow(&link);
                 }
+                app.run.frame_info = std::env::var("CRUCIBLE_FRAME_INFO").ok();
                 app.run.history_range = std::env::var("CRUCIBLE_RANGE")
                     .ok()
                     .and_then(|range| revisions::Range::parse(&range));

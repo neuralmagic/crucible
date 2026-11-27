@@ -160,6 +160,24 @@ pub struct ApiState {
     pub(crate) cluster_links: Option<Arc<crate::identity::cluster_link::ClusterLinks>>,
     /// The issuer whose people grant the consent page decides; `None` when it serves no people.
     pub(crate) people_issuer: Option<Arc<crate::agent_auth::AgentAuth>>,
+    pub(crate) calls_github: Option<crate::config::GithubToken>,
+    pub(crate) github_client_id: Option<String>,
+    pub(crate) calls_tekton: Result<
+        std::collections::BTreeMap<String, crate::calls::tekton::cluster::TektonCluster>,
+        String,
+    >,
+    pub(crate) github_logins: crate::identity::github_logins::GithubLogins,
+    pub(crate) forge_signed_in: crate::identity::forge::held::SignedIn,
+    pub(crate) gitlab_hosts: Arc<Vec<crate::identity::forge::ForgeHost>>,
+    pub(crate) calls_gitlab: Option<crate::config::GitlabToken>,
+    pub(crate) gitlab_token_files: Arc<
+        Result<
+            std::collections::BTreeMap<crate::identity::forge::ForgeHost, std::path::PathBuf>,
+            String,
+        >,
+    >,
+    pub(crate) gitlab_client_ids:
+        Arc<std::collections::BTreeMap<crate::identity::forge::ForgeHost, String>>,
 }
 
 impl ApiState {
@@ -258,6 +276,20 @@ impl ApiState {
             contracts,
             images_refresh: Arc::new(tokio::sync::Notify::new()),
             policy,
+            calls_github: cfg.calls_github_token,
+            github_client_id: cfg
+                .github_client_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned),
+            calls_tekton: cfg.calls_tekton_clusters(),
+            github_logins: cfg.github_logins(),
+            forge_signed_in: cfg.forge_signed_in.clone(),
+            gitlab_hosts: Arc::new(cfg.gitlab_hosts()),
+            calls_gitlab: cfg.calls_gitlab_token,
+            gitlab_token_files: Arc::new(cfg.gitlab_token_files()),
+            gitlab_client_ids: Arc::new(cfg.gitlab_client_ids().unwrap_or_default()),
         }
     }
 
@@ -390,6 +422,15 @@ impl ApiState {
             cluster_policy: Arc::new(Default::default()),
             policy: crate::authz::policy::ActivePolicy::default_set()
                 .expect("the shipped default policy set loads"),
+            calls_github: None,
+            github_client_id: None,
+            calls_tekton: Ok(Default::default()),
+            github_logins: Default::default(),
+            forge_signed_in: Default::default(),
+            gitlab_hosts: Arc::new(Vec::new()),
+            calls_gitlab: None,
+            gitlab_token_files: Arc::new(Ok(Default::default())),
+            gitlab_client_ids: Arc::new(Default::default()),
         }
     }
 }

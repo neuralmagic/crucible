@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|MultiEdit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/scripts/no-new-comments.py\" --hook",
+            "timeout": 30,
+            "statusMessage": "Checking for added comments"
+          }
+        ]
+      }
+    ]
+  }
+}

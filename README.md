@@ -4,6 +4,8 @@
 
 # crucible
 
+**Crucible puts an agentic outer loop around the orchestration and CI you already run.**
+
 Crucible runs agent work as a declared graph of tasks. You write the graph in Starlark. A
 task can be an agent turn, a command, an evaluation, or a decision that the engine owns.
 Crucible compiles the graph into a static plan and executes it in one Git workspace under a
@@ -116,6 +118,77 @@ Crucible's executor has properties that neither system provides:
 - **An agent turn runs in a sandbox, not a graph pod.** The agent backend owns the sandbox
   ([ADR-0015](docs/adr/ADR-0015.md)). The graph runner does not
   create a container for the turn.
+
+## Calling your existing CI
+
+Crucible executes its own graph, and it calls into the systems you already have. A `call()`
+task starts another playbook, a GitHub Actions workflow, or a GitLab pipeline as a run of its
+own, waits for it, and hands its typed result and files to the tasks after it. A `watch()` task
+waits for the Tekton PipelineRuns that a commit started, such as the Konflux builds an agent's
+pull request triggers. An agent can open the change, CI can build and test it, and the next
+task can read what CI produced.
+
+The target's jobs draw live inside the caller's graph, in the target system's colours. Each
+frame links the run, every job's own page, the commit and the pull request, and its job logs
+open in the app.
+
+<p align="center">
+  <img src="docs/img/calls-github.png" alt="A playbook whose prep task feeds a child playbook and a GitHub Actions workflow. Both draw as frames in the graph: the child's read and digest tasks, and the workflow's prepare, two-leg build and report jobs in GitHub purple, titled snapshotd #14. Their results meet in the summary task." width="960">
+</p>
+
+Targets come from the `@crucible//calls` module:
+
+```python
+load("@crucible//calls", "artifact_outputs", "github_workflow")
+
+prep = command(name = "prep", run = "python3 prep.py", emits = {"label": "string"})
+ci = call(
+    name = "ci",
+    target = github_workflow(
+        repo = "acme/app",
+        workflow = ".github/workflows/release.yml",
+        ref = "main",
+        outputs = artifact_outputs(
+            artifact = "crucible-result",
+            fields = {"summary": "string", "legs": "integer"},
+            files = ["notes.md"],
+        ),
+    ),
+    params = {"message": prep.label},
+    depends_on = [prep],
+)
+summary = command(name = "summary", run = "python3 summary.py", depends_on = [ci])
+workflow(type = "playbook", tasks = [prep, ci, summary], result = summary)
+```
+
+`summary` reads `ci`'s fields from its inputs and `notes.md` under `inputs/ci/`.
+
+| Target | Task | Starts or follows | Takes | Returns |
+| --- | --- | --- | --- | --- |
+| `playbook()` | `call()` | another playbook, pinned to a revision or a draft head | its params, including `json` and `file` | its result and files |
+| `github_workflow()` | `call()` | a `workflow_dispatch` run | the workflow's inputs | `result.json` and files from a named artifact |
+| `gitlab_pipeline()` | `call()` | a pipeline on a configured GitLab host | its `spec:inputs`, typed | `result.json` and files from a named job's artifacts |
+| `tekton()` | `watch()` | the Pipelines-as-Code PipelineRuns a commit started | the commit | each run's declared results |
+
+<p align="center">
+  <img src="docs/img/calls-gitlab.png" alt="A GitLab pipeline drawn in GitLab orange inside its caller's graph: build, a two-job test stage and report, titled crucible-call-demo #4, between the prep and report tasks." width="800">
+</p>
+<p align="center">
+  <img src="docs/img/calls-konflux.png" alt="A pr task pushes a pull request and hands its commit to a watch on Konflux, which waits for the two Pipelines-as-Code PipelineRuns that commit started. Both passed, and the report task reads their image digests." width="800">
+</p>
+
+When it saves a pack, the controller writes `calls.lock`. The lock pins each target (a playbook
+revision, or a workflow file at a commit) and records its interface. A dispatch whose target's
+interface has moved since is refused. A cluster controller dispatches with the GitHub App or a
+GitLab bot token, and only for a person whose linked account may run the target's pipelines
+(on a protected branch or tag, that means push or merge). People link their GitHub and GitLab
+accounts in the desktop app's Settings, and the controller accepts only tokens issued by its own
+GitHub App or GitLab application. A Tekton watch needs an operator grant on its namespace. A local
+controller uses your own login: the account you linked, or else `gh` and `glab`.
+
+[`examples/calls`](examples/calls/README.md) calls a playbook, a GitHub workflow and a GitLab
+pipeline (`just calls-example`, `just calls-gitlab-example`). [`examples/konflux-pr`](examples/konflux-pr)
+pushes a pull request and watches the Konflux builds it starts (`just konflux-example konflux-pr`).
 
 ## Requirements
 

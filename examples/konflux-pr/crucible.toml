@@ -1,0 +1,18 @@
+# konflux-pr: update one pull request on a Konflux-built repository and wait for the builds it
+# starts. Each run force-pushes one commit on top of the base to a fixed branch of the fork and
+# reuses the open pull request from that branch, opening a draft the first time. Commands run on
+# the local controller's host with your own git and gh logins. No model.
+
+edition = 2
+
+[workspace]
+inject = ["pr.py", "report.py"]
+
+[agent]
+backend   = "command"
+agent_cmd = "true"
+goal      = "Push a commit to a reused pull request and report the images Konflux built for it."
+
+[workflow]
+type = "playbook"
+file = "workflow.star"

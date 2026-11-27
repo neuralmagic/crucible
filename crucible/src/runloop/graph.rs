@@ -20,11 +20,12 @@ use crate::agent;
 use crate::control;
 use crate::plan::admission::{Admission, Lane, Refusal};
 use crate::plan::attempt::{Attempt, AttemptOutcome, BatchItem};
-use crate::plan::exec::{ExecCfg, Substrate, TaskRunner, execute};
+use crate::plan::exec::{ExecCfg, Substrate, execute};
 use crate::plan::harness::CandidateEvent;
 use crate::plan::ir::{
     EngineOp, Isolation, Join, Plan, PlanBudget, Stage, Task, TaskKind, TaskName, ValidPlan,
 };
+use crate::plan::task_runner::TaskRunner;
 use crate::plan::workflow::{WorkflowCaps, WorkflowCfg};
 use crate::process::STOP;
 use crate::report::reporter::Reporter;
@@ -387,6 +388,7 @@ fn harness_runner(args: &Args, p: &Paths) -> crate::plan::harness::HarnessRunner
         commit_per_task: false,
         captured_bytes: std::sync::atomic::AtomicU64::new(0),
         staged: Default::default(),
+        param_files: Vec::new(),
         budget_left: f64::INFINITY,
     }
 }
@@ -780,7 +782,8 @@ impl TaskRunner for LoopTaskRunner<'_> {
                 op: EngineOp::MeasureDiff,
                 ..
             }
-            | TaskKind::TopK { .. } => Attempt::failed(
+            | TaskKind::TopK { .. }
+            | TaskKind::Call { .. } => Attempt::failed(
                 0.0,
                 format!(
                     "unexpected task kind in the loop template: {}",

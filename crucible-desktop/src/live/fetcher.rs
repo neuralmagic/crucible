@@ -3,6 +3,7 @@
 
 use crate::captured::Captured;
 use crate::live::action::Msg;
+use crate::live::calls;
 use crate::live::shape::{
     agent_label, build_detail, captured, captured_files, clock, console, epoch, graph_fold,
     identity, landed_label, owned, pin_label, typed_log, unix_now, unlaunched,
@@ -26,6 +27,8 @@ use tokio::sync::oneshot;
 
 /// Console lines kept per run.
 const LOG_LINES: usize = 4000;
+mod dispatched;
+
 /// Finished launches kept for the window to notify about.
 pub(in crate::live) const FINISHED: usize = 32;
 /// How long a live session follow that failed waits before it is tried again.
@@ -58,6 +61,11 @@ pub(in crate::live) struct Fetcher {
     pub(in crate::live) registered: Vec<String>,
     pub(in crate::live) shareable: Vec<crux::client::Shared>,
     pub(in crate::live) catalog_at: Option<Instant>,
+    run_launches: HashMap<String, String>,
+    callers: HashMap<String, crux::dto::CalledBy>,
+    pub(in crate::live) node_ask: Option<calls::NodeAsk>,
+    node_logs: HashMap<calls::NodeAsk, (Result<String, String>, bool)>,
+    parents: HashMap<String, Option<calls::Parent>>,
 }
 
 /// One launch's detail, as of the run count and status the launch list showed when it was read:
@@ -288,6 +296,11 @@ impl Fetcher {
             registered: Vec::new(),
             shareable: Vec::new(),
             catalog_at: None,
+            run_launches: HashMap::new(),
+            callers: HashMap::new(),
+            node_ask: None,
+            node_logs: HashMap::new(),
+            parents: HashMap::new(),
         }
     }
 
@@ -514,9 +527,15 @@ impl Fetcher {
                     max_time: launch.max_time,
                     runs: launch.runs,
                     description: launch.description.filter(|text| !text.is_empty()),
+                    called_by: launch.called_by,
                 }
             })
             .collect();
+        for launch in &mut launches {
+            if launch.called_by.is_none() {
+                launch.called_by = self.callers.get(&launch.key).cloned();
+            }
+        }
         launches.sort_by_key(|launch| std::cmp::Reverse(launch.landed));
 
         self.note_finished(&launches);
@@ -740,6 +759,9 @@ impl Fetcher {
             }
             None => (RunFold::default(), Vec::new(), "", None, false, None),
         };
+        let calls = self
+            .calls(connection, &launch, run_id.as_deref(), &fold, poll)
+            .await;
         let mut next = build_detail(&launch, fold, log);
         next.source = source;
         next.error = error;
@@ -748,7 +770,13 @@ impl Fetcher {
         next.streaming = streaming;
         next.run_id = run_id;
         next.files = files;
-        let changed = self.detail.as_deref() != Some(&next);
+        next.log.extend(calls::lifecycle(&next.fold.tasks, &calls));
+        next.calls = calls;
+        next.node_log = self.node_log(connection, &next, poll).await;
+        let learned = self
+            .learn_caller(connection, &launch, next.run_id.as_deref())
+            .await;
+        let changed = learned || self.detail.as_deref() != Some(&next);
         self.detail = Some(Arc::new(next));
         changed
     }

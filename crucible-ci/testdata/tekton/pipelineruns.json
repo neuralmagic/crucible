@@ -1,0 +1,3900 @@
+{
+ "items": [
+  {
+   "metadata": {
+    "name": "early-gate-ci-build-c2k2h",
+    "namespace": "open-data-hub-tenant",
+    "uid": "11e6ae9e-8478-4784-b129-f14fe661c606",
+    "creationTimestamp": "2026-11-26T00:28:41Z",
+    "labels": {
+     "pipelinesascode.tekton.dev/check-run-id": "139606037979",
+     "pipelinesascode.tekton.dev/event-type": "on-comment",
+     "pipelinesascode.tekton.dev/original-prname": "early-gate-ci-build",
+     "pipelinesascode.tekton.dev/pull-request": "383",
+     "pipelinesascode.tekton.dev/repository": "mlserver",
+     "pipelinesascode.tekton.dev/sha": "df2bd6a9d89c7046fb053266ec876175a5328737",
+     "pipelinesascode.tekton.dev/state": "queued",
+     "pipelinesascode.tekton.dev/url-org": "opendatahub-io",
+     "pipelinesascode.tekton.dev/url-repository": "MLServer",
+     "tekton.dev/pipeline": "early-gate-ci-build-c2k2h"
+    },
+    "annotations": {
+     "pipelinesascode.tekton.dev/log-url": "https://konflux-ui.apps.stone-prd-rh01.pg1f.p1.openshiftapps.com/ns/open-data-hub-tenant/pipelinerun/early-gate-ci-build-c2k2h"
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-11-26T00:28:41Z",
+      "message": "PipelineRun \"early-gate-ci-build-c2k2h\" is pending",
+      "reason": "PipelineRunPending",
+      "status": "Unknown",
+      "type": "Succeeded"
+     }
+    ]
+   }
+  },
+  {
+   "metadata": {
+    "name": "odh-mlserver-cuda-on-pull-request-kbkcg",
+    "namespace": "open-data-hub-tenant",
+    "uid": "a78bbaa5-a5eb-4d69-ad1d-89d4ebcc50b7",
+    "creationTimestamp": "2026-11-26T00:09:52Z",
+    "labels": {
+     "pipelinesascode.tekton.dev/cancel-in-progress": "false",
+     "pipelinesascode.tekton.dev/check-run-id": "139598384226",
+     "pipelinesascode.tekton.dev/event-type": "pull_request",
+     "pipelinesascode.tekton.dev/original-prname": "odh-mlserver-cuda-on-pull-request",
+     "pipelinesascode.tekton.dev/pull-request": "383",
+     "pipelinesascode.tekton.dev/repository": "mlserver",
+     "pipelinesascode.tekton.dev/sha": "df2bd6a9d89c7046fb053266ec876175a5328737",
+     "pipelinesascode.tekton.dev/state": "completed",
+     "pipelinesascode.tekton.dev/url-org": "opendatahub-io",
+     "pipelinesascode.tekton.dev/url-repository": "MLServer",
+     "tekton.dev/pipeline": "container-build"
+    },
+    "annotations": {
+     "pipelinesascode.tekton.dev/log-url": "https://konflux-ui.apps.stone-prd-rh01.pg1f.p1.openshiftapps.com/ns/open-data-hub-tenant/pipelinerun/odh-mlserver-cuda-on-pull-request-kbkcg",
+     "results.tekton.dev/record": "open-data-hub-tenant/results/a78bbaa5-a5eb-4d69-ad1d-89d4ebcc50b7/records/a78bbaa5-a5eb-4d69-ad1d-89d4ebcc50b7"
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-11-26T00:28:38Z",
+      "message": "Tasks Completed: 19 (Failed: 0, Cancelled 0), Skipped: 6",
+      "reason": "Completed",
+      "status": "True",
+      "type": "Succeeded"
+     }
+    ],
+    "startTime": "2026-11-26T00:09:52Z",
+    "completionTime": "2026-11-26T00:28:38Z",
+    "childReferences": [
+     {
+      "kind": "TaskRun",
+      "name": "odh-mlserver-cuda-on-pull-request-kbkcg-rhoai-init",
+      "pipelineTaskName": "rhoai-init"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-mlserver-cuda-on-pull-request-kbkcg-init",
+      "pipelineTaskName": "init"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-mlserver-cuda-on-pull-request-kbkcg-clone-repository",
+      "pipelineTaskName": "clone-repository"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-mlserver-cuda-on-pull-request-kbkcg-prefetch-dependencies",
+      "pipelineTaskName": "prefetch-dependencies"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-mlserver-cuda-on-pull-request-kbkcg-build-images",
+      "pipelineTaskName": "build-images"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-mlserver-cuda-on-pull-request-kbkcg-build-image-index",
+      "pipelineTaskName": "build-image-index"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-mlserver-cuda-on-pull-request-kbkcg-build-source-image",
+      "pipelineTaskName": "build-source-image"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh4f476488e5175cef621af91233cf3892-deprecated-base-image-check",
+      "pipelineTaskName": "deprecated-base-image-check"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-mlserver-cuda-on-pull-request-kbkcg-clair-scan",
+      "pipelineTaskName": "clair-scan"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-mlserver-cuda-on-pull-request-kbkcg-sast-snyk-check",
+      "pipelineTaskName": "sast-snyk-check"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-mlserver-cuda-on-pull-request-kbkcg-clamav-scan",
+      "pipelineTaskName": "clamav-scan"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-mlserver-cuda-on-pull-request-kbkcg-sast-shell-check",
+      "pipelineTaskName": "sast-shell-check"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-mlserver-cuda-on-pull-request-kbkcg-sast-unicode-check",
+      "pipelineTaskName": "sast-unicode-check"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-mlserver-cuda-on-pull-request-kbkcg-apply-tags",
+      "pipelineTaskName": "apply-tags"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-mlserver-cuda-on-pull-request-kbkcg-push-dockerfile",
+      "pipelineTaskName": "push-dockerfile"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-mlserver-cuda-on-pull-request-kbkcg-rpms-signature-scan",
+      "pipelineTaskName": "rpms-signature-scan"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-4f476488e5175cef621af91233cf3892-pipeline-success-indicator",
+      "pipelineTaskName": "pipeline-success-indicator"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-mlserver-cuda-on-pull-request-kbkcg-show-sbom",
+      "pipelineTaskName": "show-sbom"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-ml4f476488e5175cef621af91233cf3892-trigger-early-gate-build",
+      "pipelineTaskName": "trigger-early-gate-build"
+     }
+    ],
+    "results": [
+     {
+      "name": "IMAGE_URL",
+      "value": "quay.io/opendatahub/odh-mlserver-cuda:odh-pr"
+     },
+     {
+      "name": "IMAGE_DIGEST",
+      "value": "sha256:5cabc97221a2fe2ec7bc66a9f771cb7ed7bc43ead59f12867e7b2c36f3a457bb"
+     },
+     {
+      "name": "CHAINS-GIT_URL",
+      "value": "https://github.com/brettmthompson/MLServer"
+     },
+     {
+      "name": "CHAINS-GIT_COMMIT",
+      "value": "df2bd6a9d89c7046fb053266ec876175a5328737"
+     }
+    ],
+    "skippedTasks": [
+     {
+      "name": "resolve-openclaw-release-tag",
+      "reason": "When Expressions evaluated to false"
+     },
+     {
+      "name": "ecosystem-cert-preflight-checks",
+      "reason": "When Expressions evaluated to false"
+     },
+     {
+      "name": "apply-openclaw-release-tag",
+      "reason": "When Expressions evaluated to false"
+     },
+     {
+      "name": "send-slack-notification",
+      "reason": "When Expressions evaluated to false"
+     },
+     {
+      "name": "trigger-group-testing",
+      "reason": "When Expressions evaluated to false"
+     },
+     {
+      "name": "trigger-operator-build",
+      "reason": "When Expressions evaluated to false"
+     }
+    ],
+    "pipelineSpec": {
+     "tasks": [
+      {
+       "name": "rhoai-init"
+      },
+      {
+       "name": "init",
+       "runAfter": [
+        "rhoai-init"
+       ]
+      },
+      {
+       "name": "clone-repository",
+       "runAfter": [
+        "init"
+       ],
+       "when": [
+        {
+         "input": "$(tasks.init.results.build)",
+         "operator": "in",
+         "values": [
+          "true"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "resolve-openclaw-release-tag",
+       "runAfter": [
+        "clone-repository"
+       ]
+      },
+      {
+       "name": "prefetch-dependencies",
+       "runAfter": [
+        "clone-repository",
+        "resolve-openclaw-release-tag"
+       ],
+       "params": [
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.clone-repository.results.SOURCE_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "build-images",
+       "runAfter": [
+        "prefetch-dependencies"
+       ],
+       "params": [
+        {
+         "name": "COMMIT_SHA",
+         "value": "$(tasks.clone-repository.results.commit)"
+        },
+        {
+         "name": "LABELS",
+         "value": [
+          "url=https://github.com/brettmthompson/MLServer",
+          "release=$(tasks.clone-repository.results.commit-timestamp)",
+          "git.url=https://github.com/brettmthompson/MLServer",
+          "git.commit=df2bd6a9d89c7046fb053266ec876175a5328737"
+         ]
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ],
+       "when": [
+        {
+         "input": "$(tasks.init.results.build)",
+         "operator": "in",
+         "values": [
+          "true"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "build-image-index",
+       "runAfter": [
+        "build-images"
+       ],
+       "params": [
+        {
+         "name": "COMMIT_SHA",
+         "value": "$(tasks.clone-repository.results.commit)"
+        },
+        {
+         "name": "IMAGES",
+         "value": [
+          "$(tasks.build-images.results.IMAGE_REF[*])"
+         ]
+        }
+       ],
+       "when": [
+        {
+         "input": "$(tasks.init.results.build)",
+         "operator": "in",
+         "values": [
+          "true"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "build-source-image",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "BINARY_IMAGE",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "BINARY_IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ],
+       "when": [
+        {
+         "input": "$(tasks.init.results.build)",
+         "operator": "in",
+         "values": [
+          "true"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "deprecated-base-image-check",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "IMAGE_URL",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        }
+       ]
+      },
+      {
+       "name": "clair-scan",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        }
+       ]
+      },
+      {
+       "name": "ecosystem-cert-preflight-checks",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        }
+       ]
+      },
+      {
+       "name": "sast-snyk-check",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "clamav-scan",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        }
+       ]
+      },
+      {
+       "name": "sast-shell-check",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "sast-unicode-check",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "apply-tags",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "IMAGE_URL",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "ADDITIONAL_TAGS",
+         "value": [
+          "$(tasks.rhoai-init.results.mandatory-tag)",
+          "odh-pr-df2bd6a9d89c7046fb053266ec876175a5328737"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "apply-openclaw-release-tag",
+       "runAfter": [
+        "apply-tags"
+       ],
+       "params": [
+        {
+         "name": "IMAGE_URL",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "ADDITIONAL_TAGS",
+         "value": [
+          "$(tasks.resolve-openclaw-release-tag.results.version)"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "push-dockerfile",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "IMAGE",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "rpms-signature-scan",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        }
+       ]
+      },
+      {
+       "name": "pipeline-success-indicator",
+       "runAfter": [
+        "build-source-image",
+        "sast-shell-check",
+        "sast-unicode-check",
+        "deprecated-base-image-check",
+        "clair-scan",
+        "ecosystem-cert-preflight-checks",
+        "sast-snyk-check",
+        "clamav-scan",
+        "apply-tags",
+        "apply-openclaw-release-tag",
+        "push-dockerfile",
+        "rpms-signature-scan"
+       ]
+      }
+     ],
+     "finally": [
+      {
+       "name": "show-sbom",
+       "params": [
+        {
+         "name": "IMAGE_URL",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        }
+       ]
+      },
+      {
+       "name": "send-slack-notification",
+       "params": [
+        {
+         "name": "message",
+         "value": "$(tasks.rhoai-init.results.slack-message-failure-text)"
+        }
+       ],
+       "when": [
+        {
+         "input": "$(tasks.pipeline-success-indicator.status)",
+         "operator": "notin",
+         "values": [
+          "Succeeded"
+         ]
+        },
+        {
+         "input": "$(tasks.rhoai-init.results.skip-slack-message)",
+         "operator": "in",
+         "values": [
+          "false"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "trigger-group-testing",
+       "when": [
+        {
+         "input": "$(tasks.pipeline-success-indicator.status)",
+         "operator": "in",
+         "values": [
+          "Succeeded"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "trigger-early-gate-build",
+       "when": [
+        {
+         "input": "$(tasks.pipeline-success-indicator.status)",
+         "operator": "in",
+         "values": [
+          "Succeeded"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "trigger-operator-build",
+       "when": [
+        {
+         "input": "$(tasks.pipeline-success-indicator.status)",
+         "operator": "in",
+         "values": [
+          "Succeeded"
+         ]
+        }
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "metadata": {
+    "name": "odh-openshell-cli-on-push-75chw",
+    "namespace": "open-data-hub-tenant",
+    "uid": "a0bad072-2758-49f0-b5c6-5b8ca55039b6",
+    "creationTimestamp": "2026-11-26T00:16:25Z",
+    "labels": {
+     "pipelinesascode.tekton.dev/cancel-in-progress": "false",
+     "pipelinesascode.tekton.dev/check-run-id": "139601094551",
+     "pipelinesascode.tekton.dev/event-type": "push",
+     "pipelinesascode.tekton.dev/original-prname": "odh-openshell-cli-on-push",
+     "pipelinesascode.tekton.dev/repository": "github-com-opendatahub-io-openshell",
+     "pipelinesascode.tekton.dev/sha": "6a7acf93315fcccf66676784f1eb1ab1b3dae12a",
+     "pipelinesascode.tekton.dev/state": "queued",
+     "pipelinesascode.tekton.dev/url-org": "opendatahub-io",
+     "pipelinesascode.tekton.dev/url-repository": "openshell",
+     "tekton.dev/pipeline": "container-build"
+    },
+    "annotations": {
+     "pipelinesascode.tekton.dev/log-url": "https://konflux-ui.apps.stone-prd-rh01.pg1f.p1.openshiftapps.com/ns/open-data-hub-tenant/pipelinerun/odh-openshell-cli-on-push-75chw"
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-11-26T00:22:00Z",
+      "message": "Tasks Completed: 4 (Failed: 0, Cancelled 0), Incomplete: 20, Skipped: 1",
+      "reason": "Running",
+      "status": "Unknown",
+      "type": "Succeeded"
+     }
+    ],
+    "startTime": "2026-11-26T00:17:07Z",
+    "childReferences": [
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-cli-on-push-75chw-rhoai-init",
+      "pipelineTaskName": "rhoai-init"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-cli-on-push-75chw-init",
+      "pipelineTaskName": "init"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-cli-on-push-75chw-clone-repository",
+      "pipelineTaskName": "clone-repository"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-cli-on-push-75chw-prefetch-dependencies",
+      "pipelineTaskName": "prefetch-dependencies"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-cli-on-push-75chw-build-images-0",
+      "pipelineTaskName": "build-images"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-cli-on-push-75chw-build-images-1",
+      "pipelineTaskName": "build-images"
+     }
+    ],
+    "skippedTasks": [
+     {
+      "name": "resolve-openclaw-release-tag",
+      "reason": "When Expressions evaluated to false"
+     }
+    ],
+    "pipelineSpec": {
+     "tasks": [
+      {
+       "name": "rhoai-init"
+      },
+      {
+       "name": "init",
+       "runAfter": [
+        "rhoai-init"
+       ]
+      },
+      {
+       "name": "clone-repository",
+       "runAfter": [
+        "init"
+       ],
+       "when": [
+        {
+         "input": "$(tasks.init.results.build)",
+         "operator": "in",
+         "values": [
+          "true"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "resolve-openclaw-release-tag",
+       "runAfter": [
+        "clone-repository"
+       ]
+      },
+      {
+       "name": "prefetch-dependencies",
+       "runAfter": [
+        "clone-repository",
+        "resolve-openclaw-release-tag"
+       ],
+       "params": [
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.clone-repository.results.SOURCE_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "build-images",
+       "runAfter": [
+        "prefetch-dependencies"
+       ],
+       "params": [
+        {
+         "name": "COMMIT_SHA",
+         "value": "$(tasks.clone-repository.results.commit)"
+        },
+        {
+         "name": "LABELS",
+         "value": [
+          "url=https://github.com/opendatahub-io/openshell",
+          "release=$(tasks.clone-repository.results.commit-timestamp)",
+          "git.url=https://github.com/opendatahub-io/openshell",
+          "git.commit=6a7acf93315fcccf66676784f1eb1ab1b3dae12a"
+         ]
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ],
+       "when": [
+        {
+         "input": "$(tasks.init.results.build)",
+         "operator": "in",
+         "values": [
+          "true"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "build-image-index",
+       "runAfter": [
+        "build-images"
+       ],
+       "params": [
+        {
+         "name": "COMMIT_SHA",
+         "value": "$(tasks.clone-repository.results.commit)"
+        },
+        {
+         "name": "IMAGES",
+         "value": [
+          "$(tasks.build-images.results.IMAGE_REF[*])"
+         ]
+        }
+       ],
+       "when": [
+        {
+         "input": "$(tasks.init.results.build)",
+         "operator": "in",
+         "values": [
+          "true"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "build-source-image",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "BINARY_IMAGE",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "BINARY_IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ],
+       "when": [
+        {
+         "input": "$(tasks.init.results.build)",
+         "operator": "in",
+         "values": [
+          "true"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "deprecated-base-image-check",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "IMAGE_URL",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        }
+       ]
+      },
+      {
+       "name": "clair-scan",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        }
+       ]
+      },
+      {
+       "name": "ecosystem-cert-preflight-checks",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        }
+       ]
+      },
+      {
+       "name": "sast-snyk-check",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "clamav-scan",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        }
+       ]
+      },
+      {
+       "name": "sast-shell-check",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "sast-unicode-check",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "apply-tags",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "IMAGE_URL",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "ADDITIONAL_TAGS",
+         "value": [
+          "$(tasks.rhoai-init.results.mandatory-tag)"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "apply-openclaw-release-tag",
+       "runAfter": [
+        "apply-tags"
+       ],
+       "params": [
+        {
+         "name": "IMAGE_URL",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "ADDITIONAL_TAGS",
+         "value": [
+          "$(tasks.resolve-openclaw-release-tag.results.version)"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "push-dockerfile",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "IMAGE",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "rpms-signature-scan",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        }
+       ]
+      },
+      {
+       "name": "pipeline-success-indicator",
+       "runAfter": [
+        "build-source-image",
+        "sast-shell-check",
+        "sast-unicode-check",
+        "deprecated-base-image-check",
+        "clair-scan",
+        "ecosystem-cert-preflight-checks",
+        "sast-snyk-check",
+        "clamav-scan",
+        "apply-tags",
+        "apply-openclaw-release-tag",
+        "push-dockerfile",
+        "rpms-signature-scan"
+       ]
+      }
+     ],
+     "finally": [
+      {
+       "name": "show-sbom",
+       "params": [
+        {
+         "name": "IMAGE_URL",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        }
+       ]
+      },
+      {
+       "name": "send-slack-notification",
+       "params": [
+        {
+         "name": "message",
+         "value": "$(tasks.rhoai-init.results.slack-message-failure-text)"
+        }
+       ],
+       "when": [
+        {
+         "input": "$(tasks.pipeline-success-indicator.status)",
+         "operator": "notin",
+         "values": [
+          "Succeeded"
+         ]
+        },
+        {
+         "input": "$(tasks.rhoai-init.results.skip-slack-message)",
+         "operator": "in",
+         "values": [
+          "false"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "trigger-group-testing",
+       "when": [
+        {
+         "input": "$(tasks.pipeline-success-indicator.status)",
+         "operator": "in",
+         "values": [
+          "Succeeded"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "trigger-early-gate-build",
+       "when": [
+        {
+         "input": "$(tasks.pipeline-success-indicator.status)",
+         "operator": "in",
+         "values": [
+          "Succeeded"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "trigger-operator-build",
+       "when": [
+        {
+         "input": "$(tasks.pipeline-success-indicator.status)",
+         "operator": "in",
+         "values": [
+          "Succeeded"
+         ]
+        }
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "metadata": {
+    "name": "odh-openshell-e2e-on-push-kc6q2",
+    "namespace": "open-data-hub-tenant",
+    "uid": "a5192b26-d436-44c3-9bba-4b49da204b17",
+    "creationTimestamp": "2026-11-26T00:16:25Z",
+    "labels": {
+     "pipelinesascode.tekton.dev/cancel-in-progress": "false",
+     "pipelinesascode.tekton.dev/check-run-id": "139601094650",
+     "pipelinesascode.tekton.dev/event-type": "push",
+     "pipelinesascode.tekton.dev/original-prname": "odh-openshell-e2e-on-push",
+     "pipelinesascode.tekton.dev/repository": "github-com-opendatahub-io-openshell",
+     "pipelinesascode.tekton.dev/sha": "6a7acf93315fcccf66676784f1eb1ab1b3dae12a",
+     "pipelinesascode.tekton.dev/state": "queued",
+     "pipelinesascode.tekton.dev/url-org": "opendatahub-io",
+     "pipelinesascode.tekton.dev/url-repository": "openshell",
+     "tekton.dev/pipeline": "container-build"
+    },
+    "annotations": {
+     "pipelinesascode.tekton.dev/log-url": "https://konflux-ui.apps.stone-prd-rh01.pg1f.p1.openshiftapps.com/ns/open-data-hub-tenant/pipelinerun/odh-openshell-e2e-on-push-kc6q2"
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-11-26T00:23:00Z",
+      "message": "Tasks Completed: 4 (Failed: 0, Cancelled 0), Incomplete: 20, Skipped: 1",
+      "reason": "Running",
+      "status": "Unknown",
+      "type": "Succeeded"
+     }
+    ],
+    "startTime": "2026-11-26T00:17:13Z",
+    "childReferences": [
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-e2e-on-push-kc6q2-rhoai-init",
+      "pipelineTaskName": "rhoai-init"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-e2e-on-push-kc6q2-init",
+      "pipelineTaskName": "init"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-e2e-on-push-kc6q2-clone-repository",
+      "pipelineTaskName": "clone-repository"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-e2e-on-push-kc6q2-prefetch-dependencies",
+      "pipelineTaskName": "prefetch-dependencies"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-e2e-on-push-kc6q2-build-images-0",
+      "pipelineTaskName": "build-images"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-e2e-on-push-kc6q2-build-images-1",
+      "pipelineTaskName": "build-images"
+     }
+    ],
+    "skippedTasks": [
+     {
+      "name": "resolve-openclaw-release-tag",
+      "reason": "When Expressions evaluated to false"
+     }
+    ],
+    "pipelineSpec": {
+     "tasks": [
+      {
+       "name": "rhoai-init"
+      },
+      {
+       "name": "init",
+       "runAfter": [
+        "rhoai-init"
+       ]
+      },
+      {
+       "name": "clone-repository",
+       "runAfter": [
+        "init"
+       ],
+       "when": [
+        {
+         "input": "$(tasks.init.results.build)",
+         "operator": "in",
+         "values": [
+          "true"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "resolve-openclaw-release-tag",
+       "runAfter": [
+        "clone-repository"
+       ]
+      },
+      {
+       "name": "prefetch-dependencies",
+       "runAfter": [
+        "clone-repository",
+        "resolve-openclaw-release-tag"
+       ],
+       "params": [
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.clone-repository.results.SOURCE_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "build-images",
+       "runAfter": [
+        "prefetch-dependencies"
+       ],
+       "params": [
+        {
+         "name": "COMMIT_SHA",
+         "value": "$(tasks.clone-repository.results.commit)"
+        },
+        {
+         "name": "LABELS",
+         "value": [
+          "url=https://github.com/opendatahub-io/openshell",
+          "release=$(tasks.clone-repository.results.commit-timestamp)",
+          "git.url=https://github.com/opendatahub-io/openshell",
+          "git.commit=6a7acf93315fcccf66676784f1eb1ab1b3dae12a"
+         ]
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ],
+       "when": [
+        {
+         "input": "$(tasks.init.results.build)",
+         "operator": "in",
+         "values": [
+          "true"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "build-image-index",
+       "runAfter": [
+        "build-images"
+       ],
+       "params": [
+        {
+         "name": "COMMIT_SHA",
+         "value": "$(tasks.clone-repository.results.commit)"
+        },
+        {
+         "name": "IMAGES",
+         "value": [
+          "$(tasks.build-images.results.IMAGE_REF[*])"
+         ]
+        }
+       ],
+       "when": [
+        {
+         "input": "$(tasks.init.results.build)",
+         "operator": "in",
+         "values": [
+          "true"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "build-source-image",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "BINARY_IMAGE",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "BINARY_IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ],
+       "when": [
+        {
+         "input": "$(tasks.init.results.build)",
+         "operator": "in",
+         "values": [
+          "true"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "deprecated-base-image-check",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "IMAGE_URL",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        }
+       ]
+      },
+      {
+       "name": "clair-scan",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        }
+       ]
+      },
+      {
+       "name": "ecosystem-cert-preflight-checks",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        }
+       ]
+      },
+      {
+       "name": "sast-snyk-check",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "clamav-scan",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        }
+       ]
+      },
+      {
+       "name": "sast-shell-check",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "sast-unicode-check",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "apply-tags",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "IMAGE_URL",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "ADDITIONAL_TAGS",
+         "value": [
+          "$(tasks.rhoai-init.results.mandatory-tag)"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "apply-openclaw-release-tag",
+       "runAfter": [
+        "apply-tags"
+       ],
+       "params": [
+        {
+         "name": "IMAGE_URL",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "ADDITIONAL_TAGS",
+         "value": [
+          "$(tasks.resolve-openclaw-release-tag.results.version)"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "push-dockerfile",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "IMAGE",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "rpms-signature-scan",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        }
+       ]
+      },
+      {
+       "name": "pipeline-success-indicator",
+       "runAfter": [
+        "build-source-image",
+        "sast-shell-check",
+        "sast-unicode-check",
+        "deprecated-base-image-check",
+        "clair-scan",
+        "ecosystem-cert-preflight-checks",
+        "sast-snyk-check",
+        "clamav-scan",
+        "apply-tags",
+        "apply-openclaw-release-tag",
+        "push-dockerfile",
+        "rpms-signature-scan"
+       ]
+      }
+     ],
+     "finally": [
+      {
+       "name": "show-sbom",
+       "params": [
+        {
+         "name": "IMAGE_URL",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        }
+       ]
+      },
+      {
+       "name": "send-slack-notification",
+       "params": [
+        {
+         "name": "message",
+         "value": "$(tasks.rhoai-init.results.slack-message-failure-text)"
+        }
+       ],
+       "when": [
+        {
+         "input": "$(tasks.pipeline-success-indicator.status)",
+         "operator": "notin",
+         "values": [
+          "Succeeded"
+         ]
+        },
+        {
+         "input": "$(tasks.rhoai-init.results.skip-slack-message)",
+         "operator": "in",
+         "values": [
+          "false"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "trigger-group-testing",
+       "when": [
+        {
+         "input": "$(tasks.pipeline-success-indicator.status)",
+         "operator": "in",
+         "values": [
+          "Succeeded"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "trigger-early-gate-build",
+       "when": [
+        {
+         "input": "$(tasks.pipeline-success-indicator.status)",
+         "operator": "in",
+         "values": [
+          "Succeeded"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "trigger-operator-build",
+       "when": [
+        {
+         "input": "$(tasks.pipeline-success-indicator.status)",
+         "operator": "in",
+         "values": [
+          "Succeeded"
+         ]
+        }
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "metadata": {
+    "name": "odh-openshell-gateway-on-push-wcsxc",
+    "namespace": "open-data-hub-tenant",
+    "uid": "03240239-2605-456c-a75c-15e9be23adb3",
+    "creationTimestamp": "2026-11-26T00:16:25Z",
+    "labels": {
+     "pipelinesascode.tekton.dev/cancel-in-progress": "false",
+     "pipelinesascode.tekton.dev/check-run-id": "139601094548",
+     "pipelinesascode.tekton.dev/event-type": "push",
+     "pipelinesascode.tekton.dev/original-prname": "odh-openshell-gateway-on-push",
+     "pipelinesascode.tekton.dev/repository": "github-com-opendatahub-io-openshell",
+     "pipelinesascode.tekton.dev/sha": "6a7acf93315fcccf66676784f1eb1ab1b3dae12a",
+     "pipelinesascode.tekton.dev/state": "queued",
+     "pipelinesascode.tekton.dev/url-org": "opendatahub-io",
+     "pipelinesascode.tekton.dev/url-repository": "openshell",
+     "tekton.dev/pipeline": "container-build"
+    },
+    "annotations": {
+     "pipelinesascode.tekton.dev/log-url": "https://konflux-ui.apps.stone-prd-rh01.pg1f.p1.openshiftapps.com/ns/open-data-hub-tenant/pipelinerun/odh-openshell-gateway-on-push-wcsxc"
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-11-26T00:25:12Z",
+      "message": "Tasks Completed: 4 (Failed: 0, Cancelled 0), Incomplete: 20, Skipped: 1",
+      "reason": "Running",
+      "status": "Unknown",
+      "type": "Succeeded"
+     }
+    ],
+    "startTime": "2026-11-26T00:16:40Z",
+    "childReferences": [
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-gateway-on-push-wcsxc-rhoai-init",
+      "pipelineTaskName": "rhoai-init"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-gateway-on-push-wcsxc-init",
+      "pipelineTaskName": "init"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-gateway-on-push-wcsxc-clone-repository",
+      "pipelineTaskName": "clone-repository"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-gateway-on-push-wcsxc-prefetch-dependencies",
+      "pipelineTaskName": "prefetch-dependencies"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-gateway-on-push-wcsxc-build-images-0",
+      "pipelineTaskName": "build-images"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-gateway-on-push-wcsxc-build-images-1",
+      "pipelineTaskName": "build-images"
+     }
+    ],
+    "skippedTasks": [
+     {
+      "name": "resolve-openclaw-release-tag",
+      "reason": "When Expressions evaluated to false"
+     }
+    ],
+    "pipelineSpec": {
+     "tasks": [
+      {
+       "name": "rhoai-init"
+      },
+      {
+       "name": "init",
+       "runAfter": [
+        "rhoai-init"
+       ]
+      },
+      {
+       "name": "clone-repository",
+       "runAfter": [
+        "init"
+       ],
+       "when": [
+        {
+         "input": "$(tasks.init.results.build)",
+         "operator": "in",
+         "values": [
+          "true"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "resolve-openclaw-release-tag",
+       "runAfter": [
+        "clone-repository"
+       ]
+      },
+      {
+       "name": "prefetch-dependencies",
+       "runAfter": [
+        "clone-repository",
+        "resolve-openclaw-release-tag"
+       ],
+       "params": [
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.clone-repository.results.SOURCE_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "build-images",
+       "runAfter": [
+        "prefetch-dependencies"
+       ],
+       "params": [
+        {
+         "name": "COMMIT_SHA",
+         "value": "$(tasks.clone-repository.results.commit)"
+        },
+        {
+         "name": "LABELS",
+         "value": [
+          "url=https://github.com/opendatahub-io/openshell",
+          "release=$(tasks.clone-repository.results.commit-timestamp)",
+          "git.url=https://github.com/opendatahub-io/openshell",
+          "git.commit=6a7acf93315fcccf66676784f1eb1ab1b3dae12a"
+         ]
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ],
+       "when": [
+        {
+         "input": "$(tasks.init.results.build)",
+         "operator": "in",
+         "values": [
+          "true"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "build-image-index",
+       "runAfter": [
+        "build-images"
+       ],
+       "params": [
+        {
+         "name": "COMMIT_SHA",
+         "value": "$(tasks.clone-repository.results.commit)"
+        },
+        {
+         "name": "IMAGES",
+         "value": [
+          "$(tasks.build-images.results.IMAGE_REF[*])"
+         ]
+        }
+       ],
+       "when": [
+        {
+         "input": "$(tasks.init.results.build)",
+         "operator": "in",
+         "values": [
+          "true"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "build-source-image",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "BINARY_IMAGE",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "BINARY_IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ],
+       "when": [
+        {
+         "input": "$(tasks.init.results.build)",
+         "operator": "in",
+         "values": [
+          "true"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "deprecated-base-image-check",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "IMAGE_URL",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        }
+       ]
+      },
+      {
+       "name": "clair-scan",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        }
+       ]
+      },
+      {
+       "name": "ecosystem-cert-preflight-checks",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        }
+       ]
+      },
+      {
+       "name": "sast-snyk-check",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "clamav-scan",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        }
+       ]
+      },
+      {
+       "name": "sast-shell-check",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "sast-unicode-check",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "apply-tags",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "IMAGE_URL",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "ADDITIONAL_TAGS",
+         "value": [
+          "$(tasks.rhoai-init.results.mandatory-tag)"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "apply-openclaw-release-tag",
+       "runAfter": [
+        "apply-tags"
+       ],
+       "params": [
+        {
+         "name": "IMAGE_URL",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "ADDITIONAL_TAGS",
+         "value": [
+          "$(tasks.resolve-openclaw-release-tag.results.version)"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "push-dockerfile",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "IMAGE",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "rpms-signature-scan",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        }
+       ]
+      },
+      {
+       "name": "pipeline-success-indicator",
+       "runAfter": [
+        "build-source-image",
+        "sast-shell-check",
+        "sast-unicode-check",
+        "deprecated-base-image-check",
+        "clair-scan",
+        "ecosystem-cert-preflight-checks",
+        "sast-snyk-check",
+        "clamav-scan",
+        "apply-tags",
+        "apply-openclaw-release-tag",
+        "push-dockerfile",
+        "rpms-signature-scan"
+       ]
+      }
+     ],
+     "finally": [
+      {
+       "name": "show-sbom",
+       "params": [
+        {
+         "name": "IMAGE_URL",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        }
+       ]
+      },
+      {
+       "name": "send-slack-notification",
+       "params": [
+        {
+         "name": "message",
+         "value": "$(tasks.rhoai-init.results.slack-message-failure-text)"
+        }
+       ],
+       "when": [
+        {
+         "input": "$(tasks.pipeline-success-indicator.status)",
+         "operator": "notin",
+         "values": [
+          "Succeeded"
+         ]
+        },
+        {
+         "input": "$(tasks.rhoai-init.results.skip-slack-message)",
+         "operator": "in",
+         "values": [
+          "false"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "trigger-group-testing",
+       "when": [
+        {
+         "input": "$(tasks.pipeline-success-indicator.status)",
+         "operator": "in",
+         "values": [
+          "Succeeded"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "trigger-early-gate-build",
+       "when": [
+        {
+         "input": "$(tasks.pipeline-success-indicator.status)",
+         "operator": "in",
+         "values": [
+          "Succeeded"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "trigger-operator-build",
+       "when": [
+        {
+         "input": "$(tasks.pipeline-success-indicator.status)",
+         "operator": "in",
+         "values": [
+          "Succeeded"
+         ]
+        }
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "metadata": {
+    "name": "odh-openshell-sandbox-on-push-sv5nl",
+    "namespace": "open-data-hub-tenant",
+    "uid": "4d973c73-14e8-4b88-8b4a-8816739d6278",
+    "creationTimestamp": "2026-11-26T00:16:25Z",
+    "labels": {
+     "pipelinesascode.tekton.dev/cancel-in-progress": "false",
+     "pipelinesascode.tekton.dev/check-run-id": "139601094763",
+     "pipelinesascode.tekton.dev/event-type": "push",
+     "pipelinesascode.tekton.dev/original-prname": "odh-openshell-sandbox-on-push",
+     "pipelinesascode.tekton.dev/repository": "github-com-opendatahub-io-openshell",
+     "pipelinesascode.tekton.dev/sha": "6a7acf93315fcccf66676784f1eb1ab1b3dae12a",
+     "pipelinesascode.tekton.dev/state": "queued",
+     "pipelinesascode.tekton.dev/url-org": "opendatahub-io",
+     "pipelinesascode.tekton.dev/url-repository": "openshell",
+     "tekton.dev/pipeline": "container-build"
+    },
+    "annotations": {
+     "pipelinesascode.tekton.dev/log-url": "https://konflux-ui.apps.stone-prd-rh01.pg1f.p1.openshiftapps.com/ns/open-data-hub-tenant/pipelinerun/odh-openshell-sandbox-on-push-sv5nl"
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-11-26T00:21:11Z",
+      "message": "Tasks Completed: 4 (Failed: 0, Cancelled 0), Incomplete: 20, Skipped: 1",
+      "reason": "Running",
+      "status": "Unknown",
+      "type": "Succeeded"
+     }
+    ],
+    "startTime": "2026-11-26T00:16:34Z",
+    "childReferences": [
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-sandbox-on-push-sv5nl-rhoai-init",
+      "pipelineTaskName": "rhoai-init"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-sandbox-on-push-sv5nl-init",
+      "pipelineTaskName": "init"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-sandbox-on-push-sv5nl-clone-repository",
+      "pipelineTaskName": "clone-repository"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-sandbox-on-push-sv5nl-prefetch-dependencies",
+      "pipelineTaskName": "prefetch-dependencies"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-sandbox-on-push-sv5nl-build-images-0",
+      "pipelineTaskName": "build-images"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-sandbox-on-push-sv5nl-build-images-1",
+      "pipelineTaskName": "build-images"
+     }
+    ],
+    "skippedTasks": [
+     {
+      "name": "resolve-openclaw-release-tag",
+      "reason": "When Expressions evaluated to false"
+     }
+    ],
+    "pipelineSpec": {
+     "tasks": [
+      {
+       "name": "rhoai-init"
+      },
+      {
+       "name": "init",
+       "runAfter": [
+        "rhoai-init"
+       ]
+      },
+      {
+       "name": "clone-repository",
+       "runAfter": [
+        "init"
+       ],
+       "when": [
+        {
+         "input": "$(tasks.init.results.build)",
+         "operator": "in",
+         "values": [
+          "true"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "resolve-openclaw-release-tag",
+       "runAfter": [
+        "clone-repository"
+       ]
+      },
+      {
+       "name": "prefetch-dependencies",
+       "runAfter": [
+        "clone-repository",
+        "resolve-openclaw-release-tag"
+       ],
+       "params": [
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.clone-repository.results.SOURCE_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "build-images",
+       "runAfter": [
+        "prefetch-dependencies"
+       ],
+       "params": [
+        {
+         "name": "COMMIT_SHA",
+         "value": "$(tasks.clone-repository.results.commit)"
+        },
+        {
+         "name": "LABELS",
+         "value": [
+          "url=https://github.com/opendatahub-io/openshell",
+          "release=$(tasks.clone-repository.results.commit-timestamp)",
+          "git.url=https://github.com/opendatahub-io/openshell",
+          "git.commit=6a7acf93315fcccf66676784f1eb1ab1b3dae12a"
+         ]
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ],
+       "when": [
+        {
+         "input": "$(tasks.init.results.build)",
+         "operator": "in",
+         "values": [
+          "true"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "build-image-index",
+       "runAfter": [
+        "build-images"
+       ],
+       "params": [
+        {
+         "name": "COMMIT_SHA",
+         "value": "$(tasks.clone-repository.results.commit)"
+        },
+        {
+         "name": "IMAGES",
+         "value": [
+          "$(tasks.build-images.results.IMAGE_REF[*])"
+         ]
+        }
+       ],
+       "when": [
+        {
+         "input": "$(tasks.init.results.build)",
+         "operator": "in",
+         "values": [
+          "true"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "build-source-image",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "BINARY_IMAGE",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "BINARY_IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ],
+       "when": [
+        {
+         "input": "$(tasks.init.results.build)",
+         "operator": "in",
+         "values": [
+          "true"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "deprecated-base-image-check",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "IMAGE_URL",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        }
+       ]
+      },
+      {
+       "name": "clair-scan",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        }
+       ]
+      },
+      {
+       "name": "ecosystem-cert-preflight-checks",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        }
+       ]
+      },
+      {
+       "name": "sast-snyk-check",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "clamav-scan",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        }
+       ]
+      },
+      {
+       "name": "sast-shell-check",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "sast-unicode-check",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "apply-tags",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "IMAGE_URL",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "ADDITIONAL_TAGS",
+         "value": [
+          "$(tasks.rhoai-init.results.mandatory-tag)"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "apply-openclaw-release-tag",
+       "runAfter": [
+        "apply-tags"
+       ],
+       "params": [
+        {
+         "name": "IMAGE_URL",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "ADDITIONAL_TAGS",
+         "value": [
+          "$(tasks.resolve-openclaw-release-tag.results.version)"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "push-dockerfile",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "IMAGE",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "rpms-signature-scan",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        }
+       ]
+      },
+      {
+       "name": "pipeline-success-indicator",
+       "runAfter": [
+        "build-source-image",
+        "sast-shell-check",
+        "sast-unicode-check",
+        "deprecated-base-image-check",
+        "clair-scan",
+        "ecosystem-cert-preflight-checks",
+        "sast-snyk-check",
+        "clamav-scan",
+        "apply-tags",
+        "apply-openclaw-release-tag",
+        "push-dockerfile",
+        "rpms-signature-scan"
+       ]
+      }
+     ],
+     "finally": [
+      {
+       "name": "show-sbom",
+       "params": [
+        {
+         "name": "IMAGE_URL",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        }
+       ]
+      },
+      {
+       "name": "send-slack-notification",
+       "params": [
+        {
+         "name": "message",
+         "value": "$(tasks.rhoai-init.results.slack-message-failure-text)"
+        }
+       ],
+       "when": [
+        {
+         "input": "$(tasks.pipeline-success-indicator.status)",
+         "operator": "notin",
+         "values": [
+          "Succeeded"
+         ]
+        },
+        {
+         "input": "$(tasks.rhoai-init.results.skip-slack-message)",
+         "operator": "in",
+         "values": [
+          "false"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "trigger-group-testing",
+       "when": [
+        {
+         "input": "$(tasks.pipeline-success-indicator.status)",
+         "operator": "in",
+         "values": [
+          "Succeeded"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "trigger-early-gate-build",
+       "when": [
+        {
+         "input": "$(tasks.pipeline-success-indicator.status)",
+         "operator": "in",
+         "values": [
+          "Succeeded"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "trigger-operator-build",
+       "when": [
+        {
+         "input": "$(tasks.pipeline-success-indicator.status)",
+         "operator": "in",
+         "values": [
+          "Succeeded"
+         ]
+        }
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "metadata": {
+    "name": "odh-openshell-sandbox-openclaw-on-push-wtb9f",
+    "namespace": "open-data-hub-tenant",
+    "uid": "bdac3bb5-5f70-4178-b757-428301849c9f",
+    "creationTimestamp": "2026-11-26T00:16:25Z",
+    "labels": {
+     "pipelinesascode.tekton.dev/cancel-in-progress": "false",
+     "pipelinesascode.tekton.dev/check-run-id": "139601094735",
+     "pipelinesascode.tekton.dev/event-type": "push",
+     "pipelinesascode.tekton.dev/original-prname": "odh-openshell-sandbox-openclaw-on-push",
+     "pipelinesascode.tekton.dev/repository": "github-com-opendatahub-io-openshell",
+     "pipelinesascode.tekton.dev/sha": "6a7acf93315fcccf66676784f1eb1ab1b3dae12a",
+     "pipelinesascode.tekton.dev/state": "completed",
+     "pipelinesascode.tekton.dev/url-org": "opendatahub-io",
+     "pipelinesascode.tekton.dev/url-repository": "openshell",
+     "tekton.dev/pipeline": "container-build"
+    },
+    "annotations": {
+     "pipelinesascode.tekton.dev/log-url": "https://konflux-ui.apps.stone-prd-rh01.pg1f.p1.openshiftapps.com/ns/open-data-hub-tenant/pipelinerun/odh-openshell-sandbox-openclaw-on-push-wtb9f",
+     "results.tekton.dev/record": "open-data-hub-tenant/results/bdac3bb5-5f70-4178-b757-428301849c9f/records/bdac3bb5-5f70-4178-b757-428301849c9f"
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-11-26T00:29:09Z",
+      "message": "Tasks Completed: 21 (Failed: 0, Cancelled 0), Skipped: 4",
+      "reason": "Completed",
+      "status": "True",
+      "type": "Succeeded"
+     }
+    ],
+    "startTime": "2026-11-26T00:17:00Z",
+    "completionTime": "2026-11-26T00:29:09Z",
+    "childReferences": [
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-sandbox-openclaw-on-push-wtb9f-rhoai-init",
+      "pipelineTaskName": "rhoai-init"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-sandbox-openclaw-on-push-wtb9f-init",
+      "pipelineTaskName": "init"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-sandbox-openclaw-on-push-wtb9f-clone-repository",
+      "pipelineTaskName": "clone-repository"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "od794aae7e5f232e245b27e27422b4f353-resolve-openclaw-release-tag",
+      "pipelineTaskName": "resolve-openclaw-release-tag"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-opens794aae7e5f232e245b27e27422b4f353-prefetch-dependencies",
+      "pipelineTaskName": "prefetch-dependencies"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-sandbox-openclaw-on-push-wtb9f-build-images-0",
+      "pipelineTaskName": "build-images"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-sandbox-openclaw-on-push-wtb9f-build-images-1",
+      "pipelineTaskName": "build-images"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-sandbox-openclaw-on-push-wtb9f-build-image-index",
+      "pipelineTaskName": "build-image-index"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-sandbox-openclaw-on-push-wtb9f-build-source-image",
+      "pipelineTaskName": "build-source-image"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh794aae7e5f232e245b27e27422b4f353-deprecated-base-image-check",
+      "pipelineTaskName": "deprecated-base-image-check"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-sandbox-openclaw-on-push-wtb9f-clair-scan-0",
+      "pipelineTaskName": "clair-scan"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-sandbox-openclaw-on-push-wtb9f-clair-scan-1",
+      "pipelineTaskName": "clair-scan"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-sandbox-openclaw-on-push-wtb9f-sast-snyk-check",
+      "pipelineTaskName": "sast-snyk-check"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-sandbox-openclaw-on-push-wtb9f-clamav-scan-0",
+      "pipelineTaskName": "clamav-scan"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-sandbox-openclaw-on-push-wtb9f-clamav-scan-1",
+      "pipelineTaskName": "clamav-scan"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-sandbox-openclaw-on-push-wtb9f-sast-shell-check",
+      "pipelineTaskName": "sast-shell-check"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-sandbox-openclaw-on-push-wtb9f-sast-unicode-check",
+      "pipelineTaskName": "sast-unicode-check"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-sandbox-openclaw-on-push-wtb9f-apply-tags",
+      "pipelineTaskName": "apply-tags"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-794aae7e5f232e245b27e27422b4f353-apply-openclaw-release-tag",
+      "pipelineTaskName": "apply-openclaw-release-tag"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-sandbox-openclaw-on-push-wtb9f-push-dockerfile",
+      "pipelineTaskName": "push-dockerfile"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshe794aae7e5f232e245b27e27422b4f353-rpms-signature-scan",
+      "pipelineTaskName": "rpms-signature-scan"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-794aae7e5f232e245b27e27422b4f353-pipeline-success-indicator",
+      "pipelineTaskName": "pipeline-success-indicator"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-sandbox-openclaw-on-push-wtb9f-show-sbom",
+      "pipelineTaskName": "show-sbom"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-open794aae7e5f232e245b27e27422b4f353-trigger-operator-build",
+      "pipelineTaskName": "trigger-operator-build"
+     }
+    ],
+    "results": [
+     {
+      "name": "IMAGE_URL",
+      "value": "quay.io/opendatahub/odh-openshell-sandbox-openclaw:odh-stable"
+     },
+     {
+      "name": "IMAGE_DIGEST",
+      "value": "sha256:4df9a0dee769397e98f3a39475d24307eda480809c4de733c03c2781824f5409"
+     },
+     {
+      "name": "CHAINS-GIT_URL",
+      "value": "https://github.com/opendatahub-io/openshell"
+     },
+     {
+      "name": "CHAINS-GIT_COMMIT",
+      "value": "6a7acf93315fcccf66676784f1eb1ab1b3dae12a"
+     }
+    ],
+    "skippedTasks": [
+     {
+      "name": "ecosystem-cert-preflight-checks",
+      "reason": "When Expressions evaluated to false"
+     },
+     {
+      "name": "send-slack-notification",
+      "reason": "When Expressions evaluated to false"
+     },
+     {
+      "name": "trigger-group-testing",
+      "reason": "When Expressions evaluated to false"
+     },
+     {
+      "name": "trigger-early-gate-build",
+      "reason": "When Expressions evaluated to false"
+     }
+    ],
+    "pipelineSpec": {
+     "tasks": [
+      {
+       "name": "rhoai-init"
+      },
+      {
+       "name": "init",
+       "runAfter": [
+        "rhoai-init"
+       ]
+      },
+      {
+       "name": "clone-repository",
+       "runAfter": [
+        "init"
+       ],
+       "when": [
+        {
+         "input": "$(tasks.init.results.build)",
+         "operator": "in",
+         "values": [
+          "true"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "resolve-openclaw-release-tag",
+       "runAfter": [
+        "clone-repository"
+       ]
+      },
+      {
+       "name": "prefetch-dependencies",
+       "runAfter": [
+        "clone-repository",
+        "resolve-openclaw-release-tag"
+       ],
+       "params": [
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.clone-repository.results.SOURCE_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "build-images",
+       "runAfter": [
+        "prefetch-dependencies"
+       ],
+       "params": [
+        {
+         "name": "COMMIT_SHA",
+         "value": "$(tasks.clone-repository.results.commit)"
+        },
+        {
+         "name": "LABELS",
+         "value": [
+          "url=https://github.com/opendatahub-io/openshell",
+          "release=$(tasks.clone-repository.results.commit-timestamp)",
+          "git.url=https://github.com/opendatahub-io/openshell",
+          "git.commit=6a7acf93315fcccf66676784f1eb1ab1b3dae12a"
+         ]
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ],
+       "when": [
+        {
+         "input": "$(tasks.init.results.build)",
+         "operator": "in",
+         "values": [
+          "true"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "build-image-index",
+       "runAfter": [
+        "build-images"
+       ],
+       "params": [
+        {
+         "name": "COMMIT_SHA",
+         "value": "$(tasks.clone-repository.results.commit)"
+        },
+        {
+         "name": "IMAGES",
+         "value": [
+          "$(tasks.build-images.results.IMAGE_REF[*])"
+         ]
+        }
+       ],
+       "when": [
+        {
+         "input": "$(tasks.init.results.build)",
+         "operator": "in",
+         "values": [
+          "true"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "build-source-image",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "BINARY_IMAGE",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "BINARY_IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ],
+       "when": [
+        {
+         "input": "$(tasks.init.results.build)",
+         "operator": "in",
+         "values": [
+          "true"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "deprecated-base-image-check",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "IMAGE_URL",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        }
+       ]
+      },
+      {
+       "name": "clair-scan",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        }
+       ]
+      },
+      {
+       "name": "ecosystem-cert-preflight-checks",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        }
+       ]
+      },
+      {
+       "name": "sast-snyk-check",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "clamav-scan",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        }
+       ]
+      },
+      {
+       "name": "sast-shell-check",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "sast-unicode-check",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "apply-tags",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "IMAGE_URL",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "ADDITIONAL_TAGS",
+         "value": [
+          "$(tasks.rhoai-init.results.mandatory-tag)"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "apply-openclaw-release-tag",
+       "runAfter": [
+        "apply-tags"
+       ],
+       "params": [
+        {
+         "name": "IMAGE_URL",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "ADDITIONAL_TAGS",
+         "value": [
+          "$(tasks.resolve-openclaw-release-tag.results.version)"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "push-dockerfile",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "IMAGE",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "rpms-signature-scan",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        }
+       ]
+      },
+      {
+       "name": "pipeline-success-indicator",
+       "runAfter": [
+        "build-source-image",
+        "sast-shell-check",
+        "sast-unicode-check",
+        "deprecated-base-image-check",
+        "clair-scan",
+        "ecosystem-cert-preflight-checks",
+        "sast-snyk-check",
+        "clamav-scan",
+        "apply-tags",
+        "apply-openclaw-release-tag",
+        "push-dockerfile",
+        "rpms-signature-scan"
+       ]
+      }
+     ],
+     "finally": [
+      {
+       "name": "show-sbom",
+       "params": [
+        {
+         "name": "IMAGE_URL",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        }
+       ]
+      },
+      {
+       "name": "send-slack-notification",
+       "params": [
+        {
+         "name": "message",
+         "value": "$(tasks.rhoai-init.results.slack-message-failure-text)"
+        }
+       ],
+       "when": [
+        {
+         "input": "$(tasks.pipeline-success-indicator.status)",
+         "operator": "notin",
+         "values": [
+          "Succeeded"
+         ]
+        },
+        {
+         "input": "$(tasks.rhoai-init.results.skip-slack-message)",
+         "operator": "in",
+         "values": [
+          "false"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "trigger-group-testing",
+       "when": [
+        {
+         "input": "$(tasks.pipeline-success-indicator.status)",
+         "operator": "in",
+         "values": [
+          "Succeeded"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "trigger-early-gate-build",
+       "when": [
+        {
+         "input": "$(tasks.pipeline-success-indicator.status)",
+         "operator": "in",
+         "values": [
+          "Succeeded"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "trigger-operator-build",
+       "when": [
+        {
+         "input": "$(tasks.pipeline-success-indicator.status)",
+         "operator": "in",
+         "values": [
+          "Succeeded"
+         ]
+        }
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "metadata": {
+    "name": "odh-openshell-supervisor-on-push-pm2c4",
+    "namespace": "open-data-hub-tenant",
+    "uid": "a95fe137-03ee-4b4c-b613-58a554a55b32",
+    "creationTimestamp": "2026-11-26T00:16:25Z",
+    "labels": {
+     "pipelinesascode.tekton.dev/cancel-in-progress": "false",
+     "pipelinesascode.tekton.dev/check-run-id": "139601095214",
+     "pipelinesascode.tekton.dev/event-type": "push",
+     "pipelinesascode.tekton.dev/original-prname": "odh-openshell-supervisor-on-push",
+     "pipelinesascode.tekton.dev/repository": "github-com-opendatahub-io-openshell",
+     "pipelinesascode.tekton.dev/sha": "6a7acf93315fcccf66676784f1eb1ab1b3dae12a",
+     "pipelinesascode.tekton.dev/state": "queued",
+     "pipelinesascode.tekton.dev/url-org": "opendatahub-io",
+     "pipelinesascode.tekton.dev/url-repository": "openshell",
+     "tekton.dev/pipeline": "container-build"
+    },
+    "annotations": {
+     "pipelinesascode.tekton.dev/log-url": "https://konflux-ui.apps.stone-prd-rh01.pg1f.p1.openshiftapps.com/ns/open-data-hub-tenant/pipelinerun/odh-openshell-supervisor-on-push-pm2c4"
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-11-26T00:22:35Z",
+      "message": "Tasks Completed: 4 (Failed: 0, Cancelled 0), Incomplete: 20, Skipped: 1",
+      "reason": "Running",
+      "status": "Unknown",
+      "type": "Succeeded"
+     }
+    ],
+    "startTime": "2026-11-26T00:17:05Z",
+    "childReferences": [
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-supervisor-on-push-pm2c4-rhoai-init",
+      "pipelineTaskName": "rhoai-init"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-supervisor-on-push-pm2c4-init",
+      "pipelineTaskName": "init"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-supervisor-on-push-pm2c4-clone-repository",
+      "pipelineTaskName": "clone-repository"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-supervisor-on-push-pm2c4-prefetch-dependencies",
+      "pipelineTaskName": "prefetch-dependencies"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-supervisor-on-push-pm2c4-build-images-0",
+      "pipelineTaskName": "build-images"
+     },
+     {
+      "kind": "TaskRun",
+      "name": "odh-openshell-supervisor-on-push-pm2c4-build-images-1",
+      "pipelineTaskName": "build-images"
+     }
+    ],
+    "skippedTasks": [
+     {
+      "name": "resolve-openclaw-release-tag",
+      "reason": "When Expressions evaluated to false"
+     }
+    ],
+    "pipelineSpec": {
+     "tasks": [
+      {
+       "name": "rhoai-init"
+      },
+      {
+       "name": "init",
+       "runAfter": [
+        "rhoai-init"
+       ]
+      },
+      {
+       "name": "clone-repository",
+       "runAfter": [
+        "init"
+       ],
+       "when": [
+        {
+         "input": "$(tasks.init.results.build)",
+         "operator": "in",
+         "values": [
+          "true"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "resolve-openclaw-release-tag",
+       "runAfter": [
+        "clone-repository"
+       ]
+      },
+      {
+       "name": "prefetch-dependencies",
+       "runAfter": [
+        "clone-repository",
+        "resolve-openclaw-release-tag"
+       ],
+       "params": [
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.clone-repository.results.SOURCE_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "build-images",
+       "runAfter": [
+        "prefetch-dependencies"
+       ],
+       "params": [
+        {
+         "name": "COMMIT_SHA",
+         "value": "$(tasks.clone-repository.results.commit)"
+        },
+        {
+         "name": "LABELS",
+         "value": [
+          "url=https://github.com/opendatahub-io/openshell",
+          "release=$(tasks.clone-repository.results.commit-timestamp)",
+          "git.url=https://github.com/opendatahub-io/openshell",
+          "git.commit=6a7acf93315fcccf66676784f1eb1ab1b3dae12a"
+         ]
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ],
+       "when": [
+        {
+         "input": "$(tasks.init.results.build)",
+         "operator": "in",
+         "values": [
+          "true"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "build-image-index",
+       "runAfter": [
+        "build-images"
+       ],
+       "params": [
+        {
+         "name": "COMMIT_SHA",
+         "value": "$(tasks.clone-repository.results.commit)"
+        },
+        {
+         "name": "IMAGES",
+         "value": [
+          "$(tasks.build-images.results.IMAGE_REF[*])"
+         ]
+        }
+       ],
+       "when": [
+        {
+         "input": "$(tasks.init.results.build)",
+         "operator": "in",
+         "values": [
+          "true"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "build-source-image",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "BINARY_IMAGE",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "BINARY_IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ],
+       "when": [
+        {
+         "input": "$(tasks.init.results.build)",
+         "operator": "in",
+         "values": [
+          "true"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "deprecated-base-image-check",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "IMAGE_URL",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        }
+       ]
+      },
+      {
+       "name": "clair-scan",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        }
+       ]
+      },
+      {
+       "name": "ecosystem-cert-preflight-checks",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        }
+       ]
+      },
+      {
+       "name": "sast-snyk-check",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "clamav-scan",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        }
+       ]
+      },
+      {
+       "name": "sast-shell-check",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "sast-unicode-check",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        },
+        {
+         "name": "CACHI2_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.CACHI2_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "apply-tags",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "IMAGE_URL",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "ADDITIONAL_TAGS",
+         "value": [
+          "$(tasks.rhoai-init.results.mandatory-tag)"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "apply-openclaw-release-tag",
+       "runAfter": [
+        "apply-tags"
+       ],
+       "params": [
+        {
+         "name": "IMAGE_URL",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "ADDITIONAL_TAGS",
+         "value": [
+          "$(tasks.resolve-openclaw-release-tag.results.version)"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "push-dockerfile",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "IMAGE",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "IMAGE_DIGEST",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        },
+        {
+         "name": "SOURCE_ARTIFACT",
+         "value": "$(tasks.prefetch-dependencies.results.SOURCE_ARTIFACT)"
+        }
+       ]
+      },
+      {
+       "name": "rpms-signature-scan",
+       "runAfter": [
+        "build-image-index"
+       ],
+       "params": [
+        {
+         "name": "image-url",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        },
+        {
+         "name": "image-digest",
+         "value": "$(tasks.build-image-index.results.IMAGE_DIGEST)"
+        }
+       ]
+      },
+      {
+       "name": "pipeline-success-indicator",
+       "runAfter": [
+        "build-source-image",
+        "sast-shell-check",
+        "sast-unicode-check",
+        "deprecated-base-image-check",
+        "clair-scan",
+        "ecosystem-cert-preflight-checks",
+        "sast-snyk-check",
+        "clamav-scan",
+        "apply-tags",
+        "apply-openclaw-release-tag",
+        "push-dockerfile",
+        "rpms-signature-scan"
+       ]
+      }
+     ],
+     "finally": [
+      {
+       "name": "show-sbom",
+       "params": [
+        {
+         "name": "IMAGE_URL",
+         "value": "$(tasks.build-image-index.results.IMAGE_URL)"
+        }
+       ]
+      },
+      {
+       "name": "send-slack-notification",
+       "params": [
+        {
+         "name": "message",
+         "value": "$(tasks.rhoai-init.results.slack-message-failure-text)"
+        }
+       ],
+       "when": [
+        {
+         "input": "$(tasks.pipeline-success-indicator.status)",
+         "operator": "notin",
+         "values": [
+          "Succeeded"
+         ]
+        },
+        {
+         "input": "$(tasks.rhoai-init.results.skip-slack-message)",
+         "operator": "in",
+         "values": [
+          "false"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "trigger-group-testing",
+       "when": [
+        {
+         "input": "$(tasks.pipeline-success-indicator.status)",
+         "operator": "in",
+         "values": [
+          "Succeeded"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "trigger-early-gate-build",
+       "when": [
+        {
+         "input": "$(tasks.pipeline-success-indicator.status)",
+         "operator": "in",
+         "values": [
+          "Succeeded"
+         ]
+        }
+       ]
+      },
+      {
+       "name": "trigger-operator-build",
+       "when": [
+        {
+         "input": "$(tasks.pipeline-success-indicator.status)",
+         "operator": "in",
+         "values": [
+          "Succeeded"
+         ]
+        }
+       ]
+      }
+     ]
+    }
+   }
+  }
+ ]
+}

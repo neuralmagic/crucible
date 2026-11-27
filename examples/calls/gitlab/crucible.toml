@@ -1,0 +1,18 @@
+# calls/gitlab: a playbook that runs a GitLab pipeline with typed inputs, then reads the
+# pipeline's result fields and an artifact file it staged. Commands only, no model.
+#
+#   CALLS_GITLAB_PROJECT=gitlab.com/<group>/<project> just calls-gitlab-example
+
+edition = 2
+
+[workspace]
+inject = ["prep.py", "report.py"]
+
+[agent]
+backend   = "command"
+agent_cmd = "true"
+goal      = "Pick pipeline inputs, run a GitLab pipeline, and report its result and artifact."
+
+[workflow]
+type = "playbook"
+file = "workflow.star"

@@ -23,6 +23,7 @@ pub mod api;
 pub mod authz;
 #[cfg(feature = "autoresearch")]
 pub mod builds;
+pub mod calls;
 pub mod client;
 pub(crate) mod clock;
 pub mod config;
@@ -123,6 +124,7 @@ pub(crate) fn human_router(
         guard: both.clone(),
     });
     let decisions = decisions::run_routes(state.db.clone());
+    let calls = calls::api::run_routes(state.clone());
     let router = api::router(state)
         .merge(spa::router(ui, next))
         .layer(axum::middleware::from_fn_with_state(
@@ -131,6 +133,7 @@ pub(crate) fn human_router(
         ))
         .merge(evidence)
         .merge(decisions)
+        .merge(calls)
         .merge(identity::oidc::routes::router(auth.routes));
     let router = match auth.issuer.filter(|i| i.people.is_some()) {
         Some(issuer) => router.merge(agent_auth::people::router(issuer)),

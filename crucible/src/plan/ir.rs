@@ -524,6 +524,40 @@ impl Join {
     }
 }
 
+/// Where one target parameter's value comes from. Every value is bound when the call becomes
+/// ready, never at compile time.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "from", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Binding {
+    Literal {
+        value: serde_json::Value,
+    },
+    Param {
+        name: String,
+    },
+    Field {
+        producer: TaskName,
+        field: OutputField,
+    },
+    File {
+        producer: TaskName,
+        path: String,
+    },
+    Item {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        field: Option<OutputField>,
+    },
+}
+
+impl Binding {
+    pub fn producer(&self) -> Option<&TaskName> {
+        match self {
+            Binding::Field { producer, .. } | Binding::File { producer, .. } => Some(producer),
+            Binding::Literal { .. } | Binding::Param { .. } | Binding::Item { .. } => None,
+        }
+    }
+}
+
 /// What a task *is*. The executor owns advancement; agents only ever run inside `Agent` tasks.
 ///
 /// Internally tagged so TOML and JSON authoring read naturally:
@@ -577,6 +611,18 @@ pub enum TaskKind {
         questions: BTreeMap<QuestionId, CompiledQuestion>,
         decider: Decider,
     },
+    Call {
+        alias: crucible_contract::calls::CallAlias,
+        target: crucible_contract::calls::CallKind,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        bindings: BTreeMap<String, Binding>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        budget: Option<crucible_contract::calls::CallBudget>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        interface_digest: String,
+        #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+        file_params: BTreeSet<String>,
+    },
     /// A capability-owned engine operation.
     Engine {
         op: EngineOp,
@@ -600,6 +646,7 @@ impl TaskKind {
             TaskKind::Report { .. } => "report",
             TaskKind::TopK { .. } => "top_k",
             TaskKind::Route { .. } => "route",
+            TaskKind::Call { .. } => "call",
             TaskKind::Engine { op, .. } => match op {
                 EngineOp::Propose => "engine_propose",
                 EngineOp::Apply => "engine_apply",
@@ -633,6 +680,7 @@ impl TaskKind {
             | TaskKind::Evaluate { .. }
             | TaskKind::Report { .. }
             | TaskKind::TopK { .. }
+            | TaskKind::Call { .. }
             | TaskKind::Route {
                 decider: Decider::Output { .. } | Decider::Human { .. },
                 ..
@@ -2856,6 +2904,7 @@ impl Plan {
 #[cfg(test)]
 mod tests {
     use crate::plan::ir::*;
+    use serde_json::json;
 
     fn agent(name: &str, deps: &[&str]) -> Task {
         Task {
@@ -6626,5 +6675,96 @@ emits = ["lines"]
             .unwrap();
         assert!(listed.admits("scheduler"));
         assert!(!listed.admits("frontend"));
+    }
+
+    #[test]
+    fn a_call_task_kind_round_trips() {
+        let kind: TaskKind = serde_json::from_value(serde_json::json!({
+            "kind": "call",
+            "alias": "release",
+            "target": "github_workflow",
+            "bindings": {
+                "version": {"from": "field", "producer": "plan", "field": "version"},
+                "notes": {"from": "file", "producer": "plan", "path": "notes.md"},
+            },
+            "budget": {"wall_clock_secs": 600},
+        }))
+        .unwrap();
+        let TaskKind::Call {
+            alias,
+            target,
+            bindings,
+            budget,
+            ..
+        } = &kind
+        else {
+            panic!("decoded {kind:?}");
+        };
+        assert_eq!(alias.as_str(), "release");
+        assert_eq!(*target, crucible_contract::calls::CallKind::GithubWorkflow);
+        assert_eq!(bindings.len(), 2);
+        assert_eq!(budget.and_then(|b| b.wall_clock_secs), Some(600));
+        assert_eq!(kind.label(), "call");
+        assert!(!kind.spends());
+        assert!(!kind.may_complete_early());
+        let again: TaskKind = serde_json::from_value(serde_json::to_value(&kind).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&again).unwrap(),
+            serde_json::to_value(&kind).unwrap()
+        );
+        assert!(
+            serde_json::from_value::<TaskKind>(
+                serde_json::json!({"kind": "call", "alias": "Bad", "target": "playbook"})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bindings_round_trip_by_source() {
+        for (binding, wire) in [
+            (
+                Binding::Literal {
+                    value: json!({"a": [1]}),
+                },
+                json!({"from": "literal", "value": {"a": [1]}}),
+            ),
+            (
+                Binding::Param {
+                    name: "repo".into(),
+                },
+                json!({"from": "param", "name": "repo"}),
+            ),
+            (
+                Binding::Field {
+                    producer: TaskName("plan".into()),
+                    field: OutputField("version".into()),
+                },
+                json!({"from": "field", "producer": "plan", "field": "version"}),
+            ),
+            (
+                Binding::File {
+                    producer: TaskName("plan".into()),
+                    path: "notes.md".into(),
+                },
+                json!({"from": "file", "producer": "plan", "path": "notes.md"}),
+            ),
+            (Binding::Item { field: None }, json!({"from": "item"})),
+        ] {
+            assert_eq!(serde_json::to_value(&binding).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<Binding>(wire).unwrap(),
+                binding.clone()
+            );
+        }
+        assert_eq!(
+            Binding::File {
+                producer: TaskName("p".into()),
+                path: "x".into()
+            }
+            .producer(),
+            Some(&TaskName("p".into()))
+        );
+        assert!(serde_json::from_value::<Binding>(json!({"from": "env"})).is_err());
     }
 }

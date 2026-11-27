@@ -349,6 +349,24 @@ jobs:
         run: sccache --show-stats
 
   # The rendered RFCs and ADRs against their governance source; no Rust build.
+  comments:
+    if: github.event_name != 'workflow_dispatch'
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install ast-grep
+        run: pip install --user ast-grep-cli==0.45.3
+
+      - name: No comments added to Rust beyond module and type docs
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || github.event.merge_group.base_sha }}
+        run: python3 scripts/no-new-comments.py --base "$BASE"
+
   gov:
     needs: changes
     if: needs.changes.outputs.gov == 'true'

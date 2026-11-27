@@ -5,6 +5,8 @@
 //! [`crate::plan::starlark::known_kwargs`], so a constructor cannot be added, renamed, or given a
 //! new argument without the reference following it.
 
+pub mod modules;
+
 use crate::plan::attempt::DeclaredStatus;
 use crate::plan::ir::KEPT_INPUT;
 use crate::plan::ir::{HISTORY_INPUT, ITEM_INPUT, OUTCOME_INPUT, PARAMS_INPUT, REVISION_INPUT};
@@ -43,7 +45,7 @@ pub struct Kwarg {
 }
 
 impl Kwarg {
-    fn new(name: &'static str, ty: &'static str, purpose: impl Into<String>) -> Self {
+    pub(crate) fn new(name: &'static str, ty: &'static str, purpose: impl Into<String>) -> Self {
         Kwarg {
             name,
             ty,
@@ -475,13 +477,16 @@ pub fn functions() -> Vec<Function> {
         Function {
             name: "param",
             lane: Lane::Common,
-            purpose: "Read a launch parameter. The `params` block must be the source's first \
-                      statement, and a source that declares one compiles per run. A supplied \
+            purpose: "Read a launch parameter. The `params` block must come before every \
+                      statement but `calls`, and a source that declares one compiles per run. A supplied \
                       value may reach a prompt, with `+` and inside a region marked as external \
                       input, or a skill argument; `str()`, `%`, `.format()`, and string methods \
                       on it are refused, as is a value carrying the marker text. A command or \
                       evaluate task reads it from `params` in the inputs JSON at \
-                      `CRUCIBLE_INPUTS_FILE` instead of its command line.",
+                      `CRUCIBLE_INPUTS_FILE` instead of its command line. A json or file \
+                      parameter binds a call's parameter, or reaches an agent's prompt or a skill \
+                      argument only inside the external-input markers: a json value as JSON, a \
+                      file as its read-only copy under `inputs/params/<name>/`.",
             positional: Some("name"),
             kwargs: vec![],
         },
@@ -686,6 +691,136 @@ pub fn functions() -> Vec<Function> {
                 answers_kwarg(),
                 otherwise_kwarg(),
             ],
+        },
+        Function {
+            name: "call",
+            lane: Lane::Routed,
+            purpose: "Engine-owned dispatch of a target from `@crucible//calls`, as a run of its \
+                      own, compiled against the pack's `calls.lock`. The call waits for the target \
+                      run and \
+                      settles as it ended; its output is the target's result and its files are \
+                      the target's result files.",
+            positional: None,
+            kwargs: vec![
+                name_kwarg(),
+                Kwarg::new(
+                    "target",
+                    "playbook(...) | github_workflow(...) | gitlab_pipeline(...)",
+                    "The target, written here or bound to a top-level name.",
+                ),
+                Kwarg::new(
+                    "params",
+                    "dict[str, value]",
+                    "The target's parameters, each bound to a literal, `param(name)`, \
+                     `producer.field`, `producer.files[\"path\"]`, or in a mapped call `item()`. \
+                     A producer is made a dependency. Every binding is checked against the \
+                     lock's interface: an unknown name, an unbound required parameter, a \
+                     field of another type, or a file to a non-file parameter is refused.",
+                ),
+                Kwarg::new(
+                    "over",
+                    "each(producer.field, max = N)",
+                    format!(
+                        "Dispatch one target run per item, at most {MAX_CALL_FANOUT}.",
+                        MAX_CALL_FANOUT = crucible_contract::calls::MAX_CALL_FANOUT
+                    ),
+                ),
+                max_fanout_kwarg(),
+                Kwarg::new(
+                    "budget",
+                    "budget(cost = usd, wall_clock = duration)",
+                    "The target run's own ceilings, in place of the controller's launch \
+                     defaults. The caller's ceilings keep running while it waits.",
+                ),
+                Kwarg::new(
+                    "depends_on",
+                    "list[task]",
+                    "Dependencies besides the producers its params read.",
+                ),
+                Kwarg::new("required", "bool", "False makes the call advisory."),
+                Kwarg::new(
+                    "join",
+                    "\"all\" | \"passed\" | \"settled\"",
+                    "As on any task.",
+                ),
+                Kwarg::new("stage", "\"iteration\" | \"epilogue\"", "As on any task."),
+                when_kwarg(),
+                answers_kwarg(),
+                otherwise_kwarg(),
+            ],
+        },
+        Function {
+            name: "watch",
+            lane: Lane::Routed,
+            purpose: "Engine-owned wait for the runs a commit started on a target's system, such \
+                      as the Pipelines-as-Code PipelineRuns a push or pull request triggered. The \
+                      target is a `tekton(...)` from `@crucible//calls`. The watch adds every run that appears within `appear`, passes once every \
+                      matched run passed, fails as soon as one fails, and never cancels a run. Its \
+                      output has `runs` and, per expected run, the results it declares.",
+            positional: None,
+            kwargs: vec![
+                name_kwarg(),
+                Kwarg::new(
+                    "target",
+                    "tekton(...)",
+                    "The target, written here or bound to a top-level name.",
+                ),
+                Kwarg::new(
+                    "commit",
+                    "str",
+                    "The full commit id, as a literal, `param(name)`, or `producer.field`.",
+                ),
+                Kwarg::new(
+                    "timeout",
+                    "duration",
+                    "How long the watch waits in all before it fails.",
+                ),
+                Kwarg::new(
+                    "appear",
+                    "duration",
+                    "How long runs may take to appear; 10m when unset.",
+                ),
+                Kwarg::new(
+                    "depends_on",
+                    "list[task]",
+                    "Dependencies besides the producer its commit reads.",
+                ),
+                Kwarg::new("required", "bool", "False makes the watch advisory."),
+                Kwarg::new(
+                    "join",
+                    "\"all\" | \"passed\" | \"settled\"",
+                    "As on any task.",
+                ),
+                Kwarg::new("stage", "\"iteration\" | \"epilogue\"", "As on any task."),
+                when_kwarg(),
+                answers_kwarg(),
+                otherwise_kwarg(),
+            ],
+        },
+        Function {
+            name: "budget",
+            lane: Lane::Routed,
+            purpose: "A call's ceilings for its target run.",
+            positional: None,
+            kwargs: vec![
+                Kwarg::new(
+                    "cost",
+                    "number",
+                    "The target run's cost ceiling in dollars.",
+                ),
+                Kwarg::new(
+                    "wall_clock",
+                    "duration",
+                    "The target run's wall-clock ceiling, such as `\"30m\"`.",
+                ),
+            ],
+        },
+        Function {
+            name: "item",
+            lane: Lane::Routed,
+            purpose: "A mapped call's own item, as a value in `params`.",
+            positional: None,
+            kwargs: vec![],
         },
         Function {
             name: "model",
@@ -1007,7 +1142,7 @@ fn dialect_sentence() -> String {
 }
 
 /// A pipe ends a table cell, including inside a code span, so a union type has to escape it.
-fn cell(text: &str) -> String {
+pub(crate) fn cell(text: &str) -> String {
     text.replace('|', "\\|")
 }
 
@@ -1074,6 +1209,8 @@ pub fn markdown() -> String {
             out.push('\n');
         }
     }
+
+    modules::markdown(&mut out);
 
     out.push_str(
         "## Reserved fields\n\nNames the engine reads and writes for itself. They are not \

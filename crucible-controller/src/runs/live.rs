@@ -859,6 +859,12 @@ pub(crate) async fn live_response(
     if run.status != "running" {
         return end_sse(EndReason::RunNotRunning);
     }
+    if run.pod.as_deref().is_none_or(str::is_empty)
+        && let Some(path) = crate::runs::local_run::live_session(&state.scratch_dir, run_id)
+    {
+        let rx = spawn_local_relay(path, state.db.clone(), run_id.to_owned(), resume.session);
+        return relay_sse(rx, resume);
+    }
     let Some(pod) = run.pod.filter(|p| !p.is_empty()) else {
         return end_sse(EndReason::PodGone);
     };
@@ -896,6 +902,77 @@ pub(crate) async fn live_response(
 
     let rx = spawn_relay(addr, resume.session, metrics);
     relay_sse(rx, resume)
+}
+
+const LOCAL_TAIL_EVERY: Duration = Duration::from_secs(1);
+
+fn spawn_local_relay(
+    path: std::path::PathBuf,
+    db: crate::client::Db,
+    run_id: String,
+    from_seq: SessionSeq,
+) -> mpsc::Receiver<RelayEvent> {
+    let (tx, rx) = mpsc::channel(CHANNEL_CAP);
+    tokio::spawn(local_relay_task(path, db, run_id, from_seq, tx));
+    rx
+}
+
+async fn local_relay_task(
+    path: std::path::PathBuf,
+    db: crate::client::Db,
+    run_id: String,
+    from_seq: SessionSeq,
+    tx: mpsc::Sender<RelayEvent>,
+) {
+    let deadline = tokio::time::Instant::now() + SPOKE_STREAM_DEADLINE;
+    let mut sent = from_seq.0;
+    loop {
+        let text = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+        for (seq, line) in complete_lines(&text) {
+            if seq <= sent {
+                continue;
+            }
+            sent = seq;
+            let event = RelayEvent::Session {
+                seq: SessionSeq::new(seq),
+                line: line.to_owned(),
+            };
+            if tx.send(event).await.is_err() {
+                return;
+            }
+        }
+        let running = crate::runs::store::get_run(db.pool(), &run_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|run| run.status == "running");
+        let end = match (running, tokio::time::Instant::now() >= deadline) {
+            (false, _) => Some(EndReason::Completed("run ended".to_owned())),
+            (true, true) => Some(EndReason::Timeout),
+            (true, false) => None,
+        };
+        if let Some(reason) = end {
+            let _ = tx.send(RelayEvent::End(reason)).await;
+            return;
+        }
+        if tx.is_closed() {
+            return;
+        }
+        tokio::time::sleep(LOCAL_TAIL_EVERY).await;
+    }
+}
+
+fn complete_lines(text: &str) -> Vec<(u64, &str)> {
+    let complete = text
+        .rfind('\n')
+        .and_then(|end| text.get(..end))
+        .unwrap_or_default();
+    complete
+        .split('\n')
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(i, line)| (u64::try_from(i).unwrap_or(u64::MAX).saturating_add(1), line))
+        .collect()
 }
 
 /// Truncate to at most `cap` bytes on a char boundary, marking the cut.
@@ -1839,5 +1916,15 @@ mod tests {
             !crate::runs::model::RunLocation::new("personal:abc", None).is_hub(),
             "a personal target is never the controller's own cluster"
         );
+    }
+
+    #[test]
+    fn a_local_session_streams_only_complete_lines_numbered_from_one() {
+        assert_eq!(
+            crate::runs::live::complete_lines("{\"a\":1}\n\n{\"b\":2}\n{\"c\""),
+            [(1, "{\"a\":1}"), (3, "{\"b\":2}")]
+        );
+        assert!(crate::runs::live::complete_lines("{\"partial\"").is_empty());
+        assert!(crate::runs::live::complete_lines("").is_empty());
     }
 }

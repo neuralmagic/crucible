@@ -95,6 +95,8 @@ pub(crate) fn init() -> App {
         rail_drag: None,
         geometry: Geometry::default(),
         ignition: ignition::Ignition::default(),
+        afterglows: Default::default(),
+        runs_unfolded: Default::default(),
         logo_clicks: 0,
         logo_screen: [0.0; 2],
         targets: HashMap::from([(name, (target, keeper))]),
@@ -116,6 +118,16 @@ pub(crate) fn init() -> App {
         waker: None,
         release: update::Check::default(),
         scratch: TextEdit::new(""),
+        #[cfg(not(target_arch = "wasm32"))]
+        forge: Default::default(),
+        #[cfg(not(target_arch = "wasm32"))]
+        forge_offers: Default::default(),
+        #[cfg(not(target_arch = "wasm32"))]
+        github_client_id: TextEdit::new(&settings.github_client_id),
+        #[cfg(not(target_arch = "wasm32"))]
+        gitlab_host: TextEdit::new(""),
+        #[cfg(not(target_arch = "wasm32"))]
+        gitlab_client_id: TextEdit::new(""),
         settings,
         editor_command,
         drop_cost,
@@ -180,6 +192,10 @@ pub(crate) fn setup(app: &mut App, waker: Waker) {
 /// loop once per finished snapshot.
 pub(crate) fn poll(app: &mut App, clock: f64, tx: &mut Tx) -> bool {
     let mut changed = app.ignition.tick(clock);
+    if app.afterglows.tick(clock) {
+        tx.animated();
+        changed = true;
+    }
     if let Some((version, snapshot)) = app.local.take(app.local_seen) {
         app.local_seen = version;
         app.apply_local(snapshot);
@@ -251,6 +267,10 @@ pub(crate) fn poll(app: &mut App, clock: f64, tx: &mut Tx) -> bool {
     changed |= app.refresh_working();
     changed |= app.refresh_agent();
     changed |= app.finish_sign_in();
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        changed |= app.follow_forge_accounts();
+    }
     changed |= app.finish_login_editor();
     changed |= app.finish_release_check();
     if let Some((version, view)) = app.lsp.take(app.lsp_seen) {
@@ -259,7 +279,10 @@ pub(crate) fn poll(app: &mut App, clock: f64, tx: &mut Tx) -> bool {
         changed = true;
     }
     app.sync_checks();
-    if let Some(due) = app.ignition.due(clock) {
+    for due in [app.ignition.due(clock), app.afterglows.due(clock)]
+        .into_iter()
+        .flatten()
+    {
         tx.wake_at(due);
     }
     changed

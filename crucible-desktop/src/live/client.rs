@@ -204,9 +204,12 @@ impl Client {
         self.start(Action::Prepare(target));
     }
 
-    /// Launch `target`; the result comes back in a snapshot.
-    pub fn launch(&self, target: Target, body: Value) {
-        self.start(Action::Launch { target, body });
+    pub fn launch(&self, target: Target, body: Value, uploads: Vec<crate::form::Upload>) {
+        self.start(Action::Launch {
+            target,
+            body,
+            uploads,
+        });
     }
 
     pub fn drop_pack(&self, dir: PathBuf, max_cost: f64, max_time: String) {
@@ -255,6 +258,10 @@ impl Client {
     /// Which draft save's pack to read; `None` stops.
     pub fn draft(&self, shown: Option<(String, i64)>) {
         let _ = self.tx.send(Msg::Draft(shown));
+    }
+
+    pub fn node_log(&self, ask: Option<crate::live::calls::NodeAsk>) {
+        let _ = self.tx.send(Msg::NodeLog(ask));
     }
 
     /// Fetch the file `run` captured under `key`. Its copy on disk is used only when the run
@@ -341,6 +348,10 @@ async fn run_client(
             Ok(Some(Msg::Compare(base))) => {
                 compare = base;
                 force = fetcher.refresh_base(compare.as_deref()).await;
+            }
+            Ok(Some(Msg::NodeLog(ask))) => {
+                fetcher.node_ask = ask;
+                force = fetcher.refresh_detail(selected.as_deref(), false).await;
             }
             Ok(Some(Msg::Draft(shown))) => {
                 draft = shown;

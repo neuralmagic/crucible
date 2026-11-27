@@ -132,6 +132,7 @@ pub fn render(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
                 }
             ),
             TaskKind::Report { .. } => "report".to_string(),
+            TaskKind::Call { alias, target, .. } => format!("call[{alias} {target}]"),
             TaskKind::Engine { .. } => t.task.label().to_string(),
         };
         if let Some(session) = &t.session {
@@ -242,7 +243,7 @@ fn render_mermaid_styled(
             TaskKind::TopK { .. } => ("{{", "}}", CLASS_STYLES[4]),
             TaskKind::Route { .. } => ("{", "}", CLASS_STYLES[4]),
             TaskKind::Report { .. } => ("[[", "]]", CLASS_STYLES[3]),
-            TaskKind::Engine { .. } => ("[[", "]]", CLASS_STYLES[5]),
+            TaskKind::Call { .. } | TaskKind::Engine { .. } => ("[[", "]]", CLASS_STYLES[5]),
         };
         let mut detail = match &t.task {
             TaskKind::Agent { harness, model, .. } => format!(
@@ -273,6 +274,9 @@ fn render_mermaid_styled(
             | TaskKind::Report { .. }
             | TaskKind::Engine { .. } => String::new(),
             TaskKind::TopK { k, .. } => format!("<br/>k={k}"),
+            TaskKind::Call { alias, target, .. } => {
+                format!("<br/>call {} ({target})", mermaid_label(alias.as_str()))
+            }
             TaskKind::Route { questions, .. } => questions
                 .keys()
                 .map(|q| format!("<br/>{}?", mermaid_label(q.as_str())))
@@ -657,8 +661,9 @@ pub fn run(
     manifest: Option<&Path>,
     opts: RunOpts,
 ) -> Result<()> {
-    use crate::plan::exec::{ExecCfg, PlanExit, TaskRunner, execute};
+    use crate::plan::exec::{ExecCfg, PlanExit, execute};
     use crate::plan::runner::ShellRunner;
+    use crate::plan::task_runner::TaskRunner;
     let RunOpts {
         ceilings,
         compute_driver,
@@ -834,6 +839,7 @@ pub fn run(
     let events = events.filter(|_| !prior.as_ref().is_some_and(|p| p.shut_down));
     // A run with an ingest surface can open decision requests, which is the `human` capability.
     let desk = crate::plan::desk::HttpDesk::from_env(events.as_ref());
+    let calls = crucible::plan::call_run::Controller::from_env();
     let mut caps = caps.clone();
     if desk.is_some() {
         caps.insert(crucible::plan::ir::NEEDS_HUMAN.to_owned());
@@ -989,6 +995,7 @@ pub fn run(
             decisions: desk
                 .as_ref()
                 .map(|d| d as &dyn crucible::plan::decide::DecisionDesk),
+            calls: calls.as_ref(),
             ..ExecCfg::default()
         },
         runner.as_mut(),

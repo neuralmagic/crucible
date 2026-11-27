@@ -7,7 +7,7 @@ use std::path::Path;
 
 use crucible::plan::param::ParamValue;
 use crucible::plan::starlark::params::{ParamType, Params};
-use crucible::plan::starlark::{declared_params, read_params};
+use crucible::plan::starlark::{compile_source_with, declared_params, read_params};
 
 const SOURCE: &str = r#"
 params = {
@@ -256,6 +256,8 @@ fn a_stored_kind_spells_itself_the_way_the_declaration_does() {
         ParamType::Number,
         ParamType::Bool,
         ParamType::StringList,
+        ParamType::Json,
+        ParamType::File,
     ] {
         let stored = serde_json::to_value(ty).expect("serialize");
         assert_eq!(stored, serde_json::Value::String(ty.as_str().to_owned()));
@@ -272,6 +274,8 @@ fn a_stored_value_keeps_its_kind() {
         ParamValue::Number(0.5),
         ParamValue::Bool(true),
         ParamValue::StringList(vec!["a".into()]),
+        ParamValue::Json(serde_json::json!({"os": ["linux"], "n": 2})),
+        ParamValue::Json(serde_json::json!([1, {"a": null}])),
     ] {
         let stored = serde_json::to_string(&value).expect("serialize");
         let back: ParamValue = serde_json::from_str(&stored).expect("deserialize");
@@ -347,4 +351,196 @@ params = {
     .expect_err("allow_other on a list")
     .to_string();
     assert!(refused.contains("allow_other"), "{refused}");
+}
+
+#[test]
+fn json_and_file_parameters_declare_and_describe_themselves() {
+    let params = read_params(
+        r#"
+params = {
+    "matrix": {"type": "json", "required": True, "doc": "build matrix"},
+    "notes": {"type": "file", "required": True, "max_bytes": 1024},
+}
+"#,
+        Path::new("workflow.star"),
+    )
+    .expect("read declarations");
+    let schema = params.json_schema();
+    let matrix = &schema["properties"]["matrix"];
+    assert_eq!(matrix["type"], serde_json::json!(["object", "array"]));
+    assert_eq!(ParamType::from_schema(matrix), ParamType::Json);
+    let notes = &schema["properties"]["notes"];
+    assert_eq!(ParamType::from_schema(notes), ParamType::File);
+
+    let bound = params
+        .bind(&BTreeMap::from([(
+            "matrix".into(),
+            r#"{"os": ["linux"]}"#.into(),
+        )]))
+        .expect_err("a file cannot be typed in");
+    assert!(bound.to_string().contains("notes"), "{bound}");
+    assert_eq!(
+        ParamType::Json.read(r#"{"os": ["linux"]}"#),
+        Ok(ParamValue::Json(serde_json::json!({"os": ["linux"]})))
+    );
+    assert!(ParamType::Json.read("\"text\"").is_err());
+    assert!(
+        ParamType::Json
+            .read(&format!("[\"{}\"]", "x".repeat(64 * 1024)))
+            .is_err()
+    );
+    assert!(ParamType::File.read("notes.md").is_err());
+
+    for refused in [
+        r#"params = {"m": {"type": "json", "default": {}}}"#,
+        r#"params = {"m": {"type": "json", "required": True, "pattern": "x"}}"#,
+        r#"params = {"f": {"type": "file", "required": True, "choices": ["a"]}}"#,
+        r#"params = {"f": {"type": "file", "required": True, "multiline": True}}"#,
+    ] {
+        assert!(
+            read_params(refused, Path::new("workflow.star")).is_err(),
+            "{refused}"
+        );
+    }
+}
+
+#[test]
+fn a_file_parameter_declares_its_limit_and_media_types() {
+    for (refused, says) in [
+        (
+            r#"params = {"f": {"type": "file", "required": True}}"#,
+            "max_bytes",
+        ),
+        (
+            r#"params = {"f": {"type": "file", "required": True, "max_bytes": 99999999}}"#,
+            "limit",
+        ),
+        (
+            r#"params = {"f": {"type": "string", "default": "", "max_bytes": 10}}"#,
+            "max_bytes",
+        ),
+        (
+            r#"params = {"f": {"type": "string", "default": "", "media_type": "text/plain"}}"#,
+            "media_type",
+        ),
+        (
+            r#"params = {"f": {"type": "file", "required": True, "max_bytes": 10, "schema": "s.json"}}"#,
+            "schema",
+        ),
+    ] {
+        let error = read_params(refused, Path::new("workflow.star"))
+            .expect_err(refused)
+            .to_string();
+        assert!(error.contains(says), "{refused}: {error}");
+    }
+
+    let params = read_params(
+        r#"params = {"f": {"type": "file", "required": True, "max_bytes": 8, "media_type": ["text/plain"]}}"#,
+        Path::new("workflow.star"),
+    )
+    .expect("read");
+    let schema = params.json_schema();
+    assert_eq!(
+        schema["properties"]["f"]["x-max-bytes"],
+        serde_json::json!(8)
+    );
+    assert_eq!(
+        schema["properties"]["f"]["x-media-type"],
+        serde_json::json!(["text/plain"])
+    );
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let small = dir.path().join("small.txt");
+    let large = dir.path().join("large.txt");
+    std::fs::write(&small, "hi").expect("write");
+    std::fs::write(&large, "too many bytes").expect("write");
+    let bind = |raw: String| params.bind(&BTreeMap::from([("f".to_owned(), raw)]));
+    let bound = bind(format!(
+        r#"{{"path": "{}", "media_type": "text/plain"}}"#,
+        small.display()
+    ))
+    .expect("bind");
+    let ParamValue::Json(file) = &bound["f"] else {
+        panic!("{bound:?}")
+    };
+    assert_eq!(file["size"], serde_json::json!(2));
+    assert_eq!(file["media_type"], serde_json::json!("text/plain"));
+    assert_eq!(
+        file["digest"],
+        serde_json::json!(crucible_contract::artifact::content_digest(b"hi"))
+    );
+    for (raw, says) in [
+        (
+            format!(
+                r#"{{"path": "{}", "media_type": "text/plain"}}"#,
+                large.display()
+            ),
+            "at most 8",
+        ),
+        (small.display().to_string(), "names no media type"),
+        (
+            format!(
+                r#"{{"path": "{}", "media_type": "image/png"}}"#,
+                small.display()
+            ),
+            "must be one of",
+        ),
+        ("small.txt".to_owned(), "absolute path"),
+        (
+            format!(
+                r#"{{"path": "{}", "media_type": "text/plain", "digest": "sha256:00"}}"#,
+                small.display()
+            ),
+            "not the one supplied",
+        ),
+    ] {
+        let error = bind(raw.clone()).expect_err(&raw).to_string();
+        assert!(error.contains(says), "{raw}: {error}");
+    }
+}
+
+#[test]
+fn a_json_parameter_is_held_to_its_schema() {
+    let pack = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        pack.path().join("matrix.json"),
+        r#"{"type": "object", "required": ["os"], "properties": {"os": {"type": "array"}}}"#,
+    )
+    .expect("write schema");
+    let source = r#"
+params = {"matrix": {"type": "json", "required": True, "schema": "matrix.json"}}
+t = command(name = "t", run = "true")
+workflow(type = "playbook", tasks = [t])
+"#;
+    let compile = |raw: &str| {
+        compile_source_with(
+            source,
+            Path::new("workflow.star"),
+            pack.path(),
+            &BTreeMap::from([("matrix".to_owned(), raw.to_owned())]),
+        )
+    };
+    let compiled = compile(r#"{"os": ["linux"]}"#).expect("a matching value compiles");
+    assert_eq!(
+        compiled.workflow.params["matrix"],
+        ParamValue::Json(serde_json::json!({"os": ["linux"]}))
+    );
+    let refused = compile(r#"{"arch": "arm64"}"#)
+        .expect_err("a value outside the schema is refused")
+        .message();
+    assert!(refused.contains("schema"), "{refused}");
+
+    let declared = read_params(source, Path::new("workflow.star")).expect("read");
+    assert_eq!(
+        declared.json_schema()["properties"]["matrix"]["x-schema-path"],
+        serde_json::json!("matrix.json")
+    );
+    let missing = compile_source_with(
+        source,
+        Path::new("workflow.star"),
+        tempfile::tempdir().expect("tempdir").path(),
+        &BTreeMap::from([("matrix".to_owned(), "{}".to_owned())]),
+    )
+    .expect_err("a schema the pack does not hold is refused");
+    assert!(missing.message().contains("matrix.json"), "{missing}");
 }

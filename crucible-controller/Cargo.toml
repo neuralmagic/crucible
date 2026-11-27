@@ -15,6 +15,7 @@ strum.workspace = true
 # The shared turn-result wire contract: the marker literals the scrapers match, the managed-by
 # selector, the Tier 1 envelope, and the AgentEvent NDJSON types the SSE relay reads — one
 # source of truth, no cross-crate "keep in sync" drift.
+crucible-ci = { path = "../crucible-ci" }
 crucible-contract = { path = "../crucible-contract", features = ["openapi"] }
 crucible = { path = "../crucible", default-features = false }
 crucible-vcs = { path = "../crucible-vcs" }
@@ -74,6 +75,7 @@ ipnet = "2"
 # The daemon's pod watch (lane D only — no other crate needs the async kube client;
 # `forge::kube` is the sync, block_on-wrapped client the rest of the engine uses).
 kube = { workspace = true, features = ["client", "runtime", "rustls-tls"] }
+secrecy = "0.10"
 k8s-openapi.workspace = true
 futures-util = "0.3"
 # Parse the rendered loop-pod YAML in the kube launch path (the maintained serde_yaml fork the

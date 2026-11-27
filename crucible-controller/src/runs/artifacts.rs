@@ -424,6 +424,37 @@ pub(crate) async fn fetch_artifact(
     }
 }
 
+pub(crate) async fn serve_live_session(
+    path: &std::path::Path,
+    if_none_match: Option<&str>,
+) -> Response {
+    let bytes = match tokio::fs::read(path).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "reading a live session failed");
+            return (StatusCode::BAD_GATEWAY, "failed to read the live session").into_response();
+        }
+    };
+    let etag = format!(
+        "\"{}\"",
+        crucible_contract::artifact::content_digest(&bytes)
+    );
+    if if_none_match.is_some_and(|inm| inm == etag) {
+        return StatusCode::NOT_MODIFIED.into_response();
+    }
+    let mut resp = Body::from(bytes).into_response();
+    let headers = resp.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    if let Ok(v) = HeaderValue::from_str(&etag) {
+        headers.insert(header::ETAG, v);
+    }
+    resp
+}
+
 /// Materialize a store-backed run session to a temp file (the flow render shells a subprocess over
 /// a path, and the proxy streams a file). Only `session.jsonl` exists under a `db://` prefix.
 async fn fetch_db_session(
@@ -1000,5 +1031,27 @@ mod tests {
             .expect("etag")
             .to_string();
         assert_ne!(new_etag, etag);
+    }
+
+    #[tokio::test]
+    async fn a_live_session_is_served_uncached_with_its_content_etag() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, "{\"kind\":\"plan_admitted\"}\n").unwrap();
+        let resp = serve_live_session(&path, None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-cache");
+        let etag = resp.headers()[header::ETAG].to_str().unwrap().to_string();
+        let again = serve_live_session(&path, Some(&etag)).await;
+        assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
+        std::fs::write(
+            &path,
+            "{\"kind\":\"plan_admitted\"}\n{\"kind\":\"shutdown\"}\n",
+        )
+        .unwrap();
+        let grown = serve_live_session(&path, Some(&etag)).await;
+        assert_eq!(grown.status(), StatusCode::OK);
+        let missing = serve_live_session(&dir.path().join("none.jsonl"), None).await;
+        assert_eq!(missing.status(), StatusCode::BAD_GATEWAY);
     }
 }

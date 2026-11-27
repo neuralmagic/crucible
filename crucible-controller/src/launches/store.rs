@@ -359,6 +359,25 @@ pub(crate) async fn record_emission(
     Ok(())
 }
 
+/// What a launch carries beside its row, written in the transaction that mints it, so nothing
+/// dispatches the launch without it.
+#[derive(Default)]
+pub(crate) struct Attached<'a> {
+    pub call: Option<crate::calls::store::ChildLink<'a>>,
+    pub files: &'a [crate::launches::param_files::ParamFile],
+}
+
+async fn attach(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    key: &str,
+    attached: &Attached<'_>,
+) -> Result<()> {
+    if let Some(call) = &attached.call {
+        crate::calls::store::link_child(&mut **tx, key, call).await?;
+    }
+    crate::launches::param_files::own(tx, key, attached.files).await
+}
+
 /// What adopting a registered playbook launch did, decided under a share lock on the registry row.
 pub(crate) enum AdoptPlaybookOutcome {
     Adopted,
@@ -395,6 +414,7 @@ pub(crate) async fn adopt_draft_launch(
     key: &str,
     launch: &NewPlaybookLaunch<'_>,
     exposure: &crate::playbooks::exposure::Extraction,
+    attached: &Attached<'_>,
 ) -> Result<AdoptDraftOutcome> {
     let version = launch
         .draft_version
@@ -427,6 +447,7 @@ pub(crate) async fn adopt_draft_launch(
         },
         Some(_) => {
             if insert_playbook_launch_with(&mut tx, key, launch, exposure).await? {
+                attach(&mut tx, key, attached).await?;
                 tx.commit().await.context("adopt_draft_launch: commit")?;
                 return Ok(AdoptDraftOutcome::Adopted);
             }
@@ -448,6 +469,7 @@ pub(crate) async fn adopt_playbook_launch(
     key: &str,
     launch: &NewPlaybookLaunch<'_>,
     authorized: PackRevision<'_>,
+    attached: &Attached<'_>,
 ) -> Result<AdoptPlaybookOutcome> {
     let mut tx = pool.begin().await.context("adopt_playbook_launch: begin")?;
     let current = crate::playbooks::registry::lock_revision(&mut tx, launch.playbook).await?;
@@ -470,6 +492,7 @@ pub(crate) async fn adopt_playbook_launch(
             )
             .await?
             {
+                attach(&mut tx, key, attached).await?;
                 tx.commit().await.context("adopt_playbook_launch: commit")?;
                 return Ok(AdoptPlaybookOutcome::Adopted);
             }

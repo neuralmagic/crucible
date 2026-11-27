@@ -1,0 +1,450 @@
+{
+ "items": [
+  {
+   "metadata": {
+    "name": "odh-openshell-gateway-on-push-wcsxc-build-images-0",
+    "namespace": "open-data-hub-tenant",
+    "uid": "727a6a25-b6ba-4522-ae23-f3e9950c5b83",
+    "creationTimestamp": "2026-11-26T00:25:09Z",
+    "labels": {
+     "pipelinesascode.tekton.dev/cancel-in-progress": "false",
+     "pipelinesascode.tekton.dev/check-run-id": "139601094548",
+     "pipelinesascode.tekton.dev/event-type": "push",
+     "pipelinesascode.tekton.dev/original-prname": "odh-openshell-gateway-on-push",
+     "pipelinesascode.tekton.dev/repository": "github-com-opendatahub-io-openshell",
+     "pipelinesascode.tekton.dev/sha": "6a7acf93315fcccf66676784f1eb1ab1b3dae12a",
+     "pipelinesascode.tekton.dev/state": "queued",
+     "pipelinesascode.tekton.dev/url-org": "opendatahub-io",
+     "pipelinesascode.tekton.dev/url-repository": "openshell",
+     "tekton.dev/memberOf": "tasks",
+     "tekton.dev/pipeline": "container-build",
+     "tekton.dev/pipelineRun": "odh-openshell-gateway-on-push-wcsxc",
+     "tekton.dev/pipelineRunUID": "03240239-2605-456c-a75c-15e9be23adb3",
+     "tekton.dev/pipelineTask": "build-images",
+     "tekton.dev/task": "buildah-remote-oci-ta"
+    },
+    "annotations": {
+     "pipelinesascode.tekton.dev/log-url": "https://konflux-ui.apps.stone-prd-rh01.pg1f.p1.openshiftapps.com/ns/open-data-hub-tenant/pipelinerun/odh-openshell-gateway-on-push-wcsxc"
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-11-26T00:26:18Z",
+      "message": "Not all Steps in the Task have finished executing",
+      "reason": "Running",
+      "status": "Unknown",
+      "type": "Succeeded"
+     }
+    ],
+    "podName": "odh-openshell-gateway-on-push-wcsxc-build-images-0-pod",
+    "startTime": "2026-11-26T00:25:09Z",
+    "steps": [
+     {
+      "name": "build",
+      "container": "step-build",
+      "running": {
+       "startedAt": "2026-11-26T00:26:16Z"
+      }
+     },
+     {
+      "name": "use-trusted-artifact",
+      "container": "step-use-trusted-artifact",
+      "terminated": {
+       "exitCode": 0,
+       "reason": "Completed",
+       "startedAt": "2026-11-26T00:26:19Z",
+       "finishedAt": "2026-11-26T00:26:28Z"
+      }
+     },
+     {
+      "name": "push",
+      "container": "step-push",
+      "running": {
+       "startedAt": "2026-11-26T00:26:16Z"
+      }
+     },
+     {
+      "name": "sbom-syft-generate",
+      "container": "step-sbom-syft-generate",
+      "running": {
+       "startedAt": "2026-11-26T00:26:16Z"
+      }
+     },
+     {
+      "name": "prepare-sboms",
+      "container": "step-prepare-sboms",
+      "running": {
+       "startedAt": "2026-11-26T00:26:16Z"
+      }
+     },
+     {
+      "name": "upload-sbom",
+      "container": "step-upload-sbom",
+      "running": {
+       "startedAt": "2026-11-26T00:26:17Z"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "metadata": {
+    "name": "odh-openshell-gateway-on-push-wcsxc-build-images-1",
+    "namespace": "open-data-hub-tenant",
+    "uid": "760a3b18-7d97-4319-b73f-f928cb7f7e9b",
+    "creationTimestamp": "2026-11-26T00:25:09Z",
+    "labels": {
+     "pipelinesascode.tekton.dev/cancel-in-progress": "false",
+     "pipelinesascode.tekton.dev/check-run-id": "139601094548",
+     "pipelinesascode.tekton.dev/event-type": "push",
+     "pipelinesascode.tekton.dev/original-prname": "odh-openshell-gateway-on-push",
+     "pipelinesascode.tekton.dev/repository": "github-com-opendatahub-io-openshell",
+     "pipelinesascode.tekton.dev/sha": "6a7acf93315fcccf66676784f1eb1ab1b3dae12a",
+     "pipelinesascode.tekton.dev/state": "queued",
+     "pipelinesascode.tekton.dev/url-org": "opendatahub-io",
+     "pipelinesascode.tekton.dev/url-repository": "openshell",
+     "tekton.dev/memberOf": "tasks",
+     "tekton.dev/pipeline": "container-build",
+     "tekton.dev/pipelineRun": "odh-openshell-gateway-on-push-wcsxc",
+     "tekton.dev/pipelineRunUID": "03240239-2605-456c-a75c-15e9be23adb3",
+     "tekton.dev/pipelineTask": "build-images",
+     "tekton.dev/task": "buildah-remote-oci-ta"
+    },
+    "annotations": {
+     "pipelinesascode.tekton.dev/log-url": "https://konflux-ui.apps.stone-prd-rh01.pg1f.p1.openshiftapps.com/ns/open-data-hub-tenant/pipelinerun/odh-openshell-gateway-on-push-wcsxc"
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-11-26T00:27:22Z",
+      "message": "Not all Steps in the Task have finished executing",
+      "reason": "Running",
+      "status": "Unknown",
+      "type": "Succeeded"
+     }
+    ],
+    "podName": "odh-openshell-gateway-on-push-wcsxc-build-images-1-pod",
+    "startTime": "2026-11-26T00:25:09Z",
+    "steps": [
+     {
+      "name": "build",
+      "container": "step-build",
+      "running": {
+       "startedAt": "2026-11-26T00:27:20Z"
+      }
+     },
+     {
+      "name": "use-trusted-artifact",
+      "container": "step-use-trusted-artifact",
+      "terminated": {
+       "exitCode": 0,
+       "reason": "Completed",
+       "startedAt": "2026-11-26T00:27:24Z",
+       "finishedAt": "2026-11-26T00:27:33Z"
+      }
+     },
+     {
+      "name": "push",
+      "container": "step-push",
+      "running": {
+       "startedAt": "2026-11-26T00:27:21Z"
+      }
+     },
+     {
+      "name": "sbom-syft-generate",
+      "container": "step-sbom-syft-generate",
+      "running": {
+       "startedAt": "2026-11-26T00:27:21Z"
+      }
+     },
+     {
+      "name": "prepare-sboms",
+      "container": "step-prepare-sboms",
+      "running": {
+       "startedAt": "2026-11-26T00:27:21Z"
+      }
+     },
+     {
+      "name": "upload-sbom",
+      "container": "step-upload-sbom",
+      "running": {
+       "startedAt": "2026-11-26T00:27:21Z"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "metadata": {
+    "name": "odh-openshell-gateway-on-push-wcsxc-clone-repository",
+    "namespace": "open-data-hub-tenant",
+    "uid": "af790150-86cf-4168-a925-5bd41347f6f4",
+    "creationTimestamp": "2026-11-26T00:18:45Z",
+    "labels": {
+     "pipelinesascode.tekton.dev/cancel-in-progress": "false",
+     "pipelinesascode.tekton.dev/check-run-id": "139601094548",
+     "pipelinesascode.tekton.dev/event-type": "push",
+     "pipelinesascode.tekton.dev/original-prname": "odh-openshell-gateway-on-push",
+     "pipelinesascode.tekton.dev/repository": "github-com-opendatahub-io-openshell",
+     "pipelinesascode.tekton.dev/sha": "6a7acf93315fcccf66676784f1eb1ab1b3dae12a",
+     "pipelinesascode.tekton.dev/state": "queued",
+     "pipelinesascode.tekton.dev/url-org": "opendatahub-io",
+     "pipelinesascode.tekton.dev/url-repository": "openshell",
+     "tekton.dev/memberOf": "tasks",
+     "tekton.dev/pipeline": "container-build",
+     "tekton.dev/pipelineRun": "odh-openshell-gateway-on-push-wcsxc",
+     "tekton.dev/pipelineRunUID": "03240239-2605-456c-a75c-15e9be23adb3",
+     "tekton.dev/pipelineTask": "clone-repository",
+     "tekton.dev/task": "git-clone-oci-ta"
+    },
+    "annotations": {
+     "pipelinesascode.tekton.dev/log-url": "https://konflux-ui.apps.stone-prd-rh01.pg1f.p1.openshiftapps.com/ns/open-data-hub-tenant/pipelinerun/odh-openshell-gateway-on-push-wcsxc",
+     "results.tekton.dev/record": "open-data-hub-tenant/results/03240239-2605-456c-a75c-15e9be23adb3/records/af790150-86cf-4168-a925-5bd41347f6f4"
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-11-26T00:18:58Z",
+      "message": "All Steps have completed executing",
+      "reason": "Succeeded",
+      "status": "True",
+      "type": "Succeeded"
+     }
+    ],
+    "podName": "odh-openshell-gateway-on-push-wcsxc-clone-repository-pod",
+    "startTime": "2026-11-26T00:18:45Z",
+    "completionTime": "2026-11-26T00:18:58Z",
+    "steps": [
+     {
+      "name": "clone",
+      "container": "step-clone",
+      "terminated": {
+       "exitCode": 0,
+       "reason": "Completed",
+       "startedAt": "2026-11-26T00:18:50Z",
+       "finishedAt": "2026-11-26T00:18:53Z"
+      }
+     },
+     {
+      "name": "symlink-check",
+      "container": "step-symlink-check",
+      "terminated": {
+       "exitCode": 0,
+       "reason": "Completed",
+       "startedAt": "2026-11-26T00:18:53Z",
+       "finishedAt": "2026-11-26T00:18:53Z"
+      }
+     },
+     {
+      "name": "create-trusted-artifact",
+      "container": "step-create-trusted-artifact",
+      "terminated": {
+       "exitCode": 0,
+       "reason": "Completed",
+       "startedAt": "2026-11-26T00:18:54Z",
+       "finishedAt": "2026-11-26T00:18:58Z"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "metadata": {
+    "name": "odh-openshell-gateway-on-push-wcsxc-init",
+    "namespace": "open-data-hub-tenant",
+    "uid": "30ed29ea-a4c3-4395-a462-b4c3b3a6560f",
+    "creationTimestamp": "2026-11-26T00:18:25Z",
+    "labels": {
+     "pipelinesascode.tekton.dev/cancel-in-progress": "false",
+     "pipelinesascode.tekton.dev/check-run-id": "139601094548",
+     "pipelinesascode.tekton.dev/event-type": "push",
+     "pipelinesascode.tekton.dev/original-prname": "odh-openshell-gateway-on-push",
+     "pipelinesascode.tekton.dev/repository": "github-com-opendatahub-io-openshell",
+     "pipelinesascode.tekton.dev/sha": "6a7acf93315fcccf66676784f1eb1ab1b3dae12a",
+     "pipelinesascode.tekton.dev/state": "queued",
+     "pipelinesascode.tekton.dev/url-org": "opendatahub-io",
+     "pipelinesascode.tekton.dev/url-repository": "openshell",
+     "tekton.dev/memberOf": "tasks",
+     "tekton.dev/pipeline": "container-build",
+     "tekton.dev/pipelineRun": "odh-openshell-gateway-on-push-wcsxc",
+     "tekton.dev/pipelineRunUID": "03240239-2605-456c-a75c-15e9be23adb3",
+     "tekton.dev/pipelineTask": "init",
+     "tekton.dev/task": "init"
+    },
+    "annotations": {
+     "pipelinesascode.tekton.dev/log-url": "https://konflux-ui.apps.stone-prd-rh01.pg1f.p1.openshiftapps.com/ns/open-data-hub-tenant/pipelinerun/odh-openshell-gateway-on-push-wcsxc",
+     "results.tekton.dev/record": "open-data-hub-tenant/results/03240239-2605-456c-a75c-15e9be23adb3/records/30ed29ea-a4c3-4395-a462-b4c3b3a6560f"
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-11-26T00:18:33Z",
+      "message": "All Steps have completed executing",
+      "reason": "Succeeded",
+      "status": "True",
+      "type": "Succeeded"
+     }
+    ],
+    "podName": "odh-openshell-gateway-on-push-wcsxc-init-pod",
+    "startTime": "2026-11-26T00:18:27Z",
+    "completionTime": "2026-11-26T00:18:33Z",
+    "steps": [
+     {
+      "name": "init",
+      "container": "step-init",
+      "terminated": {
+       "exitCode": 0,
+       "reason": "Completed",
+       "startedAt": "2026-11-26T00:18:31Z",
+       "finishedAt": "2026-11-26T00:18:31Z"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "metadata": {
+    "name": "odh-openshell-gateway-on-push-wcsxc-prefetch-dependencies",
+    "namespace": "open-data-hub-tenant",
+    "uid": "85b395b7-db58-4f71-a289-412bc15a2e08",
+    "creationTimestamp": "2026-11-26T00:19:10Z",
+    "labels": {
+     "pipelinesascode.tekton.dev/cancel-in-progress": "false",
+     "pipelinesascode.tekton.dev/check-run-id": "139601094548",
+     "pipelinesascode.tekton.dev/event-type": "push",
+     "pipelinesascode.tekton.dev/original-prname": "odh-openshell-gateway-on-push",
+     "pipelinesascode.tekton.dev/repository": "github-com-opendatahub-io-openshell",
+     "pipelinesascode.tekton.dev/sha": "6a7acf93315fcccf66676784f1eb1ab1b3dae12a",
+     "pipelinesascode.tekton.dev/state": "queued",
+     "pipelinesascode.tekton.dev/url-org": "opendatahub-io",
+     "pipelinesascode.tekton.dev/url-repository": "openshell",
+     "tekton.dev/memberOf": "tasks",
+     "tekton.dev/pipeline": "container-build",
+     "tekton.dev/pipelineRun": "odh-openshell-gateway-on-push-wcsxc",
+     "tekton.dev/pipelineRunUID": "03240239-2605-456c-a75c-15e9be23adb3",
+     "tekton.dev/pipelineTask": "prefetch-dependencies",
+     "tekton.dev/task": "prefetch-dependencies-oci-ta"
+    },
+    "annotations": {
+     "pipelinesascode.tekton.dev/log-url": "https://konflux-ui.apps.stone-prd-rh01.pg1f.p1.openshiftapps.com/ns/open-data-hub-tenant/pipelinerun/odh-openshell-gateway-on-push-wcsxc",
+     "results.tekton.dev/record": "open-data-hub-tenant/results/03240239-2605-456c-a75c-15e9be23adb3/records/85b395b7-db58-4f71-a289-412bc15a2e08"
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-11-26T00:25:06Z",
+      "message": "All Steps have completed executing",
+      "reason": "Succeeded",
+      "status": "True",
+      "type": "Succeeded"
+     }
+    ],
+    "podName": "odh-openshell-gateway-on-push-wcsxc-prefetch-dependencies-pod",
+    "startTime": "2026-11-26T00:19:10Z",
+    "completionTime": "2026-11-26T00:25:06Z",
+    "steps": [
+     {
+      "name": "skip-ta",
+      "container": "step-skip-ta",
+      "terminated": {
+       "exitCode": 0,
+       "reason": "Completed",
+       "startedAt": "2026-11-26T00:19:16Z",
+       "finishedAt": "2026-11-26T00:19:16Z"
+      }
+     },
+     {
+      "name": "use-trusted-artifact",
+      "container": "step-use-trusted-artifact",
+      "terminated": {
+       "exitCode": 0,
+       "reason": "Completed",
+       "startedAt": "2026-11-26T00:19:16Z",
+       "finishedAt": "2026-11-26T00:19:17Z"
+      }
+     },
+     {
+      "name": "prefetch-dependencies",
+      "container": "step-prefetch-dependencies",
+      "terminated": {
+       "exitCode": 0,
+       "reason": "Completed",
+       "startedAt": "2026-11-26T00:19:17Z",
+       "finishedAt": "2026-11-26T00:21:32Z"
+      }
+     },
+     {
+      "name": "create-trusted-artifact",
+      "container": "step-create-trusted-artifact",
+      "terminated": {
+       "exitCode": 0,
+       "reason": "Completed",
+       "startedAt": "2026-11-26T00:21:33Z",
+       "finishedAt": "2026-11-26T00:25:05Z"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "metadata": {
+    "name": "odh-openshell-gateway-on-push-wcsxc-rhoai-init",
+    "namespace": "open-data-hub-tenant",
+    "uid": "22661df6-d420-4a5e-843c-f0036b487beb",
+    "creationTimestamp": "2026-11-26T00:18:09Z",
+    "labels": {
+     "pipelinesascode.tekton.dev/cancel-in-progress": "false",
+     "pipelinesascode.tekton.dev/check-run-id": "139601094548",
+     "pipelinesascode.tekton.dev/event-type": "push",
+     "pipelinesascode.tekton.dev/original-prname": "odh-openshell-gateway-on-push",
+     "pipelinesascode.tekton.dev/repository": "github-com-opendatahub-io-openshell",
+     "pipelinesascode.tekton.dev/sha": "6a7acf93315fcccf66676784f1eb1ab1b3dae12a",
+     "pipelinesascode.tekton.dev/state": "queued",
+     "pipelinesascode.tekton.dev/url-org": "opendatahub-io",
+     "pipelinesascode.tekton.dev/url-repository": "openshell",
+     "tekton.dev/memberOf": "tasks",
+     "tekton.dev/pipeline": "container-build",
+     "tekton.dev/pipelineRun": "odh-openshell-gateway-on-push-wcsxc",
+     "tekton.dev/pipelineRunUID": "03240239-2605-456c-a75c-15e9be23adb3",
+     "tekton.dev/pipelineTask": "rhoai-init",
+     "tekton.dev/task": "rhoai-init"
+    },
+    "annotations": {
+     "pipelinesascode.tekton.dev/log-url": "https://konflux-ui.apps.stone-prd-rh01.pg1f.p1.openshiftapps.com/ns/open-data-hub-tenant/pipelinerun/odh-openshell-gateway-on-push-wcsxc",
+     "results.tekton.dev/record": "open-data-hub-tenant/results/03240239-2605-456c-a75c-15e9be23adb3/records/22661df6-d420-4a5e-843c-f0036b487beb"
+    }
+   },
+   "status": {
+    "conditions": [
+     {
+      "lastTransitionTime": "2026-11-26T00:18:14Z",
+      "message": "All Steps have completed executing",
+      "reason": "Succeeded",
+      "status": "True",
+      "type": "Succeeded"
+     }
+    ],
+    "podName": "odh-openshell-gateway-on-push-wcsxc-rhoai-init-pod",
+    "startTime": "2026-11-26T00:18:09Z",
+    "completionTime": "2026-11-26T00:18:14Z",
+    "steps": [
+     {
+      "name": "rhoai-init",
+      "container": "step-rhoai-init",
+      "terminated": {
+       "exitCode": 0,
+       "reason": "Completed",
+       "startedAt": "2026-11-26T00:18:13Z",
+       "finishedAt": "2026-11-26T00:18:14Z"
+      }
+     }
+    ]
+   }
+  }
+ ]
+}

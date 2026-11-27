@@ -454,6 +454,7 @@ pub(crate) enum LaunchOrigin {
     Watch,
     /// A webhook delivery a sender outside the controller made.
     Webhook,
+    Call,
 }
 
 crate::wire_enum::wire_enum!(LaunchOrigin, "launch origin", both, {
@@ -463,6 +464,7 @@ crate::wire_enum::wire_enum!(LaunchOrigin, "launch origin", both, {
     LaunchOrigin::Draft => "draft",
     LaunchOrigin::Watch => "watch",
     LaunchOrigin::Webhook => "webhook",
+    LaunchOrigin::Call => "call",
 });
 
 /// Which sidecar a core row belongs to. The DB discriminator; a sidecar module knows its own.

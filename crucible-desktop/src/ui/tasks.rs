@@ -9,6 +9,7 @@ use rune_kit::{Button, ButtonVariant, ControlSize, Spinner};
 use rune_theme_opencode::icons as oc;
 use serde_json::Value;
 
+use crate::live::calls::{self, Jump, LiveCall};
 use crate::logline::{Activity, LogLine, activity};
 use crate::session::{InstanceCounts, LinkView, Outcome, TaskState, TaskView};
 use crate::ui::tasks::expanded::expanded;
@@ -33,6 +34,7 @@ pub(crate) fn status_color(status: TaskStatus, p: &Paint) -> Color {
 pub(crate) fn task_list(
     app: &App,
     tasks: &[TaskView],
+    calls: &[LiveCall],
     log: &[LogLine],
     live: bool,
     empty: El,
@@ -94,6 +96,7 @@ pub(crate) fn task_list(
             rerun,
             editable,
             link,
+            target: open.then(|| calls::target(task, calls)).flatten(),
         };
         list = list.child(card(
             task,
@@ -115,6 +118,7 @@ struct Shown {
     /// The task's definition can be opened in the editor.
     editable: bool,
     link: Option<String>,
+    target: Option<(&'static str, Jump)>,
 }
 
 fn card(
@@ -130,6 +134,7 @@ fn card(
         rerun,
         editable,
         link,
+        target,
     } = shown;
     let state = task.state();
     let name = task.name.clone();
@@ -206,7 +211,7 @@ fn card(
         body = body.child(link_chips(&links, p));
     }
     if open {
-        body = body.child(expanded(task, tasks, rerun, editable, link, p));
+        body = body.child(expanded(task, tasks, rerun, editable, link, target, p));
     }
 
     row()

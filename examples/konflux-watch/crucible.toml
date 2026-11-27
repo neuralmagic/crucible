@@ -1,0 +1,16 @@
+# konflux-watch: wait for the Konflux pull request builds of a ModelExpress commit and report the
+# images they pushed. Commands only, no model. Nothing is created on the cluster.
+
+edition = 2
+
+[workspace]
+inject = ["report.py"]
+
+[agent]
+backend   = "command"
+agent_cmd = "true"
+goal      = "Report the images Konflux built for a ModelExpress commit."
+
+[workflow]
+type = "playbook"
+file = "workflow.star"

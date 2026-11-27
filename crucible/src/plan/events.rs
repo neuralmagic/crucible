@@ -396,8 +396,9 @@ mod tests {
     #[test]
     fn every_settled_row_folds_back_to_the_result_it_was_written_from() {
         use crate::plan::attempt::{Attempt, AttemptOutcome, TransportFailure};
-        use crate::plan::exec::{ExecCfg, Substrate, TaskResult, TaskRunner, execute};
+        use crate::plan::exec::{ExecCfg, Substrate, TaskResult, execute};
         use crate::plan::ir::{Task, TaskName};
+        use crate::plan::task_runner::TaskRunner;
         use std::collections::BTreeMap;
 
         struct Scripted;

@@ -16,6 +16,12 @@ impl App {
 
     pub(crate) fn apply_live(&mut self, snapshot: live::Snapshot) {
         self.remote.live = snapshot.view;
+        if let (Some(before), Some(after)) = (&self.remote.live_detail, &snapshot.detail) {
+            let views = |detail: &live::LiveDetail| -> Vec<_> {
+                detail.calls.iter().map(|call| call.view.clone()).collect()
+            };
+            self.afterglows.saw(&views(before), &views(after));
+        }
         self.remote.live_detail = snapshot.detail;
         self.remote.live_base = snapshot.base;
         self.remote.draft_pack = snapshot.draft;
@@ -101,6 +107,11 @@ impl App {
         if base != self.remote.compare_sent {
             self.remote.live_client.compare(base.as_deref());
             self.remote.compare_sent = base;
+        }
+        let node = self.run.call_node.as_ref().map(|node| node.ask.clone());
+        if node != self.remote.node_sent {
+            self.remote.live_client.node_log(node.clone());
+            self.remote.node_sent = node;
         }
         let draft = self
             .selected_draft()

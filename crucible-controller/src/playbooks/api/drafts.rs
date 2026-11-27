@@ -5,7 +5,7 @@ use crate::api::state::*;
 
 use crate::daemon::queue::IssueKey;
 
-use crate::playbooks::api::admission::{Admissible, DraftHead, LaunchRequest, admit};
+use crate::playbooks::api::admission::{Admissible, DraftHead, LaunchRequest};
 
 use crate::playbooks::api::registry::{PackDispatchDto, PlaybookLaunchAck};
 
@@ -914,10 +914,29 @@ pub(crate) async fn save_playbook_draft(
         Ok(c) => c,
         Err(refusal) => return refusal,
     };
+    let mut files = body.files;
+    if let Err(refusal) = crate::calls::locking::into_files(
+        &crate::calls::Backends::new(&state),
+        &crate::calls::CallCtx {
+            db: state.db.clone(),
+            scratch_dir: state.scratch_dir.clone(),
+        },
+        &crate::calls::locking::Locking {
+            state: &state,
+            caller: &caller,
+            draft_pack: true,
+            draft: Some(&id),
+        },
+        &mut files,
+    )
+    .await
+    {
+        return unprocessable(format!("calls.lock: {refusal}"));
+    }
     match crate::playbooks::drafts::save_version(
         state.db.pool(),
         &id,
-        body.files,
+        files,
         identity.as_deref(),
         body.base_version,
     )
@@ -1274,7 +1293,8 @@ pub(crate) async fn launch_playbook_draft(
             ),
         }]);
     };
-    let authorized = match admit(
+    let uploader = caller.subject_principal().map(|p| p.to_string());
+    let authorized = match crate::playbooks::api::admission::admit_with_files(
         &state,
         head,
         LaunchRequest {
@@ -1282,6 +1302,10 @@ pub(crate) async fn launch_playbook_draft(
             max_cost: body.max_cost,
             max_time: &body.max_time,
             schema_digest: body.schema_digest.as_deref(),
+        },
+        match uploader.as_deref() {
+            Some(uploader) => crate::launches::param_files::FileValues::Uploaded { uploader },
+            None => crate::launches::param_files::FileValues::None,
         },
     )
     .await
@@ -1368,8 +1392,17 @@ pub(crate) async fn launch_playbook_draft(
     };
 
     use crate::launches::store::AdoptDraftOutcome;
-    match crate::launches::store::adopt_draft_launch(state.db.pool(), &key, &launch, &exposure)
-        .await
+    match crate::launches::store::adopt_draft_launch(
+        state.db.pool(),
+        &key,
+        &launch,
+        &exposure,
+        &crate::launches::store::Attached {
+            call: None,
+            files: &authorized.files,
+        },
+    )
+    .await
     {
         Ok(AdoptDraftOutcome::Adopted) => {}
         Ok(AdoptDraftOutcome::UnknownDraft) => return not_found(format!("no draft {id:?}")),

@@ -1,7 +1,7 @@
 //! `crucible build <name>`: dispatch a named `[build.<name>]` from the domain manifest, wait for
 //! it, and print the digest-pinned ref. The cluster backend renders a detached rootless-buildah
 //! Job ([`forge::build`]); the `github-actions` backend dispatches a `workflow_dispatch`,
-//! correlates + polls the run, and pins the pushed tag ([`forge::github`]). `--check` runs the
+//! polls the run GitHub returned, and pins the pushed tag ([`forge::github::build`]). `--check` runs the
 //! github workflow-input introspection only, then exits. This is the exact code path the
 //! controller dispatches, one implementation, two callers.
 
@@ -192,13 +192,18 @@ fn run_github(
     provided: &BTreeMap<String, String>,
     tally: &mut OutputTally,
 ) -> Result<()> {
-    let target = forge::github::OrgAllowlist::from_env()?.authorize(&gh.repo)?;
+    let target = forge::github::build::OrgAllowlist::from_env()?.authorize(&gh.repo)?;
     // RFC-0001:C-OUTPUTS mediation point; `--check` only introspects, so it dispatches nothing.
     if !args.check {
         let repo = target.to_string();
         tally.admit(TOOL, OutputKind::WorkflowDispatch, Some(&repo))?;
     }
-    let token = resolve_github_token()?;
+    let token = forge::github::Token::new(resolve_github_token()?);
+    let client = forge::github::Client::new()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building the github runtime")?;
 
     // Introspection validates the human-declared wiring against the workflow at the dispatched ref, and
     // rejects an unsupported digest source up-front so `--check` catches it before any dispatch.
@@ -207,15 +212,23 @@ fn run_github(
         .as_ref()
         .map(|o| o.digest.clone())
         .unwrap_or_default();
-    forge::github::preflight_workflow(
+    let warnings = runtime.block_on(forge::github::build::preflight_workflow(
+        &client,
+        &token,
         &target,
         &gh.workflow,
         &gh.git_ref,
         &gh.inputs,
         &digest,
         &args.name,
-        &token,
-    )?;
+    ))?;
+    for warning in &warnings {
+        eprintln!("warning: {warning}");
+    }
+    eprintln!(
+        "==> workflow inputs validate against {} ({target}@{})",
+        gh.workflow, gh.git_ref
+    );
     if args.check {
         return Ok(());
     }
@@ -230,7 +243,7 @@ fn run_github(
         }
     }
 
-    let correlation_id = forge::github::new_correlation_id();
+    let correlation_id = forge::github::build::new_correlation_id();
     let tag = args
         .tag
         .clone()
@@ -254,27 +267,28 @@ fn run_github(
         inputs.insert(key.clone(), value);
     }
 
-    let req = forge::github::GithubBuildRequest {
+    let req = forge::github::build::GithubBuildRequest {
         name: args.name.clone(),
         repo: target,
         workflow: gh.workflow.clone(),
         git_ref: gh.git_ref.clone(),
         inputs,
         correlation_id,
-        correlation: gh
-            .outputs
-            .as_ref()
-            .map(|o| o.correlation)
-            .unwrap_or_default(),
         digest,
         image_ref,
         timeout: spec.timeout.as_duration(),
     };
 
+    let run = runtime.block_on(forge::github::build::run_build(&client, &req, &token))?;
+    eprintln!(
+        "==> run {} succeeded ({}); pinning the pushed digest",
+        run.run_id, run.html_url
+    );
+    drop(runtime);
     let authfile = args.authfile.clone().or_else(default_authfile);
-    let success = forge::github::dispatch_github(&req, &token, authfile.as_deref())?;
+    let digest_ref = forge::oci::pin_digest(&req.image_ref, authfile.as_deref())?;
     eprintln!("==> build succeeded; pinned digest:");
-    println!("{}", success.digest_ref);
+    println!("{digest_ref}");
     Ok(())
 }
 

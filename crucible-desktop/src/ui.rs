@@ -16,7 +16,10 @@ mod dock;
 mod files;
 mod finder;
 mod graph;
+mod graph_call;
 mod graph_find;
+mod graph_fx;
+mod graph_source;
 mod issues;
 mod keys;
 mod launch;
@@ -250,7 +253,10 @@ pub fn view(app: &App, cx: &mut Cx<App>) -> El {
     let window = window
         .child(detail(app, &p, &mut layer))
         .children(dock::ghost(app, &p))
-        .child(fx(gfx::GRAIN, gfx::data(Color::WHITE, p.tune.grain), 0.0));
+        .children(
+            (p.tune.grain > 0.0)
+                .then(|| fx(gfx::GRAIN, gfx::data(Color::WHITE, p.tune.grain), 0.0)),
+        );
     let window = rune_knobs::side(
         window,
         &app.knobs,
@@ -310,6 +316,8 @@ struct Pane<'a> {
     previewing: bool,
     /// The run's tasks while the preview's are shown, for marking what the edit changed.
     run_tasks: &'a [TaskView],
+    calls: &'a [crate::live::calls::LiveCall],
+    node_log: Option<&'a crate::live::calls::NodeLog>,
 }
 
 impl<'a> Pane<'a> {

@@ -2,7 +2,7 @@ use crate::api::dto::*;
 use crate::api::state::*;
 use crate::daemon::queue::IssueKey;
 use crate::playbooks::api::admission::{
-    Admissible, LaunchRequest, UNREADABLE_MANIFEST, admit, decide_launch,
+    Admissible, LaunchRequest, UNREADABLE_MANIFEST, decide_launch,
 };
 use crate::playbooks::registry::{PlaybookRow, PlaybookSource, RegisterError, RegisterPlaybook};
 use axum::extract::{Path, State};
@@ -686,7 +686,8 @@ pub(crate) async fn launch_playbook(
         Ok(pack) => pack,
         Err(refusal) => return refusal,
     };
-    let authorized = match admit(
+    let uploader = caller.subject_principal().map(|p| p.to_string());
+    let authorized = match crate::playbooks::api::admission::admit_with_files(
         &state,
         pack,
         LaunchRequest {
@@ -694,6 +695,10 @@ pub(crate) async fn launch_playbook(
             max_cost: body.max_cost,
             max_time: &body.max_time,
             schema_digest: body.schema_digest.as_deref(),
+        },
+        match uploader.as_deref() {
+            Some(uploader) => crate::launches::param_files::FileValues::Uploaded { uploader },
+            None => crate::launches::param_files::FileValues::None,
         },
     )
     .await
@@ -774,6 +779,10 @@ pub(crate) async fn launch_playbook(
         &key,
         &launch,
         pack.revision(),
+        &crate::launches::store::Attached {
+            call: None,
+            files: &authorized.files,
+        },
     )
     .await
     {

@@ -16,6 +16,7 @@ pub enum ParamValue {
     Number(f64),
     Bool(bool),
     StringList(Vec<String>),
+    Json(serde_json::Value),
 }
 
 impl Serialize for ParamValue {
@@ -47,19 +48,23 @@ impl<'de> Deserialize<'de> for ParamValue {
                     .map(ParamValue::Number)
                     .ok_or_else(|| D::Error::custom("a parameter number must be finite")),
             },
-            serde_json::Value::Array(items) => items
-                .into_iter()
-                .map(|i| match i {
-                    serde_json::Value::String(s) => Ok(s),
-                    other => Err(D::Error::custom(format!(
-                        "a list parameter holds strings, got {other}"
-                    ))),
-                })
-                .collect::<std::result::Result<Vec<String>, _>>()
-                .map(ParamValue::StringList),
-            other => Err(D::Error::custom(format!(
-                "a parameter value is a string, int, number, bool, or list of strings, got {other}"
-            ))),
+            serde_json::Value::Array(items) if items.iter().all(serde_json::Value::is_string) => {
+                Ok(ParamValue::StringList(
+                    items
+                        .into_iter()
+                        .filter_map(|i| match i {
+                            serde_json::Value::String(s) => Some(s),
+                            _ => None,
+                        })
+                        .collect(),
+                ))
+            }
+            value @ (serde_json::Value::Array(_) | serde_json::Value::Object(_)) => {
+                Ok(ParamValue::Json(value))
+            }
+            serde_json::Value::Null => Err(D::Error::custom(
+                "a parameter value is a string, int, number, bool, list, or object, got null",
+            )),
         }
     }
 }
@@ -72,6 +77,7 @@ impl ParamValue {
             ParamValue::Number(n) => serde_json::json!(n),
             ParamValue::Bool(b) => serde_json::Value::Bool(*b),
             ParamValue::StringList(items) => serde_json::json!(items),
+            ParamValue::Json(value) => value.clone(),
         }
     }
 }

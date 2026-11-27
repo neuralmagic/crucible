@@ -175,6 +175,15 @@ pub enum WorkflowError {
          a failed candidate back through its next iteration"
     )]
     ReviseOutsidePlaybook { task: String },
+    #[error("call task {task:?} is refused in an autoresearch workflow")]
+    CallInAutoresearch { task: String },
+    #[error(
+        "call task {task:?} is in the revise loop of {reviewer:?}; a call dispatches a run of its \
+         own and cannot be sent back"
+    )]
+    CallInReviseLoop { task: String, reviewer: String },
+    #[error("call task {task:?} is bound to session {session:?}; a call has no session")]
+    CallInSession { task: String, session: String },
     #[error("task {task:?} declares history, which only a playbook launched in a series receives")]
     HistoryOutsidePlaybook { task: String },
     #[error(
@@ -340,6 +349,36 @@ impl WorkflowCfg {
             return Err(WorkflowError::RouteInAutoresearch {
                 task: task.name.0.clone(),
             });
+        }
+
+        let is_call = |task: &Task| matches!(task.task, TaskKind::Call { .. });
+        if self.workflow_type == WorkflowType::Autoresearch
+            && let Some(task) = self.tasks.iter().find(|task| is_call(task))
+        {
+            return Err(WorkflowError::CallInAutoresearch {
+                task: task.name.0.clone(),
+            });
+        }
+        if let Some(task) = self.tasks.iter().find(|task| is_call(task))
+            && let Some(session) = &task.session
+        {
+            return Err(WorkflowError::CallInSession {
+                task: task.name.0.clone(),
+                session: session.clone(),
+            });
+        }
+        for reviewer in &self.tasks {
+            let Some(revise) = &reviewer.revise else {
+                continue;
+            };
+            if let Some(task) = self.tasks.iter().find(|task| {
+                is_call(task) && (task.name == reviewer.name || revise.tasks.contains(&task.name))
+            }) {
+                return Err(WorkflowError::CallInReviseLoop {
+                    task: task.name.0.clone(),
+                    reviewer: reviewer.name.0.clone(),
+                });
+            }
         }
 
         if self.workflow_type != WorkflowType::Playbook

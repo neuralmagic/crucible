@@ -6,7 +6,10 @@
 //! is not one, a ceiling over the admin cap.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
+use crucible_contract::calls::{MAX_FILE_PARAM_BYTES, MAX_JSON_PARAM_BYTES};
+use crucible_contract::emits::JsonSchema;
 use serde_json::{Map, Value};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -20,6 +23,24 @@ pub enum Kind {
     Choice(Vec<String>),
     /// Any of these values, sent as a list; the answer is its JSON array.
     MultiChoice(Vec<String>),
+    Json(Option<JsonSchema>),
+    File(FileSpec),
+}
+
+/// What a file parameter admits.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileSpec {
+    pub max_bytes: u64,
+    pub media_types: Vec<String>,
+}
+
+/// A file parameter's answer: the local file to upload as parameter `param`'s value.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Upload {
+    pub param: String,
+    pub path: PathBuf,
+    pub max_bytes: u64,
+    pub media_type: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -102,6 +123,23 @@ pub fn fields(schema: &Value) -> Vec<Field> {
                 .and_then(|items| items.get("enum"))
                 .and_then(strings);
             let kind = match (listed, prop.get("type").and_then(Value::as_str)) {
+                _ if param_type(prop) == Some("json") => Kind::Json(
+                    prop.get("allOf")
+                        .and_then(Value::as_array)
+                        .and_then(|all| all.first())
+                        .and_then(|schema| JsonSchema::new(schema.clone()).ok()),
+                ),
+                _ if param_type(prop) == Some("file") => Kind::File(FileSpec {
+                    max_bytes: prop
+                        .get("x-max-bytes")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(MAX_FILE_PARAM_BYTES)
+                        .min(MAX_FILE_PARAM_BYTES),
+                    media_types: prop
+                        .get("x-media-type")
+                        .and_then(strings)
+                        .unwrap_or_default(),
+                }),
                 (_, Some("boolean")) => Kind::Bool,
                 (_, Some("array")) if picks.is_some() => {
                     Kind::MultiChoice(picks.unwrap_or_default())
@@ -138,6 +176,10 @@ pub fn fields(schema: &Value) -> Vec<Field> {
             })
         })
         .collect()
+}
+
+fn param_type(prop: &Value) -> Option<&str> {
+    prop.get("x-param-type").and_then(Value::as_str)
 }
 
 fn offer(prop: &Value, props: &Map<String, Value>) -> Offer {
@@ -300,12 +342,12 @@ fn text_of(value: &Value) -> String {
 pub type Problems = Vec<(usize, String)>;
 
 /// The params object the answers make. An empty optional field is left out, so the schema's
-/// own default applies.
+/// own default applies. A file field is left out too: [`uploads`] reads it.
 pub fn params(fields: &[Field], answers: &[String]) -> Result<Value, Problems> {
     let mut out = Map::new();
     let mut problems = Vec::new();
     for (i, field) in fields.iter().enumerate() {
-        if !field.enabled(fields, answers) {
+        if !field.enabled(fields, answers) || matches!(field.kind, Kind::File(_)) {
             continue;
         }
         let answer = answers.get(i).map(|a| a.trim()).unwrap_or_default();
@@ -358,6 +400,14 @@ pub fn params(fields: &[Field], answers: &[String]) -> Result<Value, Problems> {
                 }
             },
             Kind::Bool => Value::Bool(answer == "true"),
+            Kind::Json(schema) => match json_value(answer, schema.as_ref()) {
+                Ok(value) => value,
+                Err(why) => {
+                    problems.push((i, why));
+                    continue;
+                }
+            },
+            Kind::File(_) => continue,
         };
         out.insert(field.name.clone(), value);
     }
@@ -366,6 +416,109 @@ pub fn params(fields: &[Field], answers: &[String]) -> Result<Value, Problems> {
     } else {
         Err(problems)
     }
+}
+
+fn json_value(answer: &str, schema: Option<&JsonSchema>) -> Result<Value, String> {
+    if answer.len() > MAX_JSON_PARAM_BYTES {
+        return Err(format!("At most {} KiB", MAX_JSON_PARAM_BYTES / 1024));
+    }
+    let value: Value = serde_json::from_str(answer).map_err(|_| "Not JSON".to_string())?;
+    if !(value.is_object() || value.is_array()) {
+        return Err("An object or array".to_string());
+    }
+    match schema.and_then(|schema| schema.refusal(&value)) {
+        Some(why) => Err(why),
+        None => Ok(value),
+    }
+}
+
+pub fn uploads(fields: &[Field], answers: &[String]) -> Result<Vec<Upload>, Problems> {
+    let mut out = Vec::new();
+    let mut problems = Vec::new();
+    for (i, field) in fields.iter().enumerate() {
+        let Kind::File(spec) = &field.kind else {
+            continue;
+        };
+        if !field.enabled(fields, answers) {
+            continue;
+        }
+        let answer = answers.get(i).map(|a| a.trim()).unwrap_or_default();
+        if answer.is_empty() {
+            if field.required {
+                problems.push((i, "Required".to_string()));
+            }
+            continue;
+        }
+        match upload(&field.name, spec, Path::new(answer)) {
+            Ok(upload) => out.push(upload),
+            Err(why) => problems.push((i, why)),
+        }
+    }
+    if problems.is_empty() {
+        Ok(out)
+    } else {
+        Err(problems)
+    }
+}
+
+pub fn upload(param: &str, spec: &FileSpec, path: &Path) -> Result<Upload, String> {
+    let size = std::fs::metadata(path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .map(|meta| meta.len())
+        .ok_or_else(|| "No such file".to_string())?;
+    too_large(size, spec.max_bytes)?;
+    let media_type = media_type(path).map(str::to_string);
+    if !spec.media_types.is_empty()
+        && !media_type
+            .as_ref()
+            .is_some_and(|m| spec.media_types.contains(m))
+    {
+        return Err(format!("One of {}", spec.media_types.join(", ")));
+    }
+    Ok(Upload {
+        param: param.to_string(),
+        path: path.to_path_buf(),
+        max_bytes: spec.max_bytes,
+        media_type,
+    })
+}
+
+pub fn too_large(size: u64, max_bytes: u64) -> Result<(), String> {
+    if size > max_bytes {
+        return Err(format!("At most {}", bytes(max_bytes)));
+    }
+    Ok(())
+}
+
+fn bytes(n: u64) -> String {
+    match n {
+        n if n >= 1 << 20 && n % (1 << 20) == 0 => format!("{} MiB", n >> 20),
+        n if n >= 1 << 10 && n % (1 << 10) == 0 => format!("{} KiB", n >> 10),
+        n => format!("{n} B"),
+    }
+}
+
+fn media_type(path: &Path) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match extension.as_str() {
+        "json" => "application/json",
+        "yaml" | "yml" => "application/yaml",
+        "toml" => "application/toml",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "gz" | "tgz" => "application/gzip",
+        "tar" => "application/x-tar",
+        "md" => "text/markdown",
+        "txt" | "log" => "text/plain",
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        _ => return None,
+    })
 }
 
 /// Minutes in a duration written as `45m`, `2h` or `1h30m`.
@@ -512,7 +665,8 @@ mod tests {
     use serde_json::json;
 
     use crate::form::{
-        Field, Kind, Refusal, Scale, ceilings, duration, fields, minutes, params, picked, toggled,
+        Field, FileSpec, Kind, Refusal, Scale, Upload, ceilings, duration, fields, minutes, params,
+        picked, toggled, upload, uploads,
     };
 
     #[test]
@@ -893,5 +1047,141 @@ mod tests {
             }
         }));
         assert!(f.iter().all(|field| field.offer.snapshot.is_none()));
+    }
+
+    fn typed() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "config": {"type": ["object", "array"], "x-param-type": "json",
+                           "allOf": [{"type": "object", "required": ["name"],
+                                      "properties": {"name": {"type": "string"}}}]},
+                "extra": {"type": ["object", "array"], "x-param-type": "json"},
+                "notes": {"type": "object", "x-param-type": "file", "x-max-bytes": 8,
+                          "x-media-type": ["text/markdown"]},
+                "blob": {"type": "object", "x-param-type": "file"}
+            },
+            "required": ["config", "notes"],
+            "x-order": ["config", "extra", "notes", "blob"]
+        })
+    }
+
+    #[test]
+    fn json_and_file_params_read_their_kinds_from_x_param_type() {
+        let f = fields(&typed());
+        assert!(matches!(&f[0].kind, Kind::Json(Some(_))), "{:?}", f[0].kind);
+        assert_eq!(f[1].kind, Kind::Json(None));
+        assert_eq!(
+            f[2].kind,
+            Kind::File(FileSpec {
+                max_bytes: 8,
+                media_types: vec!["text/markdown".into()]
+            })
+        );
+        assert_eq!(
+            f[3].kind,
+            Kind::File(FileSpec {
+                max_bytes: crucible_contract::calls::MAX_FILE_PARAM_BYTES,
+                media_types: Vec::new()
+            })
+        );
+    }
+
+    #[test]
+    fn a_json_answer_is_sent_as_its_value_once_it_parses_and_fits_its_schema() {
+        let f = fields(&typed());
+        let with = |config: &str, extra: &str| {
+            params(
+                &f,
+                &[config.into(), extra.into(), String::new(), String::new()],
+            )
+        };
+        assert_eq!(
+            with(r#"{"name": "a"}"#, "[1, 2]").unwrap(),
+            json!({"config": {"name": "a"}, "extra": [1, 2]})
+        );
+        let problem = |config: &str, extra: &str| with(config, extra).unwrap_err();
+        assert_eq!(problem("{", ""), vec![(0, "Not JSON".to_string())]);
+        assert_eq!(
+            problem(r#"{"name": "a"}"#, "3"),
+            vec![(1, "An object or array".to_string())]
+        );
+        let refused = problem("{}", "");
+        assert_eq!(refused.len(), 1);
+        assert!(refused[0].1.contains("name"), "{refused:?}");
+        let big = format!("[{}0]", "0,".repeat(40 * 1024));
+        assert_eq!(
+            problem(r#"{"name": "a"}"#, &big),
+            vec![(1, "At most 64 KiB".to_string())]
+        );
+        assert_eq!(problem("", ""), vec![(0, "Required".to_string())]);
+    }
+
+    #[test]
+    fn a_file_answer_is_an_upload_refused_past_its_cap_or_media_type_before_sending() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes.md");
+        std::fs::write(&notes, "# hi").unwrap();
+        let f = fields(&typed());
+        let answers = |notes: &str, blob: &str| {
+            vec![
+                r#"{"name": "a"}"#.to_string(),
+                String::new(),
+                notes.to_string(),
+                blob.to_string(),
+            ]
+        };
+        let path = notes.display().to_string();
+        assert_eq!(
+            uploads(&f, &answers(&path, "")).unwrap(),
+            vec![Upload {
+                param: "notes".into(),
+                path: notes.clone(),
+                max_bytes: 8,
+                media_type: Some("text/markdown".into()),
+            }]
+        );
+        assert_eq!(
+            params(&f, &answers(&path, &path)).unwrap(),
+            json!({"config": {"name": "a"}}),
+            "a file is never a param value before it is uploaded"
+        );
+
+        let problems = |notes: &str, blob: &str| uploads(&f, &answers(notes, blob)).unwrap_err();
+        assert_eq!(problems("", ""), vec![(2, "Required".to_string())]);
+        let missing = dir.path().join("gone.md").display().to_string();
+        assert_eq!(
+            problems(&missing, ""),
+            vec![(2, "No such file".to_string())]
+        );
+        let text = dir.path().join("notes.txt");
+        std::fs::write(&text, "hi").unwrap();
+        assert_eq!(
+            problems(&text.display().to_string(), ""),
+            vec![(2, "One of text/markdown".to_string())]
+        );
+        std::fs::write(&notes, "# too long").unwrap();
+        assert_eq!(problems(&path, ""), vec![(2, "At most 8 B".to_string())]);
+
+        let any = FileSpec {
+            max_bytes: 1024,
+            media_types: Vec::new(),
+        };
+        let bare = dir.path().join("data");
+        std::fs::write(&bare, "x").unwrap();
+        assert_eq!(upload("blob", &any, &bare).unwrap().media_type, None);
+        assert_eq!(
+            upload("blob", &any, dir.path()),
+            Err("No such file".to_string())
+        );
+        let sixteen = FileSpec {
+            max_bytes: 16 << 20,
+            media_types: Vec::new(),
+        };
+        assert_eq!(upload("blob", &sixteen, &bare).unwrap().max_bytes, 16 << 20);
+        assert_eq!(
+            crate::form::too_large((16 << 20) + 1, 16 << 20),
+            Err("At most 16 MiB".to_string())
+        );
     }
 }

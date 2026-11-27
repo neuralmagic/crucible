@@ -520,6 +520,13 @@ impl crate::App {
         if self.keys_error.is_some() {
             return;
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.keys_error = from.move_forge_tokens(&to, &self.forge_accounts()).err();
+            if self.keys_error.is_some() {
+                return;
+            }
+        }
         self.settings.set_keychain(on);
         self.targets.clear();
         self.retry_profile();
@@ -602,6 +609,8 @@ impl crate::App {
             return;
         }
         let was_current = form.editing.as_deref() == Some(self.remote.target.name.as_str());
+        #[cfg(not(target_arch = "wasm32"))]
+        self.forge_offers.forget(&name);
         if let Some(old) = renamed {
             if profile.auth == Auth::Own {
                 self.keys_error = self.settings.keys().rename(&old, &name, &profile.url).err();
@@ -619,6 +628,8 @@ impl crate::App {
 
     /// Forget profile `name`, stopping what it kept running. The profile in use moves to another.
     pub fn remove_profile(&mut self, name: &str) {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.forge_offers.forget(name);
         self.keys_error = self.settings.keys().forget(name).err();
         self.settings.remove_profile(name);
         self.targets.remove(name);

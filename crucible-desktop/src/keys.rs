@@ -85,6 +85,69 @@ impl Store {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn forge_tokens(
+        &self,
+        account: &crate::forge::Account,
+    ) -> Result<Option<crate::forge::device::Tokens>, String> {
+        let text = match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Store::Keychain => match entry(&account.store_key())?.get_password() {
+                Ok(text) => text,
+                Err(keyring::Error::NoEntry) => return Ok(None),
+                Err(error) => {
+                    return Err(format!(
+                        "reading the forge sign-in from the keychain: {error}"
+                    ));
+                }
+            },
+            Store::Dir(dir) => match std::fs::read_to_string(dir.join(forge_file(account))) {
+                Ok(text) => text,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(format!("reading the forge sign-in: {error}")),
+            },
+        };
+        serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|error| format!("reading the forge sign-in: {error}"))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn save_forge_tokens(
+        &self,
+        account: &crate::forge::Account,
+        tokens: &crate::forge::device::Tokens,
+    ) -> Result<(), String> {
+        let text = serde_json::to_string(tokens)
+            .map_err(|error| format!("keeping the forge sign-in: {error}"))?;
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Store::Keychain => entry(&account.store_key())?
+                .set_password(&text)
+                .map_err(|error| format!("keeping the forge sign-in in the keychain: {error}")),
+            Store::Dir(dir) => private_write(&dir.join(forge_file(account)), &text)
+                .map_err(|error| format!("keeping the forge sign-in: {error}")),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn forget_forge_tokens(&self, account: &crate::forge::Account) -> Result<(), String> {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Store::Keychain => match entry(&account.store_key())?.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                Err(error) => Err(format!(
+                    "removing the forge sign-in from the keychain: {error}"
+                )),
+            },
+            Store::Dir(dir) => match std::fs::remove_file(dir.join(forge_file(account))) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(format!("removing the forge sign-in: {error}")),
+            },
+        }
+    }
+
     /// Move the keys of `profiles` (name, URL) to `to`. Nothing leaves this store unless every
     /// key was copied; on a failure the copies already made are dropped again.
     pub fn move_to(&self, to: &Store, profiles: &[(String, String)]) -> Result<(), String> {
@@ -110,6 +173,59 @@ impl Store {
         }
         Ok(())
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn move_forge_tokens(
+        &self,
+        to: &Store,
+        accounts: &[crate::forge::Account],
+    ) -> Result<(), String> {
+        let mut copied = Vec::new();
+        for account in accounts {
+            let copy = self.forge_tokens(account).and_then(|tokens| match tokens {
+                Some(tokens) => to.save_forge_tokens(account, &tokens).map(|()| true),
+                None => Ok(false),
+            });
+            match copy {
+                Ok(true) => copied.push(account),
+                Ok(false) => {}
+                Err(why) => {
+                    for account in copied {
+                        let _ = to.forget_forge_tokens(account);
+                    }
+                    return Err(why);
+                }
+            }
+        }
+        for account in copied {
+            self.forget_forge_tokens(account)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn forge_file(account: &crate::forge::Account) -> String {
+    format!(
+        "{}-{}.json",
+        account.forge(),
+        account.host().replace(':', "_")
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn private_write(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    std::io::Write::write_all(&mut file, text.as_bytes())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -125,6 +241,50 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::Dir(dir.path().to_path_buf());
         (dir, store)
+    }
+
+    #[test]
+    fn forge_sign_ins_are_kept_private_per_account_and_move_together() {
+        use crate::forge::{Account, device::Tokens};
+        let (held, store) = dir();
+        let (_other_dir, other) = dir();
+        let gh = Account::Github;
+        let gl = Account::Gitlab("gl.example.com:8443".into());
+        assert_eq!(store.forge_tokens(&gh).unwrap(), None);
+        let tokens = |login: &str| -> Tokens {
+            serde_json::from_value(serde_json::json!({
+                "login": login,
+                "access": "a",
+                "refresh": "r",
+                "expires_at": 100,
+            }))
+            .unwrap()
+        };
+        store.save_forge_tokens(&gh, &tokens("wren")).unwrap();
+        store.save_forge_tokens(&gl, &tokens("wren-gl")).unwrap();
+        assert_eq!(store.forge_tokens(&gh).unwrap(), Some(tokens("wren")));
+        assert_eq!(store.forge_tokens(&gl).unwrap(), Some(tokens("wren-gl")));
+        let file = held.path().join("gitlab-gl.example.com_8443.json");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+            store.save_forge_tokens(&gl, &tokens("wren-gl")).unwrap();
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "a rewrite tightens an existing file");
+        }
+        store
+            .move_forge_tokens(&other, &[gh.clone(), gl.clone()])
+            .unwrap();
+        assert_eq!(store.forge_tokens(&gh).unwrap(), None);
+        assert!(!file.exists());
+        assert_eq!(other.forge_tokens(&gl).unwrap(), Some(tokens("wren-gl")));
+        other.forget_forge_tokens(&gl).unwrap();
+        other.forget_forge_tokens(&gl).unwrap();
+        assert_eq!(other.forge_tokens(&gl).unwrap(), None);
+        assert_eq!(other.forge_tokens(&gh).unwrap(), Some(tokens("wren")));
     }
 
     #[test]

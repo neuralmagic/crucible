@@ -310,6 +310,38 @@ impl App {
         }
     }
 
+    pub fn toggle_frame_info(&mut self, key: &str) {
+        self.run.frame_info = match self.run.frame_info.take() {
+            Some(open) if open == key => None,
+            _ => Some(key.to_string()),
+        };
+    }
+
+    pub fn toggle_call(&mut self, key: &str) {
+        if !self.run.call_folds.remove(key) {
+            self.run.call_folds.insert(key.to_string());
+        }
+    }
+
+    pub fn pick_call_node(&mut self, node: crate::live::calls::CallNode) {
+        if self.run.call_node.as_ref().map(|shown| &shown.ask) != Some(&node.ask) {
+            self.run.node_folds.clear();
+        }
+        self.run.call_node = Some(node);
+        self.show_pane(PaneKind::Log);
+    }
+
+    pub fn jump(&mut self, jump: &crate::live::calls::Jump, tx: &mut rune::Tx) {
+        match jump {
+            crate::live::calls::Jump::Launch { launch, task } => {
+                self.open_launch(launch, task.as_deref());
+            }
+            crate::live::calls::Jump::Web(url) => {
+                let _ = tx.open_url(url);
+            }
+        }
+    }
+
     /// Selects `task` from the graph, with `from` when its edge from that dependency was picked:
     /// the Data pane shows it when in front, else the edge opens Data and a node opens Tasks.
     pub fn pick_task(&mut self, task: &str, from: Option<&str>) {

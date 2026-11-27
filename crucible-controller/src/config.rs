@@ -13,6 +13,24 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// Where the GitHub backend takes the token it dispatches with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum GithubToken {
+    #[value(name = "person", alias = "gh")]
+    Person,
+    #[value(name = "app")]
+    AppInstallation,
+}
+
+/// Where the GitLab backend takes the token it creates pipelines with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum GitlabToken {
+    #[value(name = "person")]
+    Person,
+    #[value(name = "bot")]
+    Bot,
+}
+
 /// How grounded ranking turns run. Replaces the old silent `CONTROLLER_SANDBOX_IMAGE`-presence gate
 /// (which failed closed in-cluster: env unset → `local` backend → no `claude` binary → every grounded
 /// escalation died to the text verdict). Now an explicit choice whose prerequisites are checked
@@ -711,6 +729,71 @@ pub struct ControllerCfg {
         default_value = ""
     )]
     pub local_secret_allowlist: Vec<String>,
+    #[arg(
+        long = "calls-github-token",
+        env = "CONTROLLER_CALLS_GITHUB_TOKEN",
+        value_enum
+    )]
+    pub calls_github_token: Option<crate::config::GithubToken>,
+    #[arg(skip)]
+    pub forge_signed_in: crate::identity::forge::held::SignedIn,
+    #[arg(
+        long = "calls-gitlab-token",
+        env = "CONTROLLER_CALLS_GITLAB_TOKEN",
+        value_enum
+    )]
+    pub calls_gitlab_token: Option<crate::config::GitlabToken>,
+    #[arg(
+        long = "gitlab-token-file",
+        env = "CONTROLLER_GITLAB_TOKEN_FILES",
+        value_delimiter = ',',
+        default_value = ""
+    )]
+    pub gitlab_token_files: Vec<String>,
+    #[arg(
+        long = "gitlab-client-id",
+        env = "CONTROLLER_GITLAB_CLIENT_IDS",
+        value_delimiter = ',',
+        default_value = ""
+    )]
+    pub gitlab_client_ids: Vec<String>,
+    #[arg(
+        long = "gitlab-hosts",
+        env = "CONTROLLER_GITLAB_HOSTS",
+        value_delimiter = ',',
+        default_value = ""
+    )]
+    pub gitlab_hosts: Vec<String>,
+    #[arg(
+        long = "github-logins",
+        env = "CONTROLLER_GITHUB_LOGINS",
+        value_delimiter = ',',
+        default_value = ""
+    )]
+    pub github_logins: Vec<String>,
+    #[arg(long = "github-client-id", env = "CONTROLLER_GITHUB_CLIENT_ID")]
+    pub github_client_id: Option<String>,
+    #[arg(
+        long = "calls-tekton-cluster",
+        env = "CONTROLLER_CALLS_TEKTON_CLUSTERS",
+        value_delimiter = ',',
+        default_value = ""
+    )]
+    pub calls_tekton_kubeconfigs: Vec<String>,
+    #[arg(
+        long = "calls-tekton-results",
+        env = "CONTROLLER_CALLS_TEKTON_RESULTS",
+        value_delimiter = ',',
+        default_value = ""
+    )]
+    pub calls_tekton_results: Vec<String>,
+    #[arg(
+        long = "calls-tekton-grant",
+        env = "CONTROLLER_CALLS_TEKTON_GRANTS",
+        value_delimiter = ',',
+        default_value = ""
+    )]
+    pub calls_tekton_grants: Vec<String>,
     #[command(flatten)]
     pub profile: Profile,
 }
@@ -1024,6 +1107,141 @@ impl ControllerCfg {
         )
     }
 
+    pub(crate) fn gitlab_token_files(
+        &self,
+    ) -> std::result::Result<
+        std::collections::BTreeMap<crate::identity::forge::ForgeHost, PathBuf>,
+        String,
+    > {
+        Ok(host_map(
+            "CONTROLLER_GITLAB_TOKEN_FILES",
+            "token file",
+            &self.gitlab_token_files,
+        )?
+        .into_iter()
+        .map(|(host, path)| (host, PathBuf::from(path)))
+        .collect())
+    }
+
+    pub(crate) fn gitlab_client_ids(
+        &self,
+    ) -> std::result::Result<
+        std::collections::BTreeMap<crate::identity::forge::ForgeHost, String>,
+        String,
+    > {
+        host_map(
+            "CONTROLLER_GITLAB_CLIENT_IDS",
+            "client ID",
+            &self.gitlab_client_ids,
+        )
+    }
+
+    pub fn validate_calls_gitlab(&self, dev_identity: Option<&str>) -> Result<()> {
+        match self.calls_gitlab_token {
+            None => Ok(()),
+            Some(crate::config::GitlabToken::Person) => {
+                let local = self.playbook_executor == PlaybookExecutor::Local;
+                let dev = dev_identity.is_some_and(|login| !login.trim().is_empty());
+                if !(local && dev) {
+                    bail!(
+                        "CONTROLLER_CALLS_GITLAB_TOKEN=person is for a local controller only: it \
+                         needs CONTROLLER_PLAYBOOK_EXECUTOR=local and CONTROLLER_DEV_IDENTITY; a \
+                         deployment creates pipelines with bot tokens \
+                         (CONTROLLER_CALLS_GITLAB_TOKEN=bot)"
+                    );
+                }
+                Ok(())
+            }
+            Some(crate::config::GitlabToken::Bot) => {
+                let files = self.gitlab_token_files().map_err(anyhow::Error::msg)?;
+                let clients = self.gitlab_client_ids().map_err(anyhow::Error::msg)?;
+                for host in self.gitlab_hosts() {
+                    if !files.contains_key(&host) {
+                        bail!(
+                            "CONTROLLER_CALLS_GITLAB_TOKEN=bot needs a token file for every \
+                             CONTROLLER_GITLAB_HOSTS host; {} has none \
+                             (CONTROLLER_GITLAB_TOKEN_FILES)",
+                            host.as_str()
+                        );
+                    }
+                }
+                for host in self.gitlab_hosts() {
+                    if !clients.contains_key(&host) {
+                        bail!(
+                            "CONTROLLER_CALLS_GITLAB_TOKEN=bot needs the OAuth application people \
+                             sign in with on every CONTROLLER_GITLAB_HOSTS host; {} has none \
+                             (CONTROLLER_GITLAB_CLIENT_IDS)",
+                            host.as_str()
+                        );
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn gitlab_hosts(&self) -> Vec<crate::identity::forge::ForgeHost> {
+        self.gitlab_hosts
+            .iter()
+            .filter(|h| !h.trim().is_empty())
+            .filter_map(|h| {
+                let host = crate::identity::forge::ForgeHost::parse(h);
+                if host.is_none() {
+                    tracing::warn!(
+                        host = h,
+                        "CONTROLLER_GITLAB_HOSTS entry is not a host name; ignored"
+                    );
+                }
+                host
+            })
+            .collect()
+    }
+
+    pub(crate) fn github_logins(&self) -> crate::identity::github_logins::GithubLogins {
+        crate::identity::github_logins::GithubLogins::parse(
+            self.github_logins.iter().map(String::as_str),
+        )
+    }
+
+    pub(crate) fn calls_tekton_clusters(
+        &self,
+    ) -> std::result::Result<
+        std::collections::BTreeMap<String, crate::calls::tekton::cluster::TektonCluster>,
+        String,
+    > {
+        crate::calls::tekton::cluster::clusters(
+            &self.calls_tekton_kubeconfigs,
+            &self.calls_tekton_results,
+            &self.calls_tekton_grants,
+        )
+    }
+
+    pub fn validate_calls_github(&self, dev_identity: Option<&str>) -> Result<()> {
+        match self.calls_github_token {
+            None => Ok(()),
+            Some(crate::config::GithubToken::Person) => {
+                let local = self.playbook_executor == PlaybookExecutor::Local;
+                let dev = dev_identity.is_some_and(|login| !login.trim().is_empty());
+                if !(local && dev) {
+                    bail!(
+                        "CONTROLLER_CALLS_GITHUB_TOKEN=person is for a local controller only: it needs \
+                         CONTROLLER_PLAYBOOK_EXECUTOR=local and CONTROLLER_DEV_IDENTITY; a \
+                         deployment dispatches with the GitHub App (CONTROLLER_CALLS_GITHUB_TOKEN=app)"
+                    );
+                }
+                Ok(())
+            }
+            Some(crate::config::GithubToken::AppInstallation) => match self.github_app {
+                Some(_) => Ok(()),
+                None => bail!(
+                    "CONTROLLER_CALLS_GITHUB_TOKEN=app needs the GitHub App: set \
+                     CONTROLLER_GITHUB_APP_ID, CONTROLLER_GITHUB_APP_INSTALLATION_ID and \
+                     CONTROLLER_GITHUB_APP_KEY_PATH"
+                ),
+            },
+        }
+    }
+
     /// Validate the [`ScopeExecutor`] prerequisites at startup, mirroring [`validate_grounded`].
     /// `pod` needs a deploy profile and at least one sandbox image (its own or the grounded fallback).
     pub fn validate_scope(&self) -> Result<()> {
@@ -1182,6 +1400,29 @@ pub fn refuse_retired_settings(env: impl Fn(&str) -> Option<String>) -> Result<(
         }
     }
     Ok(())
+}
+
+fn host_map(
+    env: &str,
+    what: &str,
+    entries: &[String],
+) -> std::result::Result<
+    std::collections::BTreeMap<crate::identity::forge::ForgeHost, String>,
+    String,
+> {
+    let mut out = std::collections::BTreeMap::new();
+    for entry in entries.iter().filter(|e| !e.trim().is_empty()) {
+        let (host, value) = entry
+            .split_once('=')
+            .ok_or_else(|| format!("{env} entry {entry:?} is not <host>=<{what}>"))?;
+        let host = crate::identity::forge::ForgeHost::parse(host)
+            .ok_or_else(|| format!("{env} entry {entry:?} names no host"))?;
+        if value.trim().is_empty() {
+            return Err(format!("{env} entry {entry:?} names no {what}"));
+        }
+        out.insert(host, value.trim().to_owned());
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1372,6 +1613,126 @@ mod tests {
             cfg!(feature = "autoresearch"),
             "switching the lane on needs a build that carries it"
         );
+    }
+
+    #[test]
+    fn gitlab_person_tokens_are_local_only_and_bot_tokens_cover_every_host() {
+        let local = crate::testing::cfg_from_args([
+            "ctl",
+            "--calls-gitlab-token",
+            "person",
+            "--playbook-executor",
+            "local",
+        ]);
+        local.validate_calls_gitlab(Some("wren")).unwrap();
+        let err = local.validate_calls_gitlab(None).unwrap_err().to_string();
+        assert!(err.contains("CONTROLLER_DEV_IDENTITY"), "{err}");
+
+        let bot = crate::testing::cfg_from_args([
+            "ctl",
+            "--calls-gitlab-token",
+            "bot",
+            "--gitlab-hosts",
+            "gitlab.com,GL.example.com",
+            "--gitlab-token-file",
+            "gitlab.com=/run/secrets/gl",
+        ]);
+        let err = bot.validate_calls_gitlab(None).unwrap_err().to_string();
+        assert!(err.contains("gl.example.com has none"), "{err}");
+        let files = bot.gitlab_token_files().unwrap();
+        assert_eq!(
+            files.get(&crate::identity::forge::ForgeHost::parse("gitlab.com").unwrap()),
+            Some(&PathBuf::from("/run/secrets/gl"))
+        );
+        for bad in ["gitlab.com", "a b=/x", "gitlab.com= "] {
+            let cfg = crate::testing::cfg_from_args(["ctl", "--gitlab-token-file", bad]);
+            assert!(cfg.gitlab_token_files().is_err(), "{bad:?}");
+        }
+        let hosts =
+            crate::testing::cfg_from_args(["ctl", "--gitlab-hosts", "gitlab.com,not a host"]);
+        assert_eq!(hosts.gitlab_hosts().len(), 1);
+
+        let unclient = crate::testing::cfg_from_args([
+            "ctl",
+            "--calls-gitlab-token",
+            "bot",
+            "--gitlab-hosts",
+            "gitlab.com",
+            "--gitlab-token-file",
+            "gitlab.com=/run/secrets/gl",
+        ]);
+        let err = unclient
+            .validate_calls_gitlab(None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("CONTROLLER_GITLAB_CLIENT_IDS"), "{err}");
+        let served = crate::testing::cfg_from_args([
+            "ctl",
+            "--calls-gitlab-token",
+            "bot",
+            "--gitlab-hosts",
+            "gitlab.com",
+            "--gitlab-token-file",
+            "gitlab.com=/run/secrets/gl",
+            "--gitlab-client-id",
+            "gitlab.com=abc123",
+        ]);
+        served.validate_calls_gitlab(None).unwrap();
+        assert_eq!(
+            served
+                .gitlab_client_ids()
+                .unwrap()
+                .get(&crate::identity::forge::ForgeHost::parse("gitlab.com").unwrap())
+                .map(String::as_str),
+            Some("abc123")
+        );
+    }
+
+    #[test]
+    fn the_gh_token_source_is_for_a_local_controller_only() {
+        let local = crate::testing::cfg_from_args([
+            "ctl",
+            "--calls-github-token",
+            "gh",
+            "--playbook-executor",
+            "local",
+        ]);
+        local
+            .validate_calls_github(Some("wren"))
+            .expect("a local controller with a dev identity");
+        for dev in [None, Some(""), Some("  ")] {
+            let err = local.validate_calls_github(dev).unwrap_err().to_string();
+            assert!(err.contains("CONTROLLER_DEV_IDENTITY"), "{err}");
+        }
+        let pod = crate::testing::cfg_from_args([
+            "ctl",
+            "--calls-github-token",
+            "gh",
+            "--playbook-executor",
+            "pod",
+        ]);
+        let err = pod
+            .validate_calls_github(Some("wren"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("CONTROLLER_PLAYBOOK_EXECUTOR=local"), "{err}");
+
+        let mut app = crate::testing::cfg_from_args(["ctl", "--calls-github-token", "app"]);
+        let err = app.validate_calls_github(None).unwrap_err().to_string();
+        assert!(err.contains("CONTROLLER_GITHUB_APP_ID"), "{err}");
+        let dir = tempfile::tempdir().expect("tempdir");
+        app.github_app = Some(crate::secrets::github_app::GithubAppTokenSource::new(
+            "1",
+            "2",
+            crate::secrets::github_app::testkey::write_test_key(dir.path()),
+            "https://api.github.com",
+        ));
+        app.validate_calls_github(None)
+            .expect("the App is configured");
+
+        crate::testing::cfg_from_args(["ctl"])
+            .validate_calls_github(None)
+            .expect("no token source dispatches nothing");
     }
 
     #[test]

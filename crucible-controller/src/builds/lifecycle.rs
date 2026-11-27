@@ -6,11 +6,10 @@
 //! manifest loader all share ONE schema — no divergence in timeouts, sub-tables, `needs`, or
 //! templates by construction.
 //!
-//! **Backends run synchronously, off-thread.** `forge::build::dispatch_cluster` and
-//! `forge::github::dispatch_github` are one-shot BLOCKING calls (dispatch + wait + resolve the
-//! pushed digest, each spinning its own runtime), so a backend's [`BuildBackend::dispatch`] runs the
-//! whole build on `tokio::task::spawn_blocking` — that keeps the async reconcile executor free and
-//! avoids the nested-runtime panic. The daemon's reconcile worker is serial, so a build occupies one
+//! **Backends run to completion in dispatch.** `forge::build::dispatch_cluster` is a one-shot
+//! BLOCKING call (dispatch + wait + resolve the pushed digest, spinning its own runtime), so it runs
+//! on `tokio::task::spawn_blocking`; `forge::github::build::run_build` is async (dispatch + wait for
+//! the run GitHub returned), and the digest is pinned after it. The daemon's reconcile worker is serial, so a build occupies one
 //! `building` pass end to end; the `builds` ledger, the per-kind cap, park-on-failure, and startup
 //! adoption around it are unchanged. Production is [`ForgeBuildBackend`] (installed at daemon
 //! assembly when `--build-backends` is set with creds), routing on the build's `backend`; with none
@@ -37,8 +36,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// The real build backend: routes a build on its `backend` to `forge::build::dispatch_cluster`
-/// (a detached rootless-buildah Job) or `forge::github::dispatch_github` (`workflow_dispatch` +
-/// poll). Both forge fns are one-shot BLOCKING, so [`Self::dispatch`] runs them on `spawn_blocking`.
+/// (a detached rootless-buildah Job, BLOCKING, so run on `spawn_blocking`) or
+/// `forge::github::build::run_build` (`workflow_dispatch` + poll of the returned run, async).
 /// Creds live here (resolved from controller config, never the manifest).
 pub struct ForgeBuildBackend {
     /// The registry PUSH authfile the cluster Job's secret seeds from (and github digest resolution
@@ -95,7 +94,7 @@ impl ForgeBuildBackend {
             git_url,
             git_ref: self.git_ref.clone(),
             namespace: namespace.to_string(),
-            correlation_id: forge::github::new_correlation_id(),
+            correlation_id: forge::github::build::new_correlation_id(),
             builder_image: self.builder_image.clone(),
             git_image: self.git_image.clone(),
             ttl_seconds: self.ttl_seconds,
@@ -104,9 +103,10 @@ impl ForgeBuildBackend {
         })
     }
 
-    /// Build a `forge::github::GithubBuildRequest` from a github build + this backend's config. The
-    /// `inputs` are already template-expanded by [`drive_scope_builds`] before dispatch.
-    fn github_request(&self, req: &BuildRequest) -> Result<forge::github::GithubBuildRequest> {
+    fn github_request(
+        &self,
+        req: &BuildRequest,
+    ) -> Result<forge::github::build::GithubBuildRequest> {
         let DispatchSpec::Github {
             repo,
             workflow,
@@ -118,20 +118,19 @@ impl ForgeBuildBackend {
             bail!("build `{}` is not a github build", req.name);
         };
         let correlation_id = if correlation_id.is_empty() {
-            forge::github::new_correlation_id()
+            forge::github::build::new_correlation_id()
         } else {
             correlation_id.clone()
         };
-        let repo =
-            forge::github::OrgAllowlist::parse(&self.allowed_orgs.join(","))?.authorize(repo)?;
-        Ok(forge::github::GithubBuildRequest {
+        let repo = forge::github::build::OrgAllowlist::parse(&self.allowed_orgs.join(","))?
+            .authorize(repo)?;
+        Ok(forge::github::build::GithubBuildRequest {
             name: req.name.clone(),
             repo,
             workflow: workflow.clone(),
             git_ref: git_ref.clone(),
             inputs: inputs.clone(),
             correlation_id,
-            correlation: forge::spec::CorrelationSource::default(),
             digest: forge::spec::DigestSource::default(),
             image_ref: req.image_tag(),
             timeout: req.timeout,
@@ -168,20 +167,16 @@ impl BuildBackend for ForgeBuildBackend {
             }
             BuildBackendKind::GithubActions => {
                 let gbr = self.github_request(req)?;
-                let dispatch_id = gbr.correlation_id.clone();
-                let token = self.github_token.clone().ok_or_else(|| {
+                let token = self.github_token.as_deref().ok_or_else(|| {
                     BackendNotInstalled(
                         "github build token not configured: set CONTROLLER_BUILD_GITHUB_TOKEN"
                             .to_string(),
                     )
                 })?;
-                let authfile = self.push_authfile.clone();
-                tokio::task::spawn_blocking(move || {
-                    forge::github::dispatch_github(&gbr, &token, authfile.as_deref())
-                })
-                .await
-                .context("joining the github build task")??;
-                Ok(dispatch_id)
+                let client = forge::github::Client::new()?;
+                let token = forge::github::Token::new(token);
+                let run = forge::github::build::run_build(&client, &gbr, &token).await?;
+                Ok(run.run_id.to_string())
             }
         }
     }
@@ -670,49 +665,28 @@ fn classify_dispatch_error(err: &anyhow::Error) -> DispatchClass {
     DispatchClass::Transient
 }
 
-/// The GitHub backend split: schema/introspection rejections and a failed run are permanent; a run
-/// still in flight, a missing correlation, and transport/5xx errors are transient. Exhaustive so a
-/// new `GithubError` variant forces a deliberate classification here.
 fn classify_github_error(err: &forge::github::GithubError) -> DispatchClass {
     use forge::github::GithubError as G;
+    use forge::github::build::BuildFailure as B;
     match err {
-        // Config the operator must fix: bad repo/workflow name, a workflow that can't be dispatched,
-        // failed input validation, an unsupported digest source, or a missing/oversized/!utf8 file.
         G::MalformedRepo { .. }
-        | G::MalformedAllowedOrg { .. }
-        | G::EmptyOrgAllowlist { .. }
-        | G::OrgNotAllowed { .. }
-        | G::MalformedWorkflowFilename { .. }
-        | G::UnsupportedDigestSource { .. }
-        | G::InputValidation { .. }
-        | G::NoTriggerBlock
-        | G::NotDispatchable
-        | G::InputsNotMapping
-        | G::InputNameNotString
-        | G::ParseYaml(_)
+        | G::Workflow { .. }
         | G::WorkflowNotFound { .. }
-        | G::WorkflowTooLarge { .. }
-        | G::WorkflowBodyOverCap { .. }
-        | G::WorkflowNotUtf8(_)
-        // Introspection wraps one of the above; its message names the offending field.
-        | G::Introspecting { .. }
-        // The dispatched run ran and failed — deterministic; park with the run URL as evidence.
-        | G::RunFailed { .. } => DispatchClass::Permanent(err.to_string()),
-        // A rejected dispatch is permanent on a 4xx the operator must fix (auth, 422 validation),
-        // transient on a 429 rate-limit or 5xx worth another pass.
-        G::DispatchRejected { status, .. } => {
-            if status.is_client_error() && status.as_u16() != 429 {
-                DispatchClass::Permanent(err.to_string())
-            } else {
-                DispatchClass::Transient
-            }
-        }
-        // In-flight or environmental: retry.
-        G::RunUnfinished { .. }
-        | G::NoCorrelatedRun { .. }
-        | G::Http { .. }
-        | G::Runtime { .. }
-        | G::Upstream { .. } => DispatchClass::Transient,
+        | G::Response { .. } => DispatchClass::Permanent(err.to_string()),
+        G::Build(failure) => match failure {
+            B::MalformedAllowedOrg { .. }
+            | B::EmptyOrgAllowlist { .. }
+            | B::OrgNotAllowed { .. }
+            | B::MalformedWorkflowFilename { .. }
+            | B::UnsupportedDigestSource { .. }
+            | B::InputValidation { .. }
+            | B::RunFailed { .. } => DispatchClass::Permanent(err.to_string()),
+            B::RunUnfinished { .. } => DispatchClass::Transient,
+        },
+        G::Api { .. } | G::Http { .. } => match err.is_transient() {
+            true => DispatchClass::Transient,
+            false => DispatchClass::Permanent(err.to_string()),
+        },
     }
 }
 
@@ -785,7 +759,7 @@ fn prepare_dispatch(
         sha: String::new(),
         tag: req.tag.clone(),
         image: req.image.clone(),
-        correlation_id: forge::github::new_correlation_id(),
+        correlation_id: forge::github::build::new_correlation_id(),
         build_digests: build_digests.clone(),
     };
     let mut out = req.clone();
@@ -1049,7 +1023,13 @@ mod tests {
     impl BuildBackend for PermanentDispatchBackend {
         async fn dispatch(&self, _ns: &str, _req: &BuildRequest) -> Result<String> {
             *self.attempts.lock().expect("lock") += 1;
-            Err(forge::github::GithubError::NotDispatchable.into())
+            Err(forge::github::GithubError::Workflow {
+                repo: "o/r".into(),
+                workflow: "b.yml".into(),
+                git_ref: "main".into(),
+                error: Box::new(forge::github::workflow::WorkflowError::NotDispatchable),
+            }
+            .into())
         }
         async fn poll(&self, _ns: &str, _req: &BuildRequest, _id: &str) -> Result<BuildProgress> {
             Ok(BuildProgress::Running)
@@ -1659,7 +1639,7 @@ base-image = "{{ builds.vllm-sandbox.digest_ref }}"
         let progress = drive(&db, &cfg, scope, &[sample_request("a")]).await?;
 
         assert!(
-            matches!(progress, BuildsProgress::Blocked { evidence: Some(ref e) } if e.contains("isn't dispatchable")),
+            matches!(progress, BuildsProgress::Blocked { evidence: Some(ref e) } if e.contains("no workflow_dispatch trigger")),
             "a permanent typed error parks at once with the forge reason: {progress:?}"
         );
         let row = &crate::builds::store::builds_for_scope(db.pool(), scope).await?[0];
@@ -1719,71 +1699,51 @@ base-image = "{{ builds.vllm-sandbox.digest_ref }}"
         ));
 
         // GitHub permanent: malformed spec, non-dispatchable workflow, failed validation, failed run.
+        use forge::github::build::BuildFailure as B;
+        let build = |failure: B| -> anyhow::Error { G::from(failure).into() };
         assert!(permanent(G::MalformedRepo { repo: "bad".into() }.into()));
-        assert!(permanent(G::NotDispatchable.into()));
         assert!(permanent(
-            G::InputValidation {
+            G::Workflow {
                 repo: "o/r".into(),
                 workflow: "b.yml".into(),
                 git_ref: "main".into(),
-                errors: vec!["missing input".into()],
+                error: Box::new(forge::github::workflow::WorkflowError::NotDispatchable),
             }
             .into()
         ));
-        assert!(permanent(
-            G::RunFailed {
-                build: "b".into(),
-                run_id: 7,
-                conclusion: "failure".into(),
-                html_url: "http://x".into(),
-            }
-            .into()
-        ));
-        // A dispatch rejection splits on status: 4xx the operator must fix vs a 429/5xx retry.
-        assert!(permanent(
-            G::DispatchRejected {
-                url: "http://x".into(),
-                status: reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        assert!(permanent(build(B::InputValidation {
+            repo: "o/r".into(),
+            workflow: "b.yml".into(),
+            git_ref: "main".into(),
+            errors: vec!["missing input".into()],
+        })));
+        assert!(permanent(build(B::RunFailed {
+            build: "b".into(),
+            run_id: 7,
+            conclusion: Some(forge::github::RunConclusion::Failure),
+            html_url: "http://x".into(),
+        })));
+        let api = |status| -> anyhow::Error {
+            G::Api {
+                doing: "dispatching the workflow".into(),
+                status,
                 body: String::new(),
+                retry_after: None,
             }
             .into()
-        ));
-        assert!(transient(
-            G::DispatchRejected {
-                url: "http://x".into(),
-                status: reqwest::StatusCode::BAD_GATEWAY,
-                body: String::new(),
-            }
-            .into()
-        ));
-        assert!(transient(
-            G::DispatchRejected {
-                url: "http://x".into(),
-                status: reqwest::StatusCode::TOO_MANY_REQUESTS,
-                body: String::new(),
-            }
-            .into()
-        ));
+        };
+        assert!(permanent(api(422)));
+        assert!(permanent(api(401)));
+        assert!(transient(api(502)));
+        assert!(transient(api(429)));
 
-        // GitHub transient: run still in flight / correlation not observed yet.
-        assert!(transient(
-            G::RunUnfinished {
-                build: "b".into(),
-                run_id: 7,
-                timeout: Duration::from_secs(60),
-                status: Some("in_progress".into()),
-                html_url: "http://x".into(),
-            }
-            .into()
-        ));
-        assert!(transient(
-            G::NoCorrelatedRun {
-                correlation_id: "cid".into(),
-                window: Duration::from_secs(60),
-                correlation: forge::spec::CorrelationSource::default(),
-            }
-            .into()
-        ));
+        assert!(transient(build(B::RunUnfinished {
+            build: "b".into(),
+            run_id: 7,
+            timeout: Duration::from_secs(60),
+            status: Some(forge::github::RunStatus::InProgress),
+            html_url: "http://x".into(),
+        })));
 
         // An unrecognized plain error stays transient — the pre-typed default.
         assert!(transient(anyhow::anyhow!("registry auth blipped")));

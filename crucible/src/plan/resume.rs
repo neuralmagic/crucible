@@ -226,6 +226,22 @@ pub fn fold(log: &str, plan: &ValidPlan, elapsed: Duration) -> Result<Prior, Res
                     prior.order.push(row.name);
                 }
             }
+            SessionEvent::CallDispatched {
+                task,
+                instance,
+                attempt,
+                call,
+                ..
+            } => {
+                prior.calls.insert(
+                    crate::plan::call_run::CallKey {
+                        task,
+                        instance,
+                        attempt,
+                    },
+                    call,
+                );
+            }
             SessionEvent::HistoryEntry { .. } => prior.recorded_history = true,
             SessionEvent::Shutdown { .. } => prior.shut_down = true,
             _ => {}
@@ -669,9 +685,10 @@ mod tests {
     #[test]
     fn a_task_that_kills_its_process_every_attempt_is_stopped_by_the_cost_ceiling() {
         use crate::plan::attempt::{Attempt, AttemptOutcome};
-        use crate::plan::exec::{ExecCfg, PlanExit, Substrate, TaskRunner, execute};
+        use crate::plan::exec::{ExecCfg, PlanExit, Substrate, execute};
         use crate::plan::ir::Task;
         use crate::plan::machine::BlockedReason;
+        use crate::plan::task_runner::TaskRunner;
         use std::collections::BTreeMap;
         use std::num::NonZeroUsize;
 

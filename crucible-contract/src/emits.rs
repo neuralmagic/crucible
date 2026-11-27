@@ -445,6 +445,10 @@ impl JsonSchema {
         self.refusal(value).is_none()
     }
 
+    pub fn document(&self) -> &Value {
+        &self.0
+    }
+
     /// The finitely many values every instance is one of, when the schema bounds them with
     /// `const`, `enum`, or `type: "boolean"`.
     pub fn finite_values(&self) -> Option<Vec<Value>> {

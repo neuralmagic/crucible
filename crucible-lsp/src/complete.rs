@@ -82,16 +82,8 @@ impl Completer<'_> {
 
     /// The DSL constructor a call at `offset` reaches, unless a local binding took the name.
     fn constructor(&self, callee: &str, offset: usize) -> Option<&Function> {
-        let shadowed = self
-            .snapshot
-            .index
-            .as_ref()
-            .is_some_and(|index| index.resolve(callee, offset).is_some());
-        if shadowed {
-            None
-        } else {
-            self.reference.function(callee)
-        }
+        self.reference
+            .resolve(self.snapshot.index.as_deref(), callee, offset)
     }
 
     fn edit(&self, range: Range<usize>, new_text: String) -> Option<CompletionTextEdit> {
@@ -326,13 +318,21 @@ impl Completer<'_> {
                         extension: Some(".json"),
                     },
                 ),
-                "load" => self.paths(
-                    typed,
-                    offset,
-                    Want::File {
-                        extension: Some(".star"),
-                    },
-                ),
+                "load" => {
+                    let mut items = self.paths(
+                        typed,
+                        offset,
+                        Want::File {
+                            extension: Some(".star"),
+                        },
+                    );
+                    items.extend(self.reference.modules.iter().map(|module| {
+                        let mut item = self.item(module.label, CompletionItemKind::MODULE, &whole);
+                        item.documentation = Some(markdown(module.purpose));
+                        item
+                    }));
+                    items
+                }
                 "param" => self
                     .snapshot
                     .context
@@ -432,6 +432,15 @@ impl Completer<'_> {
             .frame
             .and_then(|frame| self.snapshot.argument_string(frame, 0))
             .filter(|_| structure.call_at(offset).is_some());
+        if let Some(builtin) = module.and_then(|label| self.reference.module(label)) {
+            return builtin
+                .functions
+                .iter()
+                .map(|f| f.name)
+                .chain(builtin.enums.iter().map(|(name, _, _)| *name))
+                .map(str::to_owned)
+                .collect();
+        }
         let Some(path) = module
             .zip(self.snapshot.context.pack.as_ref())
             .and_then(|(module, pack)| pack.resolve(module))
@@ -702,7 +711,7 @@ mod tests {
         );
         assert_eq!(
             case.labels("load(\"|\")", ""),
-            ["lib.star", "prompts/", "skills/"]
+            ["lib.star", "prompts/", "skills/", "@crucible//calls"]
         );
         assert_eq!(case.labels("skill(skill = \"skills/|\")", ""), ["triage/"]);
     }
@@ -714,6 +723,24 @@ mod tests {
             case.labels("load(\"lib.star\", \"|\")", ""),
             ["helper", "make"]
         );
+        let calls = case.labels("load(\"@crucible//calls\", \"|\")", "");
+        assert!(calls.contains(&"gitlab_pipeline".to_owned()), "{calls:?}");
+        assert!(calls.contains(&"event".to_owned()), "{calls:?}");
+    }
+
+    #[test]
+    fn an_imported_constructor_completes_its_arguments() {
+        let case = case();
+        let labels = case.labels(
+            "load(\"@crucible//calls\", gl = \"gitlab_pipeline\")\nt = gl(|)",
+            "load(\"@crucible//calls\", gl = \"gitlab_pipeline\")\nt = gl()",
+        );
+        for argument in ["host", "project", "ref", "outputs"] {
+            assert!(
+                labels.iter().any(|l| l.starts_with(argument)),
+                "{argument}: {labels:?}"
+            );
+        }
     }
 
     #[test]
@@ -747,7 +774,15 @@ mod tests {
         assert_eq!(case.labels("params = {\"repo\": {\"|\"}}", ""), FIELDS);
         assert_eq!(
             case.labels("params = {\"repo\": {\"type\": \"|\"}}", ""),
-            ["string", "int", "number", "bool", "list<string>"]
+            [
+                "string",
+                "int",
+                "number",
+                "bool",
+                "list<string>",
+                "json",
+                "file"
+            ]
         );
     }
 

@@ -1,9 +1,12 @@
 //! The runs page: every launch of one playbook on a time axis and a calendar, and as a list.
 //! Picking one opens its run.
 
-use rune::{Color, El, ScrollSpec, col, el, icon, row, text};
+use std::collections::HashSet;
 
-use crate::live::LivePlaybook;
+use rune::{Color, El, ScrollSpec, col, el, icon, row, text};
+use rune_theme_opencode::icons as oc;
+
+use crate::live::{LivePlaybook, LiveView};
 use crate::model::Verdict;
 use crate::runs::{
     DAY, Day, Summary, axis, calendar, date, day_label, lanes, month_labels, ticks, wall,
@@ -31,10 +34,15 @@ pub(crate) fn runs_page(
     shares: Option<El>,
     playbook: &str,
     launches: &[&LivePlaybook],
-    now: i64,
+    app: &App,
     view: Option<(RunsTab, Option<El>)>,
     p: &Paint,
 ) -> El {
+    let (live, unfolded) = (&*app.remote.live, &app.runs_unfolded);
+    let now = match live {
+        LiveView::Ready { now, .. } => *now,
+        _ => 0,
+    };
     let summary = Summary::of(
         &launches
             .iter()
@@ -114,7 +122,7 @@ pub(crate) fn runs_page(
                             .children(shares.map(|shares| card("Shares", shares, p))),
                     )
                     .child(
-                        card("All runs", list(launches, now, p), p)
+                        card("All runs", list(launches, live, unfolded, now, p), p)
                             .grow(1.0)
                             .min_w(0.0)
                             .min_h(0.0),
@@ -428,12 +436,67 @@ fn cell(d: &Day, busiest: usize, today: i64, landed: &[(i64, &LivePlaybook)], p:
     }
 }
 
+/// One row of the runs list: a launch, how deep under the launch whose call dispatched it, how
+/// many launches its own calls dispatched, and whether those show.
+#[derive(Clone, Copy)]
+struct Nested<'a> {
+    launch: &'a LivePlaybook,
+    depth: usize,
+    calls: usize,
+    open: bool,
+}
+
+fn nested<'a>(
+    launches: &[&'a LivePlaybook],
+    live: &'a LiveView,
+    unfolded: &HashSet<String>,
+) -> Vec<Nested<'a>> {
+    let listed: HashSet<&str> = launches.iter().map(|l| l.key.as_str()).collect();
+    let mut tops: Vec<&'a LivePlaybook> = launches
+        .iter()
+        .copied()
+        .filter(|l| {
+            l.called_by
+                .as_ref()
+                .is_none_or(|by| !listed.contains(by.launch.as_str()))
+        })
+        .collect();
+    tops.sort_by_key(|l| std::cmp::Reverse(l.landed));
+    let mut rows = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack: Vec<(&'a LivePlaybook, usize)> =
+        tops.into_iter().rev().map(|launch| (launch, 0)).collect();
+    while let Some((launch, depth)) = stack.pop() {
+        if !seen.insert(launch.key.as_str()) {
+            continue;
+        }
+        let called = live.called_from(&launch.key);
+        let open = unfolded.contains(&launch.key) && depth < MAX_DEPTH;
+        rows.push(Nested {
+            launch,
+            depth,
+            calls: called.len(),
+            open,
+        });
+        if open {
+            stack.extend(called.into_iter().rev().map(|child| (child, depth + 1)));
+        }
+    }
+    rows
+}
+
+const MAX_DEPTH: usize = crucible_contract::calls::MAX_CALL_DEPTH as usize;
+
 /// Every launch, newest first, under its column heads.
-fn list(launches: &[&LivePlaybook], now: i64, p: &Paint) -> El {
+fn list(
+    launches: &[&LivePlaybook],
+    live: &LiveView,
+    unfolded: &HashSet<String>,
+    now: i64,
+    p: &Paint,
+) -> El {
     let columns =
         rune::memo::layout_with("runs-list", |rect| Columns::fit(rect[2])).unwrap_or(Columns::All);
-    let mut sorted: Vec<&&LivePlaybook> = launches.iter().collect();
-    sorted.sort_by_key(|l| std::cmp::Reverse(l.landed));
     let mut rows = col()
         .key("runs-list")
         .w_full()
@@ -443,11 +506,11 @@ fn list(launches: &[&LivePlaybook], now: i64, p: &Paint) -> El {
             stick_bottom: false,
         })
         .scroll_edge_fade(8.0);
-    for (i, launch) in sorted.into_iter().enumerate() {
-        if i > 0 {
+    for (i, row) in nested(launches, live, unfolded).into_iter().enumerate() {
+        if i > 0 && row.depth == 0 {
             rows = rows.child(el().h(p.hair).w_full().fill(p.c.border_muted));
         }
-        rows = rows.child(list_row(i, launch, now, columns, p));
+        rows = rows.child(list_row(row, now, columns, p));
     }
     col()
         .w_full()
@@ -516,8 +579,47 @@ fn result(launch: &LivePlaybook) -> String {
         .unwrap_or_else(|| launch.status.to_string())
 }
 
-/// Row `i` of the list, newest first; keyed by position so a script can pick "run-0".
-fn list_row(i: usize, launch: &LivePlaybook, now: i64, columns: Columns, p: &Paint) -> El {
+const INDENT: f32 = 16.0;
+
+fn calls_badge(launch: &LivePlaybook, calls: usize, open: bool, p: &Paint) -> El {
+    let key = launch.key.clone();
+    row()
+        .key(format!("run-calls-{}", launch.key))
+        .role("button")
+        .label(if open { "Fold calls" } else { "Show calls" })
+        .checked(open)
+        .h(20.0)
+        .px(5.0)
+        .gap(2.0)
+        .center_y()
+        .radius(p.k.radius.sm)
+        .fill(p.c.layer_03)
+        .hover(p.c.hover)
+        .on_press(move |app: &mut App| {
+            if !app.runs_unfolded.remove(&key) {
+                app.runs_unfolded.insert(key.clone());
+            }
+        })
+        .child(
+            icon(
+                if open {
+                    &oc::CHEVRON_DOWN
+                } else {
+                    &oc::CHEVRON_RIGHT
+                },
+                10.0,
+            )
+            .color(p.c.icon_muted),
+        )
+        .child(
+            text(calls.to_string())
+                .font(p.mono(10.5, 500.0).features("'tnum' 1"))
+                .color(p.c.text_muted),
+        )
+}
+
+fn list_row(nest: Nested, now: i64, columns: Columns, p: &Paint) -> El {
+    let launch = nest.launch;
     let verdict = launch.verdict();
     let glyph = match verdict_icon(verdict) {
         _ if verdict == Verdict::Running => Spinner::new().size(14.0).color(p.live).build(p.k),
@@ -533,13 +635,19 @@ fn list_row(i: usize, launch: &LivePlaybook, now: i64, columns: Columns, p: &Pai
         glyph
     };
     let result = result(launch);
+    let landed = match nest.depth {
+        0 => launch.landed_at.clone(),
+        _ => format!("\u{21b3} {}", launch.id),
+    };
+    let badge = (nest.calls > 0).then(|| calls_badge(launch, nest.calls, nest.open, p));
     row()
-        .key(format!("run-{i}"))
+        .key(format!("run-{}", launch.key))
         .role("button")
         .label(format!("{} \u{2014} {}", launch.landed_at, launch.status))
         .w_full()
         .h(36.0)
         .px(6.0)
+        .pl(6.0 + INDENT * nest.depth as f32)
         .gap(10.0)
         .center_y()
         .radius(p.k.radius.md)
@@ -550,10 +658,19 @@ fn list_row(i: usize, launch: &LivePlaybook, now: i64, columns: Columns, p: &Pai
         .on_press(open(launch, Flight::Row))
         .child(row().size(16.0, 16.0).center().child(glyph))
         .child(
-            text(launch.landed_at.clone())
-                .font(p.k.ty.ui_medium)
-                .color(p.c.text_base)
-                .w(LANDED),
+            row()
+                .w(LANDED)
+                .gap(4.0)
+                .center_y()
+                .child(
+                    text(landed)
+                        .font(p.k.ty.ui_medium)
+                        .color(p.c.text_base)
+                        .shrink()
+                        .min_w(0.0)
+                        .truncate(),
+                )
+                .children(badge),
         )
         .child(
             text(if columns >= Columns::NoOrigin {
@@ -599,8 +716,81 @@ fn list_row(i: usize, launch: &LivePlaybook, now: i64, columns: Columns, p: &Pai
 
 #[cfg(test)]
 mod tests {
-    use crate::live::{LaunchStatus, LivePlaybook};
-    use crate::ui::runs::{Columns, result};
+    use std::collections::HashSet;
+
+    use crate::live::{LaunchStatus, LivePlaybook, LiveView};
+    use crate::ui::runs::{Columns, nested, result};
+
+    fn launch(key: &str, landed: i64, by: Option<&str>) -> LivePlaybook {
+        LivePlaybook {
+            key: key.into(),
+            landed,
+            called_by: by.map(|launch| crux::dto::CalledBy {
+                run: format!("run-{launch}"),
+                launch: launch.into(),
+                task: "call".into(),
+                instance: None,
+            }),
+            ..LivePlaybook::default()
+        }
+    }
+
+    fn ready(launches: Vec<LivePlaybook>) -> LiveView {
+        LiveView::Ready {
+            endpoint: String::new(),
+            identity: Default::default(),
+            now: 0,
+            launches,
+            drafts: Vec::new(),
+            stale: None,
+        }
+    }
+
+    #[test]
+    fn a_dispatched_run_nests_folded_under_its_caller_with_a_count() {
+        let live = ready(vec![
+            launch("p:2", 20, None),
+            launch("c:1", 12, Some("p:1")),
+            launch("c:2", 11, Some("p:1")),
+            launch("g:1", 13, Some("c:1")),
+            launch("p:1", 10, None),
+            launch("orphan", 5, Some("gone")),
+        ]);
+        let listed: Vec<&LivePlaybook> = live.launches().iter().collect();
+        let rows = |open: &[&str]| -> Vec<(String, usize, usize, bool)> {
+            let open: HashSet<String> = open.iter().map(ToString::to_string).collect();
+            nested(&listed, &live, &open)
+                .into_iter()
+                .map(|row| (row.launch.key.clone(), row.depth, row.calls, row.open))
+                .collect()
+        };
+        assert_eq!(
+            rows(&[]),
+            [
+                ("p:2".into(), 0, 0, false),
+                ("p:1".into(), 0, 2, false),
+                ("orphan".into(), 0, 0, false),
+            ]
+        );
+        assert_eq!(
+            rows(&["p:1", "c:1"]),
+            [
+                ("p:2".into(), 0, 0, false),
+                ("p:1".into(), 0, 2, true),
+                ("c:2".into(), 1, 0, false),
+                ("c:1".into(), 1, 1, true),
+                ("g:1".into(), 2, 0, false),
+                ("orphan".into(), 0, 0, false),
+            ]
+        );
+        let alone: Vec<&LivePlaybook> = listed.iter().copied().filter(|l| l.key == "c:1").collect();
+        let open = HashSet::new();
+        let shown: Vec<String> = nested(&alone, &live, &open)
+            .into_iter()
+            .map(|row| row.launch.key.clone())
+            .collect();
+        assert_eq!(shown, ["c:1"], "a caller off the list leaves it on top");
+    }
 
     #[test]
     fn a_narrow_list_drops_origin_then_the_result() {

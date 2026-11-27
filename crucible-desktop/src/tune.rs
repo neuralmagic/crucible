@@ -3,7 +3,7 @@
 
 use rune_knobs::{Group, Knob, Knobs};
 
-pub const GRAIN: Knob = Knob::new("Film grain", 0.0, 0.15, 0.035).about("Grain over the window");
+pub const GRAIN: Knob = Knob::new("Film grain", 0.0, 0.15, 0.0).about("Grain over the window");
 pub const PULSE: Knob = Knob::new("Pulse", 0.0, 1.5, 0.6).about("The ring behind running marks");
 pub const PULSE_BLEED: Knob = Knob::new("Pulse reach", 0.0, 32.0, 14.0).step(1.0);
 pub const SHIMMER: Knob =
@@ -73,7 +73,7 @@ mod tests {
     #[test]
     fn untouched_knobs_read_the_shipped_constants() {
         let tune = Tune::read(&Knobs::default());
-        assert_eq!(tune.grain, 0.035);
+        assert_eq!(tune.grain, 0.0);
         assert_eq!(tune.sidebar, 288.0);
         assert_eq!(tune.timeline_row, 26.0);
         assert_eq!(tune.timeline_label, 150.0);

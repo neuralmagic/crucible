@@ -65,6 +65,10 @@ fn every_checked_in_pack_is_clean() {
         errors.extend(render(&file, &local));
         if let Some(compile) = analysis.compile {
             for (path, found) in check::compile(&compile.entry, &compile.source) {
+                let found: Vec<Finding> = found
+                    .into_iter()
+                    .filter(|f| f.severity == DiagnosticSeverity::ERROR)
+                    .collect();
                 errors.extend(render(&path, &found));
             }
         }

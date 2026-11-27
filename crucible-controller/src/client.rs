@@ -576,6 +576,22 @@ mod tests {
                 "0091_provider_model_prices.sql",
                 "5ce4bc74c9d964ce9367ec20ef48e02a2d63c1e5500c6ecac2dc92a55ac2d669",
             ),
+            (
+                "0092_call_target_runs.sql",
+                "a3aa9b0e5edd435bb0ea3f1bdff5dc7432af1047c88292626c0be8561d4da9ad",
+            ),
+            (
+                "0093_forge_links.sql",
+                "5df4dd13b9061b783658d7e3f29ef3ab06390582f2c3a404cd1e2ce191c4cab5",
+            ),
+            (
+                "0094_gitlab_call_kind.sql",
+                "51c01c7644ab6d9569b0eca454678d6092e5c6764c75f31e519e2d35680b19c0",
+            ),
+            (
+                "0095_call_next_poll.sql",
+                "a007abf25510b4ad65a75572e503723e6c77169294c42185a2a2ad1ce8e68e3a",
+            ),
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
         for (name, want) in pinned {

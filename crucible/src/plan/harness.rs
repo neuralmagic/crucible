@@ -18,10 +18,10 @@ use crate::agent::event::{AgentEvent, RawStream};
 use crate::agent::turn::{TurnCost, TurnFailure};
 use crate::plan::admission::{Admission, Lane, Refusal};
 use crate::plan::attempt::{Attempt, AttemptOutcome, BatchItem, TransportFailure};
-use crate::plan::exec::TaskRunner;
 use crate::plan::files::CapturedFiles;
 use crate::plan::ir::{Isolation, Task, TaskKind, TaskName};
 use crate::plan::runner::ShellRunner;
+use crate::plan::task_runner::TaskRunner;
 use crate::plan::transcript::Transcript;
 use crate::plan::turn_log::{Heartbeat, TurnLog};
 use crucible_contract::TransportCause;
@@ -192,6 +192,7 @@ pub struct HarnessRunner {
     /// and materialized into that task's own root when it runs. A task with no entry is one the
     /// executor never staged, and its `inputs/` is left alone.
     pub staged: BTreeMap<TaskName, Vec<StagedInput>>,
+    pub param_files: Vec<crate::plan::param_files::ParamFile>,
     /// What the run may still spend, as the executor last reported it.
     pub budget_left: f64,
 }
@@ -238,6 +239,7 @@ impl TaskRunner for HarnessRunner {
                 paths: &self.paths,
                 captured_bytes: &self.captured_bytes,
                 staged: self.staged.get(&task.name).map(Vec::as_slice),
+                param_files: &self.param_files,
             },
             task,
             Job {
@@ -334,8 +336,13 @@ impl TaskRunner for HarnessRunner {
             },
         };
         let budget_left = self.budget_left;
-        let (args, paths, captured_bytes, staged) =
-            (&self.args, &self.paths, &self.captured_bytes, &self.staged);
+        let (args, paths, captured_bytes, staged, param_files) = (
+            &self.args,
+            &self.paths,
+            &self.captured_bytes,
+            &self.staged,
+            &self.param_files,
+        );
         admission.run_all(batch, |b, lane| {
             run_task(
                 &Dispatch {
@@ -343,6 +350,7 @@ impl TaskRunner for HarnessRunner {
                     paths,
                     captured_bytes,
                     staged: staged.get(&b.task.name).map(Vec::as_slice),
+                    param_files,
                 },
                 b.task,
                 Job {
@@ -365,6 +373,7 @@ struct Dispatch<'a> {
     paths: &'a Paths,
     captured_bytes: &'a AtomicU64,
     staged: Option<&'a [StagedInput]>,
+    param_files: &'a [crate::plan::param_files::ParamFile],
 }
 
 /// One attempt of one task: its number, its inputs, when it must be over by, what the run may
@@ -387,9 +396,14 @@ fn run_task(cx: &Dispatch<'_>, task: &Task, job: Job<'_>, pending: Option<&str>)
         paths,
         captured_bytes,
         staged,
+        param_files,
     } = *cx;
+    let param_files = match task.task {
+        TaskKind::Agent { .. } => param_files,
+        _ => &[],
+    };
     let Some(Isolation::Worktree) = task.isolation else {
-        if let Err(e) = materialize_inputs(&paths.state, &paths.workspace, staged) {
+        if let Err(e) = materialize_inputs(&paths.state, &paths.workspace, staged, param_files) {
             return Attempt::transport(TransportCause::Workspace, e);
         }
         let before = PriorContents::of(&paths.workspace, &task.emits_files);
@@ -439,7 +453,7 @@ fn run_task(cx: &Dispatch<'_>, task: &Task, job: Job<'_>, pending: Option<&str>)
     // `inputs/` is excluded from the workspace's git memory, so neither the clone nor the
     // pending patch carries it. Lay this task's own staged set down here, or an isolated
     // consumer never sees what its ancestors declared.
-    if let Err(e) = materialize_inputs(&paths.state, &worktree, staged) {
+    if let Err(e) = materialize_inputs(&paths.state, &worktree, staged, param_files) {
         return Attempt::transport(TransportCause::Workspace, e);
     }
     let iso = Paths::for_worktree(worktree.clone(), paths.skills.clone());
@@ -646,10 +660,12 @@ fn agent_prompt(
 /// Namespaced by producer so two tasks declaring the same path cannot collide, and made
 /// read-only so a consumer cannot edit what it was handed and pass the edit on as if the
 /// producer had said it. `None` is a task the executor never staged: its root is left alone.
+/// `params` are the run's file parameters, laid down under `inputs/params/`.
 fn materialize_inputs(
     state: &Path,
     root: &Path,
     staged: Option<&[StagedInput]>,
+    params: &[crate::plan::param_files::ParamFile],
 ) -> Result<(), String> {
     let Some(staged) = staged else {
         return Ok(());
@@ -676,7 +692,7 @@ fn materialize_inputs(
         }
         read_only(&to);
     }
-    Ok(())
+    crate::plan::param_files::materialize(root, params)
 }
 
 fn prepare_and_run(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
@@ -893,6 +909,12 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
         }
         TaskKind::Engine { .. } => {
             return Attempt::failed(0.0, "engine task reached a non-loop runner".to_string());
+        }
+        TaskKind::Call { alias, .. } => {
+            return Attempt::failed(
+                0.0,
+                format!("call {alias} refused: this engine does not dispatch call targets yet"),
+            );
         }
     };
 
@@ -1555,6 +1577,7 @@ mod tests {
             commit_per_task: false,
             captured_bytes: AtomicU64::new(0),
             staged: Default::default(),
+            param_files: Vec::new(),
             budget_left: f64::INFINITY,
         };
         let a = runner.run(&t, 1, &BTreeMap::new(), None);

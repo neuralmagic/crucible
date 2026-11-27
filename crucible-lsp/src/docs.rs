@@ -16,6 +16,7 @@ use tower_lsp_server::ls_types::{
 
 pub struct Reference {
     pub functions: Vec<Function>,
+    pub modules: Vec<reference::modules::Module>,
     /// Starlark's standard globals and their rendered documentation.
     builtins: BTreeMap<String, String>,
     /// The callable ones: everything but `True`, `False`, and `None`.
@@ -51,6 +52,7 @@ impl Reference {
         };
         Reference {
             functions: reference::functions(),
+            modules: reference::modules::modules(),
             builtins,
             functions_builtin,
             autoresearch: names(WorkflowType::Autoresearch),
@@ -61,6 +63,29 @@ impl Reference {
 
     pub fn function(&self, name: &str) -> Option<&Function> {
         self.functions.iter().find(|f| f.name == name)
+    }
+
+    pub fn module(&self, label: &str) -> Option<&reference::modules::Module> {
+        self.modules.iter().find(|m| m.label == label)
+    }
+
+    pub fn resolve(
+        &self,
+        index: Option<&crate::index::Index>,
+        callee: &str,
+        offset: usize,
+    ) -> Option<&Function> {
+        match index.and_then(|index| index.resolve(callee, offset)) {
+            None => self.function(callee),
+            Some(binding) => match &binding.kind {
+                crate::index::BindingKind::Load { module, original } => self
+                    .module(module)?
+                    .functions
+                    .iter()
+                    .find(|f| f.name == original),
+                _ => None,
+            },
+        }
     }
 
     /// Every name a source in `lane` can use without binding it.

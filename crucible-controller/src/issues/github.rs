@@ -326,8 +326,7 @@ const TRUSTED_ASSOCIATIONS: &[&str] = &["OWNER", "MEMBER", "COLLABORATOR"];
 #[derive(Debug, Clone, Default)]
 pub struct Authz {
     allow_users: Vec<String>,
-    /// GitHub login (lowercased) to crucible login, for the people an operator has paired.
-    logins: std::collections::BTreeMap<String, String>,
+    logins: crate::identity::github_logins::GithubLogins,
 }
 
 impl Authz {
@@ -350,28 +349,19 @@ impl Authz {
                 })
                 .unwrap_or_default()
         };
-        let mut logins = std::collections::BTreeMap::new();
-        for pair in list("CONTROLLER_GITHUB_LOGINS") {
-            match pair.split_once('=') {
-                Some((github, login)) if !github.trim().is_empty() && !login.trim().is_empty() => {
-                    logins.insert(github.trim().to_lowercase(), login.trim().to_string());
-                }
-                _ => tracing::warn!(
-                    entry = pair,
-                    "CONTROLLER_GITHUB_LOGINS entry is not <github login>=<crucible login>; ignored"
-                ),
-            }
-        }
+        let logins = list("CONTROLLER_GITHUB_LOGINS");
         Authz {
             allow_users: list("CONTROLLER_APPROVERS"),
-            logins,
+            logins: crate::identity::github_logins::GithubLogins::parse(
+                logins.iter().map(String::as_str),
+            ),
         }
     }
 
     /// The crucible login an operator paired with GitHub login `github`, matched
     /// case-insensitively.
     pub(crate) fn crucible_login(&self, github: &str) -> Option<&str> {
-        self.logins.get(&github.to_lowercase()).map(String::as_str)
+        self.logins.crucible_login(github)
     }
 
     /// Is `login` (carrying repo `assoc`) allowed? Allowlist wins when present; else the association

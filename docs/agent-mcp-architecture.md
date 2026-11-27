@@ -1976,7 +1976,7 @@ Every other key and variable in sections 9.3 and 9.4 is an override with the def
 | `POD_NAMESPACE` | the service account namespace file | The controller namespace, for the issuer key placement check: it must not be the loop, rig, sandbox, crucible-kueue, workload or `[buildit]` namespace. |
 | `CONTROLLER_AUTH_MODE` | per `docs/controller-auth.md` | People authorization needs `native`: `/oauth/authorize` reads a native session only. |
 | `CONTROLLER_CLUSTER_LINK_SECRETS` | unset | A directory with one OAuth client secret file per cluster. Necessary when the profile has `[cluster_link]`. |
-| `CONTROLLER_GITHUB_LOGINS` | unset | `<github login>=<crucible login>` pairs. A GitHub review approval sets the dispatcher only for a listed pair. |
+| `CONTROLLER_GITHUB_LOGINS` | unset | `<github login>=<crucible login>` pairs. A GitHub review approval sets the dispatcher only for a listed pair. A call to a GitHub workflow dispatches only for a launch owner listed here whose GitHub login has write, maintain or admin on the target repository. |
 | `CONTROLLER_PUSH_TOKENS`, `CONTROLLER_CLUSTERS_DIR` | unset | Together they decide which clusters are push-only (section 6.7). |
 
 The issuer refuses to start when any of these is true:

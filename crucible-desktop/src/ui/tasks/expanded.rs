@@ -1,6 +1,7 @@
 //! An opened task card: its output, files, links and the instances of a fan-out.
 
 use crate::App;
+use crate::live::calls::Jump;
 use crate::session::{Instance, TaskState, TaskView};
 use crate::ui::Paint;
 use crate::ui::tasks::rounds::{rounds, said};
@@ -18,6 +19,7 @@ pub(in crate::ui::tasks) fn expanded(
     rerun: bool,
     editable: bool,
     link: Option<String>,
+    target: Option<(&'static str, Jump)>,
     p: &Paint,
 ) -> El {
     let fix =
@@ -209,6 +211,14 @@ pub(in crate::ui::tasks) fn expanded(
                     })
                     .build(p.k)
                     .key(key)
+            }))
+            .children(target.map(|(says, jump)| {
+                Button::new(says)
+                    .variant(ButtonVariant::Neutral)
+                    .control_size(ControlSize::Small)
+                    .on_press_tx(move |app: &mut App, tx: &mut Tx| app.jump(&jump, tx))
+                    .build(p.k)
+                    .key(format!("call-open-{}", task.name))
             }))
             .children(link.map(|url| {
                 Button::new("Copy link")

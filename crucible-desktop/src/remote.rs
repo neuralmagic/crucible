@@ -24,6 +24,7 @@ pub struct Remote {
     pub live_sent: Option<String>,
     /// The launch the Compare pane reads against, as last asked of the worker.
     pub compare_sent: Option<String>,
+    pub node_sent: Option<crate::live::calls::NodeAsk>,
     /// That launch's run, once read.
     pub live_base: Option<live::Base>,
     /// The draft save whose pack the live worker was last told to read.
@@ -118,6 +119,7 @@ impl Remote {
             live_detail: None,
             live_sent: None,
             compare_sent: None,
+            node_sent: None,
             live_base: None,
             draft_sent: None,
             draft_pack: None,

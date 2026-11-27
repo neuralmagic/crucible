@@ -804,7 +804,8 @@ mod tests {
                     rerun: None,
                     dispatch: Default::default(),
                 },
-                crate::playbooks::registry::PackRevision::Bytes("sha256:tar")
+                crate::playbooks::registry::PackRevision::Bytes("sha256:tar"),
+                &Default::default()
             )
             .await?,
             AdoptPlaybookOutcome::Adopted
@@ -948,6 +949,7 @@ mod tests {
                 created_by: Some("wren"),
             },
             crate::playbooks::registry::PackRevision::Bytes("sha256:tar"),
+            &Default::default(),
         )
         .await?;
         let playbook_run = format!("{}-1787528065", crate::model::sanitize_key(key));

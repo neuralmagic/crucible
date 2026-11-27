@@ -164,12 +164,20 @@ fn compile_finding(error: &CompileError, anchor: Option<&SourceAnchor>) -> Findi
         },
         (None, _) => At::Bytes(0..0),
     };
+    let (severity, code, message) = match error {
+        CompileError::CallsUnpinned { detail } => (
+            DiagnosticSeverity::WARNING,
+            "calls-unpinned",
+            format!("{detail}; the controller writes calls.lock when it saves the pack"),
+        ),
+        _ => (DiagnosticSeverity::ERROR, "compile", message(error)),
+    };
     Finding {
         at,
-        severity: DiagnosticSeverity::ERROR,
-        code: "compile".to_owned(),
+        severity,
+        code: code.to_owned(),
         origin: Origin::Compiler,
-        message: message(error),
+        message,
         unnecessary: false,
         deprecated: false,
     }

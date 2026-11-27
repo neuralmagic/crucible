@@ -142,9 +142,12 @@ impl App {
             return;
         };
         let answers: Vec<String> = launcher.answers.iter().map(|a| a.text.clone()).collect();
-        let params = match &launcher.rerun {
-            Some(rerun) => Ok(rerun.params.clone()),
-            None => form::params(&launcher.fields, &answers),
+        let (params, uploads) = match &launcher.rerun {
+            Some(rerun) => (Ok(rerun.params.clone()), Ok(Vec::new())),
+            None => (
+                form::params(&launcher.fields, &answers),
+                form::uploads(&launcher.fields, &answers),
+            ),
         };
         let ceilings = form::ceilings(
             &launcher.cost.text,
@@ -153,8 +156,13 @@ impl App {
             &launcher.caps.1,
         );
         launcher.problems = params.as_ref().err().cloned().unwrap_or_default();
+        launcher
+            .problems
+            .extend(uploads.as_ref().err().cloned().unwrap_or_default());
+        launcher.problems.sort_by_key(|(at, _)| *at);
         launcher.refusal = ceilings.as_ref().err().cloned();
-        let (Ok(params), Ok((max_cost, max_time))) = (params, ceilings) else {
+        let (Ok(params), Ok(uploads), Ok((max_cost, max_time))) = (params, uploads, ceilings)
+        else {
             return;
         };
         if let Some(why) = launcher.rerun.as_ref().and_then(studio::Rerun::blocked) {
@@ -163,6 +171,10 @@ impl App {
         }
         let runs_on = launcher.runs_on.runs_on();
         if let Some(schedule) = &launcher.schedule {
+            if !uploads.is_empty() {
+                launcher.refusal = Some("Files cannot be scheduled".to_string());
+                return;
+            }
             match schedule.body(
                 &launcher.target,
                 &params,
@@ -193,7 +205,28 @@ impl App {
         launcher.after = self.remote.replies;
         self.remote
             .live_client
-            .launch(launcher.target.clone(), body);
+            .launch(launcher.target.clone(), body, uploads);
+    }
+
+    pub fn pick_param_file(&mut self, i: usize, path: &std::path::Path) {
+        let Some(launcher) = &mut self.remote.launcher else {
+            return;
+        };
+        let Some(field) = launcher.fields.get(i) else {
+            return;
+        };
+        let form::Kind::File(spec) = &field.kind else {
+            return;
+        };
+        let refused = form::upload(&field.name, spec, path).err();
+        if let Some(answer) = launcher.answers.get_mut(i) {
+            *answer = TextEdit::new(path.display().to_string());
+        }
+        launcher.problems.retain(|(at, _)| *at != i);
+        if let Some(why) = refused {
+            launcher.problems.push((i, why));
+            launcher.problems.sort_by_key(|(at, _)| *at);
+        }
     }
 
     /// The newest launch of `playbook` the list shows, to prefill a form from.

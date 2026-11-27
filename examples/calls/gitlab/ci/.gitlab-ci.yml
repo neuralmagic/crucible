@@ -1,0 +1,44 @@
+spec:
+  inputs:
+    message:
+      description: What the pipeline says
+      default: hello
+    count:
+      type: number
+      default: 1
+    targets:
+      type: array
+      default: [linux]
+---
+stages: [build, test, report]
+
+build:
+  stage: build
+  image: alpine:3.20
+  script:
+    - echo "building $[[ inputs.message ]]"
+
+unit:
+  stage: test
+  image: alpine:3.20
+  script:
+    - echo "unit tests on $[[ inputs.targets ]]"
+    - sleep 5
+
+lint:
+  stage: test
+  image: alpine:3.20
+  script:
+    - echo lint
+
+report:
+  stage: report
+  image: alpine:3.20
+  needs: [unit, lint]
+  script:
+    - mkdir -p out
+    - printf '{"message":"%s","count":%s,"targets":%s}\n' "$[[ inputs.message ]]" "$[[ inputs.count ]]" '$[[ inputs.targets ]]' > result.json
+    - printf '# Notes\n\npipeline %s ran %s jobs\n' "$CI_PIPELINE_IID" 4 > out/notes.md
+  artifacts:
+    paths: [result.json, out/notes.md]
+    expire_in: 1 week

@@ -175,7 +175,8 @@ impl Connector {
             Arc::new(wire)
         };
         let connection = Connection {
-            client: crux::Client::new(transport),
+            client: crux::Client::new(Arc::clone(&transport)),
+            wire: transport,
             runtime,
         };
         *open = Some(connection.clone());
@@ -206,10 +207,25 @@ impl Connector {
 #[derive(Clone)]
 pub struct Connection {
     pub client: crux::Client,
+    wire: Arc<dyn crux::client::Transport>,
     runtime: Handle,
 }
 
 impl Connection {
+    pub async fn text(&self, path: &str) -> Result<String, String> {
+        let (status, bytes) = self
+            .wire
+            .get_bytes(path)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        if status.is_success() {
+            Ok(text)
+        } else {
+            Err(format!("HTTP {status}: {}", text.trim()))
+        }
+    }
+
     /// Run one call to its end or [`TIMEOUT`], whichever comes first. Blocks, so not for a
     /// runtime thread.
     #[cfg(test)]
@@ -366,16 +382,20 @@ fn unsent(error: &reqwest::Error) -> bool {
     error.is_timeout() || error.is_request()
 }
 
+pub async fn bounded<F: Future>(what: &str, call: F) -> Result<F::Output, String> {
+    timeout(TIMEOUT, call)
+        .await
+        .map_err(|_| format!("{what} timed out after {}s", TIMEOUT.as_secs()))
+}
+
 /// `call`'s answer, or that it timed out after [`TIMEOUT`].
 pub async fn within<T, E: std::fmt::Display>(
     what: &str,
     call: impl Future<Output = Result<T, E>>,
 ) -> Result<T, String> {
-    match timeout(TIMEOUT, call).await {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(error)) => Err(format!("{error:#}")),
-        Err(_) => Err(format!("{what} timed out after {}s", TIMEOUT.as_secs())),
-    }
+    bounded(what, call)
+        .await?
+        .map_err(|error| format!("{error:#}"))
 }
 
 #[cfg(test)]

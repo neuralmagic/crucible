@@ -16,6 +16,8 @@ use starlark_syntax::syntax::ast::{AstLiteral, Expr, Stmt};
 use crate::plan::diag;
 use crate::plan::param::ParamValue;
 use crate::plan::starlark::error::CompileError;
+use crucible_contract::calls::{FileRef, MAX_FILE_PARAM_BYTES};
+use crucible_contract::emits::JsonSchema;
 
 type Result<T> = std::result::Result<T, CompileError>;
 
@@ -31,15 +33,19 @@ pub enum ParamType {
     /// Spelled as the declaration spells it, so the stored form and [`ParamType::parse`] agree.
     #[serde(rename = "list<string>")]
     StringList,
+    Json,
+    File,
 }
 
 impl ParamType {
-    pub const ALL: [ParamType; 5] = [
+    pub const ALL: [ParamType; 7] = [
         ParamType::String,
         ParamType::Int,
         ParamType::Number,
         ParamType::Bool,
         ParamType::StringList,
+        ParamType::Json,
+        ParamType::File,
     ];
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -49,6 +55,8 @@ impl ParamType {
             "number" => Some(ParamType::Number),
             "bool" => Some(ParamType::Bool),
             "list<string>" => Some(ParamType::StringList),
+            "json" => Some(ParamType::Json),
+            "file" => Some(ParamType::File),
             _ => None,
         }
     }
@@ -60,6 +68,8 @@ impl ParamType {
             ParamType::Number => "number",
             ParamType::Bool => "bool",
             ParamType::StringList => "list<string>",
+            ParamType::Json => "json",
+            ParamType::File => "file",
         }
     }
 
@@ -70,6 +80,14 @@ impl ParamType {
     /// The type a property of [`Params::json_schema`] declares; anything it does not emit reads
     /// as a string.
     pub fn from_schema(property: &serde_json::Value) -> Self {
+        match property
+            .get(PARAM_TYPE_KEY)
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("json") => return ParamType::Json,
+            Some("file") => return ParamType::File,
+            _ => {}
+        }
         match property.get("type").and_then(serde_json::Value::as_str) {
             Some("integer") => ParamType::Int,
             Some("number") => ParamType::Number,
@@ -111,6 +129,15 @@ impl ParamType {
                     ))
                 }
             }
+            ParamType::Json => match crucible_contract::json::from_str::<serde_json::Value>(raw) {
+                Ok(value @ (serde_json::Value::Object(_) | serde_json::Value::Array(_)))
+                    if raw.len() <= crucible_contract::calls::MAX_JSON_PARAM_BYTES =>
+                {
+                    Ok(ParamValue::Json(value))
+                }
+                _ => Err("a JSON object or array of at most 64 KiB"),
+            },
+            ParamType::File => Err("an uploaded file"),
         }
     }
 }
@@ -147,6 +174,14 @@ pub struct ParamSpec {
     /// The boolean parameter that must be true for this one to be supplied.
     #[serde(default)]
     pub enabled_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_document: Option<JsonSchema>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media_type: Vec<String>,
 }
 
 /// A task in the same workflow and the field it emits for a parameter's form: a list of strings,
@@ -209,9 +244,41 @@ impl ParamSpec {
                 (true, Some(choice)) => vec![choice.clone()],
                 (true, None) => vec![text()],
             }),
+            ParamType::Json => ParamValue::Json(match second {
+                false => serde_json::json!({}),
+                true => serde_json::json!([]),
+            }),
+            ParamType::File => ParamValue::Json(serde_json::json!({
+                "path": text(),
+                "size": 0,
+                "digest": PROBE_DIGEST,
+            })),
         }
     }
 }
+
+pub const PARAM_TYPE_KEY: &str = "x-param-type";
+
+pub const SCHEMA_PATH_KEY: &str = "x-schema-path";
+
+pub const MAX_BYTES_KEY: &str = "x-max-bytes";
+
+pub const MEDIA_TYPE_KEY: &str = "x-media-type";
+
+pub fn embedded(schema: &JsonSchema) -> serde_json::Value {
+    let mut document = schema.document().clone();
+    if let Some(object) = document.as_object_mut() {
+        object.remove("$schema");
+    }
+    document
+}
+
+pub fn embedded_schema(property: &serde_json::Value) -> Option<&serde_json::Value> {
+    property.get("allOf")?.as_array()?.first()
+}
+
+pub const PROBE_DIGEST: &str =
+    "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 /// Every field a declaration may carry, for the did-you-mean on a typo.
 pub const FIELDS: &[&str] = &[
@@ -229,6 +296,9 @@ pub const FIELDS: &[&str] = &[
     "placeholder_from",
     "confirm_from",
     "enabled_by",
+    "schema",
+    "max_bytes",
+    "media_type",
 ];
 
 /// Every parameter a source declares, in source order. Serializes as the bare list, so a launcher
@@ -237,31 +307,44 @@ pub const FIELDS: &[&str] = &[
 #[serde(transparent)]
 pub struct Params(Vec<ParamSpec>);
 
+fn statements(module: &AstModule) -> &[starlark_syntax::syntax::ast::AstStmt] {
+    let statement = module.statement();
+    match &statement.node {
+        Stmt::Statements(statements) => statements,
+        _ => std::slice::from_ref(statement),
+    }
+}
+
+fn header_position(module: &AstModule) -> Option<(usize, bool)> {
+    let statements = statements(module);
+    let position = statements.iter().position(|s| match &s.node {
+        Stmt::Assign(assign) => matches!(
+            &assign.lhs.node,
+            starlark_syntax::syntax::ast::AssignTarget::Identifier(name)
+                if name.node.ident == "params"
+        ),
+        _ => false,
+    })?;
+    let leading = statements[..position]
+        .iter()
+        .all(|s| matches!(s.node, Stmt::Load(_)));
+    Some((position, leading))
+}
+
 impl Params {
     /// Read the block without evaluating the source.
     ///
-    /// A source with no `params` declares none. A `params` that is not the first statement, or
+    /// A source with no `params` declares none. A `params` that follows anything but `load()`, or
     /// not a literal, is refused rather than ignored: silently skipping it would let a pack
     /// believe it declared parameters that no launcher can see.
     pub(crate) fn read(module: &AstModule) -> Result<Self> {
-        let statement = module.statement();
-        let statements: &[_] = match &statement.node {
-            Stmt::Statements(statements) => statements,
-            _ => std::slice::from_ref(statement),
-        };
-        let declared = statements.iter().position(|s| {
-            matches!(&s.node, Stmt::Assign(assign)
-                if matches!(&assign.lhs.node,
-                    starlark_syntax::syntax::ast::AssignTarget::Identifier(name)
-                        if name.node.ident == "params"))
-        });
-        let Some(position) = declared else {
+        let Some((position, leading)) = header_position(module) else {
             return Ok(Params::default());
         };
-        if position != 0 {
+        if !leading {
             return Err(CompileError::ParamsNotFirst);
         }
-        let Stmt::Assign(assign) = &statements[position].node else {
+        let Stmt::Assign(assign) = &statements(module)[position].node else {
             return Ok(Params::default());
         };
         let Expr::Dict(entries) = &assign.rhs.node else {
@@ -340,6 +423,7 @@ impl Params {
         let mut bound = BTreeMap::new();
         for spec in &self.0 {
             let value = match supplied.get(&spec.name) {
+                Some(raw) if spec.ty == ParamType::File => file_value(spec, raw)?,
                 Some(raw) => parse(spec, raw)?,
                 None => match &spec.default {
                     Some(default) => default.clone(),
@@ -373,6 +457,18 @@ impl Params {
         &self.0
     }
 
+    pub(crate) fn read_schemas(
+        &mut self,
+        mut read: impl FnMut(&str) -> Result<JsonSchema>,
+    ) -> Result<()> {
+        for spec in &mut self.0 {
+            if let Some(path) = &spec.schema {
+                spec.schema_document = Some(read(path)?);
+            }
+        }
+        Ok(())
+    }
+
     /// Whether the source declares no parameters at all. A graph that is not a function of its
     /// launch arguments can be frozen; one that is must be compiled per run.
     pub fn is_empty(&self) -> bool {
@@ -387,13 +483,32 @@ impl Params {
         for spec in &self.0 {
             let mut property = serde_json::Map::new();
             let (ty, items) = match spec.ty {
-                ParamType::String => ("string", None),
-                ParamType::Int => ("integer", None),
-                ParamType::Number => ("number", None),
-                ParamType::Bool => ("boolean", None),
-                ParamType::StringList => ("array", Some(serde_json::json!({"type": "string"}))),
+                ParamType::String => (serde_json::json!("string"), None),
+                ParamType::Int => (serde_json::json!("integer"), None),
+                ParamType::Number => (serde_json::json!("number"), None),
+                ParamType::Bool => (serde_json::json!("boolean"), None),
+                ParamType::StringList => (
+                    serde_json::json!("array"),
+                    Some(serde_json::json!({"type": "string"})),
+                ),
+                ParamType::Json => (serde_json::json!(["object", "array"]), None),
+                ParamType::File => (serde_json::json!("object"), None),
             };
-            property.insert("type".into(), serde_json::json!(ty));
+            property.insert("type".into(), ty);
+            if matches!(spec.ty, ParamType::Json | ParamType::File) {
+                property.insert(PARAM_TYPE_KEY.into(), serde_json::json!(spec.ty.as_str()));
+            }
+            if let Some(schema) = &spec.schema_document {
+                property.insert("allOf".into(), serde_json::json!([embedded(schema)]));
+            } else if let Some(path) = &spec.schema {
+                property.insert(SCHEMA_PATH_KEY.into(), serde_json::json!(path));
+            }
+            if let Some(max_bytes) = spec.max_bytes {
+                property.insert(MAX_BYTES_KEY.into(), serde_json::json!(max_bytes));
+            }
+            if !spec.media_type.is_empty() {
+                property.insert(MEDIA_TYPE_KEY.into(), serde_json::json!(spec.media_type));
+            }
             if let Some(items) = items {
                 property.insert("items".into(), items);
             }
@@ -641,6 +756,68 @@ fn spec(name: &str, expression: &Expr) -> Result<ParamSpec> {
             ty: ty.as_str(),
         });
     }
+    let schema = field(
+        &declared,
+        name,
+        "schema",
+        "a string literal",
+        literal_string,
+    )?;
+    if schema.is_some() && ty != ParamType::Json {
+        return Err(CompileError::ParamConstraintMismatch {
+            param: name.to_owned(),
+            constraint: "schema",
+            ty: ty.as_str(),
+        });
+    }
+    let max_bytes = field(
+        &declared,
+        name,
+        "max_bytes",
+        "a whole number literal of at least 1",
+        |e| literal_number(e).filter(|n| n.fract() == 0.0 && *n >= 1.0),
+    )?;
+    let media_type = match declared.get("media_type") {
+        None => Vec::new(),
+        Some(list @ Expr::List(_)) => literal_strings(list, name)?,
+        Some(_) => field(
+            &declared,
+            name,
+            "media_type",
+            "a string literal or a list of them",
+            literal_string,
+        )?
+        .into_iter()
+        .collect(),
+    };
+    if ty != ParamType::File {
+        let constraint = match (max_bytes, media_type.is_empty()) {
+            (Some(_), _) => Some("max_bytes"),
+            (None, false) => Some("media_type"),
+            (None, true) => None,
+        };
+        if let Some(constraint) = constraint {
+            return Err(CompileError::ParamConstraintMismatch {
+                param: name.to_owned(),
+                constraint,
+                ty: ty.as_str(),
+            });
+        }
+    }
+    let max_bytes = match (ty, max_bytes) {
+        (ParamType::File, None) => {
+            return Err(CompileError::ParamFileNeedsMaxBytes {
+                param: name.to_owned(),
+            });
+        }
+        (_, Some(bytes)) if bytes > MAX_FILE_PARAM_BYTES as f64 => {
+            return Err(CompileError::ParamMaxBytesTooLarge {
+                param: name.to_owned(),
+                max: MAX_FILE_PARAM_BYTES,
+            });
+        }
+        (_, bytes) => bytes.map(|b| b as u64),
+    };
 
     Ok(ParamSpec {
         name: name.to_owned(),
@@ -664,6 +841,10 @@ fn spec(name: &str, expression: &Expr) -> Result<ParamSpec> {
             "a string literal",
             literal_string,
         )?,
+        schema,
+        schema_document: None,
+        max_bytes,
+        media_type,
     })
 }
 
@@ -778,6 +959,7 @@ fn literal_value(ty: ParamType, expression: &Expr, param: &str) -> Result<ParamV
             .map(ParamValue::Number)
             .ok_or_else(wrong),
         ParamType::StringList => literal_strings(expression, param).map(ParamValue::StringList),
+        ParamType::Json | ParamType::File => Err(wrong()),
     }
 }
 
@@ -849,9 +1031,126 @@ fn check(spec: &ParamSpec, value: &ParamValue) -> Result<()> {
                 detail: range(spec),
             });
         }
+        ParamValue::Json(value) if spec.ty == ParamType::Json => {
+            if let Some(why) = spec
+                .schema_document
+                .as_ref()
+                .and_then(|schema| schema.refusal(value))
+            {
+                return Err(CompileError::ParamConstraintFailed {
+                    param: spec.name.clone(),
+                    got: shortened(&value.to_string()),
+                    detail: format!("must match its schema: {why}"),
+                });
+            }
+        }
         _ => {}
     }
     Ok(())
+}
+
+fn shortened(text: &str) -> String {
+    const SHOWN: usize = 80;
+    match text.char_indices().nth(SHOWN) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text.to_owned(),
+    }
+}
+
+/// What a launcher hands a file parameter: the absolute path the file was staged at, alone or as
+/// an object that may also state its media type, digest, and size.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SuppliedFile {
+    path: String,
+    #[serde(default)]
+    media_type: Option<String>,
+    #[serde(default)]
+    digest: Option<String>,
+    #[serde(default)]
+    size: Option<u64>,
+}
+
+fn file_value(spec: &ParamSpec, raw: &str) -> Result<ParamValue> {
+    let refused = |detail: String| CompileError::ParamConstraintFailed {
+        param: spec.name.clone(),
+        got: shortened(raw),
+        detail,
+    };
+    let supplied = if raw.trim_start().starts_with('{') {
+        crucible_contract::json::from_str::<SuppliedFile>(raw)
+            .map_err(|e| refused(format!("is not a staged file reference: {e}")))?
+    } else {
+        SuppliedFile {
+            path: raw.to_owned(),
+            media_type: None,
+            digest: None,
+            size: None,
+        }
+    };
+    let path = std::path::Path::new(&supplied.path);
+    if !path.is_absolute() && supplied.digest.as_deref() == Some(PROBE_DIGEST) {
+        return Ok(spec.probe(false));
+    }
+    if !path.is_absolute() {
+        return Err(refused(
+            "must name the staged file by its absolute path".into(),
+        ));
+    }
+    let limit = spec.max_bytes.unwrap_or(MAX_FILE_PARAM_BYTES);
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|e| refused(format!("cannot be read: {e}")))?;
+    if !metadata.is_file() {
+        return Err(refused("is not a regular file".into()));
+    }
+    if metadata.len() > limit {
+        return Err(refused(format!(
+            "is {} bytes; at most {limit} are allowed",
+            metadata.len()
+        )));
+    }
+    let bytes = std::fs::read(path).map_err(|e| refused(format!("cannot be read: {e}")))?;
+    let size = bytes.len() as u64;
+    if size > limit {
+        return Err(refused(format!(
+            "is {size} bytes; at most {limit} are allowed"
+        )));
+    }
+    let digest = crucible_contract::artifact::content_digest(&bytes);
+    if supplied.digest.as_ref().is_some_and(|d| d != &digest) {
+        return Err(refused(format!(
+            "has digest {digest}, not the one supplied"
+        )));
+    }
+    if supplied.size.is_some_and(|s| s != size) {
+        return Err(refused(format!("is {size} bytes, not the size supplied")));
+    }
+    if !spec.media_type.is_empty() {
+        match &supplied.media_type {
+            Some(media) if spec.media_type.contains(media) => {}
+            Some(media) => {
+                return Err(refused(format!(
+                    "is {media}; must be one of {}",
+                    spec.media_type.join(", ")
+                )));
+            }
+            None => {
+                return Err(refused(format!(
+                    "names no media type; must be one of {}",
+                    spec.media_type.join(", ")
+                )));
+            }
+        }
+    }
+    let file = FileRef {
+        digest,
+        size,
+        path: Some(supplied.path),
+        media_type: supplied.media_type,
+    };
+    serde_json::to_value(file)
+        .map(ParamValue::Json)
+        .map_err(|e| refused(e.to_string()))
 }
 
 fn range(spec: &ParamSpec) -> String {

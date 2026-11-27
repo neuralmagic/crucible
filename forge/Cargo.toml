@@ -22,20 +22,21 @@ hex = "0.4.3"
 # std exposes none of these, and shelling out to `mount`/`chroot` would add a runtime PATH dependency.
 libc = "0.2"
 oci-client = "0.18.0"
-# GitHub REST client for the workflow_dispatch build backend (Declarative builds M2): dispatch, run
-# correlation/poll, and the contents-API workflow fetch for introspection. Async + rustls, matching
+# GitHub Actions REST client (builds and playbook calls): dispatch, run and job reads, artifact and
+# log downloads, and the contents-API workflow fetch. Async + rustls, matching
 # crucible-broker/-controller's feature set (already in the workspace tree).
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 serde.workspace = true
 serde_json.workspace = true
 serde_norway = "0.9"
+percent-encoding.workspace = true
 # Correlation ids for workflow_dispatch (workflow_dispatch returns 204 with no run id, so a unique id
 # echoed into the run name is how we find our run). v4 = random; uuid is already a workspace dep.
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.11.0"
 tar = "0.4.46"
 thiserror.workspace = true
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "fs"] }
 # Structured logging for the capture/derive flows: leveled events an operator filters with RUST_LOG;
 # the bins install the fmt subscriber on stderr so stdout stays the machine-readable ref.
 tracing = "0.1"

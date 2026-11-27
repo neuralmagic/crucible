@@ -48,6 +48,10 @@ pub trait Transport: Send + Sync {
         Ok((status, text.into_bytes()))
     }
 
+    async fn put_bytes(&self, path: &str, _body: Vec<u8>) -> Result<(reqwest::StatusCode, String)> {
+        bail!("{path} takes raw bytes, and this transport cannot send them")
+    }
+
     /// GET a server-sent event stream, handing each event to `on_event` as it arrives, until the
     /// server closes it. A non-2xx comes back as its status and body, with no events.
     async fn events(
@@ -162,6 +166,38 @@ pub struct PackImportSource<'a> {
     pub variant: Option<&'a str>,
 }
 
+/// A controller answer outside 2xx: the status and the body as written.
+#[derive(Debug)]
+pub struct HttpStatus {
+    pub path: String,
+    pub status: reqwest::StatusCode,
+    pub body: String,
+    hint: String,
+}
+
+impl std::fmt::Display for HttpStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} -> HTTP {}: {}{}",
+            self.path, self.status, self.body, self.hint
+        )
+    }
+}
+
+impl std::error::Error for HttpStatus {}
+
+impl HttpStatus {
+    pub fn new(path: &str, status: reqwest::StatusCode, body: &str) -> Self {
+        HttpStatus {
+            path: path.to_owned(),
+            status,
+            body: body.to_owned(),
+            hint: String::new(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Client {
     transport: std::sync::Arc<dyn Transport>,
@@ -268,6 +304,23 @@ impl Transport for HttpTransport {
             act_as.note_refusal(&body);
         }
         Ok((status, body))
+    }
+
+    async fn put_bytes(&self, path: &str, body: Vec<u8>) -> Result<(reqwest::StatusCode, String)> {
+        let resp = self
+            .req(reqwest::Method::PUT, path)
+            .header("content-type", "application/octet-stream")
+            .body(body)
+            .send()
+            .await
+            .with_context(|| format!("requesting {path}"))?;
+        let status = resp.status();
+        let refused = self.refused_by(&resp);
+        let text = resp.text().await.unwrap_or_default();
+        if let Some(act_as) = refused {
+            act_as.note_refusal(&text);
+        }
+        Ok((status, text))
     }
 
     async fn get_bytes(&self, path: &str) -> Result<(reqwest::StatusCode, Vec<u8>)> {
@@ -440,11 +493,13 @@ impl Client {
         if status.is_success() {
             return Ok(text);
         }
-        bail!(
-            "{path} -> HTTP {status}: {}{}",
-            text.trim(),
-            self.hint_for(status)
-        );
+        Err(HttpStatus {
+            path: path.to_owned(),
+            status,
+            body: text.trim().to_owned(),
+            hint: self.hint_for(status),
+        }
+        .into())
     }
 
     /// The failures whose raw body does not say what to do about it.
@@ -974,6 +1029,23 @@ impl Client {
     pub async fn launch<T: DeserializeOwned>(&self, id: &str, body: &impl Serialize) -> Result<T> {
         self.post(&format!("/api/playbooks/{}/launch", encode(id)), Some(body))
             .await
+    }
+
+    pub async fn put_param_file<T: DeserializeOwned>(
+        &self,
+        digest: &str,
+        bytes: Vec<u8>,
+    ) -> Result<T> {
+        let path = format!("/api/param-files/{}", encode(digest));
+        let (status, text) = self.transport.put_bytes(&path, bytes).await?;
+        if !status.is_success() {
+            bail!(
+                "{path} -> HTTP {status}: {}{}",
+                text.trim(),
+                self.hint_for(status)
+            );
+        }
+        parse(text, &path)
     }
 
     /// What rerunning finished run `run_id` from `from` would reuse and dispatch again. An empty

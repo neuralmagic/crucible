@@ -3,6 +3,7 @@
 
 use crate::api::dto::*;
 use crate::api::state::*;
+use crate::launches::param_files::FileValues;
 use crate::playbooks::registry::{FieldError, PlaybookRow};
 use axum::response::{IntoResponse, Response};
 
@@ -106,7 +107,7 @@ impl<'a> LaunchTarget<'a> {
     }
 
     /// The resource a launch decision on this target is about.
-    fn resource(self) -> crate::authz::decision::Resource {
+    pub(crate) fn resource(self) -> crate::authz::decision::Resource {
         match self {
             Self::Registered(pack) => pack.resource(),
             Self::Draft(head) => crate::authz::decision::Resource::new(
@@ -228,6 +229,7 @@ pub(crate) struct AuthorizedLaunch<P> {
     pub max_time: crate::model::MaxTime,
     /// The `{param: {run_id, digest}}` choice snapshots the values were validated against.
     pub choice_snapshots: serde_json::Value,
+    pub files: Vec<crate::launches::param_files::ParamFile>,
 }
 
 /// What a pack whose manifest never parsed is refused with. A launch would fail at the engine's
@@ -249,12 +251,22 @@ pub(crate) fn undispatchable(refusal: String) -> Response {
 
 /// Admit `request` against `pack`: the schema it was rendered against, whether this deployment
 /// can dispatch the pack's agent, the ceilings, the values, and the graph those values compile.
-/// `Err` is the response to answer with.
+/// A value for a file parameter is refused. `Err` is the response to answer with.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn admit<P: Admissible>(
     state: &ApiState,
     pack: P,
     request: LaunchRequest<'_>,
+) -> Result<AuthorizedLaunch<P>, Response> {
+    admit_with_files(state, pack, request, FileValues::None).await
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) async fn admit_with_files<P: Admissible>(
+    state: &ApiState,
+    pack: P,
+    request: LaunchRequest<'_>,
+    files: FileValues<'_>,
 ) -> Result<AuthorizedLaunch<P>, Response> {
     let target = pack.target();
     let (schema, max_time) = admit_pack(state, target, request).await?;
@@ -262,8 +274,30 @@ pub(crate) async fn admit<P: Admissible>(
         crate::playbooks::choices::attach(state.db.pool(), target.id(), &schema)
             .await
             .map_err(|e| ApiError::from(e).into_response())?;
-    let params = crate::playbooks::registry::validate_params(&schema, request.params)
-        .map_err(invalid_fields)?;
+    let (text, supplied) =
+        match crate::launches::param_files::split(state.db.pool(), &schema, request.params, files)
+            .await
+        {
+            Ok(Ok(split)) => split,
+            Ok(Err(fields)) => return Err(invalid_fields(fields)),
+            Err(e) => return Err(ApiError::from(e).into_response()),
+        };
+    let mut params = crate::playbooks::registry::validate_params(
+        &without_required(&schema, supplied.keys()),
+        &text,
+    )
+    .map_err(invalid_fields)?;
+    let mut owned = Vec::with_capacity(supplied.len());
+    for (name, file) in supplied {
+        let (reference, file) =
+            crate::launches::param_files::stage(&state.scratch_dir, &name, file)
+                .await
+                .map_err(|e| ApiError::from(e).into_response())?;
+        if let Some(values) = params.as_object_mut() {
+            values.insert(name, serde_json::Value::String(reference));
+        }
+        owned.push(file);
+    }
     check_plan(
         target.tree(state.db.pool()).await?,
         &params,
@@ -277,7 +311,23 @@ pub(crate) async fn admit<P: Admissible>(
         max_cost: request.max_cost,
         max_time,
         choice_snapshots,
+        files: owned,
     })
+}
+
+fn without_required<'a>(
+    schema: &serde_json::Value,
+    names: impl Iterator<Item = &'a String>,
+) -> serde_json::Value {
+    let names: Vec<&String> = names.collect();
+    let mut schema = schema.clone();
+    if let Some(required) = schema
+        .get_mut("required")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        required.retain(|r| !names.iter().any(|n| r.as_str() == Some(n.as_str())));
+    }
+    schema
 }
 
 /// [`admit`] up to the values, for a standing launch whose values are only complete at each
@@ -393,4 +443,24 @@ pub(crate) async fn decide_launch(
     .await
     .map(|_| ())
     .map_err(IntoResponse::into_response)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::playbooks::api::admission::without_required;
+    use serde_json::json;
+
+    #[test]
+    fn staged_parameters_leave_the_required_list_and_nothing_else_changes() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"label": {"type": "string"}, "notes": {"type": "object"}},
+            "required": ["label", "notes"],
+        });
+        let staged = ["notes".to_string()];
+        let relaxed = without_required(&schema, staged.iter());
+        assert_eq!(relaxed["required"], json!(["label"]));
+        assert_eq!(relaxed["properties"], schema["properties"]);
+        assert_eq!(without_required(&schema, [].iter()), schema);
+    }
 }

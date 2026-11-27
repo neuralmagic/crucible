@@ -265,6 +265,27 @@ impl From<Scope> for ScopeDto {
     }
 }
 
+/// The run and call task that dispatched a run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct RunParentDto {
+    pub run: String,
+    pub task: String,
+    pub instance: Option<String>,
+}
+
+/// A target run one of a run's calls dispatched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct RunChildDto {
+    pub call: String,
+    pub task: String,
+    pub instance: Option<String>,
+    pub attempt: u32,
+    pub alias: String,
+    pub kind: crucible_contract::calls::CallKind,
+    pub run: Option<String>,
+    pub status: String,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RunDto {
     pub run_id: String,
@@ -307,6 +328,8 @@ pub struct RunDto {
     pub capability_digest: Option<String>,
     /// True when the run launched on the unverified-image override rather than a match.
     pub image_override: bool,
+    pub parent: Option<RunParentDto>,
+    pub children: Vec<RunChildDto>,
 }
 
 impl RunDto {
@@ -341,6 +364,8 @@ impl RunDto {
             dispatch: r.dispatch.as_str().to_string(),
             cluster: r.location.cluster,
             namespace: r.location.namespace,
+            parent: None,
+            children: Vec::new(),
         }
     }
 }

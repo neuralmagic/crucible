@@ -18,10 +18,12 @@ use starlark_syntax::codemap::FileSpan;
 
 use crate::plan::ir::TaskName;
 use crate::plan::starlark as dsl;
+use crate::plan::starlark::call::{BudgetValue, EnumValue, ItemValue, ParamRefValue, TargetValue};
+use crate::plan::starlark::targets;
 use crate::plan::starlark::values::{
-    AnswerRefValue, BoundValue, CONVERTED, DeciderValue, EachValue, ExternalText, OptionalValue,
-    OthersValue, OutputRefValue, QuestionValue, SchemaValue, SendBackValue, SessionValue,
-    TaskDefaultsValue, TaskValue, WhenValue, WorkflowValue,
+    AnswerRefValue, BoundValue, CONVERTED, CallFileValue, DeciderValue, EachValue, ExternalText,
+    OptionalValue, OthersValue, OutputRefValue, QuestionValue, SchemaValue, SendBackValue,
+    SessionValue, TaskDefaultsValue, TaskValue, WhenValue, WorkflowValue,
 };
 use crate::plan::workflow::{WorkflowCfg, WorkflowType};
 
@@ -235,6 +237,38 @@ pub(crate) fn routed(builder: &mut GlobalsBuilder) {
         dispatch("pick", args, kwargs, eval)
     }
 
+    fn budget<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("budget", args, kwargs, eval)
+    }
+
+    fn call<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("call", args, kwargs, eval)
+    }
+
+    fn watch<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("watch", args, kwargs, eval)
+    }
+
+    fn item<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("item", args, kwargs, eval)
+    }
+
     fn route<'v>(
         #[starlark(args)] args: UnpackTuple<Value<'v>>,
         #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
@@ -250,6 +284,109 @@ pub(crate) fn routed(builder: &mut GlobalsBuilder) {
     ) -> starlark::Result<Value<'v>> {
         dispatch("score", args, kwargs, eval)
     }
+}
+
+pub(crate) fn calls(builder: &mut GlobalsBuilder) {
+    target_constructors(builder);
+    for (name, _) in targets::ENUMS {
+        builder.set(name, EnumValue(name));
+    }
+}
+
+#[starlark_module]
+fn target_constructors(builder: &mut GlobalsBuilder) {
+    fn playbook<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        target("playbook", args, kwargs, eval)
+    }
+
+    fn github_workflow<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        target("github_workflow", args, kwargs, eval)
+    }
+
+    fn gitlab_pipeline<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        target("gitlab_pipeline", args, kwargs, eval)
+    }
+
+    fn tekton<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        target("tekton", args, kwargs, eval)
+    }
+
+    fn artifact_outputs<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        target("artifact_outputs", args, kwargs, eval)
+    }
+
+    fn job_outputs<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        target("job_outputs", args, kwargs, eval)
+    }
+
+    fn pipeline_run<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        target("pipeline_run", args, kwargs, eval)
+    }
+}
+
+fn target<'v>(
+    ctor: &'static str,
+    args: UnpackTuple<Value<'v>>,
+    kwargs: SmallMap<String, Value<'v>>,
+    eval: &mut Evaluator<'v, '_, '_>,
+) -> starlark::Result<Value<'v>> {
+    let (state, at) = compile_site(eval)?;
+    let built = target_value(ctor, args, kwargs).map_err(|error| located(&at, error));
+    match built {
+        Ok(value) => Ok(alloc(eval.heap(), value)),
+        Err(error) => Err(state.throw(error)),
+    }
+}
+
+fn target_value<'v>(
+    ctor: &'static str,
+    args: UnpackTuple<Value<'v>>,
+    kwargs: SmallMap<String, Value<'v>>,
+) -> dsl::Result<dsl::Value> {
+    let mut named = BTreeMap::new();
+    match (targets::leading(ctor), args.items.as_slice()) {
+        (_, []) => {}
+        (Some(slot), [value]) => {
+            named.insert(slot.to_owned(), convert(*value)?);
+        }
+        _ => {
+            return Err(dsl::CompileError::PositionalArgument {
+                function: ctor.to_owned(),
+            });
+        }
+    }
+    for (name, value) in kwargs {
+        named.insert(name, convert(value)?);
+    }
+    crate::plan::starlark::call::construct(ctor, named)
 }
 
 /// The scored loop's own constructors. A playbook never sees these, so a playbook author
@@ -576,6 +713,25 @@ fn convert_at(value: Value<'_>, depth: usize) -> dsl::Result<dsl::Value> {
     if let Some(defaults) = TaskDefaultsValue::from_value(value) {
         return Ok(dsl::Value::Defaults(defaults.0));
     }
+    if let Some(param) = ParamRefValue::from_value(value) {
+        return Ok(dsl::Value::ParamRef {
+            name: param.name.clone(),
+            ty: param.ty,
+            shown: param.shown.clone(),
+        });
+    }
+    if let Some(file) = CallFileValue::from_value(value) {
+        return Ok(dsl::Value::CallFile(file.0.clone()));
+    }
+    if ItemValue::from_value(value).is_some() {
+        return Ok(dsl::Value::Item);
+    }
+    if let Some(budget) = BudgetValue::from_value(value) {
+        return Ok(dsl::Value::Budget(budget.0));
+    }
+    if let Some(target) = TargetValue::from_value(value) {
+        return Ok(dsl::Value::Target(target.0.clone()));
+    }
     Ok(dsl::Value::Opaque)
 }
 
@@ -639,5 +795,10 @@ fn alloc_at<'v>(heap: Heap<'v>, value: dsl::Value, depth: usize) -> Value<'v> {
         dsl::Value::Decider(decider) => heap.alloc(DeciderValue(decider)),
         dsl::Value::Others => heap.alloc(OthersValue),
         dsl::Value::Defaults(defaults) => heap.alloc(TaskDefaultsValue(defaults)),
+        dsl::Value::ParamRef { name, ty, shown } => heap.alloc(ParamRefValue { name, ty, shown }),
+        dsl::Value::CallFile(file) => heap.alloc(CallFileValue(file)),
+        dsl::Value::Item => heap.alloc(ItemValue),
+        dsl::Value::Budget(budget) => heap.alloc(BudgetValue(budget)),
+        dsl::Value::Target(built) => heap.alloc(TargetValue(built)),
     }
 }

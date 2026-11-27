@@ -24,6 +24,7 @@ mod autoresearch;
 pub(crate) mod dto;
 pub(crate) mod events;
 pub(crate) mod metrics;
+pub(crate) mod param_files;
 pub(crate) mod system;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -55,6 +56,14 @@ pub(crate) mod tests;
         crate::runs::api::cluster_view::list_clusters,
         crate::runs::api::cluster_view::list_dispatch_targets,
         crate::runs::api::runs::get_run,
+        crate::calls::reader::call_progress,
+        crate::calls::reader::node_log,
+        crate::calls::reader::write_lock,
+        crate::identity::api::forge::list_forge_accounts,
+        crate::identity::api::forge::list_forge_apps,
+        crate::identity::api::forge::put_forge_account,
+        crate::identity::api::forge::delete_forge_account,
+        crate::api::param_files::put,
         crate::runs::api::runs::get_run_iterations,
         crate::runs::api::runs::get_run_graph,
         crate::runs::api::evidence::get_task_evidence,
@@ -209,6 +218,10 @@ pub(crate) mod tests;
         crate::authz::shares::revoke_provider_share,
     ),
     components(schemas(
+        crate::identity::api::forge::ForgeTokenBody,
+        crate::identity::api::forge::ForgeAccountDto,
+        crate::identity::api::forge::ForgeAppDto,
+        crate::identity::forge::Forge,
         system::Health,
         system::Whoami,
         system::Features,
@@ -229,6 +242,8 @@ pub(crate) mod tests;
         dto::IssueDto,
         dto::ScopeDto,
         dto::RunDto,
+        dto::RunParentDto,
+        dto::RunChildDto,
         crate::runs::api::runs::RunRowDto,
         crate::images::api::CatalogDto,
         crate::images::api::CatalogImageDto,
@@ -316,6 +331,8 @@ pub(crate) mod tests;
         crate::playbooks::plan_graph::GraphEdgeDto,
         crate::playbooks::plan_graph::FanOutDto,
         crate::playbooks::plan_graph::WhenDto,
+        crate::playbooks::plan_graph::CallDto,
+        crucible_contract::calls::CallKind,
         crate::playbooks::plan_graph::TaskKind,
         crate::playbooks::plan_graph::Needs,
         crate::playbooks::plan_graph::Join,
@@ -779,6 +796,36 @@ pub fn router(state: ApiState) -> Router {
                 .layer(axum::extract::DefaultBodyLimit::max(
                     crate::identity::api::prefs::MAX_PREFS_BYTES,
                 )),
+        )
+        .route(
+            crucible_contract::calls::CALL_PROGRESS_PATH,
+            get(crate::calls::reader::call_progress),
+        )
+        .route(
+            crucible_contract::calls::CALL_NODE_LOG_PATH,
+            get(crate::calls::reader::node_log),
+        )
+        .route(
+            crate::identity::api::forge::FORGE_ACCOUNTS_PATH,
+            get(crate::identity::api::forge::list_forge_accounts),
+        )
+        .route(
+            crate::identity::api::forge::FORGE_APPS_PATH,
+            get(crate::identity::api::forge::list_forge_apps),
+        )
+        .route(
+            crate::identity::api::forge::FORGE_ACCOUNT_PATH,
+            axum::routing::put(crate::identity::api::forge::put_forge_account)
+                .delete(crate::identity::api::forge::delete_forge_account),
+        )
+        .route(
+            crate::calls::reader::LOCK_ROUTE,
+            axum::routing::post(crate::calls::reader::write_lock),
+        )
+        .route(
+            crate::launches::param_files::UPLOAD_ROUTE,
+            axum::routing::put(crate::api::param_files::put)
+                .layer(crate::api::param_files::upload_limit()),
         )
         .route("/api/openapi.json", get(move || async { Json(api) }))
         .layer(axum::middleware::from_fn_with_state(

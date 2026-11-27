@@ -112,6 +112,35 @@ fn session_log(dir: &Path) -> PathBuf {
     dir.join("pack").join("state").join("session.jsonl")
 }
 
+pub(crate) fn live_session(scratch_root: &Path, run_id: &str) -> Option<PathBuf> {
+    if !crate::runs::task_evidence::safe_segment(run_id) {
+        return None;
+    }
+    let path = session_log(&run_dir(scratch_root, run_id));
+    path.is_file().then_some(path)
+}
+
+fn pgid_file(dir: &Path) -> PathBuf {
+    dir.join("engine.pgid")
+}
+
+pub(crate) fn interrupt(scratch_root: &Path, run_id: &str) -> bool {
+    if !crate::runs::task_evidence::safe_segment(run_id) {
+        return false;
+    }
+    let Ok(raw) = std::fs::read_to_string(pgid_file(&run_dir(scratch_root, run_id))) else {
+        return false;
+    };
+    let Ok(pgid) = raw.trim().parse::<i32>() else {
+        return false;
+    };
+    if pgid <= 1 {
+        return false;
+    }
+    let group = nix::unistd::Pid::from_raw(pgid);
+    nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGINT).is_ok()
+}
+
 /// The engine's forge storage root inside a local run's directory.
 fn forge_root(dir: &Path) -> PathBuf {
     dir.join("forge")
@@ -306,6 +335,9 @@ pub(crate) async fn start(
         .spawn()
         .with_context(|| format!("spawning `{} plan run` for {run_id}", bin.display()))?;
     let group = ProcessGroup::led_by(&child)?;
+    if let Err(e) = std::fs::write(pgid_file(&dir), group.0.as_raw().to_string()) {
+        tracing::warn!(%run_id, error = %e, "recording a local run's process group failed; it cannot be cancelled");
+    }
     tracing::info!(%issue_key, %run_id, dir = %dir.display(), "playbook launch running locally");
     Ok(LocalRun {
         child,
@@ -366,6 +398,7 @@ pub async fn supervise(db: Db, key: String, run: LocalRun) {
             )
         }
     };
+    let _ = std::fs::remove_file(pgid_file(&dir));
     let drained = tokio::time::timeout(PIPE_DRAIN_GRACE, async {
         while streams.join_next().await.is_some() {}
     })
@@ -1062,5 +1095,26 @@ waitpid($outsider, 0);
         assert!(dir.starts_with(root.join("local-runs")), "{dir:?}");
         assert!(!dir.to_string_lossy().contains(':'), "{dir:?}");
         assert_ne!(dir, run_dir(root, "playbook:fences:0199-2"));
+    }
+
+    #[test]
+    fn a_live_session_is_found_only_for_a_safe_run_with_a_log() {
+        let root = tempfile::tempdir().unwrap();
+        let run = "playbook_demo-1";
+        assert_eq!(crate::runs::local_run::live_session(root.path(), run), None);
+        let log = crate::runs::local_run::session_log(&crate::runs::task_evidence::run_dir(
+            root.path(),
+            run,
+        ));
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, "{}\n").unwrap();
+        assert_eq!(
+            crate::runs::local_run::live_session(root.path(), run),
+            Some(log)
+        );
+        assert_eq!(
+            crate::runs::local_run::live_session(root.path(), "../etc"),
+            None
+        );
     }
 }
