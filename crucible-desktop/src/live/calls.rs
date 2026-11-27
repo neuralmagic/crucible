@@ -7,6 +7,7 @@ use crucible_contract::calls::{
     CALL_PROGRESS_PATH, CallId, CallKind, CallStatus, CallView, NodeLink, ProgressNode,
     TargetHandle,
 };
+use crucible_contract::console::gitlab;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -129,6 +130,14 @@ pub struct CallNode {
 pub struct NodeLog {
     pub ask: NodeAsk,
     pub text: Result<String, String>,
+    pub trace: Vec<gitlab::Item>,
+}
+
+impl NodeLog {
+    pub fn new(ask: NodeAsk, text: Result<String, String>) -> Self {
+        let trace = text.as_deref().map(gitlab::parse).unwrap_or_default();
+        NodeLog { ask, text, trace }
+    }
 }
 
 pub(in crate::live) async fn node_log(
@@ -151,6 +160,7 @@ pub fn lifecycle(tasks: &[TaskView], calls: &[LiveCall]) -> Vec<LogLine> {
         task: Some(task.to_string()),
         raw: format!("[{task}] {text}"),
         body: Body::Notice { text, warning },
+        runs: Vec::new(),
     };
     let mut lines = Vec::new();
     for task in tasks {

@@ -94,10 +94,7 @@ impl Fetcher {
             self.node_logs.insert(ask.clone(), (text, ended));
         }
         let (text, _) = self.node_logs.get(&ask)?;
-        Some(calls::NodeLog {
-            text: text.clone(),
-            ask,
-        })
+        Some(calls::NodeLog::new(ask, text.clone()))
     }
 
     pub(in crate::live::fetcher) async fn learn_caller(
@@ -301,10 +298,10 @@ mod tests {
             let read = fetcher.node_log(&connection, &detail, false).await;
             assert_eq!(
                 read,
-                Some(NodeLog {
-                    ask: ask.clone(),
-                    text: Ok("##[group]Run make\nbuilt\n".into()),
-                })
+                Some(NodeLog::new(
+                    ask.clone(),
+                    Ok("##[group]Run make\nbuilt\n".into())
+                ))
             );
             assert_eq!(asked(&counts, LOG), 1);
             fetcher.node_log(&connection, &detail, false).await;

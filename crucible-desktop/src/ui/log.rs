@@ -8,6 +8,7 @@ use crate::logline::{self, Body, Level, LogLine, LogView};
 use crate::session::{TaskState, TaskView, split_name};
 use crate::ui::{Paint, Pane};
 
+mod ink;
 mod node;
 use crate::ui::tasks::{count, state_mark, status_color};
 use crate::unfurl::{self, Block, LogMode};
@@ -26,7 +27,7 @@ pub(crate) fn log_pane(pane: &Pane, app: &App, p: &Paint) -> El {
     let (transcript, console, tasks, font) = (pane.transcript, pane.log, pane.tasks, pane.log_font);
     if let Some(node) = &app.run.call_node {
         let log = pane.node_log.filter(|log| log.ask == node.ask);
-        return node::node_log(node, log, font, p);
+        return node::node_log(node, log, &app.run.node_folds, font, p);
     }
     let Shown {
         reading,
@@ -501,9 +502,14 @@ fn line_row(line: &LogLine, style: TextStyle, scoped: bool, p: &Paint) -> El {
                 .w(52.0),
         );
     }
+    let spans = match line.body {
+        Body::Output { .. } | Body::Job(_) | Body::Plain(_) => ink::spans(&line.runs, ink, p.dark),
+        _ => Vec::new(),
+    };
     let content = text(content)
         .font(style)
         .color(ink)
+        .spans(spans)
         .grow(1.0)
         .min_w(0.0)
         .selectable(true)
@@ -631,6 +637,7 @@ pub(crate) fn parts(line: &LogLine, p: &Paint) -> (Option<&'static str>, Color, 
             text,
         } => (Some("OUT"), dim, text.clone(), p.c.text_base),
         Body::Output { stderr: true, text } => (Some("ERR"), p.live, text.clone(), p.c.text_base),
+        Body::Job(text) => (None, dim, text.clone(), p.c.text_base),
         Body::Plain(text) => (None, dim, text.clone(), dim),
     }
 }

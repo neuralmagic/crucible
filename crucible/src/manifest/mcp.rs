@@ -48,8 +48,7 @@ impl McpLog {
         if self == McpLog::Off {
             return false;
         }
-        tracing_level(&crucible_contract::console::strip_ansi(line))
-            .is_none_or(|level| level <= self)
+        tracing_level(&crucible_contract::console::plain(line)).is_none_or(|level| level <= self)
     }
 }
 
