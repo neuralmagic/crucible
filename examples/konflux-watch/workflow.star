@@ -1,3 +1,5 @@
+load("@crucible//calls", "event", "pipeline_run", "tekton")
+
 params = {
     "commit": {
         "type": "string",
@@ -7,23 +9,20 @@ params = {
     },
 }
 
-calls = {
-    "konflux": {
-        "kind": "tekton",
-        "cluster": "konflux",
-        "namespace": "open-data-hub-tenant",
-        "repository": "github-com-opendatahub-io-modelexpress",
-        "event": "pull_request",
-        "expected": [
-            {"name": "odh-modelexpress-on-pull-request", "results": ["IMAGE_URL", "IMAGE_DIGEST"]},
-            {"name": "odh-modelexpress-operator-on-pull-request", "results": ["IMAGE_URL", "IMAGE_DIGEST"]},
-        ],
-    },
-}
+konflux = tekton(
+    cluster = "konflux",
+    namespace = "open-data-hub-tenant",
+    repository = "github-com-opendatahub-io-modelexpress",
+    event = event.pull_request,
+    expected = [
+        pipeline_run("odh-modelexpress-on-pull-request", results = ["IMAGE_URL", "IMAGE_DIGEST"]),
+        pipeline_run("odh-modelexpress-operator-on-pull-request", results = ["IMAGE_URL", "IMAGE_DIGEST"]),
+    ],
+)
 
 builds = watch(
     name = "builds",
-    target = "konflux",
+    target = konflux,
     commit = param("commit"),
     timeout = "2h",
     appear = "5m",

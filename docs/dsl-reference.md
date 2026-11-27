@@ -349,12 +349,12 @@ Engine-owned decision: answers typed questions about its dependencies' outputs a
 
 ### `call()`
 
-Engine-owned dispatch of a target the `calls` block declares, as a run of its own, compiled against the pack's `calls.lock`. The block is a dictionary literal from target name to `{"kind": "playbook", "playbook": ...}`, `{"kind": "github_workflow", "repo", "workflow", "ref", "outputs"}` or `{"kind": "gitlab_pipeline", "host", "project", "ref", "outputs"}`, assigned before every statement but `params`, and read without evaluating the source. The call waits for the target run and settles as it ended; its output is the target's result and its files are the target's result files.
+Engine-owned dispatch of a target from `@crucible//calls`, as a run of its own, compiled against the pack's `calls.lock`. The call waits for the target run and settles as it ended; its output is the target's result and its files are the target's result files.
 
 | Argument | Type | Purpose |
 | --- | --- | --- |
 | `name` | `str` | Task identity, unique within the workflow. |
-| `target` | `str` | The name of a target in the source's `calls` block. |
+| `target` | `playbook(...) \| github_workflow(...) \| gitlab_pipeline(...)` | The target, written here or bound to a top-level name. |
 | `params` | `dict[str, value]` | The target's parameters, each bound to a literal, `param(name)`, `producer.field`, `producer.files["path"]`, or in a mapped call `item()`. A producer is made a dependency. Every binding is checked against the lock's interface: an unknown name, an unbound required parameter, a field of another type, or a file to a non-file parameter is refused. |
 | `over` | `each(producer.field, max = N)` | Dispatch one target run per item, at most 64. |
 | `max_fanout` | `int` | Deprecated. Write `over = each(producer.field, max = N)`. |
@@ -369,12 +369,12 @@ Engine-owned dispatch of a target the `calls` block declares, as a run of its ow
 
 ### `watch()`
 
-Engine-owned wait for the runs a commit started on a target's system, such as the Pipelines-as-Code PipelineRuns a push or pull request triggered. The target is a `{"kind": "tekton", "cluster", "namespace", "repository", "event", "expected"}` entry of the `calls` block. The watch adds every run that appears within `appear`, passes once every matched run passed, fails as soon as one fails, and never cancels a run. Its output has `runs` and, per expected run, the results it declares.
+Engine-owned wait for the runs a commit started on a target's system, such as the Pipelines-as-Code PipelineRuns a push or pull request triggered. The target is a `tekton(...)` from `@crucible//calls`. The watch adds every run that appears within `appear`, passes once every matched run passed, fails as soon as one fails, and never cancels a run. Its output has `runs` and, per expected run, the results it declares.
 
 | Argument | Type | Purpose |
 | --- | --- | --- |
 | `name` | `str` | Task identity, unique within the workflow. |
-| `target` | `str` | The name of a `tekton` target in the source's `calls` block. |
+| `target` | `tekton(...)` | The target, written here or bound to a top-level name. |
 | `commit` | `str` | The full commit id, as a literal, `param(name)`, or `producer.field`. |
 | `timeout` | `duration` | How long the watch waits in all before it fails. |
 | `appear` | `duration` | How long runs may take to appear; 10m when unset. |
@@ -472,6 +472,93 @@ An ordinal question for `route()`. It answers its most probable level, the lowes
 Mark an entry of `depends_on` that may settle `not_taken`. Under `join = "all"` the task dispatches past it as though it passed, and its inputs carry no entry for it; one that failed or was blocked still blocks. Refused under another join, on a dependency that can never settle `not_taken`, and on a task the reviewer revises.
 
 Takes one positional argument, `task`.
+
+## Built-in modules
+
+Imported with `load()`, like a pack's own modules. A name a module exports is not in scope until it is loaded, and it can be renamed on import: `load("@crucible//calls", gl = "gitlab_pipeline")`.
+
+### `@crucible//calls`
+
+The targets `call()` and `watch()` take. Each is written in `workflow.star`, inline in the call or bound to a top-level name, from literals and other values of this module, so the controller can pin it in `calls.lock` without running the source. An inline target is pinned under its task's name, a bound one under the name it is bound to, which lets several calls share one pin.
+
+#### `playbook()`
+
+Another playbook, run as a child of this one.
+
+Takes `ref` positionally or by name.
+
+| Argument | Type | Purpose |
+| --- | --- | --- |
+| `ref` | `str` | A registered playbook id, or `draft:<id>` for a draft's head (draft packs only). |
+
+#### `github_workflow()`
+
+A GitHub Actions workflow, dispatched with its inputs.
+
+| Argument | Type | Purpose |
+| --- | --- | --- |
+| `repo` | `str` | `owner/name`. |
+| `workflow` | `str` | The workflow file, under `.github/workflows/`. |
+| `ref` | `str` | The branch or tag it runs on. |
+| `outputs` | `artifact_outputs(...)` | Where the run's result is read from. |
+
+#### `gitlab_pipeline()`
+
+A GitLab pipeline, created with typed `spec:inputs`.
+
+| Argument | Type | Purpose |
+| --- | --- | --- |
+| `host` | `str` | The GitLab host; it must be one the controller serves. |
+| `project` | `str` | The project path, `group/project`. |
+| `ref` | `str` | The branch or tag the pipeline runs on. |
+| `outputs` | `job_outputs(...)` | Where the pipeline's result is read from. Unset, the call reads none. |
+
+#### `tekton()`
+
+Pipelines-as-Code runs on a Tekton cluster, for `watch()` only.
+
+| Argument | Type | Purpose |
+| --- | --- | --- |
+| `cluster` | `str` | A cluster the controller is configured to watch. |
+| `namespace` | `str` | The namespace the runs start in. |
+| `repository` | `str` | The Pipelines-as-Code Repository name. |
+| `event` | `event.push \| event.pull_request` | Which runs to follow. Unset, both. |
+| `expected` | `list[pipeline_run(...)]` | The runs the watch waits for, and the results each declares. |
+
+#### `artifact_outputs()`
+
+A GitHub run's result: an uploaded artifact holding `result.json`.
+
+| Argument | Type | Purpose |
+| --- | --- | --- |
+| `artifact` | `str` | The artifact name. |
+| `fields` | `dict[str, type]` | The typed fields of the JSON object the run writes as its result. |
+| `files` | `list[str]` | Further paths the call stages for its dependents. |
+
+#### `job_outputs()`
+
+A GitLab pipeline's result: a job's artifacts holding `result.json`.
+
+| Argument | Type | Purpose |
+| --- | --- | --- |
+| `job` | `str` | The job whose artifacts hold it. |
+| `fields` | `dict[str, type]` | The typed fields of the JSON object the run writes as its result. |
+| `files` | `list[str]` | Further paths the call stages for its dependents. |
+
+#### `pipeline_run()`
+
+One PipelineRun a Tekton watch waits for.
+
+Takes `name` positionally or by name.
+
+| Argument | Type | Purpose |
+| --- | --- | --- |
+| `name` | `str` | The PipelineRun's name. |
+| `results` | `list[str]` | Task results the watch outputs for it. |
+
+#### `event`
+
+The Pipelines-as-Code event a Tekton watch follows. Members: `event.push`, `event.pull_request`.
 
 ## Reserved fields
 

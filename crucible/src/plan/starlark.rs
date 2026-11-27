@@ -5,13 +5,13 @@
 
 mod call;
 pub mod error;
-mod globals;
+pub(crate) mod globals;
 pub mod idents;
 mod loader;
 pub mod params;
 pub mod placeholder;
 pub mod reference;
-mod targets;
+pub(crate) mod targets;
 mod values;
 
 use std::cell::{RefCell, RefMut};
@@ -375,7 +375,7 @@ impl CompileContext {
         if !self.declared_calls.contains_key(alias) {
             let known: Vec<&str> = self.declared_calls.keys().map(|a| a.as_str()).collect();
             return Err(format!(
-                "the calls block declares no target named {alias}; it declares {}",
+                "workflow.star declares no target named {alias}; it declares {}",
                 if known.is_empty() {
                     "none".to_string()
                 } else {
@@ -556,6 +556,7 @@ enum Value {
     CallFile(call::CallFile),
     Item,
     Budget(crucible_contract::calls::CallBudget),
+    Target(targets::Built),
     /// A starlark value outside the DSL's own space: a dict, a function, a struct. The `take_*`
     /// helpers report it with the same wrong-type sentence a wrong scalar gets.
     Opaque,

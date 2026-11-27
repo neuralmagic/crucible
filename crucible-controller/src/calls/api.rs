@@ -721,11 +721,12 @@ mod tests {
 
     const CALLER_WORKFLOW: &str = concat!(
         "params = {}\n",
-        "calls = {\"target\": {\"kind\": \"playbook\", \"playbook\": \"draft:target\"}, ",
-        "\"filer\": {\"kind\": \"playbook\", \"playbook\": \"draft:filer\"}}\n",
+        "load(\"@crucible//calls\", \"playbook\")\n",
+        "target = playbook(\"draft:target\")\n",
+        "filer = playbook(\"draft:filer\")\n",
         "hello = command(name = \"hello\", run = \"echo hello\", emits_files = [\"NOTES.md\"])\n",
-        "ask = call(name = \"ask\", target = \"target\", params = {\"topic\": \"attention\"})\n",
-        "file = call(name = \"file\", target = \"filer\", ",
+        "ask = call(name = \"ask\", target = target, params = {\"topic\": \"attention\"})\n",
+        "file = call(name = \"file\", target = filer, ",
         "params = {\"notes\": hello.files[\"NOTES.md\"]}, depends_on = [hello])\n",
         "workflow(type = \"playbook\", tasks = [hello, ask, file], result = hello)\n",
     );
@@ -1255,7 +1256,7 @@ mod tests {
         let missing = crate::calls::lock::declared(|path| {
             (path == "crucible.toml")
                 .then(|| CALLER_MANIFEST.to_string())
-                .or_else(|| (path == "workflow.star").then(|| "calls = {\"gone\": {\"kind\": \"playbook\", \"playbook\": \"draft:nowhere\"}}\n".to_string()))
+                .or_else(|| (path == "workflow.star").then(|| "load(\"@crucible//calls\", \"playbook\")\ngone = playbook(\"draft:nowhere\")\n".to_string()))
         })
         .expect("declared");
         let refused = crate::calls::lock::write(&backends, &ctx(&state), &missing, &locking(true))
@@ -1267,7 +1268,7 @@ mod tests {
         let head = crate::calls::lock::declared(|path| {
             (path == "crucible.toml")
                 .then(|| CALLER_MANIFEST.to_string())
-                .or_else(|| (path == "workflow.star").then(|| "calls = {\"target\": {\"kind\": \"playbook\", \"playbook\": \"draft:target\"}}\n".to_string()))
+                .or_else(|| (path == "workflow.star").then(|| "load(\"@crucible//calls\", \"playbook\")\ntarget = playbook(\"draft:target\")\n".to_string()))
         })
         .expect("declared");
         let refused = crate::calls::lock::write(&backends, &ctx(&state), &head, &locking(false))
@@ -1292,9 +1293,9 @@ mod tests {
                 .or_else(|| {
                     (path == "workflow.star").then(|| {
                         concat!(
-                "calls = {\"ci\": {\"kind\": \"github_workflow\", \"repo\": \"acme/app\", ",
-                "\"workflow\": \".github/workflows/ci.yml\", \"ref\": \"main\", ",
-                "\"outputs\": {\"artifact\": \"result\"}}}\n",
+                "load(\"@crucible//calls\", \"artifact_outputs\", \"github_workflow\")\n",
+                "ci = github_workflow(repo = \"acme/app\", workflow = \".github/workflows/ci.yml\", ",
+                "ref = \"main\", outputs = artifact_outputs(artifact = \"result\"))\n",
             ).to_string()
                     })
                 })
@@ -1736,9 +1737,7 @@ mod tests {
         let ash = caller(&pool, "ash").await;
         let wren = caller(&pool, "wren").await;
         let calling = |draft: &str| {
-            format!(
-                "calls = {{\"t\": {{\"kind\": \"playbook\", \"playbook\": \"draft:{draft}\"}}}}\n"
-            )
+            format!("load(\"@crucible//calls\", \"playbook\")\nt = playbook(\"draft:{draft}\")\n")
         };
         let lock = |who, me, body| lock_as(&state, &backends, who, me, body);
         let (ash, wren) = (&ash, &wren);
@@ -1858,11 +1857,11 @@ mod tests {
 
     const GITHUB_CALLER: &str = concat!(
         "params = {}\n",
-        "calls = {\"ci\": {\"kind\": \"github_workflow\", \"repo\": \"acme/app\", ",
-        "\"workflow\": \".github/workflows/ci.yml\", \"ref\": \"main\", ",
-        "\"outputs\": {\"artifact\": \"result\"}}}\n",
+        "load(\"@crucible//calls\", \"artifact_outputs\", \"github_workflow\")\n",
         "hello = command(name = \"hello\", run = \"echo hello\")\n",
-        "ci = call(name = \"ci\", target = \"ci\", params = {})\n",
+        "ci = call(name = \"ci\", target = github_workflow(repo = \"acme/app\", ",
+        "workflow = \".github/workflows/ci.yml\", ref = \"main\", ",
+        "outputs = artifact_outputs(artifact = \"result\")), params = {})\n",
         "workflow(type = \"playbook\", tasks = [hello, ci], result = hello)\n",
     );
 

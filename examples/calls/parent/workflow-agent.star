@@ -1,23 +1,4 @@
-calls = {
-    "child": {"kind": "playbook", "playbook": "draft:calls-child"},
-    "ci": {
-        "kind": "github_workflow",
-        "repo": "OWNER/REPO",
-        "workflow": ".github/workflows/crucible-call-demo.yml",
-        "ref": "crucible-call-demo",
-        "outputs": {
-            "artifact": "crucible-result",
-            "fields": {
-                "summary": "string",
-                "flavor": "string",
-                "loud": "boolean",
-                "legs": "integer",
-                "payload_keys": "list",
-            },
-            "files": ["notes.md"],
-        },
-    },
-}
+load("@crucible//calls", "artifact_outputs", "github_workflow", "playbook")
 
 prep = agent(
     name = "prep",
@@ -28,7 +9,7 @@ prep = agent(
 
 child = call(
     name = "child",
-    target = "child",
+    target = playbook("draft:calls-child"),
     params = {
         "label": prep.label,
         "config": prep.config,
@@ -40,7 +21,22 @@ child = call(
 
 ci = call(
     name = "ci",
-    target = "ci",
+    target = github_workflow(
+        repo = "OWNER/REPO",
+        workflow = ".github/workflows/crucible-call-demo.yml",
+        ref = "crucible-call-demo",
+        outputs = artifact_outputs(
+            artifact = "crucible-result",
+            fields = {
+                "summary": "string",
+                "flavor": "string",
+                "loud": "boolean",
+                "legs": "integer",
+                "payload_keys": "list",
+            },
+            files = ["notes.md"],
+        ),
+    ),
     params = {
         "message": prep.label,
         "payload": prep.config,

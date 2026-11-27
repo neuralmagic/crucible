@@ -136,37 +136,39 @@ open in the app.
   <img src="docs/img/calls-github.png" alt="A playbook whose prep task feeds a child playbook and a GitHub Actions workflow. Both draw as frames in the graph: the child's read and digest tasks, and the workflow's prepare, two-leg build and report jobs in GitHub purple, titled snapshotd #14. Their results meet in the summary task." width="960">
 </p>
 
-Targets are declared in a literal `calls` block at the top of the workflow source:
+Targets come from the `@crucible//calls` module:
 
 ```python
-calls = {
-    "ci": {
-        "kind": "github_workflow",
-        "repo": "acme/app",
-        "workflow": ".github/workflows/release.yml",
-        "ref": "main",
-        "outputs": {
-            "artifact": "crucible-result",
-            "fields": {"summary": "string", "legs": "integer"},
-            "files": ["notes.md"],
-        },
-    },
-}
+load("@crucible//calls", "artifact_outputs", "github_workflow")
 
 prep = command(name = "prep", run = "python3 prep.py", emits = {"label": "string"})
-ci = call(name = "ci", target = "ci", params = {"message": prep.label}, depends_on = [prep])
+ci = call(
+    name = "ci",
+    target = github_workflow(
+        repo = "acme/app",
+        workflow = ".github/workflows/release.yml",
+        ref = "main",
+        outputs = artifact_outputs(
+            artifact = "crucible-result",
+            fields = {"summary": "string", "legs": "integer"},
+            files = ["notes.md"],
+        ),
+    ),
+    params = {"message": prep.label},
+    depends_on = [prep],
+)
 summary = command(name = "summary", run = "python3 summary.py", depends_on = [ci])
 workflow(type = "playbook", tasks = [prep, ci, summary], result = summary)
 ```
 
 `summary` reads `ci`'s fields from its inputs and `notes.md` under `inputs/ci/`.
 
-| Kind | Task | Starts or follows | Takes | Returns |
+| Target | Task | Starts or follows | Takes | Returns |
 | --- | --- | --- | --- | --- |
-| `playbook` | `call()` | another playbook, pinned to a revision or a draft head | its params, including `json` and `file` | its result and files |
-| `github_workflow` | `call()` | a `workflow_dispatch` run | the workflow's inputs | `result.json` and files from a named artifact |
-| `gitlab_pipeline` | `call()` | a pipeline on a configured GitLab host | its `spec:inputs`, typed | `result.json` and files from a named job's artifacts |
-| `tekton` | `watch()` | the Pipelines-as-Code PipelineRuns a commit started | the commit | each run's declared results |
+| `playbook()` | `call()` | another playbook, pinned to a revision or a draft head | its params, including `json` and `file` | its result and files |
+| `github_workflow()` | `call()` | a `workflow_dispatch` run | the workflow's inputs | `result.json` and files from a named artifact |
+| `gitlab_pipeline()` | `call()` | a pipeline on a configured GitLab host | its `spec:inputs`, typed | `result.json` and files from a named job's artifacts |
+| `tekton()` | `watch()` | the Pipelines-as-Code PipelineRuns a commit started | the commit | each run's declared results |
 
 <p align="center">
   <img src="docs/img/calls-gitlab.png" alt="A GitLab pipeline drawn in GitLab orange inside its caller's graph: build, a two-job test stage and report, titled crucible-call-demo #4, between the prep and report tasks." width="800">

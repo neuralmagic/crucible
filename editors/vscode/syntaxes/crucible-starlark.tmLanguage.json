@@ -174,7 +174,7 @@
     },
     "dsl-call": {
       "name": "support.function.dsl.crucible-starlark",
-      "match": "\\b(agent|apply|at_least|at_most|choice|command|decide|default_autoresearch|each|evaluate|grade|human|measure|model|noul|optional|others|output|param|pick|prompt_file|propose|report|route|schema_file|score|send_back|session|skill|task_defaults|top_k|workflow)(?=\\s*\\()"
+      "match": "\\b(agent|apply|at_least|at_most|budget|call|choice|command|decide|default_autoresearch|each|evaluate|grade|human|item|measure|model|noul|optional|others|output|param|pick|prompt_file|propose|report|route|schema_file|score|send_back|session|skill|task_defaults|top_k|watch|workflow)(?=\\s*\\()"
     },
     "builtin-call": {
       "name": "support.function.builtin.crucible-starlark",

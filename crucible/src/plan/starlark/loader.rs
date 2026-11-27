@@ -16,6 +16,42 @@ use starlark_syntax::syntax::AstModule;
 use crate::errors::FileError;
 use crate::plan::starlark as dsl;
 
+const BUILTIN: &str = "@crucible//";
+
+fn builtin(raw: &str, lane: crate::plan::workflow::WorkflowType) -> dsl::Result<FrozenModule> {
+    let globals = match raw {
+        dsl::targets::MODULE if lane != crate::plan::workflow::WorkflowType::Autoresearch => {
+            starlark::environment::GlobalsBuilder::new()
+                .with(dsl::globals::calls)
+                .build()
+        }
+        dsl::targets::MODULE => {
+            return Err(dsl::CompileError::BuiltinModule {
+                raw: raw.to_owned(),
+                detail: "call() and watch() are not in the autoresearch lane".to_owned(),
+            });
+        }
+        _ => {
+            return Err(dsl::CompileError::BuiltinModule {
+                raw: raw.to_owned(),
+                detail: format!(
+                    "there is no such module; the built-in one is {}",
+                    dsl::targets::MODULE
+                ),
+            });
+        }
+    };
+    Module::with_temp_heap(|module| {
+        module.frozen_heap().add_reference(globals.heap());
+        for (name, value) in globals.iter() {
+            module.set(name, value.to_value());
+        }
+        module
+            .freeze()
+            .map_err(|error| dsl::CompileError::Eval(error.err_msg))
+    })
+}
+
 /// The pre-resolved module map. Keys are the raw `load()` strings, so two spellings of one file
 /// hold two entries pointing at the same frozen module.
 pub(crate) struct PackLoader<'a> {
@@ -92,6 +128,11 @@ impl Resolver<'_, '_> {
             at: at.clone(),
             inner: Box::new(error),
         };
+        if raw.starts_with(BUILTIN) {
+            let module = builtin(raw, self.lane).map_err(located)?;
+            self.modules.insert(raw.to_owned(), module);
+            return Ok(());
+        }
         let (_, canonical) = self
             .state
             .context_mut()

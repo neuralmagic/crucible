@@ -31,6 +31,7 @@ pub const SHADOWS_COMPILE: &[&str] = &[
     "missing-pack-file",
     "wrong-lane",
     "unknown-argument",
+    "unknown-module",
 ];
 
 const UNNECESSARY: &[&str] = &[
@@ -188,6 +189,14 @@ impl Lints<'_> {
     fn calls(&mut self) {
         for call in &self.index.calls {
             if !self.is_constructor(call) {
+                if self
+                    .cx
+                    .reference
+                    .resolve(Some(self.index), &call.callee, call.span.start)
+                    .is_some()
+                {
+                    self.unknown_arguments(call);
+                }
                 continue;
             }
             self.wrong_lane(call);
@@ -223,7 +232,11 @@ impl Lints<'_> {
     }
 
     fn unknown_arguments(&mut self, call: &Call) {
-        let Some(function) = self.cx.reference.function(&call.callee) else {
+        let Some(function) =
+            self.cx
+                .reference
+                .resolve(Some(self.index), &call.callee, call.span.start)
+        else {
             return;
         };
         let known: Vec<&str> = function.kwargs.iter().map(|k| k.name).collect();
@@ -376,7 +389,20 @@ impl Lints<'_> {
             .map(|load| (load.module.clone(), load.module_span.clone()))
             .collect();
         for (module, at) in loads {
-            self.pack_file(&module, at, Want::File { extension: None });
+            if !module.starts_with("@crucible//") {
+                self.pack_file(&module, at, Want::File { extension: None });
+            } else if self.cx.reference.module(&module).is_none() {
+                let known: Vec<&str> = self.cx.reference.modules.iter().map(|m| m.label).collect();
+                self.push(
+                    at,
+                    DiagnosticSeverity::ERROR,
+                    "unknown-module",
+                    format!(
+                        "`{module}` is not a built-in module; there is {}",
+                        known.join(", ")
+                    ),
+                );
+            }
         }
     }
 
@@ -590,6 +616,22 @@ mod tests {
             !unknown[1].message.contains("did you mean"),
             "{}",
             unknown[1].message
+        );
+    }
+
+    #[test]
+    fn an_imported_constructor_reports_an_unknown_argument() {
+        let fixture = fixture();
+        let source = "load(\"@crucible//calls\", \"gitlab_pipeline\")\n\
+                      p = gitlab_pipeline(host = \"h\", projct = \"g/p\", ref = \"main\")\n";
+        let found = lint(&fixture, source, None);
+        let unknown = coded(&found, "unknown-argument");
+        let names: Vec<_> = unknown.iter().map(|f| covered(source, f)).collect();
+        assert_eq!(names, ["projct"]);
+        assert!(
+            unknown[0].message.contains("did you mean `project`"),
+            "{}",
+            unknown[0].message
         );
     }
 

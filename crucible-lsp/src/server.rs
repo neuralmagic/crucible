@@ -455,11 +455,10 @@ impl LanguageServer for Backend {
         let Some(callee) = structure.frame(call).and_then(|f| f.callee.as_deref()) else {
             return Ok(None);
         };
-        let shadowed = snapshot
-            .index
-            .as_ref()
-            .is_some_and(|index| index.resolve(callee, offset).is_some());
-        let Some(function) = self.reference.function(callee).filter(|_| !shadowed) else {
+        let Some(function) = self
+            .reference
+            .resolve(snapshot.index.as_deref(), callee, offset)
+        else {
             return Ok(None);
         };
         let active = structure

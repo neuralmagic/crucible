@@ -78,11 +78,17 @@ impl Navigator<'_> {
                 .iter()
                 .any(|slot| slot.key.as_ref().is_some_and(|key| key.span == word))
             && let Some(callee) = frame.callee.as_deref()
-            && index.is_none_or(|index| index.resolve(callee, offset).is_none())
-            && let Some(function) = self.reference.function(callee)
+            && let Some(function) = self.reference.resolve(index, callee, offset)
             && let Some(kwarg) = function.kwargs.iter().find(|k| k.name == name)
         {
             return Some((docs::kwarg_markdown(function, kwarg), word));
+        }
+        if let Some(function) = binding
+            .is_some()
+            .then(|| self.reference.resolve(index, name, offset))
+            .flatten()
+        {
+            return Some((docs::function_markdown(function), word));
         }
         if let (Some(binding), Some(index)) = (binding, index) {
             return Some((self.hover_binding(index, binding), word));

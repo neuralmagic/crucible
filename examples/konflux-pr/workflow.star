@@ -1,3 +1,5 @@
+load("@crucible//calls", "event", "pipeline_run", "tekton")
+
 params = {
     "fork": {"type": "string", "default": "wseaton/modelexpress", "doc": "owner/name the branch is pushed to"},
     "upstream": {"type": "string", "default": "opendatahub-io/modelexpress", "doc": "owner/name the pull request is opened on"},
@@ -5,19 +7,16 @@ params = {
     "branch": {"type": "string", "default": "crucible/konflux-watch-demo", "doc": "the fork branch every run reuses"},
 }
 
-calls = {
-    "konflux": {
-        "kind": "tekton",
-        "cluster": "konflux",
-        "namespace": "open-data-hub-tenant",
-        "repository": "github-com-opendatahub-io-modelexpress",
-        "event": "pull_request",
-        "expected": [
-            {"name": "odh-modelexpress-on-pull-request", "results": ["IMAGE_URL", "IMAGE_DIGEST"]},
-            {"name": "odh-modelexpress-operator-on-pull-request", "results": ["IMAGE_URL", "IMAGE_DIGEST"]},
-        ],
-    },
-}
+konflux = tekton(
+    cluster = "konflux",
+    namespace = "open-data-hub-tenant",
+    repository = "github-com-opendatahub-io-modelexpress",
+    event = event.pull_request,
+    expected = [
+        pipeline_run("odh-modelexpress-on-pull-request", results = ["IMAGE_URL", "IMAGE_DIGEST"]),
+        pipeline_run("odh-modelexpress-operator-on-pull-request", results = ["IMAGE_URL", "IMAGE_DIGEST"]),
+    ],
+)
 
 pr = command(
     name = "pr",
@@ -28,7 +27,7 @@ pr = command(
 
 builds = watch(
     name = "builds",
-    target = "konflux",
+    target = konflux,
     commit = pr.commit,
     timeout = "2h",
     appear = "10m",

@@ -153,12 +153,12 @@ pub enum CompileError {
         raw: String,
         why: String,
     },
-    #[error("params must come before every statement but calls")]
+    #[error("params must come before every statement but load()")]
     ParamsNotFirst,
-    #[error("calls must come before every statement but params")]
-    CallsNotLeading,
-    #[error("calls must be readable without evaluating the source: {detail}")]
-    CallsNotLiteral { detail: String },
+    #[error("call targets must be readable without evaluating the source: {detail}")]
+    CallTargetNotLiteral { detail: String },
+    #[error("{detail}")]
+    CallTargetInvalid { detail: String },
     #[error("{detail}")]
     CallsUnpinned { detail: String },
     #[error("params must be readable without evaluating the source: {detail}")]
@@ -324,6 +324,10 @@ pub enum CompileError {
     LoadCycle { raw: String },
     #[error("workflow and its loaded modules exceed {MAX_TOTAL_SOURCE_BYTES} bytes of source")]
     LoadSourceBudgetSpent,
+    #[error("{name} comes from {module}: add load({module:?}, {name:?})")]
+    NotLoaded { name: String, module: &'static str },
+    #[error("load({raw:?}): {detail}")]
+    BuiltinModule { raw: String, detail: String },
     #[error("load({raw:?}) resolved to no module")]
     LoadUnresolved { raw: String },
     #[error("unknown workflow variable {name:?}{}", diag::hint(.suggestion.as_deref()))]

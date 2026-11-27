@@ -441,7 +441,8 @@ type = "playbook"
 file = "workflow-agent.star"
 "#;
 
-    const WORKFLOW: &str = r#"calls = {"triage": {"kind": "playbook", "playbook": "draft:triage-draft"}}
+    const WORKFLOW: &str = r#"load("@crucible//calls", "playbook")
+triage = playbook("draft:triage-draft")
 workflow(type = "playbook", tasks = [])
 "#;
 
@@ -468,7 +469,8 @@ workflow(type = "playbook", tasks = [])
                 playbook: PlaybookRef::Draft("triage-draft".into())
             })
         );
-        let ci = r#"calls = {"ci": {"kind": "github_workflow", "repo": "acme/app", "workflow": ".github/workflows/ci.yml", "ref": "main", "outputs": {"artifact": "result"}}}
+        let ci = r#"load("@crucible//calls", "artifact_outputs", "github_workflow")
+ci = github_workflow(repo = "acme/app", workflow = ".github/workflows/ci.yml", ref = "main", outputs = artifact_outputs(artifact = "result"))
 "#;
         let both = declared(pack(&[
             ("crucible.toml", MANIFEST),
@@ -500,7 +502,10 @@ workflow(type = "playbook", tasks = [])
         );
         let refused = declared(pack(&[
             ("crucible.toml", MANIFEST),
-            ("workflow.star", "calls = {\"x\": {\"kind\": \"gitlab\"}}\n"),
+            (
+                "workflow.star",
+                "load(\"@crucible//calls\", \"playbook\")\nx = playbook(\"has space\")\n",
+            ),
         ]))
         .expect_err("unknown kind");
         assert!(refused.starts_with("workflow.star:"), "{refused}");

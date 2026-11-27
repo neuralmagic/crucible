@@ -13,15 +13,15 @@ use crate::plan::diag;
 use crate::plan::ir::{Emits, OutputField, Task, TaskKind, TaskName};
 use crate::plan::starlark::error::CompileError;
 use crate::plan::starlark::params::{ParamType, embedded, embedded_schema};
+use crate::plan::starlark::targets;
 use crate::plan::starlark::values::{CONVERTED, ExternalText, Segment};
 use crate::plan::starlark::{
     CompileState, Result, Value, check_fanout, imply_dependencies, note_explicit_required,
     parse_join, parse_stage, take_bool_default, take_declared_name, take_dependencies, take_fanout,
-    take_string, take_string_default, take_when, wrong_type,
+    take_string_default, take_when, wrong_type,
 };
 use crucible_contract::calls::{
-    CallAlias, CallBudget, CallKind, MAX_CALL_FANOUT, TargetInterface, WATCH_APPEAR_PARAM,
-    WATCH_COMMIT_PARAM,
+    CallBudget, CallKind, MAX_CALL_FANOUT, TargetInterface, WATCH_APPEAR_PARAM, WATCH_COMMIT_PARAM,
 };
 use crucible_contract::emits::{FieldType, JsonSchema};
 
@@ -190,6 +190,105 @@ impl Display for BudgetValue {
 #[starlark_value(type = "budget")]
 impl<'v> StarlarkValue<'v> for BudgetValue {}
 
+/// A value an `@crucible//calls` constructor or enum built.
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+pub(crate) struct TargetValue(#[allocative(skip)] pub(crate) targets::Built);
+
+starlark_simple_value!(TargetValue);
+
+impl Display for TargetValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match targets::ENUMS.iter().find(|(name, _)| *name == self.0.ctor) {
+            Some((name, _)) => write!(f, "{name}.{}", self.0.json.as_str().unwrap_or_default()),
+            None => write!(f, "{}(...)", self.0.ctor),
+        }
+    }
+}
+
+#[starlark_value(type = "call_target")]
+impl<'v> StarlarkValue<'v> for TargetValue {}
+
+/// An `@crucible//calls` enum, whose members are its attributes.
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+pub(crate) struct EnumValue(#[allocative(skip)] pub(crate) &'static str);
+
+starlark_simple_value!(EnumValue);
+
+impl Display for EnumValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+#[starlark_value(type = "enum")]
+impl<'v> StarlarkValue<'v> for EnumValue {
+    fn get_attr(&self, attribute: &str, heap: Heap<'v>) -> Option<starlark::values::Value<'v>> {
+        targets::member(self.0, attribute)
+            .ok()
+            .map(|built| heap.alloc(TargetValue(built)))
+    }
+
+    fn dir_attr(&self) -> Vec<String> {
+        targets::ENUMS
+            .iter()
+            .find(|(name, _)| *name == self.0)
+            .map(|(_, members)| members.iter().map(|m| (*m).to_owned()).collect())
+            .unwrap_or_default()
+    }
+}
+
+fn arg(value: Value) -> Result<targets::Arg> {
+    let plain = |value| {
+        json(value).ok_or_else(|| CompileError::CallTargetNotLiteral {
+            detail: "target arguments are built from dictionaries, lists, strings, numbers, \
+                     booleans and values from @crucible//calls"
+                .to_owned(),
+        })
+    };
+    match value {
+        Value::Target(built) => Ok(targets::Arg::Part(built.ctor, built.json)),
+        Value::List(items) => items
+            .into_iter()
+            .map(arg)
+            .collect::<Result<Vec<_>>>()
+            .map(targets::Arg::List),
+        other => plain(other).map(targets::Arg::Json),
+    }
+}
+
+fn json(value: Value) -> Option<serde_json::Value> {
+    Some(match value {
+        Value::None => serde_json::Value::Null,
+        Value::Bool(b) => serde_json::Value::Bool(b),
+        Value::Int(n) => serde_json::Value::from(n),
+        Value::Float(f) => serde_json::Value::Number(serde_json::Number::from_f64(f)?),
+        Value::String(s) => serde_json::Value::String(s),
+        Value::List(items) => {
+            serde_json::Value::Array(items.into_iter().map(json).collect::<Option<_>>()?)
+        }
+        Value::Map(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(k, v)| json(v).map(|v| (k, v)))
+                .collect::<Option<_>>()?,
+        ),
+        Value::Ordered(pairs) => serde_json::Value::Object(
+            pairs
+                .into_iter()
+                .map(|(k, v)| json(v).map(|v| (k, v)))
+                .collect::<Option<_>>()?,
+        ),
+        _ => return None,
+    })
+}
+
+pub(crate) fn construct(ctor: &'static str, named: BTreeMap<String, Value>) -> Result<Value> {
+    let named = named
+        .into_iter()
+        .map(|(name, value)| arg(value).map(|value| (name, value)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    targets::build(ctor, named).map(Value::Target)
+}
+
 pub(crate) fn budget(named: &mut BTreeMap<String, Value>) -> Result<Value> {
     let invalid = |detail: &str| CompileError::BudgetInvalid {
         detail: detail.to_owned(),
@@ -318,13 +417,41 @@ pub(crate) fn call_task(named: &mut BTreeMap<String, Value>, state: &CompileStat
 
 fn task(named: &mut BTreeMap<String, Value>, state: &CompileState, door: Door) -> Result<Task> {
     let name = take_declared_name(named, "name")?;
-    let target = take_string(named, "target")?;
+    let built = match named.remove("target") {
+        Some(Value::Target(built)) => built,
+        None => {
+            return Err(CompileError::MissingArgument {
+                argument: "target".to_owned(),
+            });
+        }
+        Some(_) => {
+            return Err(wrong_type(
+                "target",
+                "a target from @crucible//calls, such as gitlab_pipeline(...)",
+            ));
+        }
+    };
+    let shown = built.ctor.to_owned();
     let refused = |detail: String| CompileError::CallTarget {
         task: name.0.clone(),
-        target: target.clone(),
+        target: shown.clone(),
         detail,
     };
-    let alias = CallAlias::parse(&target).map_err(|e| refused(e.to_string()))?;
+    let target = built.target().unwrap_or_else(|| {
+        Err(format!(
+            "{} builds part of a target, not a target",
+            built.ctor
+        ))
+    });
+    let target = target.map_err(&refused)?;
+    let alias = targets::alias_of(&state.context_mut().declared_calls, &name.0, &target)
+        .ok_or_else(|| {
+            refused(
+                "this target is not declared in workflow.star; write it in the call there or \
+                 bind it to a top-level name"
+                    .to_owned(),
+            )
+        })?;
     let locked = state.context_mut().locked_call(&alias).map_err(refused)?;
     match (door, locked.kind == CallKind::Tekton) {
         (Door::Call, true) => {
@@ -385,7 +512,7 @@ fn task(named: &mut BTreeMap<String, Value>, state: &CompileState, door: Door) -
                 task: name.0.clone(),
                 param: param.clone(),
                 detail: format!(
-                    "{target} declares no such parameter{}",
+                    "target {alias} declares no such parameter{}",
                     diag::suggest(&param, declared.keys().map(String::as_str))
                         .map(|s| format!("; did you mean {s:?}?"))
                         .unwrap_or_default()
@@ -416,7 +543,7 @@ fn task(named: &mut BTreeMap<String, Value>, state: &CompileState, door: Door) -
         return Err(CompileError::CallBinding {
             task: name.0.clone(),
             param: param.clone(),
-            detail: format!("{target} requires it and params does not bind it"),
+            detail: format!("target {alias} requires it and params does not bind it"),
         });
     }
     let mut task = Task {
@@ -748,16 +875,15 @@ mod tests {
         dir
     }
 
-    const CALLS: &str = r#"calls = {
-    "triage": {"kind": "playbook", "playbook": "triage"},
-    "release": {
-        "kind": "github_workflow",
-        "repo": "acme/app",
-        "workflow": ".github/workflows/release.yml",
-        "ref": "main",
-        "outputs": {"artifact": "result"},
-    },
-}
+    const CALLS: &str = r#"load("@crucible//calls", "artifact_outputs", "github_workflow", "playbook")
+
+triage = playbook("triage")
+release = github_workflow(
+    repo = "acme/app",
+    workflow = ".github/workflows/release.yml",
+    ref = "main",
+    outputs = artifact_outputs(artifact = "result"),
+)
 "#;
 
     const PLAN: &str = r#"
@@ -792,7 +918,7 @@ plan = command(
             r#"
 t = call(
     name = "triage",
-    target = "triage",
+    target = triage,
     params = {
         "repo": plan.repo,
         "count": plan.n,
@@ -856,7 +982,7 @@ workflow(type = "playbook", tasks = [plan, t, after])
             compile(
                 pack.path(),
                 &format!(
-                    "t = call(name = \"t\", target = \"triage\", params = {params})\n\
+                    "t = call(name = \"t\", target = triage, params = {params})\n\
                      workflow(type = \"playbook\", tasks = [plan, t])"
                 ),
             )
@@ -884,14 +1010,21 @@ workflow(type = "playbook", tasks = [plan, t, after])
             let error = refused(params);
             assert!(error.contains(says), "{params}: {error}");
         }
-        let unknown = compile(
+        let named = compile(
             pack.path(),
-            "t = call(name = \"t\", target = \"nope\", params = {})\n\
+            "t = call(name = \"t\", target = \"triage\", params = {})\n\
              workflow(type = \"playbook\", tasks = [plan, t])",
         )
         .unwrap_err();
-        assert!(unknown.contains("nope"), "{unknown}");
-        assert!(unknown.contains("release, triage"), "{unknown}");
+        assert!(named.contains("@crucible//calls"), "{named}");
+        let unpinned = compile(
+            pack.path(),
+            "t = call(name = \"t\", target = playbook(\"other\"), params = {})\n\
+             workflow(type = \"playbook\", tasks = [plan, t])",
+        )
+        .unwrap_err();
+        assert!(unpinned.contains("calls.lock"), "{unpinned}");
+        assert!(unpinned.contains("t"), "{unpinned}");
     }
 
     #[test]
@@ -899,7 +1032,7 @@ workflow(type = "playbook", tasks = [plan, t, after])
         let pack = tempfile::tempdir().unwrap();
         let error = compile(
             pack.path(),
-            "t = call(name = \"t\", target = \"triage\", params = {})\n\
+            "t = call(name = \"t\", target = triage, params = {})\n\
              workflow(type = \"playbook\", tasks = [plan, t])",
         )
         .unwrap_err();
@@ -910,14 +1043,14 @@ workflow(type = "playbook", tasks = [plan, t, after])
     fn a_github_target_never_takes_a_file() {
         let error = compile(
             pack(true).path(),
-            "t = call(name = \"t\", target = \"release\", params = {})\n\
+            "t = call(name = \"t\", target = release, params = {})\n\
              workflow(type = \"playbook\", tasks = [plan, t])",
         )
         .unwrap_err();
         assert!(error.contains("GitHub Actions input"), "{error}");
         let ok = compile(
             pack(false).path(),
-            "t = call(name = \"t\", target = \"release\", params = {\"version\": plan.repo})\n\
+            "t = call(name = \"t\", target = release, params = {\"version\": plan.repo})\n\
              workflow(type = \"playbook\", tasks = [plan, t])",
         )
         .unwrap();
@@ -934,7 +1067,7 @@ workflow(type = "playbook", tasks = [plan, t, after])
         let workflow = compile(
             pack.path(),
             r#"
-t = call(name = "t", target = "triage", params = {"repo": item()}, over = each(plan.items, max = 8))
+t = call(name = "t", target = triage, params = {"repo": item()}, over = each(plan.items, max = 8))
 workflow(type = "playbook", tasks = [plan, t])
 "#,
         )
@@ -948,7 +1081,7 @@ workflow(type = "playbook", tasks = [plan, t])
         let wide = compile(
             pack.path(),
             r#"
-t = call(name = "t", target = "triage", params = {"repo": item()}, over = each(plan.items, max = 65))
+t = call(name = "t", target = triage, params = {"repo": item()}, over = each(plan.items, max = 65))
 workflow(type = "playbook", tasks = [plan, t])
 "#,
         )
@@ -970,7 +1103,7 @@ params = {
             r#"plan = command(name = "plan", run = "true", emits = {"repo": "string"})
 t = call(
     name = "t",
-    target = "triage",
+    target = triage,
     params = {"repo": plan.repo, "matrix": param("matrix"), "notes": param("notes")},
 )
 workflow(type = "playbook", tasks = [plan, t])
@@ -1033,8 +1166,8 @@ workflow(type = "playbook", tasks = [plan, t])
             compile(
                 pack.path(),
                 &format!(
-                    "first = call(name = \"first\", target = \"triage\", params = {{\"repo\": plan.repo}})\n\
-                     second = call(name = \"second\", target = \"triage\", params = {second})\n\
+                    "first = call(name = \"first\", target = triage, params = {{\"repo\": plan.repo}})\n\
+                     second = call(name = \"second\", target = triage, params = {second})\n\
                      workflow(type = \"playbook\", tasks = [plan, first, second])"
                 ),
             )
@@ -1216,7 +1349,7 @@ workflow(type = "playbook", tasks = [plan, t])
             let error = compile(
                 pack.path(),
                 &format!(
-                    "t = call(name = \"t\", target = \"triage\", params = {{\"repo\": \"a\"}}, \
+                    "t = call(name = \"t\", target = triage, params = {{\"repo\": \"a\"}}, \
                      budget = {budget})\nworkflow(type = \"playbook\", tasks = [plan, t])"
                 ),
             )
@@ -1231,7 +1364,7 @@ workflow(type = "playbook", tasks = [plan, t])
         let revised = compile(
             pack.path(),
             r#"
-t = call(name = "t", target = "triage", params = {"repo": "a"})
+t = call(name = "t", target = triage, params = {"repo": "a"})
 review = command(name = "review", run = "true", depends_on = [t], revise = send_back([t], rounds = 2))
 workflow(type = "playbook", tasks = [plan, t, review])
 "#,
@@ -1241,7 +1374,7 @@ workflow(type = "playbook", tasks = [plan, t, review])
         let scored = compile(
             pack.path(),
             r#"
-t = call(name = "t", target = "triage", params = {"repo": "a"})
+t = call(name = "t", target = triage, params = {"repo": "a"})
 workflow(type = "autoresearch", tasks = [plan, t])
 "#,
         )
@@ -1299,22 +1432,20 @@ workflow(type = "autoresearch", tasks = [plan, t])
         dir
     }
 
-    const WATCH_CALLS: &str = r#"calls = {
-    "konflux": {
-        "kind": "tekton",
-        "cluster": "konflux",
-        "namespace": "tenant",
-        "repository": "acme-app",
-        "expected": [{"name": "server", "results": ["IMAGE_DIGEST"]}],
-    },
-    "release": {
-        "kind": "github_workflow",
-        "repo": "acme/app",
-        "workflow": ".github/workflows/release.yml",
-        "ref": "main",
-        "outputs": {"artifact": "result"},
-    },
-}
+    const WATCH_CALLS: &str = r#"load("@crucible//calls", "artifact_outputs", "github_workflow", "pipeline_run", "tekton")
+
+konflux = tekton(
+    cluster = "konflux",
+    namespace = "tenant",
+    repository = "acme-app",
+    expected = [pipeline_run("server", results = ["IMAGE_DIGEST"])],
+)
+release = github_workflow(
+    repo = "acme/app",
+    workflow = ".github/workflows/release.yml",
+    ref = "main",
+    outputs = artifact_outputs(artifact = "result"),
+)
 push = command(name = "push", run = "true", emits = {"commit": "string"})
 "#;
 
@@ -1368,15 +1499,14 @@ push = command(name = "push", run = "true", emits = {"commit": "string"})
         dir
     }
 
-    const GITLAB_CALLS: &str = r#"calls = {
-    "deploy": {
-        "kind": "gitlab_pipeline",
-        "host": "gitlab.example.com",
-        "project": "group/app",
-        "ref": "main",
-        "outputs": {"job": "report", "fields": {"version": "string"}},
-    },
-}
+    const GITLAB_CALLS: &str = r#"load("@crucible//calls", "gitlab_pipeline", "job_outputs")
+
+deploy = gitlab_pipeline(
+    host = "gitlab.example.com",
+    project = "group/app",
+    ref = "main",
+    outputs = job_outputs(job = "report", fields = {"version": "string"}),
+)
 "#;
 
     fn compile_gitlab(
@@ -1395,7 +1525,7 @@ push = command(name = "push", run = "true", emits = {"commit": "string"})
         let workflow = compile_gitlab(
             false,
             r#"
-d = call(name = "ship", target = "deploy", params = {"target": "staging", "tags": ["a", "b"]})
+d = call(name = "ship", target = deploy, params = {"target": "staging", "tags": ["a", "b"]})
 workflow(type = "playbook", tasks = [d], result = d)
 "#,
         )
@@ -1418,7 +1548,7 @@ workflow(type = "playbook", tasks = [d], result = d)
         let refused = compile_gitlab(
             true,
             r#"
-d = call(name = "ship", target = "deploy", params = {"target": "staging"})
+d = call(name = "ship", target = deploy, params = {"target": "staging"})
 workflow(type = "playbook", tasks = [d], result = d)
 "#,
         )
@@ -1433,7 +1563,7 @@ workflow(type = "playbook", tasks = [d], result = d)
     fn a_watch_binds_its_commit_and_is_bounded_by_its_timeout() {
         let workflow = compile_watch(
             r#"
-w = watch(name = "builds", target = "konflux", commit = push.commit, timeout = "2h", appear = "5m")
+w = watch(name = "builds", target = konflux, commit = push.commit, timeout = "2h", appear = "5m")
 workflow(type = "playbook", tasks = [push, w], result = w)
 "#,
         )
@@ -1460,7 +1590,7 @@ workflow(type = "playbook", tasks = [push, w], result = w)
     fn a_watch_and_a_call_each_refuse_the_others_target() {
         let call = compile_watch(
             r#"
-c = call(name = "builds", target = "konflux", params = {"commit": push.commit})
+c = call(name = "builds", target = konflux, params = {"commit": push.commit})
 workflow(type = "playbook", tasks = [push, c], result = c)
 "#,
         )
@@ -1468,7 +1598,7 @@ workflow(type = "playbook", tasks = [push, c], result = c)
         assert!(call.contains("use watch()"), "{call}");
         let watch = compile_watch(
             r#"
-w = watch(name = "rel", target = "release", commit = push.commit, timeout = "1h")
+w = watch(name = "rel", target = release, commit = push.commit, timeout = "1h")
 workflow(type = "playbook", tasks = [push, w], result = w)
 "#,
         )
@@ -1476,7 +1606,7 @@ workflow(type = "playbook", tasks = [push, w], result = w)
         assert!(watch.contains("use call()"), "{watch}");
         let untimed = compile_watch(
             r#"
-w = watch(name = "builds", target = "konflux", commit = push.commit)
+w = watch(name = "builds", target = konflux, commit = push.commit)
 workflow(type = "playbook", tasks = [push, w], result = w)
 "#,
         )

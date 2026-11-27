@@ -203,6 +203,12 @@ impl Idents {
     }
 
     fn undefined(&self, name: &str) -> CompileError {
+        if let Some(export) = crate::plan::starlark::targets::known(name) {
+            return CompileError::NotLoaded {
+                name: export.to_owned(),
+                module: crate::plan::starlark::targets::MODULE,
+            };
+        }
         if self.callees.contains(name) {
             let lane = dsl_functions(self.lane);
             let reachable = lane

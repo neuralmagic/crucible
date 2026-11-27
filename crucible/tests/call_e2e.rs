@@ -38,7 +38,8 @@ file = "workflow.star"
 "#;
 
 const WORKFLOW: &str = r#"
-calls = {"release": {"kind": "playbook", "playbook": "release"}}
+load("@crucible//calls", "playbook")
+release = playbook("release")
 plan = command(
     name = "plan",
     run = "echo 'release notes' > notes.md && printf '{\"version\": \"1.2.3\", \"repos\": [\"a\", \"b\"]}\n'",
@@ -47,11 +48,11 @@ plan = command(
 )
 ship = call(
     name = "ship",
-    target = "release",
+    target = release,
     params = {"version": plan.version, "notes": plan.files["notes.md"], "mode": "fast"},
     budget = budget(wall_clock = "10m"),
 )
-fan = call(name = "fan", target = "release", params = {"version": item()}, over = each(plan.repos, max = 4))
+fan = call(name = "fan", target = release, params = {"version": item()}, over = each(plan.repos, max = 4))
 consume = command(
     name = "consume",
     run = "cp inputs/ship/report.md ../report.txt && printf '{}\n'",
@@ -513,14 +514,15 @@ fn a_dispatch_whose_answer_is_lost_is_resent_under_the_same_identity() {
 #[test]
 fn a_resumed_run_attaches_to_the_call_it_dispatched() {
     let workflow = r#"
-calls = {"release": {"kind": "playbook", "playbook": "release"}}
+load("@crucible//calls", "playbook")
+release = playbook("release")
 plan = command(
     name = "plan",
     run = "echo notes > notes.md && printf '{\"version\": \"2.0\"}\n'",
     emits = {"version": "string"},
     emits_files = ["notes.md"],
 )
-ship = call(name = "ship", target = "release", params = {"version": plan.version})
+ship = call(name = "ship", target = release, params = {"version": plan.version})
 workflow(type = "playbook", tasks = [plan, ship])
 "#;
     let dir = pack("resume", workflow);
@@ -559,9 +561,10 @@ workflow(type = "playbook", tasks = [plan, ship])
 #[test]
 fn a_call_settles_failing_when_refused_or_when_no_controller_launched_the_run() {
     let refused = r#"
-calls = {"release": {"kind": "playbook", "playbook": "release"}}
+load("@crucible//calls", "playbook")
+release = playbook("release")
 plan = command(name = "plan", run = "printf '{\"version\": \"1\"}\n'", emits = {"version": "string"})
-ship = call(name = "ship", target = "release", params = {"version": plan.version, "mode": "slow"})
+ship = call(name = "ship", target = release, params = {"version": plan.version, "mode": "slow"})
 workflow(type = "playbook", tasks = [plan, ship])
 "#;
     let dir = pack("refused", refused);
@@ -599,7 +602,7 @@ workflow(type = "playbook", tasks = [plan, ship])
 fn a_pack_whose_lock_does_not_match_its_calls_is_refused() {
     let dir = pack(
         "stale",
-        &WORKFLOW.replace("\"playbook\": \"release\"", "\"playbook\": \"other\""),
+        &WORKFLOW.replace("playbook(\"release\")", "playbook(\"other\")"),
     );
     let out = command(&dir, None, false).output().unwrap();
     assert!(!out.status.success());
@@ -614,12 +617,13 @@ fn a_pack_whose_lock_does_not_match_its_calls_is_refused() {
 #[test]
 fn a_call_binds_another_calls_result_field_and_file() {
     let workflow = r#"
-calls = {"release": {"kind": "playbook", "playbook": "release"}}
+load("@crucible//calls", "playbook")
+release = playbook("release")
 plan = command(name = "plan", run = "printf '{\"version\": \"1.2.3\"}\n'", emits = {"version": "string"})
-ship = call(name = "ship", target = "release", params = {"version": plan.version})
+ship = call(name = "ship", target = release, params = {"version": plan.version})
 again = call(
     name = "again",
-    target = "release",
+    target = release,
     params = {"version": ship.verdict, "notes": ship.files["report.md"]},
 )
 workflow(type = "playbook", tasks = [plan, ship, again])
@@ -653,8 +657,9 @@ workflow(type = "playbook", tasks = [plan, ship, again])
 #[test]
 fn a_file_param_off_the_engines_disk_is_fetched_from_the_controller() {
     let workflow = r#"params = {"notes": {"type": "file", "required": True, "max_bytes": 4096}}
-calls = {"release": {"kind": "playbook", "playbook": "release"}}
-ship = call(name = "ship", target = "release", params = {"version": "1", "notes": param("notes")})
+load("@crucible//calls", "playbook")
+release = playbook("release")
+ship = call(name = "ship", target = release, params = {"version": "1", "notes": param("notes")})
 workflow(type = "playbook", tasks = [ship])
 "#;
     let dir = pack("param-file", workflow);
@@ -726,9 +731,10 @@ workflow(type = "playbook", tasks = [ship])
 #[test]
 fn a_mapped_call_dispatches_its_instances_together() {
     let workflow = r#"
-calls = {"release": {"kind": "playbook", "playbook": "release"}}
+load("@crucible//calls", "playbook")
+release = playbook("release")
 plan = command(name = "plan", run = "printf '{\"repos\": [\"a\", \"b\", \"c\"]}\n'", emits = {"repos": "list"})
-fan = call(name = "fan", target = "release", params = {"version": item()}, over = each(plan.repos, max = 4))
+fan = call(name = "fan", target = release, params = {"version": item()}, over = each(plan.repos, max = 4))
 workflow(type = "playbook", tasks = [plan, fan])
 "#;
     let dir = pack("concurrent", workflow);

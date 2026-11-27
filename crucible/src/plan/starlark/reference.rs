@@ -5,6 +5,8 @@
 //! [`crate::plan::starlark::known_kwargs`], so a constructor cannot be added, renamed, or given a
 //! new argument without the reference following it.
 
+pub mod modules;
+
 use crate::plan::attempt::DeclaredStatus;
 use crate::plan::ir::KEPT_INPUT;
 use crate::plan::ir::{HISTORY_INPUT, ITEM_INPUT, OUTCOME_INPUT, PARAMS_INPUT, REVISION_INPUT};
@@ -43,7 +45,7 @@ pub struct Kwarg {
 }
 
 impl Kwarg {
-    fn new(name: &'static str, ty: &'static str, purpose: impl Into<String>) -> Self {
+    pub(crate) fn new(name: &'static str, ty: &'static str, purpose: impl Into<String>) -> Self {
         Kwarg {
             name,
             ty,
@@ -693,13 +695,9 @@ pub fn functions() -> Vec<Function> {
         Function {
             name: "call",
             lane: Lane::Routed,
-            purpose: "Engine-owned dispatch of a target the `calls` block declares, as a run of \
-                      its own, compiled against the pack's `calls.lock`. The block is a dictionary \
-                      literal from target name to `{\"kind\": \"playbook\", \"playbook\": ...}`, \
-                      `{\"kind\": \"github_workflow\", \"repo\", \"workflow\", \"ref\", \"outputs\"}` \
-                      or `{\"kind\": \"gitlab_pipeline\", \"host\", \"project\", \"ref\", \"outputs\"}`, \
-                      assigned before every statement but `params`, and read without evaluating \
-                      the source. The call waits for the target run and \
+            purpose: "Engine-owned dispatch of a target from `@crucible//calls`, as a run of its \
+                      own, compiled against the pack's `calls.lock`. The call waits for the target \
+                      run and \
                       settles as it ended; its output is the target's result and its files are \
                       the target's result files.",
             positional: None,
@@ -707,8 +705,8 @@ pub fn functions() -> Vec<Function> {
                 name_kwarg(),
                 Kwarg::new(
                     "target",
-                    "str",
-                    "The name of a target in the source's `calls` block.",
+                    "playbook(...) | github_workflow(...) | gitlab_pipeline(...)",
+                    "The target, written here or bound to a top-level name.",
                 ),
                 Kwarg::new(
                     "params",
@@ -756,9 +754,7 @@ pub fn functions() -> Vec<Function> {
             lane: Lane::Routed,
             purpose: "Engine-owned wait for the runs a commit started on a target's system, such \
                       as the Pipelines-as-Code PipelineRuns a push or pull request triggered. The \
-                      target is a `{\"kind\": \"tekton\", \"cluster\", \"namespace\", \
-                      \"repository\", \"event\", \"expected\"}` entry of the `calls` block. \
-                      The watch adds every run that appears within `appear`, passes once every \
+                      target is a `tekton(...)` from `@crucible//calls`. The watch adds every run that appears within `appear`, passes once every \
                       matched run passed, fails as soon as one fails, and never cancels a run. Its \
                       output has `runs` and, per expected run, the results it declares.",
             positional: None,
@@ -766,8 +762,8 @@ pub fn functions() -> Vec<Function> {
                 name_kwarg(),
                 Kwarg::new(
                     "target",
-                    "str",
-                    "The name of a `tekton` target in the source's `calls` block.",
+                    "tekton(...)",
+                    "The target, written here or bound to a top-level name.",
                 ),
                 Kwarg::new(
                     "commit",
@@ -1146,7 +1142,7 @@ fn dialect_sentence() -> String {
 }
 
 /// A pipe ends a table cell, including inside a code span, so a union type has to escape it.
-fn cell(text: &str) -> String {
+pub(crate) fn cell(text: &str) -> String {
     text.replace('|', "\\|")
 }
 
@@ -1213,6 +1209,8 @@ pub fn markdown() -> String {
             out.push('\n');
         }
     }
+
+    modules::markdown(&mut out);
 
     out.push_str(
         "## Reserved fields\n\nNames the engine reads and writes for itself. They are not \

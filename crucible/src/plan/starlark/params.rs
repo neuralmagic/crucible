@@ -307,24 +307,44 @@ pub const FIELDS: &[&str] = &[
 #[serde(transparent)]
 pub struct Params(Vec<ParamSpec>);
 
+fn statements(module: &AstModule) -> &[starlark_syntax::syntax::ast::AstStmt] {
+    let statement = module.statement();
+    match &statement.node {
+        Stmt::Statements(statements) => statements,
+        _ => std::slice::from_ref(statement),
+    }
+}
+
+fn header_position(module: &AstModule) -> Option<(usize, bool)> {
+    let statements = statements(module);
+    let position = statements.iter().position(|s| match &s.node {
+        Stmt::Assign(assign) => matches!(
+            &assign.lhs.node,
+            starlark_syntax::syntax::ast::AssignTarget::Identifier(name)
+                if name.node.ident == "params"
+        ),
+        _ => false,
+    })?;
+    let leading = statements[..position]
+        .iter()
+        .all(|s| matches!(s.node, Stmt::Load(_)));
+    Some((position, leading))
+}
+
 impl Params {
     /// Read the block without evaluating the source.
     ///
-    /// A source with no `params` declares none. A `params` that follows anything but `calls`, or
+    /// A source with no `params` declares none. A `params` that follows anything but `load()`, or
     /// not a literal, is refused rather than ignored: silently skipping it would let a pack
     /// believe it declared parameters that no launcher can see.
     pub(crate) fn read(module: &AstModule) -> Result<Self> {
-        let Some((position, leading)) =
-            crate::plan::starlark::targets::header_position(module, "params")
-        else {
+        let Some((position, leading)) = header_position(module) else {
             return Ok(Params::default());
         };
         if !leading {
             return Err(CompileError::ParamsNotFirst);
         }
-        let Stmt::Assign(assign) =
-            &crate::plan::starlark::targets::statements(module)[position].node
-        else {
+        let Stmt::Assign(assign) = &statements(module)[position].node else {
             return Ok(Params::default());
         };
         let Expr::Dict(entries) = &assign.rhs.node else {
