@@ -389,7 +389,7 @@ fn task(named: &mut BTreeMap<String, Value>, state: &CompileState, door: Door) -
             built.ctor
         ))
     });
-    let target = target.map_err(&refused)?;
+    let target = target.map_err(refused)?;
     let alias = targets::alias_of(&state.context_mut().declared_calls, &name.0, &target)
         .ok_or_else(|| {
             refused(
