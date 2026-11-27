@@ -20,6 +20,7 @@ use state::*;
 mod agent_auth;
 #[cfg(feature = "autoresearch")]
 mod autoresearch;
+mod conditional;
 
 pub(crate) mod dto;
 pub(crate) mod events;
@@ -832,6 +833,7 @@ pub fn router(state: ApiState) -> Router {
             state.clone(),
             crate::authz::bindings::enforce,
         ))
+        .layer(axum::middleware::from_fn(conditional::conditional_get))
         .layer(axum::middleware::from_fn(trace_requests))
         .layer(tower_http::compression::CompressionLayer::new())
         .with_state(state)

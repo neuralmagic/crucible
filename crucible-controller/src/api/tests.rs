@@ -6002,6 +6002,62 @@ async fn request_span_alone(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_list_poll_with_its_last_etag_reads_nothing_until_the_list_changes(
+    pool: PgPool,
+) -> Result<()> {
+    let (db, _d) = db_with(pool.clone());
+    let app = app_with_sessions(db, pool.clone()).await;
+    let bearer = bearer_of(&pool, "wren").await?;
+    let get = |etag: Option<&str>| {
+        let mut req =
+            HttpRequest::get("/api/playbook-drafts").header(header::AUTHORIZATION, &bearer);
+        if let Some(etag) = etag {
+            req = req.header(header::IF_NONE_MATCH, etag);
+        }
+        req.body(Body::empty())
+    };
+
+    let first = app.clone().oneshot(get(None)?).await?;
+    assert_eq!(first.status(), StatusCode::OK);
+    let tag = first.headers()[header::ETAG].to_str()?.to_string();
+    assert_eq!(first.headers()[header::CACHE_CONTROL], "private, no-cache");
+
+    let again = app.clone().oneshot(get(Some(&tag))?).await?;
+    assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(again.headers()[header::ETAG].to_str()?, tag);
+    assert!(
+        axum::body::to_bytes(again.into_body(), usize::MAX)
+            .await?
+            .is_empty()
+    );
+
+    let created = app
+        .clone()
+        .oneshot(
+            HttpRequest::post("/api/playbook-drafts")
+                .header(header::AUTHORIZATION, &bearer)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"id":"fresh","description":"a new draft"}"#))?,
+        )
+        .await?;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    assert!(created.headers().get(header::ETAG).is_none());
+
+    let changed = app.clone().oneshot(get(Some(&tag))?).await?;
+    assert_eq!(changed.status(), StatusCode::OK);
+    let next = changed.headers()[header::ETAG].to_str()?.to_string();
+    assert_ne!(next, tag);
+    let body = axum::body::to_bytes(changed.into_body(), usize::MAX).await?;
+    let drafts: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(drafts[0]["id"], "fresh");
+
+    let stale = app.oneshot(get(Some("W/\"stale\""))?).await?;
+    assert_eq!(stale.status(), StatusCode::OK);
+    assert_eq!(stale.headers()[header::ETAG].to_str()?, next);
+    Ok(())
+}
+
 /// Editor prefs are not session state: a second browser, with no cookie of its own, reads back
 /// what the first one wrote, and one user's document is invisible to another.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
