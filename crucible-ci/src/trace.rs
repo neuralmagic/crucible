@@ -5,11 +5,13 @@ use tracing::Span;
 pub(crate) fn request(system: &'static str, doing: &str, request: &reqwest::Request) -> Span {
     tracing::info_span!(
         "ci.request",
-        "otel.name" = doing,
+        "otel.name" = format!("{system} {}", request.method()),
+        "ci.doing" = doing,
         "otel.kind" = "client",
         "ci.system" = system,
         "http.request.method" = %request.method(),
         "url.path" = request.url().path(),
+        "url.query" = request.url().query().unwrap_or_default(),
         "http.response.status_code" = tracing::field::Empty,
         "ci.ratelimit.remaining" = tracing::field::Empty,
         "ci.ratelimit.limit" = tracing::field::Empty,

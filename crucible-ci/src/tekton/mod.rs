@@ -145,7 +145,7 @@ impl Cluster {
         selector: &str,
     ) -> Result<Vec<PipelineRun>, TektonError> {
         let doing = format!("listing PipelineRuns ({selector}) in {}", ns.as_str());
-        let params = ListParams::default().labels(selector);
+        let params = ListParams::default().labels(selector).match_any();
         let req = kube_core::Request::new(path(PIPELINE_RUNS, ns))
             .list(&params)
             .map_err(|source| TektonError::Request {
@@ -183,7 +183,9 @@ impl Cluster {
         run: &str,
     ) -> Result<Vec<TaskRun>, TektonError> {
         let doing = format!("listing the TaskRuns of {run} in {}", ns.as_str());
-        let params = ListParams::default().labels(&format!("{TASK_RUN_OWNER_LABEL}={run}"));
+        let params = ListParams::default()
+            .labels(&format!("{TASK_RUN_OWNER_LABEL}={run}"))
+            .match_any();
         let req = kube_core::Request::new(path(TASK_RUNS, ns))
             .list(&params)
             .map_err(|source| TektonError::Request {

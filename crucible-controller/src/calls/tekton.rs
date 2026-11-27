@@ -520,6 +520,10 @@ fn watch_of(call: &CallRecord) -> Result<(String, CommitId, WatchDetail), CallEr
 
 #[async_trait::async_trait]
 impl TargetBackend for TektonBackend {
+    fn cadence(&self, call: &CallRecord, now: jiff::Timestamp) -> std::time::Duration {
+        call.aging_cadence(now)
+    }
+
     async fn interface(&self, _ctx: &CallCtx, t: &CallTarget) -> Result<Resolved, CallError> {
         let t = target(t)?;
         if !self.clusters.contains_key(t.cluster) {
