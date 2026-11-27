@@ -44,6 +44,7 @@ pub struct Engine {
     ids: HashMap<PolicyId, String>,
     digest: String,
     authorizer: Authorizer,
+    blind: bool,
 }
 
 impl std::fmt::Debug for Engine {
@@ -133,12 +134,16 @@ impl Engine {
                 detail: error.to_string(),
             });
         }
+        let blind = policies
+            .policies()
+            .all(|policy| policy.to_json().is_ok_and(|est| !reads_identity(&est)));
         let engine = Engine {
             schema,
             policies,
             ids,
             digest: digest(text),
             authorizer: Authorizer::new(),
+            blind,
         };
         engine.probe()?;
         Ok(engine)
@@ -212,6 +217,103 @@ impl Engine {
         }
     }
 
+    pub fn authorize_all(
+        &self,
+        subject: &Subject,
+        resources: &[Resource],
+        verbs: &[Verb],
+        now: i64,
+    ) -> Vec<Vec<Decision>> {
+        enum Plan {
+            Stored(EntityUid),
+            Like(usize),
+            Alone,
+            Refused(String),
+        }
+        let refused = |detail: &str| {
+            verbs
+                .iter()
+                .map(|_| Decision::denied(format!("invalid-request: {detail}")))
+                .collect::<Vec<_>>()
+        };
+        let (principal_uid, principal) = match self.principal(subject) {
+            Ok(built) => built,
+            Err(detail) => return resources.iter().map(|_| refused(&detail)).collect(),
+        };
+        let mut uids = std::collections::HashSet::new();
+        let mut shapes = HashMap::new();
+        let mut stored = vec![principal];
+        let plans: Vec<Plan> = resources
+            .iter()
+            .enumerate()
+            .map(|(at, resource)| {
+                if self.blind {
+                    let shape = (
+                        resource.rtype,
+                        &resource.owner,
+                        resource.share,
+                        &resource.run,
+                        resource.public,
+                        &resource.origin_owner,
+                    );
+                    if let Some(first) = shapes.get(&shape) {
+                        return Plan::Like(*first);
+                    }
+                    shapes.insert(shape, at);
+                }
+                match self.resource(subject, resource) {
+                    Ok((uid, entity)) if uids.insert(uid.clone()) => {
+                        stored.push(entity);
+                        Plan::Stored(uid)
+                    }
+                    Ok(_) => Plan::Alone,
+                    Err(detail) => Plan::Refused(detail),
+                }
+            })
+            .collect();
+        let entities = Entities::from_entities(stored, Some(&self.schema));
+        let mut decided: Vec<Vec<Decision>> = Vec::with_capacity(resources.len());
+        for (resource, plan) in resources.iter().zip(plans) {
+            let decisions = match (plan, &entities) {
+                (Plan::Like(first), _) => decided[first].clone(),
+                (Plan::Refused(detail), _) => refused(&detail),
+                (Plan::Stored(uid), Ok(entities)) => verbs
+                    .iter()
+                    .map(|verb| {
+                        let action = Action {
+                            resource: resource.rtype,
+                            verb: *verb,
+                        };
+                        self.decide(&principal_uid, action, &uid, entities, now)
+                            .unwrap_or_else(|detail| {
+                                Decision::denied(format!("invalid-request: {detail}"))
+                            })
+                    })
+                    .collect(),
+                (Plan::Stored(_) | Plan::Alone, _) => verbs
+                    .iter()
+                    .map(|verb| self.authorize_one(subject, resource, *verb, now))
+                    .collect(),
+            };
+            decided.push(decisions);
+        }
+        decided
+    }
+
+    fn authorize_one(
+        &self,
+        subject: &Subject,
+        resource: &Resource,
+        verb: Verb,
+        now: i64,
+    ) -> Decision {
+        let action = Action {
+            resource: resource.rtype,
+            verb,
+        };
+        self.authorize(subject, action, resource, now)
+    }
+
     fn evaluate(
         &self,
         subject: &Subject,
@@ -219,6 +321,14 @@ impl Engine {
         resource: &Resource,
         now: i64,
     ) -> Result<Decision, String> {
+        let (principal_uid, principal) = self.principal(subject)?;
+        let (resource_uid, resource_entity) = self.resource(subject, resource)?;
+        let entities = Entities::from_entities([principal, resource_entity], Some(&self.schema))
+            .map_err(|e| e.to_string())?;
+        self.decide(&principal_uid, action, &resource_uid, &entities, now)
+    }
+
+    fn principal(&self, subject: &Subject) -> Result<(EntityUid, Entity), String> {
         let principal_uid: EntityUid = format!(
             "{}::{}",
             subject.entity_type(),
@@ -249,7 +359,14 @@ impl Engine {
                 .map(|(k, v)| (k.clone(), RestrictedExpression::new_string(v.clone()))),
         )
         .map_err(|e| e.to_string())?;
+        Ok((principal_uid, principal))
+    }
 
+    fn resource(
+        &self,
+        subject: &Subject,
+        resource: &Resource,
+    ) -> Result<(EntityUid, Entity), String> {
         let resource_uid: EntityUid = format!(
             "{}::{}",
             resource.rtype.entity_type(),
@@ -301,7 +418,17 @@ impl Engine {
         let resource_entity =
             Entity::new(resource_uid.clone(), attrs.into_iter().collect(), [].into())
                 .map_err(|e| e.to_string())?;
+        Ok((resource_uid, resource_entity))
+    }
 
+    fn decide(
+        &self,
+        principal_uid: &EntityUid,
+        action: Action,
+        resource_uid: &EntityUid,
+        entities: &Entities,
+        now: i64,
+    ) -> Result<Decision, String> {
         let action_uid: EntityUid = format!("Action::{}", cedar_string(&action.to_string()))
             .parse()
             .map_err(|e: cedar_policy::ParseErrors| e.to_string())?;
@@ -309,18 +436,16 @@ impl Engine {
             Context::from_pairs([("now".to_string(), RestrictedExpression::new_long(now))])
                 .map_err(|e| e.to_string())?;
         let request = Request::new(
-            principal_uid,
+            principal_uid.clone(),
             action_uid,
-            resource_uid,
+            resource_uid.clone(),
             context,
             Some(&self.schema),
         )
         .map_err(|e| e.to_string())?;
-        let entities = Entities::from_entities([principal, resource_entity], Some(&self.schema))
-            .map_err(|e| e.to_string())?;
         let response = self
             .authorizer
-            .is_authorized(&request, &self.policies, &entities);
+            .is_authorized(&request, &self.policies, entities);
         let mut rules: Vec<String> = response
             .diagnostics()
             .reason()
@@ -331,6 +456,49 @@ impl Engine {
             allowed: response.decision() == cedar_policy::Decision::Allow,
             rules,
         })
+    }
+}
+
+fn reads_identity(policy: &serde_json::Value) -> bool {
+    let scoped = policy.get("resource").is_none_or(|scope| {
+        match scope.get("op").and_then(serde_json::Value::as_str) {
+            Some("All") => false,
+            Some("is") => scope.get("in").is_some(),
+            _ => true,
+        }
+    });
+    scoped
+        || policy
+            .get("conditions")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|conditions| {
+                conditions
+                    .iter()
+                    .any(|condition| condition.get("body").is_none_or(reads_resource))
+            })
+}
+
+fn reads_resource(expr: &serde_json::Value) -> bool {
+    match expr {
+        serde_json::Value::Object(map) => {
+            if map.get("Var").and_then(serde_json::Value::as_str) == Some("resource") {
+                return true;
+            }
+            for op in [".", "has"] {
+                if let Some(access) = map.get(op)
+                    && access
+                        .get("left")
+                        .and_then(|left| left.get("Var"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("resource")
+                {
+                    return access.get("attr").and_then(serde_json::Value::as_str) == Some("id");
+                }
+            }
+            map.values().any(reads_resource)
+        }
+        serde_json::Value::Array(items) => items.iter().any(reads_resource),
+        _ => false,
     }
 }
 
@@ -404,6 +572,76 @@ mod tests {
         assert!(ids.contains(&"everyone-read-public-blueprints".to_string()));
         assert!(ids.contains(&"team-member-bind-carried".to_string()));
         assert_eq!(ids.len(), 29);
+    }
+
+    #[test]
+    fn a_set_is_blind_until_a_policy_reads_the_resource_identity() {
+        assert!(Engine::load(DEFAULT_POLICY).expect("default").blind);
+        for extra in [
+            r#"permit(principal, action, resource) when { resource.id == "special" };"#,
+            r#"permit(principal, action, resource) when { resource has id && resource.id like "x*" };"#,
+            r#"permit(principal, action, resource == PlaybookDraft::"special");"#,
+            r#"permit(principal, action, resource is PlaybookDraft in PlaybookDraft::"special");"#,
+            r#"permit(principal, action, resource) when { resource == PlaybookDraft::"special" };"#,
+            r#"permit(principal, action, resource) unless { resource != PlaybookDraft::"special" };"#,
+        ] {
+            let text = format!("{DEFAULT_POLICY}\n@id(\"extra\")\n{extra}");
+            let engine = Engine::load(&text).unwrap_or_else(|e| panic!("{extra}: {e}"));
+            assert!(!engine.blind, "{extra} reads the resource identity");
+        }
+        let text = format!(
+            "{DEFAULT_POLICY}\n@id(\"extra\")\npermit(principal, action, resource is PlaybookDraft) when {{ resource.owner == \"user:wren\" }};"
+        );
+        assert!(Engine::load(&text).expect("extra").blind);
+    }
+
+    #[test]
+    fn deciding_a_list_at_once_matches_deciding_each_row() {
+        let infra = slug("infra");
+        let mut tags = BTreeMap::new();
+        tags.insert(
+            format!("team:{infra}"),
+            TeamRole::Member.as_str().to_string(),
+        );
+        let wren = Subject::user("wren", false, true, tags);
+        let draft =
+            |id: &str, owner: Principal| Resource::new(ResourceType::PlaybookDraft, id, owner);
+        let mut shared = draft("shared", Principal::User("kai".into()));
+        shared.share = Some(ShareRole::Launcher);
+        let rows = vec![
+            draft("mine", Principal::User("wren".into())),
+            draft("mine-too", Principal::User("wren".into())),
+            draft("special", Principal::User("kai".into())),
+            draft("theirs", Principal::User("kai".into())),
+            shared,
+            draft("team", Principal::Team(infra.clone())),
+            draft("team-too", Principal::Team(infra)),
+            draft("mine", Principal::User("wren".into())),
+            draft("quo\"te", Principal::User("kai".into())),
+        ];
+        let verbs = ResourceType::PlaybookDraft.verbs();
+        let special = format!(
+            "{DEFAULT_POLICY}\n@id(\"special\")\npermit(principal, action, resource) when {{ resource.id == \"special\" }};"
+        );
+        for text in [DEFAULT_POLICY, special.as_str()] {
+            let engine = Engine::load(text).expect("set");
+            let all = engine.authorize_all(&wren, &rows, &verbs, 7);
+            for (row, decisions) in rows.iter().zip(&all) {
+                for (verb, decision) in verbs.iter().zip(decisions) {
+                    let alone = engine.authorize(&wren, act(row.rtype, *verb), row, 7);
+                    assert_eq!(
+                        decision, &alone,
+                        "{} {verb:?} blind={}",
+                        row.id, engine.blind
+                    );
+                }
+            }
+            let special_read = all[2][0].allowed;
+            assert_eq!(
+                special_read, !engine.blind,
+                "only the second set lets wren read special"
+            );
+        }
     }
 
     #[test]

@@ -120,6 +120,7 @@ impl Subject {
     Eq,
     PartialOrd,
     Ord,
+    Hash,
     serde::Serialize,
     serde::Deserialize,
     utoipa::ToSchema,
