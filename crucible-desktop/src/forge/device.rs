@@ -22,8 +22,6 @@ pub struct DeviceCode {
     device_code: String,
     pub user_code: String,
     pub verification_uri: String,
-    #[serde(default)]
-    verification_uri_complete: Option<String>,
     expires_in: u64,
     #[serde(default = "default_interval")]
     interval: u64,
@@ -35,9 +33,7 @@ fn default_interval() -> u64 {
 
 impl DeviceCode {
     pub fn page(&self) -> &str {
-        self.verification_uri_complete
-            .as_deref()
-            .unwrap_or(&self.verification_uri)
+        &self.verification_uri
     }
 
     fn checked(mut self, account: &Account) -> Result<DeviceCode, String> {
@@ -49,9 +45,6 @@ impl DeviceCode {
                 self.verification_uri
             ));
         }
-        self.verification_uri_complete = self
-            .verification_uri_complete
-            .filter(|page| page.starts_with(&home));
         self.expires_in = self.expires_in.min(MAX_EXPIRES_IN);
         self.interval = self.interval.clamp(1, MAX_INTERVAL);
         Ok(self)
@@ -500,32 +493,23 @@ mod tests {
             "expires_in": 300,
         }))
         .unwrap();
-        assert_eq!(
-            gitlab.page(),
-            "https://gitlab.example.com/oauth/device?user_code=0A44L90H"
-        );
+        assert_eq!(gitlab.page(), "https://gitlab.example.com/oauth/device");
         assert_eq!(gitlab.interval, 5);
     }
 
     #[test]
     fn a_code_opens_only_the_forges_own_page_and_waits_a_bounded_time() {
-        let code = |page: &str, complete: Option<&str>, expires: u64, interval: u64| DeviceCode {
+        let code = |page: &str, expires: u64, interval: u64| DeviceCode {
             device_code: "d".into(),
             user_code: "U".into(),
             verification_uri: page.into(),
-            verification_uri_complete: complete.map(str::to_owned),
             expires_in: expires,
             interval,
         };
         let gl = Account::Gitlab("gitlab.example.com".into());
-        let ok = code(
-            "https://gitlab.example.com/oauth/device",
-            Some("https://evil.example.com/phish"),
-            u64::MAX,
-            0,
-        )
-        .checked(&gl)
-        .unwrap();
+        let ok = code("https://gitlab.example.com/oauth/device", u64::MAX, 0)
+            .checked(&gl)
+            .unwrap();
         assert_eq!(ok.page(), "https://gitlab.example.com/oauth/device");
         assert_eq!(ok.expires_in, MAX_EXPIRES_IN);
         assert_eq!(ok.interval, 1);
@@ -535,9 +519,9 @@ mod tests {
             "file:///etc/passwd",
             "https://github.com/login/device",
         ] {
-            assert!(code(bad, None, 60, 5).checked(&gl).is_err(), "{bad}");
+            assert!(code(bad, 60, 5).checked(&gl).is_err(), "{bad}");
         }
-        let gh = code("https://github.com/login/device", None, 900, 600)
+        let gh = code("https://github.com/login/device", 900, 600)
             .checked(&Account::Github)
             .unwrap();
         assert_eq!(gh.interval, MAX_INTERVAL);

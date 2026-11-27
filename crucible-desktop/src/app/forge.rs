@@ -139,7 +139,6 @@ impl App {
                     Ok(code) => code,
                     Err(why) => return send(&tx, &waker, Event::SignedIn(Err(why))),
                 };
-                let _ = crate::editor::open_url(code.page());
                 send(&tx, &waker, Event::Code(code.clone()));
                 let tokens = device::finish(&runtime, &account, &client_id, &code, &stop)
                     .and_then(|tokens| keys.save_forge_tokens(&account, &tokens).map(|()| tokens));
@@ -290,6 +289,7 @@ impl App {
                 session.code = None;
                 session.cancel = None;
                 session.login = Some(tokens.login);
+                crate::notify::bring_to_front();
             }
             Event::SignedIn(Err(why)) => {
                 self.forge_cancel(account.clone());
