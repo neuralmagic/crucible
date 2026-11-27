@@ -20,6 +20,7 @@ use state::*;
 mod agent_auth;
 #[cfg(feature = "autoresearch")]
 mod autoresearch;
+mod conditional;
 
 pub(crate) mod dto;
 pub(crate) mod events;
@@ -832,15 +833,17 @@ pub fn router(state: ApiState) -> Router {
             state.clone(),
             crate::authz::bindings::enforce,
         ))
+        .layer(axum::middleware::from_fn(conditional::conditional_get))
         .layer(axum::middleware::from_fn(trace_requests))
         .layer(tower_http::compression::CompressionLayer::new())
         .with_state(state)
 }
 
 /// One server span per API request, named `<METHOD> <route template>` so Datadog groups by route,
-/// not by concrete path. `/healthz` is exempt — probe traffic would drown everything else. For a
-/// streaming response (SSE, artifact proxy) the span closes at the response head, which is the
-/// handler's work; the stream itself is not the handler.
+/// not by concrete path, carrying who asked: the caller's `User-Agent`, their login and the
+/// credential that proved it. `/healthz` is exempt — probe traffic would drown everything else.
+/// For a streaming response (SSE, artifact proxy) the span closes at the response head, which is
+/// the handler's work; the stream itself is not the handler.
 pub(crate) async fn trace_requests(
     req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -853,12 +856,29 @@ pub(crate) async fn trace_requests(
     if route == "/healthz" {
         return next.run(req).await;
     }
+    let user_agent = req
+        .headers()
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    let caller = req
+        .extensions()
+        .get::<crate::identity::session::Resolved>()
+        .and_then(|r| r.user.as_deref())
+        .unwrap_or_default();
+    let auth_path = req
+        .extensions()
+        .get::<crate::identity::auth::AuthPath>()
+        .map_or("", |p| p.as_str());
     let span = tracing::info_span!(
         "http.request",
         otel.name = format!("{} {}", req.method(), route),
         otel.kind = "server",
         http.method = %req.method(),
         http.route = %route,
+        user_agent.original = user_agent,
+        enduser.id = caller,
+        crucible.auth_path = auth_path,
         http.status_code = tracing::field::Empty,
         otel.status_code = tracing::field::Empty,
     );

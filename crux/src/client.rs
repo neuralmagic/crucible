@@ -52,6 +52,15 @@ pub trait Transport: Send + Sync {
         bail!("{path} takes raw bytes, and this transport cannot send them")
     }
 
+    async fn get_since(&self, path: &str, _etag: Option<&str>) -> Result<Fetched> {
+        let (status, body) = self.get_bytes(path).await?;
+        Ok(Fetched::Body {
+            status,
+            body,
+            etag: None,
+        })
+    }
+
     /// GET a server-sent event stream, handing each event to `on_event` as it arrives, until the
     /// server closes it. A non-2xx comes back as its status and body, with no events.
     async fn events(
@@ -79,6 +88,17 @@ pub trait Transport: Send + Sync {
     fn credential(&self) -> Credential {
         Credential::EdgeApiKey
     }
+}
+
+/// A conditional GET's answer: unchanged since the `ETag` sent, or a body and the tag it carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fetched {
+    Unchanged,
+    Body {
+        status: reqwest::StatusCode,
+        body: Vec<u8>,
+        etag: Option<String>,
+    },
 }
 
 /// Which endpoint a [`Client`] is talking to.
@@ -212,7 +232,9 @@ impl HttpTransport {
     /// resolver overrides before handing it to [`HttpTransport::with_client`].
     #[cfg(not(target_arch = "wasm32"))]
     pub fn builder() -> reqwest::ClientBuilder {
-        reqwest::Client::builder().timeout(Duration::from_secs(120))
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .user_agent(concat!("crux/", env!("CARGO_PKG_VERSION")))
     }
 
     /// The browser's fetch has no client-wide timeout.
@@ -321,6 +343,39 @@ impl Transport for HttpTransport {
             act_as.note_refusal(&text);
         }
         Ok((status, text))
+    }
+
+    async fn get_since(&self, path: &str, etag: Option<&str>) -> Result<Fetched> {
+        let mut req = self.req(reqwest::Method::GET, path);
+        if let Some(etag) = etag {
+            req = req.header(reqwest::header::IF_NONE_MATCH, etag);
+        }
+        let resp = req
+            .send()
+            .await
+            .with_context(|| format!("requesting {path}"))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_MODIFIED {
+            return Ok(Fetched::Unchanged);
+        }
+        let refused = self.refused_by(&resp);
+        let etag = resp
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let body = resp
+            .bytes()
+            .await
+            .with_context(|| format!("reading the body of {path}"))?;
+        if let Some(act_as) = refused {
+            act_as.note_refusal(&String::from_utf8_lossy(&body));
+        }
+        Ok(Fetched::Body {
+            status,
+            body: body.to_vec(),
+            etag,
+        })
     }
 
     async fn get_bytes(&self, path: &str) -> Result<(reqwest::StatusCode, Vec<u8>)> {

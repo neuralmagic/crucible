@@ -23,6 +23,11 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 /// output is one redraw rather than dozens.
 const STREAM_BATCH: Duration = Duration::from_millis(40);
 
+const LIST_BUSY: Duration = Duration::from_secs(2);
+const LIST_BUSY_AWAY: Duration = Duration::from_secs(10);
+const LIST_IDLE: Duration = Duration::from_secs(10);
+const LIST_IDLE_AWAY: Duration = Duration::from_secs(60);
+
 /// What one pass of the poll loop read.
 struct Polled {
     view: Arc<LiveView>,
@@ -246,6 +251,10 @@ impl Client {
         let _ = self.tx.send(Msg::Reconnect);
     }
 
+    pub fn focus(&self, focused: bool) {
+        let _ = self.tx.send(Msg::Focus(focused));
+    }
+
     /// Which live playbook's graph to keep current; `None` stops fetching graphs.
     pub fn select(&self, playbook: Option<&str>) {
         let _ = self.tx.send(Msg::Select(playbook.map(ToString::to_string)));
@@ -328,6 +337,7 @@ async fn run_client(
     let mut next_list = Instant::now();
     let mut next_detail = Instant::now();
     let mut next_stream: Option<Instant> = None;
+    let mut focused = true;
     loop {
         let mut force = false;
         let due = next_stream.map_or(next_list.min(next_detail), |at| {
@@ -344,7 +354,17 @@ async fn run_client(
             Ok(Some(Msg::Streamed)) => {
                 next_stream.get_or_insert_with(|| Instant::now() + STREAM_BATCH);
             }
-            Ok(Some(Msg::Refresh)) => next_list = Instant::now(),
+            Ok(Some(Msg::Refresh)) => {
+                fetcher.catalog_at = None;
+                next_list = Instant::now();
+            }
+            Ok(Some(Msg::Focus(now))) => {
+                if now && !focused {
+                    fetcher.catalog_at = None;
+                    next_list = Instant::now();
+                }
+                focused = now;
+            }
             Ok(Some(Msg::Compare(base))) => {
                 compare = base;
                 force = fetcher.refresh_base(compare.as_deref()).await;
@@ -377,14 +397,18 @@ async fn run_client(
                 Ok(list_changed) => changed |= list_changed,
                 Err(error) => changed |= fetcher.unavailable(error),
             }
-            changed |= fetcher.refresh_catalog().await;
+            if focused {
+                changed |= fetcher.refresh_catalog().await;
+            }
             changed |= fetcher.refresh_base(compare.as_deref()).await;
             changed |= fetcher.refresh_draft(draft.as_ref()).await;
+            let busy = fetcher.any_running() || !matches!(fetcher.view, LiveView::Ready { .. });
             next_list = now
-                + if fetcher.any_running() || !matches!(fetcher.view, LiveView::Ready { .. }) {
-                    Duration::from_secs(2)
-                } else {
-                    Duration::from_secs(8)
+                + match (busy, focused) {
+                    (true, true) => LIST_BUSY,
+                    (true, false) => LIST_BUSY_AWAY,
+                    (false, true) => LIST_IDLE,
+                    (false, false) => LIST_IDLE_AWAY,
                 };
             next_detail = now;
         }

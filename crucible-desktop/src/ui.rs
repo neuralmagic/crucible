@@ -245,6 +245,7 @@ pub fn view(app: &App, cx: &mut Cx<App>) -> El {
     let mut layer = Vec::new();
     let window = row()
         .key("window")
+        .on_window_focus(|app: &mut App, focused, _| app.window_focused = focused)
         .w_full()
         .h_full()
         .fill(p.c.bg_base)

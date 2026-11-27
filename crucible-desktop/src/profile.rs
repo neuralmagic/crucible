@@ -151,6 +151,15 @@ impl Profile {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub fn user_agent() -> String {
+    format!(
+        "crucible-playbooks/{} (pid {})",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id()
+    )
+}
+
 pub fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 32
@@ -302,7 +311,7 @@ impl Target {
     /// `resolve` are looked up here, so this blocks on DNS.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn http(&self) -> Result<reqwest::ClientBuilder, String> {
-        let mut builder = crux::client::HttpTransport::builder();
+        let mut builder = crux::client::HttpTransport::builder().user_agent(user_agent());
         if let Some(proxy) = &self.profile.proxy {
             let proxy = reqwest::Proxy::all(proxy.as_str())
                 .map_err(|e| format!("profile {}: proxy: {e}", self.name))?;

@@ -5919,6 +5919,145 @@ async fn prefs_roundtrip_across_requests(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+/// The fields of every `http.request` span opened while it is the thread's subscriber.
+#[derive(Clone, Default)]
+struct RequestSpans(Arc<std::sync::Mutex<Vec<std::collections::BTreeMap<String, String>>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RequestSpans {
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        _id: &tracing::span::Id,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct Fields<'a>(&'a mut std::collections::BTreeMap<String, String>);
+        impl tracing::field::Visit for Fields<'_> {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0.insert(field.name().to_string(), value.to_string());
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0
+                    .insert(field.name().to_string(), format!("{value:?}"));
+            }
+        }
+        if attrs.metadata().name() != "http.request" {
+            return;
+        }
+        let mut fields = std::collections::BTreeMap::new();
+        attrs.record(&mut Fields(&mut fields));
+        self.0.lock().expect("spans").push(fields);
+    }
+}
+
+#[test]
+fn request_span_names_the_client_and_the_caller() {
+    let done = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "api::tests::request_span_alone",
+            "--include-ignored",
+            "--test-threads=1",
+        ])
+        .output()
+        .expect("running the test alone");
+    assert!(
+        done.status.success() && String::from_utf8_lossy(&done.stdout).contains("1 passed"),
+        "{}{}",
+        String::from_utf8_lossy(&done.stdout),
+        String::from_utf8_lossy(&done.stderr)
+    );
+}
+
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+#[ignore = "run in a process of its own by request_span_names_the_client_and_the_caller"]
+async fn request_span_alone(pool: PgPool) -> Result<()> {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let (db, _d) = db_with(pool.clone());
+    let app = app_with_sessions(db, pool.clone()).await;
+    let spans = RequestSpans::default();
+    let _guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(spans.clone()));
+
+    let res = app
+        .oneshot(
+            HttpRequest::get("/api/prefs")
+                .header(header::AUTHORIZATION, bearer_of(&pool, "wren").await?)
+                .header(header::USER_AGENT, "crucible-playbooks/9.9.9 (pid 42)")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let spans = spans.0.lock().expect("spans").clone();
+    let [span] = spans.as_slice() else {
+        panic!("one request span, got {spans:?}");
+    };
+    assert_eq!(span["http.route"], "/api/prefs");
+    assert_eq!(
+        span["user_agent.original"],
+        "crucible-playbooks/9.9.9 (pid 42)"
+    );
+    assert_eq!(span["enduser.id"], "wren");
+    assert_eq!(span["crucible.auth_path"], "api_key");
+    Ok(())
+}
+
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_list_poll_with_its_last_etag_reads_nothing_until_the_list_changes(
+    pool: PgPool,
+) -> Result<()> {
+    let (db, _d) = db_with(pool.clone());
+    let app = app_with_sessions(db, pool.clone()).await;
+    let bearer = bearer_of(&pool, "wren").await?;
+    let get = |etag: Option<&str>| {
+        let mut req =
+            HttpRequest::get("/api/playbook-drafts").header(header::AUTHORIZATION, &bearer);
+        if let Some(etag) = etag {
+            req = req.header(header::IF_NONE_MATCH, etag);
+        }
+        req.body(Body::empty())
+    };
+
+    let first = app.clone().oneshot(get(None)?).await?;
+    assert_eq!(first.status(), StatusCode::OK);
+    let tag = first.headers()[header::ETAG].to_str()?.to_string();
+    assert_eq!(first.headers()[header::CACHE_CONTROL], "private, no-cache");
+
+    let again = app.clone().oneshot(get(Some(&tag))?).await?;
+    assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(again.headers()[header::ETAG].to_str()?, tag);
+    assert!(
+        axum::body::to_bytes(again.into_body(), usize::MAX)
+            .await?
+            .is_empty()
+    );
+
+    let created = app
+        .clone()
+        .oneshot(
+            HttpRequest::post("/api/playbook-drafts")
+                .header(header::AUTHORIZATION, &bearer)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"id":"fresh","description":"a new draft"}"#))?,
+        )
+        .await?;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    assert!(created.headers().get(header::ETAG).is_none());
+
+    let changed = app.clone().oneshot(get(Some(&tag))?).await?;
+    assert_eq!(changed.status(), StatusCode::OK);
+    let next = changed.headers()[header::ETAG].to_str()?.to_string();
+    assert_ne!(next, tag);
+    let body = axum::body::to_bytes(changed.into_body(), usize::MAX).await?;
+    let drafts: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(drafts[0]["id"], "fresh");
+
+    let stale = app.oneshot(get(Some("W/\"stale\""))?).await?;
+    assert_eq!(stale.status(), StatusCode::OK);
+    assert_eq!(stale.headers()[header::ETAG].to_str()?, next);
+    Ok(())
+}
+
 /// Editor prefs are not session state: a second browser, with no cookie of its own, reads back
 /// what the first one wrote, and one user's document is invisible to another.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]

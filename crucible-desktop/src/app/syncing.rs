@@ -93,6 +93,11 @@ impl App {
     /// Point the live worker at the launch the selection resolves to. The selection, the list
     /// and the filters all move it, so this runs once per frame.
     pub(crate) fn sync_live(&mut self) {
+        if self.remote.focus_sent != Some(self.window_focused) {
+            self.remote.live_client.focus(self.window_focused);
+            self.remote.admin_client.focus(self.window_focused);
+            self.remote.focus_sent = Some(self.window_focused);
+        }
         let key = self.selected_live().map(|launch| launch.key.clone());
         if key != self.remote.live_sent {
             self.remote.live_client.select(key.as_deref());

@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::Result;
-use crux::client::{Credential, Endpoint, Transport};
+use crux::client::{Credential, Endpoint, Fetched, Transport};
 use crux::sse::SseEvent;
 use reqwest::{Method, StatusCode};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -90,6 +90,14 @@ impl Store {
                  PRIMARY KEY (base, path)
              );",
         )?;
+        let tagged: bool = db.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('responses') WHERE name = 'etag'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !tagged {
+            db.execute_batch("ALTER TABLE responses ADD COLUMN etag TEXT")?;
+        }
         backfill(&db)?;
         let held = db.query_row(
             "SELECT COALESCE(SUM(LENGTH(body)), 0) FROM responses",
@@ -143,12 +151,17 @@ impl Store {
 
     /// The stored body and whether it is settled, marking it used.
     pub fn get(&self, base: &str, path: &str) -> Option<(Vec<u8>, bool)> {
+        self.get_tagged(base, path)
+            .map(|(body, settled, _)| (body, settled))
+    }
+
+    pub fn get_tagged(&self, base: &str, path: &str) -> Option<(Vec<u8>, bool, Option<String>)> {
         let db = self.db();
         let hit = db
             .query_row(
-                "SELECT body, settled FROM responses WHERE base = ?1 AND path = ?2",
+                "SELECT body, settled, etag FROM responses WHERE base = ?1 AND path = ?2",
                 params![base, path],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, bool>(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .ok()
@@ -163,6 +176,17 @@ impl Store {
     /// Keep `body`, then drop what was used longest ago until the cache fits its budget. A body
     /// the cache already holds is only marked used: nothing is written or indexed again.
     pub fn put(&self, base: &str, path: &str, body: &[u8], settled: bool) {
+        self.put_tagged(base, path, body, settled, None);
+    }
+
+    pub fn put_tagged(
+        &self,
+        base: &str,
+        path: &str,
+        body: &[u8],
+        settled: bool,
+        etag: Option<&str>,
+    ) {
         let db = self.db();
         let before: Option<(i64, bool)> = db
             .query_row(
@@ -175,16 +199,18 @@ impl Store {
             .flatten();
         if let Some((_, true)) = before {
             let _ = db.execute(
-                "UPDATE responses SET used = ?3 WHERE base = ?1 AND path = ?2",
-                params![base, path, now()],
+                "UPDATE responses SET used = ?3, etag = ?4 WHERE base = ?1 AND path = ?2",
+                params![base, path, now(), etag],
             );
             return;
         }
         let stored = db.execute(
-            "INSERT INTO responses (base, path, body, settled, used) VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO responses (base, path, body, settled, used, etag)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT (base, path) DO UPDATE
-             SET body = excluded.body, settled = excluded.settled, used = excluded.used",
-            params![base, path, body, settled, now()],
+             SET body = excluded.body, settled = excluded.settled, used = excluded.used,
+                 etag = excluded.etag",
+            params![base, path, body, settled, now(), etag],
         );
         if stored.is_err() {
             return;
@@ -354,20 +380,20 @@ impl CachedTransport {
     }
 
     /// The stored copy of `path`.
-    async fn stored(&self, path: &str) -> Option<(Vec<u8>, bool)> {
+    async fn stored(&self, path: &str) -> Option<(Vec<u8>, bool, Option<String>)> {
         let (store, base, path) = (
             Arc::clone(&self.store),
             self.inner.base().to_string(),
             path.to_string(),
         );
-        tokio::task::spawn_blocking(move || store.get(&base, &path))
+        tokio::task::spawn_blocking(move || store.get_tagged(&base, &path))
             .await
             .ok()
             .flatten()
     }
 
     /// Store `body` as `path`'s copy, and hand it back.
-    async fn keep(&self, path: &str, body: Vec<u8>) -> Vec<u8> {
+    async fn keep(&self, path: &str, body: Vec<u8>, etag: Option<String>) -> Vec<u8> {
         let (store, base, path) = (
             Arc::clone(&self.store),
             self.inner.base().to_string(),
@@ -376,28 +402,44 @@ impl CachedTransport {
         let body = Arc::new(body);
         let stored = Arc::clone(&body);
         let _ = tokio::task::spawn_blocking(move || {
-            store.put(&base, &path, &stored, settled(&path, &stored));
+            store.put_tagged(
+                &base,
+                &path,
+                &stored,
+                settled(&path, &stored),
+                etag.as_deref(),
+            );
         })
         .await;
         Arc::try_unwrap(body).unwrap_or_else(|shared| shared.to_vec())
     }
 
     async fn read(&self, path: &str) -> Result<(StatusCode, Vec<u8>)> {
-        if let Some((body, true)) = self.stored(path).await {
-            return Ok((StatusCode::OK, body));
-        }
-        match self.inner.get_bytes(path).await {
-            Ok((status, body)) => {
+        let held = self.stored(path).await;
+        let etag = match &held {
+            Some((body, true, _)) => return Ok((StatusCode::OK, body.clone())),
+            Some((_, false, etag)) => etag.clone(),
+            None => None,
+        };
+        match self.inner.get_since(path, etag.as_deref()).await {
+            Ok(Fetched::Unchanged) => {
+                self.offline.store(false, Ordering::Relaxed);
+                match held {
+                    Some((body, _, _)) => Ok((StatusCode::OK, body)),
+                    None => self.inner.get_bytes(path).await,
+                }
+            }
+            Ok(Fetched::Body { status, body, etag }) => {
                 self.offline.store(false, Ordering::Relaxed);
                 let body = if status.is_success() {
-                    self.keep(path, body).await
+                    self.keep(path, body, etag).await
                 } else {
                     body
                 };
                 Ok((status, body))
             }
-            Err(error) => match self.stored(path).await {
-                Some((body, _)) => {
+            Err(error) => match held {
+                Some((body, _, _)) => {
                     self.offline.store(true, Ordering::Relaxed);
                     Ok((StatusCode::OK, body))
                 }

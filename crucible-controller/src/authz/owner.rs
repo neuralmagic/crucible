@@ -309,14 +309,20 @@ pub async fn readable_with_actions<T>(
     rows: Vec<T>,
     resource: impl Fn(&T) -> Resource,
 ) -> anyhow::Result<Vec<(T, Vec<Verb>)>> {
-    let mut held = crate::authz::granted::held(state.db.pool(), &caller.principals, rtype).await?;
+    let verbs = rtype.verbs();
+    let read = verbs.iter().position(|verb| *verb == Verb::Read);
+    let (rows, allowed) = decided(state, caller, rtype, rows, resource, &verbs).await?;
     Ok(rows
         .into_iter()
-        .filter_map(|row| {
-            let mut resource = resource(&row);
-            resource.share = held.remove(&resource.id);
-            let verbs = actions(state, caller, &resource);
-            verbs.contains(&Verb::Read).then_some((row, verbs))
+        .zip(allowed)
+        .filter(|(_, allowed)| read.is_some_and(|at| allowed[at]))
+        .map(|(row, allowed)| {
+            let held = verbs
+                .iter()
+                .zip(allowed)
+                .filter_map(|(verb, allowed)| allowed.then_some(*verb))
+                .collect();
+            (row, held)
         })
         .collect())
 }
@@ -330,8 +336,44 @@ pub async fn readable<T>(
     rows: Vec<T>,
     resource: impl Fn(&T) -> Resource,
 ) -> anyhow::Result<Vec<T>> {
-    let rows = readable_with_actions(state, caller, rtype, rows, resource).await?;
-    Ok(rows.into_iter().map(|(row, _)| row).collect())
+    let (rows, allowed) = decided(state, caller, rtype, rows, resource, &[Verb::Read]).await?;
+    Ok(rows
+        .into_iter()
+        .zip(allowed)
+        .filter_map(|(row, allowed)| allowed.first().copied().unwrap_or(false).then_some(row))
+        .collect())
+}
+
+async fn decided<T>(
+    state: &ApiState,
+    caller: &Caller,
+    rtype: ResourceType,
+    rows: Vec<T>,
+    resource: impl Fn(&T) -> Resource,
+    verbs: &[Verb],
+) -> anyhow::Result<(Vec<T>, Vec<Vec<bool>>)> {
+    let mut held = crate::authz::granted::held(state.db.pool(), &caller.principals, rtype).await?;
+    let resources: Vec<Resource> = rows
+        .iter()
+        .map(|row| {
+            let mut resource = resource(row);
+            resource.share = held.remove(&resource.id);
+            resource
+        })
+        .collect();
+    let Some(subject) = caller.subject() else {
+        let denied = rows.iter().map(|_| vec![false; verbs.len()]).collect();
+        return Ok((rows, denied));
+    };
+    let now = jiff::Timestamp::now().as_second();
+    let allowed = state
+        .policy
+        .current()
+        .authorize_all(&subject, &resources, verbs, now)
+        .into_iter()
+        .map(|decisions| decisions.into_iter().map(|d| d.allowed).collect())
+        .collect();
+    Ok((rows, allowed))
 }
 
 /// The row a handler looked up by `id`, decided for `verb` against its owner. A missing row and a
