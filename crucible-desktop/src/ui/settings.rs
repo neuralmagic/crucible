@@ -413,105 +413,28 @@ fn account_control(app: &App, account: &crate::forge::Account, p: &Paint) -> El 
 
 #[cfg(not(target_arch = "wasm32"))]
 fn accounts_section(app: &App, p: &Paint) -> Option<El> {
-    use crate::forge::Account;
-    let offered: Vec<(Account, Option<String>)> = app
-        .forge_offered()
-        .iter()
-        .filter_map(|o| o.account().map(|a| (a, o.client_id.clone())))
-        .collect();
-    let named_here = |account: &Account| offered.iter().any(|(a, id)| a == account && id.is_some());
     let mut rows = Vec::new();
-    if !named_here(&Account::Github) {
-        rows.push(setting_row(
-            "GitHub App client ID",
-            TextInput::new(&app.github_client_id)
-                .placeholder("Iv23\u{2026}")
-                .width(Some(240.0))
-                .on_edit(|app: &mut App| &mut app.github_client_id)
-                .on_change(|app: &mut App, _: &mut Tx| {
-                    let id = app.github_client_id.text.clone();
-                    app.settings.set_github_client_id(&id);
-                })
-                .build(p.k)
-                .key("github-client-id"),
-            p,
-        ));
-    }
-    rows.push(setting_row(
-        "GitHub",
-        account_control(app, &Account::Github, p),
-        p,
-    ));
     for account in app.forge_accounts() {
-        let Account::Gitlab(host) = &account else {
+        let session = app.forge.get(&account);
+        let signed_in = session.is_some_and(|s| s.login.is_some());
+        if !signed_in && app.forge_client_id(&account).is_none() {
             continue;
-        };
-        let own = app.settings.gitlab_apps.contains_key(host);
-        let remove = host.clone();
-        rows.push(rule(&format!("gitlab-sep-{host}"), false, p));
+        }
+        if !rows.is_empty() {
+            rows.push(rule(
+                &format!("forge-sep-{}", account.store_key()),
+                false,
+                p,
+            ));
+        }
         rows.push(setting_row(
             &account.name(),
-            row()
-                .gap(8.0)
-                .center_y()
-                .child(account_control(app, &account, p))
-                .child(
-                    text(app.forge_client_id(&account))
-                        .font(p.mono(11.0, 400.0))
-                        .color(p.c.text_faint)
-                        .truncate(),
-                )
-                .children((own && !named_here(&account)).then(|| {
-                    Button::new("Remove")
-                        .variant(ButtonVariant::Ghost)
-                        .control_size(rune_kit::ControlSize::Small)
-                        .on_press(move |app: &mut App| app.remove_gitlab_host(remove.clone()))
-                        .build(p.k)
-                        .key(format!("gitlab-remove-{host}"))
-                })),
+            account_control(app, &account, p),
             p,
         ));
-    }
-    let host_ok = crate::forge::gitlab_host(&app.gitlab_host.text).is_some();
-    rows.push(rule("gitlab-add-sep", false, p));
-    rows.push(setting_row(
-        "Add GitLab",
-        row()
-            .gap(8.0)
-            .center_y()
-            .child(
-                TextInput::new(&app.gitlab_host)
-                    .placeholder("gitlab.com")
-                    .width(Some(180.0))
-                    .invalid(!app.gitlab_host.text.trim().is_empty() && !host_ok)
-                    .on_edit(|app: &mut App| &mut app.gitlab_host)
-                    .build(p.k)
-                    .key("gitlab-host"),
-            )
-            .child(
-                TextInput::new(&app.gitlab_client_id)
-                    .placeholder("client ID")
-                    .width(Some(180.0))
-                    .on_edit(|app: &mut App| &mut app.gitlab_client_id)
-                    .on_submit(|app: &mut App, _: &mut Tx| app.add_gitlab_host())
-                    .build(p.k)
-                    .key("gitlab-client-id"),
-            )
-            .child(
-                Button::new("Add")
-                    .variant(ButtonVariant::Neutral)
-                    .control_size(rune_kit::ControlSize::Small)
-                    .disabled(!host_ok || app.gitlab_client_id.text.trim().is_empty())
-                    .on_press(|app: &mut App| app.add_gitlab_host())
-                    .build(p.k)
-                    .key("gitlab-add"),
-            ),
-        p,
-    ));
-    for account in app.forge_accounts() {
-        if let Some(why) = app.forge.get(&account).and_then(|s| s.error.as_ref()) {
+        if let Some(why) = session.and_then(|s| s.error.as_ref()) {
             rows.push(
-                text(format!("{}: {why}", account.name()))
+                text(why.clone())
                     .font(p.k.ty.small)
                     .color(p.fail)
                     .wrap()
@@ -519,7 +442,7 @@ fn accounts_section(app: &App, p: &Paint) -> Option<El> {
             );
         }
     }
-    Some(settings_section("accounts", "Accounts", rows, p))
+    (!rows.is_empty()).then(|| settings_section("accounts", "Accounts", rows, p))
 }
 
 /// The ceilings a pack folder dropped on the Dock icon is test-fired under.

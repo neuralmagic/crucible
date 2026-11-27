@@ -127,7 +127,12 @@ impl App {
                         held.ok_or_else(|| format!("sign in to {} first", account.name()))
                     })
                     .and_then(|held| {
-                        let fresh = device::current(&runtime, &account, &client_id, held.clone())?;
+                        let fresh = device::current(
+                            &runtime,
+                            &account,
+                            client_id.as_deref(),
+                            held.clone(),
+                        )?;
                         if fresh != held {
                             keys.save_forge_tokens(&account, &fresh)?;
                         }

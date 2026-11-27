@@ -82,8 +82,8 @@ impl Tokens {
         &self.access
     }
 
-    pub fn client_id<'a>(&'a self, fallback: &'a str) -> &'a str {
-        self.client_id.as_deref().unwrap_or(fallback)
+    pub fn client_id<'a>(&'a self, offered: Option<&'a str>) -> Option<&'a str> {
+        self.client_id.as_deref().or(offered)
     }
 
     fn due(&self, now: i64) -> bool {
@@ -290,11 +290,17 @@ pub fn finish(
 pub fn revoke(
     runtime: &Handle,
     account: &Account,
-    client_id: &str,
+    offered: Option<&str>,
     tokens: &Tokens,
 ) -> Result<(), String> {
     let Some(url) = account.revoke_url() else {
         return Ok(());
+    };
+    let Some(client_id) = tokens.client_id(offered) else {
+        return Err(format!(
+            "no client to revoke the {} token with",
+            account.name()
+        ));
     };
     let http = client()?;
     let doing = format!("revoking the {} token", account.name());
@@ -302,10 +308,7 @@ pub fn revoke(
         .block_on(form::<serde_json::Value>(
             &http,
             &url,
-            &[
-                ("client_id", tokens.client_id(client_id)),
-                ("token", tokens.access()),
-            ],
+            &[("client_id", client_id), ("token", tokens.access())],
             &doing,
         ))
         .map(|_| ())
@@ -314,19 +317,20 @@ pub fn revoke(
 pub fn current(
     runtime: &Handle,
     account: &Account,
-    client_id: &str,
+    offered: Option<&str>,
     tokens: Tokens,
 ) -> Result<Tokens, String> {
     if !tokens.due(now()) {
         return Ok(tokens);
     }
-    let Some(refresh) = tokens.refresh.as_deref() else {
+    let (Some(refresh), Some(client_id)) = (tokens.refresh.as_deref(), tokens.client_id(offered))
+    else {
         return Err(format!(
             "the {} sign-in expired; sign in again",
             account.name()
         ));
     };
-    let client_id = tokens.client_id(client_id).to_string();
+    let client_id = client_id.to_string();
     let http = client()?;
     let answer: TokenAnswer = runtime.block_on(form(
         &http,
@@ -462,17 +466,19 @@ mod tests {
         assert!(!lasting.due(i64::MAX));
         let shown = format!("{tokens:?}");
         assert!(!shown.contains("secret"), "{shown}");
-        assert_eq!(tokens.client_id("set"), "set");
+        assert_eq!(tokens.client_id(Some("set")), Some("set"));
+        assert_eq!(tokens.client_id(None), None);
         let issued = Tokens {
             client_id: Some("issuer".into()),
             ..tokens.clone()
         };
-        assert_eq!(issued.client_id("set"), "issuer");
+        assert_eq!(issued.client_id(Some("set")), Some("issuer"));
+        assert_eq!(issued.client_id(None), Some("issuer"));
         let kept: Tokens = serde_json::from_value(serde_json::json!({
             "login": "wren", "access": "a"
         }))
         .unwrap();
-        assert_eq!(kept.client_id("set"), "set");
+        assert_eq!(kept.client_id(Some("set")), Some("set"));
     }
 
     #[test]

@@ -26,7 +26,7 @@ fn link_now(
     target: &Target,
     keys: &crate::keys::Store,
     account: &Account,
-    client_id: &str,
+    client_id: Option<&str>,
     tokens: Tokens,
 ) -> (Result<String, LinkError>, Option<i64>) {
     let renewed = match device::current(runtime, account, client_id, tokens.clone()) {
@@ -48,8 +48,10 @@ impl App {
     }
 
     pub fn forge_accounts(&self) -> Vec<Account> {
-        let mut accounts = self.settings.forge_accounts();
-        for account in self.forge_offered().iter().filter_map(Offered::account) {
+        let mut accounts = vec![Account::Github];
+        let linked = self.settings.linked_forge_accounts().into_iter();
+        let offered = self.forge_offered().iter().filter_map(Offered::account);
+        for account in linked.chain(offered) {
             if !accounts.contains(&account) {
                 accounts.push(account);
             }
@@ -57,12 +59,11 @@ impl App {
         accounts
     }
 
-    pub fn forge_client_id(&self, account: &Account) -> String {
+    pub fn forge_client_id(&self, account: &Account) -> Option<String> {
         self.forge_offered()
             .iter()
             .filter(|o| o.account().as_ref() == Some(account))
             .find_map(|o| o.client_id.clone())
-            .unwrap_or_else(|| self.settings.client_id(account))
     }
 
     fn follow_forge_apps(&mut self, ready: bool) -> bool {
@@ -101,11 +102,15 @@ impl App {
         if self.forge_session(&account).busy {
             return;
         }
-        let client_id = self.forge_client_id(&account);
-        if client_id.is_empty() {
-            self.forge_session(&account).error = Some("set the client ID first".into());
+        let Some(client_id) = self.forge_client_id(&account) else {
+            let why = format!(
+                "{} offers no {} sign-in",
+                self.remote.target.name,
+                account.name()
+            );
+            self.forge_session(&account).error = Some(why);
             return;
-        }
+        };
         let runtime = match self.net.handle() {
             Ok(runtime) => runtime,
             Err(why) => {
@@ -141,7 +146,7 @@ impl App {
                 send(&tx, &waker, Event::SignedIn(tokens.clone()));
                 if let Ok(tokens) = tokens {
                     let (answer, renew_at) =
-                        link_now(&runtime, &target, &keys, &account, &client_id, tokens);
+                        link_now(&runtime, &target, &keys, &account, Some(&client_id), tokens);
                     send(
                         &tx,
                         &waker,
@@ -215,29 +220,9 @@ impl App {
                     let _ = link::unlink(&runtime, target, &account);
                 }
                 if let Some(tokens) = held {
-                    let _ = device::revoke(&runtime, &account, &client_id, &tokens);
+                    let _ = device::revoke(&runtime, &account, client_id.as_deref(), &tokens);
                 }
             });
-    }
-
-    pub fn add_gitlab_host(&mut self) {
-        let Some(host) = crate::forge::gitlab_host(&self.gitlab_host.text) else {
-            return;
-        };
-        let client_id = self.gitlab_client_id.text.trim().to_string();
-        if client_id.is_empty() {
-            return;
-        }
-        self.settings.set_gitlab_app(&host, &client_id);
-        self.gitlab_host = rune::TextEdit::new("");
-        self.gitlab_client_id = rune::TextEdit::new("");
-    }
-
-    pub fn remove_gitlab_host(&mut self, host: String) {
-        let account = Account::Gitlab(host.clone());
-        self.forge_sign_out(account.clone());
-        self.forge.remove(&account);
-        self.settings.remove_gitlab_app(&host);
     }
 
     fn forge_link(&mut self, account: &Account) {
@@ -276,7 +261,7 @@ impl App {
                     &target,
                     &keys,
                     &thread_account,
-                    &client_id,
+                    client_id.as_deref(),
                     tokens,
                 );
                 send(

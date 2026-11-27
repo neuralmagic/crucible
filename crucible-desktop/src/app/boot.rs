@@ -126,12 +126,6 @@ pub(crate) fn init() -> App {
         promoting: None,
         #[cfg(not(target_arch = "wasm32"))]
         promote_form: Default::default(),
-        #[cfg(not(target_arch = "wasm32"))]
-        github_client_id: TextEdit::new(&settings.github_client_id),
-        #[cfg(not(target_arch = "wasm32"))]
-        gitlab_host: TextEdit::new(""),
-        #[cfg(not(target_arch = "wasm32"))]
-        gitlab_client_id: TextEdit::new(""),
         settings,
         editor_command,
         drop_cost,

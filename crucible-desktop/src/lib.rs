@@ -575,12 +575,6 @@ pub struct App {
     pub promoting: Option<app::promote::Promoting>,
     #[cfg(not(target_arch = "wasm32"))]
     pub promote_form: app::promote::PromoteForm,
-    #[cfg(not(target_arch = "wasm32"))]
-    pub github_client_id: TextEdit,
-    #[cfg(not(target_arch = "wasm32"))]
-    pub gitlab_host: TextEdit,
-    #[cfg(not(target_arch = "wasm32"))]
-    pub gitlab_client_id: TextEdit,
     /// The drop ceilings as typed in Settings, and why the last pair did not take.
     pub drop_cost: TextEdit,
     pub drop_time: TextEdit,
