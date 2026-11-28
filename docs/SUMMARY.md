@@ -5,6 +5,8 @@
 # Playbooks
 
 - [Your first playbook](./playbooks.md)
+- [Reading a run](./reading-a-run.md)
+- [Reports people read](./reports.md)
 - [Launching from webhooks](./webhooks.md)
 - [Drafting with a local agent](./desktop-agent-local.md)
 - [Branching and review](./playbook-patterns.md)
@@ -28,6 +30,7 @@
 - [Deploying the controller](./controller-deploy.md)
 - [Authentication](./controller-auth.md)
 - [Vault and the secrets registry](./controller-vault.md)
+- [Secrets and credentials](./secrets.md)
 - [Agent and people MCP architecture](./agent-mcp-architecture.md)
 
 # Reference

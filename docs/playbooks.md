@@ -560,6 +560,39 @@ target = "cluster-a"
 `crux draft-preview` prints `dispatching to cluster-a (pinned by crucible.toml)`. A launch that
 asks for another cluster is refused.
 
+### Dispatch targets
+
+The targets a launch may name are the clusters in the deployment's own cluster directory, which
+an administrator configures, plus every `kubeconfig` secret you registered yourself.
+
+Registering the kubeconfig *is* the setup for a personal target: a `kubeconfig` secret is consumed
+by the hub rather than by a run, so the controller probes it at registration and offers it to you
+alone in the launch form's target list and to `--dispatch-target`. The probe parses the file,
+requires an explicitly namespace-scoped context (not `default`), and checks that the identity may
+create pods in that namespace from the hub's own network position. A failure there is a refusal at
+registration, with the reason, not a failure of the launch. [Secrets](./secrets.md) covers the
+probe and what each refusal means.
+
+Every pod of a launch lands on the same cluster. A pack that only works on one cluster pins it in
+the manifest, as above, so a launch cannot land somewhere it cannot run.
+
+### What a schedule costs
+
+A schedule is a launch per firing, and each firing carries its own `--max-cost` and `--max-time`.
+Nothing sums them: a pack that re-runs a full build and validation every hour costs that much
+every hour, and a repair loop inside it multiplies the same way. Three things bound this:
+
+- the per-launch ceilings, which the controller checks at admission against the deployment's own
+  caps (`crux playbook-caps` prints them), so a pack cannot ask for more than an administrator
+  allows;
+- the loops a pack states, such as a revise loop's `max_rounds`, which are fixed before any spend;
+- the deployment's patience: a schedule that fails a fixed number of consecutive firings (five by
+  default) takes itself out of the rotation instead of failing forever.
+
+Prefer the cheapest check that can still fail. A schedule that runs the light validation and opens
+an issue when it goes red is worth more than one that re-runs the full acceptance suite hourly,
+and it leaves the cluster available for the runs that need it.
+
 ### Let your own agent write it
 
 If an agent writes the pack, give it the co-draft skill before it starts. The controller

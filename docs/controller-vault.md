@@ -100,6 +100,10 @@ broker process on the loop pod can see it (`broker_only`, the default). Members 
 use secrets that the team owns, under the policy of the team. Sharing gives the same access to
 named users or groups.
 
+This page is the operator's view. The pack author's view — how a secret is declared, registered
+and bound, what each kind and visibility is for, and why a `kubeconfig` becomes a dispatch target
+rather than a run credential — is in [Secrets and credentials](./secrets.md).
+
 ## Deployment secrets
 
 The credentials of the controller (the GitHub token, the API token, the OIDC client secret)
