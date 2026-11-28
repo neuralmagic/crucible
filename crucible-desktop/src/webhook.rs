@@ -125,13 +125,15 @@ impl WebhookForm {
                     (Some(expression), _) => Choice {
                         name: field.name.clone(),
                         mode: Mode::Derived,
-                        value: TextEdit::new(&field.default),
+                        value: TextEdit::new(field.default_text()),
                         expression: TextEdit::new(expression),
                     },
                     (None, fixed) => Choice {
                         name: field.name.clone(),
                         mode: Mode::Fixed,
-                        value: TextEdit::new(fixed.unwrap_or(&field.default)),
+                        value: TextEdit::new(
+                            fixed.cloned().unwrap_or_else(|| field.default_text()),
+                        ),
                         expression: TextEdit::new(""),
                     },
                 },

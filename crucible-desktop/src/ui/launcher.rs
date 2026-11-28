@@ -7,7 +7,7 @@ use rune_kit::{
 };
 use rune_theme_opencode::icons as oc;
 
-use crate::form::{Kind, Scale, duration, minutes};
+use crate::form::{Answer, Kind, Scale, duration, minutes};
 use crate::live::Target;
 use crate::ui::desk::{field, pills};
 use crate::ui::slider::Slider;
@@ -36,7 +36,10 @@ enum Slot {
 fn edit(app: &mut App, slot: Slot) -> &mut TextEdit {
     if let Some(launcher) = app.remote.launcher.as_mut() {
         let found = match slot {
-            Slot::Answer(i) => launcher.answers.get_mut(i),
+            Slot::Answer(i) => match launcher.answers.get_mut(i) {
+                Some(Answer::Text(edit)) => Some(edit.as_mut()),
+                _ => None,
+            },
             Slot::Cost => Some(&mut launcher.cost),
             Slot::Time => Some(&mut launcher.time),
             Slot::Model => Some(&mut launcher.runs_on.model),
@@ -327,6 +330,11 @@ fn fact(name: &str, value: String, p: &Paint) -> El {
         )
 }
 
+/// The form's answer to field `i`.
+fn answer_at(app: &mut App, i: usize) -> Option<&mut Answer> {
+    app.remote.launcher.as_mut()?.answers.get_mut(i)
+}
+
 /// The choice that switches an open list to a typed value; never sent.
 const OTHER: &str = "Other\u{2026}";
 
@@ -344,19 +352,24 @@ fn form(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
             .child(runs_on(app, p, layer))
             .child(ceilings(app, p));
     }
-    let texts: Vec<String> = launcher.answers.iter().map(|a| a.text.clone()).collect();
+    let answers = &launcher.answers;
     let mut fields = col().w_full().gap(14.0);
     for (i, field) in launcher.fields.iter().enumerate() {
-        let answer = texts.get(i).map(String::as_str).unwrap_or_default();
+        let held = answers.get(i);
+        let answer = held.map_or("", Answer::text);
+        let buffer = match held {
+            Some(Answer::Text(edit)) => edit.as_ref(),
+            _ => &app.scratch,
+        };
         let issue = launcher
             .problems
             .iter()
             .find(|(at, _)| *at == i)
             .map(|(_, why)| why.clone());
-        let off = !field.enabled(&launcher.fields, &texts);
+        let off = !field.enabled(&launcher.fields, answers);
         let typed = |id: String| {
-            TextInput::new(launcher.answers.get(i).unwrap_or(&app.scratch))
-                .placeholder(field.placeholder(&launcher.fields, &texts))
+            TextInput::new(buffer)
+                .placeholder(field.placeholder(&launcher.fields, answers))
                 .width(Some(INNER))
                 .invalid(issue.is_some())
                 .disabled(off)
@@ -364,50 +377,47 @@ fn form(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
                 .build(p.k)
                 .key(id)
         };
-        let offered = field.offered(&launcher.fields, &texts);
+        let offered = field.offered(&launcher.fields, answers);
         let control = match (&field.kind, offered) {
             (Kind::File(_), _) => file_pick(app, i, &field.name, issue.is_some(), off, p),
-            (Kind::Multiline | Kind::Json(_), _) => {
-                TextArea::new(launcher.answers.get(i).unwrap_or(&app.scratch))
-                    .placeholder(field.placeholder(&launcher.fields, &texts))
-                    .rows(8)
-                    .width(Some(INNER))
-                    .invalid(issue.is_some())
-                    .disabled(off)
-                    .on_edit(move |app: &mut App| edit(app, Slot::Answer(i)))
-                    .build(p.k)
-                    .key(format!("launch-param-{}", field.name))
-            }
-            (Kind::Bool, _) => Switch::new(answer == "true")
+            (Kind::Multiline | Kind::Json(_), _) => TextArea::new(buffer)
+                .placeholder(field.placeholder(&launcher.fields, answers))
+                .rows(8)
+                .width(Some(INNER))
+                .invalid(issue.is_some())
+                .disabled(off)
+                .on_edit(move |app: &mut App| edit(app, Slot::Answer(i)))
+                .build(p.k)
+                .key(format!("launch-param-{}", field.name)),
+            (Kind::Bool, _) => Switch::new(matches!(held, Some(Answer::Flag(true))))
                 .label(field.name.clone())
                 .hide_label()
                 .disabled(off)
                 .on_toggle(move |app: &mut App| {
-                    let on = edit(app, Slot::Answer(i)).text == "true";
-                    *edit(app, Slot::Answer(i)) = TextEdit::new(if on { "false" } else { "true" });
+                    if let Some(Answer::Flag(on)) = answer_at(app, i) {
+                        *on = !*on;
+                    }
                 })
                 .build(p.k),
             (Kind::MultiChoice(values), _) => {
-                let held = crate::form::picked(answer);
                 let mut boxes = row()
                     .key(format!("launch-picks-{}", field.name))
                     .w_full()
                     .gap(16.0)
                     .flex_wrap();
-                for value in values {
-                    let choices = values.clone();
-                    let flip = value.clone();
+                for (n, value) in values.iter().enumerate() {
+                    let picked =
+                        matches!(held, Some(Answer::MultiChoice(picks)) if picks.contains(&n));
                     boxes = boxes.child(
-                        Checkbox::new(held.contains(value))
+                        Checkbox::new(picked)
                             .label(value.clone())
                             .disabled(off)
                             .on_toggle(move |app: &mut App| {
-                                let next = crate::form::toggled(
-                                    &choices,
-                                    &edit(app, Slot::Answer(i)).text,
-                                    &flip,
-                                );
-                                *edit(app, Slot::Answer(i)) = TextEdit::new(&next);
+                                if let Some(Answer::MultiChoice(picks)) = answer_at(app, i)
+                                    && !picks.remove(&n)
+                                {
+                                    picks.insert(n);
+                                }
                             })
                             .build(p.k),
                     );
@@ -464,7 +474,7 @@ fn form(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
                                     launcher.typing.remove(&i);
                                 }
                                 if let Some(slot) = launcher.answers.get_mut(i) {
-                                    *slot = TextEdit::new(if typing { "" } else { value.as_str() });
+                                    *slot = Answer::typed(if typing { "" } else { value.as_str() });
                                 }
                             })
                             .build(p.k)
@@ -524,7 +534,10 @@ fn file_pick(app: &App, i: usize, name: &str, invalid: bool, off: bool, p: &Pain
         .remote
         .launcher
         .as_ref()
-        .and_then(|launcher| launcher.answers.get(i))
+        .and_then(|launcher| match launcher.answers.get(i) {
+            Some(Answer::Text(edit)) => Some(edit.as_ref()),
+            _ => None,
+        })
         .unwrap_or(&app.scratch);
     let title = name.to_string();
     row()

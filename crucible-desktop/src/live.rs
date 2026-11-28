@@ -2254,7 +2254,7 @@ mod tests {
             },
             "required": ["notes"]
         }));
-        let answers = [notes.display().to_string()];
+        let answers = [crate::form::Answer::typed(notes.display().to_string())];
         let uploads = crate::form::uploads(&fields, &answers).unwrap();
 
         client.launch(
