@@ -316,6 +316,13 @@ pub(crate) fn detail(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
         .gap(16.0)
         .child(header(&pane, app, p, layer));
 
+    #[cfg(not(target_arch = "wasm32"))]
+    if app.selected_draft().is_some()
+        && let Some(promote) = crate::ui::promote::section(app, p)
+    {
+        body = body.child(promote);
+    }
+
     if let Some(problem) = &pane.problem {
         body = body.child(banner(problem, p));
     }

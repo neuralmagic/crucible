@@ -13,6 +13,7 @@
 //! ```
 
 pub mod build;
+pub mod pulls;
 pub mod workflow;
 
 use std::collections::BTreeMap;
@@ -165,6 +166,10 @@ pub struct Token(String);
 impl Token {
     pub fn new(secret: impl Into<String>) -> Self {
         Token(secret.into())
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
     }
 }
 

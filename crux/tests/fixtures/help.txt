@@ -124,7 +124,6 @@ Commands:
   blueprint-private     Make a public blueprint private again
   draft-publish         Publish a draft: register its newest compiling version as a playbook, with
                         no review
-  draft-graduate        Graduate a draft: push its newest compiling version and open the export PR
   help                  Print this message or the help of the given subcommand(s)
 
 Options:
@@ -278,7 +277,6 @@ Commands:
   blueprint-private     Make a public blueprint private again
   draft-publish         Publish a draft: register its newest compiling version as a playbook, with
                         no review
-  draft-graduate        Graduate a draft: push its newest compiling version and open the export PR
   help                  Print this message or the help of the given subcommand(s)
 
 Options:
@@ -4613,67 +4611,6 @@ Options:
                                who minted it, or the controller's static token, which authenticates
                                as nobody [env: CONTROLLER_API_TOKEN]
   -h, --help                   Print help
-==== crux draft-graduate --help ====
-Graduate a draft: push its newest compiling version and open the export PR
-
-Usage: crux draft-graduate [OPTIONS] --repo <REPO> <DRAFT_ID>
-
-Arguments:
-  <DRAFT_ID>
-          
-
-Options:
-      --config <CONFIG>
-          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else
-          `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var
-          wins over the file
-          
-          [env: CONTROLLER_CONFIG=]
-
-      --repo <REPO>
-          `owner/repo` the export PR opens against
-
-      --path <PATH>
-          The pack directory inside that repo. Omit for the repo root
-
-      --url <URL>
-          Controller base URL: the API route. Defaults to a controller on this machine,
-          `http://127.0.0.1:8870`
-          
-          [env: CONTROLLER_URL=]
-
-      --api-token <API_TOKEN>
-          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the
-          controller's static token, which authenticates as nobody
-          
-          [env: CONTROLLER_API_TOKEN]
-
-      --json
-          
-
-  -h, --help
-          Print help
-==== crux draft-graduate -h ====
-Graduate a draft: push its newest compiling version and open the export PR
-
-Usage: crux draft-graduate [OPTIONS] --repo <REPO> <DRAFT_ID>
-
-Arguments:
-  <DRAFT_ID>  
-
-Options:
-      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux`
-                               (else `~/.config/crux`), which may be absent; a path given here must
-                               exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
-      --repo <REPO>            `owner/repo` the export PR opens against
-      --path <PATH>            The pack directory inside that repo. Omit for the repo root
-      --url <URL>              Controller base URL: the API route. Defaults to a controller on this
-                               machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
-      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person
-                               who minted it, or the controller's static token, which authenticates
-                               as nobody [env: CONTROLLER_API_TOKEN]
-      --json                   
-  -h, --help                   Print help
 ==== crux help --help ====
 Print this message or the help of the given subcommand(s)
 
@@ -4800,7 +4737,6 @@ Commands:
   blueprint-private     Make a public blueprint private again
   draft-publish         Publish a draft: register its newest compiling version as a playbook, with
                         no review
-  draft-graduate        Graduate a draft: push its newest compiling version and open the export PR
   help                  Print this message or the help of the given subcommand(s)
 ==== crux help -h ====
 Print this message or the help of the given subcommand(s)
@@ -4928,5 +4864,4 @@ Commands:
   blueprint-private     Make a public blueprint private again
   draft-publish         Publish a draft: register its newest compiling version as a playbook, with
                         no review
-  draft-graduate        Graduate a draft: push its newest compiling version and open the export PR
   help                  Print this message or the help of the given subcommand(s)

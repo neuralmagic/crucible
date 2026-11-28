@@ -728,40 +728,6 @@ impl Operation for DraftPublish {
     }
 }
 
-/// Export a draft as a PR against `repo`. Already graduated comes back as the controller's own
-/// refusal, which carries the open PR.
-#[derive(Debug, Clone, PartialEq, Eq, clap::Args, Deserialize, schemars::JsonSchema)]
-pub struct DraftGraduate {
-    pub draft_id: String,
-    /// `owner/repo` the export PR opens against.
-    #[arg(long)]
-    pub repo: String,
-    /// The pack directory inside that repo. Omit for the repo root.
-    #[arg(long)]
-    #[serde(default)]
-    pub path: Option<String>,
-    #[arg(long)]
-    #[serde(default)]
-    pub json: bool,
-}
-
-impl Operation for DraftGraduate {
-    type Output = dto::GraduateAck;
-
-    async fn call(&self, c: &Client) -> Result<Value> {
-        c.graduate_draft(&self.draft_id, &self.repo, self.path.as_deref())
-            .await
-    }
-
-    fn render(&self, _c: &Client, ack: Self::Output) -> Result<String> {
-        Ok(render::draft_graduated(&self.draft_id, &ack))
-    }
-
-    fn json(&self) -> bool {
-        self.json
-    }
-}
-
 /// [`DraftCreate`] as a call, for callers outside this crate.
 pub async fn draft_create(
     c: &Client,
@@ -1168,9 +1134,9 @@ mod tests {
     }
 
     /// The authoring loop, end to end and without leaving these calls: read what the newest save
-    /// compiled to, test-fire it against that digest, then graduate it.
+    /// compiled to, then test-fire it against that digest.
     #[tokio::test]
-    async fn a_draft_is_previewed_test_fired_and_graduated_through_the_same_client() {
+    async fn a_draft_is_previewed_and_test_fired_through_the_same_client() {
         use axum::extract::{Query as AxumQuery, State};
         use axum::http::StatusCode;
         use axum::routing::{get, post};
@@ -1219,21 +1185,11 @@ mod tests {
             )
         }
 
-        async fn graduate(body: String) -> (StatusCode, String) {
-            let sent: Value = serde_json::from_str(&body).expect("a JSON body");
-            assert_eq!(sent["repo"], serde_json::json!("wren/packs"));
-            (
-                StatusCode::OK,
-                serde_json::json!({ "pr_url": "https://github.com/wren/packs/pull/7" }).to_string(),
-            )
-        }
-
         let seen: Launched = Arc::new(Mutex::new(Vec::new()));
         let app = axum::Router::new()
             .route("/healthz", get(|| async { "ok" }))
             .route("/api/playbook-drafts/{id}/preview", get(preview))
             .route("/api/playbook-drafts/{id}/launch", post(launch))
-            .route("/api/playbook-drafts/{id}/graduate", post(graduate))
             .with_state(seen.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1292,20 +1248,6 @@ mod tests {
             seen.lock().expect("lock").len(),
             1,
             "the refused launch fired nothing"
-        );
-
-        let graduated = DraftGraduate {
-            draft_id: "calibrate".into(),
-            repo: "wren/packs".into(),
-            path: None,
-            json: false,
-        }
-        .run(&client)
-        .await
-        .expect("graduate");
-        assert!(
-            graduated.contains("https://github.com/wren/packs/pull/7"),
-            "{graduated}"
         );
     }
 

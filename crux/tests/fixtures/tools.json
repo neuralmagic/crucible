@@ -211,7 +211,7 @@
     "name": "crucible_contracts"
   },
   {
-    "description": "Create a draft pack in the authoring studio, seeded from a registered playbook or a minimal skeleton. Returns version 1, its diagnostics, and the studio link; author with crucible_draft_pull and crucible_draft_push from there, test-fire it with crucible_draft_launch, and promote it with crucible_draft_graduate.",
+    "description": "Create a draft pack in the authoring studio, seeded from a registered playbook or a minimal skeleton. Returns version 1, its diagnostics, and the studio link; author with crucible_draft_pull and crucible_draft_push from there, test-fire it with crucible_draft_launch. A person promotes it to a pack repository from the desktop app.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -330,39 +330,6 @@
       "type": "object"
     },
     "name": "crucible_draft_files"
-  },
-  {
-    "description": "Graduate a draft to a registered playbook: push its newest compiling version as a branch under repo/path and open the export PR. Returns the PR URL. The draft retires itself once that merged pack is imported. A draft already graduated is refused with the open PR in the refusal.",
-    "inputSchema": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {
-        "draft_id": {
-          "type": "string"
-        },
-        "json": {
-          "default": false,
-          "type": "boolean"
-        },
-        "path": {
-          "default": null,
-          "description": "The pack directory inside that repo. Omit for the repo root.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "repo": {
-          "description": "`owner/repo` the export PR opens against.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "draft_id",
-        "repo"
-      ],
-      "type": "object"
-    },
-    "name": "crucible_draft_graduate"
   },
   {
     "description": "Test-fire a draft pack. Runs the newest save, validated against its stored schema and held to the same admin cost ceiling a registered launch is. Costs money against max_cost. Returns the issue key to watch it by with crucible_playbook_run, and a crucible-playbooks:// link that opens it in the user's desktop tracker. Pass schema_digest to be refused rather than launched if a save landed since you read it. Pass provider (and optionally model) to run the pack's agent tasks on a registered inference provider instead of the crucible.toml [agent] harness and model.",
@@ -501,7 +468,7 @@
     "name": "crucible_draft_preview"
   },
   {
-    "description": "Publish a draft with no review: register its newest compiling version as a registered playbook. The draft stays live and publishing it again re-pins the same playbook. Only principals the active policy grants playbook_draft:publish may; everyone else graduates through crucible_draft_graduate.",
+    "description": "Publish a draft with no review: register its newest compiling version as a registered playbook. The draft stays live and publishing it again re-pins the same playbook. Only principals the active policy grants playbook_draft:publish may; everyone else has a person promote it from the desktop app.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {

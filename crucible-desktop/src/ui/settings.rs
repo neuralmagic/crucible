@@ -319,29 +319,69 @@ fn accounts_section(_app: &App, _p: &Paint) -> Option<El> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn account_control(app: &App, account: &crate::forge::Account, p: &Paint) -> El {
+const LOGIN_W: f32 = 140.0;
+#[cfg(not(target_arch = "wasm32"))]
+const LINKED_W: f32 = 140.0;
+#[cfg(not(target_arch = "wasm32"))]
+const ACTIONS_W: f32 = 230.0;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn account_cells(name: El, login: El, linked: El, actions: El) -> El {
+    row()
+        .w_full()
+        .py(10.0)
+        .gap(12.0)
+        .center_y()
+        .child(row().grow(1.0).child(name))
+        .child(row().w(LOGIN_W).child(login))
+        .child(row().w(LINKED_W).child(linked))
+        .child(
+            row()
+                .w(ACTIONS_W)
+                .gap(8.0)
+                .center_y()
+                .justify_end()
+                .child(actions),
+        )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn account_row(app: &App, account: &crate::forge::Account, p: &Paint) -> El {
     let key = account.store_key();
-    let Some(session) = app.forge.get(account) else {
-        return el();
+    let session = app.forge.get(account);
+    let muted = |s: String| text(s).font(p.k.ty.ui).color(p.c.text_muted).truncate();
+    let profiles = app.settings.forge_profiles(account);
+    let linked = match profiles.is_empty() {
+        true => muted("\u{2014}".into()),
+        false => text(profiles.join(", "))
+            .font(p.k.ty.ui)
+            .color(p.c.text_base)
+            .truncate(),
     };
-    if let Some(code) = &session.code {
+    let name = text(account.name())
+        .font(p.k.ty.ui_medium)
+        .color(p.c.text_base)
+        .truncate();
+    let busy = session.is_some_and(|s| s.busy);
+    let spinner = || rune_kit::Spinner::new().size(12.0).build(p.k);
+    if let Some(code) = session.and_then(|s| s.code.as_ref()) {
         let page = code.page().to_string();
+        let typed = code.user_code.clone();
         let open = account.clone();
         let cancel = account.clone();
-        return row()
+        let login = text(code.user_code.clone())
+            .font(p.mono(15.0, 600.0))
+            .color(p.c.text_base)
+            .selectable(true);
+        let actions = row()
             .gap(8.0)
             .center_y()
             .child(
-                text(code.user_code.clone())
-                    .font(p.mono(15.0, 600.0))
-                    .color(p.c.text_base)
-                    .selectable(true),
-            )
-            .child(
-                Button::new("Open")
+                Button::new("Copy and open")
                     .variant(ButtonVariant::Neutral)
                     .control_size(rune_kit::ControlSize::Small)
-                    .on_press(move |app: &mut App| {
+                    .on_press_tx(move |app: &mut App, tx: &mut Tx| {
+                        tx.copy(typed.clone());
                         if let Err(why) = crate::editor::open_url(&page) {
                             app.forge.entry(open.clone()).or_default().error = Some(why);
                         }
@@ -357,37 +397,25 @@ fn account_control(app: &App, account: &crate::forge::Account, p: &Paint) -> El 
                     .build(p.k)
                     .key(format!("forge-cancel-{key}")),
             );
+        return account_cells(name, login, linked, actions);
     }
-    if let Some(login) = &session.login {
-        let here = session
-            .linked
-            .as_ref()
-            .is_some_and(|(profile, _)| *profile == app.remote.target.name);
+    if let Some(login) = session.and_then(|s| s.login.as_ref()) {
         let out = account.clone();
         let link = account.clone();
-        let offered = !session.busy && !app.settings.forge_linked(&app.remote.target.name, account);
-        return row()
+        let here = &app.remote.target.name;
+        let linkable = !busy && !app.settings.forge_linked(here, account);
+        let actions = row()
             .gap(8.0)
             .center_y()
-            .child(text(login.clone()).font(p.k.ty.ui).color(p.c.text_base))
-            .children(here.then(|| {
-                text(format!("linked to {}", app.remote.target.name))
-                    .font(p.k.ty.small)
-                    .color(p.c.text_muted)
-            }))
-            .children(offered.then(|| {
-                Button::new(format!("Link to {}", app.remote.target.name))
+            .children(busy.then(spinner))
+            .children(linkable.then(|| {
+                Button::new(format!("Link to {here}"))
                     .variant(ButtonVariant::Neutral)
                     .control_size(rune_kit::ControlSize::Small)
                     .on_press(move |app: &mut App| app.forge_link_here(link.clone()))
                     .build(p.k)
                     .key(format!("forge-link-{key}"))
             }))
-            .children(
-                session
-                    .busy
-                    .then(|| rune_kit::Spinner::new().size(12.0).build(p.k)),
-            )
             .child(
                 Button::new("Sign out")
                     .variant(ButtonVariant::Ghost)
@@ -396,130 +424,57 @@ fn account_control(app: &App, account: &crate::forge::Account, p: &Paint) -> El 
                     .build(p.k)
                     .key(format!("forge-sign-out-{key}")),
             );
-    }
-    if session.busy {
-        return row().child(rune_kit::Spinner::new().size(12.0).build(p.k));
+        let login = text(login.clone())
+            .font(p.k.ty.ui)
+            .color(p.c.text_base)
+            .truncate();
+        return account_cells(name, login, linked, actions);
     }
     let start = account.clone();
-    row().child(
-        Button::new("Sign in")
+    let actions = match busy {
+        true => spinner(),
+        false => Button::new("Sign in")
             .variant(ButtonVariant::Submit)
             .control_size(rune_kit::ControlSize::Small)
             .on_press(move |app: &mut App| app.forge_sign_in(start.clone()))
             .build(p.k)
             .key(format!("forge-sign-in-{key}")),
-    )
+    };
+    account_cells(name, muted("\u{2014}".into()), linked, actions)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn accounts_section(app: &App, p: &Paint) -> Option<El> {
-    use crate::forge::Account;
-    let offered: Vec<(Account, Option<String>)> = app
-        .forge_offered()
-        .iter()
-        .filter_map(|o| o.account().map(|a| (a, o.client_id.clone())))
-        .collect();
-    let named_here = |account: &Account| offered.iter().any(|(a, id)| a == account && id.is_some());
-    let mut rows = Vec::new();
-    if !named_here(&Account::Github) {
-        rows.push(setting_row(
-            "GitHub App client ID",
-            TextInput::new(&app.github_client_id)
-                .placeholder("Iv23\u{2026}")
-                .width(Some(240.0))
-                .on_edit(|app: &mut App| &mut app.github_client_id)
-                .on_change(|app: &mut App, _: &mut Tx| {
-                    let id = app.github_client_id.text.clone();
-                    app.settings.set_github_client_id(&id);
-                })
-                .build(p.k)
-                .key("github-client-id"),
-            p,
-        ));
-    }
-    rows.push(setting_row(
-        "GitHub",
-        account_control(app, &Account::Github, p),
-        p,
-    ));
+    let head = |s: &str| text(s.to_string()).font(p.k.ty.small).color(p.c.text_muted);
+    let mut rows = vec![account_cells(
+        head("Account"),
+        head("Login"),
+        head("Controllers"),
+        el(),
+    )];
     for account in app.forge_accounts() {
-        let Account::Gitlab(host) = &account else {
+        let session = app.forge.get(&account);
+        let signed_in = session.is_some_and(|s| s.login.is_some());
+        if !signed_in && app.forge_client_id(&account).is_none() {
             continue;
-        };
-        let own = app.settings.gitlab_apps.contains_key(host);
-        let remove = host.clone();
-        rows.push(rule(&format!("gitlab-sep-{host}"), false, p));
-        rows.push(setting_row(
-            &account.name(),
-            row()
-                .gap(8.0)
-                .center_y()
-                .child(account_control(app, &account, p))
-                .child(
-                    text(app.forge_client_id(&account))
-                        .font(p.mono(11.0, 400.0))
-                        .color(p.c.text_faint)
-                        .truncate(),
-                )
-                .children((own && !named_here(&account)).then(|| {
-                    Button::new("Remove")
-                        .variant(ButtonVariant::Ghost)
-                        .control_size(rune_kit::ControlSize::Small)
-                        .on_press(move |app: &mut App| app.remove_gitlab_host(remove.clone()))
-                        .build(p.k)
-                        .key(format!("gitlab-remove-{host}"))
-                })),
+        }
+        rows.push(rule(
+            &format!("forge-sep-{}", account.store_key()),
+            false,
             p,
         ));
-    }
-    let host_ok = crate::forge::gitlab_host(&app.gitlab_host.text).is_some();
-    rows.push(rule("gitlab-add-sep", false, p));
-    rows.push(setting_row(
-        "Add GitLab",
-        row()
-            .gap(8.0)
-            .center_y()
-            .child(
-                TextInput::new(&app.gitlab_host)
-                    .placeholder("gitlab.com")
-                    .width(Some(180.0))
-                    .invalid(!app.gitlab_host.text.trim().is_empty() && !host_ok)
-                    .on_edit(|app: &mut App| &mut app.gitlab_host)
-                    .build(p.k)
-                    .key("gitlab-host"),
-            )
-            .child(
-                TextInput::new(&app.gitlab_client_id)
-                    .placeholder("client ID")
-                    .width(Some(180.0))
-                    .on_edit(|app: &mut App| &mut app.gitlab_client_id)
-                    .on_submit(|app: &mut App, _: &mut Tx| app.add_gitlab_host())
-                    .build(p.k)
-                    .key("gitlab-client-id"),
-            )
-            .child(
-                Button::new("Add")
-                    .variant(ButtonVariant::Neutral)
-                    .control_size(rune_kit::ControlSize::Small)
-                    .disabled(!host_ok || app.gitlab_client_id.text.trim().is_empty())
-                    .on_press(|app: &mut App| app.add_gitlab_host())
-                    .build(p.k)
-                    .key("gitlab-add"),
-            ),
-        p,
-    ));
-    for account in app.forge_accounts() {
-        if let Some(why) = app.forge.get(&account).and_then(|s| s.error.as_ref()) {
+        rows.push(account_row(app, &account, p));
+        if let Some(why) = session.and_then(|s| s.error.as_ref()) {
             rows.push(
-                text(format!("{}: {why}", account.name()))
+                text(why.clone())
                     .font(p.k.ty.small)
                     .color(p.fail)
                     .wrap()
-                    .py(6.0),
+                    .pb(10.0),
             );
         }
     }
-    Some(settings_section("accounts", "Accounts", rows, p))
+    (rows.len() > 1).then(|| settings_section("accounts", "Accounts", rows, p))
 }
 
 /// The ceilings a pack folder dropped on the Dock icon is test-fired under.

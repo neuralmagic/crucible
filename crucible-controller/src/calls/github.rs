@@ -440,7 +440,7 @@ impl GithubWorkflowBackend {
         }
     }
 
-    async fn token(&self, repo: &Repo) -> Result<Token, TargetError> {
+    pub(crate) async fn token(&self, repo: &Repo) -> Result<Token, TargetError> {
         match &self.tokens {
             TokenSource::Person(signed_in) => match signed_in.token(
                 crate::identity::forge::Forge::Github,

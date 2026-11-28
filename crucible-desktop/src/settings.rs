@@ -196,8 +196,6 @@ pub struct Settings {
     pub editor_custom: bool,
     /// A shell command with `{file}` and `{line}`, for editors that are not apps.
     pub editor_command: String,
-    pub github_client_id: String,
-    pub gitlab_apps: BTreeMap<String, String>,
     pub forge_links: BTreeMap<String, BTreeSet<String>>,
     /// Keys bound by hand, by command id; a command left out keeps its defaults.
     pub keys: BTreeMap<String, Vec<String>>,
@@ -251,10 +249,6 @@ struct Config {
     editor_custom: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     editor_command: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    github_client_id: Option<String>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    gitlab_apps: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     forge_links: BTreeMap<String, BTreeSet<String>>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -333,8 +327,6 @@ impl Settings {
             editor: config.editor,
             editor_custom: config.editor_custom.unwrap_or(false),
             editor_command: config.editor_command.unwrap_or_default(),
-            github_client_id: config.github_client_id.unwrap_or_default(),
-            gitlab_apps: config.gitlab_apps,
             forge_links: config.forge_links,
             keys: config.keys,
             checks: config.checks.unwrap_or(true),
@@ -560,30 +552,12 @@ impl Settings {
         self.save();
     }
 
-    pub fn set_github_client_id(&mut self, id: &str) {
-        self.github_client_id = id.trim().to_string();
-        self.save();
-    }
-
-    pub fn set_gitlab_app(&mut self, host: &str, client_id: &str) {
-        self.gitlab_apps
-            .insert(host.to_string(), client_id.trim().to_string());
-        self.save();
-    }
-
-    pub fn remove_gitlab_app(&mut self, host: &str) {
-        self.gitlab_apps.remove(host);
-        self.save();
-    }
-
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn forge_accounts(&self) -> Vec<crate::forge::Account> {
-        std::iter::once(crate::forge::Account::Github)
-            .chain(
-                self.gitlab_apps
-                    .keys()
-                    .map(|host| crate::forge::Account::Gitlab(host.clone())),
-            )
+    pub fn linked_forge_accounts(&self) -> BTreeSet<crate::forge::Account> {
+        self.forge_links
+            .values()
+            .flatten()
+            .filter_map(|key| crate::forge::Account::from_store_key(key))
             .collect()
     }
 
@@ -624,16 +598,6 @@ impl Settings {
             }
         }
         self.save();
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn client_id(&self, account: &crate::forge::Account) -> String {
-        match account {
-            crate::forge::Account::Github => self.github_client_id.clone(),
-            crate::forge::Account::Gitlab(host) => {
-                self.gitlab_apps.get(host).cloned().unwrap_or_default()
-            }
-        }
     }
 
     pub fn set_editor(&mut self, editor: Option<Editor>) {
@@ -689,9 +653,6 @@ impl Settings {
             editor: self.editor,
             editor_custom: Some(self.editor_custom),
             editor_command: (!self.editor_command.is_empty()).then(|| self.editor_command.clone()),
-            github_client_id: (!self.github_client_id.is_empty())
-                .then(|| self.github_client_id.clone()),
-            gitlab_apps: self.gitlab_apps.clone(),
             forge_links: self.forge_links.clone(),
             keys: self.keys.clone(),
             checks: Some(self.checks),

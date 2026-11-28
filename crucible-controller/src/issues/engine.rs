@@ -12,7 +12,8 @@
 #![allow(clippy::disallowed_macros)]
 
 use crate::model::ParkReason;
-use crate::runs::engine::{ITEM_ENV, open_draft_pr, repo_clone_url};
+use crate::runs::engine::pack_pr::open_draft_pr;
+use crate::runs::engine::{ITEM_ENV, repo_clone_url};
 use anyhow::{Context, Result, bail};
 use crucible_contract::verdict::Ruled;
 use crucible_contract::{ScopeReport, Tier};

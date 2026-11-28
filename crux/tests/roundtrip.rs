@@ -399,14 +399,6 @@ fn blueprint_use() {
 }
 
 #[test]
-fn draft_graduate() {
-    same::<ops::drafts::DraftGraduate>(
-        &["cal", "--repo", "o/packs", "--path", "p"],
-        json!({"draft_id": "cal", "repo": "o/packs", "path": "p"}),
-    );
-}
-
-#[test]
 fn secrets() {
     same::<ops::secrets::Secrets>(&["--json"], json!({"json": true}));
 }

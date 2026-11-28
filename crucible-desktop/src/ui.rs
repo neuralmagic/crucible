@@ -29,6 +29,8 @@ mod pack;
 mod palette;
 mod policy;
 mod profiles;
+#[cfg(not(target_arch = "wasm32"))]
+mod promote;
 mod providers;
 mod rail;
 mod report;

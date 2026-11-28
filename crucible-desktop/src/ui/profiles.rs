@@ -60,9 +60,9 @@ pub(crate) fn rows(app: &App, p: &Paint) -> Vec<El> {
     }
     rows.push(rule("keychain-sep", false, p));
     rows.push(setting_row(
-        "Keys in keychain",
+        "Store keys in system keychain",
         Switch::new(app.settings.keychain)
-            .label("Keys in keychain")
+            .label("Store keys in system keychain")
             .hide_label()
             .on_toggle(|app: &mut App| {
                 let on = !app.settings.keychain;

@@ -22,8 +22,6 @@ pub struct DeviceCode {
     device_code: String,
     pub user_code: String,
     pub verification_uri: String,
-    #[serde(default)]
-    verification_uri_complete: Option<String>,
     expires_in: u64,
     #[serde(default = "default_interval")]
     interval: u64,
@@ -35,9 +33,7 @@ fn default_interval() -> u64 {
 
 impl DeviceCode {
     pub fn page(&self) -> &str {
-        self.verification_uri_complete
-            .as_deref()
-            .unwrap_or(&self.verification_uri)
+        &self.verification_uri
     }
 
     fn checked(mut self, account: &Account) -> Result<DeviceCode, String> {
@@ -49,9 +45,6 @@ impl DeviceCode {
                 self.verification_uri
             ));
         }
-        self.verification_uri_complete = self
-            .verification_uri_complete
-            .filter(|page| page.starts_with(&home));
         self.expires_in = self.expires_in.min(MAX_EXPIRES_IN);
         self.interval = self.interval.clamp(1, MAX_INTERVAL);
         Ok(self)
@@ -82,8 +75,8 @@ impl Tokens {
         &self.access
     }
 
-    pub fn client_id<'a>(&'a self, fallback: &'a str) -> &'a str {
-        self.client_id.as_deref().unwrap_or(fallback)
+    pub fn client_id<'a>(&'a self, offered: Option<&'a str>) -> Option<&'a str> {
+        self.client_id.as_deref().or(offered)
     }
 
     fn due(&self, now: i64) -> bool {
@@ -290,11 +283,17 @@ pub fn finish(
 pub fn revoke(
     runtime: &Handle,
     account: &Account,
-    client_id: &str,
+    offered: Option<&str>,
     tokens: &Tokens,
 ) -> Result<(), String> {
     let Some(url) = account.revoke_url() else {
         return Ok(());
+    };
+    let Some(client_id) = tokens.client_id(offered) else {
+        return Err(format!(
+            "no client to revoke the {} token with",
+            account.name()
+        ));
     };
     let http = client()?;
     let doing = format!("revoking the {} token", account.name());
@@ -302,10 +301,7 @@ pub fn revoke(
         .block_on(form::<serde_json::Value>(
             &http,
             &url,
-            &[
-                ("client_id", tokens.client_id(client_id)),
-                ("token", tokens.access()),
-            ],
+            &[("client_id", client_id), ("token", tokens.access())],
             &doing,
         ))
         .map(|_| ())
@@ -314,19 +310,20 @@ pub fn revoke(
 pub fn current(
     runtime: &Handle,
     account: &Account,
-    client_id: &str,
+    offered: Option<&str>,
     tokens: Tokens,
 ) -> Result<Tokens, String> {
     if !tokens.due(now()) {
         return Ok(tokens);
     }
-    let Some(refresh) = tokens.refresh.as_deref() else {
+    let (Some(refresh), Some(client_id)) = (tokens.refresh.as_deref(), tokens.client_id(offered))
+    else {
         return Err(format!(
             "the {} sign-in expired; sign in again",
             account.name()
         ));
     };
-    let client_id = tokens.client_id(client_id).to_string();
+    let client_id = client_id.to_string();
     let http = client()?;
     let answer: TokenAnswer = runtime.block_on(form(
         &http,
@@ -462,17 +459,19 @@ mod tests {
         assert!(!lasting.due(i64::MAX));
         let shown = format!("{tokens:?}");
         assert!(!shown.contains("secret"), "{shown}");
-        assert_eq!(tokens.client_id("set"), "set");
+        assert_eq!(tokens.client_id(Some("set")), Some("set"));
+        assert_eq!(tokens.client_id(None), None);
         let issued = Tokens {
             client_id: Some("issuer".into()),
             ..tokens.clone()
         };
-        assert_eq!(issued.client_id("set"), "issuer");
+        assert_eq!(issued.client_id(Some("set")), Some("issuer"));
+        assert_eq!(issued.client_id(None), Some("issuer"));
         let kept: Tokens = serde_json::from_value(serde_json::json!({
             "login": "wren", "access": "a"
         }))
         .unwrap();
-        assert_eq!(kept.client_id("set"), "set");
+        assert_eq!(kept.client_id(Some("set")), Some("set"));
     }
 
     #[test]
@@ -494,32 +493,23 @@ mod tests {
             "expires_in": 300,
         }))
         .unwrap();
-        assert_eq!(
-            gitlab.page(),
-            "https://gitlab.example.com/oauth/device?user_code=0A44L90H"
-        );
+        assert_eq!(gitlab.page(), "https://gitlab.example.com/oauth/device");
         assert_eq!(gitlab.interval, 5);
     }
 
     #[test]
     fn a_code_opens_only_the_forges_own_page_and_waits_a_bounded_time() {
-        let code = |page: &str, complete: Option<&str>, expires: u64, interval: u64| DeviceCode {
+        let code = |page: &str, expires: u64, interval: u64| DeviceCode {
             device_code: "d".into(),
             user_code: "U".into(),
             verification_uri: page.into(),
-            verification_uri_complete: complete.map(str::to_owned),
             expires_in: expires,
             interval,
         };
         let gl = Account::Gitlab("gitlab.example.com".into());
-        let ok = code(
-            "https://gitlab.example.com/oauth/device",
-            Some("https://evil.example.com/phish"),
-            u64::MAX,
-            0,
-        )
-        .checked(&gl)
-        .unwrap();
+        let ok = code("https://gitlab.example.com/oauth/device", u64::MAX, 0)
+            .checked(&gl)
+            .unwrap();
         assert_eq!(ok.page(), "https://gitlab.example.com/oauth/device");
         assert_eq!(ok.expires_in, MAX_EXPIRES_IN);
         assert_eq!(ok.interval, 1);
@@ -529,9 +519,9 @@ mod tests {
             "file:///etc/passwd",
             "https://github.com/login/device",
         ] {
-            assert!(code(bad, None, 60, 5).checked(&gl).is_err(), "{bad}");
+            assert!(code(bad, 60, 5).checked(&gl).is_err(), "{bad}");
         }
-        let gh = code("https://github.com/login/device", None, 900, 600)
+        let gh = code("https://github.com/login/device", 900, 600)
             .checked(&Account::Github)
             .unwrap();
         assert_eq!(gh.interval, MAX_INTERVAL);

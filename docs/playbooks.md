@@ -537,8 +537,11 @@ crux draft-launch haiku --max-cost 1 --max-time 5m
 ```
 
 `draft-push` saves the directory as the next version of the draft and compiles it. When the
-draft is ready, `crux draft-graduate` opens a PR that exports it to a repository.
-`crux playbook-import owner/repo --path haiku` proposes to register it from that repository.
+draft is ready, promote it from the desktop app: pick a signed-in GitHub or GitLab account, a
+repository and a path, and the app opens a pull request or merge request in your name. When it
+merges, the controller registers the pack from that repository and retires the draft. To
+register a pack that is already in a repository, `crux playbook-import owner/repo --path haiku`
+proposes it.
 After registration, `crux launch` starts the playbook with parameters, and
 `crux playbook-runs` lists its runs.
 

@@ -3,6 +3,7 @@
 # See README.md and docs/ (the mdbook) for the architecture.
 
 set shell := ["bash", "-uc"]
+set dotenv-load
 
 cargo_bin := env_var_or_default("CARGO_HOME", env_var("HOME") + "/.cargo") + "/bin"
 

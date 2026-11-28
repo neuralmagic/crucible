@@ -124,11 +124,9 @@ pub(crate) fn init() -> App {
         #[cfg(not(target_arch = "wasm32"))]
         forge_offers: Default::default(),
         #[cfg(not(target_arch = "wasm32"))]
-        github_client_id: TextEdit::new(&settings.github_client_id),
+        promoting: None,
         #[cfg(not(target_arch = "wasm32"))]
-        gitlab_host: TextEdit::new(""),
-        #[cfg(not(target_arch = "wasm32"))]
-        gitlab_client_id: TextEdit::new(""),
+        promote_form: Default::default(),
         settings,
         editor_command,
         drop_cost,
@@ -271,6 +269,7 @@ pub(crate) fn poll(app: &mut App, clock: f64, tx: &mut Tx) -> bool {
     #[cfg(not(target_arch = "wasm32"))]
     {
         changed |= app.follow_forge_accounts();
+        changed |= app.follow_promotion();
     }
     changed |= app.finish_login_editor();
     changed |= app.finish_release_check();

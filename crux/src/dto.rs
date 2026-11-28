@@ -1204,12 +1204,6 @@ pub struct Placeholder {
     pub reason: String,
 }
 
-/// `POST /api/playbook-drafts/{id}/graduate`: the export PR the draft was pushed to.
-#[derive(Debug, Clone, Deserialize)]
-pub struct GraduateAck {
-    pub pr_url: String,
-}
-
 /// The 409 a save gets when another editor landed first. `error` is the controller's own wording;
 /// `current_version` is what the writer must re-read and merge onto.
 #[derive(Debug, Clone, Deserialize)]

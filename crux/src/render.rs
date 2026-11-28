@@ -946,16 +946,6 @@ pub fn draft_preview(id: &str, saved: &dto::DraftCompile, studio_url: &str) -> S
     out
 }
 
-/// A graduation that landed. The PR is the whole answer: merging it and importing the pack from
-/// the same repo/path is what retires the draft.
-pub fn draft_graduated(id: &str, ack: &dto::GraduateAck) -> String {
-    format!(
-        "graduated draft {id}\nPR: {}\nthe draft retires once that merged pack is imported from \
-         the same repo and path.\n",
-        ack.pr_url
-    )
-}
-
 pub fn draft_renamed(r: &dto::DraftRenamed, studio_url: &str) -> String {
     format!(
         "renamed draft {} to {}\nmoved: {} secret bindings, {} shares, {} standing launches, {} \
@@ -3051,27 +3041,6 @@ mod tests {
         assert!(!out.contains("dispatching to"), "{out}");
     }
 
-    /// The PR is the whole answer to a graduation: an agent that cannot read the URL back has no
-    /// way to finish the promotion.
-    #[test]
-    fn a_graduation_returns_the_pr_and_what_retires_the_draft() {
-        let ack: dto::GraduateAck =
-            serde_json::from_str(r#"{"pr_url":"https://github.com/wren/packs/pull/12"}"#)
-                .expect("the graduate fixture parses");
-        let out = draft_graduated("calibrate", &ack);
-        assert!(out.starts_with("graduated draft calibrate\n"), "{out}");
-        assert!(
-            out.contains("PR: https://github.com/wren/packs/pull/12\n"),
-            "{out}"
-        );
-        assert!(
-            out.contains("imported from the same repo and path"),
-            "{out}"
-        );
-    }
-
-    /// The registry lists where each pack came from: a git pin by repo and directory, a published
-    /// draft by the version it was published from.
     #[test]
     fn the_registry_names_a_git_pin_and_a_published_draft_by_their_sources() {
         let list: Vec<dto::Playbook> = serde_json::from_str(

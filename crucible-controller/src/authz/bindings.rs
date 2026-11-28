@@ -563,9 +563,16 @@ pub static BINDINGS: &[Binding] = &[
     ),
     bind(
         "POST",
-        "/api/playbook-drafts/{id}/graduate",
+        "/api/playbook-drafts/{id}/promote",
         R::PlaybookDraft,
         V::Approve,
+        Route,
+    ),
+    bind(
+        "GET",
+        "/api/playbook-drafts/{id}/promotion",
+        R::PlaybookDraft,
+        V::Read,
         Route,
     ),
     bind(

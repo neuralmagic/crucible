@@ -12,6 +12,7 @@
 pub mod apps;
 pub mod device;
 pub mod link;
+pub mod promote;
 pub mod session;
 
 pub(crate) const GITHUB_HOST: &str = "github.com";
@@ -48,6 +49,14 @@ impl Account {
 
     pub fn store_key(&self) -> String {
         format!("{}:{}", self.forge(), self.host())
+    }
+
+    pub fn from_store_key(key: &str) -> Option<Account> {
+        match key.split_once(':')? {
+            ("github", GITHUB_HOST) => Some(Account::Github),
+            ("gitlab", host) => gitlab_host(host).map(Account::Gitlab),
+            _ => None,
+        }
     }
 
     fn device_url(&self) -> String {
@@ -143,6 +152,25 @@ mod tests {
         );
         assert_eq!(gl.store_key(), "gitlab:gitlab.example.com");
         assert_eq!(gl.name(), "GitLab gitlab.example.com");
+    }
+
+    #[test]
+    fn an_account_reads_back_from_its_store_key() {
+        for account in [
+            Account::Github,
+            Account::Gitlab("gitlab.example.com".into()),
+        ] {
+            assert_eq!(Account::from_store_key(&account.store_key()), Some(account));
+        }
+        for bad in [
+            "github:gitlab.example.com",
+            "gitlab:",
+            "gitlab:a/b",
+            "bitbucket:x.org",
+            "github",
+        ] {
+            assert_eq!(Account::from_store_key(bad), None, "{bad:?}");
+        }
     }
 
     #[test]
