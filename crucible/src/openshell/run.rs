@@ -135,11 +135,9 @@ pub fn turn(
     deadline: Option<crucible::deadline::Deadline>,
     mut sink: impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> TurnOutcome {
+    // The pump scrubs the stream and renders console lines from scrubbed events; every other
+    // site below scrubs what it hands the sink.
     let redactor = Redactor::with_rules(turn.secret_rules.clone());
-    let mut sink = |line: &str, stream: RawStream, ev: Option<&AgentEvent>| {
-        let ev = ev.map(|ev| redactor.event(ev));
-        sink(&redactor.text(line), stream, ev.as_deref());
-    };
     // The whole turn is async; the engine runtime drives it. The one `block_on` in the openshell
     // path. A missing runtime surfaces like any orchestration failure (through the sink, a $0
     // no-op turn).
@@ -149,10 +147,11 @@ pub fn turn(
             let message = "the engine runtime is not initialized (EngineCtx::new was not called \
                            before an async call site) — this is an engine wiring bug"
                 .to_string();
-            let ev = AgentEvent::Error {
+            let error = AgentEvent::Error {
                 error_type: "openshell".into(),
                 message: message.clone(),
             };
+            let ev = redactor.event(&error);
             sink("", RawStream::Stderr, Some(&ev));
             return TurnOutcome::failed(
                 0.0,
@@ -179,10 +178,11 @@ pub fn turn(
         Err(e) => {
             let failure = masked(failure_of(e), &redactor);
             if let TurnFailure::Orchestration { message, .. } = &failure {
-                let ev = AgentEvent::Error {
+                let error = AgentEvent::Error {
                     error_type: "openshell".into(),
                     message: message.clone(),
                 };
+                let ev = redactor.event(&error);
                 sink("", RawStream::Stderr, Some(&ev));
             }
             TurnOutcome::failed(spent.get(), failure)
@@ -273,16 +273,22 @@ fn spawn_stop_bridge(cancel: CancellationToken, deadline: Option<Instant>) -> Ab
 /// slow steps below (`run_os` is silent on success) were invisible otherwise, most painfully the
 /// sandbox create, whose in-pod podman pull of the sandbox image can run 15+ minutes with zero
 /// output. The console renders it as a detail line; the scope activity feed relays it to pod stdout.
-fn stage(sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>), msg: &str) {
+fn stage(
+    redactor: &Redactor,
+    sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
+    msg: &str,
+) {
     // A parallel tracing event on the turn's span (exported over OTLP when enabled); NOT a second
     // copy on the human channel, the sink line below is the console/session narration.
     tracing::info!(stage = msg, "openshell stage");
-    let ev = AgentEvent::Log {
+    let log = AgentEvent::Log {
         level: "stage".to_string(),
         label: "openshell".to_string(),
         value: Some(msg.to_string()),
     };
-    sink(msg, RawStream::Stderr, Some(&ev));
+    let ev = redactor.event(&log);
+    let line = redactor.text(msg);
+    sink(&line, RawStream::Stderr, Some(&ev));
 }
 
 const DEFAULT_CODEX_API_KEY_ENV: &str = "OPENAI_API_KEY";
@@ -382,7 +388,7 @@ async fn try_turn(
 
     // 1. Gateway up (idempotent, boots on the first turn, no-ops after). `None` = the
     //    default supervisor emulator image; the *agent* image is `--from` on create below.
-    stage(sink, "starting the openshell gateway");
+    stage(redactor, sink, "starting the openshell gateway");
     let access = gateway::GatewayAccess::from_env()?;
     let version_warning = gateway::ensure_running(turn.compute_driver, &access, turn.gateway_boot)
         .await
@@ -390,10 +396,12 @@ async fn try_turn(
     // A degraded version check (rev mismatch, unparseable version) is turn telemetry, not a
     // failure, too-old already errored above.
     if let Some(warning) = version_warning {
-        let ev = AgentEvent::Raw {
+        let raw = AgentEvent::Raw {
             text: warning.clone(),
             stream: RawStream::Stderr,
         };
+        let ev = redactor.event(&raw);
+        let warning = redactor.text(&warning);
         sink(&warning, RawStream::Stderr, Some(&ev));
     }
     // The gateway is up, open the typed gRPC client for the rest of the turn (control plane;
@@ -534,6 +542,7 @@ async fn try_turn(
         .await
         .context("clearing a stale sandbox before create")?;
     stage(
+        redactor,
         sink,
         &format!(
             "creating sandbox from {} (pulls the image on first use, up to {}s before the wait gives up)",
@@ -586,10 +595,11 @@ async fn try_turn(
             name.clone(),
         )),
     } {
-        let ev = AgentEvent::Raw {
+        let raw = AgentEvent::Raw {
             text: format!("sandbox bind failed (its agent token requests will be refused): {e:#}"),
             stream: RawStream::Stderr,
         };
+        let ev = redactor.event(&raw);
         sink("", RawStream::Stderr, Some(&ev));
     }
 
@@ -601,10 +611,11 @@ async fn try_turn(
     //     env would collapse every turn's broker spans onto the first turn's trace).
     if turn.broker.enabled {
         if let Err(e) = write_turn_token().await {
-            let ev = AgentEvent::Raw {
+            let raw = AgentEvent::Raw {
                 text: format!("turn-token write failed (candidate budget stays uncapped): {e:#}"),
                 stream: RawStream::Stderr,
             };
+            let ev = redactor.event(&raw);
             sink("", RawStream::Stderr, Some(&ev));
         }
         if let Err(e) = write_traceparent_files(
@@ -613,10 +624,11 @@ async fn try_turn(
         )
         .await
         {
-            let ev = AgentEvent::Raw {
+            let raw = AgentEvent::Raw {
                 text: format!("turn-traceparent write failed (broker spans self-root): {e:#}"),
                 stream: RawStream::Stderr,
             };
+            let ev = redactor.event(&raw);
             sink("", RawStream::Stderr, Some(&ev));
         }
     }
@@ -651,10 +663,11 @@ async fn try_turn(
         ) {
             Ok(c) => Some(c),
             Err(e) => {
-                let ev = AgentEvent::Raw {
+                let raw = AgentEvent::Raw {
                     text: format!("otel collector unavailable (cost falls back to estimate): {e}"),
                     stream: RawStream::Stderr,
                 };
+                let ev = redactor.event(&raw);
                 sink("", RawStream::Stderr, Some(&ev));
                 None
             }
@@ -755,7 +768,7 @@ async fn try_turn(
         .context("applying the sandbox egress policy")?;
 
         // 5. Upload the workspace (dotfiles included), landing at /sandbox/<basename>.
-        stage(sink, "uploading the workspace into the sandbox");
+        stage(redactor, sink, "uploading the workspace into the sandbox");
         let ws = p.workspace.to_string_lossy().to_string();
         run_os(
             &sandbox::workdir_upload_args(&name, &ws),
@@ -893,7 +906,7 @@ async fn try_turn(
         }
 
         // 8. Exec the agent (prompt over stdin), streaming its stdout through the harness decoder.
-        stage(sink, "sandbox ready — starting the agent");
+        stage(redactor, sink, "sandbox ready — starting the agent");
         let mcp_seeded = !servers.is_empty();
         let argv = match session {
             Some(session) => backend
@@ -946,8 +959,10 @@ async fn try_turn(
             crate::agent::tool_chain::ToolChain::declared(turn.tool_plugins),
             turn.pricing,
         );
-        let exec_result =
-            exec_and_stream(&gw, &name, &wrapper, pump, &exec_opts, spent, sink).await;
+        let exec_result = exec_and_stream(
+            &gw, &name, &wrapper, pump, &exec_opts, spent, redactor, sink,
+        )
+        .await;
         if let Some(refresher) = &refresher {
             refresher.abort();
         }
@@ -955,7 +970,7 @@ async fn try_turn(
         // is about to be deleted. Replay it before unwinding: a turn that exits non-zero having
         // written nothing to stderr is otherwise indistinguishable from one that never started.
         if exec_result.is_err() {
-            replay_sandbox_log(&gw, &name, LogReplay::Tail, sink).await;
+            replay_sandbox_log(&gw, &name, LogReplay::Tail, redactor, sink).await;
         }
         let mut cost = exec_result?;
         spent.raise(cost.total());
@@ -965,19 +980,24 @@ async fn try_turn(
         if let Some(c) = &collector
             && let Some(summary) = c.summary()
         {
-            let ev = summary.to_event();
-            cost.observe(&ev);
+            let summary = summary.to_event();
+            cost.observe(&summary);
             spent.raise(cost.total());
+            let ev = redactor.event(&summary);
             sink("", RawStream::Stdout, Some(&ev));
         }
 
         // 8b. Sweep the sandbox log for egress denials before teardown. An agent probing
         //     blocked endpoints mid-turn is signal (reward-hacking telemetry), so denials
         //     land in the run log. Best-effort: a logs failure never fails the turn.
-        replay_sandbox_log(&gw, &name, LogReplay::DenialsOnly, sink).await;
+        replay_sandbox_log(&gw, &name, LogReplay::DenialsOnly, redactor, sink).await;
 
         // 9. Download the workspace back (the agent's edits round-trip to the host).
-        stage(sink, "agent turn done — downloading the workspace");
+        stage(
+            redactor,
+            sink,
+            "agent turn done — downloading the workspace",
+        );
         let sandbox_workdir = SandboxLayout::workdir(&basename);
         retrieve_workspace(&name, &sandbox_workdir, p.workspace.as_path(), &cancel).await?;
 
@@ -1053,6 +1073,7 @@ async fn replay_sandbox_log(
     gw: &Gateway,
     name: &str,
     what: LogReplay,
+    redactor: &Redactor,
     sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) {
     let lines = gw.sandbox_logs(name).await;
@@ -1073,7 +1094,9 @@ async fn replay_sandbox_log(
             denial,
             fields: line.fields.clone().into_iter().collect(),
         };
-        sink(line.message.trim_end(), RawStream::Stderr, Some(&ev));
+        let ev = redactor.event(&ev);
+        let message = redactor.text(line.message.trim_end());
+        sink(&message, RawStream::Stderr, Some(&ev));
     }
 }
 
@@ -1404,6 +1427,7 @@ struct ExecOpts<'a> {
 /// stream yields, and return the turn's running cost. The stream's stderr is replayed through the
 /// sink after the agent exits, mirroring the old CLI-child behavior. `cancel` unwinds the exec on
 /// Ctrl-C (see [`Gateway::exec`]); a tool chain stop unwinds only the exec, so teardown still runs.
+#[allow(clippy::too_many_arguments)]
 async fn exec_and_stream(
     gw: &Gateway,
     name: &str,
@@ -1411,18 +1435,19 @@ async fn exec_and_stream(
     mut pump: crate::agent::turn::StreamPump,
     opts: &ExecOpts<'_>,
     spent: &CostMeter,
+    redactor: &Redactor,
     sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> Result<crate::agent::turn::TurnCost> {
     let stop = opts.cancel.child_token();
     let exec = gw
         .exec(name, command, &stop, |line| {
-            pump.push(line, opts.json, sink);
+            pump.push(line, opts.json, Some(redactor), sink);
             if pump.stopped().is_some() {
                 stop.cancel();
             }
         })
         .await?;
-    let crate::agent::turn::PumpEnd { cost, stopped } = pump.finish(sink);
+    let crate::agent::turn::PumpEnd { cost, stopped } = pump.finish(Some(redactor), sink);
     let (exit_code, transport_error) = (exec.exit_code, exec.transport_error);
     // Bank it here, not at the caller's `?`: the agent can bill real tokens and still exit
     // non-zero below, and a turn that spent money is never reported free.
@@ -1439,6 +1464,8 @@ async fn exec_and_stream(
                 text: t.to_string(),
                 stream: RawStream::Stderr,
             };
+            let ev = redactor.event(&ev);
+            let line = redactor.text(&line);
             sink(&line, RawStream::Stderr, Some(&ev));
         }
     }
@@ -1656,6 +1683,7 @@ async fn graft_turn_telemetry(
                 message: "transcript fetch failed — the turn's result and cost are unavailable"
                     .into(),
             };
+            let ev = redactor.event(&ev);
             sink("", RawStream::Stderr, Some(&ev));
         }
         return;
@@ -1700,7 +1728,8 @@ async fn graft_turn_telemetry(
     if harness.spec().backfill_required {
         for ev in &artifacts.events {
             cost.observe(ev);
-            sink("", RawStream::Stdout, Some(ev));
+            let ev = redactor.event(ev);
+            sink("", RawStream::Stdout, Some(&ev));
         }
         if let Some(c) = artifacts.cost_usd {
             cost.report(c);

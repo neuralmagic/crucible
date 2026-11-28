@@ -790,6 +790,25 @@ pub fn encode(ev: &SessionEvent) -> String {
     })
 }
 
+/// Encode one agent event as its `agent` envelope without owning the event; byte-identical to
+/// [`encode`] on `SessionEvent::Agent`.
+pub fn encode_agent(event: &AgentEvent) -> String {
+    #[derive(Serialize)]
+    struct Ref<'a> {
+        v: u8,
+        kind: &'static str,
+        event: &'a AgentEvent,
+    }
+    serde_json::to_string(&Ref {
+        v: WIRE_VERSION,
+        kind: "agent",
+        event,
+    })
+    .unwrap_or_else(|e| {
+        format!(r#"{{"v":{WIRE_VERSION},"kind":"note","msg":"encode error: {e}"}}"#)
+    })
+}
+
 /// Decode one NDJSON line. Returns `None` for blank or torn/partial lines so a tailing
 /// reader can skip them.
 pub fn decode(line: &str) -> Option<SessionEvent> {
@@ -802,6 +821,24 @@ pub fn decode(line: &str) -> Option<SessionEvent> {
 
 #[cfg(test)]
 mod tests {
+    use super::encode_agent;
+
+    #[test]
+    fn encode_agent_is_the_owned_agent_envelope_byte_for_byte() {
+        let ev = AgentEvent::Tool {
+            name: "Bash".into(),
+            summary: "$ ls".into(),
+            subagent: false,
+            input: Some(serde_json::json!({ "command": "ls" })),
+            result: None,
+            failed: false,
+        };
+        assert_eq!(
+            encode_agent(&ev),
+            encode(&SessionEvent::Agent { event: ev.clone() })
+        );
+    }
+
     use super::*;
     use crate::event::{ModelUsage, RawStream, Tokens};
     use crate::identity::{ComponentIdentity, RigIdentity};

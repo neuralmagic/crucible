@@ -41,14 +41,17 @@ struct Calls {
 }
 
 /// Whether to scrub credential-shaped fragments from span hints. Defaults ON; set
-/// `CRUCIBLE_TURN_TRACE_REDACT` to `0`/`false`/`off` to disable it (e.g. when the harness already
-/// sanitizes tool inputs and the extra scrub just muddies the trace).
+/// `CRUCIBLE_TURN_TRACE_REDACT` to `0`/`false`/`off` to disable it (e.g. when the harness
+/// already sanitizes tool inputs and the extra scrub just muddies the trace).
 /// `pub` so the hermes reader defaults to the same toggle.
 pub fn redact_enabled() -> bool {
-    !matches!(
-        std::env::var("CRUCIBLE_TURN_TRACE_REDACT").ok().as_deref(),
-        Some("0") | Some("false") | Some("FALSE") | Some("off")
-    )
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("CRUCIBLE_TURN_TRACE_REDACT").ok().as_deref(),
+            Some("0") | Some("false") | Some("FALSE") | Some("off")
+        )
+    })
 }
 
 /// Parse a native session transcript into its tool invocations, in call order. Robust to a torn

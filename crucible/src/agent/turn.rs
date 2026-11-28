@@ -139,6 +139,8 @@ pub(crate) struct StreamPump {
     chain_decoder: Option<Box<dyn LineFormat + Send>>,
     cost: TurnCost,
     chain: ToolChain,
+    events: Vec<AgentEvent>,
+    chain_events: Vec<AgentEvent>,
 }
 
 impl StreamPump {
@@ -157,6 +159,8 @@ impl StreamPump {
             chain_decoder,
             cost: TurnCost::new(pricing),
             chain,
+            events: Vec::new(),
+            chain_events: Vec::new(),
         }
     }
 
@@ -167,24 +171,61 @@ impl StreamPump {
         &mut self,
         line: &str,
         json: bool,
+        redactor: Option<&crucible_harness::redact::Redactor>,
         sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
     ) {
-        let events = self.decoder.push(line);
-        for ev in &events {
-            self.cost.observe(ev);
-            if json {
-                sink(line, RawStream::Stdout, Some(ev));
-            } else if let Some(human) = human_line(ev) {
-                sink(&human, RawStream::Stdout, Some(ev));
+        let StreamPump {
+            decoder,
+            chain_decoder,
+            cost,
+            chain,
+            events,
+            chain_events,
+        } = self;
+        // Compact mode runs two decoders over one line, so the Value parse is shared; solo,
+        // the decoder parses through its own entry, which is a typed fast path where the
+        // harness has one. Both decode into reused buffers.
+        match chain_decoder {
+            Some(chain_decoder) => {
+                let parsed = crucible_harness::line::parse_line(line);
+                decoder.push_parsed_into(&parsed, events);
+                chain_decoder.push_parsed_into(&parsed, chain_events);
+            }
+            None => decoder.push_into(line, events),
+        }
+        // With a redactor, the pump scrubs each event once and renders the console line from
+        // the scrubbed event, so the same content is never scanned twice; `json` mode passes
+        // the raw line, whose escaped spellings still need its own scan. Without one, the
+        // caller's wrapper does the scrubbing.
+        for ev in events.iter() {
+            cost.observe(ev);
+            match redactor {
+                Some(redactor) => {
+                    let scrubbed = redactor.event(ev);
+                    let scrubbed = &*scrubbed;
+                    if json {
+                        let line = redactor.text(line);
+                        sink(&line, RawStream::Stdout, Some(scrubbed));
+                    } else if let Some(human) = human_line(scrubbed) {
+                        sink(&human, RawStream::Stdout, Some(scrubbed));
+                    }
+                }
+                None => {
+                    if json {
+                        sink(line, RawStream::Stdout, Some(ev));
+                    } else if let Some(human) = human_line(ev) {
+                        sink(&human, RawStream::Stdout, Some(ev));
+                    }
+                }
             }
         }
-        let chain_events = match &mut self.chain_decoder {
-            Some(decoder) => decoder.push(line),
-            None => events,
+        let chain_events = match chain_decoder.as_deref() {
+            Some(_) => chain_events.as_slice(),
+            None => events.as_slice(),
         };
-        for ev in &chain_events {
-            if let Some(reason) = self.chain.observe(ev) {
-                emit(&stop_event(reason), sink);
+        for ev in chain_events {
+            if let Some(reason) = chain.observe(ev) {
+                emit(redactor, &stop_event(reason), sink);
             }
         }
     }
@@ -198,9 +239,10 @@ impl StreamPump {
     /// reports reach `sink`.
     pub(crate) fn finish(
         self,
+        redactor: Option<&crucible_harness::redact::Redactor>,
         sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
     ) -> PumpEnd {
-        report_chain(&self.chain, sink);
+        report_chain(redactor, &self.chain, sink);
         PumpEnd {
             cost: self.cost,
             stopped: self.chain.into_stopped(),
@@ -210,12 +252,14 @@ impl StreamPump {
 
 /// Send each of `chain`'s end-of-turn reports to `sink` as a `Log` event.
 pub(crate) fn report_chain(
+    redactor: Option<&crucible_harness::redact::Redactor>,
     chain: &ToolChain,
     sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) {
     for (label, value) in chain.reports() {
         tracing::info!(label, report = %value, "tool chain report");
         emit(
+            redactor,
             &AgentEvent::Log {
                 level: "info".into(),
                 label: label.into(),
@@ -226,9 +270,19 @@ pub(crate) fn report_chain(
     }
 }
 
-fn emit(ev: &AgentEvent, sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>)) {
-    let human = human_line(ev).unwrap_or_default();
-    sink(&human, RawStream::Stderr, Some(ev));
+fn emit(
+    redactor: Option<&crucible_harness::redact::Redactor>,
+    ev: &AgentEvent,
+    sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
+) {
+    // Everything the pump hands the sink goes through one scrubbing point, the stop event and
+    // the chain reports included: a wedge report embeds the raw tool summaries it stopped on.
+    let scrubbed = match redactor {
+        Some(redactor) => redactor.event(ev),
+        None => std::borrow::Cow::Borrowed(ev),
+    };
+    let human = human_line(&scrubbed).unwrap_or_default();
+    sink(&human, RawStream::Stderr, Some(&scrubbed));
 }
 
 /// The run-log event for a tool chain stop.
@@ -265,20 +319,24 @@ impl TurnCost {
         }
     }
 
-    pub(crate) fn observe(&mut self, ev: &AgentEvent) {
-        if let Some(c) = cost_of(ev) {
-            self.report(c);
-        }
+    /// Fold `ev` into the totals; `true` when the settled figure can have moved (a cost or
+    /// token sample arrived), so a per-event reporter can skip the unchanged ones.
+    pub(crate) fn observe(&mut self, ev: &AgentEvent) -> bool {
+        let mut changed = cost_of(ev).is_some_and(|c| self.report(c));
         if let AgentEvent::Tokens(t) = ev
             && self.tokens.as_ref().is_none_or(|b| t.total >= b.total)
         {
             self.tokens = Some(t.clone());
+            changed = true;
         }
+        changed
     }
 
-    /// A cost the harness reported outside its event stream.
-    pub(crate) fn report(&mut self, usd: f64) {
+    /// A cost the harness reported outside its event stream. Returns whether the figure rose.
+    pub(crate) fn report(&mut self, usd: f64) -> bool {
+        let rose = usd > self.reported;
         self.reported = self.reported.max(usd);
+        rose
     }
 
     pub(crate) fn total(&self) -> f64 {
@@ -286,11 +344,14 @@ impl TurnCost {
     }
 }
 
-/// Render observable activity and failed results for the headless console.
-pub(crate) fn human_line(ev: &AgentEvent) -> Option<String> {
+/// Render observable activity and failed results for the headless console. A plain text delta
+/// borrows; every other kind formats.
+pub(crate) fn human_line(ev: &AgentEvent) -> Option<std::borrow::Cow<'_, str>> {
     match ev {
-        AgentEvent::Text { delta } => Some(delta.clone()),
-        AgentEvent::Thinking { delta } => Some(format!("\u{1f9e0} {delta}")),
+        AgentEvent::Text { delta } => Some(std::borrow::Cow::Borrowed(delta.as_str())),
+        AgentEvent::Thinking { delta } => {
+            Some(std::borrow::Cow::Owned(format!("\u{1f9e0} {delta}")))
+        }
         AgentEvent::Tool {
             name,
             summary,
@@ -303,35 +364,43 @@ pub(crate) fn human_line(ev: &AgentEvent) -> Option<String> {
             } else {
                 summary.clone()
             };
-            Some(format!("{icon} {name} {summary}").trim_end().to_string())
+            Some(std::borrow::Cow::Owned(
+                format!("{icon} {name} {summary}").trim_end().to_string(),
+            ))
         }
-        AgentEvent::Tokens(t) => Some(format!(
+        AgentEvent::Tokens(t) => Some(std::borrow::Cow::Owned(format!(
             "\u{1f4ca} TOKENS in={} out={} cache_r={} cache_w={} total={}",
             t.input, t.output, t.cache_read, t.cache_write, t.total
-        )),
+        ))),
         AgentEvent::Retry {
             attempt,
             max,
             error,
-        } => Some(format!("\u{1f504} Retry {attempt}/{max} {error}")),
+        } => Some(std::borrow::Cow::Owned(format!(
+            "\u{1f504} Retry {attempt}/{max} {error}"
+        ))),
         AgentEvent::Error {
             error_type,
             message,
-        } => Some(format!("\u{274c} Error: {error_type}: {message}")),
+        } => Some(std::borrow::Cow::Owned(format!(
+            "\u{274c} Error: {error_type}: {message}"
+        ))),
         AgentEvent::Log {
             label,
             value: Some(value),
             ..
-        } if label.starts_with("tool_") => Some(format!("\u{1f9e9} {label}: {value}")),
+        } if label.starts_with("tool_") => Some(std::borrow::Cow::Owned(format!(
+            "\u{1f9e9} {label}: {value}"
+        ))),
         AgentEvent::Result {
             is_error: true,
             subtype,
             error,
             ..
-        } => Some(format!(
+        } => Some(std::borrow::Cow::Owned(format!(
             "\u{274c} Error: {subtype}: {}",
             error.as_deref().unwrap_or("agent reported a failed turn"),
-        )),
+        ))),
         _ => None,
     }
 }
@@ -379,6 +448,7 @@ mod tests {
             pump.push(
                 line,
                 true,
+                None,
                 &mut |_l: &str, _s: RawStream, ev: Option<&AgentEvent>| events.extend(ev.cloned()),
             );
             read += 1;
@@ -386,9 +456,10 @@ mod tests {
                 break;
             }
         }
-        let end = pump.finish(&mut |_l: &str, _s: RawStream, ev: Option<&AgentEvent>| {
-            events.extend(ev.cloned())
-        });
+        let end = pump.finish(
+            None,
+            &mut |_l: &str, _s: RawStream, ev: Option<&AgentEvent>| events.extend(ev.cloned()),
+        );
         (end, read, events)
     }
 
@@ -419,9 +490,9 @@ mod tests {
             let mut sink =
                 |_l: &str, _s: RawStream, ev: Option<&AgentEvent>| logged.extend(ev.cloned());
             for line in lines {
-                pump.push(line, true, &mut sink);
+                pump.push(line, true, None, &mut sink);
             }
-            (pump.finish(&mut sink), logged)
+            (pump.finish(None, &mut sink), logged)
         };
         let (end, logged) = run(&polls);
         assert!(
@@ -442,6 +513,60 @@ mod tests {
             .flat_map(|i| claude_call(i, "buildit status b-1", Some(("0% built", false))))
             .collect();
         assert!(matches!(run(&same).0.stopped, Some(StopReason::Wedged(_))));
+    }
+
+    /// The wedge stop event embeds the raw tool summaries it stopped on; through the pump's
+    /// redactor it must reach the sink masked, like every other event and line the pump emits.
+    #[test]
+    fn a_wedge_stop_reaches_the_sink_masked() {
+        use crucible_harness::redact::{Redactor, SecretRules};
+        let rules = SecretRules::default();
+        assert!(rules.ready(), "builtin rules compiled");
+        let redactor = Redactor::with_rules(rules);
+        let secret = "not-a-real-password-0123456789";
+        let lines: Vec<String> = (0..4)
+            .flat_map(|i| {
+                claude_call(
+                    i,
+                    &format!("server=db.internal;password={secret};"),
+                    Some(("boom", true)),
+                )
+            })
+            .collect();
+        let mut pump = StreamPump::new(
+            Box::new(StreamJsonParser::default()),
+            None,
+            guard(3),
+            pricing(),
+        );
+        let mut seen = Vec::new();
+        for line in &lines {
+            pump.push(line, false, Some(&redactor), &mut |line: &str,
+                                                          _stream: RawStream,
+                                                          ev: Option<
+                &AgentEvent,
+            >| {
+                seen.push(format!("{line} {ev:?}"));
+            });
+            if pump.stopped().is_some() {
+                break;
+            }
+        }
+        let end = pump.finish(
+            Some(&redactor),
+            &mut |_l: &str, _s: RawStream, ev: Option<&AgentEvent>| {
+                if let Some(ev) = ev {
+                    seen.push(format!("{ev:?}"));
+                }
+            },
+        );
+        assert!(end.stopped.is_some(), "the guard trips");
+        let rendered = seen.join("\n");
+        assert!(!rendered.contains(secret), "leaked: {rendered}");
+        assert!(
+            rendered.contains(crucible_harness::redact::MASK),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -523,6 +648,7 @@ mod tests {
             pump.push(
                 line,
                 true,
+                None,
                 &mut |_l: &str, _s: RawStream, ev: Option<&AgentEvent>| {
                     errors += usize::from(matches!(ev, Some(AgentEvent::Error { .. })));
                 },

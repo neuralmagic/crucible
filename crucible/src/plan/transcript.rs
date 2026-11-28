@@ -28,14 +28,16 @@ struct Block {
 
 impl Block {
     fn push(&mut self, delta: &str) {
-        for c in delta.chars() {
-            if self.chars < BLOCK_CHARS {
-                self.buf.push(c);
-                self.chars += 1;
-            } else {
-                self.dropped += 1;
-            }
-        }
+        let total = delta.chars().count();
+        let room = BLOCK_CHARS.saturating_sub(self.chars);
+        let cut = delta
+            .char_indices()
+            .nth(room)
+            .map_or(delta.len(), |(i, _)| i);
+        let kept = if cut == delta.len() { total } else { room };
+        self.buf.push_str(&delta[..cut]);
+        self.chars += kept;
+        self.dropped += total - kept;
     }
 
     fn take(&mut self) -> Option<String> {
